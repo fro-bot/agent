@@ -5,6 +5,7 @@ import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
+import type {OperatorFailureKind} from '../operator-contract/run-status.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
@@ -28,6 +29,7 @@ import {sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
+import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {abortRegistry} from './abort-registry.js'
 import {attachOpencode} from './opencode-attach.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
@@ -127,6 +129,17 @@ export interface RunMentionDeps {
    * Fail-closed: any error result or thrown exception → treat as not-ready.
    */
   readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>
+  /**
+   * Operator push dispatcher — opt-in, present only when
+   * `GatewayConfig.operatorPush` is configured. Broadcasts a push
+   * notification to every active operator subscription on a pending
+   * approval or a failed run. Optional chaining at every call site keeps
+   * push fully inert (a no-op) when absent — push stays disabled-by-default.
+   */
+  readonly operatorPushDispatcher?: {
+    readonly dispatchApprovalPending: (approvalId: string) => Promise<void>
+    readonly dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
+  }
 }
 
 /**
@@ -748,6 +761,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           statusSink.setReaction('awaiting-approval')
           // Delegate to the resolved approval transport for notification + registry wiring.
           resolvedApprovalOnPending(req)
+          // Operator push — fire-and-forget, opt-in, and last so it can never
+          // preempt the real approval transports above. No-op when push is disabled.
+          // eslint-disable-next-line no-void
+          void deps.operatorPushDispatcher?.dispatchApprovalPending(req.requestID)
         },
         onReplied: event => {
           // Authoritative echo from OpenCode — let the registry render + cascade.
@@ -976,6 +993,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             } else {
               logger.warn({repo, runId}, 'run: CANCELLED transition failed — fell back to FAILED terminalization')
               notifyObserverBestEffort(deps, failedFallbackResult.data.state)
+              // eslint-disable-next-line no-void
+              void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(fallbackFailureKind))
             }
           }
         } else {
@@ -1047,6 +1066,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // status frame (which closes run subscribers). Best-effort, fire-and-forget.
         if (failedStateForNotify !== undefined) {
           notifyObserverBestEffort(deps, failedStateForNotify)
+          // eslint-disable-next-line no-void
+          void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(inFlightFailureKind))
         }
 
         // Coarse user message — no internal detail

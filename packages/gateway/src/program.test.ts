@@ -106,6 +106,7 @@ vi.mock('./web/operator-push/subscription-store.js', async importOriginal => {
       deleteForOperator: vi.fn(),
       listMetadataForOperator: vi.fn(),
       getActiveRecordsForOperator: vi.fn(),
+      listAllActiveRecords: vi.fn(),
       markDead: vi.fn(),
       pruneInactive: vi.fn(),
       verifyStillOwned: vi.fn(),
@@ -1236,6 +1237,166 @@ describe('button interaction handler (approval flow)', () => {
       import('./web/server.js').OperatorServerConfig,
     ]
     expect(serverDeps.operatorPushStore).toBeUndefined()
+  })
+
+  it('operator push enabled: dispatcher is threaded into launchWorkDeps and the session-revoke hook is registered', async () => {
+    // #given — operatorWeb and operatorPush are both configured, self-test succeeds
+    selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — the push dispatcher is live on launchWorkDeps (used by both the web
+    // launch route and Discord mentions, since both share the same deps object)
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.launchWorkDeps?.operatorPushDispatcher).toBeDefined()
+    expect(typeof serverDeps.launchWorkDeps?.operatorPushDispatcher?.dispatchApprovalPending).toBe('function')
+    expect(typeof serverDeps.launchWorkDeps?.operatorPushDispatcher?.dispatchRunFailed).toBe('function')
+
+    // #and — the session-revoke deactivation hook was registered on the GitHub OAuth deps
+    expect(serverDeps.githubOAuth?.onSessionRevoke).toBeDefined()
+    expect(typeof serverDeps.githubOAuth?.onSessionRevoke).toBe('function')
+  })
+
+  it('session-revoke hook: deactivation with skipped subscriptions logs a warn, does not throw', async () => {
+    // #given — operatorWeb and operatorPush are both configured, self-test succeeds
+    selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+    const storeMock = vi.mocked(createOperatorPushSubscriptionStore).mock.results[0]?.value as {
+      deactivateForOperator: (args: {readonly operatorId: string}) => Promise<unknown>
+    }
+    const deactivateForOperatorMock = vi.mocked(storeMock.deactivateForOperator)
+    deactivateForOperatorMock.mockResolvedValueOnce({success: true, data: {updated: 0, skipped: 2}})
+
+    // #when — the revoke hook fires with a deactivation result carrying skipped records
+    expect(() => serverDeps.githubOAuth?.onSessionRevoke?.(12345)).not.toThrow()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // #then — a warn is logged, no throw escapes the hook
+    const warnedSkipped = consoleWarnSpy.mock.calls.some(([line]) => String(line).includes('CAS exhausted'))
+    expect(warnedSkipped).toBe(true)
+    consoleWarnSpy.mockRestore()
+  })
+
+  it('session-revoke hook: a failed deactivation Result logs a warn, does not throw', async () => {
+    // #given — operatorWeb and operatorPush are both configured, self-test succeeds
+    selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+    const storeMock = vi.mocked(createOperatorPushSubscriptionStore).mock.results[0]?.value as {
+      deactivateForOperator: (args: {readonly operatorId: string}) => Promise<unknown>
+    }
+    const deactivateForOperatorMock = vi.mocked(storeMock.deactivateForOperator)
+    deactivateForOperatorMock.mockResolvedValueOnce({success: false, error: new Error('write failed')})
+
+    // #when — the revoke hook fires with a failed deactivation Result
+    expect(() => serverDeps.githubOAuth?.onSessionRevoke?.(12345)).not.toThrow()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // #then — a warn is logged, no throw escapes the hook
+    const warnedFailed = consoleWarnSpy.mock.calls.some(([line]) =>
+      String(line).includes('session-revoke deactivation failed'),
+    )
+    expect(warnedFailed).toBe(true)
+    consoleWarnSpy.mockRestore()
+  })
+
+  it('operator push disabled (config absent): no dispatcher on launchWorkDeps, push stays inert', async () => {
+    // #given — no operatorPush block in config
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — no dispatcher, no session-revoke hook: push is fully off
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.launchWorkDeps?.operatorPushDispatcher).toBeUndefined()
+    expect(serverDeps.githubOAuth?.onSessionRevoke).toBeUndefined()
   })
 
   it('composite close closes both announce and operator handles', async () => {

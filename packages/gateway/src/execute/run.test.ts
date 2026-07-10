@@ -7141,6 +7141,128 @@ describe('operator cancel — abort-registry integration', () => {
     abortRegistry.delete(CANCEL_FALLBACK_RUN_ID)
   })
 
+  it('cancelled transition failure falls back to FAILED terminalization — dispatchRunFailed fires once with the mapped failureKind', async () => {
+    // #given — same CANCELLED-fails/re-read/FAILED-succeeds setup as the fallback test above,
+    // plus an operatorPushDispatcher to observe
+    const {launchWork} = await import('./run.js')
+    const failedState = buildMockRunState({phase: 'FAILED', run_id: 'cancel-fallback-push-run-id'})
+    const executingState = buildMockRunState({phase: 'EXECUTING', run_id: 'cancel-fallback-push-run-id'})
+    const getObjectMock = vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {data: JSON.stringify(executingState), etag: 'fresh-etag-after-cancel-412'},
+    })
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
+
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'CANCELLED') {
+          return {success: false as const, error: new Error('CANCELLED conditional write conflict')}
+        }
+        if (phase === 'FAILED') {
+          return {success: true as const, data: {etag: 'failed-etag', state: failedState}}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: failedState}}
+      },
+    )
+    const heartbeatStop = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: failedState},
+    })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    const CANCEL_FALLBACK_PUSH_RUN_ID = 'cancel-fallback-push-run-id'
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(CANCEL_FALLBACK_PUSH_RUN_ID, 'operator cancel')
+    })
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const pushDispatcher = {
+      dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
+      dispatchRunFailed: vi.fn().mockResolvedValue(undefined),
+    }
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = CANCEL_FALLBACK_PUSH_RUN_ID
+    const deps = makeDeps({logger, coordinationConfig, operatorPushDispatcher: pushDispatcher})
+
+    // #when
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — dispatchRunFailed fires exactly once with the mapped failureKind for the
+    // CANCELLED→FAILED fallback path
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledTimes(1)
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledWith(CANCEL_FALLBACK_PUSH_RUN_ID, expect.anything())
+
+    abortRegistry.delete(CANCEL_FALLBACK_PUSH_RUN_ID)
+  })
+
+  it('in-flight FAILED transitionRun failure — dispatchRunFailed is NOT called (success guard is load-bearing)', async () => {
+    // #given — the in-flight FAILED transition itself fails (not the cancel-fallback path)
+    const {launchWork} = await import('./run.js')
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'FAILED') {
+          return {success: false as const, error: new Error('FAILED conditional write conflict')}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: buildMockRunState({phase: 'EXECUTING'})}}
+      },
+    )
+    const heartbeatStop = vi.fn().mockResolvedValue({success: true, data: {runEtag: 'e', lockEtag: 'l'}})
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+    mockRunOpenCodeCore.mockRejectedValue(new Error('run core in-flight failure'))
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const pushDispatcher = {
+      dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
+      dispatchRunFailed: vi.fn().mockResolvedValue(undefined),
+    }
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({logger, operatorPushDispatcher: pushDispatcher})
+
+    // #when
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — the FAILED transition did not succeed, so the notify/dispatch that only runs
+    // on success never fires
+    expect(pushDispatcher.dispatchRunFailed).not.toHaveBeenCalled()
+  })
+
   for (const terminalPhase of ['COMPLETED', 'FAILED', 'CANCELLED'] as const) {
     it(`cancelled transition failure + re-read shows run ALREADY TERMINAL (concurrent writer landed ${terminalPhase}) — no FAILED fallback attempted`, async () => {
       // #given — the CANCELLED transitionRun call fails, but a re-read shows a concurrent
@@ -8145,5 +8267,168 @@ describe('failAdmittedRun failureKind threading (pre-ACK gates)', () => {
     const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
     const failedOptions = failedCall?.[7] as {detailsPatch?: {failureKind?: unknown}}
     expect(failedOptions?.detailsPatch?.failureKind).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// operatorPushDispatcher wiring — approval-pending and FAILED terminalization
+// ---------------------------------------------------------------------------
+
+function makePushDispatcher() {
+  return {
+    dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
+    dispatchRunFailed: vi.fn().mockResolvedValue(undefined),
+  }
+}
+
+describe('operatorPushDispatcher wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // #given a run with a fake operatorPushDispatcher present
+  // #when the coordinator's onPending fires
+  // #then dispatchApprovalPending is called once with the requestID, and the
+  //       existing approval flow (Discord render + registry) is unchanged
+  it('calls dispatchApprovalPending once on a pending approval without altering the approval flow', async () => {
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const pushDispatcher = makePushDispatcher()
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      capturedOnPending?.({
+        requestID: 'req-push-1',
+        sessionID: 'sess-push',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      })
+    })
+
+    const approvalRegistry = makeApprovalRegistry()
+    const deps = makeDeps({operatorPushDispatcher: pushDispatcher, approvalRegistry})
+    const message = makeMessage()
+
+    await runMention(message, makeBinding(), deps)
+
+    expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledTimes(1)
+    expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledWith('req-push-1')
+    // The existing approval transport still ran — the push dispatch is additive, not a
+    // replacement. If push dispatch replaced the existing flow instead of augmenting it,
+    // this assertion would fail.
+    expect(approvalRegistry.register).toHaveBeenCalled()
+  })
+
+  // #given a run whose core execution fails in-flight (RunCoreError)
+  // #when the FAILED transition succeeds
+  // #then dispatchRunFailed is called once with the mapped OperatorFailureKind
+  it('calls dispatchRunFailed once with the mapped failureKind on in-flight FAILED terminalization', async () => {
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    const pushDispatcher = makePushDispatcher()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('inactivity-timeout', 'no progress'))
+
+    const deps = makeDeps({operatorPushDispatcher: pushDispatcher})
+    const message = makeMessage()
+
+    await runMention(message, makeBinding(), deps)
+
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledTimes(1)
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledWith(expect.any(String), 'inactivity-timeout')
+  })
+
+  // #given operatorPushDispatcher is undefined (push disabled)
+  // #when a pending approval and a FAILED terminalization both occur
+  // #then nothing throws and the run flow is unchanged — push is fully inert
+  it('does nothing when operatorPushDispatcher is undefined — push stays fully inert', async () => {
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      capturedOnPending?.({
+        requestID: 'req-inert-1',
+        sessionID: 'sess-inert',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      })
+      throw new RunCoreError('inactivity-timeout', 'no progress')
+    })
+
+    const deps = makeDeps({operatorPushDispatcher: undefined})
+    const message = makeMessage()
+
+    // #then — no throw
+    await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+  })
+
+  // #given a fake operatorPushDispatcher whose dispatchApprovalPending/dispatchRunFailed throw
+  // #when a pending approval and a FAILED terminalization occur
+  // #then the throw does not break the approval or run flow (fail-soft)
+  it('does not break the run flow when the dispatcher throws', async () => {
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    const throwingDispatcher = {
+      dispatchApprovalPending: vi.fn().mockRejectedValue(new Error('push boom')),
+      dispatchRunFailed: vi.fn().mockRejectedValue(new Error('push boom')),
+    }
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      capturedOnPending?.({
+        requestID: 'req-throw-1',
+        sessionID: 'sess-throw',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      })
+      throw new RunCoreError('inactivity-timeout', 'no progress')
+    })
+
+    const deps = makeDeps({operatorPushDispatcher: throwingDispatcher})
+    const message = makeMessage()
+
+    // #then — no throw propagates out of runMention despite the dispatcher rejecting
+    await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    expect(failedCall).toBeDefined()
+
+    // #and — the dispatcher was actually invoked (both call sites), not merely present but
+    // unreached — otherwise this test would pass even if dispatch never fired
+    expect(throwingDispatcher.dispatchApprovalPending.mock.calls.length).toBeGreaterThanOrEqual(1)
+    expect(throwingDispatcher.dispatchRunFailed.mock.calls.length).toBeGreaterThanOrEqual(1)
   })
 })

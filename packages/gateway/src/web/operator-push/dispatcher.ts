@@ -1,29 +1,39 @@
 /**
  * Orchestrates operator push notification dispatch: approval-pending and
- * run-failed events fan out to every active subscription owned by the
- * target operator, subject to dedupe, key-rotation trigger policy, and a
- * linearizable re-verification of ownership immediately before each send.
+ * run-failed events broadcast to every active subscription across ALL
+ * operators, subject to dedupe and key-rotation trigger policy.
+ *
+ * Broadcast model: the operator dashboard is a shared surface — approvals
+ * are run-scoped, not operator-scoped, and there is no dashboard-operator
+ * identity available at the run-failed or approval-pending seams. Every
+ * opted-in operator with an active subscription is nudged for a pending
+ * approval or a failed run, regardless of who launched the run. The payload
+ * is repo-neutral ("something needs attention, open the dashboard") so a
+ * broadcast leaks no run/repo content.
+ *
+ * Because dispatch targets every active subscriber rather than one owner,
+ * there is no specific operator to re-verify ownership against — this
+ * dispatcher does NOT call `store.verifyStillOwned`. (That check remains in
+ * the store for the existing per-operator paths.)
+ *
+ * The dedupe key is keyed by the EVENT identity only (runId-or-approvalId +
+ * kind), not per operator, so one event produces at most one nudge per
+ * subscription within the window.
  *
  * Fail-soft by design: `dispatchApprovalPending` / `dispatchRunFailed`
  * NEVER throw into the caller. Every dependency call and the whole flow is
  * wrapped so an unexpected failure degrades to a coarse log, not a crash of
  * whatever fire-and-forget call site invoked it.
  *
- * Dispatch-vs-transfer linearizability: `store.getActiveRecordsForOperator`
- * returns a point-in-time snapshot. Because ownership can transfer to a
- * different operator (or the subscription can be tombstoned) between that
- * read and the moment a notification is actually sent, this dispatcher
- * calls `store.verifyStillOwned` immediately before each send. If the
- * generation has moved on, or the record is no longer active or no longer
- * owned by the same operator, the send is skipped. This narrows the
- * delivery-to-wrong-owner window to the async gap between the ownership
- * re-check and the actual relay request — not zero, but bounded to a single
- * I/O hop; a transfer landing inside that window is additionally caught by
- * the relay returning 410 for the transferred-away subscription.
- *
  * Security invariant: this module never logs the endpoint, subscription
  * keys, VAPID keys, or push payload — only coarse operator/run identifiers
  * and outcome labels.
+ *
+ * Scale assumption: broadcast sends sequentially to every active
+ * subscription. This is sized for the operator-console scale (a small
+ * number of authenticated operators), not end-user scale. If the active
+ * subscription count grows large, a bounded concurrent fan-out should
+ * replace the sequential loop.
  */
 
 import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
@@ -55,7 +65,7 @@ export interface PushDispatcherTriggerPolicy {
 }
 
 export interface CreatePushDispatcherDeps {
-  readonly store: Pick<OperatorPushSubscriptionStore, 'getActiveRecordsForOperator' | 'verifyStillOwned' | 'markDead'>
+  readonly store: Pick<OperatorPushSubscriptionStore, 'listAllActiveRecords' | 'markDead'>
   readonly sender: PushSender
   readonly dedupeCache: DedupeCache
   readonly triggerPolicy: PushDispatcherTriggerPolicy
@@ -64,38 +74,43 @@ export interface CreatePushDispatcherDeps {
 }
 
 export interface PushDispatcher {
-  dispatchApprovalPending: (operatorId: string, approvalId: string) => Promise<void>
-  dispatchRunFailed: (operatorId: string, runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
+  dispatchApprovalPending: (approvalId: string) => Promise<void>
+  dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
 }
 
 export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispatcher {
   const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger} = deps
 
-  async function dispatchToOperator(
-    kind: 'approval' | 'run_failed',
-    operatorId: string,
-    dedupeId: string,
-    payload: string,
-  ): Promise<void> {
-    const dedupeKey = `${operatorId}:${dedupeId}:${kind}`
-    if (dedupeCache.shouldSend(dedupeKey) === false) {
-      logger.debug({operatorId, kind}, 'operator push dispatch: suppressed by dedupe window')
+  async function broadcast(kind: 'approval' | 'run_failed', dedupeId: string, payload: string): Promise<void> {
+    const dedupeKey = `${dedupeId}:${kind}`
+
+    // List first: a transient list failure must not consume the dedupe
+    // slot, or a retry of the same event within the dedupe window would be
+    // silently suppressed with nothing ever sent.
+    const activeRecords = await store.listAllActiveRecords()
+    if (activeRecords.success === false) {
+      logger.warn({kind}, 'operator push dispatch: failed to list active subscriptions')
       return
     }
 
-    const activeRecords = await store.getActiveRecordsForOperator({operatorId})
-    if (activeRecords.success === false) {
-      logger.warn({operatorId, kind}, 'operator push dispatch: failed to list active subscriptions')
+    if (activeRecords.data.length === 0) {
+      // Nothing was sent, so a later retry (once subscriptions exist)
+      // should still fire — do not consume the dedupe slot here either.
+      return
+    }
+
+    if (dedupeCache.shouldSend(dedupeKey) === false) {
+      logger.debug({kind}, 'operator push dispatch: suppressed by dedupe window')
       return
     }
 
     for (const record of activeRecords.data) {
       try {
-        await dispatchToRecord(kind, operatorId, record, payload)
+        await dispatchToRecord(kind, record, payload)
       } catch (error: unknown) {
         // One failing record must never abort dispatch to the rest.
         logger.warn(
-          {operatorId, kind, err: error instanceof Error ? error.message : String(error)},
+          {kind, err: error instanceof Error ? error.message : String(error)},
           'operator push dispatch: one subscription failed — continuing with the rest',
         )
       }
@@ -104,7 +119,6 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
 
   async function dispatchToRecord(
     kind: 'approval' | 'run_failed',
-    operatorId: string,
     record: SubscriptionRecord,
     payload: string,
   ): Promise<void> {
@@ -113,23 +127,7 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
       previous: vapidConfig.previousKeyVersion,
     })
     if (decision === 'skip-stale-key') {
-      logger.debug({operatorId, kind}, 'operator push dispatch: skipped stale key version')
-      return
-    }
-
-    // Re-verify ownership immediately before send — closes the window
-    // between the snapshot read above and this send (see module docstring).
-    const verified = await store.verifyStillOwned({
-      endpointHash: record.endpointHash,
-      operatorId,
-      ownershipGeneration: record.ownershipGeneration,
-    })
-    if (verified.success === false) {
-      logger.warn({operatorId, kind}, 'operator push dispatch: ownership re-verification failed')
-      return
-    }
-    if (verified.data === false) {
-      logger.debug({operatorId, kind}, 'operator push dispatch: skipped — ownership changed since listing')
+      logger.debug({kind}, 'operator push dispatch: skipped stale key version')
       return
     }
 
@@ -144,19 +142,16 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
         return
       }
       case 'dead-subscription': {
-        // Dead-sub cleanup relies on markDead's internal operator-ownership
-        // check (subscription-store.ts) so a transfer landing between
-        // verify and a 410 can't deactivate another operator's record.
-        const marked = await store.markDead({operatorId, endpoint: record.endpoint})
+        const marked = await store.markDead({operatorId: record.operatorId, endpoint: record.endpoint})
         if (marked.success === false) {
-          logger.warn({operatorId, kind}, 'operator push dispatch: failed to mark dead subscription')
+          logger.warn({kind}, 'operator push dispatch: failed to mark dead subscription')
         }
         return
       }
       case 'retryable':
       case 'payload-too-large':
       case 'error': {
-        logger.warn({operatorId, kind, outcome: result.outcome}, 'operator push dispatch: relay send did not succeed')
+        logger.warn({kind, outcome: result.outcome}, 'operator push dispatch: relay send did not succeed')
         return
       }
       default: {
@@ -169,25 +164,21 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     }
   }
 
-  async function dispatchApprovalPending(operatorId: string, approvalId: string): Promise<void> {
+  async function dispatchApprovalPending(approvalId: string): Promise<void> {
     try {
       const payload = JSON.stringify(buildApprovalPayload())
-      await dispatchToOperator('approval', operatorId, approvalId, payload)
+      await broadcast('approval', approvalId, payload)
     } catch {
-      logger.warn({operatorId}, 'operator push dispatch: approval dispatch threw — continuing')
+      logger.warn({approvalId}, 'operator push dispatch: approval dispatch threw — continuing')
     }
   }
 
-  async function dispatchRunFailed(
-    operatorId: string,
-    runId: string,
-    failureLabel?: OperatorFailureKind,
-  ): Promise<void> {
+  async function dispatchRunFailed(runId: string, failureLabel?: OperatorFailureKind): Promise<void> {
     try {
       const payload = JSON.stringify(buildFailedRunPayload(failureLabel))
-      await dispatchToOperator('run_failed', operatorId, runId, payload)
+      await broadcast('run_failed', runId, payload)
     } catch {
-      logger.warn({operatorId}, 'operator push dispatch: run-failed dispatch threw — continuing')
+      logger.warn({runId}, 'operator push dispatch: run-failed dispatch threw — continuing')
     }
   }
 
