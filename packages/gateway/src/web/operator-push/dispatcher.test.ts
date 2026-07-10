@@ -327,11 +327,18 @@ describe('createPushDispatcher — broadcast', () => {
   // #when inspected
   // #then no log call contains an endpoint, key, or payload body
   it('never logs sensitive detail', async () => {
-    const records = [makeRecord({endpoint: 'https://push.example.com/super-secret-path'})]
+    const records = [
+      makeRecord({
+        endpoint: 'https://push.example.com/SUPER-SECRET-ENDPOINT-PATH',
+        p256dh: 'P256DH-SECRET-KEY-MATERIAL',
+        auth: 'AUTH-SECRET-KEY-MATERIAL',
+      }),
+    ]
     const listAllActiveRecords = vi.fn(async () => ({success: true as const, data: records}))
     const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
     const sender = createFakeSender([{outcome: 'retryable', statusCode: 500}])
     const logger = createLogger()
+    const auditLogger = createAuditLogger()
 
     const dispatcher = createPushDispatcher({
       store: {listAllActiveRecords, markDead},
@@ -340,16 +347,21 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger,
-      auditLogger: createAuditLogger(),
+      auditLogger,
     })
 
     await dispatcher.dispatchRunFailed('run-1')
-    const allCalls = [...logger.debug.mock.calls, ...logger.warn.mock.calls]
+    const allCalls = [
+      ...logger.debug.mock.calls,
+      ...logger.warn.mock.calls,
+      ...auditLogger.info.mock.calls,
+      ...auditLogger.warn.mock.calls,
+    ]
     for (const call of allCalls) {
       const serialized = JSON.stringify(call)
-      expect(serialized).not.toContain('super-secret-path')
-      expect(serialized).not.toContain('p256dh')
-      expect(serialized).not.toContain('auth-value')
+      expect(serialized).not.toContain('SUPER-SECRET-ENDPOINT-PATH')
+      expect(serialized).not.toContain('P256DH-SECRET-KEY-MATERIAL')
+      expect(serialized).not.toContain('AUTH-SECRET-KEY-MATERIAL')
     }
   })
 })

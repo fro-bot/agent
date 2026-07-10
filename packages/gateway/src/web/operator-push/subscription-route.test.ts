@@ -116,7 +116,8 @@ describe('buildSubscriptionRoutes — subscribe', () => {
   // #then notFoundResponse, no store write
   it('error path: unauthenticated request is denied with no store write', async () => {
     const store = makeStore()
-    const deps = makeDeps({store})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, auditLogger})
     const app = buildAppWithGuard(deps, false)
 
     const res = await app.request('/operator/push/subscriptions', {
@@ -127,6 +128,10 @@ describe('buildSubscriptionRoutes — subscribe', () => {
 
     expect(res.status).toBe(404)
     expect(store.subscribe).not.toHaveBeenCalled()
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.subscribed'}),
+      expect.anything(),
+    )
   })
 
   // #given a malformed body (missing keys)
@@ -135,7 +140,8 @@ describe('buildSubscriptionRoutes — subscribe', () => {
   it('error path: malformed body is rejected with 400 and no store write', async () => {
     const store = makeStore()
     const warn = vi.fn()
-    const deps = makeDeps({store, logger: {debug: vi.fn(), info: vi.fn(), warn, error: vi.fn()}})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, logger: {debug: vi.fn(), info: vi.fn(), warn, error: vi.fn()}, auditLogger})
     const app = buildAppWithGuard(deps)
 
     const res = await app.request('/operator/push/subscriptions', {
@@ -149,6 +155,10 @@ describe('buildSubscriptionRoutes — subscribe', () => {
     for (const call of warn.mock.calls) {
       expect(JSON.stringify(call)).not.toContain(VALID_ENDPOINT)
     }
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.subscribed'}),
+      expect.anything(),
+    )
   })
 
   // #given an endpoint that fails SSRF validation (loopback)
@@ -157,7 +167,8 @@ describe('buildSubscriptionRoutes — subscribe', () => {
   it('error path: loopback endpoint is rejected without logging the endpoint value', async () => {
     const store = makeStore()
     const warn = vi.fn()
-    const deps = makeDeps({store, logger: {debug: vi.fn(), info: vi.fn(), warn, error: vi.fn()}})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, logger: {debug: vi.fn(), info: vi.fn(), warn, error: vi.fn()}, auditLogger})
     const app = buildAppWithGuard(deps)
     const loopbackEndpoint = 'https://127.0.0.1/secret-path'
 
@@ -172,6 +183,10 @@ describe('buildSubscriptionRoutes — subscribe', () => {
     for (const call of warn.mock.calls) {
       expect(JSON.stringify(call)).not.toContain('secret-path')
     }
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.subscribed'}),
+      expect.anything(),
+    )
   })
 
   // #given the subscribe rate limit is exhausted
@@ -180,7 +195,8 @@ describe('buildSubscriptionRoutes — subscribe', () => {
   it('rate limit: exhausted operator-keyed limit denies the request', async () => {
     const store = makeStore()
     const limiter = createRateLimiter({limit: 1, windowMs: 60_000})
-    const deps = makeDeps({store, subscribeRateLimiter: limiter})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, subscribeRateLimiter: limiter, auditLogger})
     const app = buildAppWithGuard(deps)
 
     const requestOptions = {
@@ -190,10 +206,15 @@ describe('buildSubscriptionRoutes — subscribe', () => {
     }
     // First request consumes the single-request budget.
     await app.request('/operator/push/subscriptions', requestOptions)
+    auditLogger.info.mockClear()
     const res = await app.request('/operator/push/subscriptions', requestOptions)
 
     expect(res.status).toBe(429)
     expect(store.subscribe).toHaveBeenCalledTimes(1)
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.subscribed'}),
+      expect.anything(),
+    )
   })
 
   // #given the store rejects the write (e.g. underlying object-store error)
@@ -204,7 +225,8 @@ describe('buildSubscriptionRoutes — subscribe', () => {
       subscribe: vi.fn(async () => err(createStoreError('subscribe: exceeded max CAS retry attempts'))),
     })
     const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
-    const deps = makeDeps({store, logger})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, logger, auditLogger})
     const app = buildAppWithGuard(deps)
 
     const res = await app.request('/operator/push/subscriptions', {
@@ -221,6 +243,10 @@ describe('buildSubscriptionRoutes — subscribe', () => {
         expect(JSON.stringify(call)).not.toContain(VALID_ENDPOINT)
       }
     }
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.subscribed'}),
+      expect.anything(),
+    )
   })
 
   // #given the operator already has the cap's worth of active subscriptions,
@@ -230,7 +256,8 @@ describe('buildSubscriptionRoutes — subscribe', () => {
   it('subscription cap: a new endpoint at the cap is rejected without a store write', async () => {
     const activeAtCap = Array.from({length: 20}, (_v, i) => makeMetadata({endpointHash: `hash-${i}`, active: true}))
     const store = makeStore({listMetadataForOperator: vi.fn(async () => ok(activeAtCap))})
-    const deps = makeDeps({store})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, auditLogger})
     const app = buildAppWithGuard(deps)
 
     const res = await app.request('/operator/push/subscriptions', {
@@ -241,6 +268,10 @@ describe('buildSubscriptionRoutes — subscribe', () => {
 
     expect(res.status).toBe(400)
     expect(store.subscribe).not.toHaveBeenCalled()
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.subscribed'}),
+      expect.anything(),
+    )
   })
 
   // #given the operator is at the cap but the incoming endpoint is already
@@ -358,7 +389,8 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
     const store = makeStore({
       unsubscribe: vi.fn(async () => err(createStoreError('unsubscribe: endpoint is not owned by this operator'))),
     })
-    const deps = makeDeps({store})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, auditLogger})
     const app = buildAppWithGuard(deps)
 
     const res = await app.request('/operator/push/subscriptions/unsubscribe', {
@@ -370,6 +402,10 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
     expect(res.status).toBe(404)
     const body = (await res.json()) as Record<string, unknown>
     expect(body.error).toBe('not-found')
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.unsubscribed'}),
+      expect.anything(),
+    )
   })
 
   // #given malformed body (missing endpoint)
@@ -377,7 +413,8 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
   // #then 400, no store write
   it('error path: malformed body is rejected with 400', async () => {
     const store = makeStore()
-    const deps = makeDeps({store})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, auditLogger})
     const app = buildAppWithGuard(deps)
 
     const res = await app.request('/operator/push/subscriptions/unsubscribe', {
@@ -388,6 +425,10 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
 
     expect(res.status).toBe(400)
     expect(store.unsubscribe).not.toHaveBeenCalled()
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.unsubscribed'}),
+      expect.anything(),
+    )
   })
 
   // #given no authenticated session
@@ -395,7 +436,8 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
   // #then notFoundResponse, no store write
   it('error path: unauthenticated request is denied with no store write', async () => {
     const store = makeStore()
-    const deps = makeDeps({store})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, auditLogger})
     const app = buildAppWithGuard(deps, false)
 
     const res = await app.request('/operator/push/subscriptions/unsubscribe', {
@@ -406,6 +448,10 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
 
     expect(res.status).toBe(404)
     expect(store.unsubscribe).not.toHaveBeenCalled()
+    expect(auditLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'push.unsubscribed'}),
+      expect.anything(),
+    )
   })
 })
 

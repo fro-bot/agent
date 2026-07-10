@@ -133,6 +133,13 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
             break
           case 'skipped':
             break
+          default: {
+            // Exhaustiveness guard: if a new dispatchToRecord outcome
+            // variant is added without a case here, TypeScript will fail
+            // to compile.
+            const exhaustiveCheck: never = outcome
+            throw new Error(`broadcast: unhandled dispatchToRecord outcome variant: ${String(exhaustiveCheck)}`)
+          }
         }
       } catch (error: unknown) {
         // One failing record must never abort dispatch to the rest.

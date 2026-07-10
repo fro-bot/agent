@@ -1357,6 +1357,7 @@ describe('button interaction handler (approval flow)', () => {
     const fakeClient = makeFakeClient()
     const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
     const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
 
     const deps = {
       makeClient: () => fakeClient as unknown as import('discord.js').Client,
@@ -1388,7 +1389,14 @@ describe('button interaction handler (approval flow)', () => {
     // #then — a warn is logged, no throw escapes the hook
     const warnedSkipped = consoleWarnSpy.mock.calls.some(([line]) => String(line).includes('CAS exhausted'))
     expect(warnedSkipped).toBe(true)
+
+    // #then — no audit event fires since nothing was actually updated
+    const emittedDeactivated = consoleLogSpy.mock.calls.some(([line]) =>
+      String(line).includes('push.subscription.deactivated'),
+    )
+    expect(emittedDeactivated).toBe(false)
     consoleWarnSpy.mockRestore()
+    consoleLogSpy.mockRestore()
   })
 
   it('session-revoke hook: a real deactivation emits a push.subscription.deactivated audit event', async () => {
@@ -1451,6 +1459,7 @@ describe('button interaction handler (approval flow)', () => {
     const fakeClient = makeFakeClient()
     const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
     const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
 
     const deps = {
       makeClient: () => fakeClient as unknown as import('discord.js').Client,
@@ -1484,7 +1493,14 @@ describe('button interaction handler (approval flow)', () => {
       String(line).includes('session-revoke deactivation failed'),
     )
     expect(warnedFailed).toBe(true)
+
+    // #then — no audit event fires since the deactivation was not successful
+    const emittedDeactivated = consoleLogSpy.mock.calls.some(([line]) =>
+      String(line).includes('push.subscription.deactivated'),
+    )
+    expect(emittedDeactivated).toBe(false)
     consoleWarnSpy.mockRestore()
+    consoleLogSpy.mockRestore()
   })
 
   it('operator push disabled (config absent): no dispatcher on launchWorkDeps, push stays inert', async () => {
