@@ -1197,7 +1197,7 @@ describe('GET /operator/session/csrf — happy path', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Auto-guard: registerOperatorRoute applies browser guard automatically (Unit 3e gap #2)
+// Auto-guard: registerOperatorRoute applies browser guard automatically
 // ---------------------------------------------------------------------------
 
 describe('registerOperatorRoute — auto-guard applies browser guard to privileged routes', () => {
@@ -1264,10 +1264,10 @@ describe('registerOperatorRoute — auto-guard applies browser guard to privileg
 })
 
 // ---------------------------------------------------------------------------
-// Logout protection: POST /operator/auth/logout requires session + CSRF (Unit 3e gap #3)
+// Logout protection: POST /operator/auth/logout requires session + CSRF
 // ---------------------------------------------------------------------------
 
-describe('POST /operator/auth/logout — browser guard protection (Unit 3e gap #3)', () => {
+describe('POST /operator/auth/logout — browser guard protection', () => {
   it('rejects logout without session cookie with 401 when browser guard is enabled', async () => {
     // #given — app with browser guard deps
     const sessionStore = createInMemorySessionStore()

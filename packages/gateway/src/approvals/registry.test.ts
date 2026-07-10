@@ -954,7 +954,7 @@ describe('P2 — confirmReply sessionID mismatch guard', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Unit 2: hasPendingForScope
+// hasPendingForScope
 // ---------------------------------------------------------------------------
 
 describe('hasPendingForScope', () => {

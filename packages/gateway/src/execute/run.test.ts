@@ -5660,10 +5660,10 @@ describe('threadFactory timeout path', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Unit 1: Approval transport selection and web surface support
+// Approval transport selection and web surface support
 // ---------------------------------------------------------------------------
 
-describe('Unit 1 — approval transport selection', () => {
+describe('approval transport selection', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
@@ -5860,9 +5860,9 @@ describe('Unit 1 — approval transport selection', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Unit 0: Characterization — Phase A seam invariants
+// Characterization — seam invariants (static guards)
 //
-// These static guards pin the public API contract that Phase B depends on:
+// These static guards pin the public API contract that the seam depends on:
 //   1. `executeWorkOnHeldSlot` is NOT exported — callers must use `launchWork`.
 //   2. `launchWork` IS exported — it is the single public front door.
 //   3. `runMention` IS exported — it is the Discord adapter entry point.
@@ -5871,7 +5871,7 @@ describe('Unit 1 — approval transport selection', () => {
 // front door has been removed. Both require deliberate security review.
 // ---------------------------------------------------------------------------
 
-describe('Unit 0 — Phase A seam invariants (static guards)', () => {
+describe('seam invariants (static guards)', () => {
   it('executeWorkOnHeldSlot is NOT exported from run.ts — callers must use launchWork', async () => {
     // #given — import the run module
     const runModule = await import('./run.js')
@@ -6874,7 +6874,7 @@ describe('early-abort gates terminalize to FAILED', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Operator cancel — abort-registry integration (Unit 1)
+// Operator cancel — abort-registry integration
 // ---------------------------------------------------------------------------
 
 const CANCEL_RUN_ID = 'cancel-run-id-1'
@@ -7915,7 +7915,7 @@ describe('operator cancel — abort-registry integration', () => {
 })
 
 // ---------------------------------------------------------------------------
-// failureKind persistence on the FAILED transition (Unit 3)
+// failureKind persistence on the FAILED transition
 // ---------------------------------------------------------------------------
 
 describe('failureKind persistence on FAILED transitions', () => {
@@ -8165,7 +8165,7 @@ describe('failureKind persistence on FAILED transitions', () => {
 })
 
 // ---------------------------------------------------------------------------
-// failAdmittedRun failureKind threading (Unit 4) — pre-ACK gates
+// failAdmittedRun failureKind threading — pre-ACK gates
 // ---------------------------------------------------------------------------
 
 describe('failAdmittedRun failureKind threading (pre-ACK gates)', () => {
@@ -8188,7 +8188,7 @@ describe('failAdmittedRun failureKind threading (pre-ACK gates)', () => {
     const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
     expect(failedOptions?.detailsPatch.failureKind).toBe('unreachable')
 
-    // #and — this projects to 'workspace-unreachable' via the operator mapping (Unit 1)
+    // #and — this projects to 'workspace-unreachable' via the operator mapping
     const {toOperatorFailureKind} = await import('../operator-contract/run-status.js')
     expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('workspace-unreachable')
   })
@@ -8263,7 +8263,7 @@ describe('failAdmittedRun failureKind threading (pre-ACK gates)', () => {
     // #when
     await runMention(message, makeBinding(), deps)
 
-    // #then — FAILED transition still occurs with no failureKind (this failure is post-ACK, Unit 3's path)
+    // #then — FAILED transition still occurs with no failureKind (this failure is post-ACK)
     const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
     const failedOptions = failedCall?.[7] as {detailsPatch?: {failureKind?: unknown}}
     expect(failedOptions?.detailsPatch?.failureKind).toBeUndefined()

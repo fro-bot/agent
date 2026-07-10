@@ -9,7 +9,7 @@
  *    release).
  *  - **Executing** (abort-registry hit): pending approvals for the run's scope
  *    are rejected through the single fail-closed settlement gate
- *    (`registry.handleDecision`), then the abort handle fires. Unit 1's error
+ *    (`registry.handleDecision`), then the abort handle fires. The run's error
  *    path in `run.ts` owns the CANCELLED transition and resource release.
  *  - **Pre-ACK rendezvous** (double miss — the registration window between
  *    dequeue and abort-registry registration): a direct conditional-write
@@ -46,7 +46,7 @@ import {toCoordLogger} from './run.js'
  * Minimal, readonly actor-attribution shape accepted by `cancelRun`.
  *
  * Structurally compatible with `OperatorIdentity`/`WebOperatorActor` — the
- * Unit 3 web route passes those fields directly. Kept as its own type here so
+ * operator web cancel route passes those fields directly. Kept as its own type here so
  * `cancel.ts` (execute-layer, transport-neutral) does not import the web
  * operator-contract module.
  */
@@ -358,7 +358,7 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
       sessionCorrelationId: actor.sessionCorrelationId,
     }
 
-    // Settle pending approvals FIRST — Unit 1's error path (triggered by the
+    // Settle pending approvals FIRST — the run's error path (triggered by the
     // abort below) owns the run-state transition/cleanup; approvals must be
     // rejected before the abort so the run's own catch handler doesn't race
     // a still-open approval against the cancel.

@@ -178,7 +178,7 @@ describe('probeBinary', () => {
 
 // #endregion
 
-// #region doctor version-form (U3)
+// #region doctor version-form
 
 // Mirror the cmdDoctor logic for computing expectedVersion from provenance.
 // Extracted to outer scope to satisfy unicorn/consistent-function-scoping.

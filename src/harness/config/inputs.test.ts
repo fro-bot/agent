@@ -886,7 +886,7 @@ describe('parseActionInputs', () => {
     })
   })
 
-  // --- Unit 1: enable-omo and agent contract tests ---
+  // --- enable-omo and agent contract tests ---
 
   describe('enable-omo mode flag', () => {
     it('defaults to false when enable-omo is not provided', () => {

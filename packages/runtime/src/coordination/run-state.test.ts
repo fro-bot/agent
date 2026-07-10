@@ -65,7 +65,7 @@ function createCoordinationConfig(storeAdapter: Required<ObjectStoreAdapter>): C
 }
 
 // ---------------------------------------------------------------------------
-// Unit 1: Surface widening — web surface validation
+// Surface widening — web surface validation
 // ---------------------------------------------------------------------------
 
 describe('parseRunState — surface validation', () => {
@@ -111,7 +111,7 @@ describe('parseRunState — surface validation', () => {
     expect(result.success).toBe(true)
   })
 
-  it("accepts surface: 'web' (Unit 1 widening)", () => {
+  it("accepts surface: 'web' (web surface widening)", () => {
     // #given a run-state with web surface
     const state = {
       run_id: 'run-1',

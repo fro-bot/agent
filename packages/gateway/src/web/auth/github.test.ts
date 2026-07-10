@@ -2202,7 +2202,7 @@ describe('GET /operator/auth/github/callback — onSessionRevoke wiring', () => 
 })
 
 // ---------------------------------------------------------------------------
-// OAuth callback — OAuth token retention in session (Unit 3h)
+// OAuth callback — OAuth token retention in session
 // ---------------------------------------------------------------------------
 
 describe('GET /operator/auth/github/callback — OAuth token retention', () => {
