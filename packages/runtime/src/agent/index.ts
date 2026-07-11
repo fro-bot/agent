@@ -24,6 +24,16 @@ export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.
 export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
 export {createRemoteOpenCodeHandle} from './remote-client.js'
+export {resolveResponseDelivery} from './response-delivery.js'
+export type {CredentialDisposition, ResponseDelivery, ResponseDeliveryDecision} from './response-delivery.js'
+export {
+  buildResponseFileDir,
+  buildResponseFilePath,
+  createResponseFileError,
+  MAX_BODY_BYTES,
+  parseResponseFile,
+} from './response-file.js'
+export type {ParsedResponse, ResponseFileError, ResponseFileErrorReason, ResponseSurface} from './response-file.js'
 export {MAX_LLM_RETRIES, runPromptAttempt} from './retry.js'
 export type {ActivityTracker, EventStreamResult, PromptAttemptDependencies} from './retry.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
