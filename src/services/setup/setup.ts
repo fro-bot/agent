@@ -299,14 +299,22 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       cached: opencodeResult.cached,
     })
 
-    // Configure gh CLI authentication
+    // Configure gh CLI authentication. The action's own in-process Octokit
+    // client (`octokit`) is unaffected by credential withholding — it never
+    // reads process.env.GH_TOKEN, $GITHUB_ENV, or the gh CLI config; it holds
+    // the token in-heap directly (accepted residual — see plan Scope Boundaries).
     const octokit = getOctokit(githubToken)
-    const ghResult = await configureGhAuth(octokit, null, githubToken, logger, execAdapter)
-    core.exportVariable('GH_TOKEN', githubToken)
-    if (process.env.GH_CONFIG_DIR != null && process.env.GH_CONFIG_DIR.length > 0) {
-      core.exportVariable('GH_CONFIG_DIR', process.env.GH_CONFIG_DIR)
+    const provisionChildCredential = inputs.credential === 'provision'
+    const ghResult = await configureGhAuth(octokit, null, githubToken, logger, execAdapter, provisionChildCredential)
+    if (provisionChildCredential) {
+      core.exportVariable('GH_TOKEN', githubToken)
+      if (process.env.GH_CONFIG_DIR != null && process.env.GH_CONFIG_DIR.length > 0) {
+        core.exportVariable('GH_CONFIG_DIR', process.env.GH_CONFIG_DIR)
+      }
+      logger.info('GitHub CLI configured')
+    } else {
+      logger.info('GitHub CLI credential withheld from child (affected trigger)')
     }
-    logger.info('GitHub CLI configured')
 
     await configureGitIdentity(octokit, ghResult.botLogin, logger, execAdapter)
 

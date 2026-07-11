@@ -57,6 +57,8 @@ export async function runExecute(
     resolvedOutputMode,
     fileParts: sessionPrep.attachmentResult?.fileParts,
     responseMode: bootstrap.inputs.responseMode,
+    responseDelivery: bootstrap.delivery,
+    responseFilePath: bootstrap.responseFilePath,
   }
 
   const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'

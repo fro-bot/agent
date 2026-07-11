@@ -32,6 +32,7 @@ function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
     enableOmoSlim: false,
     omoSlimPreset: 'openai' as const,
     omoSlimVersion: '1.1.1',
+    credential: 'provision',
     ...overrides,
   }
 }
@@ -263,11 +264,61 @@ describe('setup', () => {
       vi.mocked(fs.chmod).mockResolvedValue(undefined)
 
       // #when
-      await runSetup(createSetupInputs(), 'ghs_test_token')
+      await runSetup(createSetupInputs({credential: 'provision'}), 'ghs_test_token')
 
-      // #then
+      // #then — characterization: autonomous triggers ('provision') keep today's behavior.
       expect(core.exportVariable).toHaveBeenCalledWith('GH_TOKEN', 'ghs_test_token')
       expect(core.exportVariable).toHaveBeenCalledWith('GH_CONFIG_DIR', expect.any(String))
+    })
+
+    it('withholds the credential everywhere the child can read it when credential is "withhold"', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+      const token = 'ghs_should_never_leak'
+      const originalGhToken = process.env.GH_TOKEN
+      const originalGhConfigDir = process.env.GH_CONFIG_DIR
+      delete process.env.GH_TOKEN
+      delete process.env.GH_CONFIG_DIR
+
+      try {
+        // #when
+        await runSetup(createSetupInputs({credential: 'withhold'}), token)
+
+        // #then
+        // Name-independent scan of exportVariable call *values* — the token string must
+        // not appear in any exported name/value pair (this simulates the $GITHUB_ENV write).
+        const exportCalls = vi.mocked(core.exportVariable).mock.calls
+        for (const [name, value] of exportCalls) {
+          expect(name).not.toBe('GH_TOKEN')
+          expect(name).not.toBe('GH_CONFIG_DIR')
+          expect(String(value)).not.toContain(token)
+        }
+        // Name-independent scan of the harness process env values.
+        expect(Object.values(process.env)).not.toContain(token)
+        expect(process.env.GH_TOKEN).toBeUndefined()
+        expect(process.env.GH_CONFIG_DIR).toBeUndefined()
+        // gh auth login (which would write hosts.yml) must never be invoked.
+        const ghAuthLoginCalls = vi
+          .mocked(exec.getExecOutput)
+          .mock.calls.filter(call => call[0] === 'gh' && call[1]?.[0] === 'auth')
+        expect(ghAuthLoginCalls).toHaveLength(0)
+      } finally {
+        if (originalGhToken != null) {
+          process.env.GH_TOKEN = originalGhToken
+        }
+        if (originalGhConfigDir != null) {
+          process.env.GH_CONFIG_DIR = originalGhConfigDir
+        }
+      }
     })
 
     it('exports OPENCODE_CONFIG_CONTENT environment variable', async () => {

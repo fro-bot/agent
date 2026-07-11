@@ -1,3 +1,4 @@
+import type {CredentialDisposition} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {OmoSlimPreset} from '../../shared/types.js'
 import type {EnsureOpenCodeResult} from './types.js'
@@ -35,6 +36,7 @@ export async function ensureOpenCodeAvailable(options: {
   readonly enableOmoSlim: boolean
   readonly omoSlimVersion: string
   readonly omoSlimPreset: OmoSlimPreset
+  readonly credential: CredentialDisposition
 }): Promise<EnsureOpenCodeResult> {
   return ensureRuntimeOpenCodeAvailable(options, runtimeSetupAdapter)
 }

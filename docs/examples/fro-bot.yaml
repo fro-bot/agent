@@ -376,6 +376,11 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # Required. Keep this false: it prevents the checkout token from being
+          # written into .git/config, where the agent's shell (same user) could
+          # read it. On comment/review triggers the action withholds the token
+          # from the agent entirely, and a persisted checkout credential would
+          # reintroduce a readable copy.
           persist-credentials: false
           token: ${{ secrets.FRO_BOT_PAT }}
 

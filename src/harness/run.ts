@@ -133,16 +133,21 @@ export async function run(): Promise<number> {
         responseModeIsGithub: bootstrap.inputs.responseMode === 'github',
         agentSucceeded: agentSuccess,
         runStartMs: startTime,
+        isFileConventionDelivery: bootstrap.delivery === 'file-convention',
       },
       reconciliationLogger,
     )
 
-    if (agentSuccess && dedup.entity != null) {
-      await saveDedupMarker(routing.triggerResult.context, dedup.entity, repo)
-    }
-
     metrics.end()
     exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, startTime, bootstrap.logger)
+
+    // Dedup marker is saved only after a confirmed successful outcome (which,
+    // for file-convention runs, means finalize's delivery assertion passed —
+    // exitCode === 0). Saving it earlier (before finalize) risked a failed
+    // post followed by a retry being dedup-skipped and exiting 0 with no post.
+    if (exitCode === 0 && agentSuccess && dedup.entity != null) {
+      await saveDedupMarker(routing.triggerResult.context, dedup.entity, repo)
+    }
   } catch (error) {
     exitCode = 1
     const duration = Date.now() - startTime
@@ -167,11 +172,16 @@ export async function run(): Promise<number> {
       core.setFailed('An unknown error occurred')
     }
   } finally {
+    // agentSuccess reflects execution.success only — it says nothing about
+    // whether finalize actually delivered the response. A non-zero exitCode
+    // means finalize failed to deliver (or the run otherwise failed), so the
+    // success reaction must not fire for that case.
+    const deliverySucceeded = agentSuccess && exitCode === 0
     await runCleanup({
       bootstrapLogger,
       reactionCtx,
       githubClient,
-      agentSuccess,
+      agentSuccess: deliverySucceeded,
       attachmentResult,
       serverHandle,
       detectedOpencodeVersion,

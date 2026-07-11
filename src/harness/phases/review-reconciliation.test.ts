@@ -76,6 +76,7 @@ function makeParams(overrides?: {
   readonly repo?: string
   readonly octokit?: MockOctokit
   readonly runStartMs?: number
+  readonly isFileConventionDelivery?: boolean
 }) {
   return {
     octokit: (overrides?.octokit ?? makeOctokit()) as unknown as Octokit,
@@ -90,6 +91,7 @@ function makeParams(overrides?: {
     responseModeIsGithub: overrides?.responseModeIsGithub ?? true,
     agentSucceeded: overrides?.agentSucceeded ?? true,
     runStartMs: overrides?.runStartMs ?? RUN_START_MS,
+    isFileConventionDelivery: overrides?.isFileConventionDelivery ?? false,
   }
 }
 
@@ -389,6 +391,21 @@ describe('runReviewReconciliation', () => {
   // -------------------------------------------------------------------------
   // Early no-op guards — zero octokit calls
   // -------------------------------------------------------------------------
+
+  it('no-ops with zero octokit calls and reason finalize-owns-response for a file-convention run', async () => {
+    // #given this run's response is delivered via the file-convention path
+    const octokit = makeOctokit()
+    const params = makeParams({octokit, isFileConventionDelivery: true})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then it skips before any octokit call, so it cannot double-submit
+    expect(result).toEqual({reconciled: false, reason: 'finalize-owns-response'})
+    expect(octokit.rest.pulls.get).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.listReviews).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
 
   it('no-ops with zero octokit calls when not a pull_request review trigger', async () => {
     // #given a non-PR-review trigger

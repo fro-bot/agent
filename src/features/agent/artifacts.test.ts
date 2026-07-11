@@ -61,4 +61,31 @@ describe('detectArtifacts', () => {
 
     expect(onCommentPosted).not.toHaveBeenCalled()
   })
+
+  it('increments the comment count when a gh self-post command is scraped from output', () => {
+    const onCommentPosted = vi.fn()
+    const commentsPostedUrls: string[] = []
+    const command = 'gh pr comment 42 --body "review notes"'
+    const output = 'https://github.com/owner/repo/pull/42#issuecomment-98765'
+
+    detectArtifacts(command, output, [], [], onCommentPosted, commentsPostedUrls)
+
+    expect(onCommentPosted).toHaveBeenCalledTimes(1)
+    expect(commentsPostedUrls).toEqual(['https://github.com/owner/repo/pull/42#issuecomment-98765'])
+  })
+
+  it('does not report a posted comment when no gh comment command was run', () => {
+    // Response-file-convention flows never run `gh issue comment`/`gh pr comment` —
+    // the credential is withheld and the model writes a file instead. The
+    // comment count for those runs comes from the finalize post, not this scan.
+    const onCommentPosted = vi.fn()
+    const commentsPostedUrls: string[] = []
+    const command = 'cat response.md'
+    const output = 'https://github.com/owner/repo/pull/42#issuecomment-98765'
+
+    detectArtifacts(command, output, [], [], onCommentPosted, commentsPostedUrls)
+
+    expect(onCommentPosted).not.toHaveBeenCalled()
+    expect(commentsPostedUrls).toEqual([])
+  })
 })

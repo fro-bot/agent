@@ -1,4 +1,5 @@
 import type {Logger} from '../shared/logger.js'
+import type {ResponseDelivery} from './response-delivery.js'
 import type {
   AgentContext,
   LogicalSessionKey,
@@ -10,6 +11,7 @@ import type {
 } from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
+import {RESPONSE_FILE_VERDICT_KEY, RESPONSE_FILE_VERDICTS} from './response-file.js'
 
 function createMockLogger(): Logger {
   return {
@@ -2189,5 +2191,118 @@ describe('output contract', () => {
     // #then
     expect(prompt).not.toContain('<output_contract>')
     expect(prompt).not.toContain('## Output Contract')
+  })
+})
+
+describe('buildAgentPrompt response delivery gating', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  function buildPromptForDelivery(
+    responseDelivery: ResponseDelivery,
+    responseFilePath: string | null,
+    eventType: TriggerContext['eventType'] = 'pull_request',
+  ): string {
+    const options: PromptOptions = {
+      context: createMockContext({eventName: eventType, issueNumber: 42, issueType: 'pr'}),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({
+        eventType,
+        target: {kind: 'pr', number: 42, title: 'feat: add feature', body: 'PR body', locked: false, isDraft: false},
+      }),
+      responseMode: responseDelivery === 'none' ? 'none' : 'github',
+      responseDelivery,
+      responseFilePath,
+    }
+
+    return buildAgentPrompt(options, mockLogger).text
+  }
+
+  it('instructs the model to write the response file synchronously and to the exact path for file-convention delivery', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+
+    // #then
+    expect(prompt).toContain('/tmp/fro-bot-response/1-1/nonce123.md')
+    expect(prompt).toContain('SYNCHRONOUSLY')
+    expect(prompt).toContain('Do NOT background the write')
+    expect(prompt).toContain('verdict:')
+    expect(prompt).toContain('gh` CLI is NOT available')
+  })
+
+  it('omits gh posting instructions for file-convention delivery', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+
+    // #then
+    expect(prompt).not.toContain('gh pr review')
+    expect(prompt).not.toContain('gh issue comment')
+    expect(prompt).not.toContain('gh pr comment')
+  })
+
+  it('keeps gh posting instructions unchanged for model-gh delivery', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('model-gh', null)
+
+    // #then
+    expect(prompt).toContain('gh pr review')
+    expect(prompt).toContain('--approve` for a PASS verdict')
+    expect(prompt).not.toContain('gh` CLI is NOT available')
+  })
+
+  it('renders neither file-write nor gh-posting instructions for none delivery', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('none', null, 'issue_comment')
+
+    // #then
+    expect(prompt).not.toContain('gh issue comment')
+    expect(prompt).not.toContain('gh pr comment')
+    expect(prompt).not.toContain('Write to this exact path')
+    expect(prompt).not.toContain('### Response Protocol (REQUIRED)')
+  })
+
+  it('keeps the bot marker and Run Summary guidance for file-convention delivery', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+
+    // #then
+    expect(prompt).toContain('<!-- fro-bot-agent -->')
+    expect(prompt).toContain('Run Summary')
+  })
+
+  it('gates the harness rules gh instruction on file-convention delivery', () => {
+    // #given / #when
+    const filePrompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+    const ghPrompt = buildPromptForDelivery('model-gh', null)
+
+    // #then
+    expect(filePrompt).toContain('The `gh` CLI is NOT available for GitHub posting in this run')
+    expect(ghPrompt).toContain('Use `gh` CLI for all GitHub operations')
+  })
+
+  it('contains every exported response-file verdict value for pull_request file-convention delivery', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+
+    // #then
+    for (const verdict of RESPONSE_FILE_VERDICTS) {
+      expect(prompt).toContain(`${RESPONSE_FILE_VERDICT_KEY}: ${verdict}`)
+    }
+  })
+
+  it('renders no response-file instruction and no gh-posting instruction for pull_request delivery none', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('none', null, 'pull_request')
+
+    // #then
+    expect(prompt).not.toContain('Write to this exact path')
+    expect(prompt).not.toContain('gh pr review')
+    expect(prompt).not.toContain('gh pr comment')
+    expect(prompt).not.toContain('gh issue comment')
+    expect(prompt).not.toContain('### Response Protocol (REQUIRED)')
   })
 })
