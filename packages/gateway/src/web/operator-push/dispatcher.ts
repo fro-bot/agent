@@ -151,6 +151,13 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
       }
     }
 
+    // Emitted once per broadcast that reached the send loop. A record set
+    // entirely filtered by stale-key (e.g. during a VAPID rotation window)
+    // still records a {delivered:0, dead:0, failed:0} event — that a broadcast
+    // ran with no wire sends is itself worth an audit trail, and it is
+    // unambiguous: the empty-list and dedupe-suppressed paths return before
+    // this point, so a zero-count event can only mean "all subscribers were
+    // skipped".
     emitAudit({kind: 'push.dispatch', correlationId: dedupeId, trigger: kind, delivered, dead, failed}, auditLogger)
   }
 

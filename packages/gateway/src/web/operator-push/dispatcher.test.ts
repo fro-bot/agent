@@ -464,6 +464,42 @@ describe('createPushDispatcher — push.dispatch audit event', () => {
     expect(auditLogger.warn).not.toHaveBeenCalled()
   })
 
+  // #given a non-empty active list where every record is filtered by stale key
+  // #when a broadcast reaches the send loop but sends nothing over the wire
+  // #then one push.dispatch event still fires with all-zero counts (a broadcast
+  //       ran; distinct from the empty-list / dedupe-suppressed paths that emit nothing)
+  it('emits a zero-count dispatch event when every record is skipped by stale key', async () => {
+    const records = [makeRecord({keyVersion: 'old-version'}), makeRecord({keyVersion: 'old-version'})]
+    const listAllActiveRecords = vi.fn(async () => ({success: true as const, data: records}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([])
+    const auditLogger = createAuditLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {listAllActiveRecords, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: createLogger(),
+      auditLogger,
+    })
+
+    await dispatcher.dispatchApprovalPending('approval-1')
+
+    expect(sender.sendNotification).not.toHaveBeenCalled()
+    expect(auditLogger.info).toHaveBeenCalledOnce()
+    const [ctx] = auditLogger.info.mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx).toMatchObject({
+      kind: 'push.dispatch',
+      correlationId: 'approval-1',
+      trigger: 'approval',
+      delivered: 0,
+      dead: 0,
+      failed: 0,
+    })
+  })
+
   // #given the emitted push.dispatch audit event
   // #when serialized
   // #then it never contains an endpoint, key, or payload value
