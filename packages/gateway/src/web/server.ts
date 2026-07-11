@@ -34,6 +34,9 @@ import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps, SessionStore} from './auth/session.js'
+import type {SubscriptionRouteSessionStore} from './operator-push/subscription-route.js'
+import type {OperatorPushSubscriptionStore} from './operator-push/subscription-store.js'
+import type {VapidPublicKeyInfo} from './operator-push/vapid.js'
 import type {IdempotencyGuard} from './operator/idempotency.js'
 import type {RunObservationManager} from './sse/manager.js'
 import {serve} from '@hono/node-server'
@@ -48,6 +51,8 @@ import {buildGitHubOAuthRoutes} from './auth/github.js'
 import {createRepoAuthzCache} from './auth/repo-authz.js'
 import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
+import {buildSubscriptionRoutes} from './operator-push/subscription-route.js'
+import {buildVapidPublicKeyRoute} from './operator-push/vapid-public-key-route.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
 import {buildCancelRoute} from './operator/cancel-route.js'
 import {buildDecisionRoute} from './operator/decision-route.js'
@@ -227,6 +232,21 @@ export interface OperatorServerDeps {
    * When absent, the route is not registered (opt-in).
    */
   readonly cancelRunDeps?: CancelRunDeps
+  /**
+   * Durable operator push subscription store.
+   * When present (alongside operatorPushVapidKeyInfo, sessionStore, and the
+   * browser guard), the /operator/push/* routes are registered. When absent,
+   * those routes are not registered (opt-in, fail-closed).
+   */
+  readonly operatorPushStore?: Pick<
+    OperatorPushSubscriptionStore,
+    'subscribe' | 'unsubscribe' | 'listMetadataForOperator'
+  >
+  /**
+   * Client-safe VAPID material (public key + key version only).
+   * Required when operatorPushStore is present; ignored otherwise.
+   */
+  readonly operatorPushVapidKeyInfo?: VapidPublicKeyInfo
 }
 
 export interface OperatorServerConfig {
@@ -945,6 +965,49 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
       registry: deps.approvalRegistry,
+      logger: deps.logger,
+      now: clock,
+    })
+  }
+
+  // ── Operator push routes ───────────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND operatorPushStore
+  // and operatorPushVapidKeyInfo are provided AND sessionStore is present.
+  // Routes:
+  //   GET  /operator/push/vapid-key              — privileged (session + allowlist; safe GET)
+  //   POST /operator/push/subscriptions           — privileged (session + allowlist + CSRF)
+  //   POST /operator/push/subscriptions/unsubscribe — privileged (session + allowlist + CSRF)
+  //   GET  /operator/push/subscriptions            — privileged (session + allowlist; safe GET)
+  //
+  // Fail-closed by construction: the caller (program.ts) only threads
+  // operatorPushStore/operatorPushVapidKeyInfo through when the object store
+  // has passed its CAS self-test at startup. A self-test failure (or push
+  // disabled entirely) means these deps are absent here and the routes never
+  // mount — matching the fail-closed posture of every other opt-in route above.
+  //
+  // auditLogger is also required to mount: the push routes never run without
+  // an audit logger present, so every push route action (subscribe,
+  // unsubscribe, dispatch, deactivate) is guaranteed to be audited — there is
+  // no silently-unaudited push route.
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.operatorPushStore !== undefined &&
+    deps.operatorPushVapidKeyInfo !== undefined &&
+    deps.auditLogger !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    const sessionStoreForPush: SubscriptionRouteSessionStore = deps.sessionStore
+    buildVapidPublicKeyRoute(app, {
+      vapidPublicKeyInfo: deps.operatorPushVapidKeyInfo,
+      logger: deps.logger,
+    })
+    buildSubscriptionRoutes(app, {
+      sessionStore: sessionStoreForPush,
+      store: deps.operatorPushStore,
+      keyVersion: deps.operatorPushVapidKeyInfo.keyVersion,
+      auditLogger: deps.auditLogger,
       logger: deps.logger,
       now: clock,
     })

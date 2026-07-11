@@ -21,6 +21,9 @@ import type {
   OperatorCsrfToken,
   OperatorError,
   OperatorOk,
+  OperatorPushSubscribeRequest,
+  OperatorPushUnsubscribeRequest,
+  OperatorPushVapidKeyResponse,
   OperatorSessionInfo,
 } from './responses.js'
 
@@ -174,6 +177,114 @@ function hasValidOperatorCancelResponseShape(value: unknown): value is OperatorC
 export function parseOperatorCancelResponse(input: unknown): Result<OperatorCancelResponse, Error> {
   if (hasValidOperatorCancelResponseShape(input) === false) {
     return err(new Error('invalid operator cancel response shape'))
+  }
+
+  return ok(input)
+}
+
+// ---------------------------------------------------------------------------
+// OperatorPushVapidKeyResponse
+// ---------------------------------------------------------------------------
+//
+// Contract-level guard only — accepts exactly the allowlisted response
+// fields (publicKey, keyVersion). Extra fields are ignored per the module's
+// extra-field policy; this function does not itself decide route
+// availability or VAPID validity (see web/operator-push/vapid.ts for that).
+
+function hasValidOperatorPushVapidKeyResponseShape(value: unknown): value is OperatorPushVapidKeyResponse {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.publicKey === 'string' && typeof candidate.keyVersion === 'string'
+}
+
+/**
+ * Parse an unknown value as OperatorPushVapidKeyResponse.
+ *
+ * Returns ok(value) when the input has the required shape.
+ * Returns err(Error) with a FIXED reason string when validation fails —
+ * the error message never echoes any part of the input.
+ */
+export function parseOperatorPushVapidKeyResponse(input: unknown): Result<OperatorPushVapidKeyResponse, Error> {
+  if (hasValidOperatorPushVapidKeyResponseShape(input) === false) {
+    return err(new Error('invalid operator push vapid key response shape'))
+  }
+
+  return ok(input)
+}
+
+// ---------------------------------------------------------------------------
+// OperatorPushSubscribeRequest
+// ---------------------------------------------------------------------------
+//
+// Accepts the W3C `PushSubscription.toJSON()` shape: `{endpoint, keys:{p256dh, auth}}`.
+
+function hasValidOperatorPushSubscribeRequestShape(value: unknown): value is OperatorPushSubscribeRequest {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+
+  const candidate = value as Record<string, unknown>
+  if (typeof candidate.endpoint !== 'string' || candidate.endpoint.length === 0) {
+    return false
+  }
+
+  if (typeof candidate.keys !== 'object' || candidate.keys === null || Array.isArray(candidate.keys)) {
+    return false
+  }
+
+  const keys = candidate.keys as Record<string, unknown>
+  return (
+    typeof keys.p256dh === 'string' && keys.p256dh.length > 0 && typeof keys.auth === 'string' && keys.auth.length > 0
+  )
+}
+
+/**
+ * Parse an unknown value as OperatorPushSubscribeRequest.
+ *
+ * Accepts only the W3C `PushSubscription.toJSON()` shape:
+ * `{endpoint, keys:{p256dh, auth}}`, with all fields as non-empty strings.
+ * Returns err(Error) with a FIXED reason string when validation fails —
+ * the error message never echoes any part of the input (endpoint/key
+ * material must never appear in a parse error).
+ */
+export function parseOperatorPushSubscribeRequest(input: unknown): Result<OperatorPushSubscribeRequest, Error> {
+  if (hasValidOperatorPushSubscribeRequestShape(input) === false) {
+    return err(new Error('invalid operator push subscribe request shape'))
+  }
+
+  return ok(input)
+}
+
+// ---------------------------------------------------------------------------
+// OperatorPushUnsubscribeRequest
+// ---------------------------------------------------------------------------
+//
+// Accepts `{endpoint}` — the same shape the browser's push subscription
+// endpoint is registered under.
+
+function hasValidOperatorPushUnsubscribeRequestShape(value: unknown): value is OperatorPushUnsubscribeRequest {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.endpoint === 'string' && candidate.endpoint.length > 0
+}
+
+/**
+ * Parse an unknown value as OperatorPushUnsubscribeRequest.
+ *
+ * Accepts only `{endpoint: string}` with a non-empty endpoint. Returns
+ * err(Error) with a FIXED reason string when validation fails — the error
+ * message never echoes any part of the input (the endpoint must never
+ * appear in a parse error).
+ */
+export function parseOperatorPushUnsubscribeRequest(input: unknown): Result<OperatorPushUnsubscribeRequest, Error> {
+  if (hasValidOperatorPushUnsubscribeRequestShape(input) === false) {
+    return err(new Error('invalid operator push unsubscribe request shape'))
   }
 
   return ok(input)

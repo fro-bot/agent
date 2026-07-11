@@ -10,6 +10,9 @@ import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
 import type {OperatorAllowlist} from './web/auth/allowlist.js'
+import type {PushDispatcher} from './web/operator-push/dispatcher.js'
+import type {OperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
+import type {VapidPublicKeyInfo} from './web/operator-push/vapid.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './web/server.js'
 import {
   createS3Adapter,
@@ -17,6 +20,7 @@ import {
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
+  err,
 } from '@fro-bot/runtime'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Effect} from 'effect'
@@ -40,8 +44,14 @@ import {createDenylistCache} from './redaction/denylist.js'
 import {createAppClientMetadataReader} from './redaction/reader-app-client.js'
 import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutdown.js'
+import {emitAudit} from './web/audit.js'
 import {buildGitHubOAuthDeps} from './web/auth/github.js'
 import {createInMemorySessionStore} from './web/auth/session.js'
+import {createDedupeCache} from './web/operator-push/dedupe-cache.js'
+import {createPushDispatcher} from './web/operator-push/dispatcher.js'
+import {createPushSender} from './web/operator-push/push-sender.js'
+import {createOperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
+import {shouldNotify} from './web/operator-push/trigger-policy.js'
 import {createRunObservationManager} from './web/sse/manager.js'
 import {projectRunObservation} from './web/sse/projection.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
@@ -155,6 +165,23 @@ export interface BuildOperatorServerInputs {
    * a missing dep and verify the launch route is absent.
    */
   readonly launchWorkDeps?: NonNullable<OperatorServerDeps['launchWorkDeps']>
+  /**
+   * Operator push subscription deps — threaded through only when push is
+   * enabled AND the object store passed its startup CAS self-test. When
+   * absent, the /operator/push/* routes are not registered (fail-closed).
+   */
+  readonly operatorPush?: {
+    readonly store: NonNullable<OperatorServerDeps['operatorPushStore']>
+    readonly vapidPublicKeyInfo: VapidPublicKeyInfo
+  }
+  /**
+   * Operator push session-revoke hook — opt-in, present only when push is
+   * enabled. Registered onto every session minted through the OAuth
+   * callback so a subsequent logout (or TTL expiry) deactivates that
+   * operator's push subscriptions. Fail-soft: the hook itself must never
+   * throw out of `sessionStore`'s revoke path.
+   */
+  readonly onSessionRevoke?: (githubUserId: number) => void
   readonly operatorWebConfig: {
     readonly bindHost: string
     readonly bindPort: number
@@ -199,6 +226,8 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     approvalRegistry,
     cancelRunDeps,
     launchWorkDeps,
+    operatorPush,
+    onSessionRevoke,
     operatorWebConfig,
   } = inputs
 
@@ -238,6 +267,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     sessionStore,
     sessionDeps,
     operatorWebConfig.allowlist,
+    onSessionRevoke,
   )
 
   const deps: OperatorServerDeps = {
@@ -268,6 +298,11 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     runIndex,
     approvalRegistry,
     cancelRunDeps,
+    // operatorPushStore/operatorPushVapidKeyInfo: server.ts gates the
+    // /operator/push/* routes on both being present. Threaded only when the
+    // caller passed operatorPush (push enabled + self-test passed upstream).
+    operatorPushStore: operatorPush?.store,
+    operatorPushVapidKeyInfo: operatorPush?.vapidPublicKeyInfo,
   }
 
   const config: OperatorServerConfig = {
@@ -550,6 +585,14 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     // the messageCreate handler spreads these deps and overrides botUserId with
     // the concrete client.user.id value.
     // ---------------------------------------------------------------------------
+    // Operator push dispatcher — set later (inside the operator-web block) only
+    // when config.operatorPush is present and the object store passes its
+    // startup CAS self-test. Read via a lazy getter on runEngineDeps below so
+    // the single runEngineDeps object (constructed before that block runs) picks
+    // up the dispatcher once it exists, while staying undefined (fully inert)
+    // for the rest of program startup and for any deployment with push disabled.
+    let operatorPushDispatcher: PushDispatcher | undefined
+
     const runEngineDeps: import('./execute/run.js').RunMentionDeps = {
       coordinationConfig: makeCoordinationConfig(s3Adapter, config),
       identity: config.identity,
@@ -597,6 +640,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       runIndex,
       // Feeds the run-observation manager at each lifecycle transition.
       runObserver: runObservationManager,
+      // Lazy getter: operatorPushDispatcher is assigned later, inside the
+      // operator-web startup block, only when push is enabled. Undefined here
+      // (and for every read before that block runs) keeps push fully inert.
+      get operatorPushDispatcher() {
+        return operatorPushDispatcher
+      },
     }
 
     // Track in-flight mention run promises so SIGTERM can await them before tearing down.
@@ -667,6 +716,68 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     if (config.operatorWeb === undefined || deps.startOperatorServer === undefined) {
       logger.info({}, 'operator web endpoint disabled — no operator web config set')
     } else {
+      // Operator push — opt-in via config.operatorPush (presence means enabled).
+      // Before threading push deps into the operator server, prove the configured
+      // object store has real compare-and-swap semantics by running the
+      // subscription store's startup self-test. A self-test failure does NOT
+      // crash gateway startup — it only disables the push surface (the rest of
+      // the operator server still starts) so a misconfigured/incompatible object
+      // store can never silently corrupt subscription ownership transfers.
+      let operatorPush:
+        | {
+            readonly store: OperatorPushSubscriptionStore
+            readonly vapidPublicKeyInfo: VapidPublicKeyInfo
+          }
+        | undefined
+      if (config.operatorPush === undefined) {
+        emitAudit({kind: 'push.disabled', correlationId: 'startup', reason: 'config_absent'}, logger)
+      } else {
+        const pushStore = createOperatorPushSubscriptionStore({
+          adapter: s3Adapter,
+          logger,
+        })
+        // Effect.tryPromise (not Effect.promise) so a throwing adapter — not
+        // just a Result-typed failure — is caught here and degrades to
+        // "push disabled" rather than becoming an unrecoverable defect that
+        // crashes the whole gateway (Discord + operator web + announce)
+        // at startup.
+        const selfTest = yield* Effect.tryPromise({
+          try: async () => pushStore.selfTestCas(),
+          catch: error => (error instanceof Error ? error : new Error(String(error))),
+        }).pipe(Effect.catchAll(error => Effect.succeed(err(error))))
+        if (selfTest.success === true) {
+          operatorPush = {store: pushStore, vapidPublicKeyInfo: config.operatorPush.vapidPublicKeyInfo}
+
+          // Construct the push sender + broadcast dispatcher now that the store
+          // has passed its CAS self-test. Assigning the module-scoped
+          // operatorPushDispatcher makes runEngineDeps.operatorPushDispatcher
+          // (a lazy getter) start returning a live dispatcher for every run
+          // launched from here on — Discord mentions and the web launch route
+          // alike, since both share runEngineDeps.
+          const pushSender = createPushSender({logger})
+          operatorPushDispatcher = createPushDispatcher({
+            store: pushStore,
+            sender: pushSender,
+            dedupeCache: createDedupeCache({windowMs: config.operatorPush.dedupeWindowMs, clock: () => Date.now()}),
+            triggerPolicy: {shouldNotify},
+            vapidConfig: {
+              subject: config.operatorPush.current.subject,
+              publicKey: config.operatorPush.current.publicKey,
+              privateKey: config.operatorPush.current.privateKey,
+              keyVersion: config.operatorPush.current.keyVersion,
+              ...(config.operatorPush.previous === undefined
+                ? {}
+                : {previousKeyVersion: config.operatorPush.previous.keyVersion}),
+            },
+            logger,
+            auditLogger: logger,
+          })
+        } else {
+          logger.warn({err: selfTest.error.message}, 'operator push disabled — object store failed CAS self-test')
+          emitAudit({kind: 'push.disabled', correlationId: 'startup', reason: 'self_test_failed'}, logger)
+        }
+      }
+
       // Build the operator server deps and config via the shared helper.
       // The helper constructs operator-local pieces (rate limiter, session store,
       // OAuth deps, getSourceKey) and wires the program-scoped instances.
@@ -692,6 +803,53 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           runObserver: runObservationManager,
         },
         launchWorkDeps: runEngineDeps,
+        operatorPush,
+        // Session revoke → operator push deactivation. Only registered when
+        // push is enabled (operatorPush is present here iff the self-test
+        // above succeeded). Fail-soft: a throwing deactivateForOperator must
+        // never break session revocation itself.
+        //
+        // Deactivation is keyed by the operator's GitHub user id, not the
+        // session — logging out of ONE browser session deactivates that
+        // operator's push subscriptions across ALL their browsers/devices.
+        // This is intentional for a shared operator console: subscriptions
+        // are identity-scoped, not session-scoped (there is no
+        // session→endpoint link), and re-subscribing from a still-active
+        // session restores push.
+        onSessionRevoke:
+          operatorPush === undefined
+            ? undefined
+            : (githubUserId: number) => {
+                operatorPush.store
+                  .deactivateForOperator({operatorId: String(githubUserId)})
+                  .then(result => {
+                    if (result.success === true && result.data.skipped > 0) {
+                      logger.warn(
+                        {skipped: result.data.skipped},
+                        'operator push: session-revoke deactivation left some subscriptions active (CAS exhausted)',
+                      )
+                    } else if (result.success === false) {
+                      logger.warn({err: result.error.message}, 'operator push: session-revoke deactivation failed')
+                    }
+                    // Emit one coarse audit event per revoke when a real
+                    // deactivation happened — not one per record.
+                    if (result.success === true && result.data.updated > 0) {
+                      emitAudit(
+                        {
+                          kind: 'push.subscription.deactivated',
+                          correlationId: `push-session-revoke:${githubUserId}`,
+                          githubUserId,
+                          reason: 'session_revoked',
+                        },
+                        logger,
+                      )
+                    }
+                  })
+                  .catch(() => {
+                    // Fail-soft: a throw here (e.g. logger itself throwing)
+                    // must never surface as an unhandled rejection.
+                  })
+              },
         operatorWebConfig: config.operatorWeb,
       })
 

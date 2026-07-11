@@ -387,7 +387,7 @@ describe('defaultPollReady — per-probe timeout', () => {
 
 // ── Supervised respawn tests ──────────────────────────────────────────────────
 //
-// These tests exercise the supervised respawn loop added in Unit 5.
+// These tests exercise the supervised respawn loop.
 // Real timers, zero/tiny delays, injected spawnFn/pollReadyFn per convention.
 
 /**
@@ -444,7 +444,7 @@ function makeControllableChild() {
   return {child, killCalls, triggerExit}
 }
 
-describe('runSupervisedOpencode — happy path (Unit 5)', () => {
+describe('runSupervisedOpencode — happy path', () => {
   it('resolves with status ready when first spawn becomes ready (then exits cleanly)', async () => {
     // #given — first child becomes ready immediately, then exits cleanly (simulates
     // a normal lifecycle: ready → child exits → supervisor goes to degraded since
@@ -494,7 +494,7 @@ describe('runSupervisedOpencode — happy path (Unit 5)', () => {
   })
 })
 
-describe('runSupervisedOpencode — transient failure recovery (Unit 5)', () => {
+describe('runSupervisedOpencode — transient failure recovery', () => {
   it('recovers when first spawn fails but second becomes ready', async () => {
     // #given — first child exits immediately (failure), second becomes ready then exits
     const failChild = makeFakeChild({exitImmediately: true, exitCode: 1})
@@ -597,7 +597,7 @@ describe('runSupervisedOpencode — transient failure recovery (Unit 5)', () => 
   })
 })
 
-describe('runSupervisedOpencode — exhaustion (Unit 5)', () => {
+describe('runSupervisedOpencode — exhaustion', () => {
   it('lands in degraded (not starting, not down) when all attempts fail', async () => {
     // #given — all children exit immediately
     const children = [
@@ -658,7 +658,7 @@ describe('runSupervisedOpencode — exhaustion (Unit 5)', () => {
   })
 })
 
-describe('runSupervisedOpencode — post-ready exit latch fix (Unit 5)', () => {
+describe('runSupervisedOpencode — post-ready exit latch fix', () => {
   it('flips status away from ready when child exits after becoming ready', async () => {
     // #given — child becomes ready, then exits unexpectedly
     const {child, triggerExit} = makeControllableChild()
@@ -712,7 +712,7 @@ describe('runSupervisedOpencode — post-ready exit latch fix (Unit 5)', () => {
   })
 })
 
-describe('runSupervisedOpencode — fail-closed transition (Unit 5)', () => {
+describe('runSupervisedOpencode — fail-closed transition', () => {
   it('sets status to starting (not-ready) before killing the child on respawn', async () => {
     // #given — first child times out (kill is called); we capture status at kill time.
     // Second child becomes ready then exits so the supervisor can resolve.
@@ -788,7 +788,7 @@ describe('runSupervisedOpencode — fail-closed transition (Unit 5)', () => {
   })
 })
 
-// ── Unit 6: Process-group reaping tests ──────────────────────────────────────
+// ── Process-group reaping tests ──────────────────────────────────────
 //
 // These tests verify that:
 // 1. When child.pid is a number, kill uses process.kill(-pid, 'SIGTERM') (group kill).
@@ -852,7 +852,7 @@ function makeSpawnFnWithOpts(
   }
 }
 
-describe('process-group reaping (Unit 6) — group kill when pid is present', () => {
+describe('process-group reaping — group kill when pid is present', () => {
   afterEach(() => {
     vi.restoreAllMocks()
   })
@@ -1328,7 +1328,7 @@ describe('killChildGroup — does not throw on ESRCH (Fix 3)', () => {
   })
 })
 
-// ── Unit 3: Per-probe readiness deadline cap ──────────────────────────────────
+// ── Per-probe readiness deadline cap ──────────────────────────────────
 //
 // The readiness polling loop must cap each probe to the remaining overall
 // deadline so the loop can't overshoot WORKSPACE_OPENCODE_READY_TIMEOUT_MS by
@@ -1342,7 +1342,7 @@ describe('killChildGroup — does not throw on ESRCH (Fix 3)', () => {
 // the probe timeout is set to a large value (e.g. 3000ms). The spy asserts the
 // capped value (≤ remaining) was passed, not the raw 3000ms.
 
-describe('startOpencodeServer — per-probe deadline cap (Unit 3)', () => {
+describe('startOpencodeServer — per-probe deadline cap', () => {
   it('caps per-probe timeout to remaining deadline when overall timeout is very short', async () => {
     // #given — overall timeout 50ms, default probe timeout 3000ms
     // The spy records every probeTimeoutMs value passed to it
@@ -1438,7 +1438,7 @@ describe('startOpencodeServer — per-probe deadline cap (Unit 3)', () => {
   })
 })
 
-describe('runSupervisedOpencode — per-probe deadline cap (Unit 3)', () => {
+describe('runSupervisedOpencode — per-probe deadline cap', () => {
   it('caps per-probe timeout to remaining deadline in the supervisor readiness loop', async () => {
     // #given — overall timeout 50ms, default probe timeout 3000ms
     // The supervisor readiness loop must also cap per-probe timeout
@@ -1712,7 +1712,7 @@ describe('runSupervisedOpencode — abort signal wires through (Fix 4)', () => {
   })
 })
 
-describe('process-group reaping (Unit 6) — supervised respawn group kill', () => {
+describe('process-group reaping — supervised respawn group kill', () => {
   afterEach(() => {
     vi.restoreAllMocks()
   })

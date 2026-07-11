@@ -361,7 +361,7 @@ describe('CSRF token constants', () => {
 })
 
 // ---------------------------------------------------------------------------
-// applyBrowserGuard — absent Origin on mutating requests (Unit 3e gap #5)
+// applyBrowserGuard — absent Origin on mutating requests
 // ---------------------------------------------------------------------------
 
 function makeBrowserGuardDeps(sessionStore: ReturnType<typeof createInMemorySessionStore>) {
@@ -379,7 +379,7 @@ function makeBrowserGuardDeps(sessionStore: ReturnType<typeof createInMemorySess
   }
 }
 
-describe('applyBrowserGuard — absent Origin on mutating requests (Unit 3e gap #5)', () => {
+describe('applyBrowserGuard — absent Origin on mutating requests', () => {
   it('rejects POST with no Origin and no Fetch Metadata headers', async () => {
     // #given — valid session, no Origin, no Sec-Fetch-* headers
     const sessionStore = createInMemorySessionStore()
@@ -512,10 +512,10 @@ describe('applyBrowserGuard — absent Origin on mutating requests (Unit 3e gap 
 })
 
 // ---------------------------------------------------------------------------
-// applyBrowserGuard — typed audit events (Unit 3e gap #4)
+// applyBrowserGuard — typed audit events
 // ---------------------------------------------------------------------------
 
-describe('applyBrowserGuard — typed audit events (Unit 3e gap #4)', () => {
+describe('applyBrowserGuard — typed audit events', () => {
   it('emits browser.guard.rejected with reason non_cookie_credential for Authorization header', async () => {
     // #given — valid session but Authorization header present
     const sessionStore = createInMemorySessionStore()

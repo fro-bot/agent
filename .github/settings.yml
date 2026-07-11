@@ -34,12 +34,14 @@ branches:
           - Build
           - CodeQL
           - Dependency Review
+          - Gateway Image Smoke Test
           - Lint
           - Release
           - Test
           - Test GitHub Action
           - Setup
           - Renovate / Renovate
+          - Workspace Image Smoke Test
       restrictions: null
 
   - name: v0

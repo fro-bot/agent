@@ -25,6 +25,9 @@ export {
   parseOperatorCsrfToken,
   parseOperatorError,
   parseOperatorOk,
+  parseOperatorPushSubscribeRequest,
+  parseOperatorPushUnsubscribeRequest,
+  parseOperatorPushVapidKeyResponse,
   parseOperatorSessionInfo,
 } from './parse.js'
 export {assertRedactionApplied, AUTHORIZATION_OBLIGATION, REDACTION_OBLIGATION} from './redaction.js'
@@ -36,6 +39,12 @@ export type {
   OperatorCsrfToken,
   OperatorError,
   OperatorOk,
+  OperatorPushInactiveReason,
+  OperatorPushSubscribeRequest,
+  OperatorPushSubscriptionListResponse,
+  OperatorPushSubscriptionMetadata,
+  OperatorPushUnsubscribeRequest,
+  OperatorPushVapidKeyResponse,
   OperatorSessionInfo,
 } from './responses.js'
 export type {

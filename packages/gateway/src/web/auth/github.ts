@@ -140,6 +140,17 @@ export interface GitHubOAuthDeps {
    * get a session cookie. When absent, no allowlist check is performed.
    */
   readonly allowlist?: OperatorAllowlist
+  /**
+   * Operator push deactivation hook — opt-in, present only when operator push
+   * is configured. Called with the newly-minted session's `githubUserId`
+   * immediately after a session is created, so it can be closed over and
+   * invoked later from `sessionStore.onRevoke` (fired on logout / TTL
+   * expiry). Registered here — not inside the revoke hook itself — because
+   * `SessionStore.onRevoke`'s hook signature only receives the sessionId,
+   * and the entry's identity is not guaranteed readable once revoked; the
+   * identity is captured at session-creation time instead.
+   */
+  readonly onSessionRevoke?: (githubUserId: number) => void
 }
 
 /** Configuration for the GitHub OAuth PKCE + state routes. */
@@ -198,6 +209,7 @@ export function buildGitHubOAuthDeps(
   sessionStore?: SessionStore,
   sessionDeps?: SessionDeps,
   allowlist?: OperatorAllowlist,
+  onSessionRevoke?: (githubUserId: number) => void,
 ): GitHubOAuthDeps {
   return {
     logger,
@@ -212,6 +224,7 @@ export function buildGitHubOAuthDeps(
     ...(sessionStore === undefined ? {} : {sessionStore}),
     ...(sessionDeps === undefined ? {} : {sessionDeps}),
     ...(allowlist === undefined ? {} : {allowlist}),
+    ...(onSessionRevoke === undefined ? {} : {onSessionRevoke}),
   }
 }
 
@@ -657,6 +670,16 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
 
       // Emit success audit event only after session is successfully minted.
       emitAudit({kind: 'auth.callback.success', correlationId, githubUserId, login}, deps.auditLogger)
+
+      // Register the operator push deactivation hook for this session, closing
+      // over githubUserId now — sessionStore.onRevoke's hook only receives the
+      // sessionId, and the entry's identity is not reliably readable once the
+      // session has been marked revoked.
+      if (deps.onSessionRevoke !== undefined) {
+        deps.sessionStore.onRevoke(newSessionId, () => {
+          deps.onSessionRevoke?.(githubUserId)
+        })
+      }
 
       // Clear stale cookie first, then set the new session cookie.
       // Hono's c.header() appends when called multiple times for Set-Cookie.

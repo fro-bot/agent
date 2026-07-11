@@ -18,7 +18,15 @@
  */
 
 import {describe, expect, it} from 'vitest'
-import {parseOperatorCsrfToken, parseOperatorError, parseOperatorOk, parseOperatorSessionInfo} from './parse.js'
+import {
+  parseOperatorCsrfToken,
+  parseOperatorError,
+  parseOperatorOk,
+  parseOperatorPushSubscribeRequest,
+  parseOperatorPushUnsubscribeRequest,
+  parseOperatorPushVapidKeyResponse,
+  parseOperatorSessionInfo,
+} from './parse.js'
 
 // ---------------------------------------------------------------------------
 // parseOperatorSessionInfo — happy path
@@ -475,5 +483,224 @@ describe('parseOperatorError — error paths', () => {
     const message = result.success === false ? result.error.message : ''
     expect(message).not.toContain('ghp_SECRET')
     expect(message).not.toContain('42')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseOperatorPushVapidKeyResponse — happy path
+// ---------------------------------------------------------------------------
+
+describe('parseOperatorPushVapidKeyResponse — happy path', () => {
+  it('returns ok(value) for a valid {publicKey, keyVersion} payload', () => {
+    // #given
+    const input = {publicKey: 'BPublicKeyBase64Url', keyVersion: 'v1'}
+
+    // #when
+    const result = parseOperatorPushVapidKeyResponse(input)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success && result.data).toEqual({publicKey: 'BPublicKeyBase64Url', keyVersion: 'v1'})
+  })
+
+  it('ignores extra fields (permissive structural subtyping)', () => {
+    // #given
+    const input = {publicKey: 'BPublicKeyBase64Url', keyVersion: 'v1', extra: 'ignored'}
+
+    // #when
+    const result = parseOperatorPushVapidKeyResponse(input)
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+})
+
+describe('parseOperatorPushVapidKeyResponse — error paths', () => {
+  it('returns err for null input', () => {
+    expect(parseOperatorPushVapidKeyResponse(null).success).toBe(false)
+  })
+
+  it('returns err for array input', () => {
+    expect(parseOperatorPushVapidKeyResponse([]).success).toBe(false)
+  })
+
+  it('returns err when publicKey is missing', () => {
+    expect(parseOperatorPushVapidKeyResponse({keyVersion: 'v1'}).success).toBe(false)
+  })
+
+  it('returns err when keyVersion is missing', () => {
+    expect(parseOperatorPushVapidKeyResponse({publicKey: 'BPublicKeyBase64Url'}).success).toBe(false)
+  })
+
+  it('returns err when publicKey is non-string', () => {
+    expect(parseOperatorPushVapidKeyResponse({publicKey: 42, keyVersion: 'v1'}).success).toBe(false)
+  })
+
+  it('returns err when keyVersion is non-string', () => {
+    expect(parseOperatorPushVapidKeyResponse({publicKey: 'BPublicKeyBase64Url', keyVersion: 42}).success).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseOperatorPushSubscribeRequest — happy path
+// ---------------------------------------------------------------------------
+
+describe('parseOperatorPushSubscribeRequest — happy path', () => {
+  it('returns ok(value) for a valid {endpoint, keys:{p256dh, auth}} payload', () => {
+    // #given
+    const input = {
+      endpoint: 'https://push.example.com/subscription/abc123',
+      keys: {p256dh: 'p256dh-key-value', auth: 'auth-key-value'},
+    }
+
+    // #when
+    const result = parseOperatorPushSubscribeRequest(input)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success && result.data).toEqual(input)
+  })
+
+  it('ignores extra fields (permissive structural subtyping)', () => {
+    // #given
+    const input = {
+      endpoint: 'https://push.example.com/subscription/abc123',
+      keys: {p256dh: 'p256dh-key-value', auth: 'auth-key-value'},
+      expirationTime: null,
+    }
+
+    // #when
+    const result = parseOperatorPushSubscribeRequest(input)
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+})
+
+describe('parseOperatorPushSubscribeRequest — error paths', () => {
+  it('returns err for null input', () => {
+    expect(parseOperatorPushSubscribeRequest(null).success).toBe(false)
+  })
+
+  it('returns err for array input', () => {
+    expect(parseOperatorPushSubscribeRequest([]).success).toBe(false)
+  })
+
+  it('returns err when endpoint is missing', () => {
+    const input = {keys: {p256dh: 'p256dh-key-value', auth: 'auth-key-value'}}
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when endpoint is non-string', () => {
+    const input = {endpoint: 42, keys: {p256dh: 'p256dh-key-value', auth: 'auth-key-value'}}
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when endpoint is an empty string', () => {
+    const input = {endpoint: '', keys: {p256dh: 'p256dh-key-value', auth: 'auth-key-value'}}
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when keys is missing', () => {
+    const input = {endpoint: 'https://push.example.com/subscription/abc123'}
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when keys is not an object', () => {
+    const input = {endpoint: 'https://push.example.com/subscription/abc123', keys: 'not-an-object'}
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when keys.p256dh is missing', () => {
+    const input = {endpoint: 'https://push.example.com/subscription/abc123', keys: {auth: 'auth-key-value'}}
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when keys.p256dh is non-string', () => {
+    const input = {
+      endpoint: 'https://push.example.com/subscription/abc123',
+      keys: {p256dh: 42, auth: 'auth-key-value'},
+    }
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when keys.p256dh is an empty string', () => {
+    const input = {
+      endpoint: 'https://push.example.com/subscription/abc123',
+      keys: {p256dh: '', auth: 'auth-key-value'},
+    }
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when keys.auth is missing', () => {
+    const input = {endpoint: 'https://push.example.com/subscription/abc123', keys: {p256dh: 'p256dh-key-value'}}
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when keys.auth is non-string', () => {
+    const input = {
+      endpoint: 'https://push.example.com/subscription/abc123',
+      keys: {p256dh: 'p256dh-key-value', auth: 42},
+    }
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+
+  it('returns err when keys.auth is an empty string', () => {
+    const input = {
+      endpoint: 'https://push.example.com/subscription/abc123',
+      keys: {p256dh: 'p256dh-key-value', auth: ''},
+    }
+    expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseOperatorPushUnsubscribeRequest — happy path
+// ---------------------------------------------------------------------------
+
+describe('parseOperatorPushUnsubscribeRequest — happy path', () => {
+  it('returns ok(value) for a valid {endpoint} payload', () => {
+    // #given
+    const input = {endpoint: 'https://push.example.com/subscription/abc123'}
+
+    // #when
+    const result = parseOperatorPushUnsubscribeRequest(input)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success && result.data).toEqual(input)
+  })
+
+  it('ignores extra fields (permissive structural subtyping)', () => {
+    // #given
+    const input = {endpoint: 'https://push.example.com/subscription/abc123', extra: 'field'}
+
+    // #when
+    const result = parseOperatorPushUnsubscribeRequest(input)
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+})
+
+describe('parseOperatorPushUnsubscribeRequest — error paths', () => {
+  it('returns err for null input', () => {
+    expect(parseOperatorPushUnsubscribeRequest(null).success).toBe(false)
+  })
+
+  it('returns err for array input', () => {
+    expect(parseOperatorPushUnsubscribeRequest([]).success).toBe(false)
+  })
+
+  it('returns err when endpoint is missing', () => {
+    expect(parseOperatorPushUnsubscribeRequest({}).success).toBe(false)
+  })
+
+  it('returns err when endpoint is non-string', () => {
+    expect(parseOperatorPushUnsubscribeRequest({endpoint: 42}).success).toBe(false)
+  })
+
+  it('returns err when endpoint is an empty string', () => {
+    expect(parseOperatorPushUnsubscribeRequest({endpoint: ''}).success).toBe(false)
   })
 })

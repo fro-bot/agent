@@ -1552,7 +1552,7 @@ describe('executeAddProject', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Identity capture at ingest (Unit 2)
+  // Identity capture at ingest
   // -------------------------------------------------------------------------
 
   describe('WRITING_BINDING: repo identity captured at ingest', () => {

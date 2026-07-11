@@ -25,6 +25,7 @@
 
 import {Buffer} from 'node:buffer'
 
+import {ok} from '@fro-bot/runtime'
 import {buildOperatorServerInputs} from '../program.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
 import {buildOperatorApp} from './server.js'
@@ -51,6 +52,10 @@ export const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readon
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
   {method: 'GET', path: '/operator/runs/:runId/approvals'},
   {method: 'POST', path: '/operator/runs/:runId/cancel'},
+  {method: 'GET', path: '/operator/push/vapid-key'},
+  {method: 'POST', path: '/operator/push/subscriptions'},
+  {method: 'POST', path: '/operator/push/subscriptions/unsubscribe'},
+  {method: 'GET', path: '/operator/push/subscriptions'},
 ]
 
 // ---------------------------------------------------------------------------
@@ -120,6 +125,29 @@ function makeStubLaunchWorkDeps() {
   return {} as NonNullable<Parameters<typeof buildOperatorApp>[0]['launchWorkDeps']>
 }
 
+function makeStubOperatorPush(): NonNullable<Parameters<typeof buildOperatorServerInputs>[0]['operatorPush']> {
+  return {
+    store: {
+      subscribe: async () =>
+        ok({
+          endpointHash: 'stub-hash',
+          operatorId: 'stub-operator',
+          active: true,
+          keyVersion: '1',
+          ownershipGeneration: 1,
+          createdAt: 0,
+          updatedAt: 0,
+        }),
+      unsubscribe: async () => ok(undefined),
+      listMetadataForOperator: async () => ok([]),
+    },
+    vapidPublicKeyInfo: {
+      publicKey: 'BOb1EqJOpvFSxr2XOPIr82Ktdxl6AibGOAiPmrkjbsv0mpr9In09mLbskqVAgLPIDjb0UIb7mZpU0SJKWWsVazc',
+      keyVersion: '1',
+    },
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Options — allow test overrides for regression-guard tests
 // ---------------------------------------------------------------------------
@@ -165,6 +193,12 @@ export interface OperatorRouteSmokeOptions {
    * undefined here flows through the helper and causes the cancel route to be absent.
    */
   readonly cancelRunDepsOverride?: Parameters<typeof buildOperatorServerInputs>[0]['cancelRunDeps'] | undefined
+  /**
+   * Override the operatorPush deps passed to buildOperatorServerInputs.
+   * Pass undefined to simulate push disabled or a self-test failure (push
+   * routes absent). When omitted, the default stub is used (push routes present).
+   */
+  readonly operatorPushOverride?: Parameters<typeof buildOperatorServerInputs>[0]['operatorPush'] | undefined
   /**
    * Whether to suppress log output. Defaults to false (logs to stdout).
    */
@@ -257,6 +291,14 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
   const hasCancelRunDepsOverride = options !== undefined && 'cancelRunDepsOverride' in options
   const cancelRunDeps = hasCancelRunDepsOverride ? options.cancelRunDepsOverride : makeStubCancelRunDeps()
 
+  // Resolve operatorPush — use the override if provided, else the default stub.
+  // When the override is explicitly undefined, the push routes will not register
+  // because buildOperatorServerInputs passes it through to
+  // deps.operatorPushStore/deps.operatorPushVapidKeyInfo, and server.ts gates
+  // the push routes on both being present.
+  const hasOperatorPushOverride = options !== undefined && 'operatorPushOverride' in options
+  const operatorPush = hasOperatorPushOverride ? options.operatorPushOverride : makeStubOperatorPush()
+
   // Build the operator server inputs via the shared production helper.
   // This is the seam that makes the diagnostic catch wiring gaps: if a dep is
   // dropped from buildOperatorServerInputs, both production and this diagnostic
@@ -284,6 +326,11 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     // sees the same value as production. When undefined (regression test), the
     // helper passes undefined to deps.launchWorkDeps and POST /operator/runs is absent.
     launchWorkDeps,
+    // operatorPush flows through the helper so the route gate in server.ts sees
+    // the same value as production. When undefined (regression test), the helper
+    // passes undefined to deps.operatorPushStore/deps.operatorPushVapidKeyInfo
+    // and the /operator/push/* routes are absent.
+    operatorPush,
     operatorWebConfig,
   })
 

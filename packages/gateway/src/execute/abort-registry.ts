@@ -24,7 +24,7 @@
 /**
  * Attribution metadata for an operator-initiated cancel.
  *
- * Written by `cancelRun` (Unit 2) alongside `abort()` so the run's own
+ * Written by `cancelRun` alongside `abort()` so the run's own
  * settlement path in `run.ts` (the single writer of the CANCELLED transition)
  * can read it back and thread `details.cancelledBy` onto the transition —
  * without the orchestrator reaching into run.ts's private execution state.
