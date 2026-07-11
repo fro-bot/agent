@@ -1,1 +1,0 @@
-import{d as e,n as t,r as n}from"./event-streams-C8Fj2Ki3.js";t();export{n as EventStreamSerde,e as eventStreamSerdeProvider};
