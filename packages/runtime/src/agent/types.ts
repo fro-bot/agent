@@ -1,6 +1,7 @@
 import type {FilePartInput} from '@opencode-ai/sdk'
 import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 import type {ModelConfig, OmoProviders, ResolvedOutputMode, ResponseMode, TokenUsage} from '../shared/types.js'
+import type {ResponseDelivery} from './response-delivery.js'
 
 export type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 export type {OutputMode, ResolvedOutputMode, ResponseMode} from '../shared/types.js'
@@ -260,6 +261,22 @@ export interface PromptOptions {
   readonly resolvedOutputMode?: ResolvedOutputMode | null
   readonly fileParts?: readonly FilePartInput[]
   readonly responseMode?: ResponseMode
+  /**
+   * The response-delivery mechanism for this run, resolved once at bootstrap
+   * (see `resolveResponseDelivery`) and threaded through unchanged. Gates
+   * which posting instructions the prompt renders: `file-convention` tells
+   * the model to write `responseFilePath` synchronously instead of calling
+   * `gh`; `model-gh` keeps the current `gh` posting instructions unchanged;
+   * `none` renders neither. Defaults to `model-gh` when omitted so existing
+   * callers that don't thread this field keep today's behavior.
+   */
+  readonly responseDelivery?: ResponseDelivery
+  /**
+   * The exact run-scoped path (outside the checkout) the model must write
+   * its response to. Required and non-null whenever
+   * `responseDelivery === 'file-convention'`; ignored otherwise.
+   */
+  readonly responseFilePath?: string | null
 }
 
 export interface ReferenceFile {

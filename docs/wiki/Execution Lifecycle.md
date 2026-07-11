@@ -46,8 +46,8 @@ main.ts
        ├─  6. Cache Restore
        ├─  7. Session Prep
        ├─  8. Execute
-       ├─  9. Finalize
-       ├─ 10. Review Reconciliation
+       ├─  9. Review Reconciliation
+       ├─ 10. Finalize
        └─ 11. Cleanup (always, via finally)
 
 post.ts
@@ -108,15 +108,19 @@ The core phase. Calls `executeOpenCode()` which creates (or continues) an SDK se
 
 If the LLM returns a fetch error (transient provider failure), the system retries up to three times with a continuation prompt. A configurable timeout (default: 30 minutes) aborts execution if the agent runs too long.
 
-## 9. Finalize
+## 9. Review Reconciliation
 
-Writes a synthetic summary message into the session history so future runs can discover what this run accomplished. Prunes old sessions based on dual-condition retention (age OR count). Posts the run summary to GitHub. Collects metrics and sets action outputs (session ID, cache status, duration).
+Runs after Execute, before Finalize, only for `pull_request` review triggers on the model-`gh` posting path (`workflow_dispatch`/`schedule`). Calls `decideReconciliation()` in `src/features/reviews/review-reconciliation.ts` to inspect the agent's posted review body for a verdict signal. If the verdict warrants a formal GitHub APPROVE, the phase submits one automatically via the GitHub review API through the shared review guards (fork/self/head-SHA/TOCTOU). This removes the manual step of having the agent issue the `gh pr review --approve` command itself on approve-verdicts.
 
-## 10. Review Reconciliation
-
-Runs after Finalize, only for `pull_request` review triggers. Calls `decideReconciliation()` in `src/features/reviews/review-reconciliation.ts` to inspect the agent's posted review body for a verdict signal. If the verdict warrants a formal GitHub APPROVE, the phase submits one automatically via the GitHub review API. This removes the manual step of having the agent issue the `gh pr review --approve` command itself on approve-verdicts.
+For comment/review flows that post through the file convention (see Finalize), this phase **skips immediately** — the model posts no review of its own for reconciliation to reconcile; Finalize owns the review post instead.
 
 The phase is **fail-safe**: any error logs a warning and no-ops. It never throws and never fails the run. It also checks the bot login before acting — an empty or null `botLogin` triggers an immediate no-op.
+
+## 10. Finalize
+
+Writes a synthetic summary message into the session history so future runs can discover what this run accomplished. Prunes old sessions based on dual-condition retention (age OR count). Collects metrics and sets action outputs (session ID, cache status, duration).
+
+For `pull_request`/`issue_comment`/`issues` triggers, this phase also **posts the agent's response on the model's behalf**. The model wrote its response to a run-scoped file (outside the checkout, under `RUNNER_TEMP`); Finalize reads it, binds the target and surface to the trusted event (never the file), validates it, and posts via the Octokit comment/review writers — a PR-review verdict goes through the same shared review guards as reconciliation. This path is **fail-closed**: a missing, malformed, or undeliverable response fails the run (naming the file), and a delivery assertion prevents a green-but-silent run. `workflow_dispatch`/`schedule` runs post via the model's own `gh` and are unchanged.
 
 ## 11. Cleanup (Always)
 
