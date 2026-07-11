@@ -44,6 +44,7 @@ import {createDenylistCache} from './redaction/denylist.js'
 import {createAppClientMetadataReader} from './redaction/reader-app-client.js'
 import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutdown.js'
+import {emitAudit} from './web/audit.js'
 import {buildGitHubOAuthDeps} from './web/auth/github.js'
 import {createInMemorySessionStore} from './web/auth/session.js'
 import {createDedupeCache} from './web/operator-push/dedupe-cache.js'
@@ -728,7 +729,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
             readonly vapidPublicKeyInfo: VapidPublicKeyInfo
           }
         | undefined
-      if (config.operatorPush !== undefined) {
+      if (config.operatorPush === undefined) {
+        emitAudit({kind: 'push.disabled', correlationId: 'startup', reason: 'config_absent'}, logger)
+      } else {
         const pushStore = createOperatorPushSubscriptionStore({
           adapter: s3Adapter,
           logger,
@@ -767,9 +770,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                 : {previousKeyVersion: config.operatorPush.previous.keyVersion}),
             },
             logger,
+            auditLogger: logger,
           })
         } else {
           logger.warn({err: selfTest.error.message}, 'operator push disabled — object store failed CAS self-test')
+          emitAudit({kind: 'push.disabled', correlationId: 'startup', reason: 'self_test_failed'}, logger)
         }
       }
 
@@ -825,6 +830,19 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                       )
                     } else if (result.success === false) {
                       logger.warn({err: result.error.message}, 'operator push: session-revoke deactivation failed')
+                    }
+                    // Emit one coarse audit event per revoke when a real
+                    // deactivation happened — not one per record.
+                    if (result.success === true && result.data.updated > 0) {
+                      emitAudit(
+                        {
+                          kind: 'push.subscription.deactivated',
+                          correlationId: `push-session-revoke:${githubUserId}`,
+                          githubUserId,
+                          reason: 'session_revoked',
+                        },
+                        logger,
+                      )
                     }
                   })
                   .catch(() => {

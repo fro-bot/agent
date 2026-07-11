@@ -26,6 +26,12 @@ sources:
   - packages/gateway/src/web/sse/projection.ts
   - packages/gateway/src/web/sse/run-stream-route.ts
   - packages/gateway/src/web/audit.ts
+  - packages/gateway/src/web/operator-push/subscription-route.ts
+  - packages/gateway/src/web/operator-push/subscription-store.ts
+  - packages/gateway/src/web/operator-push/dispatcher.ts
+  - packages/gateway/src/web/operator-push/trigger-policy.ts
+  - packages/gateway/src/web/operator-push/vapid.ts
+  - docs/privacy/operator-push-retention.md
   - packages/gateway/src/operator-contract/identity.ts
   - packages/gateway/src/operator-contract/approval.ts
   - packages/gateway/src/operator-contract/approval-frame.ts
@@ -155,7 +161,26 @@ When a run fails, both projections may carry a `failureKind` — a coarse, sanit
 
 ## Audit
 
-Security-critical events on this surface — sign-ins, authorization decisions, launches, and stream lifecycle — flow through a typed audit seam (`web/audit.ts`) that records the numeric GitHub user ID and other safe fields while excluding tokens, prompts, and internal identifiers.
+Security-critical events on this surface — sign-ins, authorization decisions, launches, and stream lifecycle — flow through a typed audit seam (`web/audit.ts`) that records the numeric GitHub user ID and other safe fields while excluding tokens, prompts, and internal identifiers. The push subscription lifecycle (subscribe, unsubscribe, deactivation, dispatch, and startup disablement — see [Operator Push Notifications](#operator-push-notifications) below) is folded into the same seam, holding to the same rule: only operator identity, coarse enums, and counts, never endpoints or key material.
+
+## Operator Push Notifications
+
+Alongside the SSE stream, operators can opt into browser push notifications for two events: a run entering `waiting for approval` and a run failing. Push is **opt-in and disabled by default** — a deployment must both provision VAPID key material and start the object-store CAS self-test successfully before the surface is registered at all (`program.ts`; see the [privacy and retention policy](../privacy/operator-push-retention.md) for what is stored and how it is deleted).
+
+The surface exposes four authenticated operator routes (`web/operator-push/`):
+
+- `GET /operator/push/vapid-key` — the current VAPID public key and key version, used by the browser to create a `PushSubscription`.
+- `POST /operator/push/subscriptions` — register (or refresh) a subscription for the authenticated operator.
+- `POST /operator/push/subscriptions/unsubscribe` — remove a subscription.
+- `GET /operator/push/subscriptions` — list the operator's own subscription metadata (never the endpoint or keys — see `toSubscriptionMetadata` in `subscription-store.ts`).
+
+**Broadcast model.** The operator dashboard is a shared surface, not a per-operator one — approvals are run-scoped, not operator-scoped, and there is no dashboard-operator identity available at the run-failed or approval-pending seams. Every opted-in operator with an active subscription is nudged, regardless of who launched the run. The notification payload is fixed and repo-neutral ("something needs attention, open the dashboard" plus an allowlisted failure label) so a broadcast never leaks run, repo, or prompt content — Discord and the SSE stream remain the authoritative, detailed channels; push is a fail-soft nudge on top.
+
+### VAPID key rotation and leak response
+
+The VAPID private key is server-only, per-environment configuration — never logged, serialized, or returned by any route. Rotation supports a current key plus an optional previous key during a rollout window: each subscription record stores the key version it was created or refreshed under, and the dispatcher's trigger policy still delivers to previous-key records for the duration of the window (`web/operator-push/trigger-policy.ts`). Once the window closes, previous-key subscribers stop being notified until they re-subscribe under the new public key (their next browser-side subscribe call picks up the current key automatically).
+
+If the private key leaks, the response is: provision a fresh VAPID keypair, roll the current key into the previous-key slot for a bounded rollout window, then retire the old key entirely once the window ends. There is no way to invalidate an individual leaked key server-side beyond this rotation — the protection comes from bounding how long the compromised key remains honored, not from revoking specific subscriptions.
 
 ## Relationship to Other Surfaces
 

@@ -37,10 +37,12 @@ import type {
   OperatorPushSubscriptionListResponse,
   OperatorPushSubscriptionMetadata,
 } from '../../operator-contract/index.js'
+import type {AuditLogger} from '../audit.js'
 import type {OperatorLogger} from '../server.js'
 import type {OperatorPushSubscriptionStore, SubscriptionMetadata} from './subscription-store.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {parseOperatorPushSubscribeRequest, parseOperatorPushUnsubscribeRequest} from '../../operator-contract/index.js'
+import {emitAudit} from '../audit.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
 import {hashEndpoint} from './subscription-store.js'
@@ -90,6 +92,8 @@ export interface SubscriptionRouteDeps {
   readonly store: Pick<OperatorPushSubscriptionStore, 'subscribe' | 'unsubscribe' | 'listMetadataForOperator'>
   /** Current VAPID key version — stamped onto every subscribe call. */
   readonly keyVersion: string
+  /** Audit logger for security events. */
+  readonly auditLogger: AuditLogger
   /** Structured logger. */
   readonly logger: OperatorLogger
   /** Injectable clock. */
@@ -239,6 +243,10 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
 
       // ── Gate 8: Map result → safe JSON (metadata only, never endpoint/keys) ─
       deps.logger.info({githubUserId}, 'push-subscribe: accepted')
+      emitAudit(
+        {kind: 'push.subscribed', correlationId: `push-subscribe:${githubUserId}`, githubUserId},
+        deps.auditLogger,
+      )
       return c.json(toResponseMetadata(result.data), 200)
     } catch (error: unknown) {
       deps.logger.warn(
@@ -294,6 +302,10 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
 
       // ── Gate 8: Safe response — no endpoint/keys ─────────────────────────
       deps.logger.info({githubUserId}, 'push-unsubscribe: accepted')
+      emitAudit(
+        {kind: 'push.unsubscribed', correlationId: `push-unsubscribe:${githubUserId}`, githubUserId},
+        deps.auditLogger,
+      )
       return c.json({ok: true}, 200)
     } catch (error: unknown) {
       deps.logger.warn(

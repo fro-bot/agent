@@ -37,10 +37,12 @@
  */
 
 import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
+import type {AuditLogger} from '../audit.js'
 import type {DedupeCache} from './dedupe-cache.js'
 import type {PushSender} from './push-sender.js'
 import type {OperatorPushSubscriptionStore, SubscriptionRecord} from './subscription-store.js'
 import type {TriggerDecision} from './trigger-policy.js'
+import {emitAudit} from '../audit.js'
 import {buildApprovalPayload, buildFailedRunPayload} from './payload-builder.js'
 
 export interface DispatcherLogger {
@@ -71,6 +73,8 @@ export interface CreatePushDispatcherDeps {
   readonly triggerPolicy: PushDispatcherTriggerPolicy
   readonly vapidConfig: PushDispatcherVapidConfig
   readonly logger: DispatcherLogger
+  /** Audit logger — one coarse push.dispatch summary event is emitted per broadcast. */
+  readonly auditLogger: AuditLogger
 }
 
 export interface PushDispatcher {
@@ -79,7 +83,7 @@ export interface PushDispatcher {
 }
 
 export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispatcher {
-  const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger} = deps
+  const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger, auditLogger} = deps
 
   async function broadcast(kind: 'approval' | 'run_failed', dedupeId: string, payload: string): Promise<void> {
     const dedupeKey = `${dedupeId}:${kind}`
@@ -96,39 +100,79 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     if (activeRecords.data.length === 0) {
       // Nothing was sent, so a later retry (once subscriptions exist)
       // should still fire — do not consume the dedupe slot here either.
+      // No dispatch audit event either: nothing was dispatched.
       return
     }
 
     if (dedupeCache.shouldSend(dedupeKey) === false) {
       logger.debug({kind}, 'operator push dispatch: suppressed by dedupe window')
+      // No dispatch audit event: suppressed, nothing was dispatched.
       return
     }
 
+    // Coarse per-broadcast tally for the push.dispatch audit event. Dead
+    // subscriptions are counted here and covered by this single summary —
+    // markDead is NOT separately audited per record, which would be
+    // per-endpoint noise (see markDead's dead-subscription branch below).
+    let delivered = 0
+    let dead = 0
+    let failed = 0
+
     for (const record of activeRecords.data) {
       try {
-        await dispatchToRecord(kind, record, payload)
+        const outcome = await dispatchToRecord(kind, record, payload)
+        switch (outcome) {
+          case 'delivered':
+            delivered += 1
+            break
+          case 'dead':
+            dead += 1
+            break
+          case 'failed':
+            failed += 1
+            break
+          case 'skipped':
+            break
+          default: {
+            // Exhaustiveness guard: if a new dispatchToRecord outcome
+            // variant is added without a case here, TypeScript will fail
+            // to compile.
+            const exhaustiveCheck: never = outcome
+            throw new Error(`broadcast: unhandled dispatchToRecord outcome variant: ${String(exhaustiveCheck)}`)
+          }
+        }
       } catch (error: unknown) {
         // One failing record must never abort dispatch to the rest.
+        failed += 1
         logger.warn(
           {kind, err: error instanceof Error ? error.message : String(error)},
           'operator push dispatch: one subscription failed — continuing with the rest',
         )
       }
     }
+
+    // Emitted once per broadcast that reached the send loop. A record set
+    // entirely filtered by stale-key (e.g. during a VAPID rotation window)
+    // still records a {delivered:0, dead:0, failed:0} event — that a broadcast
+    // ran with no wire sends is itself worth an audit trail, and it is
+    // unambiguous: the empty-list and dedupe-suppressed paths return before
+    // this point, so a zero-count event can only mean "all subscribers were
+    // skipped".
+    emitAudit({kind: 'push.dispatch', correlationId: dedupeId, trigger: kind, delivered, dead, failed}, auditLogger)
   }
 
   async function dispatchToRecord(
     kind: 'approval' | 'run_failed',
     record: SubscriptionRecord,
     payload: string,
-  ): Promise<void> {
+  ): Promise<'delivered' | 'dead' | 'failed' | 'skipped'> {
     const decision = triggerPolicy.shouldNotify(record, {
       current: vapidConfig.keyVersion,
       previous: vapidConfig.previousKeyVersion,
     })
     if (decision === 'skip-stale-key') {
       logger.debug({kind}, 'operator push dispatch: skipped stale key version')
-      return
+      return 'skipped'
     }
 
     const result = await sender.sendNotification(
@@ -139,20 +183,25 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
 
     switch (result.outcome) {
       case 'accepted': {
-        return
+        return 'delivered'
       }
       case 'dead-subscription': {
         const marked = await store.markDead({operatorId: record.operatorId, endpoint: record.endpoint})
         if (marked.success === false) {
           logger.warn({kind}, 'operator push dispatch: failed to mark dead subscription')
         }
-        return
+        // Counted in the broadcast's coarse 'dead' tally — not separately
+        // audited per record; a per-record deactivation event would leak
+        // per-endpoint dispatch cadence. See push.subscription.deactivated
+        // usage at the session-revoke site for the one case that IS audited
+        // individually.
+        return 'dead'
       }
       case 'retryable':
       case 'payload-too-large':
       case 'error': {
         logger.warn({kind, outcome: result.outcome}, 'operator push dispatch: relay send did not succeed')
-        return
+        return 'failed'
       }
       default: {
         // Exhaustiveness guard: if a new PushRelayResult outcome variant is

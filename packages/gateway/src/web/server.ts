@@ -985,11 +985,17 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // has passed its CAS self-test at startup. A self-test failure (or push
   // disabled entirely) means these deps are absent here and the routes never
   // mount — matching the fail-closed posture of every other opt-in route above.
+  //
+  // auditLogger is also required to mount: the push routes never run without
+  // an audit logger present, so every push route action (subscribe,
+  // unsubscribe, dispatch, deactivate) is guaranteed to be audited — there is
+  // no silently-unaudited push route.
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
     deps.operatorPushStore !== undefined &&
-    deps.operatorPushVapidKeyInfo !== undefined
+    deps.operatorPushVapidKeyInfo !== undefined &&
+    deps.auditLogger !== undefined
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     const sessionStoreForPush: SubscriptionRouteSessionStore = deps.sessionStore
@@ -1001,6 +1007,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       sessionStore: sessionStoreForPush,
       store: deps.operatorPushStore,
       keyVersion: deps.operatorPushVapidKeyInfo.keyVersion,
+      auditLogger: deps.auditLogger,
       logger: deps.logger,
       now: clock,
     })
