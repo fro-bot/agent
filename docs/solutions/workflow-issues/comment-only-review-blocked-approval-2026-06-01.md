@@ -1,6 +1,7 @@
 ---
 title: Couple the review verdict to the GitHub review event so PR reviews satisfy branch protection
 date: 2026-06-01
+last_updated: 2026-07-11
 category: workflow-issues
 module: pr-review-prompt-contract
 problem_type: workflow_issue
@@ -33,6 +34,10 @@ tags:
 When the Fro Bot GitHub Action reviews a pull request, the agent reaches a clear verdict — PASS, CONDITIONAL, or REJECT — and writes it as a `## Verdict:` heading in the review body. But it was delivering that verdict as a **comment-only** review (`gh pr review --comment`). GitHub branch protection keys off the review *event* (APPROVED / CHANGES_REQUESTED), not the prose in the body, so a comment-only "PASS" never satisfied the required-approval gate. Passing PRs stayed blocked on "review required" until a human approved them manually.
 
 This surfaced live on PR #722 (two consecutive PASS verdicts delivered as COMMENTED events) and earlier on clean docs-only PRs.
+
+## Update (2026-07-11)
+
+The verdict→event coupling *principle* below is unchanged, but the delivery mechanism is now stale for `pull_request` / `issue_comment` / `issues` triggers: the model holds no `gh` credential on those flows, and the harness posts the review from a response file (a `verdict: approve | request-changes` frontmatter value mapped to a review event in `src/features/agent/response-post.ts`), not from a `gh pr review` command the model runs itself. `gh`-based delivery as described below remains accurate only for `workflow_dispatch` / `schedule` flows, where the credential is still provisioned and the model calls `gh` directly.
 
 ## Guidance
 
