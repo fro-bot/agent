@@ -128,7 +128,7 @@ jobs:
 
   test:
     name: Test
-    needs: [setup, build]
+    needs: [setup]
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -736,7 +736,7 @@ jobs:
       DRY_RUN: ${{ github.ref_name != github.event.repository.default_branch }}
       RELEASE_BRANCH: release
     name: Release
-    needs: [setup, lint, test, build]
+    needs: [lint, test, build]
     outputs:
       commit: ${{ steps.merge.outputs.commit }}
       version: ${{ steps.release-preview.outputs.next_version }}

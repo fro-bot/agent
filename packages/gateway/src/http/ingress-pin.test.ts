@@ -125,6 +125,10 @@ const EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD: readonly {method: string; pat
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
   {method: 'POST', path: '/operator/runs/:runId/cancel'},
   {method: 'GET', path: '/operator/runs/:runId/approvals'},
+  {method: 'GET', path: '/operator/push/vapid-key'},
+  {method: 'POST', path: '/operator/push/subscriptions'},
+  {method: 'POST', path: '/operator/push/subscriptions/unsubscribe'},
+  {method: 'GET', path: '/operator/push/subscriptions'},
 ]
 
 // ---------------------------------------------------------------------------
@@ -281,6 +285,28 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     },
     // Provide cancelRunDeps so the cancel route is registered in the pinned inventory.
     cancelRunDeps: {} as unknown as OperatorServerDeps['cancelRunDeps'],
+    // Provide operatorPushStore/operatorPushVapidKeyInfo so the push routes are
+    // registered in the pinned inventory.
+    operatorPushStore: {
+      subscribe: vi.fn(async () => ({
+        success: true as const,
+        data: {
+          endpointHash: 'stub-hash',
+          operatorId: 'stub-operator',
+          active: true,
+          keyVersion: '1',
+          ownershipGeneration: 1,
+          createdAt: 0,
+          updatedAt: 0,
+        },
+      })),
+      unsubscribe: vi.fn(async () => ({success: true as const, data: undefined})),
+      listMetadataForOperator: vi.fn(async () => ({success: true as const, data: []})),
+    },
+    operatorPushVapidKeyInfo: {
+      publicKey: 'BOb1EqJOpvFSxr2XOPIr82Ktdxl6AibGOAiPmrkjbsv0mpr9In09mLbskqVAgLPIDjb0UIb7mZpU0SJKWWsVazc',
+      keyVersion: '1',
+    },
   }
 }
 

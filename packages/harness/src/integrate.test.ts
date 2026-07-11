@@ -521,7 +521,7 @@ describe('runIntegration', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // U4: Per-ref provenance SHA
+  // Per-ref provenance SHA
   // ---------------------------------------------------------------------------
 
   it('per-ref SHA: 3 refs → 3 distinct resolvedSha values in manifest', async () => {
@@ -659,10 +659,10 @@ describe('runIntegration', () => {
 })
 
 // ---------------------------------------------------------------------------
-// U5: Clean-snapshot guarantee tests
+// Clean-snapshot guarantee tests
 // ---------------------------------------------------------------------------
 
-describe('U5: clean-snapshot guarantees', () => {
+describe('clean-snapshot guarantees', () => {
   it('git archive produces no .git entry in the artifact', async () => {
     // #given — packageArtifact uses git archive which by design excludes .git
     // We verify the invariant by asserting the git archive command excludes .git

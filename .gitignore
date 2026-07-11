@@ -126,3 +126,6 @@ apps/workspace-agent/dist/
 # Deploy stack — secrets and local overrides
 deploy/secrets/
 deploy/compose.override.yaml
+
+# Stray review/tool JSON dumps written to the repo root
+/output.json

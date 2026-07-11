@@ -195,6 +195,62 @@ export interface BrowserGuardRejectedEvent {
   readonly githubUserId?: number
 }
 
+/**
+ * Coarse reason a push subscription record became inactive, as surfaced on
+ * the audit trail. Aligns with (but is a superset-safe mirror of) the
+ * store's `SubscriptionInactiveReason` taxonomy — snake_case to match the
+ * other reason enums in this module.
+ */
+export type PushDeactivationReason =
+  'dead_relay' | 'session_revoked' | 'transferred' | 'key_revoked' | 'privacy_delete' | 'unknown'
+
+/** Safe reasons the operator push surface is disabled at startup. */
+export type PushDisabledReason = 'config_absent' | 'self_test_failed'
+
+/** An operator registered a push subscription. Endpoint/keys are NEVER included. */
+export interface PushSubscribedEvent {
+  readonly kind: 'push.subscribed'
+  readonly correlationId: string
+  readonly githubUserId: number
+}
+
+/** An operator removed a push subscription. Endpoint is NEVER included. */
+export interface PushUnsubscribedEvent {
+  readonly kind: 'push.unsubscribed'
+  readonly correlationId: string
+  readonly githubUserId: number
+}
+
+/** A push subscription record was deactivated (session revoke, privacy delete, etc). */
+export interface PushSubscriptionDeactivatedEvent {
+  readonly kind: 'push.subscription.deactivated'
+  readonly correlationId: string
+  readonly githubUserId: number
+  readonly reason: PushDeactivationReason
+}
+
+/**
+ * Coarse per-broadcast dispatch summary — counts only, never per-operator
+ * rows, never endpoints. Records "a broadcast for trigger X reached N
+ * subscriptions, D died, F failed."
+ */
+export interface PushDispatchEvent {
+  readonly kind: 'push.dispatch'
+  /** The triggering run/approval id — same redaction class as requestId/runId. */
+  readonly correlationId: string
+  readonly trigger: 'approval' | 'run_failed'
+  readonly delivered: number
+  readonly dead: number
+  readonly failed: number
+}
+
+/** The operator push surface was disabled at startup. */
+export interface PushDisabledEvent {
+  readonly kind: 'push.disabled'
+  readonly correlationId: string
+  readonly reason: PushDisabledReason
+}
+
 /** All security-critical audit events. */
 export type AuditEvent =
   | AuthStartEvent
@@ -212,6 +268,11 @@ export type AuditEvent =
   | BrowserGuardRejectedEvent
   | RunCancelRequestedEvent
   | RunCancelRejectedEvent
+  | PushSubscribedEvent
+  | PushUnsubscribedEvent
+  | PushSubscriptionDeactivatedEvent
+  | PushDispatchEvent
+  | PushDisabledEvent
 
 // ---------------------------------------------------------------------------
 // Redaction
@@ -266,10 +327,11 @@ function redactIfSensitive(value: string): string {
  * Exhaustive log-level map: every AuditEvent kind must be present.
  * Adding a new variant without updating this map is a compile-time error.
  *
- * Note: 'approval.rejected' is intentionally absent — its level is reason-dependent.
- * See approvalRejectedLevel() below.
+ * Note: 'approval.rejected' and 'push.disabled' are intentionally absent —
+ * their levels are reason-dependent. See approvalRejectedLevel() and
+ * pushDisabledLevel() below.
  */
-const LOG_LEVEL: Record<Exclude<AuditEvent['kind'], 'approval.rejected'>, 'info' | 'warn'> = {
+const LOG_LEVEL: Record<Exclude<AuditEvent['kind'], 'approval.rejected' | 'push.disabled'>, 'info' | 'warn'> = {
   'auth.start': 'info',
   'auth.callback.success': 'info',
   'auth.callback.failure': 'warn',
@@ -284,6 +346,10 @@ const LOG_LEVEL: Record<Exclude<AuditEvent['kind'], 'approval.rejected'>, 'info'
   'browser.guard.rejected': 'warn',
   'run.cancel.requested': 'info',
   'run.cancel.rejected': 'warn',
+  'push.subscribed': 'info',
+  'push.unsubscribed': 'info',
+  'push.subscription.deactivated': 'info',
+  'push.dispatch': 'info',
 }
 
 /**
@@ -305,6 +371,24 @@ function approvalRejectedLevel(reason: ApprovalRejectedReason): 'info' | 'warn' 
     case 'scope_mismatch':
     case 'unknown':
     case 'deadline_expired':
+      return 'warn'
+  }
+}
+
+/**
+ * Per-reason log level for 'push.disabled' events.
+ *
+ * - 'config_absent': INFO — the normal, expected state for any deployment
+ *   that has not opted into operator push.
+ * - 'self_test_failed': WARN — the object store failed the startup CAS
+ *   self-test and push was forced closed; a genuine operational anomaly
+ *   that warrants attention.
+ */
+function pushDisabledLevel(reason: PushDisabledReason): 'info' | 'warn' {
+  switch (reason) {
+    case 'config_absent':
+      return 'info'
+    case 'self_test_failed':
       return 'warn'
   }
 }
@@ -348,6 +432,11 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
     case 'bearer.rejected':
     case 'browser.guard.rejected':
     case 'run.cancel.rejected':
+    case 'push.subscribed':
+    case 'push.unsubscribed':
+    case 'push.subscription.deactivated':
+    case 'push.dispatch':
+    case 'push.disabled':
       // No additional caller-controlled string fields on these variants.
       break
     default:
@@ -356,7 +445,12 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
   }
 
   try {
-    const level = event.kind === 'approval.rejected' ? approvalRejectedLevel(event.reason) : LOG_LEVEL[event.kind]
+    const level =
+      event.kind === 'approval.rejected'
+        ? approvalRejectedLevel(event.reason)
+        : event.kind === 'push.disabled'
+          ? pushDisabledLevel(event.reason)
+          : LOG_LEVEL[event.kind]
     if (level === 'warn') {
       logger.warn(ctx, msg)
     } else {

@@ -1048,7 +1048,7 @@ describe('parseSessionCookie — empty value', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Session store — OAuth token retention (Unit 3h)
+// Session store — OAuth token retention
 // ---------------------------------------------------------------------------
 
 describe('createInMemorySessionStore — getOperatorToken (token retention)', () => {

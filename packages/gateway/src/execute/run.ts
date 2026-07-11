@@ -5,6 +5,7 @@ import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
+import type {OperatorFailureKind} from '../operator-contract/run-status.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
@@ -28,6 +29,7 @@ import {sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
+import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {abortRegistry} from './abort-registry.js'
 import {attachOpencode} from './opencode-attach.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
@@ -127,6 +129,17 @@ export interface RunMentionDeps {
    * Fail-closed: any error result or thrown exception → treat as not-ready.
    */
   readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>
+  /**
+   * Operator push dispatcher — opt-in, present only when
+   * `GatewayConfig.operatorPush` is configured. Broadcasts a push
+   * notification to every active operator subscription on a pending
+   * approval or a failed run. Optional chaining at every call site keeps
+   * push fully inert (a no-op) when absent — push stays disabled-by-default.
+   */
+  readonly operatorPushDispatcher?: {
+    readonly dispatchApprovalPending: (approvalId: string) => Promise<void>
+    readonly dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
+  }
 }
 
 /**
@@ -624,7 +637,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // ── Operator-cancel registration ──────────────────────────────────────────
       // Registered only after EXECUTING commits — the pre-ACK/pre-EXECUTING window is
       // covered by the run-state conditional-write rendezvous (see the ACK/EXECUTING
-      // etag-mismatch handling above and Unit 2's orchestrator), not by this registry.
+      // etag-mismatch handling above and the cancellation orchestrator), not by this registry.
       // Always deleted in the outer finally below, regardless of settlement outcome.
       // The returned signal is composed into effectiveSignal at the timeout seam below.
       const cancelSignal = abortRegistry.register(runId)
@@ -748,6 +761,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           statusSink.setReaction('awaiting-approval')
           // Delegate to the resolved approval transport for notification + registry wiring.
           resolvedApprovalOnPending(req)
+          // Operator push — fire-and-forget, opt-in, and last so it can never
+          // preempt the real approval transports above. No-op when push is disabled.
+          // eslint-disable-next-line no-void
+          void deps.operatorPushDispatcher?.dispatchApprovalPending(req.requestID)
         },
         onReplied: event => {
           // Authoritative echo from OpenCode — let the registry render + cascade.
@@ -872,12 +889,12 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       if (wasCancelled === true) {
         // ── Operator-cancel settlement path ──────────────────────────────────────────
         // Distinct from the generic FAILED path below: settles CANCELLED, suppresses the
-        // user-facing failure reply (Unit 2's thread notice is the communication), and
+        // user-facing failure reply (the cancellation thread notice is the communication), and
         // still flushes partial output.
 
         // Replaces the working/awaiting reaction with the failed cue — no distinct
         // "cancelled" reaction exists yet; reusing 'failed' here is a UX nit, not a
-        // correctness issue (the thread notice, added in Unit 2, carries the real signal).
+        // correctness issue (the thread notice carries the real signal).
         statusSink.setReaction('failed')
 
         // heartbeat.stop() FIRST — its runEtag/lockEtag are the authoritative
@@ -908,7 +925,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
         // Transition to CANCELLED (best-effort) with the fresh heartbeat-stop etag.
         // Attribution: the abort-registry entry may carry `cancelledBy` metadata,
-        // written by `cancelRun` (Unit 2) alongside its `abort()` call. This is the
+        // written by `cancelRun` alongside its `abort()` call. This is the
         // single writer of the CANCELLED transition, so reading it back here (rather
         // than a follow-up write from the orchestrator) keeps attribution atomic with
         // the phase write and avoids a second etag round-trip.
@@ -976,6 +993,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             } else {
               logger.warn({repo, runId}, 'run: CANCELLED transition failed — fell back to FAILED terminalization')
               notifyObserverBestEffort(deps, failedFallbackResult.data.state)
+              // eslint-disable-next-line no-void
+              void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(fallbackFailureKind))
             }
           }
         } else {
@@ -987,7 +1006,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // was already updated above so the outer finally's releaseLock uses the fresh value.
 
         // Suppress the user-facing failure reply for operator-initiated cancels — no
-        // "task failed" message to the thread. Unit 2 posts the cancellation notice.
+        // "task failed" message to the thread. The cancellation notice is posted separately.
         // Log instead so the suppression is observable in gateway logs.
         logger.info({repo, runId}, 'run: cancelled — suppressing user-facing failure reply')
       } else {
@@ -1047,6 +1066,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // status frame (which closes run subscribers). Best-effort, fire-and-forget.
         if (failedStateForNotify !== undefined) {
           notifyObserverBestEffort(deps, failedStateForNotify)
+          // eslint-disable-next-line no-void
+          void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(inFlightFailureKind))
         }
 
         // Coarse user message — no internal detail

@@ -1,6 +1,6 @@
 /**
  * Tests for integrate-command.ts — config assembly, flag parsing, exit-code mapping,
- * artifact packaging (Unit 2).
+ * artifact packaging.
  *
  * No real merge runs here. runIntegration and makeRealAdapters are stubbed.
  * packageArtifact is injected as a stub for command-level tests; it is tested

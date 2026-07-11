@@ -544,7 +544,7 @@ describe('createBindingsStore', () => {
     }
   })
 
-  // ─── Unit 1: deny-key fields (databaseId / nodeId) ──────────────────────────
+  // ─── deny-key fields (databaseId / nodeId) ──────────────────────────
 
   // Happy path — binding with deny keys round-trips through the store
   it('createBinding + getBindingByRepo round-trips a binding that carries databaseId and nodeId', async () => {
