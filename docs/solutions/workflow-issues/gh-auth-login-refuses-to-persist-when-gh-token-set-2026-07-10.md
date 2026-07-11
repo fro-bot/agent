@@ -12,6 +12,7 @@ symptoms:
   - 'gh auth login --with-token exits 1: "The value of the GH_TOKEN environment variable is being used for authentication"'
 root_cause: config_error
 resolution_type: code_fix
+last_updated: 2026-07-11
 related_components:
   - gh-cli
   - github-actions
@@ -29,6 +30,8 @@ tags:
 # gh auth login --with-token refuses to persist credentials when GH_TOKEN is set, silently breaking the CI review bot
 
 ## Problem
+
+> **Update (2026-07-11):** the review-bot posting path described here changed in PR #1170. On `pull_request` / `issue_comment` / `issues` triggers the model no longer holds a `gh` credential at all — the harness posts the review from a response file ([details](../best-practices/response-file-is-untrusted-input-2026-07-11.md)). The off-environment `gh` auth store below is now provisioned only for `workflow_dispatch` / `schedule` flows, where this bug and fix remain fully live.
 
 Setup builds an off-environment `gh` auth store: a temporary `GH_CONFIG_DIR` with its own `hosts.yml`, so that after the harness scrubs `GH_TOKEN`/`GITHUB_TOKEN` from a model's child bash processes, `gh` invocations in that child still authenticate via the stored `hosts.yml` instead of a live token. This setup ran `gh auth login --with-token` while `process.env.GH_TOKEN` was still set in the parent process's environment. `gh auth login` intentionally refuses to write credentials when `GH_TOKEN` is present in its environment, exits 1, and `hosts.yml` is never written. Combined with the later env-scrub stripping `GH_TOKEN` from the child, the child ended up with no auth at all — `gh pr review` calls from the CI review bot silently failed.
 
