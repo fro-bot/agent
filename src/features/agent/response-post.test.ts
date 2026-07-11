@@ -421,6 +421,36 @@ describe('runResponsePost', () => {
     }
   })
 
+  it('resolves issue_comment on a PR to the pr-comment surface without requiring a verdict', async () => {
+    // #given an issue_comment trigger on a PR with a response file that has no verdict frontmatter
+    const filePath = await writeFixture('Body from the model.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running the response-post orchestration
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then it is delivered as a comment on the PR number, no verdict required
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        owner: 'owner',
+        repo: 'repo',
+        issue_number: 7,
+        body: expect.stringContaining('Body from the model.') as unknown as string,
+      }),
+    )
+  })
+
   it('rejects a malformed response file with an unknown frontmatter key', async () => {
     // #given a response file with a disallowed frontmatter key (attempted target injection)
     const filePath = await writeFixture('---\nnumber: 999\n---\n\nBody.')

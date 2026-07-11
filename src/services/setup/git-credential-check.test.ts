@@ -96,4 +96,41 @@ describe('assertNoPersistedGitCredentials', () => {
     })
     expect(result.success === false && result.error).not.toContain('ghs_secrettoken')
   })
+
+  it('resolves ok when the origin remote URL carries a bare username with no colon', async () => {
+    // #given a remote URL with userinfo but no password (no colon, no secret)
+    const getExecOutput = vi.fn().mockImplementation(async (_cmd: string, args?: string[]) => {
+      if (args?.includes('--get-regexp')) {
+        return {exitCode: 1, stdout: '', stderr: ''}
+      }
+      return {exitCode: 0, stdout: 'https://someuser@github.com/owner/repo\n', stderr: ''}
+    })
+    const mockExec = createMockExecAdapter({getExecOutput})
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(mockExec, '/workspace', mockLogger)
+
+    // #then a bare username carries no secret, so this is allowed
+    expect(result.success).toBe(true)
+  })
+
+  it('errs when the origin remote URL carries a colon with an empty password', async () => {
+    // #given a remote URL with a colon but an empty password segment
+    const getExecOutput = vi.fn().mockImplementation(async (_cmd: string, args?: string[]) => {
+      if (args?.includes('--get-regexp')) {
+        return {exitCode: 1, stdout: '', stderr: ''}
+      }
+      return {exitCode: 0, stdout: 'https://user:@github.com/owner/repo\n', stderr: ''}
+    })
+    const mockExec = createMockExecAdapter({getExecOutput})
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(mockExec, '/workspace', mockLogger)
+
+    // #then the presence of a colon is treated as a credential boundary, deliberately broad
+    expect(result).toEqual({
+      success: false,
+      error: expect.stringContaining('persist-credentials: false') as string,
+    })
+  })
 })

@@ -72,6 +72,13 @@ export async function assertNoPersistedGitCredentials(
  * Detects a credential embedded in a remote URL (e.g.
  * `https://x-access-token:<token>@github.com/owner/repo`) without ever
  * logging the matched substring — the caller only receives a boolean.
+ *
+ * Deliberately broad: ANY userinfo containing a `:` (a password/token
+ * component, even an empty one) is treated as a credential, whatever its
+ * shape — this check runs only on credential-withheld runs, where refusing
+ * an unusual-but-legitimate remote is acceptable and letting a token
+ * through is not. A bare username (`https://user@host/...`) carries no
+ * secret and is allowed.
  */
 function hasEmbeddedCredential(remoteUrl: string): boolean {
   const atIndex = remoteUrl.indexOf('@')
