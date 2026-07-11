@@ -1,5 +1,6 @@
 import type {Logger} from '../shared/logger.js'
 import type {OmoProviders, OmoSlimPreset} from '../shared/types.js'
+import type {CredentialDisposition} from './response-delivery.js'
 
 /**
  * Setup action inputs needed by the runtime's auto-setup path.
@@ -20,6 +21,7 @@ export interface SetupInputs {
   readonly enableOmoSlim: boolean
   readonly omoSlimVersion: string
   readonly omoSlimPreset: OmoSlimPreset
+  readonly credential: CredentialDisposition
 }
 
 export interface SetupAdapter {

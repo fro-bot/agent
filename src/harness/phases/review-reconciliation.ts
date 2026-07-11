@@ -9,8 +9,8 @@
 
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
+import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../../features/reviews/review-guards.js'
 import {decideReconciliation, parseVerdict} from '../../features/reviews/review-reconciliation.js'
-import {submitReview} from '../../features/reviews/reviewer.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -31,6 +31,15 @@ export interface ReviewReconciliationParams {
   readonly isPullRequestReviewTrigger: boolean
   /** True when responseMode is 'github' */
   readonly responseModeIsGithub: boolean
+  /**
+   * True when this run's response is delivered via the file-convention path.
+   * Finalize owns posting for file-convention runs (see response-post.ts);
+   * reconciliation is the legacy model-gh backstop and must not also act on
+   * this run, so it early-skips here for clarity and to avoid wasted API
+   * calls (it would naturally no-op anyway, since the model posts no review
+   * under file-convention).
+   */
+  readonly isFileConventionDelivery: boolean
   /** True when the agent session completed successfully */
   readonly agentSucceeded: boolean
   /** Run start time in milliseconds (Date.now() at run start) */
@@ -47,15 +56,6 @@ export interface ReviewReconciliationOutcome {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Normalize a GitHub login for comparison.
- * Strips the `[bot]` suffix and lowercases.
- * Used only for the self-authored-PR guard (conservative).
- */
-function normalizeLogin(login: string): string {
-  return login.toLowerCase().replace(/\[bot\]$/i, '')
-}
 
 /**
  * Returns true when the review was authored by the bot.
@@ -99,11 +99,16 @@ export async function runReviewReconciliation(
     responseModeIsGithub,
     agentSucceeded,
     runStartMs,
+    isFileConventionDelivery,
   } = params
 
   // -------------------------------------------------------------------------
   // Early no-op guards — zero octokit calls
   // -------------------------------------------------------------------------
+
+  if (isFileConventionDelivery === true) {
+    return {reconciled: false, reason: 'finalize-owns-response'}
+  }
 
   if (isPullRequestReviewTrigger === false) {
     return {reconciled: false, reason: 'not-pr-review-trigger'}
@@ -132,31 +137,19 @@ export async function runReviewReconciliation(
   logger.info('Review reconciliation: phase entered', {prNumber})
 
   try {
-    const normalizedBotLogin = normalizeLogin(botLogin)
+    // Step 1: Fetch current PR state (head SHA, author, fork status) and
+    // apply the self-authored / fork guards (shared with the file-convention
+    // response-post path).
+    const forkOrSelfGuard = await checkForkOrSelfGuard(
+      {octokit, owner, repo, prNumber, botLogin, event: 'APPROVE'},
+      logger,
+    )
 
-    // Step 1: Fetch current PR state (head SHA, author, fork status)
-    const prResponse = await octokit.rest.pulls.get({
-      owner,
-      repo,
-      pull_number: prNumber,
-    })
-
-    const currentHeadSha: string = prResponse.data.head.sha
-    const prAuthorLogin: string = prResponse.data.user.login
-    const headRepoFullName: string = prResponse.data.head.repo?.full_name ?? ''
-    const baseRepoFullName: string = prResponse.data.base.repo.full_name
-
-    // Guard: self-authored PR (bot is the PR author) — normalized comparison is fine here
-    if (normalizeLogin(prAuthorLogin) === normalizedBotLogin) {
-      logger.info('Review reconciliation: skipping self-authored PR', {prNumber, prAuthorLogin})
-      return {reconciled: false, reason: 'self-or-fork'}
+    if (forkOrSelfGuard.allowed === false) {
+      return {reconciled: false, reason: forkOrSelfGuard.reason}
     }
 
-    // Guard: fork PR (head repo differs from base repo)
-    if (headRepoFullName !== baseRepoFullName) {
-      logger.info('Review reconciliation: skipping fork PR', {prNumber, headRepoFullName, baseRepoFullName})
-      return {reconciled: false, reason: 'self-or-fork'}
-    }
+    const currentHeadSha = forkOrSelfGuard.currentHeadSha
 
     // Step 2: Fetch bot's reviews on this PR.
     // Single page (max 100). On a PR with >100 reviews the latest bot review
@@ -227,41 +220,24 @@ export async function runReviewReconciliation(
       return {reconciled: false, reason: decision.reason}
     }
 
-    // Step 5: Re-fetch PR head immediately before submitting to close the TOCTOU window.
-    // If the head moved since Step 1, abort — we must not approve an unreviewed commit.
-    const freshPrResponse = await octokit.rest.pulls.get({
-      owner,
-      repo,
-      pull_number: prNumber,
-    })
-
-    const freshHeadSha: string = freshPrResponse.data.head.sha
-
-    if (freshHeadSha !== currentHeadSha) {
-      logger.info('Review reconciliation: head moved before submit, aborting', {
-        prNumber,
-        originalHead: currentHeadSha,
-        freshHead: freshHeadSha,
-      })
-      return {reconciled: false, reason: 'head-moved-before-submit'}
-    }
-
-    // Step 6: Submit formal APPROVE, pinned to the reviewed SHA
-    logger.info('Review reconciliation: submitting APPROVE', {prNumber, currentHeadSha})
-
-    await submitReview(
-      octokit,
+    // Step 5+6: Re-fetch PR head immediately before submitting (closes the
+    // TOCTOU window) and submit formal APPROVE, pinned to the reviewed SHA.
+    const submitOutcome = await submitReviewWithHeadGuard(
       {
-        prNumber,
+        octokit,
         owner,
         repo,
+        prNumber,
         event: 'APPROVE',
         body: 'Approving to match the review verdict above.',
-        comments: [],
-        commitSha: currentHeadSha,
+        currentHeadSha,
       },
       logger,
     )
+
+    if (submitOutcome.submitted === false) {
+      return {reconciled: false, reason: submitOutcome.reason}
+    }
 
     logger.info('Review reconciliation: APPROVE submitted successfully', {prNumber})
     return {reconciled: true, reason: 'approved'}

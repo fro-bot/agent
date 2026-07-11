@@ -1,4 +1,5 @@
 import type {Buffer} from 'node:buffer'
+import type {CredentialDisposition} from '@fro-bot/runtime'
 
 import type {Logger} from '../../shared/logger.js'
 import type {OmoProviders, OmoSlimPreset} from '../../shared/types.js'
@@ -23,6 +24,12 @@ export interface SetupInputs {
   readonly enableOmoSlim: boolean
   readonly omoSlimPreset: OmoSlimPreset
   readonly omoSlimVersion: string
+  /**
+   * Whether the child's GitHub token should be withheld ('withhold') or
+   * provisioned as today ('provision'). Resolved once at bootstrap from the
+   * raw event name via `resolveResponseDelivery` (see @fro-bot/runtime).
+   */
+  readonly credential: CredentialDisposition
 }
 
 /**

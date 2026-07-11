@@ -50,6 +50,7 @@ export interface EnsureOpenCodeOptions {
   readonly enableOmoSlim: boolean
   readonly omoSlimVersion: string
   readonly omoSlimPreset: SetupInputs['omoSlimPreset']
+  readonly credential: SetupInputs['credential']
 }
 
 export async function ensureOpenCodeAvailable(
@@ -81,6 +82,7 @@ export async function ensureOpenCodeAvailable(
     enableOmoSlim: options.enableOmoSlim,
     omoSlimVersion: options.omoSlimVersion,
     omoSlimPreset: options.omoSlimPreset,
+    credential: options.credential,
   }
   const setupResult = await setupAdapter.runSetup(setupInputs, options.githubToken)
   if (setupResult == null) {
