@@ -43,6 +43,21 @@ export function logServerEvent(event: Event, logger: Logger): void {
   }
 }
 
+/**
+ * Scans a bash command + its output for artifacts the model created directly
+ * via `gh`/`git` (PR URLs, commit SHAs, posted-comment URLs).
+ *
+ * The comment-URL branch only fires when the model itself ran `gh issue
+ * comment`/`gh pr comment` — true for autonomous flows (`workflow_dispatch`,
+ * `schedule`) that keep the GitHub credential and self-post. For flows that
+ * post through the action-owned response-file convention, the model never
+ * runs those `gh` commands (the credential is withheld and the prompt tells
+ * it to write a file instead), so this branch simply never matches and
+ * `commentsPosted` for those runs stays at 0 here; the count is sourced
+ * separately from the finalize post (`runFinalize` calls
+ * `metrics.incrementComments()` after the response is delivered). The two
+ * sources are mutually exclusive per run, so there is no double-count.
+ */
 export function detectArtifacts(
   command: string,
   output: string,
@@ -324,6 +339,10 @@ export async function processEventStream(
  * Called after the live SSE stream completes to reconcile any artifacts the stream may have missed.
  * No console writes — only detects PR/commit/comment artifacts from bash tool parts.
  * Returns a partial EventStreamResult with artifacts detected from the bash tool parts.
+ *
+ * Like `detectArtifacts`, the comment count this returns only reflects a
+ * model self-post via `gh` (autonomous flows); it stays 0 for
+ * response-file-convention flows, whose count comes from the finalize post.
  */
 export function detectArtifactsFromMessageParts(
   parts: readonly unknown[],
