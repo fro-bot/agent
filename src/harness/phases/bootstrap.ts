@@ -9,6 +9,8 @@ import * as core from '@actions/core'
 import * as github from '@actions/github'
 import {buildResponseFileDir, buildResponseFilePath, resolveResponseDelivery} from '@fro-bot/runtime'
 import {ensureOpenCodeAvailable} from '../../features/agent/index.js'
+import {createExecAdapter} from '../../services/setup/adapters.js'
+import {assertNoPersistedGitCredentials} from '../../services/setup/git-credential-check.js'
 import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getGitHubRunId} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
@@ -64,6 +66,20 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
   // Resolved once, from the raw event name, before setup runs any credential
   // provisioning — routing later asserts its own classification agrees.
   const {credential, delivery} = resolveResponseDelivery(github.context.eventName, inputs.responseMode)
+
+  // Preflight fail-closed assertion: for withhold runs, the checkout must
+  // carry no persisted git credentials before the model ever starts — a
+  // `persist-credentials: true` (the actions/checkout default) or a
+  // credentialed remote URL would let the model's bash exfiltrate the same
+  // token this delivery mode is designed to keep out of its reach.
+  if (credential === 'withhold') {
+    const workspaceDir = process.env.GITHUB_WORKSPACE ?? process.cwd()
+    const credentialCheck = await assertNoPersistedGitCredentials(createExecAdapter(), workspaceDir, logger)
+    if (credentialCheck.success === false) {
+      core.setFailed(`Refusing to proceed with credential withheld: ${credentialCheck.error}`)
+      return null
+    }
+  }
 
   const responseFilePath = await resolveResponseFilePath(delivery, logger)
 

@@ -74,6 +74,28 @@ export async function runFinalize(
 
     responsePostLogger.info('Delivered file-convention response', {kind: result.kind})
     metrics.incrementComments()
+
+    // Delivery succeeded, but the underlying execution may still have failed
+    // (e.g. the model wrote a valid response file and then the process
+    // exited non-zero for an unrelated reason). Preserve that failure rather
+    // than always returning 0.
+    if (execution.success === false) {
+      if (execution.llmError == null) {
+        core.setFailed(`Agent execution failed with exit code ${execution.exitCode}`)
+        return execution.exitCode
+      }
+
+      // Recoverable LLM error, but the response was already delivered above —
+      // posting a second error comment would violate the one-response-per-run
+      // invariant. Log and return success; the delivered response wins.
+      logger.info('Agent failed with recoverable LLM error, but a response was already delivered', {
+        error: execution.llmError.message,
+        type: execution.llmError.type,
+        durationMs: duration,
+      })
+      return 0
+    }
+
     logger.info('Agent run completed successfully', {durationMs: duration})
     return 0
   }

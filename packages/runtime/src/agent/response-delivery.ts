@@ -55,14 +55,45 @@ function classifyEvent(eventName: string): EventClassification {
  *   yields 'none' delivery, regardless of trigger), then on whether the
  *   trigger is affected (file-convention) or not (model-gh).
  */
+function assertNever(value: never): never {
+  throw new Error(`Unexpected value: ${String(value)}`)
+}
+
+function resolveCredential(classification: EventClassification): CredentialDisposition {
+  switch (classification) {
+    case 'affected':
+      return 'withhold'
+
+    case 'autonomous':
+    case 'deferred-or-unknown':
+      return 'provision'
+
+    default:
+      return assertNever(classification)
+  }
+}
+
+function resolveDelivery(classification: EventClassification): ResponseDelivery {
+  switch (classification) {
+    case 'affected':
+      return 'file-convention'
+
+    case 'autonomous':
+    case 'deferred-or-unknown':
+      return 'model-gh'
+
+    default:
+      return assertNever(classification)
+  }
+}
+
 export function resolveResponseDelivery(eventName: string, responseMode: ResponseMode): ResponseDeliveryDecision {
   const classification = classifyEvent(eventName)
-  const credential: CredentialDisposition = classification === 'affected' ? 'withhold' : 'provision'
+  const credential = resolveCredential(classification)
 
   if (responseMode === 'none') {
     return {delivery: 'none', credential}
   }
 
-  const delivery: ResponseDelivery = classification === 'affected' ? 'file-convention' : 'model-gh'
-  return {delivery, credential}
+  return {delivery: resolveDelivery(classification), credential}
 }

@@ -33,6 +33,14 @@ export async function configureGhAuth(
   // reads process.env.GH_TOKEN or the gh CLI config.
   if (provisionChildCredential) {
     process.env.GH_TOKEN = token
+  } else {
+    // An ambient GH_CONFIG_DIR left over from an earlier authed workflow
+    // step (e.g. actions/checkout with a token, or a prior `gh auth login`)
+    // would otherwise pass the env-scrub allowlist and reach the model's
+    // child unauthenticated-in-name-only — `gh` would fall back to that
+    // config and effectively re-authenticate. Clear it so withholding is
+    // actually withholding.
+    delete process.env.GH_CONFIG_DIR
   }
 
   logger.info('Configured authentication', {method})

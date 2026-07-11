@@ -25,6 +25,7 @@ import {
   buildHarnessRulesSection,
   buildThreadIdentitySection,
 } from './prompt-thread.js'
+import {RESPONSE_FILE_VERDICT_KEY, RESPONSE_FILE_VERDICTS} from './response-file.js'
 
 export interface TriggerDirective {
   readonly directive: string
@@ -83,12 +84,19 @@ export function getTriggerDirective(
 }
 
 function buildPullRequestDirective(responseDelivery: ResponseDelivery): string {
+  if (responseDelivery === 'none') {
+    return [
+      'Review this pull request for code quality, potential bugs, and improvements.',
+      'This run is silent: do not post a comment or review, do not write a response file, and do not call `gh` to post anything. Report your findings only in your assistant message and session summary.',
+    ].join('\n')
+  }
+
   if (responseDelivery === 'file-convention') {
     return [
       'Review this pull request for code quality, potential bugs, and improvements.',
-      'Deliver your verdict via the response file (see Response Protocol): `verdict: approve` in the frontmatter for a PASS verdict, `verdict: request-changes` for a CONDITIONAL or REJECT verdict.',
-      'A comment-only response does NOT satisfy a requested review and leaves the PR blocked on review-required. Once you reach a verdict you MUST set `verdict: approve` or `verdict: request-changes` — never omit it or bury it in prose.',
-      'This applies equally to re-reviews (after a push or dismissed review): a follow-up validation still requires a `verdict:` frontmatter value.',
+      `Deliver your verdict via the response file (see Response Protocol): \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\` in the frontmatter for a PASS verdict, \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\` for a CONDITIONAL or REJECT verdict.`,
+      `A comment-only response does NOT satisfy a requested review and leaves the PR blocked on review-required. Once you reach a verdict you MUST set \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\` — never omit it or bury it in prose.`,
+      `This applies equally to re-reviews (after a push or dismissed review): a follow-up validation still requires a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter value.`,
       'If the author is a collaborator, prioritize actionable feedback over style nits.',
     ].join('\n')
   }
@@ -756,7 +764,7 @@ You MUST deliver exactly ONE response per invocation by writing it to the respon
 2. **Write to this exact path:** \`${responseFilePath ?? '<response file path>'}\`
 3. **Write SYNCHRONOUSLY, in the foreground.** Use a blocking command such as a heredoc (\`cat > "${responseFilePath ?? '<response file path>'}" <<'EOF' ... EOF\`). Do NOT background the write (no \`&\`, \`nohup\`, or \`disown\`) — a backgrounded write may not be flushed to disk before this run ends, and your response will be lost.
 4. **One write per run.** Write the file exactly once. Do not write it more than once.
-5. **For a PR review, include a \`verdict:\` frontmatter key** at the top of the file with value \`approve\` or \`request-changes\` (PASS → \`approve\`; CONDITIONAL or REJECT → \`request-changes\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.
+    5. **For a PR review, include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.
 6. **Include the Run Summary** at the end of the body (see template below), including the \`<!-- fro-bot-agent -->\` marker.
 
 **File Format (comment, no frontmatter):**
@@ -764,7 +772,7 @@ ${runSummaryTemplate}
 **File Format (PR review, with verdict frontmatter):**
 \`\`\`markdown
 ---
-verdict: approve
+${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}
 ---
 ${runSummaryBlock}
 \`\`\`
@@ -904,7 +912,7 @@ function buildOutputContractSection(context: AgentContext, responseDelivery: Res
 
   if (responseDelivery === 'file-convention') {
     lines.push(
-      `- Review action (REQUIRED): deliver the verdict that matches your review via the \`verdict:\` frontmatter key in the response file — PASS → \`verdict: approve\`, CONDITIONAL or REJECT → \`verdict: request-changes\`. Omitting \`verdict:\` does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it via the frontmatter. This applies on re-reviews too — never omit the \`verdict:\` key.`,
+      `- Review action (REQUIRED): deliver the verdict that matches your review via the \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key in the response file — PASS → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\`, CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\`. Omitting \`${RESPONSE_FILE_VERDICT_KEY}:\` does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it via the frontmatter. This applies on re-reviews too — never omit the \`${RESPONSE_FILE_VERDICT_KEY}:\` key.`,
     )
   } else if (responseDelivery === 'none') {
     lines.push(

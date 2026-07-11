@@ -13,9 +13,31 @@ export const MAX_BODY_BYTES = 65_536
 
 export type ResponseSurface = 'issue-comment' | 'pr-comment' | 'pr-review'
 
+/**
+ * The frontmatter key that carries a PR review verdict. Exported so prompt
+ * construction can reference the exact key name instead of hardcoding it,
+ * keeping the model-facing instructions and the parser in lockstep.
+ */
+export const RESPONSE_FILE_VERDICT_KEY = 'verdict' as const
+
+/**
+ * The frontmatter key that carries an optional schema version.
+ */
+export const RESPONSE_FILE_SCHEMA_VERSION_KEY = 'schemaVersion' as const
+
+/**
+ * The allowed values for the `verdict` frontmatter key. Exported so prompt
+ * construction can interpolate the exact accepted values instead of
+ * hardcoding them, keeping the model-facing instructions and the parser in
+ * lockstep.
+ */
+export const RESPONSE_FILE_VERDICTS = ['approve', 'request-changes'] as const
+
+export type ResponseFileVerdict = (typeof RESPONSE_FILE_VERDICTS)[number]
+
 export interface ParsedResponse {
   readonly body: string
-  readonly verdict?: 'approve' | 'request-changes'
+  readonly verdict?: ResponseFileVerdict
 }
 
 export type ResponseFileErrorReason =
@@ -70,9 +92,21 @@ interface Frontmatter {
   readonly schemaVersion?: string
 }
 
-const ALLOWED_FRONTMATTER_KEYS = new Set(['verdict', 'schemaVersion'])
+const ALLOWED_FRONTMATTER_KEYS = new Set<string>([RESPONSE_FILE_VERDICT_KEY, RESPONSE_FILE_SCHEMA_VERSION_KEY])
+const VERDICT_VALUES = new Set<string>(RESPONSE_FILE_VERDICTS)
 const FRONTMATTER_DELIMITER = '---'
 
+/**
+ * Splits a raw response file into an optional frontmatter block and a body.
+ *
+ * A leading `---` line is only treated as the start of a frontmatter block
+ * when a matching closing `---` line is found. If the file's first line is
+ * `---` but no closing fence exists anywhere after it, the leading `---` is
+ * NOT frontmatter — it's just the first line of the body (e.g. a response
+ * that legitimately opens with a markdown horizontal rule) — and the whole
+ * file is treated as body-only. This is a fail-closed choice: we never guess
+ * at a malformed frontmatter block, we just fall back to "no frontmatter".
+ */
 function splitFrontmatter(
   raw: string,
 ): Result<{readonly frontmatter: string | null; readonly body: string}, ResponseFileError> {
@@ -82,17 +116,17 @@ function splitFrontmatter(
 
   const afterOpen = raw.slice(FRONTMATTER_DELIMITER.length)
   // The opening delimiter must be followed by a newline (a bare '---' body line
-  // with no closing fence is not frontmatter — it's malformed).
+  // with no closing fence is not frontmatter — it's body-only).
   const openNewlineIndex = afterOpen.indexOf('\n')
   if (openNewlineIndex === -1) {
-    return err(createResponseFileError('malformed-frontmatter', 'Response file has an unterminated frontmatter block'))
+    return ok({frontmatter: null, body: raw})
   }
 
   const rest = afterOpen.slice(openNewlineIndex + 1)
   const closeDelimiter = `\n${FRONTMATTER_DELIMITER}`
   const closeIndex = rest.indexOf(closeDelimiter)
   if (closeIndex === -1) {
-    return err(createResponseFileError('malformed-frontmatter', 'Response file has an unterminated frontmatter block'))
+    return ok({frontmatter: null, body: raw})
   }
 
   const frontmatterBlock = rest.slice(0, closeIndex)
@@ -131,9 +165,9 @@ function parseFrontmatterBlock(block: string): Result<Frontmatter, ResponseFileE
       return err(createResponseFileError('unknown-key', `Frontmatter key "${key}" is not permitted`))
     }
 
-    if (key === 'verdict') {
+    if (key === RESPONSE_FILE_VERDICT_KEY) {
       result.verdict = value
-    } else if (key === 'schemaVersion') {
+    } else if (key === RESPONSE_FILE_SCHEMA_VERSION_KEY) {
       result.schemaVersion = value
     }
   }
@@ -197,9 +231,9 @@ export function parseResponseFile(
     return err(createResponseFileError('missing-verdict-value', 'Frontmatter "verdict" key has no value'))
   }
 
-  if (verdict !== 'approve' && verdict !== 'request-changes') {
+  if (VERDICT_VALUES.has(verdict) === false) {
     return err(createResponseFileError('unknown-verdict', `Unknown verdict value: "${verdict}"`))
   }
 
-  return ok({body: trimmedBody, verdict})
+  return ok({body: trimmedBody, verdict: verdict as ResponseFileVerdict})
 }

@@ -162,7 +162,7 @@ describe('parseResponseFile', () => {
     expect(result.success === false ? result.error.reason : undefined).toBe('empty')
   })
 
-  it('rejects malformed frontmatter with an unterminated delimiter', () => {
+  it('treats an unterminated frontmatter-looking block as body-only rather than erroring', () => {
     // #given
     const raw = '---\nverdict: approve\nBody with no closing fence'
 
@@ -170,7 +170,7 @@ describe('parseResponseFile', () => {
     const result = parseResponseFile(raw, {surface: 'pr-review'})
 
     // #then
-    expect(result.success === false ? result.error.reason : undefined).toBe('malformed-frontmatter')
+    expect(result).toEqual({success: true, data: {body: raw}})
   })
 
   it('rejects verdict on a non-review surface', () => {
@@ -205,6 +205,34 @@ describe('parseResponseFile', () => {
 
     // #then
     expect(result.success === false ? result.error.reason : undefined).toBe('body-too-large')
+  })
+
+  it('treats a body-only file whose first line is "---" with no closing fence as body, not frontmatter', () => {
+    // #given
+    const raw = '---\nThis is prose that starts with a horizontal rule, not frontmatter.'
+
+    // #when
+    const result = parseResponseFile(raw, {surface: 'issue-comment'})
+
+    // #then
+    expect(result).toEqual({
+      success: true,
+      data: {body: '---\nThis is prose that starts with a horizontal rule, not frontmatter.'},
+    })
+  })
+
+  it('preserves a body that legitimately starts with "---" after real frontmatter', () => {
+    // #given
+    const raw = '---\nverdict: approve\n---\n---\nThis body line is a markdown rule, not frontmatter.'
+
+    // #when
+    const result = parseResponseFile(raw, {surface: 'pr-review'})
+
+    // #then
+    expect(result).toEqual({
+      success: true,
+      data: {body: '---\nThis body line is a markdown rule, not frontmatter.', verdict: 'approve'},
+    })
   })
 
   it('accepts schemaVersion alongside verdict as an allowlisted key', () => {

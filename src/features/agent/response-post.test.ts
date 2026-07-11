@@ -59,6 +59,8 @@ function makeOctokit(overrides?: {
   readonly createComment?: () => unknown
   readonly getPR?: () => unknown
   readonly createReview?: () => unknown
+  readonly getIssue?: () => unknown
+  readonly listComments?: () => unknown
 }) {
   const defaultComment = {data: {id: 1, html_url: 'https://github.com/owner/repo/issues/42#issuecomment-1'}}
   const defaultPR = {
@@ -69,11 +71,15 @@ function makeOctokit(overrides?: {
     },
   }
   const defaultReview = {data: {id: 1, state: 'APPROVED', html_url: 'https://github.com/owner/repo/pull/1/reviews/1'}}
+  const defaultIssue = {data: {title: 'Title', body: 'Body', user: {login: 'someone'}}}
+  const defaultComments = {data: []}
 
   return {
     rest: {
       issues: {
         createComment: vi.fn().mockResolvedValue(overrides?.createComment?.() ?? defaultComment),
+        get: vi.fn().mockResolvedValue(overrides?.getIssue?.() ?? defaultIssue),
+        listComments: vi.fn().mockResolvedValue(overrides?.listComments?.() ?? defaultComments),
       },
       pulls: {
         get: vi.fn().mockResolvedValue(overrides?.getPR?.() ?? defaultPR),
@@ -299,6 +305,120 @@ describe('runResponsePost', () => {
     // #then delivery fails closed after the bounded retry attempts
     expect(result.delivered).toBe(false)
     expect((result as {reason: string}).reason).toBe('post-failed')
+  })
+
+  it('does not probe on the first attempt (only creates)', async () => {
+    // #given a valid response file that posts successfully on the first attempt
+    const filePath = await writeFixture('Body from the model.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running the response-post orchestration
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'issue', issueNumber: 42}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then delivery succeeds and the probe (listComments/get) is never invoked
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledOnce()
+    expect(octokit.rest.issues.get).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.listComments).not.toHaveBeenCalled()
+  })
+
+  it("treats an ambiguous failure as delivered when the probe finds this run's marker", async () => {
+    // #given the first create attempt throws (ambiguous failure), but the comment actually landed
+    process.env.GITHUB_RUN_ID = '999'
+    process.env.GITHUB_RUN_ATTEMPT = '1'
+    const filePath = await writeFixture('Body from the model.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({
+      listComments: () => ({
+        data: [
+          {
+            id: 5,
+            body: `Body from the model.\n<!-- fro-bot-agent -->\n<!-- fro-bot-response:999-1 -->`,
+            user: {login: 'fro-bot[bot]'},
+            author_association: 'NONE',
+            created_at: '2024-01-01T00:00:00Z',
+            updated_at: '2024-01-01T00:00:00Z',
+          },
+        ],
+      }),
+    })
+    octokit.rest.issues.createComment.mockRejectedValueOnce(new Error('network blip'))
+
+    try {
+      // #when running the response-post orchestration
+      const result = await runResponsePost(
+        {
+          octokit: octokit as unknown as Octokit,
+          agentContext: makeAgentContext({issueType: 'issue', issueNumber: 42}),
+          triggerResult: makeTriggerResult('issue_comment'),
+          botLogin: 'fro-bot[bot]',
+          responseFilePath: filePath,
+        },
+        logger,
+      )
+
+      // #then the probe finds this run's marker and delivery succeeds without a second create
+      expect(result).toEqual({delivered: true, kind: 'comment'})
+      expect(octokit.rest.issues.createComment).toHaveBeenCalledOnce()
+      expect(octokit.rest.issues.listComments).toHaveBeenCalled()
+    } finally {
+      delete process.env.GITHUB_RUN_ID
+      delete process.env.GITHUB_RUN_ATTEMPT
+    }
+  })
+
+  it("creates a new comment when the probe only finds a previous run's marker comment", async () => {
+    // #given a previous run's response comment exists (different run id), and this run's create ambiguously fails once
+    process.env.GITHUB_RUN_ID = '999'
+    process.env.GITHUB_RUN_ATTEMPT = '1'
+    const filePath = await writeFixture('Body from the model.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({
+      listComments: () => ({
+        data: [
+          {
+            id: 5,
+            body: `Old response.\n<!-- fro-bot-agent -->\n<!-- fro-bot-response:111-1 -->`,
+            user: {login: 'fro-bot[bot]'},
+            author_association: 'NONE',
+            created_at: '2024-01-01T00:00:00Z',
+            updated_at: '2024-01-01T00:00:00Z',
+          },
+        ],
+      }),
+    })
+    octokit.rest.issues.createComment.mockRejectedValueOnce(new Error('network blip'))
+
+    try {
+      // #when running the response-post orchestration
+      const result = await runResponsePost(
+        {
+          octokit: octokit as unknown as Octokit,
+          agentContext: makeAgentContext({issueType: 'issue', issueNumber: 42}),
+          triggerResult: makeTriggerResult('issue_comment'),
+          botLogin: 'fro-bot[bot]',
+          responseFilePath: filePath,
+        },
+        logger,
+      )
+
+      // #then the previous run's marker does not satisfy the probe, so a new comment is created
+      expect(result).toEqual({delivered: true, kind: 'comment'})
+      expect(octokit.rest.issues.createComment).toHaveBeenCalledTimes(2)
+    } finally {
+      delete process.env.GITHUB_RUN_ID
+      delete process.env.GITHUB_RUN_ATTEMPT
+    }
   })
 
   it('rejects a malformed response file with an unknown frontmatter key', async () => {

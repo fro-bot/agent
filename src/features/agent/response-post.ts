@@ -16,8 +16,10 @@ import type {TriggerResultProcess} from '../../features/triggers/types.js'
 import type {Logger} from '../../shared/logger.js'
 
 import * as fs from 'node:fs/promises'
+import process from 'node:process'
 import {parseResponseFile} from '@fro-bot/runtime'
 import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../services/github/types.js'
+import {readThread} from '../comments/reader.js'
 import {postComment} from '../comments/writer.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../reviews/review-guards.js'
 
@@ -30,7 +32,12 @@ import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../reviews/review
 const TRANSIENT_RETRY_ATTEMPTS = 3
 
 export type ResponsePostFailureReason =
-  'file-read-failed' | 'parse-failed' | 'missing-target-context' | 'post-failed' | 'review-guard-blocked'
+  | 'file-read-failed'
+  | 'parse-failed'
+  | 'missing-target-context'
+  | 'missing-verdict'
+  | 'post-failed'
+  | 'review-guard-blocked'
 
 export interface ResponsePostFailure {
   readonly delivered: false
@@ -62,6 +69,22 @@ function withMarker(body: string): string {
 }
 
 /**
+ * Run-scoped marker distinguishing THIS invocation's response comment from
+ * any earlier response comment on the same thread. `BOT_COMMENT_MARKER`
+ * alone only identifies "a bot response", which is ambiguous across repeat
+ * @-mentions on the same issue/PR.
+ */
+function runMarker(): string {
+  const runId = process.env.GITHUB_RUN_ID ?? 'local'
+  const runAttempt = process.env.GITHUB_RUN_ATTEMPT ?? '1'
+  return `<!-- fro-bot-response:${runId}-${runAttempt} -->`
+}
+
+function withRunMarker(body: string): string {
+  return `${body}\n${runMarker()}`
+}
+
+/**
  * Derives the response-file surface (comment vs. review) and the Octokit
  * comment target strictly from the trusted routing context — never from the
  * response file itself.
@@ -88,13 +111,45 @@ function deriveSurfaceAndTarget(
   return {surface: 'issue-comment', target: {type: 'issue', number, owner, repo}}
 }
 
+/**
+ * Posts the response comment with bounded retries for transient writer
+ * failures. Idempotency is a run-scoped marker probe, NOT `updateExisting`:
+ * `postComment`'s updateExisting path finds the LAST bot comment carrying
+ * the generic `BOT_COMMENT_MARKER`, which on a repeat @-mention in the same
+ * thread is the PREVIOUS invocation's response — using it here would
+ * silently overwrite that prior answer instead of posting a new one (the
+ * Response Protocol requires exactly one new comment per invocation).
+ *
+ * Attempt 1 always creates. On a later attempt (after an ambiguous failure
+ * where GitHub may have recorded the comment but the client saw an error),
+ * probe the thread for THIS run's marker before creating again: if found,
+ * the earlier attempt actually succeeded and nothing more is posted. A
+ * previous run's generic-marker comment does not satisfy the probe. If
+ * botLogin is unavailable the probe is skipped and every attempt creates
+ * (pre-existing ambiguous-duplicate risk on retry, unchanged from before).
+ */
 async function postCommentWithRetry(
   octokit: Octokit,
   target: CommentTarget,
   body: string,
+  botLogin: string | null,
   logger: Logger,
 ): Promise<boolean> {
+  const marker = runMarker()
+
   for (let attempt = 1; attempt <= TRANSIENT_RETRY_ATTEMPTS; attempt += 1) {
+    if (attempt > 1 && botLogin != null && botLogin.length > 0) {
+      const thread = await readThread(octokit, target, botLogin, logger)
+      const alreadyDelivered = thread?.comments.some(c => c.isBot && c.body.includes(marker)) ?? false
+      if (alreadyDelivered) {
+        logger.debug("Response-post: probe found this run's comment already posted, skipping re-create", {
+          attempt,
+          target,
+        })
+        return true
+      }
+    }
+
     const result = await postComment(octokit, target, {body}, logger)
     if (result != null) {
       return true
@@ -148,8 +203,17 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
   const body = withMarker(parsed.data.body)
 
   if (parsed.data.verdict == null) {
-    const posted = await postCommentWithRetry(octokit, target, body, logger)
-    if (!posted) {
+    // A pull_request trigger's surface is always 'pr-review' and requires a
+    // structured verdict — falling through to a plain comment here would
+    // silently downgrade a required review into a comment and still report
+    // delivered:true. Fail closed instead; nothing is posted.
+    if (surface === 'pr-review') {
+      logger.error('Response-post: pr-review surface has no verdict frontmatter', {responseFilePath})
+      return failure('missing-verdict', 'pull_request responses must carry a verdict frontmatter')
+    }
+
+    const posted = await postCommentWithRetry(octokit, target, withRunMarker(body), botLogin, logger)
+    if (posted === false) {
       return failure('post-failed', 'postComment returned null after retries')
     }
     return {delivered: true, kind: 'comment'}
@@ -175,33 +239,33 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return failure('review-guard-blocked', `Review guard blocked submission: ${guard.reason}`)
   }
 
-  const lastReason: ResponsePostFailureReason = 'post-failed'
-  let lastDetail = 'submitReview failed after retries'
-  for (let attempt = 1; attempt <= TRANSIENT_RETRY_ATTEMPTS; attempt += 1) {
-    try {
-      const outcome = await submitReviewWithHeadGuard(
-        {
-          octokit,
-          owner: target.owner,
-          repo: target.repo,
-          prNumber: target.number,
-          event: reviewEvent,
-          body,
-          currentHeadSha: guard.currentHeadSha,
-        },
-        logger,
-      )
+  // Reviews are NOT idempotent (unlike comments, there is no marker-based
+  // find-and-update path) — a create that fails ambiguously (GitHub records
+  // the review but the client sees a network error) risks a duplicate review
+  // on retry. Single attempt only; an ambiguous failure fails the run and
+  // the operator re-runs rather than the harness silently retrying.
+  try {
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: target.owner,
+        repo: target.repo,
+        prNumber: target.number,
+        event: reviewEvent,
+        body,
+        currentHeadSha: guard.currentHeadSha,
+      },
+      logger,
+    )
 
-      if (outcome.submitted === false) {
-        return failure('review-guard-blocked', `Review guard blocked submission: ${outcome.reason}`)
-      }
-
-      return {delivered: true, kind: 'review'}
-    } catch (error) {
-      lastDetail = error instanceof Error ? error.message : String(error)
-      logger.warning('Response-post: submitReview failed, retrying', {attempt, error: lastDetail})
+    if (outcome.submitted === false) {
+      return failure('review-guard-blocked', `Review guard blocked submission: ${outcome.reason}`)
     }
-  }
 
-  return failure(lastReason, lastDetail)
+    return {delivered: true, kind: 'review'}
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    logger.error('Response-post: submitReview failed', {error: detail})
+    return failure('post-failed', detail)
+  }
 }

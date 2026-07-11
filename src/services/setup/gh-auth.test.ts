@@ -297,6 +297,22 @@ describe('gh-auth', () => {
       expect(getExecOutput).not.toHaveBeenCalled()
     })
 
+    it('clears an ambient process.env.GH_CONFIG_DIR from a prior workflow step when withholding the child credential', async () => {
+      // #given a pre-existing GH_CONFIG_DIR left over from an earlier authed step (e.g.
+      // actions/checkout with a token, or a prior gh auth login) — this must not leak
+      // through to the model's child even though it wasn't set by configureGhAuth itself.
+      const mockOctokit = createMockOctokit()
+      const mockExec = createMockExecAdapter()
+      process.env.GH_CONFIG_DIR = '/tmp/ambient-gh-config-from-prior-step'
+
+      // #when withholding the child credential
+      const result = await configureGhAuth(mockOctokit, 'app-token', 'default', mockLogger, mockExec, false)
+
+      // #then the ambient config dir is gone
+      expect(result.authenticated).toBe(true)
+      expect(process.env.GH_CONFIG_DIR).toBeUndefined()
+    })
+
     it('still resolves botLogin via the passed-in Octokit client when withholding the child credential', async () => {
       // #given — the action's own in-process Octokit client is unaffected by withholding.
       const mockOctokit = createMockOctokit()

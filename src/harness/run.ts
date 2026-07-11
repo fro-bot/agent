@@ -172,11 +172,16 @@ export async function run(): Promise<number> {
       core.setFailed('An unknown error occurred')
     }
   } finally {
+    // agentSuccess reflects execution.success only — it says nothing about
+    // whether finalize actually delivered the response. A non-zero exitCode
+    // means finalize failed to deliver (or the run otherwise failed), so the
+    // success reaction must not fire for that case.
+    const deliverySucceeded = agentSuccess && exitCode === 0
     await runCleanup({
       bootstrapLogger,
       reactionCtx,
       githubClient,
-      agentSuccess,
+      agentSuccess: deliverySucceeded,
       attachmentResult,
       serverHandle,
       detectedOpencodeVersion,

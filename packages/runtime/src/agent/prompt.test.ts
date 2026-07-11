@@ -11,6 +11,7 @@ import type {
 } from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
+import {RESPONSE_FILE_VERDICT_KEY, RESPONSE_FILE_VERDICTS} from './response-file.js'
 
 function createMockLogger(): Logger {
   return {
@@ -2281,5 +2282,27 @@ describe('buildAgentPrompt response delivery gating', () => {
     // #then
     expect(filePrompt).toContain('The `gh` CLI is NOT available for GitHub posting in this run')
     expect(ghPrompt).toContain('Use `gh` CLI for all GitHub operations')
+  })
+
+  it('contains every exported response-file verdict value for pull_request file-convention delivery', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+
+    // #then
+    for (const verdict of RESPONSE_FILE_VERDICTS) {
+      expect(prompt).toContain(`${RESPONSE_FILE_VERDICT_KEY}: ${verdict}`)
+    }
+  })
+
+  it('renders no response-file instruction and no gh-posting instruction for pull_request delivery none', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery('none', null, 'pull_request')
+
+    // #then
+    expect(prompt).not.toContain('Write to this exact path')
+    expect(prompt).not.toContain('gh pr review')
+    expect(prompt).not.toContain('gh pr comment')
+    expect(prompt).not.toContain('gh issue comment')
+    expect(prompt).not.toContain('### Response Protocol (REQUIRED)')
   })
 })
