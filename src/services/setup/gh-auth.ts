@@ -15,6 +15,7 @@ export async function configureGhAuth(
   defaultToken: string,
   logger: Logger,
   execAdapter: ExecAdapter,
+  provisionChildCredential = true,
 ): Promise<GhAuthResult> {
   const token = appToken ?? defaultToken
   const method: GhAuthResult['method'] =
@@ -25,11 +26,18 @@ export async function configureGhAuth(
     return {authenticated: false, method: 'none', botLogin: null}
   }
 
-  process.env.GH_TOKEN = token
+  // The child (model bash) can read process.env.GH_TOKEN and the hosts.yml
+  // written below via the temp GH_CONFIG_DIR. When the credential is being
+  // withheld, skip both so nothing same-UID-readable is left for the child —
+  // the action's own Octokit `client` (passed in) is unaffected; it never
+  // reads process.env.GH_TOKEN or the gh CLI config.
+  if (provisionChildCredential) {
+    process.env.GH_TOKEN = token
+  }
 
   logger.info('Configured authentication', {method})
 
-  if (token.length > 0) {
+  if (provisionChildCredential && token.length > 0) {
     // Off-environment gh auth (#1147): the model's bash child has GH_TOKEN/GITHUB_TOKEN
     // scrubbed from its env before spawn, so `gh` can no longer authenticate via env var.
     // Persist auth to a temp GH_CONFIG_DIR/hosts.yml instead — GH_CONFIG_DIR is allowlisted

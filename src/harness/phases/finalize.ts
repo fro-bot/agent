@@ -7,6 +7,7 @@ import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
 import * as core from '@actions/core'
+import {runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
 import {writeJobSummary} from '../../features/observability/index.js'
 import {createLogger} from '../../shared/logger.js'
@@ -41,6 +42,41 @@ export async function runFinalize(
     resolvedOutputMode: execution.resolvedOutputMode,
   }
   await writeJobSummary(summaryOptions, logger)
+
+  // For file-convention delivery, the `execution.success → return 0` early
+  // path below is bypassed: the delivery assertion must run regardless of
+  // execution.success, otherwise a model that wrote no response file (or
+  // wrote a malformed one) would still exit the run green (#1154 class).
+  if (bootstrap.delivery === 'file-convention') {
+    if (bootstrap.responseFilePath == null) {
+      core.setFailed('File-convention delivery is active but no response file path was resolved at bootstrap')
+      return 1
+    }
+
+    const responsePostLogger = createLogger({phase: 'response-post'})
+    const result = await runResponsePost(
+      {
+        octokit: routing.githubClient,
+        agentContext: routing.agentContext,
+        triggerResult: routing.triggerResult,
+        botLogin: routing.botLogin,
+        responseFilePath: bootstrap.responseFilePath,
+      },
+      responsePostLogger,
+    )
+
+    if (result.delivered === false) {
+      core.setFailed(
+        `Failed to deliver the agent's response from ${bootstrap.responseFilePath}: ${result.reason} — ${result.detail}`,
+      )
+      return 1
+    }
+
+    responsePostLogger.info('Delivered file-convention response', {kind: result.kind})
+    metrics.incrementComments()
+    logger.info('Agent run completed successfully', {durationMs: duration})
+    return 0
+  }
 
   if (execution.success) {
     logger.info('Agent run completed successfully', {durationMs: duration})

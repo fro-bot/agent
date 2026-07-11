@@ -7,6 +7,7 @@
 
 import type {Logger} from '../shared/logger.js'
 import type {ResolvedOutputMode} from './output-mode.js'
+import type {ResponseDelivery} from './response-delivery.js'
 import type {
   AgentContext,
   DiffContext,
@@ -34,7 +35,11 @@ function wrapXml(tag: string, content: string): string {
   return `<${tag}>\n${content.trim()}\n</${tag}>`
 }
 
-export function getTriggerDirective(context: TriggerContext, promptInput: string | null): TriggerDirective {
+export function getTriggerDirective(
+  context: TriggerContext,
+  promptInput: string | null,
+  responseDelivery: ResponseDelivery = 'model-gh',
+): TriggerDirective {
   switch (context.eventType) {
     case 'issue_comment':
       return {
@@ -62,16 +67,7 @@ export function getTriggerDirective(context: TriggerContext, promptInput: string
       }
 
     case 'pull_request':
-      return {
-        directive: [
-          'Review this pull request for code quality, potential bugs, and improvements.',
-          'Submit your review via `gh pr review` and choose the event that matches your verdict: `--approve` for a PASS verdict, `--request-changes` for a CONDITIONAL or REJECT verdict. Put your full response (including the Run Summary) in the --body.',
-          'A comment-only review does NOT satisfy a requested review and leaves the PR blocked on review-required. Once you reach a verdict you MUST approve or request changes — never deliver a verdict as a plain comment.',
-          'This applies equally to re-reviews (after a push or dismissed review): a follow-up validation is still a review, not a comment. Always use `gh pr review --approve` or `gh pr review --request-changes` — never `gh pr comment` or `gh issue comment` — to deliver your verdict.',
-          'Do not post a separate comment. If the author is a collaborator, prioritize actionable feedback over style nits.',
-        ].join('\n'),
-        appendMode: true,
-      }
+      return {directive: buildPullRequestDirective(responseDelivery), appendMode: true}
 
     case 'pull_request_review_comment':
       return {directive: buildReviewCommentDirective(context), appendMode: true}
@@ -84,6 +80,26 @@ export function getTriggerDirective(context: TriggerContext, promptInput: string
     default:
       return {directive: 'Execute the requested operation.', appendMode: true}
   }
+}
+
+function buildPullRequestDirective(responseDelivery: ResponseDelivery): string {
+  if (responseDelivery === 'file-convention') {
+    return [
+      'Review this pull request for code quality, potential bugs, and improvements.',
+      'Deliver your verdict via the response file (see Response Protocol): `verdict: approve` in the frontmatter for a PASS verdict, `verdict: request-changes` for a CONDITIONAL or REJECT verdict.',
+      'A comment-only response does NOT satisfy a requested review and leaves the PR blocked on review-required. Once you reach a verdict you MUST set `verdict: approve` or `verdict: request-changes` — never omit it or bury it in prose.',
+      'This applies equally to re-reviews (after a push or dismissed review): a follow-up validation still requires a `verdict:` frontmatter value.',
+      'If the author is a collaborator, prioritize actionable feedback over style nits.',
+    ].join('\n')
+  }
+
+  return [
+    'Review this pull request for code quality, potential bugs, and improvements.',
+    'Submit your review via `gh pr review` and choose the event that matches your verdict: `--approve` for a PASS verdict, `--request-changes` for a CONDITIONAL or REJECT verdict. Put your full response (including the Run Summary) in the --body.',
+    'A comment-only review does NOT satisfy a requested review and leaves the PR blocked on review-required. Once you reach a verdict you MUST approve or request changes — never deliver a verdict as a plain comment.',
+    'This applies equally to re-reviews (after a push or dismissed review): a follow-up validation is still a review, not a comment. Always use `gh pr review --approve` or `gh pr review --request-changes` — never `gh pr comment` or `gh issue comment` — to deliver your verdict.',
+    'Do not post a separate comment. If the author is a collaborator, prioritize actionable feedback over style nits.',
+  ].join('\n')
 }
 
 function buildReviewCommentDirective(context: TriggerContext): string {
@@ -134,8 +150,9 @@ export function buildTaskSection(
   context: TriggerContext,
   promptInput: string | null,
   resolvedMode: ResolvedOutputMode | null,
+  responseDelivery: ResponseDelivery = 'model-gh',
 ): string {
-  const {directive} = getTriggerDirective(context, promptInput)
+  const {directive} = getTriggerDirective(context, promptInput, responseDelivery)
   const lines: string[] = []
 
   if ((context.eventType === 'schedule' || context.eventType === 'workflow_dispatch') && resolvedMode != null) {
@@ -155,9 +172,12 @@ function buildAgentContextSection(
   cacheStatus: string,
   sessionId: string | undefined,
   responseMode: 'github' | 'none',
+  responseDelivery: ResponseDelivery,
+  responseFilePath: string | null,
 ): string {
   const issueNum = context.issueNumber ?? '<number>'
   const hasResponseProtocol = context.issueNumber != null && responseMode !== 'none'
+  const isFileConvention = hasResponseProtocol && responseDelivery === 'file-convention'
 
   const lines: string[] = [
     '## Agent Context',
@@ -173,6 +193,11 @@ function buildAgentContextSection(
       '- **Response surface:** Your final assistant message and the GitHub Actions job log are the only output surfaces for this run.',
       '- **Do NOT create GitHub comments, reviews, issues, discussions, reactions, or labels.** This run is non-posting automation.',
       '- Git and GitHub operations (branch, commit, push, PR open/update) are permitted only when the task explicitly requires them.',
+    )
+  } else if (isFileConvention) {
+    lines.push(
+      '- The human who invoked you will ONLY see what you write to the response file (see Response Protocol below). Your assistant messages are invisible to them.',
+      '- **The `gh` CLI is NOT available in this run.** A `gh` call will fail. You MUST write your response to the response file instead. Do not rely on assistant message output to communicate with the user.',
     )
   } else {
     lines.push(
@@ -196,15 +221,22 @@ function buildAgentContextSection(
   )
 
   if (hasResponseProtocol) {
-    lines.push('', buildResponseProtocolSection(context, cacheStatus, sessionId))
+    lines.push('', buildResponseProtocolSection(context, cacheStatus, sessionId, responseDelivery, responseFilePath))
   }
 
-  lines.push(
-    '',
-    `### GitHub Operations
+  if (isFileConvention) {
+    lines.push(
+      '',
+      `### GitHub Operations
+The \`gh\` CLI is NOT pre-authenticated for this run and any \`gh\` call will fail. Deliver your response by writing to the response file (see Response Protocol) instead of calling \`gh\`.`,
+    )
+  } else {
+    lines.push(
+      '',
+      `### GitHub Operations
 The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.${
-      hasResponseProtocol
-        ? ` Post exactly one comment or review per run (see Response Protocol).
+        hasResponseProtocol
+          ? ` Post exactly one comment or review per run (see Response Protocol).
 
 \`\`\`bash
 gh pr comment ${issueNum} --body "Your response with Run Summary"
@@ -212,9 +244,10 @@ gh pr review ${issueNum} --approve --body "Your review with Run Summary"
 gh issue comment ${issueNum} --body "Your response with Run Summary"
 gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
 \`\`\``
-        : ''
-    }`,
-  )
+          : ''
+      }`,
+    )
+  }
 
   return lines.join('\n')
 }
@@ -253,8 +286,10 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
     (triggerCommentEvent === 'issue_comment' ||
       triggerCommentEvent === 'discussion_comment' ||
       triggerCommentEvent === 'pull_request_review_comment')
+  const responseDelivery = options.responseDelivery ?? 'model-gh'
+  const responseFilePath = options.responseFilePath ?? null
 
-  parts.push(wrapXml('harness_rules', buildHarnessRulesSection()))
+  parts.push(wrapXml('harness_rules', buildHarnessRulesSection(responseDelivery)))
 
   const threadIdentitySection = buildThreadIdentitySection(logicalKey ?? null, continuationEnabled, null)
   if (threadIdentitySection.length > 0) {
@@ -353,7 +388,12 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
   }
 
   if (options.triggerContext != null) {
-    parts.push(wrapXml('task', buildTaskSection(options.triggerContext, customPrompt, resolvedOutputMode ?? null)))
+    parts.push(
+      wrapXml(
+        'task',
+        buildTaskSection(options.triggerContext, customPrompt, resolvedOutputMode ?? null, responseDelivery),
+      ),
+    )
   } else if (context.commentBody == null) {
     parts.push(
       wrapXml(
@@ -376,7 +416,8 @@ Respond to the trigger comment above. Follow all instructions and requirements l
 
   if (trimmedCustomPrompt != null && trimmedCustomPrompt.length > 0) {
     const shouldWrapCustomPrompt =
-      options.triggerContext == null || getTriggerDirective(options.triggerContext, customPrompt).appendMode
+      options.triggerContext == null ||
+      getTriggerDirective(options.triggerContext, customPrompt, responseDelivery).appendMode
 
     if (shouldWrapCustomPrompt) {
       parts.push(
@@ -393,14 +434,21 @@ ${trimmedCustomPrompt}`,
   if (options.triggerContext != null) {
     const eventType = options.triggerContext.eventType
     if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
-      parts.push(wrapXml('output_contract', buildOutputContractSection(context)))
+      parts.push(wrapXml('output_contract', buildOutputContractSection(context, responseDelivery)))
     }
   }
 
   parts.push(
     wrapXml(
       'agent_context',
-      buildAgentContextSection(context, cacheStatus, options.sessionId, options.responseMode ?? 'github'),
+      buildAgentContextSection(
+        context,
+        cacheStatus,
+        options.sessionId,
+        options.responseMode ?? 'github',
+        responseDelivery,
+        responseFilePath,
+      ),
     ),
   )
 
@@ -673,22 +721,11 @@ function buildResponseProtocolSection(
   context: AgentContext,
   cacheStatus: string,
   sessionId: string | undefined,
+  responseDelivery: ResponseDelivery,
+  responseFilePath: string | null,
 ): string {
   const issueNum = context.issueNumber ?? '<number>'
-  return `### Response Protocol (REQUIRED)
-You MUST post exactly ONE comment or review per invocation. All of your output — your response content AND the Run Summary — goes into that single artifact.
-**Rules:**
-1. **One output per run.** Post exactly ONE comment (via \`gh issue comment\` or \`gh pr comment\`) or ONE review (via \`gh pr review\`). Never both. Never multiple comments.
-2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
-3. **NEVER post the Run Summary as a separate comment.** This is the most common mistake. The Run Summary goes INSIDE your response.
-4. **Include the bot marker.** Your response must contain \`<!-- fro-bot-agent -->\` (inside the Run Summary block) so the system can identify your comment.
-5. **For PR reviews — match the event to your verdict.** Submit exactly ONE review via \`gh pr review\`: use \`--approve\` for a PASS verdict and \`--request-changes\` for a CONDITIONAL or REJECT verdict. Put your full response (analysis + Run Summary) in the \`--body\` argument. A comment-only review (\`gh pr review --comment\` or \`gh pr comment\`) does NOT count as the review and leaves the PR blocked on review-required — never use it to deliver a verdict. This applies equally on re-reviews (after a push or dismissed review): a follow-up validation is still a review event, not a comment. Do not post a separate PR comment afterward.
-6. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
-
-**Response Format:**
-Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:
-\`\`\`markdown
-[Your response content here]
+  const runSummaryBlock = `[Your response content here]
 
 ---
 
@@ -704,9 +741,49 @@ Every response you post — regardless of channel (issue, PR, discussion, review
 | Cache | ${cacheStatus} |
 | Session | ${sessionId ?? '<your_session_id>'} |
 
-</details>
+</details>`
+
+  const runSummaryTemplate = `\`\`\`markdown
+${runSummaryBlock}
 \`\`\`
 `
+
+  if (responseDelivery === 'file-convention') {
+    return `### Response Protocol (REQUIRED)
+You MUST deliver exactly ONE response per invocation by writing it to the response file. All of your output — your response content AND the Run Summary — goes into that single file.
+**Rules:**
+1. **The \`gh\` CLI is NOT available.** A \`gh\` call will fail — write the response file instead.
+2. **Write to this exact path:** \`${responseFilePath ?? '<response file path>'}\`
+3. **Write SYNCHRONOUSLY, in the foreground.** Use a blocking command such as a heredoc (\`cat > "${responseFilePath ?? '<response file path>'}" <<'EOF' ... EOF\`). Do NOT background the write (no \`&\`, \`nohup\`, or \`disown\`) — a backgrounded write may not be flushed to disk before this run ends, and your response will be lost.
+4. **One write per run.** Write the file exactly once. Do not write it more than once.
+5. **For a PR review, include a \`verdict:\` frontmatter key** at the top of the file with value \`approve\` or \`request-changes\` (PASS → \`approve\`; CONDITIONAL or REJECT → \`request-changes\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.
+6. **Include the Run Summary** at the end of the body (see template below), including the \`<!-- fro-bot-agent -->\` marker.
+
+**File Format (comment, no frontmatter):**
+${runSummaryTemplate}
+**File Format (PR review, with verdict frontmatter):**
+\`\`\`markdown
+---
+verdict: approve
+---
+${runSummaryBlock}
+\`\`\`
+`
+  }
+
+  return `### Response Protocol (REQUIRED)
+You MUST post exactly ONE comment or review per invocation. All of your output — your response content AND the Run Summary — goes into that single artifact.
+**Rules:**
+1. **One output per run.** Post exactly ONE comment (via \`gh issue comment\` or \`gh pr comment\`) or ONE review (via \`gh pr review\`). Never both. Never multiple comments.
+2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
+3. **NEVER post the Run Summary as a separate comment.** This is the most common mistake. The Run Summary goes INSIDE your response.
+4. **Include the bot marker.** Your response must contain \`<!-- fro-bot-agent -->\` (inside the Run Summary block) so the system can identify your comment.
+5. **For PR reviews — match the event to your verdict.** Submit exactly ONE review via \`gh pr review\`: use \`--approve\` for a PASS verdict and \`--request-changes\` for a CONDITIONAL or REJECT verdict. Put your full response (analysis + Run Summary) in the \`--body\` argument. A comment-only review (\`gh pr review --comment\` or \`gh pr comment\`) does NOT count as the review and leaves the PR blocked on review-required — never use it to deliver a verdict. This applies equally on re-reviews (after a push or dismissed review): a follow-up validation is still a review event, not a comment. Do not post a separate PR comment afterward.
+6. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
+
+**Response Format:**
+Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:
+${runSummaryTemplate}`
 }
 
 /**
@@ -822,11 +899,23 @@ function buildHistoricalSessionContext(
   }
 }
 
-function buildOutputContractSection(context: AgentContext): string {
+function buildOutputContractSection(context: AgentContext, responseDelivery: ResponseDelivery): string {
   const lines: string[] = ['## Output Contract']
-  lines.push(
-    `- Review action (REQUIRED): submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. A comment-only review does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it as the matching event. This applies on re-reviews too — never substitute a plain comment for a review event.`,
-  )
+
+  if (responseDelivery === 'file-convention') {
+    lines.push(
+      `- Review action (REQUIRED): deliver the verdict that matches your review via the \`verdict:\` frontmatter key in the response file — PASS → \`verdict: approve\`, CONDITIONAL or REJECT → \`verdict: request-changes\`. Omitting \`verdict:\` does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it via the frontmatter. This applies on re-reviews too — never omit the \`verdict:\` key.`,
+    )
+  } else if (responseDelivery === 'none') {
+    lines.push(
+      '- This run is non-posting automation. Do not call `gh` or write a response file — report your findings only in your assistant message and session summary.',
+    )
+  } else {
+    lines.push(
+      `- Review action (REQUIRED): submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. A comment-only review does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it as the matching event. This applies on re-reviews too — never substitute a plain comment for a review event.`,
+    )
+  }
+
   lines.push(`- Requested reviewer: ${context.isRequestedReviewer ? 'yes' : 'no'}`)
   if (context.authorAssociation != null) {
     lines.push(`- Author association: ${context.authorAssociation}`)
