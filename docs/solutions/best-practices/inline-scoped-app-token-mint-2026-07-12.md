@@ -72,10 +72,14 @@ Mint step shape (illustrative, not the full script):
 const REQUESTED_PERMISSIONS = {contents: 'write'} as const
 const EXPECTED_PERMISSIONS_ECHO = {contents: 'write', metadata: 'read'} as const
 
-// mint, then validate all-or-nothing on both axes before ever emitting the token
-if (!deepEqual(response.permissions, EXPECTED_PERMISSIONS_ECHO) || response.repository.full_name !== targetRepo) {
-  core.setFailed('token-mint-failed')
-  process.exit(1)
+// mint, then validate all-or-nothing on both axes before ever emitting the
+// token. The response echoes a `repositories` ARRAY of repository objects —
+// require exactly one entry naming exactly the intended repo.
+const repositoriesOk =
+  Array.isArray(response.repositories) && response.repositories.length === 1 && response.repositories[0].name === REPO
+if (!deepEqual(response.permissions, EXPECTED_PERMISSIONS_ECHO) || !repositoriesOk) {
+  // constant-class error, fail closed (process.exitCode = 1) — no output emitted
+  throw new Error('token-mint-failed')
 }
 ```
 
