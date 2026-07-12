@@ -201,9 +201,11 @@ describe('main — happy path', () => {
     mocks.setSecret.mockImplementation((value: string) => {
       if (value === privateKey) callOrder.push('setSecret(key)')
     })
+    let callCount = 0
     const fetchMock = vi.fn().mockImplementation(async () => {
       callOrder.push('fetch')
-      return jsonResponse(200, {id: 999})
+      callCount += 1
+      return callCount === 1 ? jsonResponse(200, {id: 999}) : jsonResponse(201, VALID_TOKEN_BODY)
     })
     vi.stubGlobal('fetch', fetchMock)
 
@@ -211,6 +213,8 @@ describe('main — happy path', () => {
     await main()
 
     // #then
+    expect(process.exitCode).toBeUndefined()
+    expect(mocks.setOutput).toHaveBeenCalledWith('github-token', 'ghs_faketoken123')
     expect(callOrder[0]).toBe('setSecret(key)')
     expect(callOrder).toContain('fetch')
   })
@@ -232,7 +236,7 @@ describe('main — happy path', () => {
     const headers = init.headers as Record<string, string>
     expect(headers.Authorization).toBeDefined()
     const jwt = (headers.Authorization ?? '').replace('Bearer ', '')
-    const [headerSegment, payloadSegment] = jwt.split('.')
+    const [headerSegment, payloadSegment, signatureSegment] = jwt.split('.')
     const header = decodeJwtSegment(headerSegment)
     const payload = decodeJwtSegment(payloadSegment)
     expect(header.alg).toBe('RS256')
@@ -240,6 +244,10 @@ describe('main — happy path', () => {
     expect(payload.iat as number).toBeLessThan(payload.exp as number)
     expect(Math.floor(Date.now() / 1000) - (payload.iat as number)).toBeGreaterThanOrEqual(59)
     expect(init.signal).toBeInstanceOf(AbortSignal)
+    for (const segment of [headerSegment, payloadSegment, signatureSegment]) {
+      expect(segment).toBeDefined()
+      expect(segment).not.toMatch(/[+/=]/)
+    }
   })
 
   it('sends the correct POST body on the token mint request', async () => {
@@ -488,6 +496,22 @@ describe('main — error paths (fail closed)', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(403, {message: 'Forbidden'}))
+    vi.stubGlobal('fetch', fetchMock)
+
+    // #when
+    await main()
+
+    // #then
+    expect(process.exitCode).toBe(1)
+    expect(mocks.setOutput).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when the token POST returns 200 with an otherwise-valid body', async () => {
+    // #given
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
+      .mockResolvedValueOnce(jsonResponse(200, VALID_TOKEN_BODY))
     vi.stubGlobal('fetch', fetchMock)
 
     // #when
