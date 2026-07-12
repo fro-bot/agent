@@ -126,6 +126,27 @@ const stubLogger: GatewayLogger = {
   error: vi.fn(),
 }
 
+// makeGatewayProgram calls installShutdownHandlers internally and does not expose
+// its returned cleanup fn to callers — that's intentional for production (the
+// process owns its own shutdown lifecycle). Tests that invoke makeGatewayProgram
+// repeatedly would otherwise accumulate SIGTERM/SIGINT listeners across cases
+// (Issue #1134). Since the cleanup closure isn't reachable here, snapshot the
+// listener set before each test and strip anything added during it, restoring
+// the exact pre-test listener set the same way installShutdownHandlers's own
+// cleanup would (process.off per added listener).
+beforeEach(() => {
+  const sigtermBefore = process.listeners('SIGTERM')
+  const sigintBefore = process.listeners('SIGINT')
+  return () => {
+    for (const listener of process.listeners('SIGTERM')) {
+      if (!sigtermBefore.includes(listener)) process.off('SIGTERM', listener)
+    }
+    for (const listener of process.listeners('SIGINT')) {
+      if (!sigintBefore.includes(listener)) process.off('SIGINT', listener)
+    }
+  }
+})
+
 describe('makeDiscordClientFromConfig', () => {
   it('passes empty privilegedIntents to createDiscordClient (common case after posture flip)', () => {
     // #given a config with no privileged intents opted in
