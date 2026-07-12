@@ -25,6 +25,7 @@ import type {OpenCodeServerHandle} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 
+import {createInactivityTimer} from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 import {formatToolPart} from './format-part.js'
 
@@ -271,37 +272,34 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     )
   }
 
-  // ── 0b. Inactivity controller setup ───────────────────────────────────────
-  // When inactivityTimeoutMs is set, arm an AbortController that fires after the
-  // configured window of silence. The controller is reset on every text delta,
-  // tool completion, and permission.replied event. It is cleared (paused) on
-  // permission.asked and re-armed on permission.replied.
+  // ── 0b. Inactivity timer setup ─────────────────────────────────────────────
+  // When inactivityTimeoutMs is set (>0), the shared `createInactivityTimer` primitive
+  // arms a timeout that fires after the configured window of silence. It is reset on
+  // every text delta, tool completion, and permission.replied event. It is paused on
+  // permission.asked and resumed+reset on permission.replied.
+  // `timer.signal` never aborts when inactivityTimeoutMs is undefined or <= 0 (inert
+  // instance), mirroring the previous `inactivityController === null` arming guard.
   // The combined signal merges the wall-clock timeout signal with the inactivity signal
   // so either can abort the event loop.
-  let inactivityController: AbortController | null = null
-  let inactivityTimer: ReturnType<typeof setTimeout> | null = null
+  const inactivityTimer = createInactivityTimer({timeoutMs: inactivityTimeoutMs ?? 0})
+  const inactivityArmed = inactivityTimeoutMs !== undefined && inactivityTimeoutMs > 0
+  // The primitive auto-arms on creation; run-core's contract is to NOT start counting
+  // idle time until the prompt is actually sent (resetInactivity() below, after
+  // promptAsync succeeds) — pause immediately to cancel that initial auto-arm and
+  // preserve the exact prior timing (no timer running during session.create/subscribe).
+  inactivityTimer.pause()
 
   function clearInactivity(): void {
-    if (inactivityTimer !== null) {
-      clearTimeout(inactivityTimer)
-      inactivityTimer = null
-    }
+    inactivityTimer.pause()
   }
 
   function resetInactivity(): void {
-    if (inactivityController === null || inactivityTimeoutMs === undefined) return
-    clearInactivity()
-    inactivityTimer = setTimeout(() => {
-      inactivityController?.abort()
-    }, inactivityTimeoutMs)
-  }
-
-  if (inactivityTimeoutMs !== undefined && inactivityTimeoutMs > 0) {
-    inactivityController = new AbortController()
+    if (!inactivityArmed) return
+    inactivityTimer.reset()
   }
 
   // combinedSignal: aborts when either the wall-clock signal or the inactivity signal fires.
-  const combinedSignal = inactivityController === null ? signal : AbortSignal.any([signal, inactivityController.signal])
+  const combinedSignal = inactivityArmed ? AbortSignal.any([signal, inactivityTimer.signal]) : signal
 
   // ── 0c. Pre-flight abort check ─────────────────────────────────────────────
   // Check before any external call so an already-expired signal (e.g. AbortSignal.timeout
@@ -642,10 +640,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       }
     }
   } finally {
-    // Ensure the inactivity timer is always cleared on loop exit (normal, break, or throw).
+    // Ensure the inactivity timer is always disposed on loop exit (normal, break, or throw).
     // The explicit clearInactivity() calls on the session.idle and session.error paths are
-    // kept as defensive double-clears — clearTimeout on an already-cleared handle is a no-op.
-    clearInactivity()
+    // kept as defensive double-clears — pause()/dispose() on an already-cleared timer is a no-op.
+    inactivityTimer.dispose()
   }
 
   // Stream exhausted (loop exited normally or via break). Distinguish timeout from premature close.
@@ -653,7 +651,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   if (combinedSignal.aborted) {
     // Inactivity is the tighter bound (always < hard ceiling), so on the rare both-aborted
     // tick we attribute to inactivity-timeout deliberately.
-    if (inactivityController !== null && inactivityController.signal.aborted) {
+    if (inactivityArmed && inactivityTimer.signal.aborted) {
       logger.warn(
         {sessionId, totalEvents, activityEvents, lastEventType},
         'run-core: stream ended due to inactivity timeout',
