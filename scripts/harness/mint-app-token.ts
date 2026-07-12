@@ -13,7 +13,11 @@
 //      timeout — no retry loop.
 //   3. Validate the minted token response ALL-OR-NOTHING: token, expires_at,
 //      exact permissions echo, and exact single-repo echo must all hold or
-//      the entire mint is rejected.
+//      the entire mint is rejected. GitHub adds the implied `metadata: read`
+//      grant to every installation access token — it is not requestable or
+//      declinable — so the echo is pinned to exactly the requested grant
+//      plus that implied read; any other extra, missing, or different grant
+//      still rejects.
 //   4. Emit the minted token as a masked GitHub Actions step output — never
 //      write it to disk, never place it (or the private key) in
 //      process.env, GITHUB_ENV, or logs.
@@ -44,6 +48,12 @@ const MINT_TIMEOUT_MS = 30_000
 const JWT_BACKDATE_SECONDS = 60
 const JWT_LIFETIME_SECONDS = 540
 const REQUESTED_PERMISSIONS: Readonly<Record<string, string>> = {contents: 'write'}
+// GitHub always adds the implied `metadata: read` grant to every installation
+// access token — it is not requestable or declinable in the request body, but
+// it is always present in the response echo. The validator pins the echo to
+// exactly the requested grant plus that implied read; any other extra,
+// missing, or different grant still rejects.
+const EXPECTED_PERMISSIONS_ECHO: Readonly<Record<string, string>> = {contents: 'write', metadata: 'read'}
 
 function base64url(input: Buffer | string): string {
   const buffer = typeof input === 'string' ? Buffer.from(input, 'utf8') : input
@@ -93,11 +103,11 @@ export function validateTokenResponse(parsed: unknown): ValidateTokenResponseRes
     return {ok: false, reason: 'token response permissions is not an object'}
   }
   const permissionEntries = Object.entries(permissions as Record<string, unknown>)
-  const requestedEntries = Object.entries(REQUESTED_PERMISSIONS)
-  if (permissionEntries.length !== requestedEntries.length) {
+  const expectedEntries = Object.entries(EXPECTED_PERMISSIONS_ECHO)
+  if (permissionEntries.length !== expectedEntries.length) {
     return {ok: false, reason: 'token response permissions do not match the requested scope exactly'}
   }
-  for (const [key, value] of requestedEntries) {
+  for (const [key, value] of expectedEntries) {
     if ((permissions as Record<string, unknown>)[key] !== value) {
       return {ok: false, reason: 'token response permissions do not match the requested scope exactly'}
     }

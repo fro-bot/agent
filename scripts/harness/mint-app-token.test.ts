@@ -41,7 +41,7 @@ function decodeJwtSegment(segment: string | undefined): Record<string, unknown> 
 const VALID_TOKEN_BODY = {
   token: 'ghs_faketoken123',
   expires_at: '2026-07-11T13:00:00Z',
-  permissions: {contents: 'write'},
+  permissions: {contents: 'write', metadata: 'read'},
   repositories: [{name: 'agent'}],
 }
 
@@ -105,7 +105,7 @@ describe('validateTokenResponse', () => {
 
   it('rejects broader-than-requested permissions', () => {
     // #given
-    const body = {...VALID_TOKEN_BODY, permissions: {contents: 'write', issues: 'write'}}
+    const body = {...VALID_TOKEN_BODY, permissions: {contents: 'write', metadata: 'read', issues: 'write'}}
 
     // #when
     const result = validateTokenResponse(body)
@@ -116,7 +116,29 @@ describe('validateTokenResponse', () => {
 
   it('rejects narrower-than-requested permissions', () => {
     // #given
-    const body = {...VALID_TOKEN_BODY, permissions: {contents: 'read'}}
+    const body = {...VALID_TOKEN_BODY, permissions: {contents: 'read', metadata: 'read'}}
+
+    // #when
+    const result = validateTokenResponse(body)
+
+    // #then
+    expect(result.ok).toBe(false)
+  })
+
+  it('rejects an echo missing the implied metadata:read grant', () => {
+    // #given
+    const body = {...VALID_TOKEN_BODY, permissions: {contents: 'write'}}
+
+    // #when
+    const result = validateTokenResponse(body)
+
+    // #then
+    expect(result.ok).toBe(false)
+  })
+
+  it('rejects an echo with metadata other than read', () => {
+    // #given
+    const body = {...VALID_TOKEN_BODY, permissions: {contents: 'write', metadata: 'write'}}
 
     // #when
     const result = validateTokenResponse(body)
@@ -424,7 +446,7 @@ describe('main — error paths (fail closed)', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(
-        jsonResponse(201, {...VALID_TOKEN_BODY, permissions: {contents: 'write', issues: 'write'}}),
+        jsonResponse(201, {...VALID_TOKEN_BODY, permissions: {contents: 'write', metadata: 'read', issues: 'write'}}),
       )
     vi.stubGlobal('fetch', fetchMock)
 
@@ -441,7 +463,9 @@ describe('main — error paths (fail closed)', () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
-      .mockResolvedValueOnce(jsonResponse(201, {...VALID_TOKEN_BODY, permissions: {contents: 'read'}}))
+      .mockResolvedValueOnce(
+        jsonResponse(201, {...VALID_TOKEN_BODY, permissions: {contents: 'read', metadata: 'read'}}),
+      )
     vi.stubGlobal('fetch', fetchMock)
 
     // #when
