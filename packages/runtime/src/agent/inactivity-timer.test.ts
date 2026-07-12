@@ -113,7 +113,7 @@ describe('createInactivityTimer', () => {
     expect(timer.signal.aborted).toBe(false)
   })
 
-  it('signal.reason is distinguishable — abort() with no reason argument yields a default AbortError-like reason', () => {
+  it('fired signal carries a defined reason — callers distinguish sources by signal identity, not reason shape', () => {
     // #given
     const timer = createInactivityTimer({timeoutMs: 1000})
 
@@ -125,6 +125,38 @@ describe('createInactivityTimer', () => {
     // asserted structurally here since callers probe identity, not reason shape.
     expect(timer.signal.aborted).toBe(true)
     expect(timer.signal.reason).toBeDefined()
+  })
+
+  it('reset after fire is a no-op — an aborted timer is never re-armed', () => {
+    // #given
+    const timer = createInactivityTimer({timeoutMs: 1000})
+    vi.advanceTimersByTime(1000)
+    expect(timer.signal.aborted).toBe(true)
+
+    // #when — attempt to resurrect
+    timer.reset()
+    vi.advanceTimersByTime(10_000)
+
+    // #then — still the same aborted signal, no new timer scheduled
+    expect(timer.signal.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('signal identity is stable across pause/resume cycles', () => {
+    // #given
+    const timer = createInactivityTimer({timeoutMs: 1000})
+    const before = timer.signal
+
+    // #when
+    timer.pause()
+    timer.resume()
+    timer.pause()
+    timer.resume()
+
+    // #then — same signal object; composed AbortSignal.any() references stay valid
+    expect(timer.signal).toBe(before)
+    vi.advanceTimersByTime(1000)
+    expect(before.aborted).toBe(true)
   })
 
   it('double-dispose is safe', () => {
