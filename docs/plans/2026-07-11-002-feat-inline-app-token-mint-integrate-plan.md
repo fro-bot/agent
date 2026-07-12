@@ -1,7 +1,7 @@
 ---
 title: 'feat: replace FRO_BOT_PAT with an inline-minted scoped App token on the integrate path'
 type: feat
-status: active
+status: done
 date: 2026-07-11
 origin: https://github.com/fro-bot/agent/issues/1126
 ---
@@ -82,7 +82,7 @@ The integrate job runs an autonomous OpenCode agent over upstream PR content (pr
 
 ## Implementation Units
 
-- [ ] **Unit 0: Verify App installed scope (precondition)**
+- [x] **Unit 0: Verify App installed scope (precondition)**
 
 **Goal:** Confirm the App behind `APPLICATION_ID` is installed on `fro-bot/agent` with permissions covering `contents: write`, and record its full installed scope so the blast radius of key theft is known.
 
@@ -100,7 +100,7 @@ The integrate job runs an autonomous OpenCode agent over upstream PR content (pr
 
 **Verification:** Installed scope documented; `contents: write` on `fro-bot/agent` confirmed available to mint.
 
-- [ ] **Unit 1: `scripts/harness/mint-app-token.ts` + tests**
+- [x] **Unit 1: `scripts/harness/mint-app-token.ts` + tests**
 
 **Goal:** A no-deps, no-post mint script mirroring the broker-mint security contract, emitting a single masked `github-token` step output.
 
@@ -137,7 +137,7 @@ The integrate job runs an autonomous OpenCode agent over upstream PR content (pr
 
 **Verification:** `bun run test:scripts` green; script passes lint + the Node 24 strip-only TS constraints (no non-erasable syntax).
 
-- [ ] **Unit 2: Wire the mint into `harness-integrate.yaml`**
+- [x] **Unit 2: Wire the mint into `harness-integrate.yaml`**
 
 **Goal:** Integrate job mints and consumes the scoped token; `FRO_BOT_PAT` fully removed from the workflow.
 
@@ -159,7 +159,7 @@ The integrate job runs an autonomous OpenCode agent over upstream PR content (pr
 
 **Verification:** YAML parses; grep confirms zero `FRO_BOT_PAT` references remain in the file; step order harden-runner → checkout → setup → broker mint → app mint → Run Fro Bot.
 
-- [ ] **Unit 3: Caller pass-through in `harness-release.yaml`**
+- [x] **Unit 3: Caller pass-through in `harness-release.yaml`**
 
 **Goal:** The integrate call passes the App secrets and stops passing the PAT.
 
@@ -178,7 +178,7 @@ The integrate job runs an autonomous OpenCode agent over upstream PR content (pr
 
 **Verification:** Zero `FRO_BOT_PAT` references remain on the integrate path across both workflows (release workflow may still use it elsewhere — only the integrate call changes).
 
-- [ ] **Unit 4: End-to-end proof on a real dispatch**
+- [x] **Unit 4: End-to-end proof on a real dispatch**
 
 **Goal:** Prove the full pipeline on the App token (R7) — fail-closed if anything is mis-wired.
 

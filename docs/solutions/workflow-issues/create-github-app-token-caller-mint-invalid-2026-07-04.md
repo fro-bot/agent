@@ -1,6 +1,7 @@
 ---
 title: You cannot caller-mint a GitHub App token and pass it into a reusable workflow
 date: 2026-07-04
+last_updated: 2026-07-12
 category: workflow-issues
 module: harness/release pipeline
 problem_type: workflow_issue
@@ -106,7 +107,7 @@ steps:
   - run: node scripts/harness/mint-broker-credential.ts # OIDC → broker → scoped short-lived token
 ```
 
-Tradeoff: needs a broker that holds the App key server-side. This is the chosen direction for #1107 (see the broker doc below).
+Tradeoff: needs a broker that holds the App key server-side. This was the direction initially chosen for #1107 (see the broker doc below), but it was subsequently ruled out for the integrate path. The shipped fix is an inline no-post mint inside the called workflow's single job (issue #1126, PR #1179) — see `docs/solutions/best-practices/inline-scoped-app-token-mint-2026-07-12.md`. That inline mint also could not use `actions/create-github-app-token` (the obvious choice for alternative 2 above) because that action's `post:` hook re-exposes its inputs at job end, defeating same-job isolation — see the new section in `docs/solutions/best-practices/same-job-phase-split-not-a-security-boundary-2026-07-04.md`. The inline mint instead uses a checked-in `scripts/` script with no post phase.
 
 ## Related
 
