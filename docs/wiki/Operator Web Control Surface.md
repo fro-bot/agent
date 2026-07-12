@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-07-05"
-updated-by: "schedule-d7190410-28754466543"
+last-updated: "2026-07-12"
+updated-by: "schedule-d7190410-29208059688"
 sources:
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/web/operator-route.ts
@@ -31,6 +31,15 @@ sources:
   - packages/gateway/src/web/operator-push/dispatcher.ts
   - packages/gateway/src/web/operator-push/trigger-policy.ts
   - packages/gateway/src/web/operator-push/vapid.ts
+  - packages/gateway/src/web/operator-push/vapid-public-key-route.ts
+  - packages/gateway/src/web/operator-push/push-sender.ts
+  - packages/gateway/src/web/operator-push/payload-builder.ts
+  - packages/gateway/src/web/operator-push/validate-endpoint.ts
+  - packages/gateway/src/web/operator-push/ip-classification.ts
+  - packages/gateway/src/web/operator-push/dedupe-cache.ts
+  - packages/gateway/src/web/operator-push/config-keys.ts
+  - packages/gateway/src/web/audit.ts
+  - packages/gateway/src/program.ts
   - docs/privacy/operator-push-retention.md
   - packages/gateway/src/operator-contract/identity.ts
   - packages/gateway/src/operator-contract/approval.ts
@@ -175,6 +184,10 @@ The surface exposes four authenticated operator routes (`web/operator-push/`):
 - `GET /operator/push/subscriptions` — list the operator's own subscription metadata (never the endpoint or keys — see `toSubscriptionMetadata` in `subscription-store.ts`).
 
 **Broadcast model.** The operator dashboard is a shared surface, not a per-operator one — approvals are run-scoped, not operator-scoped, and there is no dashboard-operator identity available at the run-failed or approval-pending seams. Every opted-in operator with an active subscription is nudged, regardless of who launched the run. The notification payload is fixed and repo-neutral ("something needs attention, open the dashboard" plus an allowlisted failure label) so a broadcast never leaks run, repo, or prompt content — Discord and the SSE stream remain the authoritative, detailed channels; push is a fail-soft nudge on top.
+
+**Dispatch and deduplication.** Only two lifecycle events fan out a push: a run entering the approval-pending state and a run reaching the `FAILED` phase. Neither successful completion nor an operator logout sends a notification (logout instead _deactivates_ that operator's subscriptions). The dispatcher (`web/operator-push/dispatcher.ts`) coalesces bursts through a bounded in-memory dedupe cache (`dedupe-cache.ts`, default five-minute window keyed by the run/approval id and event kind), so a flurry of retries on one run does not spam every browser. Each broadcast records a single coarse `push.dispatch` audit entry carrying only delivered/dead/failed counts. When the push relay reports an endpoint is gone (HTTP 410/404), the dispatcher deactivates that subscription in place rather than retrying it.
+
+**SSRF defense in depth.** Because a subscription endpoint is an attacker-influenceable URL that the gateway later makes an outbound request to, the surface guards it twice. A _parse-time_ check (`validate-endpoint.ts`, sharing IP classification with `ip-classification.ts`) rejects the endpoint as written at subscribe time — non-HTTPS schemes, loopback and private/link-local literals, and bare dotless hostnames are refused before a record is ever stored. A second _connect-time_ guard in the sender (`push-sender.ts`) closes the DNS-rebinding gap: it resolves the endpoint host itself, classifies every candidate address, and refuses to open the socket if any resolves into an internal range — so a hostname that passed validation but now points at a private IP still cannot reach the internal network. Endpoint URLs and key material are never logged; only coarse rejection-reason enums surface.
 
 ### VAPID key rotation and leak response
 
