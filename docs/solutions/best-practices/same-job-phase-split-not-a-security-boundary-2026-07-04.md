@@ -1,6 +1,7 @@
 ---
 title: Sequential steps in one GitHub Actions job are not a security boundary
 date: 2026-07-04
+last_updated: 2026-07-12
 category: best-practices
 module: ci security
 problem_type: best_practice
@@ -102,8 +103,15 @@ env:
   GH_TOKEN: ${{ steps.mint.outputs.token }}
 ```
 
+## Post-phase input re-injection (2026-07-12)
+
+A marketplace action's `post:` hook is another same-job boundary failure, distinct from step-order poisoning but rooted in the same shared-filesystem reality: the runner re-supplies the action's `with:` inputs as `INPUT_*` environment variables during the post (cleanup) phase, at the **end** of the job. An action that received a private key via `with:` therefore exposes that key again at job end, after every untrusted step has already run. A prompt-injected earlier step can tamper with the on-disk `_actions/**/dist/post.js` before the post phase executes and harvest the re-supplied input directly. SHA-pinning the action pins the download it fetched, not same-job filesystem integrity — it does nothing to stop a same-job step from rewriting the checked-out post script.
+
+Consequence: any step that must hold a genuinely sensitive key (e.g. a GitHub App private key) has to be a plain `run:` step invoking a checked-in script, not a marketplace action with a `post:` hook — see `docs/solutions/best-practices/inline-scoped-app-token-mint-2026-07-12.md` for the concrete pattern this rules out `actions/create-github-app-token` for. Evidence: `actions/create-github-app-token`'s post phase re-reads its inputs via `getBooleanInput`, confirming the re-injection is real, not theoretical.
+
 ## Related
 
+- `docs/solutions/best-practices/inline-scoped-app-token-mint-2026-07-12.md` — the inline no-post mint pattern this post-phase finding rules toward.
 - `docs/solutions/workflow-issues/isolate-ci-credential-via-oidc-broker-2026-07-01.md` — credential minimization via broker-mint (the real fix for #1107), and why credential-lifetime/process boundaries matter more than agent config.
 - `docs/solutions/workflow-issues/create-github-app-token-caller-mint-invalid-2026-07-04.md` — the reusable-workflow constraint that pushes this design toward mint-in-workflow or broker-mint.
 - Issue #1107; PR #1119 (interim hygiene); #1124 + `marcusrbrown/infra#771` (the broker-mint fix).
