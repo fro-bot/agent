@@ -27,8 +27,11 @@ on:
         type: string
         required: false
     secrets:
-      FRO_BOT_PAT:
-        description: PAT used for checkout and as the action's github-token. Required.
+      APPLICATION_ID:
+        description: GitHub App id used to mint the scoped installation token for the merge push. Required.
+        required: true
+      APPLICATION_PRIVATE_KEY:
+        description: GitHub App private key (PEM). Mapped only to the mint step's env; never job-level. Required.
         required: true
       OPENCODE_CONFIG:
         description: JSON merged into the OpenCode config (OPENCODE_CONFIG_CONTENT). Optional.
@@ -79,7 +82,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          token: ${{ secrets.FRO_BOT_PAT }}
+          # Default GITHUB_TOKEN: checkout needs only contents: read. The
+          # scoped App token is minted as late as possible (below) so its
+          # ~1h TTL is not spent on checkout/setup.
+          token: ${{ github.token }}
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
@@ -88,12 +94,25 @@ jobs:
         id: mint
         run: node --experimental-strip-types scripts/harness/mint-broker-credential.ts
 
+      # Trusted inline no-post mint. MUST stay a plain run: step invoking the
+      # checked-in script — never a marketplace action with a post: hook (the
+      # runner re-supplies INPUT_* — including the private key — during the
+      # post phase, and a prompt-injected earlier step can tamper the on-disk
+      # post script; see docs/plans/2026-07-11-002-feat-inline-app-token-mint-integrate-plan.md).
+      # The App secrets are mapped to THIS step's env only — never job-level.
+      - name: Mint scoped App token
+        id: mint-app-token
+        run: node --experimental-strip-types scripts/harness/mint-app-token.ts
+        env:
+          APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
+          APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+
       # SYNC: keep the shared merge inputs in step with fro-bot.yaml's Run Fro Bot step
       - name: Run Fro Bot
         uses: ./
         with:
           auth-json: ${{ steps.mint.outputs.auth-json }}
-          github-token: ${{ secrets.FRO_BOT_PAT }}
+          github-token: ${{ steps.mint-app-token.outputs.github-token }}
           model: ${{ inputs.model || vars.HARNESS_MODEL }}
           prompt: ${{ inputs.prompt }}
           response-mode: none

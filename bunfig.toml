@@ -12,3 +12,8 @@ linker = "hoisted"
 # Supply-chain age gate: refuse dependency versions published within this window.
 # Mirrors the prior pnpm minimumReleaseAge policy. Seconds (3 days).
 minimumReleaseAge = 259200
+
+# Temporary fast-track: @opencode-ai/sdk 1.17.18 pairs with the released
+# harness base (1.17.18+harness.4ec05a47) and clears the 3-day window at
+# 2026-07-12T18:50Z. Remove this exclusion after that.
+minimumReleaseAgeExcludes = ["@opencode-ai/sdk"]

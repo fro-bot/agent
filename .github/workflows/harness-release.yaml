@@ -205,7 +205,8 @@ jobs:
       contents: read
     uses: ./.github/workflows/harness-integrate.yaml
     secrets:
-      FRO_BOT_PAT: ${{ secrets.FRO_BOT_PAT }}
+      APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
+      APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
       OPENCODE_CONFIG: ${{ secrets.OPENCODE_CONFIG }}
       OMO_PROVIDERS: ${{ secrets.OMO_PROVIDERS }}
     with:

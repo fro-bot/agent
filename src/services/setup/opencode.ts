@@ -16,7 +16,7 @@ const HARNESS_MARKER = '+harness.'
  * Known stable stock version for fallback when latest-fetch fails or for non-harness paths.
  * This is a plain anomalyco/opencode release — not a harness build.
  */
-export const FALLBACK_VERSION = '1.17.13'
+export const FALLBACK_VERSION = '1.17.18'
 
 /**
  * Semver-ish pattern for version validation (defense-in-depth, path-traversal guard).
