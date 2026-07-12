@@ -354,6 +354,38 @@ describe('main — error paths (fail closed)', () => {
     expect(mocks.setOutput).not.toHaveBeenCalled()
   })
 
+  it.each([
+    ['empty body', {}],
+    ['non-numeric id', {id: '999'}],
+  ])(
+    'exits non-zero and never mints a token when the installation lookup id is not numeric: %s',
+    async (_label, body) => {
+      // #given
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(200, body))
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      await main()
+
+      // #then
+      expect(process.exitCode).toBe(1)
+      expect(mocks.setOutput).not.toHaveBeenCalled()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('never issues the token POST fetch when the installation lookup fails', async () => {
+    // #given
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(404, {message: 'Not Found'}))
+    vi.stubGlobal('fetch', fetchMock)
+
+    // #when
+    await main()
+
+    // #then
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it('exits non-zero when the token response is missing token', async () => {
     // #given
     const fetchMock = vi
