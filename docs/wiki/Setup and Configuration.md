@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-07-05"
-updated-by: "schedule-d7190410-28754466543"
+last-updated: "2026-07-12"
+updated-by: "schedule-d7190410-29208059688"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -10,8 +10,13 @@ sources:
   - src/services/setup/bun.ts
   - src/services/setup/omo.ts
   - src/services/setup/gh-auth.ts
+  - src/services/setup/git-credential-check.ts
   - src/services/setup/auth-json.ts
   - src/services/setup/tools-cache.ts
+  - packages/runtime/src/agent/filter-env.ts
+  - packages/runtime/src/agent/with-scrubbed-env.ts
+  - packages/runtime/src/agent/response-delivery.ts
+  - packages/harness/harness.config.json
   - packages/runtime/src/shared/constants.ts
   - src/shared/constants.ts
   - src/harness/config/inputs.ts
@@ -84,21 +89,21 @@ These can be overridden per-run via action inputs (`opencode-version`, `omo-vers
 
 Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
 
-The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.17.13+harness.ee55e157`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.17.18+harness.4ec05a47`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.13`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.13+harness.ee55e157`) and is a `fro-bot/agent` release that bundles the upstream binary together with patches this project carries on top of OpenCode — recent carries include a session-summary restore fix (OpenCode #33444) that rode the 1.17.13 upgrade, on top of the SQLite-reliability fixes from the 1.17.9 cycle. The action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.18`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.18+harness.4ec05a47`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries seventeen such refs on top of the `1.17.18` base, spanning provider/model routing fixes (notably one that lets `gpt-5.6` variants resolve instead of failing `model_not_found`), SQLite lock-timeout retries, SSE backlog bounding, and several memory-leak and stability patches. The exact carry set is defined in `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
 The presence of the `+harness.` marker drives three behavioral differences in `src/services/setup/opencode.ts`:
 
 - **Download source** — Harness versions are routed to the `fro-bot/agent` releases URL instead of the upstream `anomalyco/opencode` releases. Because harness release tags are non-`v`-prefixed and GitHub stores tags URL-encoded, the `+` in the version is percent-encoded as `%2B` when building the download path. Stock versions keep their conventional `v`-prefixed upstream URL.
 
-- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters.
+- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary; the stock fallback (`FALLBACK_VERSION`, currently `1.17.18`) is reached only on the `latest`-resolution path.
 
 - **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build-metadata and would collapse a harness build onto a stock cache entry of the same base version. To preserve identity, the `+harness.` marker is rewritten to a `-harness.` prerelease segment (`toolCacheVersion()`) _only_ at tool-cache call sites. Download URLs, checksums, logs, and return values keep the raw `+harness.` form. This guarantees a harness build and a stock build of the same base version never share a cache slot.
 
-If the `latest` resolution path or a non-harness flow needs a fallback, the setup module falls back to a known-good stock version rather than a harness build.
+If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
 
 ## Configuration Assembly
 
@@ -140,8 +145,15 @@ Credentials are handled with care:
 
 - **`auth.json`** is written with `0o600` permissions (owner-only read/write) and is never cached. It's regenerated fresh from secrets on every run.
 - **Git identity** is forced to `{bot}[bot]` so commits made by the agent have a clear audit trail.
-- **`GH_TOKEN`** is set as an environment variable for the `gh` CLI but never logged.
 - **Telemetry** is disabled for oMo before any oMo code executes.
+
+### GitHub credential disposition
+
+The GitHub token the agent might use to post is provisioned **conditionally**, driven by the response-delivery decision computed in [[Execution Lifecycle|bootstrap]]. On comment and review flows (`issue_comment`, `pull_request`, `issues`) the credential is **withheld** — `configureGhAuth()` skips setting `GH_TOKEN`, skips writing the `gh` `hosts.yml`, and clears any ambient `GH_CONFIG_DIR` from earlier workflow steps. The rationale is that on those flows the action posts the agent's answer itself (the file-convention delivery path), so the model has no legitimate need to call `gh` — and a credential the model never receives is a credential a prompt-injected model cannot exfiltrate from disk or environment. A preflight check (`git-credential-check.ts`) additionally asserts that no persisted git credential lingers in `.git/config` on these flows, which is why consumers are asked to check out with `persist-credentials: false`. Autonomous flows (`schedule`, `workflow_dispatch`) keep the credential provisioned, because they legitimately create branches, commits, and PRs on their own.
+
+### Environment scrubbing at agent spawn
+
+Independently of whether a credential is provisioned, the OpenCode child process is spawned under a **deny-by-default environment filter** (`packages/runtime/src/agent/filter-env.ts`, applied via `with-scrubbed-env.ts`). Only an enumerated allowlist of keys survives — GitHub Actions context, a handful of standard shell and locale variables, proxy/CA-bundle settings, and the `OPENCODE_*`, `RUNNER_*`, `XDG_*`, `LC_*`, and `NODE_*` prefixes. Anything ending in a credential-shaped suffix (`_TOKEN`, `_API_KEY`, `_SECRET`, `_KEY`, and similar), the `AWS_*` and `INPUT_*` prefixes, and `GITHUB_TOKEN`/`GH_TOKEN` by exact name are stripped even if they would otherwise match. The reduction is scoped: the harness restores its own environment immediately after the spawn so it can still reach the S3 backend, and it fails closed — if the scrub cannot complete, the child is never spawned.
 
 ## Action Inputs
 
