@@ -6,7 +6,12 @@ import { createStore } from "solid-js/store"
 import { useModels } from "@/context/models"
 import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
-import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
+import {
+  cycleModelVariant,
+  getConfiguredAgentVariant,
+  resolveModelVariant,
+  resolveModelVariantFromMessage,
+} from "@opencode-ai/core/util/model-variant"
 import { useSDK } from "./sdk"
 import { useSync } from "./sync"
 import { useServerSDK } from "./server-sdk"
@@ -67,7 +72,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const list = createMemo(() => sync().data.agent.filter((item) => item.mode !== "subagent" && !item.hidden))
     const connected = createMemo(() => new Set(providers.connected().map((item) => item.id)))
 
-    const [saved, setSaved] = persisted(
+    const [saved, setSaved, , savedReady] = persisted(
       {
         ...Persist.serverWorkspace(serverSDK().scope, sdk().directory, "model-selection", ["model-selection.v1"]),
         migrate,
@@ -190,19 +195,19 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return
         }
 
+        const prev = scope()
         batch(() => {
           setStore("current", item.name)
           setStore("last", {
             type: "agent",
             agent: item.name,
             model: item.model,
-            variant: item.variant ?? null,
+            variant: prev?.variant,
           })
-          const prev = scope()
           const next = {
             agent: item.name,
             model: item.model ?? prev?.model,
-            variant: item.variant ?? prev?.variant,
+            variant: prev?.variant,
           } satisfies State
           const session = id()
           if (session) {
@@ -323,12 +328,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         configured,
         selected,
         current() {
+          const selected = this.selected()
           const resolved = resolveModelVariant({
             variants: this.list(),
-            selected: this.selected(),
+            selected,
             configured: this.configured(),
           })
           if (resolved) return resolved
+          if (selected === null) return
           const model = current()
           if (!model) return
           const saved = models.variant.get({ providerID: model.provider.id, modelID: model.id })
@@ -375,11 +382,12 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       model,
       agent,
       session: {
+        ready: savedReady,
         reset() {
           setStore({ draft: undefined, promoting: undefined })
         },
-        promote(dir: string, session: string) {
-          const next = clone(snapshot())
+        promote(dir: string, session: string, state?: State) {
+          const next = clone(state ?? snapshot())
           if (!next) return
           const key = handoffKey(serverSDK().scope, dir, session)
           handoff.set(key, next)
@@ -401,7 +409,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           setSaved("session", session, {
             agent: msg.agent,
             model: msg.model,
-            variant: msg.model?.variant ?? null,
+            variant: resolveModelVariantFromMessage(msg.model?.variant),
           })
         },
       },
@@ -409,3 +417,5 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     return result
   },
 })
+
+export type ModelSelection = ReturnType<typeof useLocal>["model"]

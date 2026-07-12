@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
 import type { Prompt } from "@/context/prompt"
+import type { ModelSelection } from "@/context/local"
 
 let createPromptSubmit: typeof import("./submit").createPromptSubmit
 
@@ -11,13 +12,13 @@ const optimistic: Array<{
   sessionID?: string
   message: {
     agent: string
-    model: { providerID: string; modelID: string }
-    variant?: string
+    model: { providerID: string; modelID: string; variant?: string }
   }
 }> = []
 const optimisticSeeded: boolean[] = []
 const storedSessions: Record<string, Array<{ id: string; title?: string }>> = {}
 const promoted: Array<{ directory: string; sessionID: string }> = []
+const promotedVariants: Array<string | null | undefined> = []
 const sentShell: string[] = []
 const syncedDirectories: string[] = []
 const promotedDrafts: Array<{ draftID: string; server: string; sessionId: string }> = []
@@ -26,6 +27,7 @@ let params: { id?: string } = {}
 let search: { draftId?: string } = {}
 let selected = "/repo/worktree-a"
 let variant: string | undefined
+let selectedVariant: string | null | undefined
 
 const promptValue: Prompt = [{ type: "text", content: "ls", start: 0, end: 2 }]
 const prompt = {
@@ -33,6 +35,10 @@ const prompt = {
   current: () => promptValue,
   cursor: () => 0,
   dirty: () => true,
+  model: {
+    current: () => undefined,
+    set: () => undefined,
+  },
   reset: () => undefined,
   set: () => undefined,
   context: {
@@ -91,8 +97,7 @@ beforeAll(async () => {
     },
   }))
 
-  mock.module("@opencode-ai/ui/toast", () => ({
-    Toast: { Region: () => null },
+  mock.module("@/utils/toast", () => ({
     showToast: () => 0,
   }))
 
@@ -104,14 +109,15 @@ beforeAll(async () => {
     useLocal: () => ({
       model: {
         current: () => ({ id: "model", provider: { id: "provider" } }),
-        variant: { current: () => variant },
+        variant: { current: () => variant, selected: () => selectedVariant },
       },
       agent: {
         current: () => ({ name: "agent" }),
       },
       session: {
-        promote(directory: string, sessionID: string) {
+        promote(directory: string, sessionID: string, state?: { variant?: string | null }) {
           promoted.push({ directory, sessionID })
+          promotedVariants.push(state?.variant)
         },
       },
     }),
@@ -239,6 +245,7 @@ beforeEach(() => {
   optimistic.length = 0
   optimisticSeeded.length = 0
   promoted.length = 0
+  promotedVariants.length = 0
   promotedDrafts.length = 0
   params = {}
   search = {}
@@ -246,6 +253,7 @@ beforeEach(() => {
   syncedDirectories.length = 0
   selected = "/repo/worktree-a"
   variant = undefined
+  selectedVariant = undefined
   for (const key of Object.keys(storedSessions)) delete storedSessions[key]
 })
 
@@ -376,6 +384,101 @@ describe("prompt submit worktree selection", () => {
         model: { providerID: "provider", modelID: "model", variant: "high" },
       },
     })
+  })
+
+  test("uses an injected model selection", async () => {
+    params = { id: "session-1" }
+    const model = {
+      current: () => ({ id: "draft-model", provider: { id: "draft-provider" } }),
+      variant: { current: () => "draft-variant", selected: () => undefined },
+    } as unknown as ModelSelection
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => false,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      model,
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(optimistic[0]).toMatchObject({
+      message: {
+        model: { providerID: "draft-provider", modelID: "draft-model", variant: "draft-variant" },
+      },
+    })
+  })
+
+  test("sends explicit default variant on optimistic prompts", async () => {
+    params = { id: "session-1" }
+    selectedVariant = null
+
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => false,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      onSubmit: () => undefined,
+    })
+
+    const event = { preventDefault: () => undefined } as unknown as Event
+
+    await submit.handleSubmit(event)
+
+    expect(optimistic).toHaveLength(1)
+    expect(optimistic[0]).toMatchObject({
+      message: {
+        agent: "agent",
+        model: { providerID: "provider", modelID: "model", variant: "default" },
+      },
+    })
+  })
+
+  test("preserves explicit default when promoting a new session", async () => {
+    selectedVariant = null
+
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => undefined,
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => false,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      onSubmit: () => undefined,
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(promotedVariants).toEqual([null])
+    expect(optimistic[0]?.message.model.variant).toBe("default")
   })
 
   test("seeds new sessions before optimistic prompts are added", async () => {

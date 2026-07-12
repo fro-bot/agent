@@ -43,6 +43,7 @@ import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import * as DateTime from "effect/DateTime"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -53,9 +54,13 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { errorMessage } from "@/util/error"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
+
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -222,11 +227,14 @@ const layer = Layer.effect(
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
         : yield* MessageV2.toModelMessagesEffect(context, mdl)
+      // Title generation is an auxiliary request without a matching messages.transform
+      // hook, so prebuild the system prompt without firing chat system hooks.
+      const system = LLM.buildSystem({ agent: ag, model: mdl, parts: [], user: firstInfo })
       const text = yield* llm
         .stream({
           agent: ag,
           user: firstInfo,
-          system: [],
+          system,
           small: true,
           tools: {},
           model: mdl,
@@ -264,7 +272,20 @@ const layer = Layer.effect(
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
       const { task: taskTool } = yield* registry.named()
-      const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
+      const taskAgent = yield* agents.get(task.agent)
+      if (!taskAgent) {
+        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+        const error = new NamedError.Unknown({ message: `Agent not found: "${task.agent}".${hint}` })
+        yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+        throw error
+      }
+
+      const taskModel = task.model
+        ? yield* getModel(task.model.providerID, task.model.modelID, sessionID)
+        : taskAgent.model
+          ? yield* getModel(taskAgent.model.providerID, taskAgent.model.modelID, sessionID)
+          : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
         role: "assistant",
@@ -272,7 +293,7 @@ const layer = Layer.effect(
         sessionID,
         mode: task.agent,
         agent: task.agent,
-        variant: lastUser.model.variant,
+        variant: taskAgent.variant ?? lastUser.model.variant,
         path: { cwd: ctx.directory, root: ctx.worktree },
         cost: 0,
         tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -309,15 +330,6 @@ const layer = Layer.effect(
         { tool: TaskTool.id, sessionID, callID: part.id },
         { args: taskArgs },
       )
-
-      const taskAgent = yield* agents.get(task.agent)
-      if (!taskAgent) {
-        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${task.agent}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-        throw error
-      }
 
       let error: Error | undefined
       const taskAbort = new AbortController()
@@ -1135,7 +1147,7 @@ const layer = Layer.effect(
               session,
               modelID: lastUser.model.modelID,
               providerID: lastUser.model.providerID,
-              history: msgs,
+              history: structuredClone(msgs),
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
@@ -1210,13 +1222,53 @@ const layer = Layer.effect(
             yield* sessions.updateMessage(msg)
           })
 
+          const finalizeFailedAssistant = (error: unknown) =>
+            Effect.gen(function* () {
+              msg.error = MessageV2.fromError(error, { providerID: model.providerID })
+              msg.finish = "error"
+              msg.time.completed = Date.now()
+              yield* sessions.updateMessage(msg)
+              if (flags.experimentalEventSystem) {
+                const assistantMessageID = SessionMessage.ID.create()
+                yield* events.publish(SessionEvent.Step.Started, {
+                  sessionID,
+                  assistantMessageID,
+                  agent: msg.agent,
+                  model: {
+                    id: ModelV2.ID.make(msg.modelID),
+                    providerID: ProviderV2.ID.make(msg.providerID),
+                    variant: ModelV2.VariantID.make(msg.variant ?? "default"),
+                  },
+                  timestamp: DateTime.makeUnsafe(msg.time.created),
+                })
+                yield* events.publish(SessionEvent.Step.Failed, {
+                  sessionID,
+                  assistantMessageID,
+                  error: {
+                    type: "unknown",
+                    message: errorMessage(error),
+                  },
+                  timestamp: DateTime.makeUnsafe(Date.now()),
+                })
+              }
+              yield* events.publish(Session.Event.Error, { sessionID, error: msg.error })
+              yield* status.set(sessionID, { type: "idle" })
+            })
+
           const handle = yield* processor
             .create({
               assistantMessage: msg,
               sessionID,
               model,
             })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+            .pipe(
+              Effect.catchCauseIf(
+                (cause) => !Cause.hasInterruptsOnly(cause),
+                (cause) => finalizeFailedAssistant(Cause.squash(cause)).pipe(Effect.as(undefined)),
+              ),
+              Effect.onInterrupt(() => finalizeInterruptedAssistant),
+            )
+          if (!handle) break
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
@@ -1250,25 +1302,54 @@ const layer = Layer.effect(
             }
 
             if (step === 1)
-              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.void
+                    : Effect.logWarning("session summary background task failed", {
+                        error: Cause.squash(cause),
+                      }),
+                ),
+                Effect.forkIn(scope),
+              )
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+            // Build complete system prompt
+            const format = lastUser.format ?? { type: "text" as const }
+            const [skills, env, instructions, mcpInstructions] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
             ])
-            const system = [
-              ...env,
-              ...instructions,
-              ...(mcpInstructions ? [mcpInstructions] : []),
-              ...(skills ? [skills] : []),
-            ]
-            const format = lastUser.format ?? { type: "text" as const }
-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            const system = LLM.buildSystem({
+              agent,
+              model,
+              parts: [
+                ...env,
+                ...instructions,
+                ...(mcpInstructions ? [mcpInstructions] : []),
+                ...(skills ? [skills] : []),
+                ...(format.type === "json_schema" ? [STRUCTURED_OUTPUT_SYSTEM_PROMPT] : []),
+              ],
+              user: lastUser,
+            })
+
+            // system.transform fires first so plugins can inspect final system state
+            const systemHeader = system[0]
+            yield* plugin.trigger(
+              "experimental.chat.system.transform",
+              { sessionID, model },
+              { system },
+            )
+            LLM.rejoinSystemForCaching(system, systemHeader)
+
+            // messages.transform fires after so plugins can react to system prompt state
+            yield* plugin.trigger(
+              "experimental.chat.messages.transform",
+              { sessionID, model: { providerID: model.providerID, modelID: model.id } },
+              { messages: msgs },
+            )
+            const modelMsgs = yield* MessageV2.toModelMessagesEffect(msgs, model)
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1328,6 +1409,9 @@ const layer = Layer.effect(
             }
             return "continue" as const
           }).pipe(
+            Effect.catchCauseIf((cause) => !Cause.hasInterruptsOnly(cause), (cause) =>
+              finalizeFailedAssistant(Cause.squash(cause)).pipe(Effect.as("break" as const)),
+            ),
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
@@ -1335,16 +1419,33 @@ const layer = Layer.effect(
           continue
         }
 
-        yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+        yield* compaction.prune({ sessionID }).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.void
+              : Effect.logWarning("session compaction prune background task failed", {
+                  error: Cause.squash(cause),
+                }),
+          ),
+          Effect.forkIn(scope),
+        )
         return yield* lastAssistant(sessionID)
       },
     )
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
-    })
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input: LoopInput) =>
+      state
+        .ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+        .pipe(
+          Effect.withSpan("invoke_agent", {
+            root: true,
+            attributes: {
+              "gen_ai.operation.name": "invoke_agent",
+              "gen_ai.conversation.id": input.sessionID,
+              "session.id": input.sessionID,
+            },
+          }),
+        )
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",

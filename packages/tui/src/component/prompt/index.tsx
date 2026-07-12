@@ -56,6 +56,7 @@ import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
+import { resolveModelVariantForRequest, resolveModelVariantFromMessage } from "@opencode-ai/core/util/model-variant"
 
 registerOpencodeSpinner()
 
@@ -323,7 +324,14 @@ export function Prompt(props: PromptProps) {
         if (!args.agent) local.agent.set(msg.agent)
         if (msg.model) {
           local.model.set(msg.model)
-          local.model.variant.set(msg.model.variant)
+          const selected = resolveModelVariantFromMessage(msg.model.variant)
+          const configured = local.model.variant.configured()
+          if (selected === undefined || selected === configured) {
+            local.model.variant.clear()
+          }
+          if (selected !== undefined && selected !== configured) {
+            local.model.variant.set(selected ?? undefined)
+          }
         }
       }
     }
@@ -983,7 +991,10 @@ export function Prompt(props: PromptProps) {
       return false
     }
 
-    const variant = local.model.variant.current()
+    const variant = resolveModelVariantForRequest({
+      selected: local.model.variant.selected(),
+      current: local.model.variant.current(),
+    })
     let sessionID = props.sessionID
     let finishMoveProgress = false
     if (sessionID == null) {

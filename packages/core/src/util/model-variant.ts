@@ -12,6 +12,9 @@ type Model = AgentModel & {
   variants?: Record<string, unknown>
 }
 
+// selected: string          = user-chosen variant name
+// selected: null            = user explicitly chose "default" (clears any agent-configured variant)
+// selected: undefined       = no user choice yet (fall back to agent-configured variant)
 type VariantInput = {
   variants: string[]
   selected: string | null | undefined
@@ -35,6 +38,19 @@ export function resolveModelVariant(input: VariantInput) {
   return undefined
 }
 
+export function resolveModelVariantForRequest(input: {
+  selected: string | null | undefined
+  current: string | undefined
+}) {
+  if (input.selected === null) return "default"
+  return input.current
+}
+
+export function resolveModelVariantFromMessage(variant: string | undefined) {
+  if (variant === "default") return null
+  return variant
+}
+
 export function cycleModelVariant(input: VariantInput) {
   if (input.variants.length === 0) return undefined
   if (input.selected === null) return input.variants[0]
@@ -43,6 +59,7 @@ export function cycleModelVariant(input: VariantInput) {
     if (index === input.variants.length - 1) return undefined
     return input.variants[index + 1]
   }
+  // No explicit selection: start cycling from the agent-configured variant.
   if (input.configured && input.variants.includes(input.configured)) {
     const index = input.variants.indexOf(input.configured)
     if (index === input.variants.length - 1) return input.variants[0]

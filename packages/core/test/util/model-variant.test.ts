@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
+import {
+  cycleModelVariant,
+  getConfiguredAgentVariant,
+  resolveModelVariant,
+  resolveModelVariantForRequest,
+  resolveModelVariantFromMessage,
+} from "../../src/util/model-variant"
 
 describe("model variant", () => {
   test("resolves configured agent variant when model matches", () => {
@@ -82,5 +88,42 @@ describe("model variant", () => {
     })
 
     expect(value).toBe("low")
+  })
+
+  test("cycles through all variants from explicit selection", () => {
+    const variants = ["low", "high", "xhigh"]
+    const first = cycleModelVariant({ variants, selected: undefined, configured: undefined })
+    const second = cycleModelVariant({ variants, selected: first, configured: undefined })
+    const third = cycleModelVariant({ variants, selected: second, configured: undefined })
+    const fourth = cycleModelVariant({ variants, selected: third, configured: undefined })
+
+    expect(first).toBe("low")
+    expect(second).toBe("high")
+    expect(third).toBe("xhigh")
+    expect(fourth).toBeUndefined()
+  })
+
+  test("sends explicit default as request sentinel", () => {
+    const value = resolveModelVariantForRequest({ selected: null, current: undefined })
+
+    expect(value).toBe("default")
+  })
+
+  test("keeps current variant for requests without explicit default", () => {
+    const value = resolveModelVariantForRequest({ selected: undefined, current: "xhigh" })
+
+    expect(value).toBe("xhigh")
+  })
+
+  test("restores explicit default from message sentinel", () => {
+    const value = resolveModelVariantFromMessage("default")
+
+    expect(value).toBeNull()
+  })
+
+  test("keeps absent message variant as inherit", () => {
+    const value = resolveModelVariantFromMessage(undefined)
+
+    expect(value).toBeUndefined()
   })
 })
