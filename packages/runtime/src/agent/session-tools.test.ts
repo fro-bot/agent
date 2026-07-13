@@ -1,4 +1,5 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {z} from 'zod'
 
 import {createSessionTools, info, list, read, search} from './session-tools.js'
 
@@ -8,6 +9,7 @@ const mockGetSessionInfo = vi.fn()
 const mockGetSession = vi.fn()
 const mockGetSessionMessages = vi.fn()
 const mockGetSessionTodos = vi.fn()
+const mockExtractTextFromPart = vi.fn()
 
 vi.mock('../session/index.js', () => ({
   listSessions: (...args: unknown[]): unknown => mockListSessions(...args),
@@ -16,8 +18,10 @@ vi.mock('../session/index.js', () => ({
   getSession: (...args: unknown[]): unknown => mockGetSession(...args),
   getSessionMessages: (...args: unknown[]): unknown => mockGetSessionMessages(...args),
   getSessionTodos: (...args: unknown[]): unknown => mockGetSessionTodos(...args),
+  extractTextFromPart: (...args: unknown[]): unknown => mockExtractTextFromPart(...args),
 }))
 
+const SENTINEL_CLIENT = {session: {sentinel: true}, project: {sentinel: true}}
 const mockCreateOpencodeClient = vi.fn()
 
 vi.mock('@opencode-ai/sdk', () => ({
@@ -28,7 +32,10 @@ const FAKE_BASE_URL = 'http://127.0.0.1:4096'
 
 beforeEach(() => {
   vi.resetAllMocks()
-  mockCreateOpencodeClient.mockReturnValue({session: {}, project: {}})
+  mockCreateOpencodeClient.mockReturnValue(SENTINEL_CLIENT)
+  mockExtractTextFromPart.mockImplementation((part: {type: string; text?: string}) =>
+    part.type === 'text' ? (part.text ?? null) : null,
+  )
 })
 
 describe('createSessionTools — contract shape', () => {
@@ -62,12 +69,18 @@ describe('createSessionTools — contract shape', () => {
     expect(Object.keys(info.args)).toEqual(['session_id'])
   })
 
-  it('each arg schema is a plain {type, description} object', () => {
+  it('every arg is a Zod schema; only read/info session_id and search query are required', () => {
     // #then
-    for (const tool of [list, read, search, info]) {
-      for (const schema of Object.values(tool.args)) {
-        expect(typeof schema.type).toBe('string')
-        expect(typeof schema.description).toBe('string')
+    const requiredByTool = new Map<typeof list, readonly string[]>([
+      [list, []],
+      [read, ['session_id']],
+      [search, ['query']],
+      [info, ['session_id']],
+    ])
+    for (const [tool, requiredNames] of requiredByTool) {
+      for (const [name, schema] of Object.entries(tool.args)) {
+        expect(schema).toBeInstanceOf(z.ZodType)
+        expect(schema.isOptional()).toBe(!requiredNames.includes(name))
       }
     }
   })
@@ -136,17 +149,46 @@ describe('createSessionTools — list', () => {
     const tools = createSessionTools(() => FAKE_BASE_URL)
 
     // #when
-    const result = await tools.list.execute({limit: 5})
+    const result = await tools.list.execute({limit: 5, project_path: '/w'})
 
     // #then
     expect(result).toContain('ses_1')
     expect(result).toContain('Session One')
+    expect(mockCreateOpencodeClient).toHaveBeenCalledWith({baseUrl: FAKE_BASE_URL})
     expect(mockListSessions).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.any(String),
-      expect.objectContaining({limit: 5}),
+      SENTINEL_CLIENT,
+      '/w',
+      {limit: 5, fromDate: undefined, toDate: undefined},
       expect.anything(),
     )
+  })
+
+  it('passes fromDate at midnight and toDate at end-of-day for the same date', async () => {
+    // #given
+    mockListSessions.mockResolvedValue([])
+    const tools = createSessionTools(() => FAKE_BASE_URL)
+
+    // #when
+    await tools.list.execute({from_date: '2024-01-01', to_date: '2024-01-01'})
+
+    // #then
+    const call = mockListSessions.mock.calls[0]?.[2] as {fromDate: Date; toDate: Date}
+    expect(call.fromDate.toISOString()).toBe('2024-01-01T00:00:00.000Z')
+    expect(call.toDate.toISOString()).toBe('2024-01-01T23:59:59.999Z')
+  })
+
+  it('normalizes zero and negative limits to "no limit" (undefined)', async () => {
+    // #given
+    mockListSessions.mockResolvedValue([])
+    const tools = createSessionTools(() => FAKE_BASE_URL)
+
+    // #when
+    await tools.list.execute({limit: -1})
+    await tools.list.execute({limit: 0})
+
+    // #then
+    expect(mockListSessions.mock.calls[0]?.[2]).toMatchObject({limit: undefined})
+    expect(mockListSessions.mock.calls[1]?.[2]).toMatchObject({limit: undefined})
   })
 
   it('returns a friendly message when no sessions exist', async () => {
@@ -186,6 +228,7 @@ describe('createSessionTools — read', () => {
     // #then
     expect(result).toContain('session not found')
     expect(result).toContain('ses_missing')
+    expect(mockGetSession).toHaveBeenCalledWith(SENTINEL_CLIENT, 'ses_missing', expect.anything())
   })
 
   it('requires session_id and fails soft when missing', async () => {
@@ -217,10 +260,10 @@ describe('createSessionTools — read', () => {
 
     // #then
     expect(result).toContain('do the thing')
-    expect(mockGetSessionTodos).toHaveBeenCalled()
+    expect(mockGetSessionTodos).toHaveBeenCalledWith(SENTINEL_CLIENT, 'ses_1', expect.anything())
   })
 
-  it('includes transcript respecting limit when include_transcript is true', async () => {
+  it('includes transcript content (not message ids) respecting limit when include_transcript is true', async () => {
     // #given
     mockGetSession.mockResolvedValue({
       id: 'ses_1',
@@ -231,8 +274,8 @@ describe('createSessionTools — read', () => {
       time: {created: 1, updated: 2},
     })
     mockGetSessionMessages.mockResolvedValue([
-      {id: 'm1', role: 'user'},
-      {id: 'm2', role: 'assistant'},
+      {id: 'm1', role: 'user', parts: [{id: 'p1', type: 'text', text: 'hello there'}]},
+      {id: 'm2', role: 'assistant', parts: [{id: 'p2', type: 'text', text: 'second message'}]},
     ])
     const tools = createSessionTools(() => FAKE_BASE_URL)
 
@@ -240,8 +283,34 @@ describe('createSessionTools — read', () => {
     const result = await tools.read.execute({session_id: 'ses_1', include_transcript: true, limit: 1})
 
     // #then
-    expect(result).toContain('m1')
-    expect(result).not.toContain('m2')
+    expect(result).toContain('[user] hello there')
+    expect(result).not.toContain('second message')
+    expect(result).not.toContain('m1')
+    expect(mockGetSessionMessages).toHaveBeenCalledWith(SENTINEL_CLIENT, 'ses_1', expect.anything())
+  })
+
+  it('normalizes a negative transcript limit to "no limit"', async () => {
+    // #given
+    mockGetSession.mockResolvedValue({
+      id: 'ses_1',
+      version: '1',
+      projectID: 'p1',
+      directory: '/w',
+      title: 'T',
+      time: {created: 1, updated: 2},
+    })
+    mockGetSessionMessages.mockResolvedValue([
+      {id: 'm1', role: 'user', parts: [{id: 'p1', type: 'text', text: 'one'}]},
+      {id: 'm2', role: 'assistant', parts: [{id: 'p2', type: 'text', text: 'two'}]},
+    ])
+    const tools = createSessionTools(() => FAKE_BASE_URL)
+
+    // #when
+    const result = await tools.read.execute({session_id: 'ses_1', include_transcript: true, limit: -1})
+
+    // #then
+    expect(result).toContain('[user] one')
+    expect(result).toContain('[assistant] two')
   })
 })
 
@@ -257,7 +326,7 @@ describe('createSessionTools — search', () => {
     expect(result.startsWith('session store unavailable:')).toBe(true)
   })
 
-  it('formats matches with per-match context lines', async () => {
+  it('formats matches with per-match context lines and passes exact args through', async () => {
     // #given
     mockSearchSessions.mockResolvedValue([
       {sessionId: 'ses_1', matches: [{messageId: 'm1', partId: 'p1', excerpt: '...found it...', role: 'user'}]},
@@ -265,11 +334,30 @@ describe('createSessionTools — search', () => {
     const tools = createSessionTools(() => FAKE_BASE_URL)
 
     // #when
-    const result = await tools.search.execute({query: 'found'})
+    const result = await tools.search.execute({query: 'found', limit: 3, case_sensitive: true})
 
     // #then
     expect(result).toContain('ses_1')
     expect(result).toContain('found it')
+    expect(mockSearchSessions).toHaveBeenCalledWith(
+      'found',
+      SENTINEL_CLIENT,
+      expect.any(String),
+      {limit: 3, caseSensitive: true, sessionId: undefined},
+      expect.anything(),
+    )
+  })
+
+  it('normalizes zero/negative limit to "no limit"', async () => {
+    // #given
+    mockSearchSessions.mockResolvedValue([])
+    const tools = createSessionTools(() => FAKE_BASE_URL)
+
+    // #when
+    await tools.search.execute({query: 'found', limit: -5})
+
+    // #then
+    expect(mockSearchSessions.mock.calls[0]?.[3]).toMatchObject({limit: undefined})
   })
 
   it('returns a friendly message when there are no matches', async () => {
@@ -282,6 +370,46 @@ describe('createSessionTools — search', () => {
 
     // #then
     expect(result).toBe('No matches found.')
+  })
+
+  it('returns "session not found" (distinct from empty results) when session_id does not exist', async () => {
+    // #given
+    mockGetSession.mockResolvedValue(null)
+    const tools = createSessionTools(() => FAKE_BASE_URL)
+
+    // #when
+    const result = await tools.search.execute({query: 'anything', session_id: 'ses_missing'})
+
+    // #then
+    expect(result).toBe('session not found: ses_missing')
+    expect(mockGetSession).toHaveBeenCalledWith(SENTINEL_CLIENT, 'ses_missing', expect.anything())
+    expect(mockSearchSessions).not.toHaveBeenCalled()
+  })
+
+  it('scopes to session_id when it exists', async () => {
+    // #given
+    mockGetSession.mockResolvedValue({
+      id: 'ses_1',
+      version: '1',
+      projectID: 'p1',
+      directory: '/w',
+      title: 'T',
+      time: {created: 1, updated: 2},
+    })
+    mockSearchSessions.mockResolvedValue([])
+    const tools = createSessionTools(() => FAKE_BASE_URL)
+
+    // #when
+    await tools.search.execute({query: 'found', session_id: 'ses_1'})
+
+    // #then
+    expect(mockSearchSessions).toHaveBeenCalledWith(
+      'found',
+      SENTINEL_CLIENT,
+      expect.any(String),
+      {limit: undefined, caseSensitive: undefined, sessionId: 'ses_1'},
+      expect.anything(),
+    )
   })
 })
 
@@ -296,6 +424,7 @@ describe('createSessionTools — info', () => {
 
     // #then
     expect(result).toContain('session not found')
+    expect(mockGetSessionInfo).toHaveBeenCalledWith(SENTINEL_CLIENT, 'ses_missing', expect.anything())
   })
 
   it('summarizes id/title/created/updated/message-count', async () => {

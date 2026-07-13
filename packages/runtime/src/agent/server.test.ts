@@ -62,6 +62,34 @@ describe('bootstrapOpenCodeServer', () => {
     expect(capturedEnvUrl).toBe(`http://127.0.0.1:${String(callArgs?.port)}`)
   })
 
+  it('scrubs denied secrets (e.g. GITHUB_TOKEN) from spawn env and restores them after bootstrap', async () => {
+    // #given
+    process.env.GITHUB_TOKEN = 'ghp_super_secret'
+    const logger = createMockLogger()
+    let capturedGithubTokenAtSpawn: string | undefined
+    let capturedPinnedUrlAtSpawn: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedGithubTokenAtSpawn = process.env.GITHUB_TOKEN
+      capturedPinnedUrlAtSpawn = process.env.FRO_BOT_OPENCODE_URL
+      const port = (options as {port?: number}).port
+      return {
+        client: {} as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedGithubTokenAtSpawn).toBeUndefined()
+    const callArgs = vi.mocked(createOpencode).mock.calls[0]?.[0]
+    expect(capturedPinnedUrlAtSpawn).toBe(`http://127.0.0.1:${String(callArgs?.port)}`)
+    expect(process.env.GITHUB_TOKEN).toBe('ghp_super_secret')
+  })
+
   it('leaves FRO_BOT_OPENCODE_URL set in the parent process after bootstrap, matching the server URL', async () => {
     // #given
     const logger = createMockLogger()
@@ -83,12 +111,13 @@ describe('bootstrapOpenCodeServer', () => {
     expect(process.env.FRO_BOT_OPENCODE_URL).toBe(serverUrl)
   })
 
-  it('warns and overwrites FRO_BOT_OPENCODE_URL when the actual server URL differs from the pinned port', async () => {
+  it('fails the bootstrap when the actual server URL differs from the pinned port', async () => {
     // #given
     const logger = createMockLogger()
+    const closeSpy = vi.fn()
     vi.mocked(createOpencode).mockResolvedValue({
       client: {} as never,
-      server: {url: 'http://127.0.0.1:9999', close: vi.fn()},
+      server: {url: 'http://127.0.0.1:9999', close: closeSpy},
     })
     const controller = new AbortController()
 
@@ -96,12 +125,10 @@ describe('bootstrapOpenCodeServer', () => {
     const result = await bootstrapOpenCodeServer(controller.signal, logger)
 
     // #then
-    expect(result.success).toBe(true)
-    expect(logger.warning).toHaveBeenCalledWith(
-      'OpenCode server URL differs from pinned port',
-      expect.objectContaining({actualUrl: 'http://127.0.0.1:9999'}),
-    )
-    expect(process.env.FRO_BOT_OPENCODE_URL).toBe('http://127.0.0.1:9999')
+    expect(result.success).toBe(false)
+    const message = result.success ? undefined : result.error.message
+    expect(message).toContain('http://127.0.0.1:9999')
+    expect(closeSpy).toHaveBeenCalledTimes(1)
   })
 
   it('returns an error result when createOpencode fails', async () => {

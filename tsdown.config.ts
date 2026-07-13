@@ -49,6 +49,7 @@ const sharedNoExternal = (id: string): boolean => {
   if (id.startsWith('@aws-sdk/')) return true
   if (id.startsWith('@smithy/')) return true
   if (id.startsWith('@fro-bot/runtime')) return true
+  if (id === 'zod' || id.startsWith('zod/')) return true
   return false
 }
 

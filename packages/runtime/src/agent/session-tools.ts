@@ -17,11 +17,13 @@
  *   string-shaped outputs, so the override is invisible to the model.
  */
 
-import type {SessionInfo} from '../session/index.js'
+import type {Part, SessionInfo} from '../session/index.js'
 import process from 'node:process'
 
 import {createOpencodeClient} from '@opencode-ai/sdk'
+import {z} from 'zod'
 import {
+  extractTextFromPart,
   getSession,
   getSessionInfo,
   getSessionMessages,
@@ -52,14 +54,9 @@ function formatTimestamp(ms: number): string {
   return new Date(ms).toISOString()
 }
 
-export interface SessionToolArgSchema {
-  readonly type: string
-  readonly description: string
-}
-
 export interface SessionToolDefinition {
   readonly description: string
-  readonly args: Readonly<Record<string, SessionToolArgSchema>>
+  readonly args: Readonly<Record<string, z.ZodType>>
   readonly execute: (args: Readonly<Record<string, unknown>>) => Promise<string>
 }
 
@@ -88,6 +85,29 @@ function parseDate(value: string | undefined): Date | undefined {
   return Number.isNaN(parsed.getTime()) ? undefined : parsed
 }
 
+/** Parses a `to_date` bound to the END of that day (inclusive upper bound). */
+function parseEndOfDayDate(value: string | undefined): Date | undefined {
+  const parsed = parseDate(value)
+  if (parsed == null) return undefined
+  const endOfDay = new Date(parsed)
+  endOfDay.setUTCHours(23, 59, 59, 999)
+  return endOfDay
+}
+
+/** Any limit below 1 (including negative values) means "no limit". */
+function normalizeLimit(value: number | undefined): number | undefined {
+  return value == null || value < 1 ? undefined : value
+}
+
+function formatMessageForTranscript(message: {readonly role: string; readonly parts?: readonly Part[]}): string {
+  const parts = message.parts ?? []
+  const text = parts
+    .map(part => extractTextFromPart(part))
+    .filter((value): value is string => value != null)
+    .join(' ')
+  return text.length > 0 ? `[${message.role}] ${text}` : `[${message.role}] (no content)`
+}
+
 /**
  * Factory: creates the four session tool definitions against an injectable base-URL
  * resolver. The resolver is called inside `execute()` (never at import time) so tests
@@ -105,10 +125,10 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
   const list: SessionToolDefinition = {
     description: 'List recent OpenCode sessions for the current workspace, most recently updated first.',
     args: {
-      limit: {type: 'number', description: 'Maximum number of sessions to return.'},
-      from_date: {type: 'string', description: 'Only include sessions created on or after this date (YYYY-MM-DD).'},
-      to_date: {type: 'string', description: 'Only include sessions created on or before this date (YYYY-MM-DD).'},
-      project_path: {type: 'string', description: 'Workspace/project directory to list sessions for.'},
+      limit: z.number().describe('Maximum number of sessions to return.').optional(),
+      from_date: z.string().describe('Only include sessions created on or after this date (YYYY-MM-DD).').optional(),
+      to_date: z.string().describe('Only include sessions created on or before this date (YYYY-MM-DD).').optional(),
+      project_path: z.string().describe('Workspace/project directory to list sessions for.').optional(),
     },
     async execute(args) {
       const resolved = resolveClientOrReason()
@@ -121,9 +141,9 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
           client,
           projectPath,
           {
-            limit: asNumber(args.limit),
+            limit: normalizeLimit(asNumber(args.limit)),
             fromDate: parseDate(asString(args.from_date)),
-            toDate: parseDate(asString(args.to_date)),
+            toDate: parseEndOfDayDate(asString(args.to_date)),
           },
           silentLogger,
         )
@@ -144,10 +164,10 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
   const read: SessionToolDefinition = {
     description: 'Read a session: header, optional todos, and optional transcript.',
     args: {
-      session_id: {type: 'string', description: 'The session id to read (required).'},
-      include_todos: {type: 'boolean', description: 'Include the session todo list.'},
-      include_transcript: {type: 'boolean', description: 'Include the message transcript.'},
-      limit: {type: 'number', description: 'Maximum number of transcript messages to include.'},
+      session_id: z.string().describe('The session id to read (required).'),
+      include_todos: z.boolean().describe('Include the session todo list.').optional(),
+      include_transcript: z.boolean().describe('Include the message transcript.').optional(),
+      limit: z.number().describe('Maximum number of transcript messages to include.').optional(),
     },
     async execute(args) {
       const resolved = resolveClientOrReason()
@@ -181,7 +201,7 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
         }
 
         if (asBoolean(args.include_transcript) === true) {
-          const limit = asNumber(args.limit)
+          const limit = normalizeLimit(asNumber(args.limit))
           const messages = await getSessionMessages(client, sessionId, silentLogger)
           const sliced = limit == null ? messages : messages.slice(0, limit)
           lines.push('', 'Transcript:')
@@ -189,7 +209,7 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
             lines.push('  (empty)')
           } else {
             for (const message of sliced) {
-              lines.push(`  [${message.role}] ${message.id}`)
+              lines.push(`  ${formatMessageForTranscript(message)}`)
             }
           }
         }
@@ -204,10 +224,10 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
   const search: SessionToolDefinition = {
     description: 'Search prior session content for matching text, optionally scoped to one session.',
     args: {
-      query: {type: 'string', description: 'Text to search for (required).'},
-      session_id: {type: 'string', description: 'Restrict the search to a single session id.'},
-      case_sensitive: {type: 'boolean', description: 'Match case-sensitively.'},
-      limit: {type: 'number', description: 'Maximum number of matches to return.'},
+      query: z.string().describe('Text to search for (required).'),
+      session_id: z.string().describe('Restrict the search to a single session id.').optional(),
+      case_sensitive: z.boolean().describe('Match case-sensitively.').optional(),
+      limit: z.number().describe('Maximum number of matches to return.').optional(),
     },
     async execute(args) {
       const resolved = resolveClientOrReason()
@@ -219,14 +239,19 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
       try {
         const client = createOpencodeClient({baseUrl: resolved.baseUrl})
         const projectPath = process.cwd()
+        const scopedSessionId = asString(args.session_id)
+        if (scopedSessionId != null) {
+          const session = await getSession(client, scopedSessionId, silentLogger)
+          if (session == null) return `session not found: ${scopedSessionId}`
+        }
         const results = await searchSessions(
           query,
           client,
           projectPath,
           {
-            limit: asNumber(args.limit),
+            limit: normalizeLimit(asNumber(args.limit)),
             caseSensitive: asBoolean(args.case_sensitive),
-            sessionId: asString(args.session_id),
+            sessionId: scopedSessionId,
           },
           silentLogger,
         )
@@ -250,7 +275,7 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
   const info: SessionToolDefinition = {
     description: 'Summarize a session: id, title, timestamps, message and todo counts.',
     args: {
-      session_id: {type: 'string', description: 'The session id to summarize (required).'},
+      session_id: z.string().describe('The session id to summarize (required).'),
     },
     async execute(args) {
       const resolved = resolveClientOrReason()

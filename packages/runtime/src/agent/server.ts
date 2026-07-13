@@ -59,8 +59,13 @@ export async function bootstrapOpenCodeServer(
     const opencode = await withScrubbedEnv(async () => createOpencode({signal, hostname: '127.0.0.1', port}), logger)
     const {client, server} = opencode
     if (server.url !== pinnedUrl) {
-      logger.warning('OpenCode server URL differs from pinned port', {pinnedUrl, actualUrl: server.url})
-      process.env.FRO_BOT_OPENCODE_URL = server.url
+      // The child server (and the bundled session-tools file tool running inside it)
+      // already captured pinnedUrl via FRO_BOT_OPENCODE_URL at spawn time. If the actual
+      // bound URL differs, that env var is now stale and the file tool will talk to the
+      // wrong server — updating the parent's env here would not fix that. Treat this as
+      // a genuine bootstrap fault instead of papering over it.
+      server.close()
+      return err(new Error(`OpenCode server URL mismatch: pinned ${pinnedUrl} but server bound to ${server.url}`))
     }
     logger.debug('OpenCode server bootstrapped', {url: server.url})
     return ok({
