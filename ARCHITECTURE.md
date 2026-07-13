@@ -230,7 +230,9 @@ Agent prompts are assembled from named XML-tagged sections with an explicit auth
 
 ### Two-Layer Session Management
 
-Session persistence spans two distinct layers that are easy to conflate. The **agent-side** layer is a set of in-session tools the model calls _during_ a run — `session_search` and `session_read`, injected into the prompt (`packages/runtime/src/agent/prompt.ts`) so the agent can recall relevant prior work before re-investigating. The **action-side** layer is a set of TypeScript utilities the harness runs _around_ execution — `listSessions`, `searchSessions`, `pruneSessions`, and `writeSessionSummary` (`packages/runtime/src/session/`) — invoked by the finalize and cleanup phases to persist, summarize, and prune session state across CI runs. The agent never calls the action-side utilities directly, and the harness never invokes the agent-side tools; they meet only through the persisted session store.
+Session persistence spans two distinct layers that are easy to conflate. During execution, the **agent-side** layer is a set of always-on native OpenCode file tools that let the model query prior sessions directly. Around execution, the **action-side** layer is a set of runtime utilities that summarize, prune, and write session state. Both layers share the same SDK-backed persisted session store, but neither calls the other directly.
+
+> See also: [Session Persistence](docs/wiki/Session%20Persistence.md) — canonical reference for the native tool inventory, config-dir registration, fallback behavior, and detailed session lifecycle.
 
 ### OIDC Trusted Publishing
 

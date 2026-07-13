@@ -99,6 +99,12 @@ The key operations:
 
 All SDK operations return empty arrays or `null` on failure — they never throw. This null-safe pattern prevents a single bad session from crashing the entire run.
 
+These runtime-side operations are distinct from the native agent tools described below: the operations above are invoked by harness/runtime code outside of model tool calls, never by the model directly. The native tools are what the model itself calls mid-run.
+
+### Native Agent Session Tools
+
+`packages/runtime/src/agent/session-tools.ts` implements the always-on `session_list` / `session_read` / `session_search` / `session_info` tool contract as a plain config-dir file tool (`tool/session.js`), independent of any plugin. Setup copies the compiled asset into the CI OpenCode config dir via `writeSessionToolsFile` (`src/services/setup/session-tools-config.ts`); OpenCode's tool registry loads it as a file tool before plugin tools, so an oh-my-openagent plugin tool of the same id overrides it at registry time (later-wins). The tools resolve an OpenCode client from `FRO_BOT_OPENCODE_URL` at call time (never at import time) and delegate to the same `packages/runtime/src/session/` primitives (`listSessions`, `getSession`, `getSessionMessages`, `getSessionTodos`, `getSessionInfo`, `searchSessions`) described above — they are a thin, string-formatted, model-facing wrapper over the SDK operations, not a separate storage path. Every failure path returns a `'session store unavailable: ...'` string rather than throwing, so a session-tool failure never fails the run; if the asset is missing at setup time, setup warns and continues, and the tools are simply absent from that run.
+
 ## Mapper Architecture
 
 SDK types don't perfectly match the project's local types. The mapper layer in `packages/runtime/src/session/` (`storage-mappers.ts`, `storage-message-mappers.ts`) translates between them:
@@ -112,12 +118,12 @@ The local types in `types.ts` are authoritative — they define the canonical sh
 
 ## Session Search
 
-The search module (`packages/runtime/src/session/search.ts`) provides two capabilities consumed by the prompt builder:
+The search module (`packages/runtime/src/session/search.ts`) provides two capabilities consumed by both the prompt builder and the native `session_list` / `session_search` agent tools:
 
 - **`listSessions`** — Returns recent non-child sessions sorted by `updatedAt`. Child sessions (those with a `parentID`, representing agent-spawned branches) are filtered out of the main listing.
 - **`searchSessions`** — Full-text search across session message content. Returns excerpts with context so the agent can decide which prior sessions are relevant without reading every message.
 
-During the session-prep phase of each run (see [[Execution Lifecycle]]), the system searches for sessions related to the current issue or PR. Matching excerpts are injected into the prompt as "Relevant Prior Work," giving the agent a lightweight summary of past interactions.
+During the session-prep phase of each run (see [[Execution Lifecycle]]), the system searches for sessions related to the current issue or PR. Matching excerpts are injected into the prompt as "Relevant Prior Work," giving the agent a lightweight summary of past interactions. Mid-run, the agent can additionally reach for the same search directly via the native `session_search` tool instead of waiting on the pre-injected excerpts.
 
 ## Logical Session Keys
 
