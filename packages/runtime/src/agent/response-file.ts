@@ -59,6 +59,15 @@ export function createResponseFileError(reason: ResponseFileErrorReason, message
 }
 
 /**
+ * The directory segment name (relative to RUNNER_TEMP) under which the
+ * harness places run-scoped response files. Exported so other modules that
+ * need to reason about this path (e.g. CI OpenCode config's
+ * `external_directory` permission scoping) can import the exact segment
+ * instead of duplicating the literal string — keeping the two in lockstep.
+ */
+export const RESPONSE_FILE_DIR_SEGMENT = 'fro-bot-response' as const
+
+/**
  * Build the run-scoped response-file directory. This directory lives OUTSIDE
  * the checkout (under RUNNER_TEMP) so a compromised/malicious checkout can
  * never plant or tamper with the response file the harness reads back.
@@ -68,7 +77,7 @@ export function buildResponseFileDir(parts: {
   readonly runId: string | number
   readonly runAttempt: string | number
 }): string {
-  return path.join(parts.runnerTemp, 'fro-bot-response', `${parts.runId}-${parts.runAttempt}`)
+  return path.join(parts.runnerTemp, RESPONSE_FILE_DIR_SEGMENT, `${parts.runId}-${parts.runAttempt}`)
 }
 
 /**

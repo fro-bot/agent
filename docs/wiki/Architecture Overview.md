@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-07-05"
-updated-by: "schedule-d7190410-28754466543"
+last-updated: "2026-07-12"
+updated-by: "schedule-d7190410-29208059688"
 sources:
   - src/main.ts
   - src/post.ts
@@ -17,6 +17,10 @@ sources:
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/approvals/coordinator.ts
   - packages/runtime/src/agent/remote-client.ts
+  - packages/runtime/src/agent/filter-env.ts
+  - packages/runtime/src/agent/with-scrubbed-env.ts
+  - scripts/harness/mint-app-token.ts
+  - packages/harness/harness.config.json
   - apps/workspace-agent/src/main.ts
   - apps/workspace-agent/src/server.ts
   - apps/workspace-agent/src/opencode-server.ts
@@ -72,7 +76,7 @@ Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `p
 
 `@fro.bot/harness` is a published, patched OpenCode binary built via the LLM-merge integration method (`cortexkit/orw`). Rather than downloading stock OpenCode, the action setup can install the harness binary, which carries a curated set of integration refs (stalled or closed upstream PRs, branch URLs) merged onto each deliberately-pinned upstream release via a one-time `opencode run` LLM merge. The produced binary is frozen: the merge runs once in CI per release bump, is reviewed as a bump PR, and the integration commit SHA is pinned before per-platform binaries are built and published.
 
-The CLI is a drop-in replacement — all arguments pass through to the patched OpenCode binary. Own subcommands (`info`, `patches`, `doctor`) report provenance (upstream tag, integration refs, build SHA) and health. The `integrate` merge step (`integrate.ts`) runs the OpenCode merge agent in CI; to keep the merge credential off a durable secret, it is minted just-in-time from an OIDC broker (`scripts/harness/mint-broker-credential.ts`) and fails closed on any error rather than falling back to a stored key. As defense-in-depth, the harness masks the `github-token` value and scrubs the raw `INPUT_GITHUB-TOKEN` copy from the merge child's environment so the OpenCode subprocess never inherits it.
+The CLI is a drop-in replacement — all arguments pass through to the patched OpenCode binary. Own subcommands (`info`, `patches`, `doctor`) report provenance (upstream tag, integration refs, build SHA) and health. The `integrate` merge step (`integrate.ts`) runs the OpenCode merge agent in CI over prompt-injectable upstream PR content, so both of its GitHub credentials are short-lived and minted just-in-time rather than drawn from durable secrets. The merge agent's own auth is minted from an OIDC broker (`scripts/harness/mint-broker-credential.ts`), and the credential used to `git push` the merge result is a scoped GitHub App installation token — single-repo, `contents: write`-only, roughly one-hour TTL — minted inline by a trusted no-post step (`scripts/harness/mint-app-token.ts`) that validates the returned token's scope all-or-nothing and fails closed on any mismatch. Neither mint has a durable-credential fallback, and the App private key is mapped only to the mint step's environment, never to job-level env or disk. As further defense-in-depth, the harness masks the `github-token` value and scrubs the raw `INPUT_GITHUB-TOKEN` copy from the merge child's environment so the OpenCode subprocess never inherits it.
 
 The package ships as `@fro.bot/harness` (the main resolver) plus four per-platform packages (`@fro.bot/harness-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`), each containing only its native binary. The main package's `postinstall` resolver picks the host platform's binary, verifies it, and symlinks it; `OPENCODE_PATH` and a bare `opencode` on `PATH` are honored as fallbacks for local or unbuilt use. Per-platform `optionalDependencies` are injected at publish time and are not listed in the workspace `package.json`.
 
@@ -108,7 +112,7 @@ The workspace-agent is a sandboxed Hono HTTP service that runs as a sidecar to t
 
 The runtime package exports five module groups:
 
-**Agent** (`agent/`) — Prompt construction, SDK execution, output-mode resolution, server bootstrapping, retry logic, and reference file management (see [[Prompt Architecture]]). Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
+**Agent** (`agent/`) — Prompt construction, SDK execution, output-mode and response-delivery resolution, server bootstrapping, retry logic, and reference file management (see [[Prompt Architecture]]). Spawns of the OpenCode child are wrapped in a deny-by-default environment filter (`filter-env.ts` / `with-scrubbed-env.ts`) so credential-shaped variables never reach the agent process (see [[Setup and Configuration]]). Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
 
 **Session** (`session/`) — SDK-backed session storage, search, pruning, writeback, and mapper layers (see [[Session Persistence]]).
 
