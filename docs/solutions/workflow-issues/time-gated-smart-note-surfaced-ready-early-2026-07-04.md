@@ -6,6 +6,7 @@ module: development-workflow
 problem_type: workflow_issue
 component: assistant
 severity: medium
+last_updated: 2026-07-13
 applies_when:
   - A smart note, reminder, or CI gate is conditioned on an age window, embargo, or release-timing rule
   - A background checker marks something "ready" on or near the boundary date
@@ -90,3 +91,4 @@ Rule: verify-then-act on any time-gated condition; a "ready" flag is a prompt to
 ## Related
 
 - [Migrating a pnpm workspace to Bun](migrate-pnpm-to-bun-monorepo-2026-06-24.md) — where `minimumReleaseAge` moved into `bunfig.toml` (§3c); this is the operational hazard of acting on that gate too early.
+- [Bun's local cache can mask the minimumReleaseAge gate](./bun-local-cache-masks-minimum-release-age-2026-07-13.md) — the same verify-the-timestamp discipline applied to install-cache freshness rather than smart-note readiness.

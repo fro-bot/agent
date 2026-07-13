@@ -444,8 +444,10 @@ describe('buildAgentPrompt', () => {
     // #then
     expect(prompt).toContain('<agent_context>')
     expect(prompt).toContain('### Session Management (REQUIRED)')
+    expect(prompt).toContain('session_list')
     expect(prompt).toContain('session_search')
     expect(prompt).toContain('session_read')
+    expect(prompt).toContain('session_info')
   })
 
   it('includes Response Protocol requiring single output', () => {
@@ -1502,8 +1504,10 @@ describe('buildAgentPrompt', () => {
 
       // #then
       expect(prompt).toContain('### Session Management (REQUIRED)')
+      expect(prompt).toContain('session_list')
       expect(prompt).toContain('session_search')
       expect(prompt).toContain('session_read')
+      expect(prompt).toContain('session_info')
     })
 
     it('still includes GitHub Operations section when responseMode is none', () => {

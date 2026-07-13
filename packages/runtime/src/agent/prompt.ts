@@ -217,8 +217,10 @@ function buildAgentContextSection(
   lines.push(
     '',
     '### Session Management (REQUIRED)',
+    'Tools: `session_list` (recent sessions), `session_search` (find relevant sessions by query), `session_read` (read a session in full), `session_info` (metadata for one session).',
+    '',
     'Before investigating any issue:',
-    '1. Use `session_search` to find relevant prior sessions for this repository',
+    '1. Use `session_search` (or `session_list`) to find relevant prior sessions for this repository',
     '2. Use `session_read` to review prior work if found',
     '3. Avoid repeating investigation already completed in previous sessions',
     '',

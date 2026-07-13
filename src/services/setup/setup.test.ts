@@ -6,6 +6,7 @@ import * as exec from '@actions/exec'
 import * as github from '@actions/github'
 import * as tc from '@actions/tool-cache'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import * as sessionToolsConfig from './session-tools-config.js'
 import {runSetup} from './setup.js'
 import * as toolsCache from './tools-cache.js'
 
@@ -120,6 +121,12 @@ vi.mock('./omo-slim.js', () => ({
   installOmoSlim: vi.fn().mockResolvedValue({installed: true, version: '1.1.1', error: null}),
 }))
 
+// Mock session-tools-config module so tests can assert the native session tools file is
+// actually written, not just that some unrelated mkdir happened.
+vi.mock('./session-tools-config.js', () => ({
+  writeSessionToolsFile: vi.fn().mockResolvedValue(undefined),
+}))
+
 describe('setup', () => {
   const originalEnv = process.env
 
@@ -159,6 +166,9 @@ describe('setup', () => {
 
     // Default exec.getExecOutput mock
     vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+
+    // Re-apply session-tools-config mock cleared by vi.resetAllMocks() above.
+    vi.mocked(sessionToolsConfig.writeSessionToolsFile).mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -597,6 +607,19 @@ describe('setup', () => {
         expect(written).toMatchObject({agents: {default: 'build'}, mode: 'strict'})
       })
 
+      it('always attempts to write the session tools file, regardless of oMo mode', async () => {
+        // #given
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(sessionToolsConfig.writeSessionToolsFile).toHaveBeenCalledTimes(1)
+        const [configDirArg] = vi.mocked(sessionToolsConfig.writeSessionToolsFile).mock.calls[0] ?? []
+        expect(typeof configDirArg).toBe('string')
+      })
+
       it('writes fresh config without merging existing opencode.json', async () => {
         // #given - simulate existing opencode.json with stale oMo data
         vi.mocked(fs.readFile).mockResolvedValue(
@@ -660,6 +683,17 @@ describe('setup', () => {
         expect(core.exportVariable).toHaveBeenCalledWith('OMO_SEND_ANONYMOUS_TELEMETRY', '0')
         expect(core.exportVariable).toHaveBeenCalledWith('OMO_DISABLE_POSTHOG', '1')
         expect(result?.omoStatus).toBe('installed')
+      })
+
+      it('writes the session tools file in enabled mode too', async () => {
+        // #given
+
+        // #when
+        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(sessionToolsConfig.writeSessionToolsFile).toHaveBeenCalledTimes(1)
       })
 
       it('returns omoStatus failed when oMo installer fails', async () => {
@@ -1085,6 +1119,17 @@ describe('setup', () => {
         vi.mocked(bunMod.installBun).mockResolvedValue({path: '/cached/bun', version: '1.3.5', cached: true})
         const omoSlimMod = await import('./omo-slim.js')
         vi.mocked(omoSlimMod.installOmoSlim).mockResolvedValue({installed: true, version: '1.1.1', error: null})
+      })
+
+      it('writes the session tools file in slim mode too', async () => {
+        // #given
+
+        // #when
+        const result = await runSetup(createSetupInputs({enableOmoSlim: true}), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(sessionToolsConfig.writeSessionToolsFile).toHaveBeenCalledTimes(1)
       })
 
       it('slim install success: config has default_agent orchestrator and oh-my-opencode-slim plugin', async () => {
