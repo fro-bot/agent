@@ -170,7 +170,7 @@ async function searchSessionContent(
 /**
  * Extract searchable text from a message part.
  */
-function extractTextFromPart(part: Part): string | null {
+export function extractTextFromPart(part: Part): string | null {
   switch (part.type) {
     case 'text':
       return part.text
