@@ -6,7 +6,7 @@ summary: "Navigable entry point for the Fro Bot Agent project wiki"
 
 # Fro Bot Agent Wiki
 
-An Obsidian-powered project wiki maintained by Fro Bot. This vault provides human-readable documentation covering the architecture, subsystems, and conventions of the [fro-bot/agent](https://github.com/fro-bot/agent) GitHub Action.
+An Obsidian-powered project wiki maintained by Fro Bot. This vault provides human-readable documentation covering the architecture, subsystems, and conventions of the [fro-bot/agent](https://github.com/fro-bot/agent) Bun monorepo — the GitHub Action, the Discord-first Gateway and operator web surface, the sandboxed workspace executor, the patched OpenCode harness, and the shared runtime/session primitives underneath them.
 
 > **Getting started:** Open this folder (`docs/wiki/`) as a vault in [Obsidian](https://obsidian.md/) for the best experience — graph view, backlinks, and search work out of the box. For the Dataview plugin (optional), install it from Obsidian's community plugins after opening the vault.
 
