@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-07-05"
-updated-by: "schedule-d7190410-28754466543"
+last-updated: "2026-07-12"
+updated-by: "schedule-d7190410-29208059688"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -18,8 +18,12 @@ sources:
   - src/harness/post.ts
   - src/features/triggers/router.ts
   - src/features/agent/output-mode.ts
+  - src/features/agent/response-post.ts
   - src/features/reviews/review-reconciliation.ts
+  - src/features/reviews/review-guards.ts
   - src/services/github/context.ts
+  - packages/runtime/src/agent/response-delivery.ts
+  - packages/runtime/src/agent/response-file.ts
   - packages/runtime/src/coordination/lock.ts
   - packages/runtime/src/coordination/types.ts
   - RFCs/RFC-005-GitHub-Triggers-Events.md
@@ -58,6 +62,8 @@ post.ts
 ## 1. Bootstrap
 
 Parses action inputs (`parseActionInputs`), validates credentials, and ensures the OpenCode CLI is available. If the tools aren't already cached, the setup module installs OpenCode. When `enable-omo: true`, it also installs Bun and oMo (see [[Setup and Configuration]]). On failure, the run exits immediately with code 1.
+
+Bootstrap also resolves the run's **response-delivery decision** — a two-axis object (`resolveResponseDelivery()` in `packages/runtime/src/agent/response-delivery.ts`) that decides both _how_ the agent's answer reaches GitHub and _whether the agent is given a GitHub credential at all_. Comment and review triggers (`issue_comment`, `pull_request`, `issues`) resolve to `file-convention` delivery with the credential **withheld**; `schedule` and `workflow_dispatch` resolve to `model-gh` delivery with the credential **provisioned**, because those flows legitimately create branches, commits, and PRs on their own. The decision is computed once here from the raw event name, threaded through setup so the credential is (or is not) provisioned, and re-asserted against the routing classification so a mismatch fails loudly rather than silently mis-provisioning. See [[Setup and Configuration]] for how the credential is withheld and [[Prompt Architecture]] for how the delivery mode reshapes the response protocol the agent is told to follow.
 
 ## 2. Routing
 
@@ -112,7 +118,7 @@ If the LLM returns a fetch error (transient provider failure), the system retrie
 
 Runs after Execute, before Finalize, only for `pull_request` review triggers on the model-`gh` posting path (`workflow_dispatch`/`schedule`). Calls `decideReconciliation()` in `src/features/reviews/review-reconciliation.ts` to inspect the agent's posted review body for a verdict signal. If the verdict warrants a formal GitHub APPROVE, the phase submits one automatically via the GitHub review API through the shared review guards (fork/self/head-SHA/TOCTOU). This removes the manual step of having the agent issue the `gh pr review --approve` command itself on approve-verdicts.
 
-For comment/review flows that post through the file convention (see Finalize), this phase **skips immediately** — the model posts no review of its own for reconciliation to reconcile; Finalize owns the review post instead.
+For comment/review flows that post through the file convention (see Finalize), this phase **skips immediately** — the model posts no review of its own for reconciliation to reconcile, and Finalize owns the review post instead. The fork/self/head-SHA/TOCTOU guard set both paths share has been extracted into `src/features/reviews/review-guards.ts`, so a file-driven approve on a fork PR is blocked exactly as a reconciled one would be.
 
 The phase is **fail-safe**: any error logs a warning and no-ops. It never throws and never fails the run. It also checks the bot login before acting — an empty or null `botLogin` triggers an immediate no-op.
 
@@ -120,7 +126,9 @@ The phase is **fail-safe**: any error logs a warning and no-ops. It never throws
 
 Writes a synthetic summary message into the session history so future runs can discover what this run accomplished. Prunes old sessions based on dual-condition retention (age OR count). Collects metrics and sets action outputs (session ID, cache status, duration).
 
-For `pull_request`/`issue_comment`/`issues` triggers, this phase also **posts the agent's response on the model's behalf**. The model wrote its response to a run-scoped file (outside the checkout, under `RUNNER_TEMP`); Finalize reads it, binds the target and surface to the trusted event (never the file), validates it, and posts via the Octokit comment/review writers — a PR-review verdict goes through the same shared review guards as reconciliation. This path is **fail-closed**: a missing, malformed, or undeliverable response fails the run (naming the file), and a delivery assertion prevents a green-but-silent run. `workflow_dispatch`/`schedule` runs post via the model's own `gh` and are unchanged.
+For `pull_request`/`issue_comment`/`issues` triggers, this phase also **posts the agent's response on the model's behalf** — the file-convention delivery path. The model wrote its response to a run-scoped file (outside the checkout, under `RUNNER_TEMP`, nonce-named and created by the action); Finalize reads it, binds the target and surface to the trusted `NormalizedEvent` (never the file), validates it against a strict allowlist schema, and posts via the Octokit comment/review writers (`src/features/agent/response-post.ts`) — a PR-review verdict goes through the same shared review guards (`src/features/reviews/review-guards.ts`) as reconciliation. This path is **fail-closed**: a missing, malformed, or undeliverable response fails the run (naming the file), and a delivery assertion prevents a green-but-silent run. The dedup marker for these flows is written only after delivery is confirmed, so a failed post followed by a retry cannot dedup-skip into a silent success.
+
+This design exists for a security reason, not just tidiness. Because the model no longer posts its own comment or review, it no longer needs a GitHub credential for those flows — so the credential is withheld from the OpenCode child entirely (see [[Setup and Configuration]]). The response file is treated as _untrusted payload_: it contributes only body content (and, for a review, an `approve`/`request-changes` verdict) within an envelope whose target, surface, and eligibility come from the trusted event. A fork PR cannot preseed a workspace file to redirect a post or forge an approval. `workflow_dispatch`/`schedule` runs keep `model-gh` delivery — they post via the model's own `gh` and are unchanged.
 
 ## 11. Cleanup (Always)
 

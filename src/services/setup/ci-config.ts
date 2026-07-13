@@ -1,5 +1,8 @@
 import type {OmoSlimPreset} from '../../shared/types.js'
 import type {Logger} from './types.js'
+import * as path from 'node:path'
+import process from 'node:process'
+import {RESPONSE_FILE_DIR_SEGMENT} from '@fro-bot/runtime'
 import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 
 export interface CIConfigResult {
@@ -78,10 +81,54 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function denyBuildExternalDirectoryPermission(config: Record<string, unknown>): void {
+/**
+ * Scope the build agent's `external_directory` permission so the harness's
+ * own response-file delivery (see `packages/runtime/src/agent/response-file.ts`
+ * `buildResponseFileDir` — a run-scoped dir under `RUNNER_TEMP`, deliberately
+ * OUTSIDE the checkout so a compromised checkout can never plant/tamper with
+ * the file the harness reads back) is allowed, while every other external
+ * directory stays denied fail-closed.
+ *
+ * Without this, OpenCode's shell-command scanner and the write/edit tools'
+ * external-file check both raise an `external_directory` "ask" for any
+ * external directory a command/tool touches (vendored source:
+ * `.slim/clonedeps/repos/anomalyco__opencode/packages/opencode/src/tool/shell.ts:263-280`,
+ * `.../src/tool/external-directory.ts:15-45`) — and a flat `'deny'` blocks
+ * even the model's write to its own designated response-file dir, so
+ * finalize fails fail-closed reading it back (ENOENT).
+ *
+ * Pattern semantics (verified against
+ * `.slim/clonedeps/repos/anomalyco__opencode/packages/core/src/util/wildcard.ts:3-14`):
+ * a config pattern's `*` compiles to regex `.*`, which matches `/` too (not
+ * just a single path segment) — so a single `<runnerTemp>/fro-bot-response/*`
+ * pattern matches BOTH asks: the shell scan's `<runId-attempt-dir>/*` glob
+ * (`shell.ts:266-269`, dir = the run-scoped subdir) and the write/edit tool's
+ * `<parentDir>/*` glob (`external-directory.ts:29-33`, parentDir = the same
+ * run-scoped subdir) — no separate nested-level pattern is needed. This
+ * mirrors the vendored native-agent defaults' own whitelisted-dir shape
+ * (`agent/agent.ts:108-117`, `path.join(dir, "*")` keys).
+ *
+ * Rule-evaluation order matters: `Permission.evaluate` (`permission/index.ts:29-39`)
+ * does `rulesets.flat().findLast(...)` — the LAST matching entry wins. Since
+ * `'*'` matches every pattern (including our specific one), `'*'` MUST come
+ * first in the object and the specific allow entry MUST come after it, or
+ * the deny would shadow the allow.
+ */
+function scopeExternalDirectoryPermission(config: Record<string, unknown>, runnerTemp: string | undefined): void {
   const agent = isRecord(config.agent) ? config.agent : {}
   const build = isRecord(agent.build) ? agent.build : {}
   const permission = isRecord(build.permission) ? build.permission : {}
+
+  // Fail safe: if RUNNER_TEMP isn't set (e.g. local/non-Actions runs), we
+  // can't know where the response-file dir will be, so keep the flat deny
+  // rather than guessing a broad allow pattern.
+  const externalDirectory: Record<string, 'allow' | 'deny'> | 'deny' =
+    runnerTemp != null && runnerTemp.length > 0
+      ? {
+          '*': 'deny',
+          [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',
+        }
+      : 'deny'
 
   config.agent = {
     ...agent,
@@ -89,7 +136,7 @@ function denyBuildExternalDirectoryPermission(config: Record<string, unknown>): 
       ...build,
       permission: {
         ...permission,
-        external_directory: 'deny',
+        external_directory: externalDirectory,
       },
     },
   }
@@ -197,7 +244,7 @@ export function buildCIConfig(
     // Pin default_agent to "build" — overrides any user-provided value
     const userAgent: unknown = ciConfig.default_agent
     ciConfig.default_agent = 'build'
-    denyBuildExternalDirectoryPermission(ciConfig)
+    scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP)
     if (userAgent != null && userAgent !== 'build') {
       rewrittenFields.push('default_agent')
     }

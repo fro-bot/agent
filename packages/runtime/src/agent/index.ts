@@ -14,6 +14,8 @@ export type {ErrorInfo, ErrorType} from './error-format/types.js'
 export {ERROR_TYPES} from './error-format/types.js'
 export {executeOpenCode} from './execution.js'
 export {filterAgentEnv} from './filter-env.js'
+export {createInactivityTimer} from './inactivity-timer.js'
+export type {InactivityTimer} from './inactivity-timer.js'
 export {resolveOutputMode} from './output-mode.js'
 export {
   buildCurrentThreadContextSection,
@@ -32,6 +34,7 @@ export {
   createResponseFileError,
   MAX_BODY_BYTES,
   parseResponseFile,
+  RESPONSE_FILE_DIR_SEGMENT,
 } from './response-file.js'
 export type {ParsedResponse, ResponseFileError, ResponseFileErrorReason, ResponseSurface} from './response-file.js'
 export {MAX_LLM_RETRIES, runPromptAttempt} from './retry.js'

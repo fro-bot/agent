@@ -6,6 +6,7 @@ module: agent-response-delivery
 problem_type: best_practice
 component: authentication
 severity: critical
+last_updated: 2026-07-13
 related_components:
   - development_workflow
   - tooling
@@ -82,3 +83,4 @@ The harness derives the post target from `AgentContext`/`NormalizedEvent` (the a
 - [Isolate CI credentials via an OIDC broker](../workflow-issues/isolate-ci-credential-via-oidc-broker-2026-07-01.md) — same trust-boundary discipline applied to credential issuance.
 - [A same-job phase split is not a security boundary](../best-practices/same-job-phase-split-not-a-security-boundary-2026-07-04.md) — the trust boundary must be enforced by data flow and validation, not by job/phase structure alone.
 - [A fork/self PR review guard must refuse APPROVE only, not all review events](../workflow-issues/fork-review-guard-gates-approve-only-2026-07-11.md) — the guard that keeps a forged verdict from reaching branch protection.
+- [An injected permission deny blocked the harness's own response-file delivery path](../logic-errors/injected-deny-blocks-own-delivery-path-2026-07-13.md) — an unrelated hardening feature nearly broke this delivery path by denying the write it depends on.
