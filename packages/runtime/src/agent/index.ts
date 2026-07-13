@@ -41,6 +41,8 @@ export {MAX_LLM_RETRIES, runPromptAttempt} from './retry.js'
 export type {ActivityTracker, EventStreamResult, PromptAttemptDependencies} from './retry.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
 export type {OpenCodeServerHandle} from './server.js'
+export {createSessionTools, info, list, read, search} from './session-tools.js'
+export type {SessionToolArgSchema, SessionToolDefinition, SessionTools} from './session-tools.js'
 export type {SetupAdapter} from './setup-adapter.js'
 export type {
   AcknowledgmentState,

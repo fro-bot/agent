@@ -597,6 +597,21 @@ describe('setup', () => {
         expect(written).toMatchObject({agents: {default: 'build'}, mode: 'strict'})
       })
 
+      it('always attempts to write the session tools file, regardless of oMo mode', async () => {
+        // #given
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        // The bundled asset does not exist under vitest (no dist sibling of setup.ts),
+        // so this must fail soft — mkdir is still attempted for the tool dir up front,
+        // but the write itself is skipped. Assert we degrade without throwing/failing setup.
+        const mkdirCalls = vi.mocked(fs.mkdir).mock.calls
+        expect(mkdirCalls.length).toBeGreaterThan(0)
+      })
+
       it('writes fresh config without merging existing opencode.json', async () => {
         // #given - simulate existing opencode.json with stale oMo data
         vi.mocked(fs.readFile).mockResolvedValue(

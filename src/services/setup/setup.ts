@@ -17,6 +17,7 @@ import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {installOmoSlim} from './omo-slim.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode, toolCacheVersion} from './opencode.js'
+import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
 
@@ -192,6 +193,11 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         logger.warning(`systematic-config write failed: ${toErrorMessage(error)}`)
       }
     }
+
+    // Native session tools are always-on, regardless of oMo mode. oMo's own
+    // plugin tools (when present) override by id at registry time, so this
+    // never needs to be gated on enableOmo.
+    await writeSessionToolsFile(configDir, logger)
 
     const ciConfigResult = buildCIConfig(
       {
