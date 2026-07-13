@@ -39,6 +39,10 @@ const EXACT_ALLOW_KEYS: ReadonlySet<string> = new Set([
   'TERM',
   'GH_CONFIG_DIR',
   'TZ',
+  // Loopback URL of the harness-bootstrapped OpenCode server, consumed by the
+  // bundled session-tools file tool inside the child. Non-secret: always
+  // http://127.0.0.1:<port>.
+  'FRO_BOT_OPENCODE_URL',
   // Proxy/CA-bundle vars: operational config the child needs for egress/TLS on
   // self-hosted runners behind a proxy or enterprise-CA git. Proxy URLs CAN embed
   // credentials (`user:pass@host`) — this is a known no-regression-from-baseline

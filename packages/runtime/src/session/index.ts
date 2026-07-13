@@ -12,7 +12,7 @@ export type {LogicalSessionKey, SessionResolution} from './logical-key.js'
 export {DEFAULT_PRUNING_CONFIG, pruneSessions} from './prune.js'
 // PruningConfig is already exported via shared/types.ts → shared/index.ts
 // Search operations
-export {getSessionInfo, listSessions, searchSessions} from './search.js'
+export {extractTextFromPart, getSessionInfo, listSessions, searchSessions} from './search.js'
 // Storage utilities
 export {
   deleteSession,

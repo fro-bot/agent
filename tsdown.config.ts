@@ -41,24 +41,47 @@ function defaultVersionInvariantPlugin(): Plugin {
   }
 }
 
-export default defineConfig({
-  entry: ['apps/action/src/main.ts', 'apps/action/src/post.ts'],
-  fixedExtension: false,
-  inlineOnly: false,
-  minify: true,
-  // Source maps roughly triple committed dist/ size and the action never reads them.
-  sourcemap: false,
-  // Escape runs post-bundle in scripts/build-action-dist.ts (failure-safe) and
-  // at the root build tail (pnpm run dist:escape-hidden-unicode, full dist).
-  plugins: [defaultVersionInvariantPlugin()],
-  noExternal: id => {
-    if (id.startsWith('@bfra.me/es')) return true
-    if (id.startsWith('@actions/')) return true
-    if (id.startsWith('@octokit/auth-app')) return true
-    if (id.startsWith('@opencode-ai/sdk')) return true
-    if (id.startsWith('@aws-sdk/')) return true
-    if (id.startsWith('@smithy/')) return true
-    if (id.startsWith('@fro-bot/runtime')) return true
-    return false
+const sharedNoExternal = (id: string): boolean => {
+  if (id.startsWith('@bfra.me/es')) return true
+  if (id.startsWith('@actions/')) return true
+  if (id.startsWith('@octokit/auth-app')) return true
+  if (id.startsWith('@opencode-ai/sdk')) return true
+  if (id.startsWith('@aws-sdk/')) return true
+  if (id.startsWith('@smithy/')) return true
+  if (id.startsWith('@fro-bot/runtime')) return true
+  if (id === 'zod' || id.startsWith('zod/')) return true
+  return false
+}
+
+export default defineConfig([
+  {
+    entry: ['apps/action/src/main.ts', 'apps/action/src/post.ts'],
+    fixedExtension: false,
+    inlineOnly: false,
+    minify: true,
+    // Source maps roughly triple committed dist/ size and the action never reads them.
+    sourcemap: false,
+    // Escape runs post-bundle in scripts/build-action-dist.ts (failure-safe) and
+    // at the root build tail (pnpm run dist:escape-hidden-unicode, full dist).
+    plugins: [defaultVersionInvariantPlugin()],
+    noExternal: sharedNoExternal,
   },
-})
+  {
+    // Dedicated build: session-tools.js is copied standalone into the CI OpenCode
+    // config dir (U3) as `tool/session.js`, so it must be a single file with no
+    // sibling-chunk dependency. Building it as its own tsdown config (separate
+    // rolldown invocation) prevents rolldown from splitting shared helpers into
+    // chunks shared with main.js/post.js.
+    entry: ['apps/action/src/session-tools.ts'],
+    fixedExtension: false,
+    inlineOnly: false,
+    minify: true,
+    sourcemap: false,
+    dts: false,
+    clean: false,
+    outputOptions: {
+      inlineDynamicImports: true,
+    },
+    noExternal: sharedNoExternal,
+  },
+])

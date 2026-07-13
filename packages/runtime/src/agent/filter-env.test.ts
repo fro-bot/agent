@@ -120,6 +120,17 @@ describe('filterAgentEnv', () => {
     expect(result).toEqual(env)
   })
 
+  it('retains FRO_BOT_OPENCODE_URL (load-bearing: session-tools file tool reads this env var to reach the loopback server)', () => {
+    // #given
+    const env = {FRO_BOT_OPENCODE_URL: 'http://127.0.0.1:54321', PATH: '/usr/bin'}
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then
+    expect(result).toEqual(env)
+  })
+
   it('returns an empty object for an empty env', () => {
     // #given
     const env = {}
