@@ -108,6 +108,29 @@ function formatMessageForTranscript(message: {readonly role: string; readonly pa
   return text.length > 0 ? `[${message.role}] ${text}` : `[${message.role}] (no content)`
 }
 
+const TRANSCRIPT_CHAR_CAP = 48_000
+
+/** Renders messages oldest-first, capping total rendered size so a huge transcript can't blow the response. */
+function renderTranscript(messages: readonly {readonly role: string; readonly parts?: readonly Part[]}[]): string[] {
+  const lines: string[] = []
+  let size = 0
+  let shown = 0
+
+  for (const message of messages) {
+    const line = `  ${formatMessageForTranscript(message)}`
+    if (size + line.length > TRANSCRIPT_CHAR_CAP) break
+    lines.push(line)
+    size += line.length
+    shown += 1
+  }
+
+  if (shown < messages.length) {
+    lines.push(`  ... transcript truncated (${shown} of ${messages.length} messages shown)`)
+  }
+
+  return lines
+}
+
 /**
  * Factory: creates the four session tool definitions against an injectable base-URL
  * resolver. The resolver is called inside `execute()` (never at import time) so tests
@@ -203,14 +226,16 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
         if (asBoolean(args.include_transcript) === true) {
           const limit = normalizeLimit(asNumber(args.limit))
           const messages = await getSessionMessages(client, sessionId, silentLogger)
+          // Deliberately oldest-first: chronological reading order. A bounded
+          // transcript (limit set) returns the earliest N messages, not the most
+          // recent — callers wanting recent context should omit limit or read
+          // the full transcript and take the tail themselves.
           const sliced = limit == null ? messages : messages.slice(0, limit)
           lines.push('', 'Transcript:')
           if (sliced.length === 0) {
             lines.push('  (empty)')
           } else {
-            for (const message of sliced) {
-              lines.push(`  ${formatMessageForTranscript(message)}`)
-            }
+            lines.push(...renderTranscript(sliced))
           }
         }
 
@@ -238,6 +263,8 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
 
       try {
         const client = createOpencodeClient({baseUrl: resolved.baseUrl})
+        // Intentionally no project_path arg here (oMo contract parity): search
+        // always scopes to the current workspace, unlike `list`.
         const projectPath = process.cwd()
         const scopedSessionId = asString(args.session_id)
         if (scopedSessionId != null) {

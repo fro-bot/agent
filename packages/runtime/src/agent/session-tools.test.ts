@@ -312,6 +312,58 @@ describe('createSessionTools — read', () => {
     expect(result).toContain('[user] one')
     expect(result).toContain('[assistant] two')
   })
+
+  it('renders transcript messages oldest-first, keeping the earliest N under a limit', async () => {
+    // #given
+    mockGetSession.mockResolvedValue({
+      id: 'ses_1',
+      version: '1',
+      projectID: 'p1',
+      directory: '/w',
+      title: 'T',
+      time: {created: 1, updated: 2},
+    })
+    mockGetSessionMessages.mockResolvedValue([
+      {id: 'm1', role: 'user', parts: [{id: 'p1', type: 'text', text: 'first message'}]},
+      {id: 'm2', role: 'assistant', parts: [{id: 'p2', type: 'text', text: 'second message'}]},
+      {id: 'm3', role: 'user', parts: [{id: 'p3', type: 'text', text: 'third message'}]},
+    ])
+    const tools = createSessionTools(() => FAKE_BASE_URL)
+
+    // #when
+    const result = await tools.read.execute({session_id: 'ses_1', include_transcript: true, limit: 2})
+
+    // #then
+    expect(result).toContain('first message')
+    expect(result).toContain('second message')
+    expect(result).not.toContain('third message')
+  })
+
+  it('caps the rendered transcript size and appends a truncation marker with counts', async () => {
+    // #given
+    mockGetSession.mockResolvedValue({
+      id: 'ses_1',
+      version: '1',
+      projectID: 'p1',
+      directory: '/w',
+      title: 'T',
+      time: {created: 1, updated: 2},
+    })
+    const bigText = 'x'.repeat(20_000)
+    mockGetSessionMessages.mockResolvedValue([
+      {id: 'm1', role: 'user', parts: [{id: 'p1', type: 'text', text: bigText}]},
+      {id: 'm2', role: 'assistant', parts: [{id: 'p2', type: 'text', text: bigText}]},
+      {id: 'm3', role: 'user', parts: [{id: 'p3', type: 'text', text: bigText}]},
+    ])
+    const tools = createSessionTools(() => FAKE_BASE_URL)
+
+    // #when
+    const result = await tools.read.execute({session_id: 'ses_1', include_transcript: true})
+
+    // #then
+    expect(result.length).toBeLessThan(60_000)
+    expect(result).toMatch(/transcript truncated \(2 of 3 messages shown\)/)
+  })
 })
 
 describe('createSessionTools — search', () => {
