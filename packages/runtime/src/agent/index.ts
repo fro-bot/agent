@@ -34,6 +34,7 @@ export {
   createResponseFileError,
   MAX_BODY_BYTES,
   parseResponseFile,
+  RESPONSE_FILE_DIR_SEGMENT,
 } from './response-file.js'
 export type {ParsedResponse, ResponseFileError, ResponseFileErrorReason, ResponseSurface} from './response-file.js'
 export {MAX_LLM_RETRIES, runPromptAttempt} from './retry.js'

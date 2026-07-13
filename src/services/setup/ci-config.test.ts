@@ -1,11 +1,26 @@
 import type {Logger} from './types.js'
-import {describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {buildCIConfig, pluginPrefix} from './ci-config.js'
 
 function createLogger(): Logger {
   return createMockLogger()
 }
+
+const ORIGINAL_RUNNER_TEMP = process.env.RUNNER_TEMP
+
+beforeEach(() => {
+  delete process.env.RUNNER_TEMP
+})
+
+afterEach(() => {
+  if (ORIGINAL_RUNNER_TEMP === undefined) {
+    delete process.env.RUNNER_TEMP
+  } else {
+    process.env.RUNNER_TEMP = ORIGINAL_RUNNER_TEMP
+  }
+  vi.unstubAllEnvs()
+})
 
 describe('buildCIConfig', () => {
   describe('pluginPrefix', () => {
@@ -357,6 +372,95 @@ describe('buildCIConfig', () => {
           },
         },
       })
+    })
+
+    it('allows the response-file dir under RUNNER_TEMP for the build agent while denying everything else external', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config).toMatchObject({
+        agent: {
+          build: {
+            permission: {
+              external_directory: {
+                '*': 'deny',
+                '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+              },
+            },
+          },
+        },
+      })
+    })
+
+    it('falls back to a flat deny when RUNNER_TEMP is unset (fail safe, never guesses a broad allow)', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+
+      // #then
+      expect(result.error).toBeNull()
+      const config = result.config as {agent: {build: {permission: Record<string, unknown>}}}
+      expect(config.agent.build.permission.external_directory).toBe('deny')
+      expect(Object.keys(config.agent.build.permission)).not.toContain('fro-bot-response')
+    })
+
+    it('overrides a user-supplied external_directory string with our scoped map', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: '{"agent":{"build":{"permission":{"external_directory":"allow"}}}}',
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config).toMatchObject({
+        agent: {
+          build: {
+            permission: {
+              external_directory: {
+                '*': 'deny',
+                '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+              },
+            },
+          },
+        },
+      })
+    })
+
+    it('overrides a user-supplied external_directory map with our scoped map', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: '{"agent":{"build":{"permission":{"external_directory":{"/etc/**":"allow","*":"allow"}}}}}',
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      const config = result.config as {agent: {build: {permission: Record<string, unknown>}}}
+      expect(config.agent.build.permission.external_directory).toBe('deny')
     })
   })
 
