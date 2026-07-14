@@ -214,7 +214,7 @@
       matchCurrentVersion: '/^v?0/',
       matchPackageNames: ['tsdown'],
       matchUpdateTypes: ['minor', 'patch'],
-      extends: ['github>bfra-me/renovate-config:automerge.json5#5.2.3'],
+      extends: ['github>bfra-me/renovate-config:automerge.json5#5.2.4'],
       dependencyDashboardApproval: false,
     },
   ],
