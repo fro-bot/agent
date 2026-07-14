@@ -12,3 +12,8 @@ linker = "hoisted"
 # Supply-chain age gate: refuse dependency versions published within this window.
 # Mirrors the prior pnpm minimumReleaseAge policy. Seconds (3 days).
 minimumReleaseAge = 259200
+
+# Temporary fast-track for the deliberate @opencode-ai/sdk 1.17.20 bump; publish
+# time 2026-07-13T21:08:29.496Z, clears the 3-day window 2026-07-16T21:08:30Z.
+# Remove this exclusion after that date.
+minimumReleaseAgeExcludes = ["@opencode-ai/sdk"]
