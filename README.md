@@ -16,14 +16,17 @@
 
 ## Overview
 
-Fro Bot Agent is a GitHub Action that runs an [OpenCode](https://opencode.ai/) agent in response to repository events — issues, pull requests, comments, reviews, and scheduled runs — and **remembers previous interactions across workflow runs**.
+Fro Bot Agent is a Bun monorepo that runs an [OpenCode](https://opencode.ai/) agent across several surfaces: a **GitHub Action** that responds to repository events (issues, pull requests, comments, reviews, and scheduled runs), a **Discord-first Gateway** daemon with an authenticated operator web/API surface for launching and observing runs outside of CI, a **sandboxed workspace executor** that clones and runs the agent in an isolated container, a **patched OpenCode harness** build/publish pipeline, and shared **runtime/session primitives** used across all of the above. The GitHub Action **preserves OpenCode session state across runs**, while the Gateway starts a fresh OpenCode session per run but persists coordination and run state through its S3-backed control plane.
 
-Traditional CI-based AI agents are stateless: each run starts from scratch, repeating investigations and burning tokens. Fro Bot persists its session state across runs (GitHub Actions cache, with optional S3 backup), so it builds context over time, references prior work instead of redoing it, and resumes interrupted tasks.
+Traditional CI-based AI agents are stateless: each run starts from scratch, repeating investigations and burning tokens. The GitHub Action persists its session state across runs (GitHub Actions cache, with optional S3 backup), so it builds context over time, references prior work instead of redoing it, and resumes interrupted tasks.
 
 ### Key Features
 
 - **Persistent memory** — session state survives workflow runs via cache, with optional S3 write-through backup that outlives cache eviction.
 - **Multiple triggers** — responds to comments, issues, pull requests, review threads, and scheduled or manually dispatched runs.
+- **Discord Gateway** — a daemon that runs OpenCode work from authorized `@fro-bot` mentions and exposes slash commands for setup and operator controls (e.g. adding a project, clearing the queue).
+- **Operator web surface** — an authenticated HTTP/SSE control surface for launching, observing, and approving gateway agent runs from a browser.
+- **Sandboxed workspace executor** — a workspace-agent container that clones repositories and runs the agent behind an egress-allowlisted proxy, deployable via the `deploy/` Compose stack.
 - **Auto-setup** — installs OpenCode on first run; no manual toolchain setup.
 - **Security-first** — author-association gating, credential hygiene, and fork-PR protection are enforced, not optional.
 - **Observability** — every run writes a summary with metrics and error context.
@@ -224,7 +227,7 @@ For Cloudflare R2, Backblaze B2, or MinIO, set `s3-endpoint` and `s3-sse-encrypt
 
 ## Repository Structure
 
-The repository is a Bun monorepo: the Action's logic lives in the layered root `src/`, alongside the gateway, harness, and runtime packages. See **[STRUCTURE.md](STRUCTURE.md)** for the directory layout, key file locations, and where to add new code.
+The repository is a Bun monorepo: the Action's logic lives in the layered root `src/`, alongside the `apps/workspace-agent` sandboxed executor and the gateway, harness, and runtime packages under `packages/`; the `deploy/` directory holds the Docker Compose stack that runs the gateway and workspace executor behind a mitmproxy egress proxy enforcing an allowlist of permitted outbound hosts. See **[STRUCTURE.md](STRUCTURE.md)** for the directory layout, key file locations, and where to add new code, and **[deploy/README.md](deploy/README.md)** / **[apps/workspace-agent/README.md](apps/workspace-agent/README.md)** for running the gateway and workspace stack.
 
 ## Development
 
