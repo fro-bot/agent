@@ -13,12 +13,10 @@
     "https://github.com/anomalyco/opencode/pull/34975",
     "https://github.com/anomalyco/opencode/pull/34977",
     "https://github.com/anomalyco/opencode/pull/33713",
-    "https://github.com/anomalyco/opencode/pull/7156",
     "https://github.com/anomalyco/opencode/pull/36045",
     "https://github.com/anomalyco/opencode/pull/36281",
     "https://github.com/anomalyco/opencode/pull/36002",
-    "https://github.com/anomalyco/opencode/pull/36361",
-    "https://github.com/anomalyco/opencode/pull/36179"
+    "https://github.com/anomalyco/opencode/pull/36361"
   ],
   "agent": "build",
   "model": "anthropic/claude-sonnet-4-6",
