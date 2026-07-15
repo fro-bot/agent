@@ -2,7 +2,13 @@ import type {ErrorInfo} from '@fro-bot/runtime'
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
-import {createAgentError, createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
+import {
+  classifyQuotaError,
+  createAgentError,
+  createErrorInfo,
+  createLLMFetchError,
+  isLlmFetchError,
+} from '@fro-bot/runtime'
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 
@@ -28,6 +34,31 @@ export interface ActivityTracker {
   completedAssistantMessageId?: string
   sessionIdle: boolean
   sessionError: string | null
+  /** Set when a quota_exceeded ErrorInfo has been classified; fails fast (no grace, no v2 wait success). */
+  quotaExceeded?: ErrorInfo
+}
+
+/** Shared quota classification for `session.status`/`retry`, used by both SSE and REST poll paths. */
+export function classifyRetryStatusQuota(status: unknown): ErrorInfo | null {
+  if (getStringProperty(status, 'type') !== 'retry') return null
+
+  const action = getObjectProperty(status, 'action')
+  const reason = getStringProperty(action, 'reason')
+  if (reason == null) return null
+
+  const nextRaw = getNumberProperty(status, 'next')
+  const candidateResetAt = nextRaw != null && Number.isFinite(nextRaw) ? new Date(nextRaw) : undefined
+  const resetAt = candidateResetAt != null && !Number.isNaN(candidateResetAt.getTime()) ? candidateResetAt : undefined
+
+  return classifyQuotaError({kind: 'retry-status', reason, resetAt})
+}
+
+/** First-writer-wins, except quota may upgrade a prior error and is then sticky (never downgraded). */
+function mergeTerminalError(existing: ErrorInfo | null, candidate: ErrorInfo): ErrorInfo {
+  if (existing == null) return candidate
+  if (existing.type === 'quota_exceeded') return existing
+  if (candidate.type === 'quota_exceeded') return candidate
+  return existing
 }
 
 export function logServerEvent(event: Event, logger: Logger): void {
@@ -39,7 +70,10 @@ export function logServerEvent(event: Event, logger: Logger): void {
     const sessionID = getSessionID(data)
     logger.debug('Server event', {eventKind: kind, sessionID})
   } else {
-    logger.debug('Server event', {eventType, properties: getObjectProperty(event, 'properties')})
+    // Bounded log: never dump raw event properties (may carry provider message/URL/account metadata).
+    const properties = getObjectProperty(event, 'properties')
+    const sessionId = getSessionID(properties) ?? getSessionID(getObjectProperty(properties, 'part'))
+    logger.debug('Server event', sessionId == null ? {eventType} : {eventType, sessionId})
   }
 }
 
@@ -308,15 +342,65 @@ export async function processEventStream(
         cost = getNumberProperty(msg, 'cost')
         logger.debug('Token usage received', {tokens, model, cost})
       }
+    } else if (eventType === 'session.status') {
+      if (getSessionID(eventPayload) === sessionId) {
+        const status = getObjectProperty(eventPayload, 'status')
+        const quotaError = classifyRetryStatusQuota(status)
+        if (quotaError != null && llmError?.type !== 'quota_exceeded') {
+          logger.error('Session status retry classified as quota exceeded', {sessionId, type: quotaError.type})
+          llmError = mergeTerminalError(llmError, quotaError)
+          if (activityTracker != null) {
+            activityTracker.sessionError = llmError.message
+            activityTracker.quotaExceeded = llmError
+            activityTracker.currentTurnTerminalSignalReceived = true
+          }
+        }
+      }
     } else if (eventType === 'session.error') {
       if (getSessionID(eventPayload) === sessionId) {
         const sessionError = getObjectProperty(eventPayload, 'error')
-        const errorStr = typeof sessionError === 'string' ? sessionError : String(sessionError)
-        logger.error('Session error', {error: sessionError})
-        llmError = isLlmFetchError(sessionError)
-          ? createLLMFetchError(errorStr, model ?? undefined)
-          : createAgentError(errorStr)
-        if (activityTracker != null) activityTracker.sessionError = errorStr
+        // Bounded log: never pass the raw session error payload to the logger.
+        logger.error('Session error received', {sessionType: typeof sessionError})
+
+        // Quota may upgrade a prior non-quota error; quota itself is sticky.
+        if (llmError == null || llmError.type !== 'quota_exceeded') {
+          // Allowlisted structured fields only — never echo the raw session error object/URL.
+          const errorData = getObjectProperty(sessionError, 'data') ?? sessionError
+          const status = getNumberProperty(errorData, 'status') ?? getNumberProperty(errorData, 'statusCode')
+          const code = getStringProperty(errorData, 'code')
+          const structuredMessage = getStringProperty(errorData, 'message')
+          const plainMessage = typeof sessionError === 'string' ? sessionError : undefined
+          const message = structuredMessage ?? plainMessage
+
+          const quotaError = classifyQuotaError({
+            kind: 'session-error',
+            status: status ?? undefined,
+            code: code ?? undefined,
+            message: message ?? undefined,
+          })
+
+          if (quotaError == null) {
+            if (llmError == null) {
+              const errorStr = typeof sessionError === 'string' ? sessionError : String(sessionError)
+              if (isLlmFetchError(sessionError)) {
+                llmError = createLLMFetchError(errorStr, model ?? undefined)
+              } else if (status === 429) {
+                // Ordinary 429 without account_rate_limit stays retryable rate_limit.
+                llmError = createErrorInfo('rate_limit', errorStr, true)
+              } else {
+                llmError = createAgentError(errorStr)
+              }
+              if (activityTracker != null) activityTracker.sessionError = errorStr
+            }
+          } else {
+            llmError = mergeTerminalError(llmError, quotaError)
+            if (activityTracker != null) {
+              activityTracker.sessionError = llmError.message
+              activityTracker.quotaExceeded = llmError
+              activityTracker.currentTurnTerminalSignalReceived = true
+            }
+          }
+        }
       }
     } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
       if (activityTracker != null) {

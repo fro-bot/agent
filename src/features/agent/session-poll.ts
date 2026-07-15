@@ -4,6 +4,7 @@ import type {ActivityTracker} from './streaming.js'
 import {sleep} from '../../shared/async.js'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {classifyRetryStatusQuota} from './streaming.js'
 
 const POLL_INTERVAL_MS = 500
 const POLL_REQUEST_TIMEOUT_MS = 5_000
@@ -176,6 +177,22 @@ export async function pollForSessionCompletion(
           logger.debug('Session idle detected via polling', {sessionId})
           return {completed: true, error: null}
         }
+      } else if (sessionStatus.type === 'retry') {
+        // Poll-only quota fails fast instead of waiting out the full timeout.
+        const quotaError = classifyRetryStatusQuota(sessionStatus)
+        if (quotaError != null) {
+          logger.error('Session status retry classified as quota exceeded via poll', {
+            sessionId,
+            type: sessionStatus.type,
+          })
+          if (activityTracker != null) {
+            activityTracker.quotaExceeded = quotaError
+            activityTracker.sessionError = quotaError.message
+            activityTracker.currentTurnTerminalSignalReceived = true
+          }
+          return {completed: false, error: quotaError.message}
+        }
+        logger.debug('Session status', {sessionId, type: sessionStatus.type})
       } else {
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       }

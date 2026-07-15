@@ -61,20 +61,8 @@ export interface PostCommentResult {
   readonly url: string
 }
 
-/**
- * Error types for categorizing failures.
- */
-export const ERROR_TYPES = [
-  'api_error',
-  'configuration',
-  'internal',
-  'llm_fetch_error',
-  'llm_timeout',
-  'permission',
-  'rate_limit',
-  'validation',
-] as const
-
+// Canonically owned by `@fro-bot/runtime`; re-exported for this module's import surface.
+export {ERROR_TYPES} from '@fro-bot/runtime'
 export type {ErrorInfo, ErrorType} from '@fro-bot/runtime'
 
 /**
