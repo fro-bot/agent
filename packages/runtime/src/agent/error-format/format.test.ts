@@ -1,16 +1,18 @@
 import {describe, expect, it} from 'vitest'
 import {
+  classifyQuotaError,
   createAgentError,
   createErrorInfo,
   createLLMFetchError,
   createLLMTimeoutError,
+  createQuotaExceededError,
   createRateLimitError,
   formatErrorComment,
   isAgentNotFoundError,
   isLlmFetchError,
 } from './format.js'
 
-describe('agent/error-format', () => {
+describe('agent/error-format/format', () => {
   describe('formatErrorComment', () => {
     it('formats rate limit error with warning icon and reset time', () => {
       // #given a rate limit error
@@ -79,6 +81,21 @@ describe('agent/error-format', () => {
 
       // #then it should include the details
       expect(formatted).toContain('502 Bad Gateway')
+    })
+
+    it('formats quota_exceeded error with error icon and no retryable marker', () => {
+      // #given a quota_exceeded error
+      const error = createQuotaExceededError()
+
+      // #when formatting the error
+      const formatted = formatErrorComment(error)
+
+      // #then it should include error icon (non-retryable)
+      expect(formatted).toContain(':x:')
+      // #then it should include the label
+      expect(formatted).toContain('Quota Exceeded')
+      // #then it should NOT indicate it's retryable
+      expect(formatted).not.toContain('retryable')
     })
   })
 
@@ -331,27 +348,168 @@ describe('agent/error-format', () => {
   })
 
   describe('createAgentError', () => {
-    it('creates non-retryable agent error', () => {
-      // #when creating an agent error
+    it('creates non-retryable configuration error with the generic suggested action', () => {
       const error = createAgentError('agent not found', 'sisyphus')
 
-      // #then it should be correctly structured
       expect(error.type).toBe('configuration')
       expect(error.retryable).toBe(false)
       expect(error.message).toContain('agent not found')
       expect(error.details).toContain('sisyphus')
-      expect(error.suggestedAction).toContain('Verify the agent name is correct')
+      expect(error.suggestedAction).toBe(
+        'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
+      )
     })
 
-    it('creates error without agent when not provided', () => {
-      // #when creating an agent error without agent name
+    it('creates error without agent when not provided, using the same suggested action', () => {
       const error = createAgentError('unknown agent error')
 
-      // #then it should work without agent details
       expect(error.type).toBe('configuration')
       expect(error.message).toContain('unknown agent error')
       expect(error.details).toBeUndefined()
-      expect(error.suggestedAction).toContain('Verify the agent name is correct')
+      expect(error.suggestedAction).toBe(
+        'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
+      )
+    })
+  })
+
+  describe('classifyQuotaError — retry-status primary path', () => {
+    it('classifies exact reason "account_rate_limit" as non-retryable quota_exceeded with normalized reset time', () => {
+      // #given a retry-status signal matching OpenCode's exact account_rate_limit reason
+      const resetAt = new Date('2026-07-16T12:00:00Z')
+
+      // #when classifying it
+      const error = classifyQuotaError({kind: 'retry-status', reason: 'account_rate_limit', resetAt})
+
+      // #then it becomes a non-retryable quota_exceeded error with the normalized reset time
+      expect(error).not.toBeNull()
+      expect(error?.type).toBe('quota_exceeded')
+      expect(error?.retryable).toBe(false)
+      expect(error?.resetTime).toEqual(resetAt)
+    })
+
+    it('does not classify any other action.reason as quota_exceeded', () => {
+      // #given retry-status signals with other reasons
+      const reasons = ['free_tier_limit', 'account_rate_limited', 'ACCOUNT_RATE_LIMIT', 'account rate limit', '']
+
+      // #then none become quota_exceeded — the match must be exact, not partial/prefix
+      for (const reason of reasons) {
+        expect(classifyQuotaError({kind: 'retry-status', reason})).toBeNull()
+      }
+    })
+  })
+
+  describe('classifyQuotaError — structured/text fallback path', () => {
+    it('classifies a structured session error with status 402 as quota_exceeded', () => {
+      // #given a structured session error with HTTP 402 (Payment Required)
+      const error = classifyQuotaError({kind: 'session-error', status: 402})
+
+      // #then it becomes quota_exceeded
+      expect(error?.type).toBe('quota_exceeded')
+      expect(error?.retryable).toBe(false)
+    })
+
+    it('classifies explicit insufficient_quota code as quota_exceeded', () => {
+      expect(classifyQuotaError({kind: 'session-error', code: 'insufficient_quota'})?.type).toBe('quota_exceeded')
+    })
+
+    it('classifies explicit usage_not_included code as quota_exceeded', () => {
+      expect(classifyQuotaError({kind: 'session-error', code: 'usage_not_included'})?.type).toBe('quota_exceeded')
+    })
+
+    it('classifies a usage-limit-reached fallback message as quota_exceeded', () => {
+      const message =
+        'Usage limit reached. It will reset in 17 hours 56 minutes. To continue using this model now, enable usage from your available balance - https://opencode.ai/workspace/acme/go'
+
+      // #then it classifies as quota_exceeded without echoing the raw message/link in the output
+      const error = classifyQuotaError({kind: 'session-error', message})
+      expect(error?.type).toBe('quota_exceeded')
+      expect(error?.message).not.toContain('https://opencode.ai')
+      expect(error?.message).not.toContain('workspace/acme')
+    })
+
+    it('classifies exhausted-credits phrasing as quota_exceeded', () => {
+      expect(
+        classifyQuotaError({kind: 'session-error', message: 'You have exhausted your credits for this billing period'})
+          ?.type,
+      ).toBe('quota_exceeded')
+    })
+
+    it('classifies available-balance guidance phrasing as quota_exceeded', () => {
+      expect(
+        classifyQuotaError({kind: 'session-error', message: 'Please top up your available balance to continue'})?.type,
+      ).toBe('quota_exceeded')
+    })
+
+    it('does not classify ordinary HTTP 429 without account_rate_limit as quota_exceeded', () => {
+      expect(classifyQuotaError({kind: 'session-error', status: 429})).toBeNull()
+    })
+
+    it('does not classify ordinary rate-limit text as quota_exceeded', () => {
+      expect(
+        classifyQuotaError({kind: 'session-error', message: 'Rate limit exceeded, please retry after 60 seconds'}),
+      ).toBeNull()
+    })
+
+    it('does not classify fetch, auth, overload, or arbitrary text as quota_exceeded', () => {
+      const messages = [
+        'fetch failed',
+        'ECONNRESET',
+        'Invalid API key',
+        'Unauthorized',
+        'Provider is overloaded',
+        'Something went wrong',
+      ]
+
+      for (const message of messages) {
+        expect(classifyQuotaError({kind: 'session-error', message})).toBeNull()
+      }
+    })
+
+    it('does not classify empty or malformed values as quota_exceeded', () => {
+      expect(classifyQuotaError({kind: 'session-error'})).toBeNull()
+      expect(classifyQuotaError({kind: 'session-error', message: ''})).toBeNull()
+      expect(classifyQuotaError({kind: 'session-error', status: Number.NaN})).toBeNull()
+    })
+  })
+
+  describe('createQuotaExceededError', () => {
+    it('creates a fixed, non-retryable, bounded quota_exceeded ErrorInfo', () => {
+      // #when creating a quota exceeded error with a trusted provider and reset time
+      const resetTime = new Date('2026-07-16T12:00:00Z')
+      const error = createQuotaExceededError({provider: 'openai', resetTime})
+
+      // #then the output is fixed guidance plus only the trusted provider and normalized reset time
+      expect(error.type).toBe('quota_exceeded')
+      expect(error.retryable).toBe(false)
+      expect(error.resetTime).toEqual(resetTime)
+      expect(error.details).toContain('openai')
+      expect(error.suggestedAction).toBeDefined()
+    })
+
+    it('does not leak raw payload values from a structurally compatible session-error input', () => {
+      // #given a session-error variable with unique sentinel values in its allowlisted message field
+      // plus extra raw provider fields a caller might mistakenly forward
+      const sentinelWorkspace = 'wksp-9f3a1c'
+      const sentinelLimitName = 'limit-tier-77q'
+      const sentinelAccount = 'acct-4e21b8'
+      const rawSessionError = {
+        kind: 'session-error' as const,
+        message: `Usage limit reached. It will reset in 1 hour - enable usage from your available balance`,
+        workspace: sentinelWorkspace,
+        limitName: sentinelLimitName,
+        account: sentinelAccount,
+      }
+
+      // #when classifying and formatting it
+      const error = classifyQuotaError(rawSessionError)
+      expect(error).not.toBeNull()
+      if (error === null) throw new Error('Expected quota error')
+      const rendered = JSON.stringify(error) + formatErrorComment(error)
+
+      // #then none of the sentinel values appear anywhere in the output
+      expect(rendered).not.toContain(sentinelWorkspace)
+      expect(rendered).not.toContain(sentinelLimitName)
+      expect(rendered).not.toContain(sentinelAccount)
     })
   })
 })
