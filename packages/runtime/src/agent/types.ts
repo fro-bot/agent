@@ -1,10 +1,15 @@
 import type {FilePartInput} from '@opencode-ai/sdk'
 import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 import type {ModelConfig, OmoProviders, ResolvedOutputMode, ResponseMode, TokenUsage} from '../shared/types.js'
+import type {ErrorInfo} from './error-format/types.js'
 import type {ResponseDelivery} from './response-delivery.js'
 
 export type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 export type {OutputMode, ResolvedOutputMode, ResponseMode} from '../shared/types.js'
+
+// Canonically owned by `./error-format/types.js`; re-exported for `./types.js` callers.
+export type {ErrorInfo, ErrorType} from './error-format/types.js'
+export {ERROR_TYPES} from './error-format/types.js'
 
 export const EVENT_TYPES = [
   'discussion_comment',
@@ -177,28 +182,6 @@ export interface TriggerContext {
   readonly command: ParsedCommand | null
   readonly isBotReviewRequested: boolean
   readonly raw: unknown
-}
-
-export const ERROR_TYPES = [
-  'api_error',
-  'configuration',
-  'internal',
-  'llm_fetch_error',
-  'llm_timeout',
-  'permission',
-  'rate_limit',
-  'validation',
-] as const
-
-export type ErrorType = (typeof ERROR_TYPES)[number]
-
-export interface ErrorInfo {
-  readonly type: ErrorType
-  readonly message: string
-  readonly details?: string
-  readonly suggestedAction?: string
-  readonly retryable: boolean
-  readonly resetTime?: Date
 }
 
 export interface AgentContext {
