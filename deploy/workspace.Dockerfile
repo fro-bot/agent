@@ -120,8 +120,8 @@ WORKDIR /app
 # OPENCODE_VERSION is the harness build of OpenCode (fro-bot/agent releases),
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
-ARG OPENCODE_VERSION=1.17.20+harness.1d703b44
-ARG SYSTEMATIC_VERSION=2.33.2
+ARG OPENCODE_VERSION=1.17.20+harness.b78cc9e1
+ARG SYSTEMATIC_VERSION=2.33.3
 
 # System packages:
 #   git            — clone.ts runs `git clone` via execFile
