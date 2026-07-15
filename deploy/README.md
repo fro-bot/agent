@@ -550,8 +550,6 @@ Any host not on the list receives a 403 and the connection is dropped. Both HTTP
 
 ### Object-store bucket scoping
 
-For testing the gateway itself, see [Testing-Only Configuration](#testing-only-configuration-discord-plumbing) — S3 isn't exercised in v1.
-
 The allowlist does **not** include broad S3/R2 wildcards (`*.s3.amazonaws.com`, `*.r2.cloudflarestorage.com`). Instead, set the `OBJECT_STORE_HOSTS` environment variable on the `mitmproxy` service to the exact bucket host(s) your deployment uses:
 
 ```
@@ -561,6 +559,12 @@ OBJECT_STORE_HOSTS=my-bucket.s3.amazonaws.com,my-account.r2.cloudflarestorage.co
 If `OBJECT_STORE_HOSTS` is unset or empty, all S3/R2 traffic is blocked (fail-closed default). This prevents workspace processes from exfiltrating data to attacker-controlled buckets in those clouds.
 
 Set the variable in your `.env` file or `compose.override.yaml` (see `compose.override.example.yaml` for an example).
+
+#### AWS run-state retention rollout
+
+AWS S3 deployments tag gateway run-state writes with `object-type=run-state`. Before deploying a release that emits these tags, the infrastructure operator must grant `s3:PutObjectTagging` and pass a tagged put/delete preflight. After deployment, verify the tag on a newly written run-state object and inventory the finite set of older untagged run-state records before enabling the exact-match lifecycle rule tracked in [marcusrbrown/infra#729](https://github.com/marcusrbrown/infra/issues/729). Custom S3 endpoints remain untagged.
+
+Treat `AccessDenied` on tagged writes as IAM drift: restore the permission or roll back the tagged runtime, but do not retry the write without its tag. Treat S3 timeouts and 5xx responses as provider failures under the existing retry and incident policy. If the lifecycle rule itself misbehaves, disable it and confirm the rule is absent before rolling back the runtime.
 
 ### Additional workspace egress hosts
 

@@ -175,7 +175,7 @@ describe('run-state coordination', () => {
     expect(storeAdapter.conditionalPut).toHaveBeenCalledWith(
       'fro-bot-state/coordination/owner/repo/runs/run-1.json',
       JSON.stringify(runState),
-      {ifNoneMatch: '*'},
+      {ifNoneMatch: '*', tagging: 'object-type=run-state'},
     )
   })
 
@@ -511,7 +511,58 @@ describe('run-state coordination', () => {
     expect(storeAdapter.conditionalPut).toHaveBeenCalledWith(
       'fro-bot-state/coordination/owner/repo/runs/run-1.json',
       JSON.stringify(runState),
-      {ifNoneMatch: '*'},
+      {ifNoneMatch: '*', tagging: 'object-type=run-state'},
+    )
+  })
+
+  it('passes the run-state tag and current etag on a non-terminal transition', async () => {
+    // #given
+    const acknowledged = createRunState({phase: 'ACKNOWLEDGED'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(createRunState()), etag: 'etag-1'}))
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(ok({etag: 'etag-2'}))
+    const storeAdapter = createStoreAdapter({getObject, conditionalPut})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'ACKNOWLEDGED', 'etag-1', logger)
+
+    // #then
+    expect(result).toEqual(ok({etag: 'etag-2', state: acknowledged}))
+    expect(conditionalPut).toHaveBeenCalledWith(
+      'fro-bot-state/coordination/owner/repo/runs/run-1.json',
+      JSON.stringify(acknowledged),
+      {ifMatch: 'etag-1', tagging: 'object-type=run-state'},
+    )
+  })
+
+  it('passes the run-state tag on terminalization', async () => {
+    // #given
+    const executing = createRunState({phase: 'EXECUTING'})
+    const completed = createRunState({phase: 'COMPLETED'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(executing), etag: 'etag-3'}))
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(ok({etag: 'etag-4'}))
+    const storeAdapter = createStoreAdapter({getObject, conditionalPut})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'COMPLETED', 'etag-3', logger)
+
+    // #then
+    expect(result).toEqual(ok({etag: 'etag-4', state: completed}))
+    expect(conditionalPut).toHaveBeenCalledWith(
+      'fro-bot-state/coordination/owner/repo/runs/run-1.json',
+      JSON.stringify(completed),
+      {ifMatch: 'etag-3', tagging: 'object-type=run-state'},
     )
   })
 

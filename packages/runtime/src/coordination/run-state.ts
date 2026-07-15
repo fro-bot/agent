@@ -5,6 +5,9 @@ import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
 import {resolveConditionalPut, resolveGetObject} from './adapter-guards.js'
 
+/** S3 object-tag classification applied to every run-state write so infrastructure can lifecycle-select run-state objects on AWS. */
+export const RUN_STATE_TAG = 'object-type=run-state'
+
 const VALID_TRANSITIONS: Record<RunPhase, readonly RunPhase[]> = {
   PENDING: ['ACKNOWLEDGED', 'FAILED', 'CANCELLED'],
   ACKNOWLEDGED: ['EXECUTING', 'FAILED', 'CANCELLED'],
@@ -100,7 +103,7 @@ export async function createRun(
   }
 
   logger.debug('Creating run-state record', {key: key.data, phase: runState.phase, repo, runId: runState.run_id})
-  return conditionalPut.data(key.data, JSON.stringify(runState), {ifNoneMatch: '*'})
+  return conditionalPut.data(key.data, JSON.stringify(runState), {ifNoneMatch: '*', tagging: RUN_STATE_TAG})
 }
 
 /**
@@ -180,7 +183,10 @@ export async function transitionRun(
     runId,
     to: newPhase,
   })
-  const writeResult = await conditionalPut.data(key.data, JSON.stringify(nextState), {ifMatch: etag})
+  const writeResult = await conditionalPut.data(key.data, JSON.stringify(nextState), {
+    ifMatch: etag,
+    tagging: RUN_STATE_TAG,
+  })
   if (writeResult.success === false) {
     return err(writeResult.error)
   }

@@ -11,7 +11,12 @@ export interface ObjectStoreAdapter {
   readonly conditionalPut?: (
     key: string,
     data: string,
-    options: {ifNoneMatch?: string; ifMatch?: string},
+    options: {
+      ifNoneMatch?: string
+      ifMatch?: string
+      /** URL-encoded `key=value` query string passed to S3 PutObject Tagging. */
+      tagging?: string
+    },
   ) => Promise<Result<{etag: string}, Error>>
   readonly conditionalDelete?: (key: string, options: {ifMatch: string}) => Promise<Result<void, Error>>
   readonly getObject?: (key: string) => Promise<Result<{data: string; etag: string}, Error>>

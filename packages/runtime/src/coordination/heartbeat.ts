@@ -5,7 +5,7 @@ import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
 import {requireConditionalPut, requireGetObject, resolveGetObject} from './adapter-guards.js'
 import {renewLease} from './lock.js'
-import {parseRunState} from './run-state.js'
+import {parseRunState, RUN_STATE_TAG} from './run-state.js'
 
 export interface HeartbeatStopResult {
   /** Current ETag of the run-state object after the final heartbeat tick. */
@@ -99,6 +99,7 @@ export function createHeartbeatController(
 
     const written = await requireConditionalPut(config)(runKey.data, JSON.stringify(nextState), {
       ifMatch: current.data.etag,
+      tagging: RUN_STATE_TAG,
     })
     if (written.success === false) {
       throw written.error
