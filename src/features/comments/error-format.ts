@@ -1,7 +1,7 @@
 import type {ErrorInfo} from '@fro-bot/runtime'
 import {createErrorInfo} from '@fro-bot/runtime'
 
-/** Legacy Action compatibility surface over the canonical runtime formatters. */
+/** Legacy comments-module compatibility surface over the canonical runtime formatters. */
 export {
   createErrorInfo,
   createLLMFetchError,
@@ -12,7 +12,7 @@ export {
   isLlmFetchError,
 } from '@fro-bot/runtime'
 
-/** Preserve the Action's historical oMo guidance while sharing the runtime error shape. */
+/** Preserve the comments-module's legacy import/API behavior for callers while sharing the runtime error shape. */
 export function createAgentError(message: string, agent?: string): ErrorInfo {
   return createErrorInfo('configuration', `Agent error: ${message}`, false, {
     details: agent == null ? undefined : `Requested agent: ${agent}`,
