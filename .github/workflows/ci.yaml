@@ -730,7 +730,7 @@ jobs:
 
   release:
     concurrency:
-      group: release
+      group: ${{ github.ref_name == github.event.repository.default_branch && 'release' || format('release-validation-{0}', github.event.pull_request.number || github.run_id) }}
       cancel-in-progress: false
     env:
       DRY_RUN: ${{ github.ref_name != github.event.repository.default_branch }}
