@@ -329,6 +329,97 @@ describe('createS3Adapter', () => {
     })
   })
 
+  it('includes requested tagging metadata in the AWS conditional-write command', async () => {
+    // #given
+    sendMock.mockResolvedValue({ETag: 'etag-123'})
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const conditionalPut = adapter.conditionalPut
+
+    if (conditionalPut == null) {
+      throw new Error('Expected conditionalPut to be defined')
+    }
+
+    // #when
+    const result = await conditionalPut(
+      'fro-bot-state/github/owner/repo/runs/run-1.json',
+      JSON.stringify({status: 'terminal'}),
+      {ifNoneMatch: '*', tagging: 'lifecycle=run-state-terminal'},
+    )
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(getCommandInput(0)).toMatchObject({
+      Tagging: 'lifecycle=run-state-terminal',
+    })
+  })
+
+  it('omits tagging metadata from the command when using a custom endpoint', async () => {
+    // #given
+    sendMock.mockResolvedValue({ETag: 'etag-123'})
+    const logger = createLogger()
+    const adapter = createS3Adapter({...baseConfig, endpoint: 'https://example.r2.cloudflarestorage.com'}, logger)
+    const conditionalPut = adapter.conditionalPut
+
+    if (conditionalPut == null) {
+      throw new Error('Expected conditionalPut to be defined')
+    }
+
+    // #when
+    const result = await conditionalPut(
+      'fro-bot-state/github/owner/repo/runs/run-1.json',
+      JSON.stringify({status: 'terminal'}),
+      {ifNoneMatch: '*', tagging: 'lifecycle=run-state-terminal'},
+    )
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(getCommandInput(0)).not.toHaveProperty('Tagging')
+  })
+
+  it('omits tagging metadata when the caller provides none', async () => {
+    // #given
+    sendMock.mockResolvedValue({ETag: 'etag-123'})
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const conditionalPut = adapter.conditionalPut
+
+    if (conditionalPut == null) {
+      throw new Error('Expected conditionalPut to be defined')
+    }
+
+    // #when
+    const result = await conditionalPut('fro-bot-state/github/owner/repo/locks/repo.json', '{}', {
+      ifNoneMatch: '*',
+    })
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(getCommandInput(0)).not.toHaveProperty('Tagging')
+  })
+
+  it('treats an empty tagging value as absent rather than emitting an invalid header', async () => {
+    // #given
+    sendMock.mockResolvedValue({ETag: 'etag-123'})
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const conditionalPut = adapter.conditionalPut
+
+    if (conditionalPut == null) {
+      throw new Error('Expected conditionalPut to be defined')
+    }
+
+    // #when
+    const result = await conditionalPut('fro-bot-state/github/owner/repo/locks/repo.json', '{}', {
+      ifNoneMatch: '*',
+      tagging: '',
+    })
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(getCommandInput(0)).not.toHaveProperty('Tagging')
+  })
+
   it('returns an error when conditional upload hits a precondition failure', async () => {
     // #given
     sendMock.mockRejectedValue(
