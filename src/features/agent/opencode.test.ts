@@ -1001,6 +1001,74 @@ describe('executeOpenCode retry behavior', () => {
     )
   })
 
+  it('does not retry when session.status retry classifies as quota_exceeded (non-retryable)', async () => {
+    // #given — an accepted prompt followed by an account-quota retry status
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+        }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () =>
+          createPromptStartedEventStream(mockClient.session.promptAsync, [
+            {
+              type: 'session.status',
+              properties: {
+                sessionID: 'ses_123',
+                status: {
+                  type: 'retry',
+                  attempt: 1,
+                  message: 'Usage limit reached',
+                  action: {
+                    reason: 'account_rate_limit',
+                    provider: 'anthropic',
+                    title: 'Usage limit reached',
+                    message: 'x',
+                    label: 'x',
+                  },
+                  next: Date.now() + 5000,
+                },
+              },
+            } as unknown as Event,
+          ]),
+        ),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when — quota exhaustion must fail fast (grace-cycle path, no retry delay is ever consumed),
+    // so settlement is proven within under 10 simulated seconds — not the full multi-minute
+    // retry-delay budget a genuinely retryable error would need.
+    const settlementBudgetMs = 10_000
+    const startedAt = Date.now()
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(settlementBudgetMs - 1)
+    const result = await resultPromise
+    const elapsedMs = Date.now() - startedAt
+
+    // #then — one failed quota attempt, no continuation prompt, settled well under the budget
+    expect(promptCallCount).toBe(1)
+    expect(result.success).toBe(false)
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(elapsedMs).toBeLessThan(settlementBudgetMs)
+    expect(mockLogger.warning).not.toHaveBeenCalledWith(
+      'LLM fetch error detected, retrying with continuation prompt',
+      expect.any(Object),
+    )
+  })
+
   it('stops retrying after MAX_LLM_RETRIES attempts', async () => {
     // #given
     const mockServer = createMockServer()
@@ -1521,7 +1589,7 @@ describe('logServerEvent', () => {
     vi.restoreAllMocks()
   })
 
-  it('logs event with type and properties in debug mode', () => {
+  it('logs non-sync events with bounded eventType + sessionId only — does not dump raw properties', () => {
     // #given
     const event: Event = {
       type: 'session.idle',
@@ -1534,11 +1602,11 @@ describe('logServerEvent', () => {
     // #then
     expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
       eventType: 'session.idle',
-      properties: {sessionID: 'ses_123'},
+      sessionId: 'ses_123',
     })
   })
 
-  it('logs message.part.updated events with part details', () => {
+  it('extracts sessionId from a nested part for message.part.updated without logging the raw part', () => {
     // #given
     const event = {
       type: 'message.part.updated',
@@ -1558,38 +1626,65 @@ describe('logServerEvent', () => {
     // #then
     expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
       eventType: 'message.part.updated',
-      properties: {
-        part: {
-          sessionID: 'ses_123',
-          type: 'tool',
-          tool: 'bash',
-          state: {status: 'completed', title: 'git status'},
-        },
-      },
+      sessionId: 'ses_123',
     })
   })
 
-  it('logs session.error events with error details', () => {
-    // #given
+  it('omits sessionId when it cannot be extracted, without logging raw properties', () => {
+    // #given — no sessionID anywhere in the event
     const event = {
       type: 'session.error',
-      properties: {
-        sessionID: 'ses_123',
-        error: 'Connection timeout',
-      },
+      properties: {error: 'Connection timeout'},
     } as unknown as Event
 
     // #when
     logServerEvent(event, mockLogger)
 
     // #then
-    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
-      eventType: 'session.error',
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {eventType: 'session.error'})
+  })
+
+  it('never leaks a hostile session.error payload (provider message, workspace/account/limitName, URL, nested error) into any logger call', () => {
+    // #given — a non-sync event carrying every kind of sensitive field the bounded log must exclude
+    const event = {
+      type: 'session.error',
       properties: {
         sessionID: 'ses_123',
-        error: 'Connection timeout',
+        error: {
+          name: 'APIError',
+          message: 'UNIQUE_PROVIDER_MESSAGE_TOKEN_88213',
+          data: {
+            message: 'UNIQUE_PROVIDER_MESSAGE_TOKEN_88213',
+            workspace: 'wrk_unique_secret_99001',
+            accountId: 'acct_unique_secret_77302',
+            limitName: 'Weekly-unique-limit-55671',
+            link: 'https://opencode.ai/workspace/unique-secret-path/go',
+          },
+          cause: {message: 'nested unique cause token 33447'},
+        },
       },
-    })
+    } as unknown as Event
+    const logger = createMockLogger()
+
+    // #when
+    logServerEvent(event, logger)
+
+    // #then — bounded fields present, every sensitive substring absent from every logger call
+    expect(logger.debug).toHaveBeenCalledWith('Server event', {eventType: 'session.error', sessionId: 'ses_123'})
+    const allCalls = [
+      ...vi.mocked(logger.debug).mock.calls,
+      ...vi.mocked(logger.error).mock.calls,
+      ...vi.mocked(logger.warning).mock.calls,
+      ...vi.mocked(logger.info).mock.calls,
+    ]
+    const serialized = JSON.stringify(allCalls)
+    expect(serialized).not.toContain('UNIQUE_PROVIDER_MESSAGE_TOKEN_88213')
+    expect(serialized).not.toContain('wrk_unique_secret_99001')
+    expect(serialized).not.toContain('acct_unique_secret_77302')
+    expect(serialized).not.toContain('Weekly-unique-limit-55671')
+    expect(serialized).not.toContain('opencode.ai')
+    expect(serialized).not.toContain('unique-secret-path')
+    expect(serialized).not.toContain('nested unique cause token 33447')
   })
 
   it('logs sync events with normalized kind and sessionID only — does not dump full payload', () => {
@@ -1772,6 +1867,103 @@ describe('pollForSessionCompletion', () => {
     // #then
     expect(result.completed).toBe(true)
     expect(callCount).toBeGreaterThan(5)
+  })
+
+  it('fails fast on a poll-only retry status with action.reason account_rate_limit (no SSE event at all)', async () => {
+    // #given — the REST poll observes the exact quota retry shape with no corresponding SSE
+    // session.status event ever having arrived. It must fail immediately on the first poll tick,
+    // not be treated as ordinary busy backoff.
+    let callCount = 0
+    const mockClient = {
+      session: {
+        status: vi.fn().mockImplementation(async () => {
+          callCount++
+          return {
+            data: {
+              ses_123: {
+                type: 'retry',
+                attempt: 1,
+                message: 'Usage limit reached',
+                action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+                next: Date.now() + 5000,
+              },
+            },
+          }
+        }),
+      },
+    }
+    const abortController = new AbortController()
+    const activityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+
+    // #when
+    const result = await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+
+    // #then — fails on the very first poll tick, not after exhausting the full timeout
+    expect(result.completed).toBe(false)
+    expect(callCount).toBe(1)
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+  })
+
+  it('never passes the raw poll-only retry status payload (message/provider text/link) into any logger call', async () => {
+    // #given — the poll-only quota fail-fast path must also bound its logging
+    const sensitiveLink = 'https://opencode.ai/workspace/acme-corp/go'
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({
+          data: {
+            ses_123: {
+              type: 'retry',
+              attempt: 1,
+              message: `Usage limit reached. Visit ${sensitiveLink}`,
+              action: {
+                reason: 'account_rate_limit',
+                provider: 'anthropic',
+                title: 'x',
+                message: `Enable usage at ${sensitiveLink}`,
+                label: 'x',
+                link: sensitiveLink,
+              },
+              next: Date.now() + 5000,
+            },
+          },
+        }),
+      },
+    }
+    const abortController = new AbortController()
+    const logger = createMockLogger()
+
+    // #when
+    await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      logger,
+    )
+
+    // #then
+    const allCalls = [
+      ...vi.mocked(logger.debug).mock.calls,
+      ...vi.mocked(logger.error).mock.calls,
+      ...vi.mocked(logger.warning).mock.calls,
+      ...vi.mocked(logger.info).mock.calls,
+    ]
+    const serializedCalls = JSON.stringify(allCalls)
+    expect(serializedCalls).not.toContain(sensitiveLink)
+    expect(serializedCalls).not.toContain('acme-corp')
   })
 
   it('returns error after session.error grace cycles exhausted', async () => {
@@ -2329,6 +2521,778 @@ describe('processEventStream', () => {
 
     // #then
     expect(activityTracker.sessionError).toBe('Rate limit exceeded')
+  })
+
+  it('never passes the raw session.error payload (message/body/account metadata) into any logger call', async () => {
+    // #given — a session.error carrying provider message text, a URL, and account/workspace
+    // metadata that must never reach the logger, structured or as a raw string.
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const sensitiveMessage = 'Usage limit reached — see https://opencode.ai/workspace/acme-corp/billing for details'
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {
+            name: 'APIError',
+            data: {status: 429, message: sensitiveMessage, accountId: 'acct_super_secret_12345'},
+          },
+        },
+      } as unknown as Event,
+    ])
+    const logger = createMockLogger()
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, logger, activityTracker)
+
+    // #then — the quota-classification log call (distinct from the generic raw 'Server event' trace
+    // logged by logServerEvent, which intentionally dumps the full event for debugging and is
+    // covered separately) must never carry the sensitive message/URL/account metadata.
+    const classificationCalls = [...vi.mocked(logger.debug).mock.calls, ...vi.mocked(logger.error).mock.calls].filter(
+      ([message]) => message !== 'Server event',
+    )
+    const serializedCalls = JSON.stringify(classificationCalls)
+    expect(serializedCalls).not.toContain('opencode.ai')
+    expect(serializedCalls).not.toContain('acme-corp')
+    expect(serializedCalls).not.toContain('acct_super_secret_12345')
+    expect(serializedCalls).not.toContain(sensitiveMessage)
+  })
+
+  it('never passes the raw session.status retry payload (message/provider text) into any logger call', async () => {
+    // #given — a retry status carrying provider message text and a link that must never be logged
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const sensitiveLink = 'https://opencode.ai/workspace/acme-corp/go'
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: `Usage limit reached. Visit ${sensitiveLink}`,
+            action: {
+              reason: 'account_rate_limit',
+              provider: 'anthropic',
+              title: 'Usage limit reached',
+              message: `Enable usage at ${sensitiveLink}`,
+              label: 'Enable usage',
+              link: sensitiveLink,
+            },
+            next: Date.now() + 5000,
+          },
+        },
+      } as unknown as Event,
+    ])
+    const logger = createMockLogger()
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, logger, activityTracker)
+
+    // #then — same scoping as above: only the quota-classification log call is bounded here,
+    // not the pre-existing generic 'Server event' raw trace (unrelated/unchanged behavior).
+    const classificationCalls = [...vi.mocked(logger.debug).mock.calls, ...vi.mocked(logger.error).mock.calls].filter(
+      ([message]) => message !== 'Server event',
+    )
+    const serializedCalls = JSON.stringify(classificationCalls)
+    expect(serializedCalls).not.toContain(sensitiveLink)
+    expect(serializedCalls).not.toContain('acme-corp')
+  })
+
+  it('classifies session.status retry with account_rate_limit reason as quota exceeded, sets terminal signal, and bounds tracker message', async () => {
+    // #given — OpenCode's session.status event with retry.action.reason === 'account_rate_limit' and a finite next
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const nextEpochMs = Date.parse('2026-07-16T12:00:00Z')
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached. Enable usage from your available balance - https://opencode.ai/acme/go',
+            action: {
+              reason: 'account_rate_limit',
+              provider: 'anthropic',
+              title: 'Usage limit reached',
+              message: 'https://opencode.ai/acme/go',
+              label: 'Enable usage',
+            },
+            next: nextEpochMs,
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — classified as quota_exceeded with normalized reset time, terminal signal set, no raw sentinel
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(result.llmError?.resetTime).toEqual(new Date(nextEpochMs))
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(activityTracker.sessionError).not.toBeNull()
+    expect(activityTracker.sessionError).not.toContain('https://opencode.ai')
+    expect(activityTracker.sessionError).not.toContain('acme')
+    expect(JSON.stringify(result)).not.toContain('https://opencode.ai')
+  })
+
+  it('does not classify session.status retry with an unrelated reason as quota exceeded', async () => {
+    // #given — retry status with a different action.reason (e.g. free_tier_limit)
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Retrying due to transient provider error',
+            action: {reason: 'free_tier_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: Date.now() + 5000,
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — no classification, no terminal signal
+    expect(result.llmError).toBeNull()
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+    expect(activityTracker.sessionError).toBeNull()
+  })
+
+  it('classifies session.status retry with account_rate_limit and an invalid/non-finite next by omitting resetTime', async () => {
+    // #given — next is 0 (falsy but technically finite) vs. a genuinely invalid case: NaN/Infinity should be omitted
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: Number.NaN,
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — still classified as quota_exceeded, but no reset time attached
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.resetTime).toBeUndefined()
+  })
+
+  it('classifies session.status retry with account_rate_limit and a finite but out-of-Date-range next by omitting resetTime', async () => {
+    // #given — next is finite per Number.isFinite but exceeds JS Date's representable range,
+    // producing an Invalid Date (getTime() === NaN) if constructed naively
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: Number.MAX_VALUE,
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — still classified as quota_exceeded, but no reset time attached (Invalid Date rejected)
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.resetTime).toBeUndefined()
+  })
+
+  it('first-writer-wins: session.status retry quota then a non-quota structured session.error does not overwrite the first error or tracker message', async () => {
+    // #given — quota retry classified first; a later non-quota structured session.error must not overwrite it
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const firstResetAt = Date.parse('2026-07-16T12:00:00Z')
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: firstResetAt,
+          },
+        },
+      } as unknown as Event,
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'APIError', data: {status: 500, message: 'Internal provider failure'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — first classified quota error survives; tracker message stays the bounded quota message
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.resetTime).toEqual(new Date(firstResetAt))
+    expect(activityTracker.sessionError).not.toContain('Internal provider failure')
+  })
+
+  it('first-writer-wins: session.status retry quota then a plain-string session.error does not overwrite the first error or tracker message', async () => {
+    // #given — quota retry classified first; a later plain-string (non-structured) session.error must not overwrite it
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const firstResetAt = Date.parse('2026-07-16T12:00:00Z')
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: firstResetAt,
+          },
+        },
+      } as unknown as Event,
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: 'Connection reset by peer'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — first classified quota error survives; tracker message stays the bounded quota message
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.resetTime).toEqual(new Date(firstResetAt))
+    expect(activityTracker.sessionError).not.toContain('Connection reset by peer')
+  })
+
+  it('quota upgrades an earlier generic session.error: a later account_rate_limit retry status replaces it', async () => {
+    // #given — generic non-quota session.error arrives first; a later account_rate_limit retry
+    // is a more specific/actionable classification and is now ALLOWED to upgrade it.
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: 'Invalid API key'},
+      } as unknown as Event,
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: Date.now() + 5000,
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — quota upgraded the earlier generic error; bounded quota message replaces the tracker
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.sessionError).not.toBe('Invalid API key')
+    expect(activityTracker.sessionError).not.toContain('Invalid API key')
+  })
+
+  it('quota is sticky: once classified, a later generic session.error cannot downgrade it', async () => {
+    // #given — account_rate_limit retry classifies quota first; a later unrelated session.error
+    // must NOT replace the sticky quota classification.
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: Date.now() + 5000,
+          },
+        },
+      } as unknown as Event,
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: 'Invalid API key'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — quota remains; not downgraded to the later generic configuration error
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.sessionError).not.toContain('Invalid API key')
+  })
+
+  it('classifies structured session.error with allowlisted status/code/message fields as quota exceeded via fallback', async () => {
+    // #given — structured session.error with HTTP 402 payment-required status
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {
+            name: 'APIError',
+            data: {status: 402, statusCode: 402, code: 'insufficient_quota', message: 'Payment required'},
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+  })
+
+  it('does not classify an ordinary structured 429 session.error as quota exceeded', async () => {
+    // #given — ordinary rate limit, not account-level quota exhaustion
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'APIError', data: {status: 429, message: 'Rate limit exceeded, please retry after 60 seconds'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — falls back to a retryable rate_limit classification, not quota_exceeded and not
+    // the non-retryable 'configuration' fallback — the caller's retry loop may still retry it.
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('rate_limit')
+    expect(result.llmError?.retryable).toBe(true)
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+  })
+
+  it('classifies a plain-string session.error quota message (no structured .data) as quota_exceeded', async () => {
+    // #given — session.error carries only a plain string, not a structured error object,
+    // but the string matches one of the bounded quota fallback message patterns.
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error:
+            'Usage limit reached. It will reset in 12 hours. To continue using this model now, enable usage from your available balance.',
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+  })
+
+  it('does not classify an ordinary plain-string session.error as quota_exceeded', async () => {
+    // #given — a plain string that does not match any bounded quota fallback pattern
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: 'Invalid API key'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).not.toBe('quota_exceeded')
+  })
+
+  it('classifies a structured session.error with only status 402 (no code/message) as quota_exceeded', async () => {
+    // #given — bare 402 with no other fields
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: {name: 'APIError', data: {status: 402}}},
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.retryable).toBe(false)
+  })
+
+  it('classifies a structured session.error with only an allowlisted stable code (no status/message) as quota_exceeded', async () => {
+    // #given — bare insufficient_quota code, no status/message
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: {name: 'APIError', data: {code: 'insufficient_quota'}}},
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.retryable).toBe(false)
+  })
+
+  it('classifies a structured session.error with only a bounded quota message (no status/code) as quota_exceeded', async () => {
+    // #given — bare quota message text, no status/code
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'APIError', data: {message: 'You have exhausted your credits for this billing period'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.retryable).toBe(false)
+  })
+
+  it('first-writer-wins: session.status retry quota then session.error quota does not overwrite the first classified error', async () => {
+    // #given — duplicate quota surfaces, retry-status first, session.error second
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const firstResetAt = Date.parse('2026-07-16T12:00:00Z')
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: firstResetAt,
+          },
+        },
+      } as unknown as Event,
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'APIError', data: {status: 402, message: 'Payment required'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — first classified error (with the retry-status reset time) wins; not overwritten by the second
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.resetTime).toEqual(new Date(firstResetAt))
+  })
+
+  it('first-writer-wins: session.error quota then session.status retry quota does not overwrite the first classified error', async () => {
+    // #given — duplicate quota surfaces, session.error first, retry-status second
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const secondResetAt = Date.parse('2026-07-16T12:00:00Z')
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'APIError', data: {status: 402, message: 'Payment required'}},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: secondResetAt,
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — first classified error (session.error's, no resetTime) wins; second does not overwrite
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.resetTime).toBeUndefined()
   })
 
   it('continues processing events after session.error without breaking', async () => {
@@ -3301,6 +4265,101 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(mockClient.session.status).not.toHaveBeenCalled()
   })
 
+  it('v2.session.wait() resolving after quota_exceeded is classified never reports success', async () => {
+    // #given — wait() resolves (no SDK-level error) after the SSE stream has already classified
+    // an account_rate_limit retry as quota_exceeded and set the terminal signal. A non-retryable
+    // quota failure must never be reported as a completed/successful run.
+    let resolveWait!: () => void
+    const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+      async () =>
+        new Promise<TestWaitResponse>(resolve => {
+          resolveWait = () => resolve({data: undefined, error: undefined})
+        }),
+    )
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Usage limit reached',
+            action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+            next: Date.now() + 5000,
+          },
+        },
+      } as unknown as Event,
+    ])
+    setTimeout(() => resolveWait(), 20)
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+      'http://localhost:1234',
+    )
+
+    // #then — wait() resolved, but the result is a quota failure, never success
+    expect(waitFn).toHaveBeenCalled()
+    expect(result.success).toBe(false)
+    expect(result.llmError?.type).toBe('quota_exceeded')
+  })
+
+  it('poll-only quota via REST (no SSE event at all) produces a failed, non-retryable quota_exceeded result', async () => {
+    // #given — the SSE stream never emits a session.status/session.error quota signal (empty
+    // stream); the REST poll is the only source that observes the account_rate_limit retry status.
+    const waitFn = vi.fn<TestWaitFn>().mockRejectedValue(new Error('wait not supported'))
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({
+          data: {
+            ses_123: {
+              type: 'retry',
+              attempt: 1,
+              message: 'Usage limit reached',
+              action: {reason: 'account_rate_limit', provider: 'anthropic', title: 'x', message: 'x', label: 'x'},
+              next: Date.now() + 5000,
+            },
+          },
+        }),
+      },
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+      'http://localhost:1234',
+    )
+
+    // #then — the poll-observed quota classification becomes the authoritative result
+    expect(result.success).toBe(false)
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.shouldRetry).toBe(false)
+    expect(result.eventStreamResult.llmError).not.toBeNull()
+    expect(result.eventStreamResult.llmError?.type).toBe('quota_exceeded')
+  })
+
   it('falls back to pollForSessionCompletion when v2.session.wait() rejects', async () => {
     // #given — wait throws; fallback poll sees busy then idle after real stream activity
     const waitFn = vi.fn<TestWaitFn>().mockRejectedValue(new Error('wait not supported'))
@@ -3656,6 +4715,117 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     } finally {
       writeSpy.mockRestore()
     }
+  })
+
+  it('does not set shouldRetry when llmError is a non-retryable quota_exceeded error, even though the poll failed', async () => {
+    // #given — a structured session.error classifies as quota_exceeded (non-retryable); the poll
+    // fails via the sessionError grace-cycle path since the session never reaches idle.
+    vi.useFakeTimers()
+    try {
+      const {runPromptAttempt} = await import('./retry.js')
+      const mockClient = {
+        session: {
+          status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+        },
+      }
+      const eventStream = createMockEventStream([
+        {
+          type: 'session.error',
+          properties: {
+            sessionID: 'ses_123',
+            error: {name: 'APIError', data: {status: 402, message: 'Payment required'}},
+          },
+        } as unknown as Event,
+      ])
+
+      // #when
+      const resultPromise = runPromptAttempt(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        30_000,
+        mockLogger,
+        eventStream.stream,
+        undefined,
+      )
+      await vi.advanceTimersByTimeAsync(2_000)
+      const result = await resultPromise
+
+      // #then — llmError is present but non-retryable, so shouldRetry must be false
+      expect(result.llmError).not.toBeNull()
+      expect(result.llmError?.type).toBe('quota_exceeded')
+      expect(result.llmError?.retryable).toBe(false)
+      expect(result.shouldRetry).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('sets shouldRetry when llmError is a retryable llm_fetch_error and the poll failed', async () => {
+    // #given — an LLM fetch error (retryable: true) triggers the sessionError grace-cycle path
+    vi.useFakeTimers()
+    try {
+      const {runPromptAttempt} = await import('./retry.js')
+      const mockClient = {
+        session: {
+          status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+        },
+      }
+      const eventStream = createMockEventStream([
+        {
+          type: 'session.error',
+          properties: {sessionID: 'ses_123', error: 'fetch failed: network error'},
+        } as unknown as Event,
+      ])
+
+      // #when
+      const resultPromise = runPromptAttempt(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        30_000,
+        mockLogger,
+        eventStream.stream,
+        undefined,
+      )
+      await vi.advanceTimersByTimeAsync(2_000)
+      const result = await resultPromise
+
+      // #then — llmError is present and retryable, so shouldRetry must be true
+      expect(result.llmError).not.toBeNull()
+      expect(result.llmError?.type).toBe('llm_fetch_error')
+      expect(result.llmError?.retryable).toBe(true)
+      expect(result.shouldRetry).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not set shouldRetry when llmError is null and the poll failed', async () => {
+    // #given — no session.error at all; poll fails via plain timeout with no llmError classified
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {}}),
+      },
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when — very short timeout, no activity ever observed
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      200,
+      mockLogger,
+      eventStream.stream,
+      undefined,
+    )
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.llmError).toBeNull()
+    expect(result.shouldRetry).toBe(false)
   })
 
   it('does not sum duplicate counter-only fallback comment artifacts when no comment URLs are available', async () => {

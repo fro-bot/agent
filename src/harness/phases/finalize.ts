@@ -7,11 +7,59 @@ import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
 import * as core from '@actions/core'
+import {createQuotaExceededError} from '@fro-bot/runtime'
 import {runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
 import {writeJobSummary} from '../../features/observability/index.js'
 import {createLogger} from '../../shared/logger.js'
 import {setActionOutputs} from '../config/outputs.js'
+
+/**
+ * Fixed, non-retryable guidance surfaced via `core.setFailed` for quota
+ * exhaustion. Never includes raw provider/incoming message text.
+ */
+const QUOTA_EXCEEDED_SET_FAILED_MESSAGE =
+  'Agent execution stopped: provider quota exceeded. Check the provider account/billing settings, wait for the quota to reset, or switch to a different model or provider.'
+
+/** Resolve the event-bound comment target (issue, PR, or discussion) shared by all error-comment paths. */
+function resolveCommentTarget(routing: RoutingPhaseResult): CommentTarget {
+  const [repoOwner, repoName] = routing.agentContext.repo.split('/')
+  const targetType =
+    routing.triggerResult.context.eventType === 'discussion_comment'
+      ? 'discussion'
+      : routing.agentContext.issueType === 'pr'
+        ? 'pr'
+        : 'issue'
+
+  return {
+    type: targetType,
+    number: routing.agentContext.issueNumber ?? 0,
+    owner: repoOwner ?? '',
+    repo: repoName ?? '',
+  }
+}
+
+function isResolvedCommentTarget(target: CommentTarget): boolean {
+  return target.number > 0 && target.owner.length > 0 && target.repo.length > 0
+}
+
+/** Post a formatted error comment to the resolved target, if any. Never throws. */
+async function postErrorComment(
+  routing: RoutingPhaseResult,
+  commentTarget: CommentTarget,
+  errorCommentBody: string,
+  metrics: MetricsCollector,
+  logger: Logger,
+): Promise<void> {
+  const commentResult = await postComment(routing.githubClient, commentTarget, {body: errorCommentBody}, logger)
+
+  if (commentResult == null) {
+    logger.warning('Failed to post LLM error comment')
+  } else {
+    logger.info('Posted LLM error comment', {commentUrl: commentResult.url})
+    metrics.incrementComments()
+  }
+}
 
 export async function runFinalize(
   bootstrap: BootstrapPhaseResult,
@@ -42,6 +90,23 @@ export async function runFinalize(
     resolvedOutputMode: execution.resolvedOutputMode,
   }
   await writeJobSummary(summaryOptions, logger)
+
+  // Rebuilds a safe ErrorInfo instead of trusting the incoming llmError; skips runResponsePost entirely.
+  // Posts at most once, only when delivery isn't 'none' and no response was already posted; always fails closed.
+  if (execution.llmError?.type === 'quota_exceeded') {
+    const commentTarget = resolveCommentTarget(routing)
+    const shouldPost =
+      bootstrap.delivery !== 'none' && execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)
+
+    if (shouldPost) {
+      const safeError = createQuotaExceededError({resetTime: execution.llmError.resetTime})
+      const errorCommentBody = formatErrorComment(safeError)
+      await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+    }
+
+    core.setFailed(QUOTA_EXCEEDED_SET_FAILED_MESSAGE)
+    return 1
+  }
 
   // For file-convention delivery, the `execution.success → return 0` early
   // path below is bypassed: the delivery assertion must run regardless of
@@ -116,37 +181,11 @@ export async function runFinalize(
     durationMs: duration,
   })
 
-  const [repoOwner, repoName] = routing.agentContext.repo.split('/')
-  const targetType =
-    routing.triggerResult.context.eventType === 'discussion_comment'
-      ? 'discussion'
-      : routing.agentContext.issueType === 'pr'
-        ? 'pr'
-        : 'issue'
+  const commentTarget = resolveCommentTarget(routing)
 
-  const commentTarget: CommentTarget = {
-    type: targetType,
-    number: routing.agentContext.issueNumber ?? 0,
-    owner: repoOwner ?? '',
-    repo: repoName ?? '',
-  }
-
-  if (commentTarget.number > 0 && commentTarget.owner.length > 0 && commentTarget.repo.length > 0) {
+  if (isResolvedCommentTarget(commentTarget)) {
     const errorCommentBody = formatErrorComment(execution.llmError)
-    const commentLogger = createLogger({phase: 'error-comment'})
-    const commentResult = await postComment(
-      routing.githubClient,
-      commentTarget,
-      {body: errorCommentBody},
-      commentLogger,
-    )
-
-    if (commentResult == null) {
-      commentLogger.warning('Failed to post LLM error comment')
-    } else {
-      commentLogger.info('Posted LLM error comment', {commentUrl: commentResult.url})
-      metrics.incrementComments()
-    }
+    await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
   } else {
     logger.warning('Cannot post error comment: missing target context')
   }

@@ -167,23 +167,18 @@ async function tryCreateV2Client(
   }
 }
 
-/**
- * Call v2.session.wait() on an existing server via a v2 client.
- * Returns true when wait() resolves and a terminal signal for the current turn has been observed,
- * false if unavailable, errored, or the terminal signal was not received within the grace window.
- *
- * This is intentionally non-blocking — callers start it in parallel with
- * pollForSessionCompletion() so the watchdog timeout is never suppressed.
- */
+/** Calls v2.session.wait() on an existing server; non-blocking, runs alongside pollForSessionCompletion(). */
+type V2WaitOutcome = 'fallback-to-poll' | 'quota-failed' | 'succeeded'
+
 async function startV2SessionWait(
   serverUrl: string | null | undefined,
   sessionId: string,
   activityTracker: ActivityTracker,
   logger: Logger,
   signal: AbortSignal,
-): Promise<boolean> {
+): Promise<V2WaitOutcome> {
   const v2Client = await tryCreateV2Client(serverUrl)
-  if (v2Client == null) return false
+  if (v2Client == null) return 'fallback-to-poll'
 
   try {
     const response = await v2Client.v2.session.wait({sessionID: sessionId}, {signal})
@@ -192,14 +187,10 @@ async function startV2SessionWait(
         sessionId,
         error: String(response.error),
       })
-      return false
+      return 'fallback-to-poll'
     }
-    // Guard: only accept wait() as the completion signal if a terminal signal for the current
-    // turn has been received (session.idle event or completed assistant message). wait() can
-    // resolve before the event processor has processed the terminal event (async scheduling gap),
-    // so we poll briefly (up to 500ms in 10ms ticks) to give the event processor time to catch up.
-    // Crucially, firstMeaningfulEventReceived (LLM stream start) is NOT sufficient — the session
-    // must have actually finished, not just started. Fall back to poll watchdog otherwise.
+    // Only accept wait() as completion once the terminal signal is observed; poll briefly to
+    // absorb the async gap between wait() resolving and the event processor catching up.
     const TERMINAL_GRACE_MS = 500
     const TERMINAL_POLL_INTERVAL_MS = 10
     const deadline = Date.now() + TERMINAL_GRACE_MS
@@ -212,13 +203,20 @@ async function startV2SessionWait(
     }
     if (activityTracker.currentTurnTerminalSignalReceived !== true) {
       logger.debug('v2.session.wait() resolved without terminal signal — deferring to poll watchdog', {sessionId})
-      return false
+      return 'fallback-to-poll'
+    }
+    // Quota is terminal but must never be reported as wait() success.
+    if (activityTracker.quotaExceeded != null) {
+      logger.debug('v2.session.wait() resolved after quota exceeded — reporting quota failure, not success', {
+        sessionId,
+      })
+      return 'quota-failed'
     }
     logger.debug('v2.session.wait() resolved with terminal signal — session is done', {sessionId})
-    return true
+    return 'succeeded'
   } catch (error) {
     logger.debug('v2.session.wait() threw, relying on poll watchdog', {sessionId, error: toErrorMessage(error)})
-    return false
+    return 'fallback-to-poll'
   }
 }
 
@@ -287,9 +285,7 @@ export async function runPromptAttempt(
       }
     }
 
-    // Start the polling watchdog immediately — it enforces the no-activity timeout and
-    // serves as fallback completion detection via session.idle events and session.status().
-    // This must always run in parallel; never awaited before starting.
+    // Watchdog: enforces no-activity timeout and fallback completion detection; runs in parallel.
     const pollPromise = pollForSessionCompletion(
       client,
       sessionId,
@@ -300,23 +296,19 @@ export async function runPromptAttempt(
       activityTracker,
     )
 
-    // Concurrently start v2.session.wait() if available (SDK v2 session-wait endpoint).
-    // It is the authoritative completion signal — blocks until the agent loop is idle.
-    // On success it marks activityTracker idle so the poller exits on its next tick.
-    // On error/rejection it resolves false and we rely solely on the poller.
+    // Authoritative completion signal when available; falls back to the poller otherwise.
     const waitPromise = startV2SessionWait(serverUrl, sessionId, activityTracker, logger, waitAbortController.signal)
 
-    // Race: whichever settles first wins.
-    // - wait() wins → marks activityTracker idle → return success immediately.
-    // - wait() fails (false) → await pollPromise for the authoritative result.
-    // - poll wins before wait() → use poll result; wait() is still pending but ignored.
+    // Race: wait() succeeds → success; wait() quota-failed → failure (never success on quota);
+    // wait() falls back → use poll result.
     const pollResult = await Promise.race([
       waitPromise.then(
-        (
-          waitSucceeded,
-        ): Promise<{completed: boolean; error: string | null}> | {completed: boolean; error: string | null} => {
-          if (waitSucceeded) {
+        (outcome): Promise<{completed: boolean; error: string | null}> | {completed: boolean; error: string | null} => {
+          if (outcome === 'succeeded') {
             return {completed: true, error: null}
+          }
+          if (outcome === 'quota-failed') {
+            return {completed: false, error: activityTracker.quotaExceeded?.message ?? 'Quota exceeded'}
           }
           // wait() unavailable or failed — fall through to poll result
           return pollPromise
@@ -327,6 +319,11 @@ export async function runPromptAttempt(
 
     await collectEventResults()
 
+    // Merge poll-observed quota (SSE may never have emitted one) into the authoritative result.
+    if (activityTracker.quotaExceeded != null && eventStreamResult.llmError?.type !== 'quota_exceeded') {
+      eventStreamResult = {...eventStreamResult, llmError: activityTracker.quotaExceeded}
+    }
+
     if (!pollResult.completed) {
       const pollError = pollResult.error ?? 'Session did not reach idle state'
       logger.error('Session completion polling failed', {error: pollError, sessionId})
@@ -334,14 +331,12 @@ export async function runPromptAttempt(
         success: false,
         error: pollError,
         llmError: eventStreamResult.llmError,
-        shouldRetry: eventStreamResult.llmError != null,
+        shouldRetry: eventStreamResult.llmError?.retryable === true,
         eventStreamResult,
       }
     }
 
-    // Post-idle artifact reconciliation: one-shot read of the completed assistant message
-    // to capture any artifacts (PRs, commits, comments) the live stream may have missed.
-    // No polling loop, no stability window, no visible rendering.
+    // Post-idle artifact reconciliation: one-shot read of the completed assistant message.
     const fallbackMessageParts = await readCompletedAssistantMessageParts(
       client,
       sessionId,
