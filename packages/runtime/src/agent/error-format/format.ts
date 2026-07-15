@@ -1,4 +1,4 @@
-import type {ErrorInfo, ErrorType} from './types.js'
+import type {ErrorInfo, ErrorType, QuotaErrorInput} from './types.js'
 
 const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   api_error: 'API Error',
@@ -7,6 +7,7 @@ const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   llm_fetch_error: 'LLM Fetch Error',
   llm_timeout: 'LLM Timeout',
   permission: 'Permission Error',
+  quota_exceeded: 'Quota Exceeded',
   rate_limit: 'Rate Limit',
   validation: 'Validation Error',
 }
@@ -156,4 +157,65 @@ export function createAgentError(message: string, agent?: string): ErrorInfo {
     details: agent == null ? undefined : `Requested agent: ${agent}`,
     suggestedAction: 'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
   })
+}
+
+/** Stable provider error codes that indicate quota exhaustion. */
+const QUOTA_FALLBACK_CODES = new Set(['insufficient_quota', 'usage_not_included'])
+
+/** Tightly bounded text patterns that indicate quota exhaustion; must not match ordinary rate-limit/fetch/auth text. */
+const QUOTA_FALLBACK_MESSAGE_PATTERNS = [
+  /usage limit reached\..*enable usage from your available balance/i,
+  /exhausted (your|the) credits/i,
+  /top up your available balance/i,
+] as const
+
+/**
+ * Classify a normalized error signal as `quota_exceeded`, or `null` when it
+ * is not. `retry-status` requires an exact `reason === 'account_rate_limit'`
+ * match (no partial/prefix matching). `session-error` matches HTTP 402, an
+ * allowlisted stable code, or a bounded exhausted-quota message pattern.
+ * Never echoes the raw input into the returned `ErrorInfo`.
+ */
+export function classifyQuotaError(input: QuotaErrorInput): ErrorInfo | null {
+  if (input.kind === 'retry-status') {
+    if (input.reason !== 'account_rate_limit') return null
+    return createQuotaExceededError({resetTime: input.resetAt})
+  }
+
+  const status = input.status
+  if (status !== undefined && Number.isFinite(status) && status === 402) {
+    return createQuotaExceededError()
+  }
+
+  const code = input.code
+  if (code !== undefined && QUOTA_FALLBACK_CODES.has(code)) {
+    return createQuotaExceededError()
+  }
+
+  const message = input.message
+  if (typeof message === 'string' && message.length > 0) {
+    const matches = QUOTA_FALLBACK_MESSAGE_PATTERNS.some(pattern => pattern.test(message))
+    if (matches) return createQuotaExceededError()
+  }
+
+  return null
+}
+
+/**
+ * Create the fixed, non-retryable `quota_exceeded` ErrorInfo. Output is
+ * bounded to fixed guidance plus an optional trusted `provider` name and a
+ * normalized `resetTime`; never a raw provider payload.
+ */
+export function createQuotaExceededError(options?: {provider?: string; resetTime?: Date}): ErrorInfo {
+  return createErrorInfo(
+    'quota_exceeded',
+    'Provider quota exceeded. This run has stopped because the configured model has reached its usage limit.',
+    false,
+    {
+      details: options?.provider == null ? undefined : `Provider: ${options.provider}`,
+      suggestedAction:
+        'Check the provider account/billing settings, wait for the quota to reset, or switch to a different model or provider.',
+      resetTime: options?.resetTime,
+    },
+  )
 }

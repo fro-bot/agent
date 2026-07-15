@@ -112,7 +112,7 @@ export async function runPromptAttempt(
         success: false,
         error: pollError,
         llmError: eventStreamResult.llmError,
-        shouldRetry: eventStreamResult.llmError != null,
+        shouldRetry: eventStreamResult.llmError?.retryable === true,
         eventStreamResult,
       }
     }
