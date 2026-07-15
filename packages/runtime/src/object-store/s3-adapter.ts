@@ -246,6 +246,9 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
             ...(effectiveEncryption === 'aws:kms' && config.sseKmsKeyId != null
               ? {SSEKMSKeyId: config.sseKmsKeyId}
               : {}),
+            ...(config.endpoint == null && options.tagging != null && options.tagging.length > 0
+              ? {Tagging: options.tagging}
+              : {}),
           }),
         )
 

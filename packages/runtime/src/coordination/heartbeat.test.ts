@@ -128,8 +128,91 @@ describe('heartbeat controller', () => {
     expect(conditionalPut).toHaveBeenCalledWith(
       'fro-bot-state/coordination/owner/repo/runs/run-1.json',
       JSON.stringify(createRunState({last_heartbeat: '2026-04-24T18:15:30.000Z'})),
-      {ifMatch: 'etag-current'},
+      {ifMatch: 'etag-current', tagging: 'object-type=run-state'},
     )
+  })
+
+  it('renews the lock before writing the tagged run-state heartbeat', async () => {
+    // #given
+    const conditionalPut = vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>(async () => ok({etag: 'etag-next'}))
+    const controller = createHeartbeatController(
+      createCoordinationConfig(createStoreAdapter({conditionalPut})),
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'lock-etag-1',
+      createLogger(),
+    )
+    controller.start()
+
+    // #when
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #then the lock renewal completes before the run-state write
+    expect(renewLeaseMock).toHaveBeenCalledTimes(1)
+    expect(conditionalPut).toHaveBeenCalledTimes(1)
+    expect(conditionalPut).toHaveBeenCalledWith(
+      'fro-bot-state/coordination/owner/repo/runs/run-1.json',
+      expect.any(String),
+      expect.objectContaining({tagging: 'object-type=run-state'}),
+    )
+
+    // #then the lock lease is renewed strictly before the tagged run-state write
+    const renewOrder = renewLeaseMock.mock.invocationCallOrder[0]
+    const putOrder = conditionalPut.mock.invocationCallOrder[0]
+    expect(renewOrder).toBeDefined()
+    expect(putOrder).toBeDefined()
+    expect(renewOrder as number).toBeLessThan(putOrder as number)
+  })
+
+  it('resends the run-state tag on every repeated heartbeat tick', async () => {
+    // #given
+    const conditionalPut = vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>(async () => ok({etag: 'etag-next'}))
+    const controller = createHeartbeatController(
+      createCoordinationConfig(createStoreAdapter({conditionalPut})),
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'lock-etag-1',
+      createLogger(),
+    )
+    controller.start()
+
+    // #when three ticks elapse
+    await vi.advanceTimersByTimeAsync(30_000)
+    await vi.advanceTimersByTimeAsync(30_000)
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #then every tick's write carries the tag
+    expect(conditionalPut).toHaveBeenCalledTimes(3)
+    for (const call of conditionalPut.mock.calls) {
+      expect(call[2]).toMatchObject({tagging: 'object-type=run-state'})
+    }
+  })
+
+  it('prevents the run-state write when lock renewal fails', async () => {
+    // #given
+    renewLeaseMock.mockReset()
+    renewLeaseMock.mockResolvedValue(err(new Error('lock renewal failed')))
+    const conditionalPut = vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>(async () => ok({etag: 'etag-next'}))
+    const controller = createHeartbeatController(
+      createCoordinationConfig(createStoreAdapter({conditionalPut})),
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'lock-etag-1',
+      createLogger(),
+    )
+    controller.start()
+
+    // #when
+    await vi.advanceTimersByTimeAsync(30_000)
+    const result = await controller.stop()
+
+    // #then the tagged run-state write never happens, and the failure propagates
+    expect(conditionalPut).not.toHaveBeenCalled()
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe('lock renewal failed')
   })
 
   it('returns the current run snapshot from stop without writing a terminal state', async () => {
