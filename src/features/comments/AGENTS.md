@@ -8,7 +8,7 @@
 | ---------------- | ----------------- | ------------------------------------------------------------ |
 | **Reader**       | `reader.ts`       | `readThread()`, `findBotComment()`, pagination (257 L)       |
 | **Writer**       | `writer.ts`       | `postComment()`, `isBotComment()`, GraphQL mutations (214 L) |
-| **Error Format** | `error-format.ts` | `formatErrorComment()`, error creation helpers (187 L)       |
+| **Error Format** | `error-format.ts` | Thin re-export of the canonical `@fro-bot/runtime` error-format module (`ErrorInfo`/`ErrorType`/`formatErrorComment`/error factories) |
 | **Types**        | `types.ts`        | ThreadComment, Thread, ErrorInfo, PostCommentResult (141 L)  |
 
 ## KEY EXPORTS
@@ -36,6 +36,9 @@ BOT_COMMENT_MARKER // HTML comment for identification
 - **Non-fatal operations**: All API calls catch errors, log warnings, and return `null`.
 - **Idempotent updates**: `postComment` with `updateExisting` replaces latest bot comment.
 - **Visual Severity Mapping**: ErrorType maps to emojis (⚠️ `rate_limit`, ⏳ `llm_timeout`, ❌ others).
+- **Single canonical error-format source**: `ErrorInfo`/`ErrorType`/`createErrorInfo`/`formatErrorComment`/error
+  factories are owned by `packages/runtime/src/agent/error-format/`. `error-format.ts` re-exports that surface except
+  for the Action-specific `createAgentError` compatibility wrapper; `types.ts` only re-exports runtime types.
 
 ## DATA FLOW
 
