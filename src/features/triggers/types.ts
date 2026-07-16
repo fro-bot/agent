@@ -70,6 +70,8 @@ export interface TriggerTarget {
   readonly requestedTeamSlug?: string
   /** Current PR requested reviewers (for ready_for_review fallback) */
   readonly requestedReviewerLogins?: readonly string[]
+  /** PR label names (pull_request only) */
+  readonly labels?: readonly string[]
   /** File path for review comments (pull_request_review_comment only) */
   readonly path?: string
   /** Line number for review comments (pull_request_review_comment only) */

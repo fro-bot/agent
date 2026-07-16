@@ -971,6 +971,41 @@ describe('routeEvent', () => {
       expect(result.context.target?.isDraft).toBe(false)
     })
 
+    it('maps normalized labels onto target.labels', () => {
+      // #given a pull_request event with labels on the payload
+      const payload = {
+        action: 'synchronize',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          body: 'Description of the feature',
+          state: 'open',
+          user: {login: 'contributor'},
+          draft: false,
+          locked: false,
+          author_association: 'COLLABORATOR',
+          labels: [
+            {id: 1, name: 'skip-agent-review', color: 'ededed', description: null},
+            {id: 2, name: 'needs-triage', color: 'ff0000', description: null},
+          ],
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'contributor'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then target.labels should carry the label names
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.target?.labels).toEqual(['skip-agent-review', 'needs-triage'])
+    })
+
     it('routes pull_request.synchronize event', () => {
       // #given a pull_request.synchronize event
       const payload = {
