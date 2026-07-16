@@ -249,6 +249,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const responseModeRaw = core.getInput('response-mode').trim().toLowerCase()
     const responseMode: ResponseMode = responseModeRaw.length > 0 ? parseResponseMode(responseModeRaw) : 'github'
 
+    const reviewSkipLabelRaw = core.getInput('review-skip-label').trim()
+    const reviewSkipLabel = reviewSkipLabelRaw.length > 0 ? reviewSkipLabelRaw : null
+
     // Optional numeric input with default
     const sessionRetentionRaw = core.getInput('session-retention').trim()
     const sessionRetention =
@@ -436,6 +439,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       opencodeConfig,
       systematicConfig,
       dedupWindow,
+      reviewSkipLabel,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))

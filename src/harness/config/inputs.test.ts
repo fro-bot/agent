@@ -178,6 +178,61 @@ describe('parseActionInputs', () => {
       expect(result.success && result.data.responseMode).toBe('github')
     })
 
+    it('parses review-skip-label as null when input is empty (metadata default applies at runtime)', () => {
+      // #given no review-skip-label input provided (unit-test env has no action.yaml metadata defaults)
+      mockInputs({})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the parsed value is null; action.yaml's 'skip-agent-review' default flows through
+      // core.getInput() only at real Action runtime, not in this unit-test harness
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.reviewSkipLabel).toBeNull()
+    })
+
+    it('trims and preserves review-skip-label value verbatim', () => {
+      // #given a review-skip-label input with surrounding whitespace
+      mockInputs({
+        'review-skip-label': ' no-bot-review ',
+      })
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the value is trimmed but not case-normalized
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.reviewSkipLabel).toBe('no-bot-review')
+    })
+
+    it('parses whitespace-only review-skip-label as null', () => {
+      // #given a review-skip-label input containing only whitespace
+      mockInputs({
+        'review-skip-label': '   ',
+      })
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the trimmed-empty value disables the feature
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.reviewSkipLabel).toBeNull()
+    })
+
+    it('preserves mixed-case review-skip-label verbatim (case handling is comparison-time)', () => {
+      // #given a review-skip-label input with mixed casing
+      mockInputs({
+        'review-skip-label': 'Skip-Agent-Review',
+      })
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the value is preserved verbatim, not lowercased
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.reviewSkipLabel).toBe('Skip-Agent-Review')
+    })
+
     it('parses response-mode case-insensitively (e.g., NONE)', () => {
       mockInputs({
         'response-mode': 'NONE',
