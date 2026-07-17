@@ -2,7 +2,11 @@ import type {Logger} from '../../shared/logger.js'
 import type {TriggerConfig} from './types.js'
 import {beforeEach, describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {createIssueCommentCreatedEvent} from './__fixtures__/payloads.js'
+import {
+  createIssueCommentCreatedEvent,
+  createIssuesOpenedEvent,
+  createPullRequestOpenedEvent,
+} from './__fixtures__/payloads.js'
 import {checkSkipConditions, extractCommand, hasBotMention, routeEvent} from './router.js'
 import {createMockGitHubContext} from './test-helpers.js'
 import {ALL_AUTHOR_ASSOCIATIONS, ALLOWED_ASSOCIATIONS} from './types.js'
@@ -192,6 +196,7 @@ describe('checkSkipConditions', () => {
       skipDraftPRs: true,
       promptInput: null,
       senderAssociation: null,
+      reviewSkipLabel: null,
     }
   })
 
@@ -971,6 +976,41 @@ describe('routeEvent', () => {
       expect(result.context.target?.isDraft).toBe(false)
     })
 
+    it('maps normalized labels onto target.labels', () => {
+      // #given a pull_request event with labels on the payload
+      const payload = {
+        action: 'synchronize',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          body: 'Description of the feature',
+          state: 'open',
+          user: {login: 'contributor'},
+          draft: false,
+          locked: false,
+          author_association: 'COLLABORATOR',
+          labels: [
+            {id: 1, name: 'skip-agent-review', color: 'ededed', description: null},
+            {id: 2, name: 'needs-triage', color: 'ff0000', description: null},
+          ],
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'contributor'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then target.labels should carry the label names
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.target?.labels).toEqual(['skip-agent-review', 'needs-triage'])
+    })
+
     it('routes pull_request.synchronize event', () => {
       // #given a pull_request.synchronize event
       const payload = {
@@ -1544,5 +1584,40 @@ describe('ALLOWED_ASSOCIATIONS', () => {
     expect(ALLOWED_ASSOCIATIONS).not.toContain('CONTRIBUTOR')
     expect(ALLOWED_ASSOCIATIONS).not.toContain('NONE')
     expect(ALLOWED_ASSOCIATIONS).not.toContain('FIRST_TIMER')
+  })
+})
+
+describe('routeEvent review-skip-label integration', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  it('skips a labeled pull_request event end-to-end via routeEvent', () => {
+    // #given a pull_request payload carrying the opt-out label
+    const payload = createPullRequestOpenedEvent({authorAssociation: 'MEMBER'})
+    payload.pull_request.labels = [{name: 'skip-agent-review'}] as never
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it should skip before any acknowledgement/processing
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('review_skip_label')
+  })
+
+  it('leaves issue-triage events unaffected by a same-named label', () => {
+    // #given an issues event whose issue carries a same-named label
+    const payload = createIssuesOpenedEvent({authorAssociation: 'MEMBER'})
+    payload.issue.labels = [{name: 'skip-agent-review'}] as never
+    const ghContext = createMockGitHubContext('issues', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then issue-triage routing is unaffected — it processes normally
+    expect(result.shouldProcess).toBe(true)
   })
 })

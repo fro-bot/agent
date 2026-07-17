@@ -1,8 +1,11 @@
 import type {Logger} from '../../shared/logger.js'
+import type {TriggerConfig, TriggerContext} from './types.js'
 import {beforeEach, describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {routeEvent} from './router.js'
+import {checkPullRequestSkipConditions} from './skip-conditions-pr.js'
 import {createMockGitHubContext} from './test-helpers.js'
+import {DEFAULT_TRIGGER_CONFIG} from './types.js'
 
 describe('pull_request ready_for_review routing', () => {
   let logger: Logger
@@ -398,5 +401,411 @@ describe('pull_request ready_for_review routing', () => {
     // #then it should process and the author association should be overridden
     expect(result.shouldProcess).toBe(true)
     expect(result.context.author?.association).toBe('OWNER')
+  })
+})
+
+function labeledPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    action: 'synchronize',
+    pull_request: {
+      number: 200,
+      title: 'feat: work in progress',
+      body: 'WIP, do not review yet',
+      locked: false,
+      draft: false,
+      author_association: 'MEMBER',
+      requested_reviewers: [],
+      requested_teams: [],
+      labels: [{name: 'skip-agent-review'}],
+    },
+    sender: {login: 'contributor'},
+    ...overrides,
+  }
+}
+
+describe('pull_request review-skip-label routing', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  it('skips a labeled PR on synchronize', () => {
+    // #given a PR carrying the configured opt-out label
+    const ghContext = createMockGitHubContext('pull_request', labeledPayload())
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it should skip with the review_skip_label reason
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('review_skip_label')
+  })
+
+  it('matches the label case-insensitively', () => {
+    // #given a PR labeled 'skip-agent-review' and a config value with different casing
+    const ghContext = createMockGitHubContext('pull_request', labeledPayload())
+
+    // #when routing with a mixed-case config value
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'Skip-Agent-Review'})
+
+    // #then it should still skip
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('review_skip_label')
+  })
+
+  it('does not skip when the feature is disabled even if the label is present', () => {
+    // #given a labeled PR but reviewSkipLabel disabled (null)
+    const ghContext = createMockGitHubContext('pull_request', labeledPayload())
+
+    // #when routing with the feature disabled
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: null})
+
+    // #then it should process normally
+    expect(result.shouldProcess).toBe(true)
+  })
+
+  it('does not skip an unlabeled PR', () => {
+    // #given a PR with no labels
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        labels: [],
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it should process — behavior identical to pre-feature routing
+    expect(result.shouldProcess).toBe(true)
+  })
+
+  it('does not skip when labels are empty or undefined on the target', () => {
+    // #given a PR payload with no labels array at all
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        labels: undefined,
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it should process — no match on missing labels
+    expect(result.shouldProcess).toBe(true)
+  })
+
+  it('overrides the skip when the PR body mentions the bot', () => {
+    // #given a labeled PR whose body mentions the bot (authorized mention)
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        body: '@fro-bot please review anyway',
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then the mention overrides the label skip
+    expect(result.shouldProcess).toBe(true)
+  })
+
+  it('overrides the skip when review_requested names the bot', () => {
+    // #given a labeled PR with a live review_requested action naming the bot
+    const payload = labeledPayload({
+      action: 'review_requested',
+      requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then the live review request overrides the label skip
+    expect(result.shouldProcess).toBe(true)
+  })
+
+  it('does not override the skip for ready_for_review even when the PR body mentions the bot', () => {
+    // #given a labeled PR marked ready_for_review whose body mentions the bot and
+    // whose bot review request is already satisfied (isBotReviewRequested true).
+    // ready_for_review substitutes the sender's association into context.author,
+    // so the body mention's authorship was never validated — it must not override.
+    const payload = labeledPayload({
+      action: 'ready_for_review',
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        body: '@fro-bot please review anyway',
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then the mention does not override — the label skip still applies
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('review_skip_label')
+  })
+
+  it('still overrides the skip on synchronize when the PR body mentions the bot', () => {
+    // #given a labeled PR on synchronize whose body mentions the bot — the
+    // association here is the PR author's own, genuinely validated
+    const payload = labeledPayload({
+      action: 'synchronize',
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        body: '@fro-bot please review anyway',
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then the mention overrides the label skip
+    expect(result.shouldProcess).toBe(true)
+  })
+
+  it('does not override the skip for ready_for_review with a stale bot assignment', () => {
+    // #given a labeled PR marked ready_for_review where the bot is already a
+    // requested reviewer from an earlier event (stale assignment, not a live request)
+    const payload = labeledPayload({
+      action: 'ready_for_review',
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then ready_for_review is never an override — the label skip still applies
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('review_skip_label')
+  })
+
+  it('re-evaluates per event: label removed on a later synchronize runs normally', () => {
+    // #given a later synchronize event where the label has since been removed
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        labels: [],
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing the new event with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it processes normally — no memory of the earlier skip
+    expect(result.shouldProcess).toBe(true)
+  })
+
+  it('reports draft_pr before review_skip_label for a labeled draft PR', () => {
+    // #given a labeled PR that is also a draft
+    const payload = labeledPayload({
+      action: 'opened',
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        draft: true,
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then draft_pr takes precedence over review_skip_label
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('draft_pr')
+  })
+
+  it('reports issue_locked before review_skip_label for a labeled locked PR', () => {
+    // #given a labeled PR that is also locked
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        locked: true,
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then issue_locked takes precedence over review_skip_label
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('issue_locked')
+  })
+
+  it('matches the label case-insensitively in the reverse direction', () => {
+    // #given a config label in lowercase-hyphen form and a payload label with mixed casing
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        labels: [{name: 'Skip-Agent-Review'}],
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with a lowercase-hyphen config value
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it should still skip
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('review_skip_label')
+  })
+
+  it('skips when only one of several labels matches the configured opt-out label', () => {
+    // #given a PR with multiple labels, only one of which is the opt-out label
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        labels: [{name: 'needs-human-review'}, {name: 'skip-agent-review'}],
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it should skip
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('review_skip_label')
+  })
+
+  it('re-evaluates per event via routeEvent: labeled then unlabeled runs proves no skip memory', () => {
+    // #given the same PR routed twice — first with the opt-out label present
+    const firstPayload = labeledPayload()
+    const firstContext = createMockGitHubContext('pull_request', firstPayload)
+
+    // #when routing the first (labeled) event
+    const firstResult = routeEvent(firstContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it should skip
+    expect(firstResult.shouldProcess).toBe(false)
+    expect(firstResult.shouldProcess === false && firstResult.skipReason).toBe('review_skip_label')
+
+    // #given the same PR routed again with the label removed
+    const secondPayload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        labels: [],
+      },
+    })
+    const secondContext = createMockGitHubContext('pull_request', secondPayload)
+
+    // #when routing the second (unlabeled) event through the real router
+    const secondResult = routeEvent(secondContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then it should process — no memory of the earlier skip
+    expect(secondResult.shouldProcess).toBe(true)
+  })
+
+  it('does not skip when target.labels is undefined on a direct call', () => {
+    // #given a TriggerContext whose target has no labels field at all
+    const context: TriggerContext = {
+      eventType: 'pull_request',
+      eventName: 'pull_request',
+      repo: {owner: 'owner', repo: 'repo'},
+      ref: 'refs/heads/main',
+      sha: 'abc123',
+      runId: 1,
+      actor: 'contributor',
+      author: {login: 'contributor', association: 'MEMBER', isBot: false},
+      target: {kind: 'pr', number: 300, title: 'Test', body: 'WIP', locked: false, isDraft: false},
+      commentBody: null,
+      commentId: null,
+      hasMention: false,
+      command: null,
+      isBotReviewRequested: false,
+      action: 'synchronize',
+      raw: {},
+    }
+    const config: TriggerConfig = {...DEFAULT_TRIGGER_CONFIG, reviewSkipLabel: 'skip-agent-review'}
+
+    // #when checking skip conditions directly
+    const result = checkPullRequestSkipConditions(context, config)
+
+    // #then it should not skip — no match on missing labels
+    expect(result.shouldSkip).toBe(false)
+  })
+
+  it('does not skip when reviewSkipLabel is whitespace-only and a label is named the empty string', () => {
+    // #given a whitespace-only config value and a target label with an empty-string name
+    const context: TriggerContext = {
+      eventType: 'pull_request',
+      eventName: 'pull_request',
+      repo: {owner: 'owner', repo: 'repo'},
+      ref: 'refs/heads/main',
+      sha: 'abc123',
+      runId: 1,
+      actor: 'contributor',
+      author: {login: 'contributor', association: 'MEMBER', isBot: false},
+      target: {kind: 'pr', number: 301, title: 'Test', body: 'WIP', locked: false, isDraft: false, labels: ['']},
+      commentBody: null,
+      commentId: null,
+      hasMention: false,
+      command: null,
+      isBotReviewRequested: false,
+      action: 'synchronize',
+      raw: {},
+    }
+    const config: TriggerConfig = {...DEFAULT_TRIGGER_CONFIG, reviewSkipLabel: '   '}
+
+    // #when checking skip conditions directly
+    const result = checkPullRequestSkipConditions(context, config)
+
+    // #then the feature should be treated as disabled — no skip
+    expect(result.shouldSkip).toBe(false)
+  })
+
+  it('skips on a custom trimmed label with internal whitespace', () => {
+    // #given a PR labeled with a custom multi-word opt-out label
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        labels: [{name: 'no bot review'}],
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the same custom label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'no bot review'})
+
+    // #then it should skip
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('review_skip_label')
+  })
+
+  it('reports unauthorized_author before review_skip_label for a labeled PR from an unauthorized author', () => {
+    // #given a labeled PR authored by an unauthorized user
+    const payload = labeledPayload({
+      pull_request: {
+        ...(labeledPayload().pull_request as Record<string, unknown>),
+        author_association: 'NONE',
+      },
+    })
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with the label configured
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
+
+    // #then unauthorized_author takes precedence over review_skip_label
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('unauthorized_author')
   })
 })

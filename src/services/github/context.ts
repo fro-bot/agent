@@ -123,6 +123,9 @@ export function normalizeEvent(eventType: EventType, payload: unknown): Normaliz
             ]
           : [],
       )
+      const labels = (p.pull_request.labels ?? []).flatMap(label =>
+        typeof label.name === 'string' && label.name !== '' ? [label.name] : [],
+      )
       return {
         type: 'pull_request',
         action: p.action,
@@ -136,6 +139,7 @@ export function normalizeEvent(eventType: EventType, payload: unknown): Normaliz
           draft: p.pull_request.draft ?? false,
           authorAssociation: p.pull_request.author_association ?? 'NONE',
           requestedReviewers,
+          labels,
         },
         sender: {
           login: p.sender.login,

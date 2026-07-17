@@ -87,6 +87,7 @@ export function buildPullRequestContextData(
     requestedReviewerLogin: event.requestedReviewer?.login,
     requestedTeamSlug: event.requestedTeam?.slug,
     requestedReviewerLogins: event.pullRequest.requestedReviewers.map(reviewer => reviewer.login),
+    labels: event.pullRequest.labels,
   }
   const prBody = event.pullRequest.body ?? ''
   const {hasMention, command} = parseBotMentionAndCommand(prBody, botLogin)

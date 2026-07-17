@@ -123,6 +123,12 @@ inputs:
       Use 'none' for non-posting automation runs (e.g., LLM merge, code generation).
     required: false
     default: github
+  review-skip-label:
+    description: >-
+      Label name that suppresses automatic PR-event reviews when present on a PR
+      (case-insensitive). Set empty to disable.
+    required: false
+    default: skip-agent-review
 
 outputs:
   session-id:
