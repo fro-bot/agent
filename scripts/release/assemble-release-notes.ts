@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-// Trusted apply-phase script (docs/plans/2026-07-17-001-feat-two-phase-release-notes-narration-plan.md,
-// Unit 1). Runs in a separate job on a fresh runner from the model's generate job — the model's
+// Trusted apply-phase script for release-notes narration.
+// Runs in a separate job on a fresh runner from the model's generate job — the model's
 // workspace never existed here, so this file contains NO model-controlled code paths. It:
 //   1. Fetches the current release body (idempotency check — marker present → skip, no edit).
 //   2. Reads the candidate narrative file the generate job produced (missing → warn, fail-soft).

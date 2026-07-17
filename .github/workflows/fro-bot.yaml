@@ -35,6 +35,10 @@ on:
       correlation-id:
         description: Audit correlation token forwarded by an external dispatcher (e.g. the release-notes narration step)
         required: false
+      release-tag:
+        description: Release tag for narration runs; enables the trusted apply job
+        type: string
+        default: ''
   # Called by other workflows (e.g. harness-release) to run Fro Bot with a
   # specific model and/or prompt. Secrets are inherited from the caller via
   # `secrets: inherit` — no secret passthrough inputs needed.
@@ -238,7 +242,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ steps.prehead.outputs.ref }}
-          token: ${{ secrets.FRO_BOT_PAT }}
+          # Correlation-tagged (release-notes narration) runs are read-only by construction:
+          # checkout uses the workflow's own GITHUB_TOKEN instead of the write-capable PAT.
+          # The trusted apply-release-notes job (below) is the only place FRO_BOT_PAT appears
+          # for this flow. All other dispatch paths (mention/comment/schedule/workflow_call)
+          # are unaffected.
+          token: ${{ github.event.inputs.correlation-id != '' && github.token || secrets.FRO_BOT_PAT }}
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
@@ -259,7 +268,8 @@ jobs:
             }}
         with:
           auth-json: ${{ secrets.AUTH_JSON }}
-          github-token: ${{ secrets.FRO_BOT_PAT }}
+          # Same read-only-by-construction switch as the checkout token above.
+          github-token: ${{ github.event.inputs.correlation-id != '' && github.token || secrets.FRO_BOT_PAT }}
           model: ${{ inputs.model || vars.FRO_BOT_MODEL }}
           # Release-notes narration (correlation-id-tagged) uses an explicit model
           # override; oMo is skipped so its provider routing does not interfere with
@@ -289,3 +299,58 @@ jobs:
           # provider stall fails fast (the successCmd then soft-warns) instead of
           # hanging the run; all other runs remain unbounded.
           timeout: ${{ github.event.inputs.correlation-id != '' && '600000' || '0' }}
+
+      - name: Upload release-notes candidate
+        # Only release-notes runs (release-tag set) produce a candidate; output-mode
+        # working-dir writes it to release-notes-candidate.md at the workspace root.
+        # if-no-files-found: warn — the agent may legitimately produce nothing (over
+        # bounds, quality bar unmet), which is fail-soft by design: the apply job below
+        # then finds no artifact and skips without touching the release.
+        if: ${{ github.event.inputs.release-tag != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes-candidate-${{ github.event.inputs.correlation-id }}
+          path: release-notes-candidate.md
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Trusted apply phase for release-notes narration.
+  # Runs on a fresh runner, separate from the generate job above — the model's
+  # workspace never existed here. FRO_BOT_PAT appears ONLY in this job for the
+  # release-notes narration flow; the generate job above is read-only by construction.
+  # ---------------------------------------------------------------------------
+  apply-release-notes:
+    name: Apply Release Notes
+    needs: fro-bot
+    # Plain `needs` semantics (no always()): if the generate job hard-fails, this job
+    # is skipped entirely — matches the fail-soft design (no candidate, no edit).
+    if: ${{ github.event.inputs.release-tag != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # FRO_BOT_PAT (not GITHUB_TOKEN) carries the write authority for `gh release edit`.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download release-notes candidate
+        # The artifact is absent when the generate job produced nothing (over bounds,
+        # quality bar unmet) or upload was skipped. continue-on-error lets the run
+        # proceed to the apply script, whose readCandidate() treats a missing file
+        # as fail-soft (warn + exit 0) rather than failing the step here.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-notes-candidate-${{ github.event.inputs.correlation-id }}
+          path: .
+
+      - name: Assemble and apply release notes
+        env:
+          GH_TOKEN: ${{ secrets.FRO_BOT_PAT }}
+          # Dispatch inputs never reach the shell via template expansion — env only.
+          RELEASE_TAG: ${{ github.event.inputs.release-tag }}
+        run: |
+          node --experimental-strip-types scripts/release/assemble-release-notes.ts "$RELEASE_TAG" release-notes-candidate.md

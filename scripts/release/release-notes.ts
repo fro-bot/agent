@@ -263,6 +263,17 @@ export function classifyOutcome(input: ClassifyOutcomeInput): ClassifyOutcomeRes
   }
 
   // Rule 5: success — prefer positive proof
+  // Note: classifyOutcome only sees the run-level conclusion (both the generate and the
+  // trusted apply-release-notes job roll into one `gh run watch` conclusion). An
+  // apply-job failure (e.g. a bug in assemble-release-notes.ts) surfaces here as
+  // conclusion === 'failure' and lands on Rule 10 (warn), which is already fail-soft —
+  // no dedicated hard-fail path is needed since FRO_BOT_PAT scope failures inside the
+  // apply job still match hasAuthFailure's log patterns and hard-fail via Rule 1.
+  // A skipped candidate (agent hit bounds / produced nothing) is not a run failure at
+  // all: the apply job's own fail-soft exit (0) keeps the run 'success', and the
+  // release body is untouched (still the semantic-release changelog, which already
+  // clears MIN_RELEASE_BODY_LENGTH in practice) — so it lands here as 'ok', which is
+  // correct: the release itself is fine, only the narrative enrichment was skipped.
   if (conclusion === 'success') {
     if (bodyLen >= MIN_RELEASE_BODY_LENGTH) {
       return {level: 'ok', exitCode: 0, message: 'narrative applied successfully'}

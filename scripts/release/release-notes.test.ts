@@ -1,4 +1,5 @@
 import {describe, expect, it} from 'vitest'
+import {buildDispatchArgs} from './dispatch-release-notes.js'
 import {
   AMBIGUOUS_RUN_SENTINEL,
   buildNarrationPrompt,
@@ -9,6 +10,28 @@ import {
   selectDispatchedRun,
   validateTag,
 } from './release-notes.js'
+
+describe('buildDispatchArgs', () => {
+  it('includes release-tag alongside prompt, correlation-id, and model', () => {
+    // #given
+    const opts = {
+      prompt: 'narrate this',
+      correlationId: 'corr-123',
+      model: 'anthropic/claude-haiku-4-5',
+      tag: 'v2.23.0',
+    }
+
+    // #when
+    const args = buildDispatchArgs(opts)
+
+    // #then
+    expect(args).toContain('-f')
+    expect(args).toContain('prompt=narrate this')
+    expect(args).toContain('correlation-id=corr-123')
+    expect(args).toContain('model=anthropic/claude-haiku-4-5')
+    expect(args).toContain('release-tag=v2.23.0')
+  })
+})
 
 describe('resolveNarrationModel', () => {
   it('returns model when RELEASE_NOTES_MODEL is set to a non-empty value', () => {
@@ -405,6 +428,28 @@ describe('classifyOutcome', () => {
     expect(result.level).toBe('warn')
     expect(result.exitCode).toBe(0)
     expect(result.message).toContain('narrative-failure')
+  })
+
+  // Two-phase workflow (Unit 3/4): the apply-release-notes job's failure rolls into the
+  // same run-level conclusion classifyOutcome sees here. A non-auth apply failure (e.g. a
+  // bug in assemble-release-notes.ts) is indistinguishable from a generic run failure and
+  // already lands on this warn path — no dedicated outcome needed.
+  it('returns warn exit 0 for an apply-job-shaped failure (non-auth)', () => {
+    // #given
+    const input = {
+      watchExit: 0,
+      conclusion: 'failure',
+      log: 'edit applied but marker missing from release v2.23.0 on re-fetch',
+      bodyLen: 0,
+      targetTag: 'v2.23.0',
+    }
+
+    // #when
+    const result = classifyOutcome(input)
+
+    // #then — fail-soft: warn, not error
+    expect(result.level).toBe('warn')
+    expect(result.exitCode).toBe(0)
   })
 
   it('returns warn exit 0 for unknown conclusion', () => {
