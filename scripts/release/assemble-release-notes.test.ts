@@ -5,7 +5,7 @@ import {
   validateCandidate,
   type ValidateCandidateResult,
 } from './assemble-release-notes.js'
-import {NARRATION_MARKER} from './release-notes.js'
+import {hasAppliedNarration, NARRATION_MARKER} from './release-notes.js'
 
 // ---------------------------------------------------------------------------
 // validateCandidate
@@ -115,6 +115,23 @@ describe('validateCandidate', () => {
     expect((result as {reason: string}).reason).toBe('contains-details')
   })
 
+  it.each([
+    ['closing tag only', 'Some narrative.\n</details>\nMore text.'],
+    ['open tag with attribute', 'Some narrative.\n<details open>\nMore text.'],
+    ['uppercase tag', 'Some narrative.\n<DETAILS>\nMore text.'],
+    ['whitespace before tag name', 'Some narrative.\n< details>\nMore text.'],
+  ])('rejects a candidate with a details-tag variant: %s', (_label, candidate) => {
+    // #given — Fix 3: structural regex must reject variants a plain '<details>' substring check misses
+    const originalBody = 'anything'
+
+    // #when
+    const result = validateCandidate(candidate, originalBody)
+
+    // #then
+    expect(result.ok).toBe(false)
+    expect((result as {reason: string}).reason).toBe('contains-details')
+  })
+
   it('rejects a candidate that restates a conventional-commit bullet dump (real semantic-release shape)', () => {
     // #given
     const candidate = [
@@ -169,6 +186,57 @@ describe('validateCandidate', () => {
     // #then
     expect(result.ok).toBe(false)
     expect((result as {reason: string}).reason).toBe('missing-pr-link')
+  })
+
+  it('rejects a candidate containing an ANSI escape sequence', () => {
+    // #given — Fix 6: control/invisible characters
+    const candidate = 'Some narrative \u001B[31mred text\u001B[0m here.'
+    const originalBody = 'anything'
+
+    // #when
+    const result = validateCandidate(candidate, originalBody)
+
+    // #then
+    expect(result.ok).toBe(false)
+    expect((result as {reason: string}).reason).toBe('control-characters')
+  })
+
+  it('rejects a candidate containing a zero-width space', () => {
+    // #given
+    const candidate = 'Some\u200Bnarrative text.'
+    const originalBody = 'anything'
+
+    // #when
+    const result = validateCandidate(candidate, originalBody)
+
+    // #then
+    expect(result.ok).toBe(false)
+    expect((result as {reason: string}).reason).toBe('control-characters')
+  })
+
+  it('rejects a candidate containing a bidi override character', () => {
+    // #given
+    const candidate = 'Some narrative \u202Ereversed text.'
+    const originalBody = 'anything'
+
+    // #when
+    const result = validateCandidate(candidate, originalBody)
+
+    // #then
+    expect(result.ok).toBe(false)
+    expect((result as {reason: string}).reason).toBe('control-characters')
+  })
+
+  it('accepts a candidate with normal accented text and emoji', () => {
+    // #given
+    const candidate = 'Café résumé naïve — improvements landed 🎉 for the release.'
+    const originalBody = 'anything'
+
+    // #when
+    const result = validateCandidate(candidate, originalBody)
+
+    // #then
+    expect(result.ok).toBe(true)
   })
 
   it('accepts a candidate with an /issues/ link when the original body references /issues/', () => {
@@ -342,8 +410,9 @@ describe('CLI main (mocked gh)', () => {
     const originalBody = '* fix: something'
     const ghView = vi
       .fn()
-      .mockReturnValueOnce(JSON.stringify({body: originalBody}))
-      .mockReturnValueOnce(JSON.stringify({body: `## What's new\n${NARRATION_MARKER}\n\nnarrative\n\n${originalBody}`}))
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 1: initial snapshot
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 3.5: pre-edit re-fetch, no drift
+      .mockReturnValueOnce(JSON.stringify({body: `## What's new\n${NARRATION_MARKER}\n\nnarrative\n\n${originalBody}`})) // Step 5: post-edit verify
     const ghEdit = vi.fn()
     const readCandidate = vi.fn().mockReturnValue('narrative')
 
@@ -367,8 +436,9 @@ describe('CLI main (mocked gh)', () => {
     const originalBody = '* fix: something'
     const ghView = vi
       .fn()
-      .mockReturnValueOnce(JSON.stringify({body: originalBody}))
-      .mockReturnValueOnce(JSON.stringify({body: 'edit did not stick'}))
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 1
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 3.5: no drift
+      .mockReturnValueOnce(JSON.stringify({body: 'edit did not stick'})) // Step 5
     const ghEdit = vi.fn()
     const readCandidate = vi.fn().mockReturnValue('narrative')
 
@@ -384,5 +454,89 @@ describe('CLI main (mocked gh)', () => {
     // #then
     expect(ghEdit).toHaveBeenCalledTimes(1)
     expect(result.exitCode).toBe(1)
+  })
+
+  it('does NOT skip as already-applied when the raw marker string appears mid-changelog (forgery attempt)', async () => {
+    // #given — a PR title containing the marker literal landed in the changelog, not as
+    // the heading-adjacent assembled prefix. Fix 4 regression: this must NOT be treated
+    // as an already-applied narration.
+    const {runApply, assembleReleaseBody} = await import('./assemble-release-notes.js')
+    const originalBody = `* feat: add support for ${NARRATION_MARKER} in docs\n* fix: something else`
+    const assembled = assembleReleaseBody('narrative', originalBody)
+    const ghView = vi
+      .fn()
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 1
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 3.5: no drift
+      .mockReturnValueOnce(JSON.stringify({body: assembled})) // Step 5
+    const ghEdit = vi.fn()
+    const readCandidate = vi.fn().mockReturnValue('narrative')
+
+    // #when
+    const result = runApply({
+      tag: 'v1.0.0',
+      repo: 'fro-bot/agent',
+      ghView,
+      ghEdit,
+      readCandidate,
+    })
+
+    // #then — proceeds to validate/apply rather than short-circuiting as already-applied
+    expect(ghEdit).toHaveBeenCalledTimes(1)
+    expect(result.exitCode).toBe(0)
+    expect(hasAppliedNarration(originalBody)).toBe(false)
+  })
+
+  it('warns and exits 0 without editing when the release body drifted since it was first read (stale-body clobber protection)', async () => {
+    // #given — Step 1 snapshot differs from the Step 3.5 pre-edit re-fetch, simulating a
+    // concurrent operator edit
+    const {runApply} = await import('./assemble-release-notes.js')
+    const originalBody = '* fix: something'
+    const driftedBody = '* fix: something\n* fix: an operator added this manually'
+    const ghView = vi
+      .fn()
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 1
+      .mockReturnValueOnce(JSON.stringify({body: driftedBody})) // Step 3.5: drift detected
+    const ghEdit = vi.fn()
+    const readCandidate = vi.fn().mockReturnValue('narrative')
+
+    // #when
+    const result = runApply({
+      tag: 'v1.0.0',
+      repo: 'fro-bot/agent',
+      ghView,
+      ghEdit,
+      readCandidate,
+    })
+
+    // #then — fail-soft: no edit, exit 0
+    expect(ghEdit).not.toHaveBeenCalled()
+    expect(result.exitCode).toBe(0)
+    expect(result.message).toContain('changed since it was read')
+  })
+
+  it('proceeds to edit when the pre-edit re-fetch shows no drift', async () => {
+    // #given
+    const {runApply} = await import('./assemble-release-notes.js')
+    const originalBody = '* fix: something'
+    const ghView = vi
+      .fn()
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 1
+      .mockReturnValueOnce(JSON.stringify({body: originalBody})) // Step 3.5: identical, no drift
+      .mockReturnValueOnce(JSON.stringify({body: `## What's new\n${NARRATION_MARKER}\n\nnarrative\n\n${originalBody}`})) // Step 5
+    const ghEdit = vi.fn()
+    const readCandidate = vi.fn().mockReturnValue('narrative')
+
+    // #when
+    const result = runApply({
+      tag: 'v1.0.0',
+      repo: 'fro-bot/agent',
+      ghView,
+      ghEdit,
+      readCandidate,
+    })
+
+    // #then
+    expect(ghEdit).toHaveBeenCalledTimes(1)
+    expect(result.exitCode).toBe(0)
   })
 })

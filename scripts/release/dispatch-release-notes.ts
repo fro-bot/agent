@@ -14,6 +14,7 @@ import {
   buildNarrationPrompt,
   classifyOutcome,
   escapeAnnotation,
+  hasAppliedNarration,
   isAuthError,
   parseDispatchedRuns,
   resolveNarrationModel,
@@ -225,17 +226,19 @@ function main(): void {
   }
 
   let bodyLen = 0
+  let narrationApplied: boolean | null = null
   if (conclusion === 'success') {
     try {
-      const raw = ghExec(['release', 'view', tag, '--json', 'body', '--jq', '.body | length'], childEnv)
-      bodyLen = Number(raw)
+      const body = ghExec(['release', 'view', tag, '--json', 'body', '--jq', '.body'], childEnv)
+      bodyLen = body.length
+      narrationApplied = hasAppliedNarration(body)
     } catch {
-      // default 0
+      // default 0 / null — body unavailable, classifyOutcome falls back to the bodyLen heuristic
     }
   }
 
   // Step 12: classify and emit
-  const result = classifyOutcome({watchExit, conclusion, log, bodyLen, targetTag: tag})
+  const result = classifyOutcome({watchExit, conclusion, log, bodyLen, targetTag: tag, narrationApplied})
 
   if (result.level === 'error') {
     process.stdout.write(`::error::${escapeAnnotation(result.message)}\n`)

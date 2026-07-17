@@ -22,6 +22,26 @@ export const MIN_RELEASE_BODY_LENGTH = 200
 
 export type ValidateTagResult = {ok: true} | {ok: false; error: string}
 
+// The assembled shape (see assembleReleaseBody) always emits the heading line
+// immediately followed by the marker line. Checking that exact structural prefix
+// — rather than a bare substring search — prevents a forged marker embedded
+// mid-changelog (e.g. inside a PR title that lands in the changelog text) from
+// being mistaken for an already-applied narration.
+const APPLIED_NARRATION_PREFIX = `## What's new\n${NARRATION_MARKER}`
+
+/**
+ * Structural check for whether a release body already carries an applied narration:
+ * the body must start with, or contain at a line boundary, the exact assembled
+ * `## What's new\n<marker>` prefix. A bare substring match on the marker alone is
+ * insufficient — see APPLIED_NARRATION_PREFIX.
+ */
+export function hasAppliedNarration(body: string): boolean {
+  if (body.startsWith(APPLIED_NARRATION_PREFIX)) {
+    return true
+  }
+  return body.includes(`\n${APPLIED_NARRATION_PREFIX}`)
+}
+
 export type ResolveNarrationModelResult = {readonly model: string} | {readonly skip: string}
 
 /**
@@ -190,6 +210,10 @@ export interface ClassifyOutcomeInput {
   readonly log: string
   readonly bodyLen: number
   readonly targetTag: string
+  // Structural narration-applied signal (hasAppliedNarration on the fetched release
+  // body). null when the body was unavailable (fetch failed) — falls back to the
+  // bodyLen-based heuristic in that case only.
+  readonly narrationApplied: boolean | null
 }
 
 export interface ClassifyOutcomeResult {
@@ -228,7 +252,7 @@ export function isAuthError(text: string): boolean {
 
 // CHANGE 1: rewritten classifyOutcome with correct precedence
 export function classifyOutcome(input: ClassifyOutcomeInput): ClassifyOutcomeResult {
-  const {watchExit, conclusion, log, bodyLen, targetTag} = input
+  const {watchExit, conclusion, log, bodyLen, targetTag, narrationApplied} = input
 
   // Rule 1 (FIRST): auth failure — the ONLY hard-fail path derived from log scanning.
   // Must come before timeout/watch-exit so a timed-out run that also shows auth failure still hard-fails.
@@ -275,6 +299,21 @@ export function classifyOutcome(input: ClassifyOutcomeInput): ClassifyOutcomeRes
   // clears MIN_RELEASE_BODY_LENGTH in practice) — so it lands here as 'ok', which is
   // correct: the release itself is fine, only the narrative enrichment was skipped.
   if (conclusion === 'success') {
+    // Prefer the structural narrationApplied signal over the bodyLen heuristic: a
+    // success with no narration actually applied (candidate missing or rejected) must
+    // not be misreported as narrated just because the untouched semantic-release body
+    // happens to clear MIN_RELEASE_BODY_LENGTH.
+    if (narrationApplied === true) {
+      return {level: 'ok', exitCode: 0, message: 'narrative applied successfully'}
+    }
+    if (narrationApplied === false) {
+      return {
+        level: 'warn',
+        exitCode: 0,
+        message: 'run succeeded but no narration was applied (candidate missing or rejected)',
+      }
+    }
+    // narrationApplied === null: body was unavailable — fall back to the bodyLen heuristic.
     if (bodyLen >= MIN_RELEASE_BODY_LENGTH) {
       return {level: 'ok', exitCode: 0, message: 'narrative applied successfully'}
     }

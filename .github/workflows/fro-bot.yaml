@@ -242,12 +242,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ steps.prehead.outputs.ref }}
-          # Correlation-tagged (release-notes narration) runs are read-only by construction:
+          # Release-notes narration runs (release-tag set) are read-only by construction:
           # checkout uses the workflow's own GITHUB_TOKEN instead of the write-capable PAT.
           # The trusted apply-release-notes job (below) is the only place FRO_BOT_PAT appears
           # for this flow. All other dispatch paths (mention/comment/schedule/workflow_call)
           # are unaffected.
-          token: ${{ github.event.inputs.correlation-id != '' && github.token || secrets.FRO_BOT_PAT }}
+          # Keyed on release-tag (the operation), not correlation-id (an audit token):
+          #   (a) a manual dispatch that sets release-tag without correlation-id must NOT
+          #       hand the generation agent the PAT;
+          #   (b) deploy-window compatibility — an old dispatcher (checked out from a
+          #       released tag) that sets correlation-id but not release-tag keeps the old
+          #       PAT + old mutation-prompt behavior working unchanged, instead of
+          #       403-hard-failing the release job.
+          token: ${{ github.event.inputs.release-tag != '' && github.token || secrets.FRO_BOT_PAT }}
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
@@ -268,8 +275,10 @@ jobs:
             }}
         with:
           auth-json: ${{ secrets.AUTH_JSON }}
-          # Same read-only-by-construction switch as the checkout token above.
-          github-token: ${{ github.event.inputs.correlation-id != '' && github.token || secrets.FRO_BOT_PAT }}
+          # Same read-only-by-construction switch as the checkout token above, keyed on
+          # release-tag (the operation) rather than correlation-id (an audit token) —
+          # see the checkout step comment for the full rationale.
+          github-token: ${{ github.event.inputs.release-tag != '' && github.token || secrets.FRO_BOT_PAT }}
           model: ${{ inputs.model || vars.FRO_BOT_MODEL }}
           # Release-notes narration (correlation-id-tagged) uses an explicit model
           # override; oMo is skipped so its provider routing does not interfere with
@@ -301,12 +310,15 @@ jobs:
           timeout: ${{ github.event.inputs.correlation-id != '' && '600000' || '0' }}
 
       - name: Upload release-notes candidate
-        # Only release-notes runs (release-tag set) produce a candidate; output-mode
-        # working-dir writes it to release-notes-candidate.md at the workspace root.
+        # Only release-notes runs (both release-tag and correlation-id set) produce a
+        # candidate; output-mode working-dir writes it to release-notes-candidate.md at
+        # the workspace root. The artifact name needs correlation-id, so a half-specified
+        # manual dispatch (release-tag without correlation-id, or vice versa) produces a
+        # read-only generate run with no candidate upload — fail-soft.
         # if-no-files-found: warn — the agent may legitimately produce nothing (over
         # bounds, quality bar unmet), which is fail-soft by design: the apply job below
         # then finds no artifact and skips without touching the release.
-        if: ${{ github.event.inputs.release-tag != '' }}
+        if: ${{ github.event.inputs.release-tag != '' && github.event.inputs.correlation-id != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-notes-candidate-${{ github.event.inputs.correlation-id }}
@@ -325,7 +337,10 @@ jobs:
     needs: fro-bot
     # Plain `needs` semantics (no always()): if the generate job hard-fails, this job
     # is skipped entirely — matches the fail-soft design (no candidate, no edit).
-    if: ${{ github.event.inputs.release-tag != '' }}
+    # Both inputs are required: the artifact name needs correlation-id, and a
+    # half-specified manual dispatch should produce a read-only generate run with no
+    # apply — fail-soft.
+    if: ${{ github.event.inputs.release-tag != '' && github.event.inputs.correlation-id != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

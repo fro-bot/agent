@@ -5,6 +5,8 @@ import {
   buildNarrationPrompt,
   classifyOutcome,
   escapeAnnotation,
+  hasAppliedNarration,
+  NARRATION_MARKER,
   parseDispatchedRuns,
   resolveNarrationModel,
   selectDispatchedRun,
@@ -208,10 +210,59 @@ describe('validateTag', () => {
   })
 })
 
-describe('classifyOutcome', () => {
-  it('returns ok exit 0 for success with sufficient body length', () => {
+describe('hasAppliedNarration', () => {
+  it('returns true when the body starts with the assembled prefix', () => {
     // #given
-    const input = {watchExit: 0, conclusion: 'success', log: '', bodyLen: 800, targetTag: 'v2.23.0'}
+    const body = `## What's new\n${NARRATION_MARKER}\n\nSome narrative.\n\n<details><summary>Full changelog</summary>\n\n* fix: x\n\n</details>`
+
+    // #when / #then
+    expect(hasAppliedNarration(body)).toBe(true)
+  })
+
+  it('returns true when the assembled prefix appears at a line boundary (not at position 0)', () => {
+    // #given — defensive: some wrapper prepended a line before the assembled body
+    const body = `\n## What's new\n${NARRATION_MARKER}\n\nSome narrative.`
+
+    // #when / #then
+    expect(hasAppliedNarration(body)).toBe(true)
+  })
+
+  it('returns false for a plain semantic-release body with no narration applied', () => {
+    // #given
+    const body = '* fix: something\n* feat: something else'
+
+    // #when / #then
+    expect(hasAppliedNarration(body)).toBe(false)
+  })
+
+  it('returns false when the raw marker string appears mid-changelog (forgery attempt, not the assembled prefix)', () => {
+    // #given — e.g. a PR title containing the marker literal landing in the changelog
+    const body = `* feat: add support for ${NARRATION_MARKER} in docs\n* fix: something else`
+
+    // #when / #then — substring-anywhere would wrongly return true; structural check must not
+    expect(hasAppliedNarration(body)).toBe(false)
+  })
+
+  it('returns false when the marker appears without the preceding heading line', () => {
+    // #given
+    const body = `Some text\n${NARRATION_MARKER}\nmore text`
+
+    // #when / #then
+    expect(hasAppliedNarration(body)).toBe(false)
+  })
+})
+
+describe('classifyOutcome', () => {
+  it('returns ok exit 0 for success with sufficient body length (narrationApplied null fallback)', () => {
+    // #given
+    const input = {
+      watchExit: 0,
+      conclusion: 'success',
+      log: '',
+      bodyLen: 800,
+      targetTag: 'v2.23.0',
+      narrationApplied: null,
+    }
 
     // #when
     const result = classifyOutcome(input)
@@ -222,9 +273,56 @@ describe('classifyOutcome', () => {
     expect(result.message).toContain('narrative applied')
   })
 
+  it('returns ok exit 0 for success when narrationApplied is true (structural signal wins over bodyLen)', () => {
+    // #given — bodyLen is below MIN_RELEASE_BODY_LENGTH but narrationApplied is true
+    const input = {
+      watchExit: 0,
+      conclusion: 'success',
+      log: '',
+      bodyLen: 10,
+      targetTag: 'v2.23.0',
+      narrationApplied: true,
+    }
+
+    // #when
+    const result = classifyOutcome(input)
+
+    // #then
+    expect(result.level).toBe('ok')
+    expect(result.exitCode).toBe(0)
+    expect(result.message).toContain('narrative applied')
+  })
+
+  it('returns warn exit 0 for success when narrationApplied is false (candidate missing or rejected)', () => {
+    // #given — bodyLen clears MIN_RELEASE_BODY_LENGTH (semantic-release body alone) but no narration applied
+    const input = {
+      watchExit: 0,
+      conclusion: 'success',
+      log: '',
+      bodyLen: 800,
+      targetTag: 'v2.23.0',
+      narrationApplied: false,
+    }
+
+    // #when
+    const result = classifyOutcome(input)
+
+    // #then — must NOT be misreported as narrated
+    expect(result.level).toBe('warn')
+    expect(result.exitCode).toBe(0)
+    expect(result.message).toContain('no narration was applied')
+  })
+
   it('returns ok exit 0 for neutral conclusion (idempotent short-circuit)', () => {
     // #given
-    const input = {watchExit: 0, conclusion: 'neutral', log: '', bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {
+      watchExit: 0,
+      conclusion: 'neutral',
+      log: '',
+      bodyLen: 0,
+      targetTag: 'v2.23.0',
+      narrationApplied: null,
+    }
 
     // #when
     const result = classifyOutcome(input)
@@ -237,7 +335,7 @@ describe('classifyOutcome', () => {
 
   it('returns warn exit 0 for watchExit 124 (timeout)', () => {
     // #given
-    const input = {watchExit: 124, conclusion: '', log: '', bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {watchExit: 124, conclusion: '', log: '', bodyLen: 0, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -251,7 +349,7 @@ describe('classifyOutcome', () => {
   // CHANGE 5 FLIP: non-zero non-124 watchExit is now warn/exit 0 (not error/exit 1)
   it('returns warn exit 0 for unexpected watchExit (non-zero, non-124)', () => {
     // #given
-    const input = {watchExit: 137, conclusion: '', log: '', bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {watchExit: 137, conclusion: '', log: '', bodyLen: 0, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -266,7 +364,7 @@ describe('classifyOutcome', () => {
   it('returns warn exit 0 for off-target release edit (ANSI-colored log)', () => {
     // #given — log contains ANSI escape codes around a different tag
     const log = '\u001B[31mgh release edit v9.9.9\u001B[0m\nsome other output'
-    const input = {watchExit: 0, conclusion: 'success', log, bodyLen: 800, targetTag: 'v2.23.0'}
+    const input = {watchExit: 0, conclusion: 'success', log, bodyLen: 800, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -280,7 +378,7 @@ describe('classifyOutcome', () => {
   it('does NOT flag off-target when the log contains the correct target tag', () => {
     // #given — log contains the same tag as targetTag
     const log = 'gh release edit v2.23.0 succeeded'
-    const input = {watchExit: 0, conclusion: 'success', log, bodyLen: 800, targetTag: 'v2.23.0'}
+    const input = {watchExit: 0, conclusion: 'success', log, bodyLen: 800, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -293,7 +391,7 @@ describe('classifyOutcome', () => {
   it('returns error exit 1 for HTTP 401 auth failure', () => {
     // #given
     const log = 'HTTP 401: Bad credentials'
-    const input = {watchExit: 0, conclusion: 'failure', log, bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {watchExit: 0, conclusion: 'failure', log, bodyLen: 0, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -307,7 +405,7 @@ describe('classifyOutcome', () => {
   it('returns error exit 1 for HTTP 403 + permission denied auth failure', () => {
     // #given
     const log = 'HTTP 403\npermission denied'
-    const input = {watchExit: 0, conclusion: 'failure', log, bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {watchExit: 0, conclusion: 'failure', log, bodyLen: 0, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -321,7 +419,7 @@ describe('classifyOutcome', () => {
   it('returns error exit 1 for Resource not accessible auth failure', () => {
     // #given
     const log = 'Resource not accessible by integration'
-    const input = {watchExit: 0, conclusion: 'failure', log, bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {watchExit: 0, conclusion: 'failure', log, bodyLen: 0, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -336,7 +434,7 @@ describe('classifyOutcome', () => {
   it('auth failure takes precedence over watchExit 124 (timeout)', () => {
     // #given — log has auth keywords AND watchExit is 124 (timeout)
     const log = 'HTTP 401: Bad credentials'
-    const input = {watchExit: 124, conclusion: '', log, bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {watchExit: 124, conclusion: '', log, bodyLen: 0, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -351,7 +449,7 @@ describe('classifyOutcome', () => {
   it('auth failure takes precedence over non-zero non-124 watchExit', () => {
     // #given — log has auth keywords AND watchExit is 137
     const log = 'HTTP 401: Bad credentials'
-    const input = {watchExit: 137, conclusion: 'failure', log, bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {watchExit: 137, conclusion: 'failure', log, bodyLen: 0, targetTag: 'v2.23.0', narrationApplied: null}
 
     // #when
     const result = classifyOutcome(input)
@@ -365,7 +463,14 @@ describe('classifyOutcome', () => {
   // CHANGE 5 FLIP: action_required is now warn/exit 0 (not error/exit 1)
   it('returns warn exit 0 for action_required conclusion', () => {
     // #given
-    const input = {watchExit: 0, conclusion: 'action_required', log: '', bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {
+      watchExit: 0,
+      conclusion: 'action_required',
+      log: '',
+      bodyLen: 0,
+      targetTag: 'v2.23.0',
+      narrationApplied: null,
+    }
 
     // #when
     const result = classifyOutcome(input)
@@ -379,7 +484,14 @@ describe('classifyOutcome', () => {
   // CHANGE 5 FLIP: skipped is now warn/exit 0 (not error/exit 1)
   it('returns warn exit 0 for skipped conclusion', () => {
     // #given
-    const input = {watchExit: 0, conclusion: 'skipped', log: '', bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {
+      watchExit: 0,
+      conclusion: 'skipped',
+      log: '',
+      bodyLen: 0,
+      targetTag: 'v2.23.0',
+      narrationApplied: null,
+    }
 
     // #when
     const result = classifyOutcome(input)
@@ -393,7 +505,14 @@ describe('classifyOutcome', () => {
   // CHANGE 5 FLIP: below-floor body is now warn/exit 0 (not error/exit 1)
   it('returns warn exit 0 for success with body length below MIN_RELEASE_BODY_LENGTH', () => {
     // #given
-    const input = {watchExit: 0, conclusion: 'success', log: '', bodyLen: 50, targetTag: 'v2.23.0'}
+    const input = {
+      watchExit: 0,
+      conclusion: 'success',
+      log: '',
+      bodyLen: 50,
+      targetTag: 'v2.23.0',
+      narrationApplied: null,
+    }
 
     // #when
     const result = classifyOutcome(input)
@@ -407,7 +526,14 @@ describe('classifyOutcome', () => {
 
   it('returns warn exit 0 for cancelled conclusion', () => {
     // #given
-    const input = {watchExit: 0, conclusion: 'cancelled', log: '', bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {
+      watchExit: 0,
+      conclusion: 'cancelled',
+      log: '',
+      bodyLen: 0,
+      targetTag: 'v2.23.0',
+      narrationApplied: null,
+    }
 
     // #when
     const result = classifyOutcome(input)
@@ -419,7 +545,14 @@ describe('classifyOutcome', () => {
 
   it('returns warn exit 0 for generic failure (no auth/off-target keywords)', () => {
     // #given
-    const input = {watchExit: 0, conclusion: 'failure', log: 'some generic error', bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {
+      watchExit: 0,
+      conclusion: 'failure',
+      log: 'some generic error',
+      bodyLen: 0,
+      targetTag: 'v2.23.0',
+      narrationApplied: null,
+    }
 
     // #when
     const result = classifyOutcome(input)
@@ -442,6 +575,7 @@ describe('classifyOutcome', () => {
       log: 'edit applied but marker missing from release v2.23.0 on re-fetch',
       bodyLen: 0,
       targetTag: 'v2.23.0',
+      narrationApplied: null,
     }
 
     // #when
@@ -454,7 +588,14 @@ describe('classifyOutcome', () => {
 
   it('returns warn exit 0 for unknown conclusion', () => {
     // #given
-    const input = {watchExit: 0, conclusion: 'some_new_value', log: '', bodyLen: 0, targetTag: 'v2.23.0'}
+    const input = {
+      watchExit: 0,
+      conclusion: 'some_new_value',
+      log: '',
+      bodyLen: 0,
+      targetTag: 'v2.23.0',
+      narrationApplied: null,
+    }
 
     // #when
     const result = classifyOutcome(input)

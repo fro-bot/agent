@@ -21,7 +21,7 @@ import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
-import {NARRATION_MARKER} from './release-notes.ts'
+import {hasAppliedNarration, NARRATION_MARKER} from './release-notes.ts'
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -30,7 +30,13 @@ import {NARRATION_MARKER} from './release-notes.ts'
 export const MAX_CANDIDATE_LENGTH = 20_000
 
 export type ValidationRejectionReason =
-  'empty' | 'oversized' | 'contains-marker' | 'contains-details' | 'commit-list-dump' | 'missing-pr-link'
+  | 'empty'
+  | 'oversized'
+  | 'contains-marker'
+  | 'contains-details'
+  | 'commit-list-dump'
+  | 'missing-pr-link'
+  | 'control-characters'
 
 export type ValidateCandidateResult = {readonly ok: true} | {readonly ok: false; readonly reason: string}
 
@@ -44,6 +50,20 @@ const COMMIT_LIST_BULLET_PATTERN = /^[ \t]*[*-][ \t]+(?:\*\*[a-z]+(?:\([^()\r\n]
 
 const PR_REFERENCE_PATTERN = /\/(?:issues|pull)\/\d+/
 const PR_LINK_PATTERN = /\]\([^)]*\/(?:issues|pull)\/\d[^)]*\)/
+
+// Structural match for any details-tag variant (open, close, self-closing-shaped, with
+// attributes, mixed case, extra whitespace) rather than a plain-substring check on
+// '<details>', which a candidate could trivially dodge with '<details open>' or '</details>'.
+const DETAILS_TAG_PATTERN = /<\/?\s*details\b/i
+
+// Rejects candidates containing ANSI escape sequences, C0 control characters other than
+// \n \r \t, DEL, or hidden/bidi Unicode formatting characters. These have no legitimate
+// place in release-notes prose and can be used to spoof terminal/rendering output or hide
+// content from reviewers. The Unicode ranges mirror the project's hidden-Unicode policy
+// (see scripts/dist-hidden-unicode.ts) plus bidi-override characters relevant to text
+// rendering rather than dist-file scrubbing.
+// eslint-disable-next-line no-control-regex -- control-character detection is the point
+const CONTROL_CHARACTERS_PATTERN = /[\u0001-\u0008\v\f\u000E-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/
 
 /**
  * Pure validation of an untrusted narrative candidate against the original (trusted) release body.
@@ -63,8 +83,12 @@ export function validateCandidate(candidate: string, originalBody: string): Vali
     return {ok: false, reason: 'contains-marker'}
   }
 
-  if (candidate.includes('<details>')) {
+  if (DETAILS_TAG_PATTERN.test(candidate)) {
     return {ok: false, reason: 'contains-details'}
+  }
+
+  if (CONTROL_CHARACTERS_PATTERN.test(candidate)) {
+    return {ok: false, reason: 'control-characters'}
   }
 
   if (COMMIT_LIST_BULLET_PATTERN.test(candidate)) {
@@ -133,9 +157,11 @@ function extractBody(rawJson: string): string {
 export function runApply(deps: RunApplyDeps): RunApplyResult {
   const {tag, ghView, ghEdit, readCandidate} = deps
 
-  // Step 1: idempotency check
+  // Step 1: idempotency check — structural check (hasAppliedNarration), not a bare
+  // marker substring search, so a forged marker embedded mid-changelog cannot be
+  // mistaken for an already-applied narration (see hasAppliedNarration).
   const currentBody = extractBody(ghView())
-  if (currentBody.includes(NARRATION_MARKER)) {
+  if (hasAppliedNarration(currentBody)) {
     return {exitCode: 0, message: `already-applied: release ${tag} body already contains the narration marker`}
   }
 
@@ -151,6 +177,18 @@ export function runApply(deps: RunApplyDeps): RunApplyResult {
     return {exitCode: 0, message: `candidate rejected (${validation.reason}); release ${tag} left untouched`}
   }
 
+  // Step 3.5: re-fetch the body immediately before editing. If it drifted since the
+  // Step 1 snapshot (e.g. an operator made a concurrent manual edit), warn and skip
+  // the edit entirely rather than clobbering it — narration can always be
+  // re-dispatched, but a clobbered manual edit cannot be recovered here.
+  const preEditBody = extractBody(ghView())
+  if (preEditBody !== currentBody) {
+    return {
+      exitCode: 0,
+      message: `release ${tag} body changed since it was read; narration skipped to avoid clobbering a concurrent edit`,
+    }
+  }
+
   // Step 4: assemble + edit
   const assembled = assembleReleaseBody(candidate, currentBody)
   const tmpDir = mkdtempSync(join(tmpdir(), 'release-notes-'))
@@ -160,7 +198,7 @@ export function runApply(deps: RunApplyDeps): RunApplyResult {
 
   // Step 5: verify the edit stuck
   const verifiedBody = extractBody(ghView())
-  if (!verifiedBody.includes(NARRATION_MARKER)) {
+  if (!hasAppliedNarration(verifiedBody)) {
     return {exitCode: 1, message: `edit applied but marker missing from release ${tag} on re-fetch`}
   }
 
