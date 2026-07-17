@@ -112,6 +112,11 @@ expect(hasAppliedNarration(forged)).toBe(false)
 
 ## Related Issues
 
+- [`release-notes-candidate-validation-must-be-code-span-aware-2026-07-17.md`](./release-notes-candidate-validation-must-be-code-span-aware-2026-07-17.md)
+  — the companion validation hardening in the same apply job. Position anchoring
+  alone did not close the class: the candidate validator's structural scans also
+  had to become code-span aware (raw-text scans rejected legitimate prose that
+  described the defenses in inline code).
 - [`../best-practices/release-notes-narration-routing-and-fail-soft-guards-2026-06-07.md`](../best-practices/release-notes-narration-routing-and-fail-soft-guards-2026-06-07.md)
   — the progenitor doc. Its idempotency rule now states the position-anchor
   requirement (a bare substring check is unsafe).
