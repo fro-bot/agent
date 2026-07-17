@@ -2,6 +2,7 @@ import {describe, expect, it, vi} from 'vitest'
 import {
   assembleReleaseBody,
   MAX_CANDIDATE_LENGTH,
+  stripCodeSpans,
   validateCandidate,
   type ValidateCandidateResult,
 } from './assemble-release-notes.js'
@@ -113,6 +114,60 @@ describe('validateCandidate', () => {
     // #then
     expect(result.ok).toBe(false)
     expect((result as {reason: string}).reason).toBe('contains-details')
+  })
+
+  it('accepts a candidate describing a details tag in inline code', () => {
+    // #given
+    const candidate =
+      'The validator rejects no marker or `<details>` forgery ([#42](https://github.com/fro-bot/agent/pull/42)).'
+    const originalBody = '* fix: validator ([#42](https://github.com/fro-bot/agent/pull/42))'
+
+    // #when
+    const result = validateCandidate(candidate, originalBody)
+
+    // #then
+    expect(result.ok).toBe(true)
+  })
+
+  it('accepts details tags and the narration marker inside a fenced code block', () => {
+    // #given
+    const candidate = `Example validator input:\n\`\`\`markdown\n<details>\n${NARRATION_MARKER}\n</details>\n\`\`\``
+
+    // #when
+    const result = validateCandidate(candidate, 'anything')
+
+    // #then
+    expect(result.ok).toBe(true)
+  })
+
+  it('rejects raw closing and opening details tags outside code spans', () => {
+    // #given / #when / #then
+    for (const candidate of ['Some text.\n</details>', 'Some text.\n<details open>']) {
+      expect(validateCandidate(candidate, 'anything')).toEqual({ok: false, reason: 'contains-details'})
+    }
+  })
+
+  it('rejects the raw narration marker outside code spans', () => {
+    expect(validateCandidate(`Some text.\n${NARRATION_MARKER}`, 'anything')).toEqual({
+      ok: false,
+      reason: 'contains-marker',
+    })
+  })
+
+  it('fails closed for an unbalanced backtick before a raw details tag', () => {
+    expect(validateCandidate('Some ` explanation with <details> still exposed.', 'anything')).toEqual({
+      ok: false,
+      reason: 'contains-details',
+    })
+  })
+
+  it('rejects a raw details tag behind an invalid backtick fence (backtick in info string)', () => {
+    // #given — CommonMark forbids backticks in a backtick fence's info string, so ```js` is NOT
+    // a fence and GitHub renders the following <details> as live markup. The stripper must not
+    // blank the region (fail-open) — the structural check must still see the raw tag.
+    const candidate = 'Narrative text.\n```js`\n<details>\n```\nSee [#1](https://github.com/o/r/pull/1).'
+    // #then
+    expect(validateCandidate(candidate, 'anything')).toEqual({ok: false, reason: 'contains-details'})
   })
 
   it.each([
@@ -273,6 +328,50 @@ describe('validateCandidate', () => {
     // #then
     expect(result.ok).toBe(true)
     expect('reason' in result).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stripCodeSpans
+// ---------------------------------------------------------------------------
+
+describe('stripCodeSpans', () => {
+  it('strips inline code, double-backtick code, and fenced code contents', () => {
+    // #given
+    const text = 'a `<details>` b ``<details>`` c\n~~~md\n<details>\n~~~\n d'
+
+    // #when
+    const stripped = stripCodeSpans(text)
+
+    // #then
+    expect(stripped).not.toContain('<details>')
+    expect(stripped).toContain('a ')
+    expect(stripped).toContain(' d')
+  })
+
+  it('leaves unbalanced spans unchanged', () => {
+    // #given
+    const text = 'a `unbalanced <details>\n```\n<details>'
+
+    // #when / #then
+    expect(stripCodeSpans(text)).toBe(text)
+  })
+
+  it('leaves an invalid backtick fence (backtick in info string) intact', () => {
+    // #given — ```js` is not a valid fence per CommonMark (no backticks in a backtick
+    // fence's info string); blanking it would hide live markup from the structural checks
+    const text = '```js`\n<details>\n```\nafter'
+
+    // #then — the <details> line must survive stripping
+    expect(stripCodeSpans(text)).toContain('<details>')
+  })
+
+  it('still strips a tilde fence whose info string contains a backtick', () => {
+    // #given — tildes fences MAY carry backticks in the info string per CommonMark
+    const text = '~~~js`\n<details>\n~~~\nafter'
+
+    // #then
+    expect(stripCodeSpans(text)).not.toContain('<details>')
   })
 })
 
