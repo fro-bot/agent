@@ -142,8 +142,6 @@ A session is kept if **either**:
 
 This "age OR count" approach prevents both unbounded growth (count limit) and premature deletion of recent sessions (age limit). When a parent session is pruned, its child sessions are cascade-deleted to avoid orphans.
 
-One exception exists for the legacy aggregate schedule session created before per-run keying. The count-based floor would otherwise keep that single bloated session alive indefinitely as long as it stayed within the recent-count window. Pruning recognizes the legacy title shape (`fro-bot: schedule-<8 hex>`, with no run-ID suffix) and force-expires it once it has aged past the cutoff, regardless of the count floor — clearing the stale thread that the keying fix was designed to retire.
-
 ## Run Summary Writeback
 
 After each run, the finalize phase writes a synthetic user message into the session containing a structured summary of what the agent did — including the event type, repository, cache status, session ID, and any errors. This message becomes searchable by future runs, enabling the agent to find its own prior work via `searchSessions`.
