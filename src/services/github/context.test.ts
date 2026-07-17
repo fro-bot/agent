@@ -292,6 +292,37 @@ describe('normalizeEvent for pull_request labels', () => {
     }
     expect(event.pullRequest.labels).toEqual([])
   })
+
+  it('drops labels with an empty-string name', () => {
+    // #given a pull_request payload with one real label and one empty-string-named label
+    const payload = {
+      action: 'synchronize',
+      pull_request: {
+        number: 203,
+        title: 'feat: label with empty name',
+        body: 'body',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [],
+        labels: [
+          {id: 1, name: 'skip-agent-review', color: 'ededed', description: null},
+          {id: 2, name: '', color: 'ff0000', description: null},
+        ],
+      },
+      sender: {login: 'contributor'},
+    }
+
+    // #when normalizing the event
+    const event = normalizeEvent('pull_request', payload)
+
+    // #then the empty-string-named label should be dropped
+    expect(event.type).toBe('pull_request')
+    if (event.type !== 'pull_request') {
+      throw new Error('Expected pull_request event')
+    }
+    expect(event.pullRequest.labels).toEqual(['skip-agent-review'])
+  })
 })
 
 describe('isPullRequest', () => {

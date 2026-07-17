@@ -76,13 +76,24 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
   }
   if (config.reviewSkipLabel != null) {
     const skipLabel = config.reviewSkipLabel.trim().toLowerCase()
+    if (skipLabel === '') {
+      return {shouldSkip: false}
+    }
     const hasSkipLabel = (context.target?.labels ?? []).some(label => label.toLowerCase() === skipLabel)
-    // An authorized PR-body mention or a live review_requested naming the bot
-    // overrides the opt-out label. A ready_for_review event carrying a
-    // pre-existing bot assignment (isBotReviewRequested) is NOT an override —
-    // only a live review_requested action is.
+    // A PR-body mention overrides the opt-out label only for opened, synchronize,
+    // and reopened, where context.author.association reflects the PR author who
+    // wrote that body. For review_requested and ready_for_review, the router
+    // substitutes the webhook sender's association into context.author before
+    // this check runs (see routeEvent) — so hasMention still reflects the PR
+    // body, which the (possibly unauthorized) PR author controls, not the
+    // validated sender. Honoring it there would let an unauthorized fork author
+    // plant a mention that overrides the skip label using the sender's borrowed
+    // authorization. ready_for_review has no override at all; review_requested
+    // gets its own trusted override below, driven by the live API-verified
+    // reviewer request rather than PR-author-controlled body text.
     const isOverridden =
-      context.hasMention === true || (context.action === 'review_requested' && context.isBotReviewRequested === true)
+      (context.hasMention === true && context.action !== 'ready_for_review' && context.action !== 'review_requested') ||
+      (context.action === 'review_requested' && context.isBotReviewRequested === true)
     if (hasSkipLabel && !isOverridden) {
       return {
         shouldSkip: true,
