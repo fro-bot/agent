@@ -193,6 +193,7 @@ A few inputs most workflows touch:
 | `systematic-config` | No | — | JSON deep-merged into the Systematic plugin config |
 | `dedup-window` | No | `600000` | Skip a run if the agent already ran for the same PR/issue within this window (ms); `0` disables |
 | `response-mode` | No | `github` | `github` posts one comment/review; `none` suppresses all GitHub writes |
+| `review-skip-label` | No | `skip-agent-review` | PR label that suppresses automatic PR-event reviews (case-insensitive); authorized mentions and review requests naming the bot still run; empty disables |
 
 **Outputs**
 

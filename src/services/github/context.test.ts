@@ -206,6 +206,125 @@ describe('normalizeEvent for pull_request reviewer fields', () => {
   })
 })
 
+describe('normalizeEvent for pull_request labels', () => {
+  it('normalizes two labels to names in order', () => {
+    // #given a pull_request payload with two labels
+    const payload = {
+      action: 'synchronize',
+      pull_request: {
+        number: 200,
+        title: 'feat: add labels support',
+        body: 'body',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [],
+        labels: [
+          {id: 1, name: 'skip-agent-review', color: 'ededed', description: null},
+          {id: 2, name: 'needs-triage', color: 'ff0000', description: null},
+        ],
+      },
+      sender: {login: 'contributor'},
+    }
+
+    // #when normalizing the event
+    const event = normalizeEvent('pull_request', payload)
+
+    // #then it should carry both label names in order
+    expect(event.type).toBe('pull_request')
+    if (event.type !== 'pull_request') {
+      throw new Error('Expected pull_request event')
+    }
+    expect(event.pullRequest.labels).toEqual(['skip-agent-review', 'needs-triage'])
+  })
+
+  it('normalizes absent labels to an empty array', () => {
+    // #given a pull_request payload with no labels field
+    const payload = {
+      action: 'synchronize',
+      pull_request: {
+        number: 201,
+        title: 'feat: no labels field',
+        body: 'body',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [],
+      },
+      sender: {login: 'contributor'},
+    }
+
+    // #when normalizing the event
+    const event = normalizeEvent('pull_request', payload)
+
+    // #then labels should default to an empty array
+    expect(event.type).toBe('pull_request')
+    if (event.type !== 'pull_request') {
+      throw new Error('Expected pull_request event')
+    }
+    expect(event.pullRequest.labels).toEqual([])
+  })
+
+  it('normalizes empty labels array to an empty array', () => {
+    // #given a pull_request payload with an empty labels array
+    const payload = {
+      action: 'synchronize',
+      pull_request: {
+        number: 202,
+        title: 'feat: empty labels',
+        body: 'body',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [],
+        labels: [],
+      },
+      sender: {login: 'contributor'},
+    }
+
+    // #when normalizing the event
+    const event = normalizeEvent('pull_request', payload)
+
+    // #then labels should be an empty array
+    expect(event.type).toBe('pull_request')
+    if (event.type !== 'pull_request') {
+      throw new Error('Expected pull_request event')
+    }
+    expect(event.pullRequest.labels).toEqual([])
+  })
+
+  it('drops labels with an empty-string name', () => {
+    // #given a pull_request payload with one real label and one empty-string-named label
+    const payload = {
+      action: 'synchronize',
+      pull_request: {
+        number: 203,
+        title: 'feat: label with empty name',
+        body: 'body',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [],
+        labels: [
+          {id: 1, name: 'skip-agent-review', color: 'ededed', description: null},
+          {id: 2, name: '', color: 'ff0000', description: null},
+        ],
+      },
+      sender: {login: 'contributor'},
+    }
+
+    // #when normalizing the event
+    const event = normalizeEvent('pull_request', payload)
+
+    // #then the empty-string-named label should be dropped
+    expect(event.type).toBe('pull_request')
+    if (event.type !== 'pull_request') {
+      throw new Error('Expected pull_request event')
+    }
+    expect(event.pullRequest.labels).toEqual(['skip-agent-review'])
+  })
+})
+
 describe('isPullRequest', () => {
   it('returns true when pull_request field exists', () => {
     const event: GitHubContext['event'] = {
