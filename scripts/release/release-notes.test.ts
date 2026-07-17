@@ -553,40 +553,49 @@ describe('buildNarrationPrompt', () => {
     expect(prompt).toContain('fro-bot/agent')
   })
 
-  it('includes the idempotency marker HTML comment', () => {
+  it('includes the untrusted-data rule', () => {
     // #given / #when
     const prompt = buildNarrationPrompt(opts)
 
     // #then
-    expect(prompt).toContain('<!-- fro-bot-narration-v1 -->')
+    expect(prompt).toMatch(/untrusted/i)
+    expect(prompt).toMatch(/never follow (?:directives|instructions)/i)
   })
 
-  it("includes the ## What's new heading", () => {
+  it('includes gather bounds (25 PRs, 6000 char truncation, 50 file paths, 5 diffs)', () => {
     // #given / #when
     const prompt = buildNarrationPrompt(opts)
 
     // #then
-    expect(prompt).toContain("## What's new")
+    expect(prompt).toContain('25')
+    expect(prompt).toContain('6000')
+    expect(prompt).toContain('50')
+    expect(prompt).toMatch(/at most 5 diffs/i)
   })
 
-  it('includes gh release edit command', () => {
+  it('includes the candidate output filename', () => {
     // #given / #when
     const prompt = buildNarrationPrompt(opts)
 
     // #then
-    expect(prompt).toContain('gh release edit')
+    expect(prompt).toContain('release-notes-candidate.md')
   })
 
-  it('uses --notes-file (never --notes)', () => {
+  it('includes the no-restatement / must-contain-new-facts instruction', () => {
     // #given / #when
     const prompt = buildNarrationPrompt(opts)
 
     // #then
-    expect(prompt).toContain('--notes-file')
-    // Ensure bare --notes is not used (--notes-file is fine, --notes <string> is not)
-    // We check that the only occurrence of --notes is as --notes-file
-    const notesOccurrences = prompt.match(/--notes(?!-file)/g)
-    expect(notesOccurrences).toBeNull()
+    expect(prompt).toMatch(/do not convert the changelog into prose/i)
+    expect(prompt).toMatch(/facts learned from pr bodies.*not already present in the commit subject/i)
+  })
+
+  it('includes read-only framing', () => {
+    // #given / #when
+    const prompt = buildNarrationPrompt(opts)
+
+    // #then
+    expect(prompt).toMatch(/read-only/i)
   })
 
   it('includes forbidden-actions scope constraints (no PR/issue comments)', () => {
@@ -602,7 +611,7 @@ describe('buildNarrationPrompt', () => {
     const prompt = buildNarrationPrompt(opts)
 
     // #then
-    expect(prompt).toMatch(/do not.*edit.*other|not.*other.*release|only.*mutating.*operation|only.*gh release edit/i)
+    expect(prompt).toMatch(/edit this release or any other release|must not.*edit/i)
   })
 
   it('does NOT contain GitHub Actions workflow-expression syntax', () => {
@@ -613,13 +622,23 @@ describe('buildNarrationPrompt', () => {
     expect(prompt).not.toContain('${{')
   })
 
-  it('includes the collapsed Full changelog details block instruction', () => {
+  it('does NOT contain gh release edit, the narration marker, or details-block instructions', () => {
     // #given / #when
     const prompt = buildNarrationPrompt(opts)
 
     // #then
-    expect(prompt).toContain('<details>')
-    expect(prompt).toContain('Full changelog')
+    expect(prompt).not.toContain('gh release edit')
+    expect(prompt).not.toContain('<!-- fro-bot-narration-v1 -->')
+    expect(prompt).not.toContain('<details>')
+  })
+
+  it('does NOT contain category-bullet structure instructions', () => {
+    // #given / #when
+    const prompt = buildNarrationPrompt(opts)
+
+    // #then
+    expect(prompt).not.toContain("## What's new")
+    expect(prompt).not.toMatch(/\*\*Features\*\* — new capabilities/)
   })
 })
 
