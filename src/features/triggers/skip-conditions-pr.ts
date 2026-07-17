@@ -76,6 +76,8 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
   }
   if (config.reviewSkipLabel != null) {
     const skipLabel = config.reviewSkipLabel.trim().toLowerCase()
+    // Direct-call guard: parseActionInputs already collapses whitespace-only
+    // input to null, so this is only reachable when callers bypass the parser.
     if (skipLabel === '') {
       return {shouldSkip: false}
     }
@@ -90,7 +92,10 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
     // plant a mention that overrides the skip label using the sender's borrowed
     // authorization. ready_for_review has no override at all; review_requested
     // gets its own trusted override below, driven by the live API-verified
-    // reviewer request rather than PR-author-controlled body text.
+    // reviewer request rather than PR-author-controlled body text. Note:
+    // isBotReviewRequested also gates bot_not_requested above — an explicit
+    // bot reviewer request both admits the event and beats the opt-out label;
+    // revisit both gates together if either's semantics change.
     const isOverridden =
       (context.hasMention === true && context.action !== 'ready_for_review' && context.action !== 'review_requested') ||
       (context.action === 'review_requested' && context.isBotReviewRequested === true)
