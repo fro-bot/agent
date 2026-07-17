@@ -34,7 +34,8 @@ opt-out label. The override read `context.hasMention === true` and relied on the
 But for `review_requested` and `ready_for_review` events, `routeEvent`
 (`src/features/triggers/router.ts`) substitutes the webhook **sender's** association into
 `context.author.association` before skip checks run — the webhook payload lacks a usable
-association for those senders, so the router resolves it via API and overwrites the field.
+association for those senders, so the resolved sender association (looked up via API
+upstream at config-build time) is substituted into `context.author.association`.
 Meanwhile `hasMention` is parsed from the **PR body**, which the PR author controls
 (`buildPullRequestContextData`).
 
