@@ -108,7 +108,7 @@ A meaningful change has audience impact: user- or operator-visible behavior, sec
 
 ## Compose
 
-For each logical change, write one paragraph of 3-6 sentences: observable problem or capability → what changed → mechanism → rationale or an important preserved behavior. End the paragraph with the PR link(s), e.g. [#123](https://github.com/${repo}/pull/123).
+For each logical change, write 1-3 SHORT paragraphs of 2-4 sentences each, separated by blank lines. Lead with the observable problem or capability and what changed; put mechanism, rationale, or important preserved behavior in the follow-on sentences or a second paragraph. Never compress a whole change into one dense wall of text — prefer two or three short paragraphs over one long one. End the LAST paragraph of the change with the PR link(s), e.g. [#123](https://github.com/${repo}/pull/123).
 
 If there are multiple logical changes, you may open with an optional 1-2 sentence release summary. Use \`###\` headings (e.g. Features, Bug fixes) ONLY when at least two logical changes share a category — do not use a heading for a single change.
 
