@@ -74,6 +74,23 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
       message: `Pull request action '${context.action}' did not request review from the bot`,
     }
   }
+  if (config.reviewSkipLabel != null) {
+    const skipLabel = config.reviewSkipLabel.trim().toLowerCase()
+    const hasSkipLabel = (context.target?.labels ?? []).some(label => label.toLowerCase() === skipLabel)
+    // An authorized PR-body mention or a live review_requested naming the bot
+    // overrides the opt-out label. A ready_for_review event carrying a
+    // pre-existing bot assignment (isBotReviewRequested) is NOT an override —
+    // only a live review_requested action is.
+    const isOverridden =
+      context.hasMention === true || (context.action === 'review_requested' && context.isBotReviewRequested === true)
+    if (hasSkipLabel && !isOverridden) {
+      return {
+        shouldSkip: true,
+        reason: 'review_skip_label',
+        message: `Pull request has the opt-out label '${config.reviewSkipLabel}'`,
+      }
+    }
+  }
 
   return {shouldSkip: false}
 }

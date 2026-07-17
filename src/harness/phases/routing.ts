@@ -48,6 +48,7 @@ export async function runRouting(
     requireMention: true,
     promptInput: bootstrap.inputs.prompt,
     senderAssociation,
+    reviewSkipLabel: bootstrap.inputs.reviewSkipLabel,
   })
 
   if (!triggerResult.shouldProcess) {

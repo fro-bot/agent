@@ -111,6 +111,7 @@ export const SKIP_REASONS = [
   'issue_locked',
   'no_mention',
   'prompt_required',
+  'review_skip_label',
   'self_comment',
   'unauthorized_author',
   'unsupported_event',
@@ -159,6 +160,8 @@ export interface TriggerConfig {
   readonly promptInput: string | null
   /** Resolved sender association from API (for review_requested where webhook lacks it) */
   readonly senderAssociation: string | null
+  /** Label name that opts a PR out of automatic review (null disables the check) */
+  readonly reviewSkipLabel: string | null
 }
 
 /**
@@ -171,4 +174,5 @@ export const DEFAULT_TRIGGER_CONFIG: TriggerConfig = {
   skipDraftPRs: true,
   promptInput: null,
   senderAssociation: null,
+  reviewSkipLabel: null,
 } as const
