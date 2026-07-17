@@ -74,7 +74,7 @@ PR-triggered review runs process every authorized, non-draft, unlocked PR with n
 
 ## Implementation Units
 
-- [ ] **Unit 1: Public input contract — `review-skip-label`**
+- [x] **Unit 1: Public input contract — `review-skip-label`**
 
 **Goal:** Expose and parse the opt-out label input with trim/empty-disable semantics.
 
@@ -97,7 +97,7 @@ PR-triggered review runs process every authorized, non-draft, unlocked PR with n
 
 **Verification:** `inputs.test.ts` green; parsed shape matches `action.yaml` default per the metadata-defaults contract.
 
-- [ ] **Unit 2: Normalized PR label propagation**
+- [x] **Unit 2: Normalized PR label propagation**
 
 **Goal:** Carry PR label names from the webhook payload through `NormalizedEvent` into `TriggerTarget` — no API fetch.
 
@@ -119,7 +119,7 @@ PR-triggered review runs process every authorized, non-draft, unlocked PR with n
 
 **Verification:** context and router tests green; no `octokit`/API call added anywhere in the normalization path.
 
-- [ ] **Unit 3: Routing policy — skip + overrides**
+- [x] **Unit 3: Routing policy — skip + overrides**
 
 **Goal:** Enforce the label skip with exact override behavior in the PR skip chain, threaded from the Action input.
 
@@ -154,7 +154,7 @@ PR-triggered review runs process every authorized, non-draft, unlocked PR with n
 
 **Verification:** All AE1–AE11 encoded and green; `SKIP_REASONS` addition does not break exhaustive consumers (grep for `SkipReason` switches).
 
-- [ ] **Unit 4: Public docs + dist**
+- [x] **Unit 4: Public docs + dist**
 
 **Goal:** Document the input and ship the rebuilt bundle.
 
