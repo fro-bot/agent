@@ -59,6 +59,107 @@ const PR_LINK_PATTERN = /\]\([^)]*\/(?:issues|pull)\/\d[^)]*\)/
 // '<details>', which a candidate could trivially dodge with '<details open>' or '</details>'.
 const DETAILS_TAG_PATTERN = /<\/?\s*details\b/i
 
+/**
+ * Removes well-formed fenced and inline Markdown code spans while leaving unbalanced markup intact.
+ * This is deliberately small and conservative: callers use the result only for structural checks,
+ * so anything that cannot be paired unambiguously remains visible to those checks.
+ */
+export function stripCodeSpans(text: string): string {
+  const output: string[] = []
+  let index = 0
+
+  const isLineStart = (position: number): boolean => position === 0 || text[position - 1] === '\n'
+  const fenceAt = (position: number): {readonly character: '`' | '~'; readonly length: number} | null => {
+    if (!isLineStart(position)) return null
+
+    let cursor = position
+    while (cursor < text.length && text[cursor] === ' ' && cursor - position < 4) cursor += 1
+    const character = text[cursor]
+    if (character !== '`' && character !== '~') return null
+
+    let length = 0
+    while (text[cursor + length] === character) length += 1
+    if (length < 3) return null
+
+    // CommonMark: a backtick fence's info string may not contain a backtick. A line like
+    // ```js` is NOT a fence — GitHub renders the following lines as live markup — so treating
+    // it as one here would blank a region the structural checks must still see (fail-open).
+    // Tilde fences are exempt: tildes are permitted in ~~~ info strings.
+    if (character === '`') {
+      const lineEnd = text.indexOf('\n', cursor + length)
+      const infoString = text.slice(cursor + length, lineEnd === -1 ? text.length : lineEnd)
+      if (infoString.includes('`')) return null
+    }
+
+    return {character, length}
+  }
+
+  const closingFenceAt = (
+    position: number,
+    fence: {readonly character: '`' | '~'; readonly length: number},
+  ): boolean => {
+    if (!isLineStart(position)) return false
+
+    let cursor = position
+    while (cursor < text.length && text[cursor] === ' ' && cursor - position < 4) cursor += 1
+    let length = 0
+    while (text[cursor + length] === fence.character) length += 1
+    if (length < fence.length) return false
+
+    cursor += length
+    while (text[cursor] === ' ' || text[cursor] === '\t') cursor += 1
+    return text[cursor] === '\n' || cursor === text.length
+  }
+
+  const blanked = (value: string): string => value.replaceAll(/[^\n]/g, ' ')
+
+  while (index < text.length) {
+    const fence = fenceAt(index)
+    if (fence !== null) {
+      let closing = index + 1
+      while (closing < text.length && !closingFenceAt(closing, fence)) closing += 1
+      if (closing < text.length) {
+        let end = text.indexOf('\n', closing)
+        end = end === -1 ? text.length : end + 1
+        output.push(blanked(text.slice(index, end)))
+        index = end
+        continue
+      }
+    }
+
+    const character = text[index]
+    if (character === '`') {
+      let length = 1
+      while (text[index + length] === '`') length += 1
+      // Inline spans are confined to a single line: a line-starting HTML tag (e.g. <details>)
+      // interrupts the enclosing paragraph as a block per CommonMark, so a span crossing a
+      // newline could blank live markup the structural checks must still see. Scanning less
+      // aggressively here is the fail-closed direction.
+      const lineEnd = text.indexOf('\n', index + length)
+      const searchLimit = lineEnd === -1 ? text.length : lineEnd
+      let closing = text.indexOf('`'.repeat(length), index + length)
+      while (closing !== -1 && closing < searchLimit) {
+        let runLength = 0
+        while (text[closing + runLength] === '`') runLength += 1
+        const startsRun = closing === 0 || text[closing - 1] !== '`'
+        if (runLength === length && startsRun) break
+        closing = text.indexOf('`'.repeat(length), closing + 1)
+      }
+      if (closing !== -1 && closing < searchLimit) {
+        const end = closing + length
+        output.push(blanked(text.slice(index, end)))
+        index = end
+        continue
+      }
+    }
+
+    output.push(character ?? '')
+    index += 1
+  }
+
+  return output.join('')
+}
+
 // Rejects candidates containing ANSI escape sequences, C0 control characters other than
 // \n \r \t, DEL, or hidden/bidi Unicode formatting characters. These have no legitimate
 // place in release-notes prose and can be used to spoof terminal/rendering output or hide
@@ -82,11 +183,15 @@ export function validateCandidate(candidate: string, originalBody: string): Vali
     return {ok: false, reason: 'oversized'}
   }
 
-  if (candidate.includes(NARRATION_MARKER)) {
+  const candidateWithoutCodeSpans = stripCodeSpans(candidate)
+
+  if (candidateWithoutCodeSpans.includes(NARRATION_MARKER)) {
     return {ok: false, reason: 'contains-marker'}
   }
 
-  if (DETAILS_TAG_PATTERN.test(candidate)) {
+  // Code-quoted tags are rendered as text by GitHub and cannot open a details block. The live v0.93.0
+  // candidate was rejected for legitimately describing this validator with `<details>` in code.
+  if (DETAILS_TAG_PATTERN.test(candidateWithoutCodeSpans)) {
     return {ok: false, reason: 'contains-details'}
   }
 

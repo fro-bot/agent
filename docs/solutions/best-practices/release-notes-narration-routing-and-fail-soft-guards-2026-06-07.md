@@ -87,6 +87,10 @@ effect**. Six rules:
    user-influenced, so a bare `body.includes(marker)` check lets a forged marker in a
    PR title suppress narration permanently. See
    [`../logic-errors/sentinel-marker-must-be-position-anchored-when-body-contains-untrusted-content-2026-07-17.md`](../logic-errors/sentinel-marker-must-be-position-anchored-when-body-contains-untrusted-content-2026-07-17.md).
+   The candidate validator's structural scans (marker/details forgery) are
+   additionally **code-span aware**: they run on `stripCodeSpans(candidate)` so
+   legitimate prose describing the defenses in inline code is not rejected — see
+   [`../logic-errors/release-notes-candidate-validation-must-be-code-span-aware-2026-07-17.md`](../logic-errors/release-notes-candidate-validation-must-be-code-span-aware-2026-07-17.md).
 
 5. **Enforce side effects structurally, not by prompt wording.** Do not rely on
    prompt text to suppress unwanted GitHub posts. Dispatch with
@@ -217,6 +221,9 @@ Short human-readable summary of the release.
   generate phase keys on the operation input, not the correlation id.
 - [`../logic-errors/sentinel-marker-must-be-position-anchored-when-body-contains-untrusted-content-2026-07-17.md`](../logic-errors/sentinel-marker-must-be-position-anchored-when-body-contains-untrusted-content-2026-07-17.md)
   — the position-anchoring requirement behind Rule #4's marker scheme.
+- [`../logic-errors/release-notes-candidate-validation-must-be-code-span-aware-2026-07-17.md`](../logic-errors/release-notes-candidate-validation-must-be-code-span-aware-2026-07-17.md)
+  — the code-span exemption in Rule #4's candidate validation (raw-text scans
+  rejected the first live narration for describing the validator itself).
 - [`workspace-executor-opencode-provisioning-best-practices-2026-06-01.md`](./workspace-executor-opencode-provisioning-best-practices-2026-06-01.md)
   — the cliproxy / model-routing / deploy-time provisioning surface. Same
   "route models through config, distinguish absent vs malformed" axis, but for
