@@ -1,3 +1,5 @@
+import {readFileSync} from 'node:fs'
+import {resolve} from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {
@@ -231,6 +233,18 @@ describe('parseActionInputs', () => {
       // #then the value is preserved verbatim, not lowercased
       expect(result.success).toBe(true)
       expect(result.success && result.data.reviewSkipLabel).toBe('Skip-Agent-Review')
+    })
+
+    it('pins the action.yaml metadata default for review-skip-label', () => {
+      // #given the committed action metadata (defaults apply at runtime via core.getInput, not in parsing code)
+      const actionYaml = readFileSync(resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+
+      // #when locating the review-skip-label input block
+      const block = actionYaml.slice(actionYaml.indexOf('review-skip-label:'))
+
+      // #then its metadata default is the documented label name
+      expect(block.length).toBeGreaterThan(0)
+      expect(block.slice(0, block.indexOf('\n\n'))).toContain('default: skip-agent-review')
     })
 
     it('parses response-mode case-insensitively (e.g., NONE)', () => {
