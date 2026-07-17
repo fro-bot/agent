@@ -113,4 +113,76 @@ describe('runRouting', () => {
     expect(vi.mocked(collectAgentContext)).not.toHaveBeenCalled()
     expect(vi.mocked(getRepositoryPermission)).not.toHaveBeenCalled()
   })
+
+  it('threads the parsed reviewSkipLabel input into the TriggerConfig passed to routeEvent', async () => {
+    // #given bootstrap inputs carrying a parsed reviewSkipLabel
+    const bootstrap = {
+      inputs: {
+        githubToken: 'ghp_test123',
+        prompt: 'test prompt',
+        reviewSkipLabel: 'skip-agent-review',
+      },
+      logger: createMockLogger(),
+      opencodeResult: {path: '/tmp/opencode', version: '1.0.0', didSetup: false},
+    } as BootstrapPhaseResult
+
+    vi.mocked(parseGitHubContext).mockReturnValue({
+      eventName: 'pull_request',
+      eventType: 'pull_request',
+      repo: {owner: 'fro-bot', repo: 'agent'},
+      ref: 'refs/heads/main',
+      sha: 'abc123',
+      runId: 123,
+      actor: 'mrbrown',
+      payload: {},
+      event: {type: 'pull_request', action: 'synchronize'} as never,
+    })
+    vi.mocked(createClient).mockReturnValue({} as never)
+    vi.mocked(getBotLogin).mockResolvedValue('fro-bot[bot]')
+    vi.mocked(routeEvent).mockReturnValue({
+      shouldProcess: false,
+      skipReason: 'review_skip_label',
+      skipMessage: "Pull request has the opt-out label 'skip-agent-review'",
+      context: {
+        eventType: 'pull_request',
+        eventName: 'pull_request',
+        repo: {owner: 'fro-bot', repo: 'agent'},
+        ref: 'refs/heads/main',
+        sha: 'abc123',
+        runId: 123,
+        actor: 'mrbrown',
+        action: 'synchronize',
+        author: null,
+        target: null,
+        commentBody: null,
+        commentId: null,
+        hasMention: false,
+        command: null,
+        isBotReviewRequested: false,
+        raw: {
+          eventName: 'pull_request',
+          eventType: 'pull_request',
+          repo: {owner: 'fro-bot', repo: 'agent'},
+          ref: 'refs/heads/main',
+          sha: 'abc123',
+          runId: 123,
+          actor: 'mrbrown',
+          payload: {},
+          event: {type: 'pull_request', action: 'synchronize'},
+        },
+      },
+    })
+
+    const result = await runRouting(bootstrap, 100)
+
+    // #then routeEvent receives the parsed reviewSkipLabel and the phase returns null
+    // before collectAgentContext (no acknowledgement/token spend)
+    expect(vi.mocked(routeEvent)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({reviewSkipLabel: 'skip-agent-review'}),
+    )
+    expect(result).toBeNull()
+    expect(vi.mocked(collectAgentContext)).not.toHaveBeenCalled()
+  })
 })

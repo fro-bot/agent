@@ -3,6 +3,7 @@
 import {execFileSync} from 'node:child_process'
 import {randomUUID} from 'node:crypto'
 import process from 'node:process'
+import {fileURLToPath} from 'node:url'
 
 // This file uses .ts import because it runs directly under Node's
 // --experimental-strip-types / --experimental-transform-types.
@@ -13,6 +14,7 @@ import {
   buildNarrationPrompt,
   classifyOutcome,
   escapeAnnotation,
+  hasAppliedNarration,
   isAuthError,
   parseDispatchedRuns,
   resolveNarrationModel,
@@ -35,6 +37,38 @@ function ghExec(args: readonly string[], childEnv: NodeJS.ProcessEnv): string {
 function sleep(seconds: number): void {
   // Sync sleep via Atomics.wait on a shared buffer — no subprocess needed.
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000)
+}
+
+export interface DispatchArgsOpts {
+  readonly prompt: string
+  readonly correlationId: string
+  readonly model: string
+  readonly tag: string
+}
+
+/**
+ * Pure builder for the `gh workflow run` argument list, extracted so the release-tag
+ * wiring is directly testable without mocking execFileSync. Tag is passed as a
+ * structured `-f release-tag=<tag>` input rather than embedded in prose, so the
+ * apply-release-notes job (fro-bot.yaml) can key on it without any prompt parsing.
+ */
+export function buildDispatchArgs(opts: DispatchArgsOpts): readonly string[] {
+  const {prompt, correlationId, model, tag} = opts
+  return [
+    'workflow',
+    'run',
+    '--ref',
+    'main',
+    'fro-bot.yaml',
+    '-f',
+    `prompt=${prompt}`,
+    '-f',
+    `correlation-id=${correlationId}`,
+    '-f',
+    `model=${model}`,
+    '-f',
+    `release-tag=${tag}`,
+  ]
 }
 
 // ---------------------------------------------------------------------------
@@ -83,23 +117,10 @@ function main(): void {
 
   // Step 8: dispatch — CHANGE 2: auth failures hard-fail; everything else soft-warns
   try {
-    execFileSync(
-      'gh',
-      [
-        'workflow',
-        'run',
-        '--ref',
-        'main',
-        'fro-bot.yaml',
-        '-f',
-        `prompt=${prompt}`,
-        '-f',
-        `correlation-id=${correlationId}`,
-        '-f',
-        `model=${releaseNotesModel}`,
-      ],
-      {env: childEnv, stdio: ['ignore', 'pipe', 'pipe']},
-    )
+    execFileSync('gh', buildDispatchArgs({prompt, correlationId, model: releaseNotesModel, tag}), {
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
   } catch (error: unknown) {
     // Capture stderr/message for auth detection — do NOT echo full env or token
     const message = error instanceof Error ? error.message : String(error)
@@ -205,17 +226,19 @@ function main(): void {
   }
 
   let bodyLen = 0
+  let narrationApplied: boolean | null = null
   if (conclusion === 'success') {
     try {
-      const raw = ghExec(['release', 'view', tag, '--json', 'body', '--jq', '.body | length'], childEnv)
-      bodyLen = Number(raw)
+      const body = ghExec(['release', 'view', tag, '--json', 'body', '--jq', '.body'], childEnv)
+      bodyLen = body.length
+      narrationApplied = hasAppliedNarration(body)
     } catch {
-      // default 0
+      // default 0 / null — body unavailable, classifyOutcome falls back to the bodyLen heuristic
     }
   }
 
   // Step 12: classify and emit
-  const result = classifyOutcome({watchExit, conclusion, log, bodyLen, targetTag: tag})
+  const result = classifyOutcome({watchExit, conclusion, log, bodyLen, targetTag: tag, narrationApplied})
 
   if (result.level === 'error') {
     process.stdout.write(`::error::${escapeAnnotation(result.message)}\n`)
@@ -228,4 +251,8 @@ function main(): void {
   process.exit(result.exitCode)
 }
 
-main()
+// Only run when executed directly (node --experimental-strip-types ...), not when imported
+// by the test file under Vitest.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main()
+}

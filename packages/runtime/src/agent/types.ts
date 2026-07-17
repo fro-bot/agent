@@ -149,6 +149,8 @@ export interface TriggerTarget {
   readonly requestedReviewerLogin?: string
   readonly requestedTeamSlug?: string
   readonly requestedReviewerLogins?: readonly string[]
+  /** PR label names (pull_request only) */
+  readonly labels?: readonly string[]
   readonly path?: string
   readonly line?: number
   readonly diffHunk?: string

@@ -74,6 +74,39 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
       message: `Pull request action '${context.action}' did not request review from the bot`,
     }
   }
+  if (config.reviewSkipLabel != null) {
+    const skipLabel = config.reviewSkipLabel.trim().toLowerCase()
+    // Direct-call guard: parseActionInputs already collapses whitespace-only
+    // input to null, so this is only reachable when callers bypass the parser.
+    if (skipLabel === '') {
+      return {shouldSkip: false}
+    }
+    const hasSkipLabel = (context.target?.labels ?? []).some(label => label.toLowerCase() === skipLabel)
+    // A PR-body mention overrides the opt-out label only for opened, synchronize,
+    // and reopened, where context.author.association reflects the PR author who
+    // wrote that body. For review_requested and ready_for_review, the router
+    // substitutes the webhook sender's association into context.author before
+    // this check runs (see routeEvent) — so hasMention still reflects the PR
+    // body, which the (possibly unauthorized) PR author controls, not the
+    // validated sender. Honoring it there would let an unauthorized fork author
+    // plant a mention that overrides the skip label using the sender's borrowed
+    // authorization. ready_for_review has no override at all; review_requested
+    // gets its own trusted override below, driven by the live API-verified
+    // reviewer request rather than PR-author-controlled body text. Note:
+    // isBotReviewRequested also gates bot_not_requested above — an explicit
+    // bot reviewer request both admits the event and beats the opt-out label;
+    // revisit both gates together if either's semantics change.
+    const isOverridden =
+      (context.hasMention === true && context.action !== 'ready_for_review' && context.action !== 'review_requested') ||
+      (context.action === 'review_requested' && context.isBotReviewRequested === true)
+    if (hasSkipLabel && !isOverridden) {
+      return {
+        shouldSkip: true,
+        reason: 'review_skip_label',
+        message: `Pull request has the opt-out label '${config.reviewSkipLabel}'`,
+      }
+    }
+  }
 
   return {shouldSkip: false}
 }

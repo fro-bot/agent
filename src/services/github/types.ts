@@ -103,6 +103,7 @@ export interface NormalizedPullRequestEvent {
     readonly draft: boolean
     readonly authorAssociation: string
     readonly requestedReviewers: readonly {readonly login: string; readonly type: string}[]
+    readonly labels: readonly string[]
   }
   readonly sender: {
     readonly login: string

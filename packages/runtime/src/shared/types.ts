@@ -100,6 +100,9 @@ export interface ActionInputs {
   readonly dedupWindow: number
   // Response mode: controls whether the agent posts GitHub comments/reviews (default: 'github')
   readonly responseMode: ResponseMode
+  // Label name that suppresses automatic PR-event reviews when present (case-insensitive at
+  // comparison time). null = feature disabled (trimmed-empty input).
+  readonly reviewSkipLabel: string | null
 }
 
 // OMO Slim presets (single-name selection, unlike oMo's provider list).

@@ -68,6 +68,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     omoSlimPreset: 'openai',
     dedupWindow: 0,
     responseMode: 'github',
+    reviewSkipLabel: null,
     storeConfig: {
       enabled: false,
       bucket: '',
