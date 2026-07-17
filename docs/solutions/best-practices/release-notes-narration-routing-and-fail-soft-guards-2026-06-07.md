@@ -6,6 +6,7 @@ module: release-notes
 problem_type: best_practice
 component: development_workflow
 severity: high
+last_updated: 2026-07-17
 applies_when:
   - release automation dispatches a narration or rewrite workflow
   - model identifiers are routed through a provider proxy
@@ -78,15 +79,25 @@ effect**. Six rules:
 3. **Bound the narration path with a real timeout.** A stalled provider must fail
    fast and be classified as a soft warning — never an unbounded hang.
 
-4. **Make the release-body update idempotent.** A stable marker
-   (`<!-- fro-bot-narration-v1 -->`) lets a re-run skip instead of double-narrating;
-   keep the raw changelog under `<details>`.
+4. **Make the release-body update idempotent — and anchor the marker structurally.**
+   A stable marker (`<!-- fro-bot-narration-v1 -->`) on its own line, immediately
+   under the `## What's new` heading, lets a re-run skip instead of double-narrating;
+   keep the raw changelog under `<details>`. Match it by structural position, **not**
+   by substring: the body embeds a `<details>` changelog whose PR titles are
+   user-influenced, so a bare `body.includes(marker)` check lets a forged marker in a
+   PR title suppress narration permanently. See
+   [`../logic-errors/sentinel-marker-must-be-position-anchored-when-body-contains-untrusted-content-2026-07-17.md`](../logic-errors/sentinel-marker-must-be-position-anchored-when-body-contains-untrusted-content-2026-07-17.md).
 
 5. **Enforce side effects structurally, not by prompt wording.** Do not rely on
    prompt text to suppress unwanted GitHub posts. Dispatch with
    `response-mode: none` so the workflow edits the release body directly and posts
    nothing. (Narration also runs `enable-omo: false` — it needs no orchestration —
-   and `output-mode: working-dir`, all gated on the correlation id.)
+   and `output-mode: working-dir`, all gated on the correlation id.) Note the scope
+   boundary: `correlation-id` is for **run selection / audit only**. The credential
+   scope selector (read-only `GITHUB_TOKEN` vs write-capable `FRO_BOT_PAT`) must be
+   keyed on the **operation input** (`release-tag` present vs absent), never on the
+   tracing token — see
+   [`key-credential-switch-on-operation-input-not-audit-token-2026-07-17.md`](./key-credential-switch-on-operation-input-not-audit-token-2026-07-17.md).
 
 6. **Classify outcomes by precedence — security first, narration soft.**
    - **Auth failure is the only hard fail (exit 1), checked first.**
@@ -201,6 +212,11 @@ Short human-readable summary of the release.
 
 ## Related
 
+- [`key-credential-switch-on-operation-input-not-audit-token-2026-07-17.md`](./key-credential-switch-on-operation-input-not-audit-token-2026-07-17.md)
+  — the two-phase redesign (PR #1239): the credential selector for the read-only
+  generate phase keys on the operation input, not the correlation id.
+- [`../logic-errors/sentinel-marker-must-be-position-anchored-when-body-contains-untrusted-content-2026-07-17.md`](../logic-errors/sentinel-marker-must-be-position-anchored-when-body-contains-untrusted-content-2026-07-17.md)
+  — the position-anchoring requirement behind Rule #4's marker scheme.
 - [`workspace-executor-opencode-provisioning-best-practices-2026-06-01.md`](./workspace-executor-opencode-provisioning-best-practices-2026-06-01.md)
   — the cliproxy / model-routing / deploy-time provisioning surface. Same
   "route models through config, distinguish absent vs malformed" axis, but for
