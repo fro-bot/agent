@@ -351,7 +351,6 @@ describe('CLI main (mocked gh)', () => {
     // #when
     const result = runApply({
       tag: 'v1.0.0',
-      repo: 'fro-bot/agent',
       ghView,
       ghEdit,
       readCandidate,
@@ -372,7 +371,6 @@ describe('CLI main (mocked gh)', () => {
     // #when
     const result = runApply({
       tag: 'v1.0.0',
-      repo: 'fro-bot/agent',
       ghView,
       ghEdit,
       readCandidate,
@@ -393,7 +391,6 @@ describe('CLI main (mocked gh)', () => {
     // #when
     const result = runApply({
       tag: 'v1.0.0',
-      repo: 'fro-bot/agent',
       ghView,
       ghEdit,
       readCandidate,
@@ -419,7 +416,6 @@ describe('CLI main (mocked gh)', () => {
     // #when
     const result = runApply({
       tag: 'v1.0.0',
-      repo: 'fro-bot/agent',
       ghView,
       ghEdit,
       readCandidate,
@@ -445,7 +441,6 @@ describe('CLI main (mocked gh)', () => {
     // #when
     const result = runApply({
       tag: 'v1.0.0',
-      repo: 'fro-bot/agent',
       ghView,
       ghEdit,
       readCandidate,
@@ -474,7 +469,6 @@ describe('CLI main (mocked gh)', () => {
     // #when
     const result = runApply({
       tag: 'v1.0.0',
-      repo: 'fro-bot/agent',
       ghView,
       ghEdit,
       readCandidate,
@@ -502,7 +496,6 @@ describe('CLI main (mocked gh)', () => {
     // #when
     const result = runApply({
       tag: 'v1.0.0',
-      repo: 'fro-bot/agent',
       ghView,
       ghEdit,
       readCandidate,
@@ -529,7 +522,6 @@ describe('CLI main (mocked gh)', () => {
     // #when
     const result = runApply({
       tag: 'v1.0.0',
-      repo: 'fro-bot/agent',
       ghView,
       ghEdit,
       readCandidate,

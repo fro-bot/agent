@@ -49,6 +49,9 @@ export type ValidateCandidateResult = {readonly ok: true} | {readonly ok: false;
 const COMMIT_LIST_BULLET_PATTERN = /^[ \t]*[*-][ \t]+(?:\*\*[a-z]+(?:\([^()\r\n]*\))?:\*\*|[a-z]+\([^()\r\n]*\):)/im
 
 const PR_REFERENCE_PATTERN = /\/(?:issues|pull)\/\d+/
+// Intentionally narrower than PR_REFERENCE_PATTERN: the prompt's compose contract requires
+// markdown-form PR links ([#N](...)), so bare URLs don't satisfy the rule. Worst case is a
+// fail-soft skipped narration, never a wrong edit.
 const PR_LINK_PATTERN = /\]\([^)]*\/(?:issues|pull)\/\d[^)]*\)/
 
 // Structural match for any details-tag variant (open, close, self-closing-shaped, with
@@ -132,7 +135,6 @@ export function assembleReleaseBody(candidate: string, originalBody: string): st
 
 export interface RunApplyDeps {
   readonly tag: string
-  readonly repo: string
   readonly ghView: () => string
   readonly ghEdit: (notesFile: string) => void
   readonly readCandidate: () => string | null
@@ -235,9 +237,9 @@ function main(): void {
   const candidateFile = process.argv[3] ?? 'release-notes-candidate.md'
   const repo = resolveRepo(process.argv.slice(4))
 
+  // repo binds into the gh closures below; runApply itself never needs it.
   const result = runApply({
     tag,
-    repo,
     ghView: () => execFileSync('gh', ['release', 'view', tag, '--repo', repo, '--json', 'body'], {encoding: 'utf8'}),
     ghEdit: notesFile => {
       execFileSync('gh', ['release', 'edit', tag, '--repo', repo, '--notes-file', notesFile], {stdio: 'inherit'})
