@@ -73,13 +73,25 @@ export function stripCodeSpans(text: string): string {
     if (!isLineStart(position)) return null
 
     let cursor = position
-    while (text[cursor] === ' ' && cursor < text.length && cursor - position < 4) cursor += 1
+    while (cursor < text.length && text[cursor] === ' ' && cursor - position < 4) cursor += 1
     const character = text[cursor]
     if (character !== '`' && character !== '~') return null
 
     let length = 0
     while (text[cursor + length] === character) length += 1
-    return length >= 3 ? {character, length} : null
+    if (length < 3) return null
+
+    // CommonMark: a backtick fence's info string may not contain a backtick. A line like
+    // ```js` is NOT a fence — GitHub renders the following lines as live markup — so treating
+    // it as one here would blank a region the structural checks must still see (fail-open).
+    // Tilde fences are exempt: tildes are permitted in ~~~ info strings.
+    if (character === '`') {
+      const lineEnd = text.indexOf('\n', cursor + length)
+      const infoString = text.slice(cursor + length, lineEnd === -1 ? text.length : lineEnd)
+      if (infoString.includes('`')) return null
+    }
+
+    return {character, length}
   }
 
   const closingFenceAt = (
@@ -89,7 +101,7 @@ export function stripCodeSpans(text: string): string {
     if (!isLineStart(position)) return false
 
     let cursor = position
-    while (text[cursor] === ' ' && cursor < text.length && cursor - position < 4) cursor += 1
+    while (cursor < text.length && text[cursor] === ' ' && cursor - position < 4) cursor += 1
     let length = 0
     while (text[cursor + length] === fence.character) length += 1
     if (length < fence.length) return false
@@ -119,15 +131,21 @@ export function stripCodeSpans(text: string): string {
     if (character === '`') {
       let length = 1
       while (text[index + length] === '`') length += 1
+      // Inline spans are confined to a single line: a line-starting HTML tag (e.g. <details>)
+      // interrupts the enclosing paragraph as a block per CommonMark, so a span crossing a
+      // newline could blank live markup the structural checks must still see. Scanning less
+      // aggressively here is the fail-closed direction.
+      const lineEnd = text.indexOf('\n', index + length)
+      const searchLimit = lineEnd === -1 ? text.length : lineEnd
       let closing = text.indexOf('`'.repeat(length), index + length)
-      while (closing !== -1) {
+      while (closing !== -1 && closing < searchLimit) {
         let runLength = 0
         while (text[closing + runLength] === '`') runLength += 1
         const startsRun = closing === 0 || text[closing - 1] !== '`'
         if (runLength === length && startsRun) break
         closing = text.indexOf('`'.repeat(length), closing + 1)
       }
-      if (closing !== -1) {
+      if (closing !== -1 && closing < searchLimit) {
         const end = closing + length
         output.push(blanked(text.slice(index, end)))
         index = end

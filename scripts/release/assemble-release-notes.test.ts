@@ -161,6 +161,15 @@ describe('validateCandidate', () => {
     })
   })
 
+  it('rejects a raw details tag behind an invalid backtick fence (backtick in info string)', () => {
+    // #given — CommonMark forbids backticks in a backtick fence's info string, so ```js` is NOT
+    // a fence and GitHub renders the following <details> as live markup. The stripper must not
+    // blank the region (fail-open) — the structural check must still see the raw tag.
+    const candidate = 'Narrative text.\n```js`\n<details>\n```\nSee [#1](https://github.com/o/r/pull/1).'
+    // #then
+    expect(validateCandidate(candidate, 'anything')).toEqual({ok: false, reason: 'contains-details'})
+  })
+
   it.each([
     ['closing tag only', 'Some narrative.\n</details>\nMore text.'],
     ['open tag with attribute', 'Some narrative.\n<details open>\nMore text.'],
@@ -346,6 +355,23 @@ describe('stripCodeSpans', () => {
 
     // #when / #then
     expect(stripCodeSpans(text)).toBe(text)
+  })
+
+  it('leaves an invalid backtick fence (backtick in info string) intact', () => {
+    // #given — ```js` is not a valid fence per CommonMark (no backticks in a backtick
+    // fence's info string); blanking it would hide live markup from the structural checks
+    const text = '```js`\n<details>\n```\nafter'
+
+    // #then — the <details> line must survive stripping
+    expect(stripCodeSpans(text)).toContain('<details>')
+  })
+
+  it('still strips a tilde fence whose info string contains a backtick', () => {
+    // #given — tildes fences MAY carry backticks in the info string per CommonMark
+    const text = '~~~js`\n<details>\n~~~\nafter'
+
+    // #then
+    expect(stripCodeSpans(text)).not.toContain('<details>')
   })
 })
 
