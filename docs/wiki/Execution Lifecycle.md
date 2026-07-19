@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-07-12"
-updated-by: "schedule-d7190410-29208059688"
+last-updated: "2026-07-19"
+updated-by: "1a2d8b2"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -11,12 +11,16 @@ sources:
   - src/harness/phases/cache-restore.ts
   - src/harness/phases/session-prep.ts
   - src/harness/phases/execute.ts
+  - src/features/agent/retry.ts
+  - src/features/agent/session-poll.ts
+  - src/features/agent/streaming.ts
   - src/harness/phases/finalize.ts
   - src/harness/phases/cleanup.ts
   - src/harness/phases/dedup.ts
   - src/harness/phases/review-reconciliation.ts
   - src/harness/post.ts
   - src/features/triggers/router.ts
+  - src/features/triggers/skip-conditions-pr.ts
   - src/features/agent/output-mode.ts
   - src/features/agent/response-post.ts
   - src/features/reviews/review-reconciliation.ts
@@ -73,6 +77,8 @@ First, `parseGitHubContext()` reads the raw Actions context and calls `normalize
 
 Then `routeEvent()` applies skip conditions to decide whether to proceed. Skip conditions include: action not supported (e.g., a `labeled` event), draft PR, locked issue, bot responding to itself, unauthorized author (not `OWNER`, `MEMBER`, or `COLLABORATOR`), missing prompt for schedule/dispatch events, and PR review not requested from the bot. If any condition matches, the run exits cleanly with code 0 and a skip reason.
 
+Pull-request events also carry an **opt-out label** check (`src/features/triggers/skip-conditions-pr.ts`). When a PR carries the configured `review-skip-label` (default `skip-agent-review`, see [[Setup and Configuration]]), the automatic review is suppressed. The suppression is deliberately overridable so it never silences a directed request: a `@fro-bot` mention in the PR body overrides the label on opened, synchronize, reopened, and edited actions (where the PR author controls the body), and an explicit review request naming the bot overrides it on `review_requested`. `ready_for_review` has no override — its trigger is not author-controlled — so the label always wins there. This keeps the label a passive default-off switch rather than a hard gate an authorized human cannot bypass.
+
 ## 3. Deduplication
 
 A lightweight guard against duplicate runs for the same entity within a configurable window (default: 10 minutes). Uses cache-based sentinel markers — not an in-flight lock. This is best-effort suppression; workflow-level concurrency groups provide the stronger guarantee.
@@ -113,6 +119,8 @@ Processes any file attachments from the triggering context, searches prior sessi
 The core phase. Calls `executeOpenCode()` which creates (or continues) an SDK session, sends the assembled prompt, and streams events back in real time. The SDK lifecycle follows the pattern: spawn server, connect client, create session, send prompt, process event stream, close.
 
 If the LLM returns a fetch error (transient provider failure), the system retries up to three times with a continuation prompt. A configurable timeout (default: 30 minutes) aborts execution if the agent runs too long.
+
+Not every provider error is retryable, and the phase distinguishes them. **Provider quota exhaustion is terminal**: the retry loop classifies a `quota_exceeded` error as non-retryable and fails fast rather than burning the remaining attempts on a wall it cannot get past. The subtlety this guards against is that a provider's quota-retry can look like session activity — the underlying `wait()` may even resolve as if it succeeded — so an activity tracker records the quota signal and the phase reconciles it into the authoritative result, reporting a quota failure instead of a false success. A brief poll also merges any quota signal the event stream never emitted, so a quota wall observed only during polling still surfaces as a failure. Transient fetch errors keep their retryable classification and still get their retries; only genuinely terminal conditions like quota short-circuit.
 
 ## 9. Review Reconciliation
 
