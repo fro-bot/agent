@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-07-05"
-updated-by: "schedule-d7190410-28754466543"
+last-updated: "2026-07-19"
+updated-by: "1a2d8b2"
 sources:
   - AGENTS.md
   - packages/runtime/src/shared/logger.ts

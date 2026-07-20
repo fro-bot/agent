@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-07-12"
-updated-by: "schedule-d7190410-29208059688"
+last-updated: "2026-07-19"
+updated-by: "1a2d8b2"
 sources:
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/prompt-thread.ts
@@ -49,7 +49,7 @@ The prompt is assembled in this order:
 
 10. **`<output_contract>`** — For PR review events only. Specifies whether to approve, request changes, or comment, and includes the author's association level.
 
-11. **`<agent_context>`** — Operating environment description, session management instructions, response protocol template, and `gh` CLI reference examples.
+11. **`<agent_context>`** — Operating environment description, session management instructions, response protocol template, and `gh` CLI reference examples. The session-management block enumerates the four always-on session tools by name — `session_list`, `session_search`, `session_read`, and `session_info` — so the model knows the exact surface it can call before investigating (see the [native session tools](Session%20Persistence.md#native-agent-session-tools) in [[Session Persistence]]). Listing them in the prompt keeps discovery in sync with the tools the harness actually registers, rather than leaving the model to guess.
 
 ## Trigger Directive System
 
