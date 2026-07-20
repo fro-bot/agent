@@ -30,7 +30,7 @@ export const DEFAULT_OMO_VERSION = '3.17.15'
 // channel is not the default. Renovate tracks this via .github/renovate.json5.
 export const DEFAULT_OMO_SLIM_VERSION = '1.1.2'
 export const DEFAULT_OMO_PROVIDERS = ''
-export const DEFAULT_SYSTEMATIC_VERSION = '2.33.3'
+export const DEFAULT_SYSTEMATIC_VERSION = '3.2.2'
 
 // All-'no' OmoProviders sentinel for disabled oMo mode
 export const OMO_PROVIDERS_DISABLED = {
