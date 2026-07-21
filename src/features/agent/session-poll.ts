@@ -1,7 +1,7 @@
 import type {createOpencode} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
+import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
-import {sleep} from '../../shared/async.js'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {classifyRetryStatusQuota} from './streaming.js'
@@ -34,9 +34,42 @@ function getObjectProperty(value: unknown, property: string): unknown {
   return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
 }
 
-async function withRequestTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+export async function waitForAbortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) return Promise.resolve()
+
+  return new Promise(resolve => {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    const finish = (): void => {
+      if (timeout != null) clearTimeout(timeout)
+      if (signal != null && onAbort != null) signal.removeEventListener('abort', onAbort)
+      resolve()
+    }
+
+    timeout = setTimeout(finish, delayMs)
+    if (signal != null) {
+      onAbort = finish
+      signal.addEventListener('abort', onAbort, {once: true})
+    }
+  })
+}
+
+async function withRequestTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  label: string,
+  signal?: AbortSignal,
+): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
   try {
+    const abortPromise =
+      signal == null
+        ? null
+        : new Promise<T>((_, reject) => {
+            onAbort = () => reject(new Error(`${label} aborted`))
+            signal.addEventListener('abort', onAbort, {once: true})
+          })
     return await Promise.race([
       operation,
       new Promise<T>((_, reject) => {
@@ -44,10 +77,28 @@ async function withRequestTimeout<T>(operation: Promise<T>, timeoutMs: number, l
           reject(new Error(`${label} timed out after ${timeoutMs}ms`))
         }, timeoutMs)
       }),
+      ...(abortPromise == null ? [] : [abortPromise]),
     ])
   } finally {
     if (timeout != null) clearTimeout(timeout)
+    if (signal != null && onAbort != null) signal.removeEventListener('abort', onAbort)
   }
+}
+
+async function runPollRequest<T>(
+  operation: () => Promise<T>,
+  label: string,
+  signal: AbortSignal,
+  deadline?: ExecutionDeadline,
+): Promise<T> {
+  const request = async () =>
+    withRequestTimeout(
+      operation(),
+      Math.min(POLL_REQUEST_TIMEOUT_MS, deadline?.remainingMs() ?? POLL_REQUEST_TIMEOUT_MS),
+      label,
+      signal,
+    )
+  return deadline == null ? request() : deadline.run(request, label)
 }
 
 async function detectMessageActivity(
@@ -56,6 +107,8 @@ async function detectMessageActivity(
   directory: string,
   activityTracker: ActivityTracker | undefined,
   logger: Logger,
+  signal: AbortSignal,
+  deadline?: ExecutionDeadline,
 ): Promise<PollResult | null> {
   if (activityTracker?.baselineMessageIds == null) return null
 
@@ -64,10 +117,11 @@ async function detectMessageActivity(
     return null
   }
 
-  const messagesResponse = await withRequestTimeout(
-    client.session.messages({path: {id: sessionId}, query: {directory}}),
-    POLL_REQUEST_TIMEOUT_MS,
+  const messagesResponse = await runPollRequest(
+    async () => client.session.messages({path: {id: sessionId}, query: {directory}, signal}),
     'session.messages()',
+    signal,
+    deadline,
   )
   const messages = Array.isArray(messagesResponse.data) ? messagesResponse.data : []
   let latestAssistantMessageInfo: unknown = null
@@ -122,13 +176,23 @@ export async function pollForSessionCompletion(
   logger: Logger,
   maxPollTimeMs: number = DEFAULT_TIMEOUT_MS,
   activityTracker?: ActivityTracker,
+  deadline?: ExecutionDeadline,
 ): Promise<PollResult> {
   const pollStart = Date.now()
   let errorGraceCycles = 0
   let firstSessionError: string | null = null
 
   while (!signal.aborted) {
-    await sleep(POLL_INTERVAL_MS)
+    if (deadline?.isExpired() === true) return {completed: false, error: 'Aborted'}
+    try {
+      const delay = async () => {
+        await waitForAbortableDelay(POLL_INTERVAL_MS, signal)
+      }
+      if (deadline == null) await delay()
+      else await deadline.run(delay, 'poll interval')
+    } catch {
+      return {completed: false, error: 'Aborted'}
+    }
     if (signal.aborted) return {completed: false, error: 'Aborted'}
 
     const observedSessionError = activityTracker?.sessionError
@@ -158,19 +222,28 @@ export async function pollForSessionCompletion(
     }
 
     const elapsed = Date.now() - pollStart
-    if (maxPollTimeMs > 0 && elapsed >= maxPollTimeMs) {
+    if (deadline == null && maxPollTimeMs > 0 && elapsed >= maxPollTimeMs) {
       logger.warning('Poll timeout reached', {elapsedMs: elapsed, maxPollTimeMs})
       return {completed: false, error: `Poll timeout after ${elapsed}ms`}
     }
 
     try {
-      const messageResult = await detectMessageActivity(client, sessionId, directory, activityTracker, logger)
+      const messageResult = await detectMessageActivity(
+        client,
+        sessionId,
+        directory,
+        activityTracker,
+        logger,
+        signal,
+        deadline,
+      )
       if (messageResult != null) return messageResult
 
-      const statusResponse = await withRequestTimeout(
-        client.session.status({query: {directory}}),
-        POLL_REQUEST_TIMEOUT_MS,
+      const statusResponse = await runPollRequest(
+        async () => client.session.status({query: {directory}, signal}),
         'session.status()',
+        signal,
+        deadline,
       )
       const statuses = statusResponse.data ?? {}
       const sessionStatus = statuses[sessionId]
@@ -228,11 +301,28 @@ export async function pollForSessionCompletion(
 export async function waitForEventProcessorShutdown(
   eventProcessor: Promise<void>,
   timeoutMs: number = EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<void> {
-  await Promise.race([
-    eventProcessor,
-    new Promise<void>(resolve => {
-      setTimeout(resolve, timeoutMs)
-    }),
-  ])
+  if (signal?.aborted === true) return
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  const abortPromise =
+    signal == null
+      ? null
+      : new Promise<void>(resolve => {
+          onAbort = () => resolve()
+          signal.addEventListener('abort', onAbort, {once: true})
+        })
+  try {
+    await Promise.race([
+      eventProcessor,
+      new Promise<void>(resolve => {
+        timeoutId = setTimeout(resolve, timeoutMs)
+      }),
+      ...(abortPromise == null ? [] : [abortPromise]),
+    ])
+  } finally {
+    if (timeoutId != null) clearTimeout(timeoutId)
+    if (signal != null && onAbort != null) signal.removeEventListener('abort', onAbort)
+  }
 }

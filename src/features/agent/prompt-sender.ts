@@ -4,7 +4,7 @@ import type {EventStreamResult} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
-import {runPromptAttempt} from './retry.js'
+import {runPromptAttempt, type ExecutionDeadline} from './retry.js'
 
 export const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
 Please continue where you left off. If you were in the middle of a task, resume it.
@@ -35,6 +35,7 @@ export async function sendPromptToSession(
   config: ExecutionConfig | undefined,
   logger: Logger,
   serverUrl?: string | null,
+  deadline?: ExecutionDeadline,
 ): Promise<AttemptResult> {
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart, ...(fileParts ?? [])]
@@ -48,38 +49,57 @@ export async function sendPromptToSession(
   const agentName = config?.agent ?? null
   if (agentName != null) body.agent = agentName
 
-  const events = await client.event.subscribe()
-  const startPrompt = async () => {
-    const response = await client.session.promptAsync({path: {id: sessionId}, body, query: {directory}})
-    if (response.error == null) return null
+  const attemptAbortController = new AbortController()
+  try {
+    const subscriptionSignal =
+      deadline == null
+        ? attemptAbortController.signal
+        : AbortSignal.any([attemptAbortController.signal, deadline.signal])
+    const subscribe = async () => client.event.subscribe({signal: subscriptionSignal})
+    const events = deadline == null ? await subscribe() : await deadline.run(subscribe, 'event subscription')
+    const startPrompt = async () => {
+      const response = await client.session.promptAsync({
+        path: {id: sessionId},
+        body,
+        query: {directory},
+        signal: deadline?.signal,
+      })
+      if (response.error == null) return null
 
-    const promptError = String(response.error)
-    const promptLlmError = isLlmFetchError(response.error) ? createLLMFetchError(promptError) : null
-    return {
-      success: false,
-      error: promptError,
-      llmError: promptLlmError,
-      shouldRetry: promptLlmError != null,
-      eventStreamResult: {
-        tokens: null,
-        model: null,
-        cost: null,
-        prsCreated: [],
-        commitsCreated: [],
-        commentsPosted: 0,
+      const promptError = String(response.error)
+      const promptLlmError = isLlmFetchError(response.error) ? createLLMFetchError(promptError) : null
+      return {
+        success: false,
+        error: promptError,
         llmError: promptLlmError,
-      },
+        shouldRetry: promptLlmError != null,
+        eventStreamResult: {
+          tokens: null,
+          model: null,
+          cost: null,
+          prsCreated: [],
+          commitsCreated: [],
+          commentsPosted: 0,
+          llmError: promptLlmError,
+        },
+      }
     }
-  }
 
-  return runPromptAttempt(
-    client,
-    sessionId,
-    directory,
-    config?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    logger,
-    events.stream as AsyncIterable<Event>,
-    serverUrl,
-    startPrompt,
-  )
+    const runAttempt = async () =>
+      runPromptAttempt(
+        client,
+        sessionId,
+        directory,
+        config?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        logger,
+        events.stream as AsyncIterable<Event>,
+        serverUrl,
+        startPrompt,
+        deadline,
+        attemptAbortController,
+      )
+    return deadline == null ? await runAttempt() : await deadline.run(runAttempt, 'prompt attempt')
+  } finally {
+    attemptAbortController.abort()
+  }
 }

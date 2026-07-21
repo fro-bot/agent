@@ -214,6 +214,7 @@ function createMockClient(options: {
         ? vi.fn().mockRejectedValue(new Error('Session creation failed'))
         : vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
       update: vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
+      abort: vi.fn().mockResolvedValue({data: undefined}),
       promptAsync,
       messages: vi.fn().mockResolvedValue({data: []}),
       status: vi.fn().mockImplementation(async () => {
@@ -324,6 +325,283 @@ describe('executeOpenCode', () => {
     expect(promptCall?.body?.parts).toEqual([{type: 'text', text: 'Built prompt with sessionId'}])
     expect(promptCall?.query?.directory).toEqual(expect.any(String))
     expect(result.sessionId).toBe('ses_123')
+  })
+
+  it('settles with a timeout when session creation never resolves', async () => {
+    // #given — the SDK session-create request ignores cancellation and never settles
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(mockClient.session.create).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+    await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+    // #then — the shared deadline must settle the root execution instead of leaving it pending
+    const result = await Promise.race([resultPromise, Promise.resolve(null)])
+    expect(result).not.toBeNull()
+    expect(result).toMatchObject({success: false, exitCode: 130, error: 'Execution timed out after 25ms'})
+  })
+
+  it('settles at the shared deadline when event subscription never resolves', async () => {
+    // #given — subscription ignores the propagated cancellation signal
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.event.subscribe).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then — timeout is terminal and the already-created remote session receives one best-effort abort
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.abort).toHaveBeenCalledOnce()
+  })
+
+  it('settles at the shared deadline when prompt submission never resolves', async () => {
+    // #given — prompt submission ignores the propagated cancellation signal
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.abort).toHaveBeenCalledOnce()
+  })
+
+  it('settles at the shared deadline when a poll request never resolves', async () => {
+    // #given — no event activity, followed by a poll status request that never settles
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+      events: [],
+    })
+    vi.mocked(mockClient.session.status).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 700,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.status).toHaveBeenCalled()
+  })
+
+  it('settles at the shared deadline when title reassertion never resolves', async () => {
+    // #given — the attempt completes, then its best-effort title update hangs
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.update).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 700,
+      omoProviders: createDisabledProviders(),
+      sessionTitle: 'deadline title',
+    })
+
+    // #then — title cleanup cannot extend or rewrite the execution
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.update).toHaveBeenCalledOnce()
+  })
+
+  it('keeps timeout zero internally unbounded', async () => {
+    // #given — setup exceeds a short finite window but the explicit opt-out remains unbounded
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.create).mockReturnValue(
+      new Promise(resolve => setTimeout(() => resolve({data: {id: 'ses_123'}}), 50)),
+    )
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 0,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+
+  it('does not let a late prompt success replace the latched timeout', async () => {
+    // #given — the prompt resolves after the execution deadline
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Late response'}]}})
+    vi.mocked(mockClient.session.promptAsync).mockReturnValue(
+      new Promise(resolve => setTimeout(() => resolve({data: undefined}), 100)),
+    )
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    await new Promise<void>(resolve => setTimeout(resolve, 120))
+    expect(result.success).toBe(false)
+  })
+
+  it('does not start another attempt after a retry delay crosses the shared deadline', async () => {
+    // #given — the first prompt reports a retryable fetch failure immediately
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.promptAsync).mockResolvedValueOnce({error: {message: 'fetch failed'}})
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 50,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then — the retry shares the first attempt's budget instead of opening a fresh 5-second window
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
+  })
+
+  it('does not rewrite a timeout when the remote session abort rejects', async () => {
+    // #given
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
+    vi.mocked(mockClient.session.abort).mockRejectedValue(new Error('abort unavailable'))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then — teardown is fail-soft and cannot replace the terminal timeout result
+    expect(result).toMatchObject({success: false, exitCode: 130})
+  })
+
+  it('awaits a rejecting remote abort before closing the server', async () => {
+    // #given — the remote abort rejects asynchronously after timeout, so teardown ordering is observable
+    vi.useFakeTimers()
+    try {
+      const teardownOrder: string[] = []
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      vi.mocked(mockClient.event.subscribe).mockResolvedValue({
+        stream: (async function* () {})(),
+      } as Awaited<ReturnType<typeof mockClient.event.subscribe>>)
+      vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
+      vi.mocked(mockClient.session.abort).mockReturnValue(
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => {
+            teardownOrder.push('abort-rejected')
+            reject(new Error('abort unavailable'))
+          }, 100)
+        }),
+      )
+      const mockServer = createMockServer()
+      mockServer.close.mockImplementation(() => {
+        teardownOrder.push('server-closed')
+      })
+      const mockOpencode = createMockOpencode({client: mockClient, server: mockServer})
+      vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+      // #when
+      const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 25,
+        omoProviders: createDisabledProviders(),
+      })
+      await vi.advanceTimersByTimeAsync(25)
+
+      // #then — server teardown waits for the independent abort request, not just its invocation
+      expect(teardownOrder).toEqual([])
+      await vi.advanceTimersByTimeAsync(100)
+      const result = await resultPromise
+      expect(result).toMatchObject({success: false, exitCode: 130})
+      expect(teardownOrder).toEqual(['abort-rejected', 'server-closed'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('waits for a bounded never-resolving remote abort before closing the server', async () => {
+    // #given — the remote abort ignores cancellation and never settles
+    vi.useFakeTimers()
+    try {
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      vi.mocked(mockClient.event.subscribe).mockResolvedValue({
+        stream: (async function* () {})(),
+      } as Awaited<ReturnType<typeof mockClient.event.subscribe>>)
+      vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
+      vi.mocked(mockClient.session.abort).mockReturnValue(new Promise<never>(() => undefined))
+      const mockServer = createMockServer()
+      vi.mocked(createOpencode).mockResolvedValue(
+        createMockOpencode({client: mockClient, server: mockServer}) as unknown as Awaited<
+          ReturnType<typeof createOpencode>
+        >,
+      )
+
+      // #when
+      const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 25,
+        omoProviders: createDisabledProviders(),
+      })
+      await vi.advanceTimersByTimeAsync(25)
+
+      // #then — the timeout is latched, but the owned server remains open during abort teardown
+      expect(mockClient.session.abort).toHaveBeenCalledOnce()
+      expect(mockServer.close).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1_999)
+      expect(mockServer.close).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      const result = await resultPromise
+      expect(result).toMatchObject({success: false, exitCode: 130})
+      expect(mockServer.close).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('passes model configuration when provided', async () => {
@@ -600,10 +878,13 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    expect(mockClient.session.update).toHaveBeenCalledWith({
-      path: {id: 'ses_123'},
-      body: {title: 'fro-bot: schedule-c757a308'},
-    })
+    expect(mockClient.session.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: {id: 'ses_123'},
+        body: {title: 'fro-bot: schedule-c757a308'},
+        signal: expect.any(AbortSignal) as AbortSignal,
+      }),
+    )
   })
 
   it('re-asserts session title even when prompt attempt fails', async () => {
@@ -631,10 +912,13 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    expect(mockClient.session.update).toHaveBeenCalledWith({
-      path: {id: 'ses_123'},
-      body: {title: 'fro-bot: schedule-c757a308'},
-    })
+    expect(mockClient.session.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: {id: 'ses_123'},
+        body: {title: 'fro-bot: schedule-c757a308'},
+        signal: expect.any(AbortSignal) as AbortSignal,
+      }),
+    )
   })
 
   it('returns failure result when prompt fails', async () => {
@@ -3872,6 +4156,144 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     // #then
     expect(startPrompt).toHaveBeenCalledOnce()
     expect(result.success).toBe(true)
+  })
+
+  it('collects results from and tears down a keep-open SSE stream for each attempt', async () => {
+    // #given — the SSE stream only closes when its attempt-local subscription signal aborts
+    const {createExecutionDeadline} = await import('./retry.js')
+    const {sendPromptToSession} = await import('./prompt-sender.js')
+    const deadline = createExecutionDeadline(10_000, mockLogger)
+    let subscriptionSignal: AbortSignal | undefined
+    let streamClosed = false
+    let releasePromptStarted!: () => void
+    const promptStarted = new Promise<void>(resolve => {
+      releasePromptStarted = resolve
+    })
+    const events: Event[] = [
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'ses_123',
+            role: 'assistant',
+            tokens: {input: 3, output: 2, reasoning: 0, cache: {read: 0, write: 0}},
+            modelID: 'test-model',
+            cost: 0.01,
+          },
+        },
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ]
+    const keepOpenStream: AsyncIterable<Event> = {
+      [Symbol.asyncIterator]() {
+        let index = 0
+        return {
+          next: async (): Promise<IteratorResult<Event>> => {
+            const event = events[index]
+            if (event != null) {
+              if (index === 0) await promptStarted
+              index++
+              return {done: false, value: event}
+            }
+            await new Promise<void>(resolve => {
+              if (subscriptionSignal?.aborted === true) {
+                resolve()
+                return
+              }
+              subscriptionSignal?.addEventListener('abort', () => resolve(), {once: true})
+            })
+            streamClosed = true
+            return {done: true, value: undefined}
+          },
+        }
+      },
+    }
+    const mockClient = {
+      session: {
+        promptAsync: vi.fn().mockImplementation(async () => {
+          releasePromptStarted()
+          return {data: undefined}
+        }),
+        messages: vi.fn().mockResolvedValue({data: []}),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn(async (options: {signal?: AbortSignal}) => {
+          subscriptionSignal = options.signal
+          return {stream: keepOpenStream}
+        }),
+      },
+    }
+
+    // #when
+    let result
+    try {
+      result = await sendPromptToSession(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        'prompt',
+        undefined,
+        '/workspace',
+        undefined,
+        mockLogger,
+        undefined,
+        deadline,
+      )
+    } finally {
+      deadline.dispose()
+    }
+
+    // #then — completion waits for the stream to flush, and attempt cleanup closes its subscription
+    expect(result.success).toBe(true)
+    expect(result.eventStreamResult.tokens).toEqual({
+      input: 3,
+      output: 2,
+      reasoning: 0,
+      cache: {read: 0, write: 0},
+    })
+    expect(subscriptionSignal).toBeInstanceOf(AbortSignal)
+    expect(subscriptionSignal?.aborted).toBe(true)
+    expect(streamClosed).toBe(true)
+  })
+
+  it('removes the poll interval abort listener when the timer wins', async () => {
+    // #given — a deadline-aware poll whose first interval completes normally
+    vi.useFakeTimers()
+    try {
+      const {createExecutionDeadline} = await import('./retry.js')
+      const pollSignalController = new AbortController()
+      const addListener = vi.spyOn(pollSignalController.signal, 'addEventListener')
+      const removeListener = vi.spyOn(pollSignalController.signal, 'removeEventListener')
+      const deadline = createExecutionDeadline(10_000, mockLogger)
+      const mockClient = {
+        session: {
+          status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+        },
+      }
+
+      // #when
+      const pollPromise = pollForSessionCompletion(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        pollSignalController.signal,
+        mockLogger,
+        10_000,
+        undefined,
+        deadline,
+      )
+      await vi.advanceTimersByTimeAsync(500)
+      const result = await pollPromise
+      deadline.dispose()
+
+      // #then — the interval's listener is removed even though its timer resolved first
+      const intervalListener = addListener.mock.calls.find(call => call[0] === 'abort')?.[1]
+      expect(intervalListener).toBeDefined()
+      expect(removeListener).toHaveBeenCalledWith('abort', intervalListener)
+      expect(result).toEqual({completed: true, error: null})
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('prevents wait() resolving before any current-turn activity from declaring success', async () => {
