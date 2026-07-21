@@ -13,8 +13,8 @@
     "test": "bunx vitest run --passWithNoTests src"
   },
   "dependencies": {
-    "@hono/node-server": "2.0.8",
-    "hono": "4.12.29"
+    "@hono/node-server": "2.0.10",
+    "hono": "4.12.30"
   },
   "devDependencies": {
     "vitest": "4.1.10"
