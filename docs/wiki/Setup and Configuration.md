@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-07-12"
-updated-by: "schedule-d7190410-29208059688"
+last-updated: "2026-07-19"
+updated-by: "1a2d8b2"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -89,11 +89,11 @@ These can be overridden per-run via action inputs (`opencode-version`, `omo-vers
 
 Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
 
-The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.17.18+harness.4ec05a47`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.17.20+harness.b78cc9e1`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.18`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.18+harness.4ec05a47`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries seventeen such refs on top of the `1.17.18` base, spanning provider/model routing fixes (notably one that lets `gpt-5.6` variants resolve instead of failing `model_not_found`), SQLite lock-timeout retries, SSE backlog bounding, and several memory-leak and stability patches. The exact carry set is defined in `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.18`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.20+harness.b78cc9e1`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries twelve such refs on top of the `1.17.20` base, spanning provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, and several memory-leak and stability patches; as the base advanced from `1.17.18` to `1.17.20`, superseded and low-value carries were retired so the set stays lean. The exact carry set is defined in `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
 The presence of the `+harness.` marker drives three behavioral differences in `src/services/setup/opencode.ts`:
 
@@ -163,6 +163,7 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 - `prompt` provides a custom instruction for the agent. Required for `schedule` and `workflow_dispatch` events.
 - `output-mode` controls the delivery contract for `schedule` and `workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`; default `auto`). When set to `auto`, the resolver in `src/features/agent/output-mode.ts` scans the prompt text for branch/PR-related phrases (e.g., "pull request", "create a pr", "git push") and selects `branch-pr` if any match, otherwise `working-dir`. This heuristic is frozen — new phrases require a code change. The `output-mode` input has no effect on non-manual event types (issue comments, PRs, etc.), which always return `null`. See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md) for the design rationale.
 - `agent` selects the OpenCode agent. When unset, uses OpenCode's built-in `build` agent. Must be a primary agent, not a subagent.
+- `review-skip-label` (default `skip-agent-review`) names a PR label that suppresses the automatic review on `pull_request` events when present (case-insensitive). Setting it empty disables the opt-out. The label is a passive suppressor, not a hard block: an authorized `@fro-bot` mention in the PR body still runs on opened/synchronize/reopened/edited actions, and an explicit review request naming the bot both admits the event and beats the label. The suppression is evaluated in the routing phase (see [[Execution Lifecycle]]).
 - `enable-omo` enables Oh My OpenAgent (default: `false`). When `true`, oMo installs and configures Sisyphus as the default agent.
 - `enable-omo-slim` enables OMO Slim (default: `false`), mutually exclusive with `enable-omo`. When `true`, OMO Slim installs with the chosen `omo-slim-preset` (`openai` or `opencode-go`, default `openai`) and pins `orchestrator` as the default agent.
 - `model` overrides the LLM model in `provider/model` format.

@@ -193,7 +193,7 @@ jobs:
   # harness-integrate.yaml mints a short-lived credential from the OIDC
   # credential broker (no secrets: inherit, no AUTH_JSON) and runs the LLM
   # merge on it via the Fro Bot action.
-  # vars.HARNESS_MODEL must be set to anthropic/claude-sonnet-4-6 in repo vars.
+  # vars.HARNESS_MODEL must be set to anthropic/claude-sonnet-5 in repo vars.
   # Skipped when the carry set is empty (has_refs == 'false').
   # ---------------------------------------------------------------------------
   integrate:

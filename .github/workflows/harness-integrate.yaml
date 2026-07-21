@@ -19,7 +19,7 @@ on:
   workflow_call:
     inputs:
       model:
-        description: Model override for the merge agent (e.g. anthropic/claude-sonnet-4-6). Falls back to vars.HARNESS_MODEL when omitted.
+        description: Model override for the merge agent (e.g. anthropic/claude-sonnet-5). Falls back to vars.HARNESS_MODEL when omitted.
         type: string
         required: false
       prompt:
