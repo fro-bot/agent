@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-07-12"
-updated-by: "schedule-d7190410-29208059688"
+last-updated: "2026-07-19"
+updated-by: "1a2d8b2"
 sources:
   - src/main.ts
   - src/post.ts
@@ -19,6 +19,8 @@ sources:
   - packages/runtime/src/agent/remote-client.ts
   - packages/runtime/src/agent/filter-env.ts
   - packages/runtime/src/agent/with-scrubbed-env.ts
+  - packages/runtime/src/agent/error-format/types.ts
+  - src/features/triggers/skip-conditions-pr.ts
   - scripts/harness/mint-app-token.ts
   - packages/harness/harness.config.json
   - apps/workspace-agent/src/main.ts
@@ -112,7 +114,7 @@ The workspace-agent is a sandboxed Hono HTTP service that runs as a sidecar to t
 
 The runtime package exports five module groups:
 
-**Agent** (`agent/`) — Prompt construction, SDK execution, output-mode and response-delivery resolution, server bootstrapping, retry logic, and reference file management (see [[Prompt Architecture]]). Spawns of the OpenCode child are wrapped in a deny-by-default environment filter (`filter-env.ts` / `with-scrubbed-env.ts`) so credential-shaped variables never reach the agent process (see [[Setup and Configuration]]). Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
+**Agent** (`agent/`) — Prompt construction, SDK execution, output-mode and response-delivery resolution, server bootstrapping, retry logic, and reference file management (see [[Prompt Architecture]]). Spawns of the OpenCode child are wrapped in a deny-by-default environment filter (`filter-env.ts` / `with-scrubbed-env.ts`) so credential-shaped variables never reach the agent process (see [[Setup and Configuration]]). Error classification lives in a dedicated `error-format/` submodule that canonically owns the `ErrorType` union and `ErrorInfo` shape (re-exported from `types.ts` for callers), so the action and gateway format agent failures identically and the quota-vs-transient distinction stays in one place (see [[Execution Lifecycle]]). Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
 
 **Session** (`session/`) — SDK-backed session storage, search, pruning, writeback, and mapper layers (see [[Session Persistence]]).
 
@@ -128,7 +130,7 @@ The runtime package exports five module groups:
 
 **Services** — `github/` wraps Octokit and the `NormalizedEvent` system (see [[Execution Lifecycle]]). `cache/` manages GitHub Actions cache with corruption detection and S3 fallback. `setup/` orchestrates tool installation, including the new opt-in oMo installation controlled by the `enable-omo` input (see [[Setup and Configuration]]).
 
-**Features** — `agent/` bridges the runtime prompt builder with GitHub-specific context and the output-mode resolver (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic. `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` manages branch, commit, and PR operations the agent performs.
+**Features** — `agent/` bridges the runtime prompt builder with GitHub-specific context and the output-mode resolver (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic, including the PR review opt-out label handled in `skip-conditions-pr.ts` (see [[Execution Lifecycle]]). `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` manages branch, commit, and PR operations the agent performs.
 
 **Harness** — `run.ts` orchestrates the full execution lifecycle through discrete phases, including the new lock acquisition phase. `post.ts` handles the post-action cache save. `config/` parses action inputs and manages state keys.
 

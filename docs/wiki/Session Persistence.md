@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-06-28"
-updated-by: "schedule-d7190410-28335678121"
+last-updated: "2026-07-19"
+updated-by: "1a2d8b2"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
@@ -72,7 +72,7 @@ The implementation lives in `packages/runtime/src/object-store/` and consists of
 
 - **`validation.ts`** — Endpoint validation (HTTPS enforcement, SSRF protection against link-local/loopback/private IPs, metadata service blocking for `169.254.169.254` and `fd00:ec2::254`), prefix validation, key component sanitization, and download path traversal checks.
 
-- **`types.ts`** — Defines the `ObjectStoreAdapter` interface and typed error factories (`ValidationError`, `PathTraversalError`, `ObjectStoreOperationError`). The interface keeps the core upload/download/list operations required and exposes the conditional (ETag-guarded) and recency-aware operations — `conditionalPut`, `conditionalDelete`, `getObject`, and `listWithMetadata` — as optional, so backends that do not need them are not forced to implement them.
+- **`types.ts`** — Defines the `ObjectStoreAdapter` interface and typed error factories (`ValidationError`, `PathTraversalError`, `ObjectStoreOperationError`). The interface keeps the core upload/download/list operations required and exposes the conditional (ETag-guarded) and recency-aware operations — `conditionalPut`, `conditionalDelete`, `getObject`, and `listWithMetadata` — as optional, so backends that do not need them are not forced to implement them. `conditionalPut` also accepts an optional `tagging` string: the coordination layer (see [[Execution Lifecycle]]) tags its run-state objects so a bucket lifecycle policy can expire them on its own schedule. Tagging is applied only on real AWS S3 (`config.endpoint == null`); custom S3-compatible endpoints skip it, since their tagging support varies. Session database objects themselves are not tagged — the tag path is specific to the short-lived coordination records, not the durable session backup.
 
 ### How It Integrates
 
