@@ -2523,6 +2523,142 @@ describe('processEventStream', () => {
     expect(activityTracker.sessionError).toBe('Rate limit exceeded')
   })
 
+  it('preserves bounded allowlisted diagnostics from an object session.error through poll grace', async () => {
+    // #given — the provider error includes useful fields alongside nested and arbitrary secret data
+    const activityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const logger = createMockLogger()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {
+            provider: 'anthropic',
+            name: 'APIError',
+            data: {
+              status: 429,
+              code: 'provider_error',
+              message: 'Provider unavailable',
+              accountId: 'acct_super_secret_12345',
+              nested: {token: 'nested-secret'},
+            },
+            arbitrary: 'do-not-copy',
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, logger, activityTracker)
+
+    // #then — the event boundary keeps only bounded, allowlisted diagnostics
+    expect(activityTracker.sessionError).toBe(
+      'provider=anthropic; name=APIError; status=429; code=provider_error; message=Provider unavailable',
+    )
+    expect(activityTracker.sessionError).not.toContain('[object Object]')
+    expect(activityTracker.sessionError).not.toContain('acct_super_secret_12345')
+    expect(activityTracker.sessionError).not.toContain('nested-secret')
+    expect(activityTracker.sessionError).not.toContain('do-not-copy')
+
+    vi.useFakeTimers()
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const resultPromise = pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      logger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(2_000)
+    const result = await resultPromise
+    vi.useRealTimers()
+
+    expect(result.completed).toBe(false)
+    expect(result.error).toContain('provider=anthropic; name=APIError; status=429; code=provider_error')
+    expect(result.error).not.toContain('acct_super_secret_12345')
+    expect(result.error).not.toContain('nested-secret')
+    const loggerCalls = [...vi.mocked(logger.debug).mock.calls, ...vi.mocked(logger.error).mock.calls]
+    expect(JSON.stringify(loggerCalls)).not.toContain('acct_super_secret_12345')
+    expect(JSON.stringify(loggerCalls)).not.toContain('nested-secret')
+  })
+
+  it('uses a generic safe summary when an object session.error has no usable fields', async () => {
+    // #given — the provider error has no allowlisted diagnostics
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {accountId: 'acct_super_secret_12345', nested: {token: 'nested-secret'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(activityTracker.sessionError).toBe('Unknown session error')
+    expect(result.llmError?.message).toBe('Agent error: Unknown session error')
+    expect(JSON.stringify(result)).not.toContain('acct_super_secret_12345')
+    expect(JSON.stringify(result)).not.toContain('nested-secret')
+  })
+
+  it('retains the first normalized session error when a later error is only a string fallback', async () => {
+    // #given — a useful structured error arrives before a weaker repeated error
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {provider: 'anthropic', name: 'APIError', data: {status: 500, message: 'Upstream failed'}},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: 'late generic fallback'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.sessionError).toBe('provider=anthropic; name=APIError; status=500; message=Upstream failed')
+  })
+
   it('never passes the raw session.error payload (message/body/account metadata) into any logger call', async () => {
     // #given — a session.error carrying provider message text, a URL, and account/workspace
     // metadata that must never reach the logger, structured or as a raw string.

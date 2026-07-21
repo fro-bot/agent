@@ -125,22 +125,29 @@ export async function pollForSessionCompletion(
 ): Promise<PollResult> {
   const pollStart = Date.now()
   let errorGraceCycles = 0
+  let firstSessionError: string | null = null
 
   while (!signal.aborted) {
     await sleep(POLL_INTERVAL_MS)
     if (signal.aborted) return {completed: false, error: 'Aborted'}
 
-    if (activityTracker?.sessionError == null) {
+    const observedSessionError = activityTracker?.sessionError
+    if (firstSessionError == null && observedSessionError != null) {
+      firstSessionError = observedSessionError
+    }
+    const sessionError = activityTracker?.quotaExceeded?.message ?? firstSessionError
+
+    if (sessionError == null) {
       errorGraceCycles = 0
     } else {
       errorGraceCycles++
       if (errorGraceCycles >= ERROR_GRACE_CYCLES) {
         logger.error('Session error persisted through grace period', {
           sessionId,
-          error: activityTracker.sessionError,
+          error: sessionError,
           graceCycles: errorGraceCycles,
         })
-        return {completed: false, error: `Session error: ${activityTracker.sessionError}`}
+        return {completed: false, error: `Session error: ${sessionError}`}
       }
       continue
     }
