@@ -4676,7 +4676,7 @@ Apache-2.0
    limitations under the License.
 
 
-@hono/node-server@2.0.8
+@hono/node-server@2.0.10
 MIT
 MIT License
 
@@ -10126,7 +10126,7 @@ Apache License
    limitations under the License.
 
 
-effect@3.21.4
+effect@3.22.0
 MIT
 MIT License
 
@@ -10607,7 +10607,7 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
 IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 
-hono@4.12.29
+hono@4.12.30
 MIT
 MIT License
 

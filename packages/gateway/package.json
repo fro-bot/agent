@@ -13,11 +13,11 @@
   },
   "dependencies": {
     "@fro-bot/runtime": "workspace:*",
-    "@hono/node-server": "2.0.8",
+    "@hono/node-server": "2.0.10",
     "@octokit/core": "7.0.6",
     "discord.js": "14.26.5",
-    "effect": "3.21.4",
-    "hono": "4.12.29",
+    "effect": "3.22.0",
+    "hono": "4.12.30",
     "web-push": "3.6.7",
     "yaml": "2.9.0"
   },
