@@ -7,7 +7,9 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
+import {createProviderAuthError} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {formatErrorComment} from '../../features/comments/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 
 const mocks = vi.hoisted(() => ({
@@ -471,6 +473,244 @@ describe('runFinalize non-file-convention delivery', () => {
   })
 })
 
+describe('runFinalize provider_auth_error handling', () => {
+  const AUTH_RAW_MESSAGE = 'provider raw message with auth-token-sentinel'
+  const AUTH_PROVIDER_ID = 'provider-id-sentinel'
+  const AUTH_PROVIDER_URL = 'https://provider.example.invalid/account-sentinel'
+  const AUTH_ACCOUNT = 'provider-account-sentinel'
+  const AUTH_ROUTE = 'discussion://provider-route-sentinel'
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+  })
+
+  function createProviderAuthExecution(overrides: Partial<ExecutePhaseResult> = {}): ExecutePhaseResult {
+    const safeError = createProviderAuthError()
+    return createExecution({
+      success: false,
+      exitCode: 1,
+      error: `${AUTH_RAW_MESSAGE} ${AUTH_PROVIDER_ID} ${AUTH_PROVIDER_URL} ${AUTH_ACCOUNT} ${AUTH_ROUTE}`,
+      llmError: {
+        ...safeError,
+        message: `${AUTH_RAW_MESSAGE} ${AUTH_PROVIDER_ID}`,
+        details: `${AUTH_PROVIDER_URL} ${AUTH_ACCOUNT}`,
+        suggestedAction: AUTH_ROUTE,
+      },
+      ...overrides,
+    })
+  }
+
+  function assertNoProviderAuthSentinelLeak(text: string): void {
+    expect(text).not.toContain(AUTH_RAW_MESSAGE)
+    expect(text).not.toContain(AUTH_PROVIDER_ID)
+    expect(text).not.toContain(AUTH_PROVIDER_URL)
+    expect(text).not.toContain(AUTH_ACCOUNT)
+    expect(text).not.toContain(AUTH_ROUTE)
+  }
+
+  it.each([
+    {
+      label: 'issue',
+      routing: createRouting(),
+      expectedTarget: {type: 'issue', number: 1, owner: 'owner', repo: 'repo'},
+    },
+    {
+      label: 'pull request',
+      routing: createRouting({
+        triggerResult: {context: {eventType: 'pull_request'}} as TriggerResultProcess,
+        agentContext: {
+          eventName: 'pull_request',
+          repo: 'owner/repo',
+          ref: 'refs/heads/main',
+          runId: '123',
+          issueNumber: 42,
+          issueType: 'pr',
+        } as AgentContext,
+      }),
+      expectedTarget: {type: 'pr', number: 42, owner: 'owner', repo: 'repo'},
+    },
+    {
+      label: 'discussion',
+      routing: createRouting({triggerResult: {context: {eventType: 'discussion_comment'}} as TriggerResultProcess}),
+      expectedTarget: {type: 'discussion', number: 1, owner: 'owner', repo: 'repo'},
+    },
+  ])(
+    'posts one trusted auth comment to the bound $label target without reading the response file',
+    async ({routing, expectedTarget}) => {
+      // #given file-convention delivery and a terminal provider authentication error
+      const bootstrap = createBootstrap({delivery: 'file-convention'})
+      const execution = createProviderAuthExecution()
+      const metrics = createMetrics()
+
+      // #when runFinalize runs
+      const exitCode = await runFinalize(
+        bootstrap,
+        routing,
+        cacheRestore,
+        execution,
+        metrics,
+        Date.now(),
+        createMockLogger(),
+      )
+
+      // #then auth finalization owns delivery, preserves the harness target, and fails the Action
+      expect(exitCode).toBe(1)
+      expect(mocks.runResponsePost).not.toHaveBeenCalled()
+      expect(mocks.postComment).toHaveBeenCalledTimes(1)
+      const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
+      expect(target).toEqual(expectedTarget)
+      expect(options.body).toBe(formatErrorComment(createProviderAuthError()))
+      expect(options.body).not.toContain('response artifact')
+      expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+      const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
+      expect(failedMessage).toContain('model provider authentication failed')
+      assertNoProviderAuthSentinelLeak(options.body)
+      assertNoProviderAuthSentinelLeak(failedMessage)
+    },
+  )
+
+  it('posts one trusted auth comment for model-gh delivery and never changes the target from provider-shaped fields', async () => {
+    // #given model-gh delivery with a bound PR target and provider-controlled route-like fields
+    const bootstrap = createBootstrap({delivery: 'model-gh', responseFilePath: null})
+    const routing = createRouting({
+      triggerResult: {context: {eventType: 'pull_request'}} as TriggerResultProcess,
+      agentContext: {
+        eventName: 'pull_request',
+        repo: 'trusted-owner/trusted-repo',
+        ref: 'refs/heads/main',
+        runId: '123',
+        issueNumber: 7,
+        issueType: 'pr',
+      } as AgentContext,
+    })
+    const execution = createProviderAuthExecution()
+    const metrics = createMetrics()
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then only harness-owned routing determines the trusted surface and target
+    expect(exitCode).toBe(1)
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+    expect(mocks.postComment).toHaveBeenCalledTimes(1)
+    const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
+    expect(target).toEqual({type: 'pr', number: 7, owner: 'trusted-owner', repo: 'trusted-repo'})
+    expect(options.body).toBe(formatErrorComment(createProviderAuthError()))
+    expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+    const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
+    assertNoProviderAuthSentinelLeak(options.body)
+    assertNoProviderAuthSentinelLeak(failedMessage)
+  })
+
+  it('fails silently for delivery none without reading or posting a response', async () => {
+    // #given delivery: none and a valid harness target
+    const bootstrap = createBootstrap({delivery: 'none', responseFilePath: null})
+    const execution = createProviderAuthExecution()
+    const metrics = createMetrics()
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      createRouting(),
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then delivery is suppressed but the Action still fails
+    expect(exitCode).toBe(1)
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+    expect(mocks.postComment).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+    const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
+    expect(failedMessage).toContain('model provider authentication failed')
+    assertNoProviderAuthSentinelLeak(failedMessage)
+  })
+
+  it('fails without posting and logs only bounded fixed context when the target is malformed', async () => {
+    // #given malformed routing target data and provider-shaped fields in the execution result
+    const bootstrap = createBootstrap({delivery: 'model-gh', responseFilePath: null})
+    const routing = createRouting({
+      agentContext: {...createRouting().agentContext, repo: 'trusted-owner-only', issueNumber: 0},
+    })
+    const execution = createProviderAuthExecution()
+    const metrics = createMetrics()
+    const logger = createMockLogger()
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), logger)
+
+    // #then no delivery surface is invented and the Action still fails
+    expect(exitCode).toBe(1)
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+    expect(mocks.postComment).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Cannot post provider authentication error comment: missing target context',
+    )
+    const logText = JSON.stringify(vi.mocked(logger.warning).mock.calls)
+    assertNoProviderAuthSentinelLeak(logText)
+  })
+
+  it('suppresses a duplicate auth response while keeping the run failed', async () => {
+    // #given a response was already posted before auth finalization
+    const bootstrap = createBootstrap({delivery: 'file-convention'})
+    const execution = createProviderAuthExecution({commentsPosted: 1})
+    const metrics = createMetrics()
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      createRouting(),
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the one-response invariant suppresses another post without masking auth failure
+    expect(exitCode).toBe(1)
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+    expect(mocks.postComment).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not retry or use another surface when the trusted auth writer fails', async () => {
+    // #given a bound target whose one allowed post attempt fails
+    mocks.postComment.mockResolvedValue(null)
+    const bootstrap = createBootstrap({delivery: 'model-gh', responseFilePath: null})
+    const execution = createProviderAuthExecution()
+    const metrics = createMetrics()
+    const logger = createMockLogger()
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(bootstrap, createRouting(), cacheRestore, execution, metrics, Date.now(), logger)
+
+    // #then writer failure is warning-only and auth remains the primary failed outcome
+    expect(exitCode).toBe(1)
+    expect(mocks.postComment).toHaveBeenCalledTimes(1)
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+    const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
+    expect(failedMessage).toContain('model provider authentication failed')
+    expect(logger.warning).toHaveBeenCalledTimes(1)
+    assertNoProviderAuthSentinelLeak(JSON.stringify(vi.mocked(logger.warning).mock.calls))
+    assertNoProviderAuthSentinelLeak(failedMessage)
+  })
+})
+
 describe('runFinalize quota_exceeded llmError handling', () => {
   const ATTACKER_MESSAGE = 'attacker-controlled message with secret-token-xyz'
   const ATTACKER_DETAILS = 'attacker-controlled details'
@@ -616,22 +856,16 @@ describe('runFinalize quota_exceeded llmError handling', () => {
     })
     const execution = createQuotaExecution()
     const metrics = createMetrics()
+    const logger = createMockLogger()
 
     // #when runFinalize runs
-    const exitCode = await runFinalize(
-      bootstrap,
-      routing,
-      cacheRestore,
-      execution,
-      metrics,
-      Date.now(),
-      createMockLogger(),
-    )
+    const exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), logger)
 
-    // #then no post is attempted, but the run still fails closed
+    // #then no post is attempted, a coarse warning is emitted, and the run still fails closed
     expect(mocks.postComment).not.toHaveBeenCalled()
     expect(exitCode).toBe(1)
     expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+    expect(logger.warning).toHaveBeenCalledWith('Cannot post quota exceeded error comment: missing target context')
   })
 
   it('makes zero postComment calls and fails closed when delivery is none, even with a valid target', async () => {

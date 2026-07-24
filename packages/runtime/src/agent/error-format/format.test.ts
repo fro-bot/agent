@@ -1,10 +1,13 @@
-import {describe, expect, it} from 'vitest'
+import type {ProviderAuthErrorInput} from './types.js'
+import {describe, expect, expectTypeOf, it} from 'vitest'
 import {
+  classifyProviderAuthError,
   classifyQuotaError,
   createAgentError,
   createErrorInfo,
   createLLMFetchError,
   createLLMTimeoutError,
+  createProviderAuthError,
   createQuotaExceededError,
   createRateLimitError,
   formatErrorComment,
@@ -369,6 +372,125 @@ describe('agent/error-format/format', () => {
       expect(error.suggestedAction).toBe(
         'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
       )
+    })
+  })
+
+  describe('provider authentication errors', () => {
+    it('keeps only classification fields in the provider auth input type', () => {
+      // #given the provider authentication classifier input type
+      // #when inspecting its shape
+      expectTypeOf<ProviderAuthErrorInput>().not.toHaveProperty('status')
+      expectTypeOf<ProviderAuthErrorInput>().not.toHaveProperty('code')
+      expectTypeOf<ProviderAuthErrorInput>().not.toHaveProperty('providerID')
+      expectTypeOf<ProviderAuthErrorInput>().not.toHaveProperty('message')
+      // #then it excludes fields that do not affect classification
+    })
+
+    it('classifies the exact structured ProviderAuthError marker into fixed non-retryable output', () => {
+      // #given a structured provider authentication failure with untrusted provider fields
+      const providerId = 'provider-auth-sentinel-7f2c'
+      const providerMessage = 'https://provider.example.invalid/account/sentinel-token'
+      const input = {
+        kind: 'session-error' as const,
+        name: 'ProviderAuthError',
+        providerID: providerId,
+        message: providerMessage,
+        status: 401,
+        code: 'invalid_api_key',
+      }
+
+      // #when classifying the signal
+      const error = classifyProviderAuthError(input)
+
+      // #then it becomes the fixed provider authentication error
+      expect(error).toEqual(createProviderAuthError())
+      expect(error?.type).toBe('provider_auth_error')
+      expect(error?.retryable).toBe(false)
+    })
+
+    it('classifies only the exact auth_unavailable retry reason into the same fixed error', () => {
+      // #given OpenCode's issue-derived retry status marker
+      const error = classifyProviderAuthError({kind: 'retry-status', reason: 'auth_unavailable'})
+
+      // #then it becomes the same fixed provider authentication error
+      expect(error).toEqual(createProviderAuthError())
+      expect(error?.type).toBe('provider_auth_error')
+      expect(error?.retryable).toBe(false)
+    })
+
+    it('classifies with hostile provider fields and does not leak sentinels', () => {
+      // #given a structured marker with missing provider fields and a runtime object carrying hostile extras
+      const missingFields = classifyProviderAuthError({kind: 'session-error', name: 'ProviderAuthError'})
+      // Keep this as an inferred variable so the runtime extras are exercised instead of rejected by excess-property checking.
+      const hostileInput = {
+        kind: 'session-error' as const,
+        name: 'ProviderAuthError',
+        providerID: 'acct-sentinel-91d4',
+        message: 'token-sentinel-52aa https://provider.example.invalid/account/sentinel',
+        status: 401,
+        code: 'account-sentinel-83e1',
+      }
+      const hostileError = classifyProviderAuthError(hostileInput)
+      const rendered = JSON.stringify(hostileError) + formatErrorComment(hostileError ?? createProviderAuthError())
+
+      // #then missing fields do not change the fixed output and no provider-controlled values are rendered
+      expect(missingFields).toEqual(createProviderAuthError())
+      expect(hostileError).toEqual(createProviderAuthError())
+      expect(rendered).not.toContain('acct-sentinel-91d4')
+      expect(rendered).not.toContain('token-sentinel-52aa')
+      expect(rendered).not.toContain('https://provider.example.invalid')
+      expect(rendered).not.toContain('account-sentinel-83e1')
+      expect(rendered).not.toContain('401')
+    })
+
+    it('formats provider authentication errors as fixed non-retryable guidance', () => {
+      // #given a fixed provider authentication error
+      const error = createProviderAuthError()
+
+      // #when formatting the error
+      const formatted = formatErrorComment(error)
+
+      // #then it uses the exhaustive provider-auth label and fatal icon without retry guidance
+      expect(formatted).toContain(':x:')
+      expect(formatted).toContain('Provider Authentication Error')
+      expect(formatted).not.toContain('retryable')
+    })
+
+    it('does not classify generic outages, network failures, or unrelated markers', () => {
+      // #given provider signals without one of the exact authentication markers
+      const unrelatedNames = ['ProviderAutherror', 'providerautherror', 'ProviderAuthError ']
+      const unrelatedReasons = ['account_rate_limit', 'service_unavailable', 'auth_unavailable_retry', '']
+
+      // #then none become provider authentication errors
+      for (const name of unrelatedNames) {
+        expect(classifyProviderAuthError({kind: 'session-error', name})).toBeNull()
+      }
+      for (const reason of unrelatedReasons) {
+        expect(classifyProviderAuthError({kind: 'retry-status', reason})).toBeNull()
+      }
+    })
+
+    it('does not classify wrong-case, overlong, or malformed structured values', () => {
+      // #given structured signals that are not valid provider-auth markers
+      const overlongName = `ProviderAuthError${'x'.repeat(128)}`
+      const overlongReason = `auth_unavailable${'x'.repeat(128)}`
+      const nonAuthInputs = [
+        {kind: 'session-error' as const, name: 'ProviderAuthError '},
+        {kind: 'session-error' as const, name: 'providerautherror'},
+        {kind: 'session-error' as const, name: overlongName},
+        {kind: 'session-error' as const, name: 42},
+        {kind: 'session-error' as const, name: {}},
+        {kind: 'retry-status' as const, reason: 'AUTH_UNAVAILABLE'},
+        {kind: 'retry-status' as const, reason: 'auth_unavailable_retry'},
+        {kind: 'retry-status' as const, reason: overlongReason},
+        {kind: 'retry-status' as const, reason: 42},
+        {kind: 'retry-status' as const, reason: {}},
+      ]
+
+      // #then malformed or unrelated values remain outside the provider-auth category
+      for (const input of nonAuthInputs) {
+        expect(classifyProviderAuthError(input)).toBeNull()
+      }
     })
   })
 
