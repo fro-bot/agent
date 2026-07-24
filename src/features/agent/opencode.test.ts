@@ -15,7 +15,7 @@ import {createMockLogger} from '../../shared/test-helpers.js'
 import {executeOpenCode} from './execution.js'
 import {verifyOpenCodeAvailable} from './server.js'
 import {INITIAL_ACTIVITY_TIMEOUT_MS, pollForSessionCompletion, waitForEventProcessorShutdown} from './session-poll.js'
-import {logServerEvent, processEventStream} from './streaming.js'
+import {logServerEvent, processEventStream, type ActivityTracker} from './streaming.js'
 
 // Mock node:fs/promises
 vi.mock('node:fs/promises', () => ({
@@ -1571,6 +1571,64 @@ describe('executeOpenCode retry behavior', () => {
     )
   })
 
+  it('does not retry when ProviderAuthError is observed and returns only fixed safe output', async () => {
+    // #given — an accepted prompt followed by a structured provider authentication failure
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+        }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () =>
+          createPromptStartedEventStream(mockClient.session.promptAsync, [
+            {
+              type: 'session.error',
+              properties: {
+                sessionID: 'ses_123',
+                error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+              },
+            } as unknown as Event,
+          ]),
+        ),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const startedAt = Date.now()
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(2_000)
+    const result = await resultPromise
+    const elapsedMs = Date.now() - startedAt
+
+    // #then — one attempt, no continuation, and no provider-controlled values in AgentResult
+    expect(promptCallCount).toBe(1)
+    expect(elapsedMs).toBeLessThan(10_000)
+    expect(result.success).toBe(false)
+    expect(result.exitCode).toBe(1)
+    expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(result.error).toContain('model provider rejected authentication')
+    expect(result.llmError?.message).not.toContain('sentinel')
+    expect(result.error).not.toContain('sentinel')
+    expect(JSON.stringify(result)).not.toContain('sentinel-provider')
+    expect(JSON.stringify(result)).not.toContain('sentinel-token')
+    expect(mockLogger.warning).not.toHaveBeenCalledWith(
+      'LLM fetch error detected, retrying with continuation prompt',
+      expect.any(Object),
+    )
+  })
+
   it('stops retrying after MAX_LLM_RETRIES attempts', async () => {
     // #given
     const mockServer = createMockServer()
@@ -2419,6 +2477,111 @@ describe('pollForSessionCompletion', () => {
     expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
   })
 
+  it('fails fast on a poll-only retry status with action.reason auth_unavailable (no SSE event at all)', async () => {
+    // #given — REST polling observes the auth marker while the SSE stream misses it
+    vi.useFakeTimers()
+    try {
+      let callCount = 0
+      const mockClient = {
+        session: {
+          status: vi.fn().mockImplementation(async () => {
+            callCount++
+            return {
+              data: {
+                ses_123: {
+                  type: 'retry',
+                  attempt: 1,
+                  action: {reason: 'auth_unavailable', provider: 'sentinel-provider'},
+                  message: 'sentinel-token',
+                },
+              },
+            }
+          }),
+        },
+      }
+      const activityTracker = {
+        firstMeaningfulEventReceived: true,
+        currentTurnTerminalSignalReceived: false,
+        sessionIdle: false,
+        sessionError: null,
+      }
+      const pollPromise = pollForSessionCompletion(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        new AbortController().signal,
+        mockLogger,
+        30_000,
+        activityTracker,
+      )
+
+      // #when
+      await vi.advanceTimersByTimeAsync(1_000)
+      const result = await pollPromise
+
+      // #then — auth must terminate on the first poll instead of becoming a timeout
+      expect(result.completed).toBe(false)
+      expect(result.error).toContain('model provider rejected authentication')
+      expect(callCount).toBe(1)
+      expect(JSON.stringify(result)).not.toContain('sentinel-provider')
+      expect(JSON.stringify(result)).not.toContain('sentinel-token')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves a terminal auth slot when the deadline expires before the next poll handoff', async () => {
+    // #given — auth was accepted into the shared tracker before the deadline became authoritative
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    await processEventStream(
+      createMockEventStream([
+        {
+          type: 'session.error',
+          properties: {
+            sessionID: 'ses_123',
+            error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+          },
+        } as unknown as Event,
+      ]).stream,
+      'ses_123',
+      new AbortController().signal,
+      mockLogger,
+      activityTracker,
+    )
+    const deadline: ExecutionDeadline = {
+      timeoutMs: 1,
+      signal: new AbortController().signal,
+      isExpired: () => true,
+      isTimedOut: () => true,
+      remainingMs: () => 0,
+      run: async operation => operation(),
+      dispose: vi.fn(),
+    }
+
+    // #when
+    const result = await pollForSessionCompletion(
+      {session: {status: vi.fn()}} as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+      deadline,
+    )
+
+    // #then — the accepted terminal outcome wins over the later deadline callback
+    expect(result.completed).toBe(false)
+    expect(result.error).toContain('model provider rejected authentication')
+    expect(JSON.stringify(result)).not.toContain('sentinel-provider')
+    expect(JSON.stringify(result)).not.toContain('sentinel-token')
+  })
+
   it('never passes the raw poll-only retry status payload (message/provider text/link) into any logger call', async () => {
     // #given — the poll-only quota fail-fast path must also bound its logging
     const sensitiveLink = 'https://opencode.ai/workspace/acme-corp/go'
@@ -2476,7 +2639,7 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {
+    const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: true,
       currentTurnTerminalSignalReceived: false,
       sessionIdle: false,
@@ -3348,6 +3511,128 @@ describe('processEventStream', () => {
     expect(JSON.stringify(result)).not.toContain('https://opencode.ai')
   })
 
+  it.each([
+    [
+      'properties.error',
+      {
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+        },
+      },
+    ],
+    [
+      'data.error',
+      {
+        data: {
+          sessionID: 'ses_123',
+          error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+        },
+      },
+    ],
+  ])(
+    'classifies ProviderAuthError from the %s session.error envelope as a terminal provider auth error',
+    async (_label, event) => {
+      // #given — OpenCode's structured provider authentication failure in either supported envelope
+      const activityTracker = {
+        firstMeaningfulEventReceived: false,
+        currentTurnTerminalSignalReceived: false,
+        sessionIdle: false,
+        sessionError: null,
+      }
+      const eventStream = createMockEventStream([{type: 'session.error', ...event} as unknown as Event])
+
+      // #when
+      const result = await processEventStream(
+        eventStream.stream,
+        'ses_123',
+        new AbortController().signal,
+        createMockLogger(),
+        activityTracker,
+      )
+
+      // #then — classification is fixed and terminal; provider-controlled values do not cross the boundary
+      expect(result.llmError?.type).toBe('provider_auth_error')
+      expect(result.llmError?.retryable).toBe(false)
+      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+      expect(JSON.stringify(result)).not.toContain('sentinel-provider')
+      expect(JSON.stringify(result)).not.toContain('sentinel-token')
+    },
+  )
+
+  it('classifies the exact auth_unavailable retry status as a terminal provider auth error', async () => {
+    // #given — issue #1253's retry status marker
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_123',
+          status: {
+            type: 'retry',
+            action: {reason: 'auth_unavailable', provider: 'sentinel-provider'},
+            message: 'sentinel-token',
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(JSON.stringify(result)).not.toContain('sentinel-provider')
+    expect(JSON.stringify(result)).not.toContain('sentinel-token')
+  })
+
+  it('keeps a generic structured 503 session error outside the provider auth terminal path', async () => {
+    // #given — a provider outage marker without the structured auth name/code contract
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'APIError', data: {status: 503, message: 'sentinel-outage'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — generic outage behavior is unchanged and does not retain provider prose
+    expect(result.llmError?.type).toBe('configuration')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(JSON.stringify(result)).not.toContain('sentinel-outage')
+  })
+
   it('does not classify session.status retry with an unrelated reason as quota exceeded', async () => {
     // #given — retry status with a different action.reason (e.g. free_tier_limit)
     const activityTracker = {
@@ -3649,6 +3934,128 @@ describe('processEventStream', () => {
     // #then — quota remains; not downgraded to the later generic configuration error
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(activityTracker.sessionError).not.toContain('Invalid API key')
+  })
+
+  it('upgrades generic session errors to auth and keeps auth across later generic and idle events', async () => {
+    // #given — a generic error arrives before the terminal auth marker, followed by downgrade attempts
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([
+      {type: 'session.error', properties: {sessionID: 'ses_123', error: 'sentinel-generic'}} as unknown as Event,
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+        },
+      } as unknown as Event,
+      {type: 'session.error', properties: {sessionID: 'ses_123', error: 'later-generic'}} as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — terminal auth upgrades generic state and remains authoritative
+    expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(activityTracker.terminalProviderError?.type).toBe('provider_auth_error')
+    expect(activityTracker.sessionError).toBe(result.llmError?.message)
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(JSON.stringify(activityTracker)).not.toContain('sentinel-generic')
+    expect(JSON.stringify(activityTracker)).not.toContain('sentinel-provider')
+    expect(JSON.stringify(activityTracker)).not.toContain('sentinel-token')
+  })
+
+  it.each([
+    ['auth first', 'provider_auth_error'],
+    ['quota first', 'quota_exceeded'],
+  ])('preserves the first terminal provider signal when %s', async (_label, expectedType) => {
+    // #given — auth and quota arrive in both possible terminal orders
+    const firstAuth = _label === 'auth first'
+    const authEvent = {
+      type: 'session.error',
+      properties: {
+        sessionID: 'ses_123',
+        error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+      },
+    } as unknown as Event
+    const quotaEvent = {
+      type: 'session.status',
+      properties: {
+        sessionID: 'ses_123',
+        status: {
+          type: 'retry',
+          action: {reason: 'account_rate_limit', provider: 'sentinel-provider'},
+          message: 'sentinel-quota',
+        },
+      },
+    } as unknown as Event
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream(firstAuth ? [authEvent, quotaEvent] : [quotaEvent, authEvent]).stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — the first terminal classification wins and remains safe
+    expect(result.llmError?.type).toBe(expectedType)
+    expect(activityTracker.terminalProviderError?.type).toBe(expectedType)
+    expect(JSON.stringify(result)).not.toContain('sentinel-provider')
+    expect(JSON.stringify(result)).not.toContain('sentinel-token')
+    expect(JSON.stringify(result)).not.toContain('sentinel-quota')
+  })
+
+  it('ignores a ProviderAuthError event for another session', async () => {
+    // #given — auth is associated with a different session ID
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_other',
+          error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+        },
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError).toBeNull()
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
   })
 
   it('classifies structured session.error with allowlisted status/code/message fields as quota exceeded via fallback', async () => {
@@ -4717,6 +5124,44 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
   })
 
+  it('keeps the deadline authoritative when auth classification occurs after expiry', async () => {
+    // #given — the deadline is already expired before the auth event can be accepted
+    const {runPromptAttempt} = await import('./retry.js')
+    const deadline: ExecutionDeadline = {
+      timeoutMs: 1,
+      signal: new AbortController().signal,
+      isExpired: () => true,
+      isTimedOut: () => true,
+      remainingMs: () => 0,
+      run: async operation => operation(),
+      dispose: vi.fn(),
+    }
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when / #then
+    await expect(
+      runPromptAttempt(
+        {session: {status: vi.fn()}} as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        30_000,
+        mockLogger,
+        eventStream.stream,
+        undefined,
+        undefined,
+        deadline,
+      ),
+    ).rejects.toMatchObject({name: 'DeadlineExceededError'})
+  })
+
   it('removes the poll interval abort listener when the timer wins', async () => {
     // #given — a deadline-aware poll whose first interval completes normally
     vi.useFakeTimers()
@@ -5336,6 +5781,53 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(result.llmError?.type).toBe('quota_exceeded')
   })
 
+  it('v2.session.wait() resolving after provider auth failure never reports success', async () => {
+    // #given — wait() resolves after SSE observes the structured provider auth failure
+    let resolveWait!: () => void
+    const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+      async () =>
+        new Promise<TestWaitResponse>(resolve => {
+          resolveWait = () => resolve({data: undefined, error: undefined})
+        }),
+    )
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+        },
+      } as unknown as Event,
+    ])
+    setTimeout(() => resolveWait(), 20)
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+      'http://localhost:1234',
+    )
+
+    // #then — wait() completion cannot turn a terminal auth failure into success or a retry
+    expect(waitFn).toHaveBeenCalled()
+    expect(result.success).toBe(false)
+    expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(result.shouldRetry).toBe(false)
+    expect(JSON.stringify(result)).not.toContain('sentinel-provider')
+    expect(JSON.stringify(result)).not.toContain('sentinel-token')
+  })
+
   it('poll-only quota via REST (no SSE event at all) produces a failed, non-retryable quota_exceeded result', async () => {
     // #given — the SSE stream never emits a session.status/session.error quota signal (empty
     // stream); the REST poll is the only source that observes the account_rate_limit retry status.
@@ -5738,7 +6230,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
   it('does not set shouldRetry when llmError is a non-retryable quota_exceeded error, even though the poll failed', async () => {
     // #given — a structured session.error classifies as quota_exceeded (non-retryable); the poll
-    // fails via the sessionError grace-cycle path since the session never reaches idle.
+    // fails through the shared terminal-provider slot since the session never reaches idle.
     vi.useFakeTimers()
     try {
       const {runPromptAttempt} = await import('./retry.js')

@@ -275,7 +275,7 @@ async function tryCreateV2Client(
 }
 
 /** Calls v2.session.wait() on an existing server; non-blocking, runs alongside pollForSessionCompletion(). */
-type V2WaitOutcome = 'fallback-to-poll' | 'quota-failed' | 'succeeded'
+type V2WaitOutcome = 'fallback-to-poll' | 'terminal-provider-failed' | 'succeeded'
 
 async function startV2SessionWait(
   serverUrl: string | null | undefined,
@@ -323,12 +323,12 @@ async function startV2SessionWait(
       logger.debug('v2.session.wait() resolved without terminal signal — deferring to poll watchdog', {sessionId})
       return 'fallback-to-poll'
     }
-    // Quota is terminal but must never be reported as wait() success.
-    if (activityTracker.quotaExceeded != null) {
-      logger.debug('v2.session.wait() resolved after quota exceeded — reporting quota failure, not success', {
+    // Terminal provider errors must never be reported as wait() success.
+    if (activityTracker.terminalProviderError != null) {
+      logger.debug('v2.session.wait() resolved after terminal provider error — reporting failure, not success', {
         sessionId,
       })
-      return 'quota-failed'
+      return 'terminal-provider-failed'
     }
     logger.debug('v2.session.wait() resolved with terminal signal — session is done', {sessionId})
     return 'succeeded'
@@ -383,7 +383,7 @@ export async function runPromptAttempt(
     llmError: null,
   }
 
-  const eventProcessor = processEventStream(events, sessionId, eventSignal, logger, activityTracker)
+  const eventProcessor = processEventStream(events, sessionId, eventSignal, logger, activityTracker, deadline)
     .then(result => {
       eventStreamResult = result
     })
@@ -439,7 +439,7 @@ export async function runPromptAttempt(
     // Authoritative completion signal when available; falls back to the poller otherwise.
     const waitPromise = startV2SessionWait(serverUrl, sessionId, activityTracker, logger, waitSignal, deadline)
 
-    // Race: wait() succeeds → success; wait() quota-failed → failure (never success on quota);
+    // Race: wait() succeeds → success; terminal provider failure → failure (never success);
     // wait() falls back → use poll result.
     const pollResult = await Promise.race([
       waitPromise.then(
@@ -447,8 +447,11 @@ export async function runPromptAttempt(
           if (outcome === 'succeeded') {
             return {completed: true, error: null}
           }
-          if (outcome === 'quota-failed') {
-            return {completed: false, error: activityTracker.quotaExceeded?.message ?? 'Quota exceeded'}
+          if (outcome === 'terminal-provider-failed') {
+            return {
+              completed: false,
+              error: activityTracker.terminalProviderError?.message ?? 'Terminal provider error',
+            }
           }
           // wait() unavailable or failed — fall through to poll result
           return pollPromise
@@ -457,13 +460,29 @@ export async function runPromptAttempt(
       pollPromise,
     ])
 
-    if (deadline?.isExpired() === true) throw createDeadlineExceededError('prompt attempt')
+    if (deadline?.isExpired() === true && activityTracker.terminalProviderError == null) {
+      throw createDeadlineExceededError('prompt attempt')
+    }
 
     await collectEventResults()
 
-    // Merge poll-observed quota (SSE may never have emitted one) into the authoritative result.
-    if (activityTracker.quotaExceeded != null && eventStreamResult.llmError?.type !== 'quota_exceeded') {
-      eventStreamResult = {...eventStreamResult, llmError: activityTracker.quotaExceeded}
+    // Merge poll-observed terminal provider errors (SSE may never have emitted one) into the authoritative result.
+    if (
+      activityTracker.terminalProviderError != null &&
+      eventStreamResult.llmError?.type !== activityTracker.terminalProviderError.type
+    ) {
+      eventStreamResult = {...eventStreamResult, llmError: activityTracker.terminalProviderError}
+    }
+
+    if (activityTracker.terminalProviderError != null) {
+      const terminalError = activityTracker.terminalProviderError
+      return {
+        success: false,
+        error: terminalError.message,
+        llmError: terminalError,
+        shouldRetry: false,
+        eventStreamResult,
+      }
     }
 
     if (!pollResult.completed) {

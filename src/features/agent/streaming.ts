@@ -2,7 +2,9 @@ import type {ErrorInfo} from '@fro-bot/runtime'
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
+import type {ExecutionDeadline} from './retry.js'
 import {
+  classifyProviderAuthError,
   classifyQuotaError,
   createAgentError,
   createErrorInfo,
@@ -34,12 +36,12 @@ export interface ActivityTracker {
   completedAssistantMessageId?: string
   sessionIdle: boolean
   sessionError: string | null
-  /** Set when a quota_exceeded ErrorInfo has been classified; fails fast (no grace, no v2 wait success). */
-  quotaExceeded?: ErrorInfo
+  /** Set when a terminal provider ErrorInfo has been classified; first terminal signal wins. */
+  terminalProviderError?: ErrorInfo
 }
 
-/** Shared quota classification for `session.status`/`retry`, used by both SSE and REST poll paths. */
-export function classifyRetryStatusQuota(status: unknown): ErrorInfo | null {
+/** Shared provider-terminal classification for `session.status`/`retry`, used by both SSE and REST poll paths. */
+export function classifyRetryStatusError(status: unknown): ErrorInfo | null {
   if (getStringProperty(status, 'type') !== 'retry') return null
 
   const action = getObjectProperty(status, 'action')
@@ -50,15 +52,44 @@ export function classifyRetryStatusQuota(status: unknown): ErrorInfo | null {
   const candidateResetAt = nextRaw != null && Number.isFinite(nextRaw) ? new Date(nextRaw) : undefined
   const resetAt = candidateResetAt != null && !Number.isNaN(candidateResetAt.getTime()) ? candidateResetAt : undefined
 
-  return classifyQuotaError({kind: 'retry-status', reason, resetAt})
+  return (
+    classifyProviderAuthError({kind: 'retry-status', reason}) ??
+    classifyQuotaError({kind: 'retry-status', reason, resetAt})
+  )
 }
 
-/** First-writer-wins, except quota may upgrade a prior error and is then sticky (never downgraded). */
-function mergeTerminalError(existing: ErrorInfo | null, candidate: ErrorInfo): ErrorInfo {
-  if (existing == null) return candidate
-  if (existing.type === 'quota_exceeded') return existing
-  if (candidate.type === 'quota_exceeded') return candidate
-  return existing
+function isTerminalProviderError(error: ErrorInfo): boolean {
+  return error.type === 'quota_exceeded' || error.type === 'provider_auth_error'
+}
+
+/** Merge generic and terminal observations while freezing the first terminal provider signal. */
+export function mergeActivityError(
+  existing: ErrorInfo | null,
+  candidate: ErrorInfo,
+  activityTracker?: ActivityTracker,
+  genericSessionError?: string,
+): ErrorInfo {
+  const existingTerminal = activityTracker?.terminalProviderError
+  if (existingTerminal != null) return existingTerminal
+
+  const candidateIsTerminal = isTerminalProviderError(candidate)
+  const existingIsTerminal = existing != null && isTerminalProviderError(existing)
+  let merged = existing ?? candidate
+  if (existingIsTerminal) merged = existing
+  else if (candidateIsTerminal) merged = candidate
+
+  if (activityTracker != null && isTerminalProviderError(merged)) {
+    activityTracker.terminalProviderError = merged
+    activityTracker.sessionError = merged.message
+    activityTracker.currentTurnTerminalSignalReceived = true
+    return merged
+  }
+
+  if (activityTracker != null && activityTracker.sessionError == null && genericSessionError != null) {
+    activityTracker.sessionError = genericSessionError
+  }
+
+  return merged
 }
 
 export function logServerEvent(event: Event, logger: Logger): void {
@@ -225,6 +256,7 @@ export async function processEventStream(
   signal: AbortSignal,
   logger: Logger,
   activityTracker?: ActivityTracker,
+  deadline?: ExecutionDeadline,
 ): Promise<EventStreamResult> {
   let lastText = ''
   let tokens: TokenUsage | null = null
@@ -387,15 +419,14 @@ export async function processEventStream(
     } else if (eventType === 'session.status') {
       if (getSessionID(eventPayload) === sessionId) {
         const status = getObjectProperty(eventPayload, 'status')
-        const quotaError = classifyRetryStatusQuota(status)
-        if (quotaError != null && llmError?.type !== 'quota_exceeded') {
-          logger.error('Session status retry classified as quota exceeded', {sessionId, type: quotaError.type})
-          llmError = mergeTerminalError(llmError, quotaError)
-          if (activityTracker != null) {
-            activityTracker.sessionError = llmError.message
-            activityTracker.quotaExceeded = llmError
-            activityTracker.currentTurnTerminalSignalReceived = true
-          }
+        const terminalError = classifyRetryStatusError(status)
+        if (terminalError != null) {
+          if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
+          logger.error('Session status retry classified as terminal provider error', {
+            sessionId,
+            type: terminalError.type,
+          })
+          llmError = mergeActivityError(llmError, terminalError, activityTracker)
         }
       }
     } else if (eventType === 'session.error') {
@@ -404,52 +435,50 @@ export async function processEventStream(
         // Bounded log: never pass the raw session error payload to the logger.
         logger.error('Session error received', {sessionType: typeof sessionError})
 
-        // Quota may upgrade a prior non-quota error; quota itself is sticky.
-        if (llmError == null || llmError.type !== 'quota_exceeded') {
-          // Allowlisted structured fields only — never echo the raw session error object/URL.
-          const errorData = getObjectProperty(sessionError, 'data')
-          const status =
-            getNumberProperty(sessionError, 'status') ??
-            getNumberProperty(sessionError, 'statusCode') ??
-            getNumberProperty(errorData, 'status') ??
-            getNumberProperty(errorData, 'statusCode')
-          const code = getStringProperty(sessionError, 'code') ?? getStringProperty(errorData, 'code')
-          // Intentional tradeoff: object message text is classification-only for quota and excluded from safe
-          // fetch-retry classification, so object {message: 'fetch failed'} remains non-retryable; string/thrown
-          // fetch errors remain retryable.
-          const structuredMessage =
-            getStringProperty(sessionError, 'message') ?? getStringProperty(errorData, 'message')
-          const plainMessage = typeof sessionError === 'string' ? sessionError : undefined
-          const message = structuredMessage ?? plainMessage
+        // Allowlisted structured fields only — never echo the raw session error object/URL.
+        const errorData = getObjectProperty(sessionError, 'data')
+        const status =
+          getNumberProperty(sessionError, 'status') ??
+          getNumberProperty(sessionError, 'statusCode') ??
+          getNumberProperty(errorData, 'status') ??
+          getNumberProperty(errorData, 'statusCode')
+        const code = getStringProperty(sessionError, 'code') ?? getStringProperty(errorData, 'code')
+        const name = getStringProperty(sessionError, 'name') ?? getStringProperty(errorData, 'name')
+        // Intentional tradeoff: object message text is classification-only for quota and excluded from safe
+        // fetch-retry classification, so object {message: 'fetch failed'} remains non-retryable; string/thrown
+        // fetch errors remain retryable.
+        const structuredMessage = getStringProperty(sessionError, 'message') ?? getStringProperty(errorData, 'message')
+        const plainMessage = typeof sessionError === 'string' ? sessionError : undefined
+        const message = structuredMessage ?? plainMessage
 
-          const quotaError = classifyQuotaError({
+        const terminalError =
+          classifyProviderAuthError({
+            kind: 'session-error',
+            name,
+            status,
+            code,
+            message,
+          }) ??
+          classifyQuotaError({
             kind: 'session-error',
             status: status ?? undefined,
             code: code ?? undefined,
             message: message ?? undefined,
           })
 
-          if (quotaError == null) {
-            if (llmError == null) {
-              const errorStr = normalizeSessionError(sessionError)
-              if (isLlmFetchError(errorStr)) {
-                llmError = createLLMFetchError(errorStr, model ?? undefined)
-              } else if (status === 429) {
-                // Ordinary 429 without account_rate_limit stays retryable rate_limit.
-                llmError = createErrorInfo('rate_limit', errorStr, true)
-              } else {
-                llmError = createAgentError(errorStr)
-              }
-              if (activityTracker != null) activityTracker.sessionError = errorStr
-            }
-          } else {
-            llmError = mergeTerminalError(llmError, quotaError)
-            if (activityTracker != null) {
-              activityTracker.sessionError = llmError.message
-              activityTracker.quotaExceeded = llmError
-              activityTracker.currentTurnTerminalSignalReceived = true
-            }
-          }
+        if (terminalError != null) {
+          if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
+          logger.error('Session error classified as terminal provider error', {sessionId, type: terminalError.type})
+          llmError = mergeActivityError(llmError, terminalError, activityTracker)
+        } else if (llmError == null || isTerminalProviderError(llmError) === false) {
+          const errorStr = normalizeSessionError(sessionError)
+          const genericError = isLlmFetchError(errorStr)
+            ? createLLMFetchError(errorStr, model ?? undefined)
+            : status === 429
+              ? // Ordinary 429 without account_rate_limit stays retryable rate_limit.
+                createErrorInfo('rate_limit', errorStr, true)
+              : createAgentError(errorStr)
+          llmError = mergeActivityError(llmError, genericError, activityTracker, errorStr)
         }
       }
     } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
