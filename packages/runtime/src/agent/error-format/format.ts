@@ -180,40 +180,18 @@ function normalizeProviderAuthString(value: unknown): string | undefined {
   return value
 }
 
-function normalizeProviderAuthStatus(value: unknown): number | undefined {
-  if (typeof value !== 'number') return undefined
-  if (!Number.isInteger(value) || value < 100 || value > 599) return undefined
-  return value
-}
-
-function normalizeProviderAuthInput(input: ProviderAuthErrorInput): {
-  readonly name?: string
-  readonly status?: number
-  readonly reason?: string
-  readonly code?: string
-} {
-  return {
-    name: normalizeProviderAuthString(input.name),
-    status: normalizeProviderAuthStatus(input.status),
-    reason: normalizeProviderAuthString(input.reason),
-    code: normalizeProviderAuthString(input.code),
-  }
-}
-
 /**
  * Classify exact structured provider authentication markers as a fixed
  * `provider_auth_error`. Generic statuses, messages, codes, and retry reasons
  * are intentionally not authentication evidence.
  */
-export function classifyProviderAuthError(input: ProviderAuthErrorInput): ErrorInfo | null {
-  const normalized = normalizeProviderAuthInput(input)
-
+export function classifyProviderAuthError<T extends ProviderAuthErrorInput>(input: T): ErrorInfo | null {
   if (input.kind === 'retry-status') {
-    if (normalized.reason !== 'auth_unavailable') return null
+    if (normalizeProviderAuthString(input.reason) !== 'auth_unavailable') return null
     return createProviderAuthError()
   }
 
-  if (input.kind === 'session-error' && normalized.name === 'ProviderAuthError') {
+  if (normalizeProviderAuthString(input.name) === 'ProviderAuthError') {
     return createProviderAuthError()
   }
 
