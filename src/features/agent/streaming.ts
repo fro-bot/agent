@@ -180,7 +180,6 @@ function normalizeSessionError(sessionError: unknown): string {
   const provider = getSessionErrorField(sessionError, errorData, 'provider')
   const name = getSessionErrorField(sessionError, errorData, 'name')
   const code = getSessionErrorField(sessionError, errorData, 'code')
-  const message = getSessionErrorField(sessionError, errorData, 'message')
   const status =
     getNumberProperty(sessionError, 'status') ??
     getNumberProperty(sessionError, 'statusCode') ??
@@ -192,7 +191,6 @@ function normalizeSessionError(sessionError: unknown): string {
   if (name != null) fields.push(`name=${name}`)
   if (status != null && Number.isFinite(status)) fields.push(`status=${status}`)
   if (code != null) fields.push(`code=${code}`)
-  if (message != null) fields.push(`message=${message}`)
 
   return fields.length > 0 ? fields.join('; ') : GENERIC_SESSION_ERROR
 }

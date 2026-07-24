@@ -98,7 +98,7 @@ export async function sendPromptToSession(
         deadline,
         attemptAbortController,
       )
-    return deadline == null ? await runAttempt() : await deadline.run(runAttempt, 'prompt attempt')
+    return await runAttempt()
   } finally {
     attemptAbortController.abort()
   }

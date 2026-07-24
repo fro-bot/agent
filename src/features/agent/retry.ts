@@ -10,11 +10,10 @@ import {detectArtifactsFromMessageParts, processEventStream} from './streaming.j
 export type PromptStartResult = AttemptResult | null
 export type PromptStarter = () => Promise<PromptStartResult>
 
-export class DeadlineExceededError extends Error {
-  constructor(label: string) {
-    super(`${label} exceeded the execution deadline`)
-    this.name = 'DeadlineExceededError'
-  }
+export function createDeadlineExceededError(label: string): Error {
+  const error = new Error(`${label} exceeded the execution deadline`)
+  error.name = 'DeadlineExceededError'
+  return error
 }
 
 export interface ExecutionDeadline {
@@ -57,22 +56,22 @@ export function createExecutionDeadline(timeoutMs: number, logger: Logger): Exec
   }
 
   const run = async <T>(operation: () => Promise<T>, label: string): Promise<T> => {
-    if (isExpired()) throw new DeadlineExceededError(label)
+    if (isExpired()) throw createDeadlineExceededError(label)
     if (deadlineAt == null) return operation()
 
     let onAbort: (() => void) | null = null
     const abortPromise = new Promise<never>((_, reject) => {
-      onAbort = (): void => reject(new DeadlineExceededError(label))
+      onAbort = (): void => reject(createDeadlineExceededError(label))
       controller.signal.addEventListener('abort', onAbort, {once: true})
     })
 
     const operationPromise = Promise.resolve().then(operation)
     try {
       const result = await Promise.race([operationPromise, abortPromise])
-      if (isExpired()) throw new DeadlineExceededError(label)
+      if (isExpired()) throw createDeadlineExceededError(label)
       return result
     } catch (error) {
-      if (timedOut) throw new DeadlineExceededError(label)
+      if (timedOut) throw createDeadlineExceededError(label)
       throw error
     } finally {
       if (onAbort != null) controller.signal.removeEventListener('abort', onAbort)
@@ -394,11 +393,18 @@ export async function runPromptAttempt(
       }
     })
 
-  const collectEventResults = async () => {
+  let eventProcessorShutdown: Promise<void> | null = null
+  const stopEventProcessor = async (): Promise<void> => {
+    if (eventProcessorShutdown != null) return eventProcessorShutdown
     attemptController.abort()
     waitAbortController.abort()
-    await waitForEventProcessorShutdown(eventProcessor)
     eventAbortController.abort()
+    eventProcessorShutdown = waitForEventProcessorShutdown(eventProcessor)
+    return eventProcessorShutdown
+  }
+
+  const collectEventResults = async () => {
+    await stopEventProcessor()
   }
 
   try {
@@ -451,7 +457,7 @@ export async function runPromptAttempt(
       pollPromise,
     ])
 
-    if (deadline?.isTimedOut() === true) throw new DeadlineExceededError('prompt attempt')
+    if (deadline?.isExpired() === true) throw createDeadlineExceededError('prompt attempt')
 
     await collectEventResults()
 
@@ -472,6 +478,16 @@ export async function runPromptAttempt(
       }
     }
 
+    if (deadline?.isTimedOut() === true) {
+      return {
+        success: true,
+        error: null,
+        llmError: null,
+        shouldRetry: false,
+        eventStreamResult,
+      }
+    }
+
     // Post-idle artifact reconciliation: one-shot read of the completed assistant message.
     const fallbackMessageParts = await readCompletedAssistantMessageParts(
       client,
@@ -481,8 +497,6 @@ export async function runPromptAttempt(
       logger,
       deadline,
     )
-
-    if (deadline?.isTimedOut() === true) throw new DeadlineExceededError('artifact reconciliation')
 
     if (fallbackMessageParts != null) {
       const fallback = detectArtifactsFromMessageParts(fallbackMessageParts, logger)
@@ -504,9 +518,6 @@ export async function runPromptAttempt(
       eventStreamResult,
     }
   } finally {
-    attemptController.abort()
-    waitAbortController.abort()
-    await waitForEventProcessorShutdown(eventProcessor)
-    eventAbortController.abort()
+    await stopEventProcessor()
   }
 }

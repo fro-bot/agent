@@ -70,6 +70,7 @@ export async function executeOpenCode(
     llmError: null,
   }
   let lastLlmError: ErrorInfo | null = null
+  let shouldAbortRemoteOnTimeout = true
   logger.info('Executing OpenCode agent (SDK mode)', {
     agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
@@ -164,21 +165,19 @@ export async function executeOpenCode(
       const files = allFileParts.length > 0 ? allFileParts : undefined
       const result = await (async () => {
         try {
-          return await deadline.run(
-            async () =>
-              sendPromptToSession(
-                sessionClient,
-                activeSessionId,
-                prompt,
-                files,
-                directory,
-                config,
-                logger,
-                serverUrl,
-                deadline,
-              ),
-            'OpenCode prompt attempt',
+          const attemptResult = await sendPromptToSession(
+            sessionClient,
+            activeSessionId,
+            prompt,
+            files,
+            directory,
+            config,
+            logger,
+            serverUrl,
+            deadline,
           )
+          shouldAbortRemoteOnTimeout = false
+          return attemptResult
         } finally {
           if (deadline.isExpired() === false)
             await reassertSessionTitle(sessionClient, activeSessionId, config?.sessionTitle, logger, {
@@ -188,8 +187,6 @@ export async function executeOpenCode(
             })
         }
       })()
-
-      if (deadline.isExpired()) return timeoutResult()
 
       if (result.success) {
         final = result.eventStreamResult
@@ -212,7 +209,8 @@ export async function executeOpenCode(
 
       lastError = result.error
       lastLlmError = result.llmError
-      if (!result.shouldRetry || attempt >= MAX_LLM_RETRIES) break
+      if (!result.shouldRetry || attempt >= MAX_LLM_RETRIES || deadline.isExpired()) break
+      shouldAbortRemoteOnTimeout = true
       logger.warning('LLM fetch error detected, retrying with continuation prompt', {
         attempt,
         maxAttempts: MAX_LLM_RETRIES,
@@ -259,7 +257,7 @@ export async function executeOpenCode(
       llmError: isLlmFetchError(error) ? createLLMFetchError(errorMessage) : null,
     }
   } finally {
-    if (deadline.isTimedOut() && client != null && sessionId != null)
+    if (shouldAbortRemoteOnTimeout && deadline.isTimedOut() && client != null && sessionId != null)
       await abortRemoteSession(client, sessionId, logger)
     deadline.dispose()
     if (ownsServer) server?.close()
