@@ -153,6 +153,48 @@ function getObjectProperty(value: unknown, property: string): unknown {
   return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
 }
 
+const SESSION_ERROR_FIELD_MAX_LENGTH = 256
+const GENERIC_SESSION_ERROR = 'Unknown session error'
+
+function getBoundedStringProperty(value: unknown, property: string): string | null {
+  const propertyValue = getStringProperty(value, property)
+  if (propertyValue == null || propertyValue.length === 0) return null
+
+  const normalized = propertyValue.replaceAll(/[\r\n]+/g, '; ').trim()
+  if (normalized.length === 0) return null
+  if (normalized.length <= SESSION_ERROR_FIELD_MAX_LENGTH) return normalized
+
+  return `${normalized.slice(0, SESSION_ERROR_FIELD_MAX_LENGTH - 3)}...`
+}
+
+function getSessionErrorField(primary: unknown, fallback: unknown, property: string): string | null {
+  return getBoundedStringProperty(primary, property) ?? getBoundedStringProperty(fallback, property)
+}
+
+/** Normalize an SDK session error without coercing or retaining its raw payload. */
+function normalizeSessionError(sessionError: unknown): string {
+  if (typeof sessionError === 'string') return sessionError
+  if (sessionError == null || typeof sessionError !== 'object') return GENERIC_SESSION_ERROR
+
+  const errorData = getObjectProperty(sessionError, 'data')
+  const provider = getSessionErrorField(sessionError, errorData, 'provider')
+  const name = getSessionErrorField(sessionError, errorData, 'name')
+  const code = getSessionErrorField(sessionError, errorData, 'code')
+  const status =
+    getNumberProperty(sessionError, 'status') ??
+    getNumberProperty(sessionError, 'statusCode') ??
+    getNumberProperty(errorData, 'status') ??
+    getNumberProperty(errorData, 'statusCode')
+  const fields: string[] = []
+
+  if (provider != null) fields.push(`provider=${provider}`)
+  if (name != null) fields.push(`name=${name}`)
+  if (status != null && Number.isFinite(status)) fields.push(`status=${status}`)
+  if (code != null) fields.push(`code=${code}`)
+
+  return fields.length > 0 ? fields.join('; ') : GENERIC_SESSION_ERROR
+}
+
 function getEventSessionID(event: Event): string | null {
   return getSessionID(getObjectProperty(event, 'properties')) ?? getSessionID(getObjectProperty(event, 'data'))
 }
@@ -365,10 +407,18 @@ export async function processEventStream(
         // Quota may upgrade a prior non-quota error; quota itself is sticky.
         if (llmError == null || llmError.type !== 'quota_exceeded') {
           // Allowlisted structured fields only — never echo the raw session error object/URL.
-          const errorData = getObjectProperty(sessionError, 'data') ?? sessionError
-          const status = getNumberProperty(errorData, 'status') ?? getNumberProperty(errorData, 'statusCode')
-          const code = getStringProperty(errorData, 'code')
-          const structuredMessage = getStringProperty(errorData, 'message')
+          const errorData = getObjectProperty(sessionError, 'data')
+          const status =
+            getNumberProperty(sessionError, 'status') ??
+            getNumberProperty(sessionError, 'statusCode') ??
+            getNumberProperty(errorData, 'status') ??
+            getNumberProperty(errorData, 'statusCode')
+          const code = getStringProperty(sessionError, 'code') ?? getStringProperty(errorData, 'code')
+          // Intentional tradeoff: object message text is classification-only for quota and excluded from safe
+          // fetch-retry classification, so object {message: 'fetch failed'} remains non-retryable; string/thrown
+          // fetch errors remain retryable.
+          const structuredMessage =
+            getStringProperty(sessionError, 'message') ?? getStringProperty(errorData, 'message')
           const plainMessage = typeof sessionError === 'string' ? sessionError : undefined
           const message = structuredMessage ?? plainMessage
 
@@ -381,8 +431,8 @@ export async function processEventStream(
 
           if (quotaError == null) {
             if (llmError == null) {
-              const errorStr = typeof sessionError === 'string' ? sessionError : String(sessionError)
-              if (isLlmFetchError(sessionError)) {
+              const errorStr = normalizeSessionError(sessionError)
+              if (isLlmFetchError(errorStr)) {
                 llmError = createLLMFetchError(errorStr, model ?? undefined)
               } else if (status === 429) {
                 // Ordinary 429 without account_rate_limit stays retryable rate_limit.

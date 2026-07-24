@@ -21,6 +21,9 @@ import {setActionOutputs} from '../config/outputs.js'
 const QUOTA_EXCEEDED_SET_FAILED_MESSAGE =
   'Agent execution stopped: provider quota exceeded. Check the provider account/billing settings, wait for the quota to reset, or switch to a different model or provider.'
 
+const FILE_READ_FAILURE_FALLBACK_ACTION =
+  'The agent execution failed before it could write a response artifact, so no response was delivered.'
+
 /** Resolve the event-bound comment target (issue, PR, or discussion) shared by all error-comment paths. */
 function resolveCommentTarget(routing: RoutingPhaseResult): CommentTarget {
   const [repoOwner, repoName] = routing.agentContext.repo.split('/')
@@ -41,6 +44,19 @@ function resolveCommentTarget(routing: RoutingPhaseResult): CommentTarget {
 
 function isResolvedCommentTarget(target: CommentTarget): boolean {
   return target.number > 0 && target.owner.length > 0 && target.repo.length > 0
+}
+
+function formatFileReadFailureFallback(): string {
+  return FILE_READ_FAILURE_FALLBACK_ACTION
+}
+
+function failWithPrimaryExecutionError(execution: ExecutePhaseResult): number {
+  const failureMessage =
+    execution.error != null && execution.error.length > 0
+      ? `Agent execution failed: ${execution.error}`
+      : `Agent execution failed with exit code ${execution.exitCode}`
+  core.setFailed(failureMessage)
+  return execution.exitCode
 }
 
 /** Post a formatted error comment to the resolved target, if any. Never throws. */
@@ -131,6 +147,17 @@ export async function runFinalize(
     )
 
     if (result.delivered === false) {
+      if (result.reason === 'file-read-failed' && execution.success === false && execution.commentsPosted === 0) {
+        const commentTarget = resolveCommentTarget(routing)
+        if (isResolvedCommentTarget(commentTarget)) {
+          await postErrorComment(routing, commentTarget, formatFileReadFailureFallback(), metrics, logger)
+        } else {
+          logger.warning('Cannot post missing-response fallback comment: missing target context')
+        }
+
+        return failWithPrimaryExecutionError(execution)
+      }
+
       core.setFailed(
         `Failed to deliver the agent's response from ${bootstrap.responseFilePath}: ${result.reason} — ${result.detail}`,
       )

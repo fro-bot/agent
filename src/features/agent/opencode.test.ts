@@ -1,5 +1,6 @@
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
+import type {ExecutionDeadline} from './retry.js'
 import type {OpenCodeServerHandle} from './server.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
@@ -180,6 +181,23 @@ function createPromptStartedEventStream(
   }
 }
 
+function createPromptStartedHangingEventStream(
+  promptAsync: ReturnType<typeof vi.fn>,
+  events: Event[],
+): AsyncIterable<Event> {
+  return (async function* () {
+    const callsBeforeSubscribe = promptAsync.mock.calls.length
+    while (promptAsync.mock.calls.length === callsBeforeSubscribe) {
+      await new Promise<void>(resolve => {
+        setTimeout(resolve, 0)
+      })
+    }
+    await Promise.resolve()
+    for (const event of events) yield event
+    await new Promise<never>(() => undefined)
+  })()
+}
+
 type SessionStatus = {type: 'idle'} | {type: 'retry'; attempt: number; message: string; next: number} | {type: 'busy'}
 
 function createMockClient(options: {
@@ -214,6 +232,7 @@ function createMockClient(options: {
         ? vi.fn().mockRejectedValue(new Error('Session creation failed'))
         : vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
       update: vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
+      abort: vi.fn().mockResolvedValue({data: undefined}),
       promptAsync,
       messages: vi.fn().mockResolvedValue({data: []}),
       status: vi.fn().mockImplementation(async () => {
@@ -324,6 +343,483 @@ describe('executeOpenCode', () => {
     expect(promptCall?.body?.parts).toEqual([{type: 'text', text: 'Built prompt with sessionId'}])
     expect(promptCall?.query?.directory).toEqual(expect.any(String))
     expect(result.sessionId).toBe('ses_123')
+  })
+
+  it('settles with a timeout when session creation never resolves', async () => {
+    // #given — the SDK session-create request ignores cancellation and never settles
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(mockClient.session.create).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+    await new Promise<void>(resolve => setTimeout(resolve, 50))
+
+    // #then — the shared deadline must settle the root execution instead of leaving it pending
+    const result = await Promise.race([resultPromise, Promise.resolve(null)])
+    expect(result).not.toBeNull()
+    expect(result).toMatchObject({success: false, exitCode: 130, error: 'Execution timed out after 25ms'})
+  })
+
+  it('settles at the shared deadline when event subscription never resolves', async () => {
+    // #given — subscription ignores the propagated cancellation signal
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.event.subscribe).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then — timeout is terminal and the already-created remote session receives one best-effort abort
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.abort).toHaveBeenCalledOnce()
+  })
+
+  it('settles at the shared deadline when prompt submission never resolves', async () => {
+    // #given — prompt submission ignores the propagated cancellation signal
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.abort).toHaveBeenCalledOnce()
+  })
+
+  it('settles at the shared deadline when a poll request never resolves', async () => {
+    // #given — no event activity, followed by a poll status request that never settles
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+      events: [],
+    })
+    vi.mocked(mockClient.session.status).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 700,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.status).toHaveBeenCalled()
+  })
+
+  it('returns the shared timeout when v2 session.wait never resolves and polling cannot complete', async () => {
+    // #given — v2 wait ignores cancellation while polling observes a permanently busy session
+    vi.useFakeTimers()
+    try {
+      const waitFn = vi.fn<TestWaitFn>().mockImplementation(async () => new Promise<never>(() => undefined))
+      vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+      vi.resetModules()
+      const {executeOpenCode: executeWithDeadline} = await import('./execution.js')
+      const {createOpencode: createOpencodeForTest} = await import('@opencode-ai/sdk')
+      const mockClient = createMockClient({
+        promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+        events: [
+          {
+            type: 'message.part.delta',
+            properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'activity'}},
+          } as unknown as Event,
+        ],
+        statusSequence: [{ses_123: {type: 'busy'}}],
+      })
+      const mockOpencode = createMockOpencode({client: mockClient})
+      vi.mocked(createOpencodeForTest).mockResolvedValue(
+        mockOpencode as unknown as Awaited<ReturnType<typeof createOpencodeForTest>>,
+      )
+
+      // #when
+      const resultPromise = executeWithDeadline(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 1_000,
+        omoProviders: createDisabledProviders(),
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+      const result = await resultPromise
+
+      // #then — the harness deadline wins without waiting for an SDK-level timeout
+      expect(result).toMatchObject({success: false, exitCode: 130})
+      expect(result.error).toBe('Execution timed out after 1000ms')
+      expect(waitFn).toHaveBeenCalledOnce()
+      expect(mockClient.session.status).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves pre-deadline success when bounded SSE cleanup crosses the deadline', async () => {
+    // #given — terminal success arrives before the deadline, but SSE shutdown ignores cancellation
+    vi.useFakeTimers()
+    let resultPromise: ReturnType<typeof executeOpenCode> | undefined
+    try {
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      const terminalEvents: Event[] = [
+        {
+          type: 'message.updated',
+          properties: {
+            info: {
+              sessionID: 'ses_123',
+              role: 'assistant',
+              tokens: {input: 3, output: 2, reasoning: 1, cache: {read: 4, write: 5}},
+              modelID: 'test-model',
+              cost: 0.01,
+            },
+          },
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ]
+      vi.mocked(mockClient.event.subscribe).mockResolvedValue({
+        stream: createPromptStartedHangingEventStream(mockClient.session.promptAsync, terminalEvents),
+      })
+      const mockOpencode = createMockOpencode({client: mockClient})
+      vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+      // #when
+      resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 1_000,
+        omoProviders: createDisabledProviders(),
+        sessionTitle: 'pre-deadline success',
+      })
+      await vi.advanceTimersByTimeAsync(2_500)
+      const result = await resultPromise
+
+      // #then — cleanup may consume the remaining budget, but cannot rewrite terminal success
+      expect(result).toMatchObject({success: true, exitCode: 0})
+      expect(mockClient.session.messages).toHaveBeenCalledOnce()
+      expect(mockClient.session.update).not.toHaveBeenCalled()
+      expect(mockClient.session.abort).not.toHaveBeenCalled()
+    } finally {
+      await vi.advanceTimersByTimeAsync(4_000)
+      if (resultPromise != null) await resultPromise
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves a pre-deadline retryable failure when cleanup crosses the deadline without retrying', async () => {
+    // #given — prompt submission returns a retryable terminal failure before SSE cleanup hangs
+    vi.useFakeTimers()
+    let resultPromise: ReturnType<typeof executeOpenCode> | undefined
+    try {
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      vi.mocked(mockClient.session.promptAsync).mockResolvedValue({error: 'fetch failed'})
+      vi.mocked(mockClient.event.subscribe).mockResolvedValue({
+        stream: createPromptStartedHangingEventStream(mockClient.session.promptAsync, []),
+      })
+      const mockOpencode = createMockOpencode({client: mockClient})
+      vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+      // #when
+      resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 1_000,
+        omoProviders: createDisabledProviders(),
+        sessionTitle: 'pre-deadline failure',
+      })
+      await vi.advanceTimersByTimeAsync(10_000)
+      const result = await resultPromise
+
+      // #then — primary failure survives cleanup and cannot open a continuation attempt
+      expect(result).toMatchObject({success: false, exitCode: 1})
+      expect(result.error).toContain('fetch failed')
+      expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
+      expect(mockClient.session.update).not.toHaveBeenCalled()
+      expect(mockClient.session.abort).not.toHaveBeenCalled()
+    } finally {
+      await vi.advanceTimersByTimeAsync(4_000)
+      if (resultPromise != null) await resultPromise
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves terminal success when title reassertion crosses the deadline', async () => {
+    // #given — the attempt completes, then its best-effort title update hangs
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.update).mockReturnValue(new Promise<never>(() => undefined))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 700,
+      omoProviders: createDisabledProviders(),
+      sessionTitle: 'deadline title',
+    })
+
+    // #then — title cleanup cannot extend or rewrite the terminal success
+    expect(result).toMatchObject({success: true, exitCode: 0})
+    expect(mockClient.session.update).toHaveBeenCalledOnce()
+  })
+
+  it('preserves terminal success when artifact enrichment crosses the deadline', async () => {
+    // #given — terminal success is accepted before a started artifact read crosses the deadline
+    vi.useFakeTimers()
+    let resultPromise: ReturnType<typeof executeOpenCode> | undefined
+    try {
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      vi.mocked(mockClient.session.messages)
+        .mockResolvedValueOnce({data: []})
+        .mockReturnValue(new Promise<never>(() => undefined))
+      const mockOpencode = createMockOpencode({client: mockClient})
+      vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+      // #when
+      resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 1_000,
+        omoProviders: createDisabledProviders(),
+        sessionTitle: 'artifact deadline',
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+      const result = await resultPromise
+
+      // #then — the terminal result survives a timed-out best-effort artifact read
+      expect(result).toMatchObject({success: true, exitCode: 0})
+      expect(mockClient.session.messages).toHaveBeenCalledTimes(2)
+      expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
+      expect(mockClient.session.update).not.toHaveBeenCalled()
+      expect(mockClient.session.abort).not.toHaveBeenCalled()
+    } finally {
+      await vi.advanceTimersByTimeAsync(4_000)
+      if (resultPromise != null) await resultPromise
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps timeout zero internally unbounded', async () => {
+    // #given — setup exceeds a short finite window but the explicit opt-out remains unbounded
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.create).mockReturnValue(
+      new Promise(resolve => setTimeout(() => resolve({data: {id: 'ses_123'}}), 50)),
+    )
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 0,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+
+  it('does not let a late prompt success replace the latched timeout or trigger post-timeout work', async () => {
+    // #given — the prompt resolves after the execution deadline
+    vi.useFakeTimers()
+    try {
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Late response'}]}})
+      vi.mocked(mockClient.session.promptAsync).mockReturnValue(
+        new Promise(resolve => setTimeout(() => resolve({data: undefined}), 100)),
+      )
+      const mockOpencode = createMockOpencode({client: mockClient})
+      vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+      // #when
+      const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 25,
+        omoProviders: createDisabledProviders(),
+        sessionTitle: 'late title',
+      })
+      await vi.advanceTimersByTimeAsync(25)
+      const result = await resultPromise
+      await vi.advanceTimersByTimeAsync(100)
+      await Promise.resolve()
+
+      // #then — terminal timeout fences retries, artifact reconciliation, title updates, and late SDK effects
+      expect(result).toMatchObject({success: false, exitCode: 130})
+      expect(result.success).toBe(false)
+      expect(mockClient.session.create).toHaveBeenCalledOnce()
+      expect(mockClient.event.subscribe).toHaveBeenCalledOnce()
+      expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
+      expect(mockClient.session.messages).toHaveBeenCalledOnce()
+      expect(mockClient.session.status).not.toHaveBeenCalled()
+      expect(mockClient.session.update).not.toHaveBeenCalled()
+      expect(mockClient.session.abort).toHaveBeenCalledOnce()
+      expect(mockOpencode.server.close).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not start another attempt after a retry delay crosses the shared deadline', async () => {
+    // #given — the first prompt reports a retryable fetch failure immediately
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.promptAsync).mockResolvedValueOnce({error: {message: 'fetch failed'}})
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 50,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then — the retry shares the first attempt's budget instead of opening a fresh 5-second window
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
+  })
+
+  it('does not rewrite a timeout when the remote session abort rejects', async () => {
+    // #given
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    const logger = createMockLogger()
+    vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
+    vi.mocked(mockClient.session.abort).mockRejectedValue(new Error('abort unavailable'))
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), logger, {
+      agent: null,
+      model: null,
+      timeoutMs: 25,
+      omoProviders: createDisabledProviders(),
+    })
+
+    // #then — teardown is fail-soft and cannot replace the terminal timeout result
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(logger.debug).toHaveBeenCalledWith('OpenCode session abort failed; continuing teardown', {
+      sessionId: 'ses_123',
+      error: 'abort unavailable',
+    })
+    expect(vi.mocked(logger.warning).mock.calls.filter(([message]) => message.includes('session abort'))).toHaveLength(
+      0,
+    )
+  })
+
+  it('awaits a rejecting remote abort before closing the server', async () => {
+    // #given — the remote abort rejects asynchronously after timeout, so teardown ordering is observable
+    vi.useFakeTimers()
+    try {
+      const teardownOrder: string[] = []
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      vi.mocked(mockClient.event.subscribe).mockResolvedValue({
+        stream: (async function* () {})(),
+      } as Awaited<ReturnType<typeof mockClient.event.subscribe>>)
+      vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
+      vi.mocked(mockClient.session.abort).mockReturnValue(
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => {
+            teardownOrder.push('abort-rejected')
+            reject(new Error('abort unavailable'))
+          }, 100)
+        }),
+      )
+      const mockServer = createMockServer()
+      mockServer.close.mockImplementation(() => {
+        teardownOrder.push('server-closed')
+      })
+      const mockOpencode = createMockOpencode({client: mockClient, server: mockServer})
+      vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+      // #when
+      const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 25,
+        omoProviders: createDisabledProviders(),
+      })
+      await vi.advanceTimersByTimeAsync(25)
+
+      // #then — server teardown waits for the independent abort request, not just its invocation
+      expect(teardownOrder).toEqual([])
+      await vi.advanceTimersByTimeAsync(100)
+      const result = await resultPromise
+      expect(result).toMatchObject({success: false, exitCode: 130})
+      expect(teardownOrder).toEqual(['abort-rejected', 'server-closed'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('waits for a bounded never-resolving remote abort before closing the server', async () => {
+    // #given — the remote abort ignores cancellation and never settles
+    vi.useFakeTimers()
+    try {
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      const logger = createMockLogger()
+      vi.mocked(mockClient.event.subscribe).mockResolvedValue({
+        stream: (async function* () {})(),
+      } as Awaited<ReturnType<typeof mockClient.event.subscribe>>)
+      vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
+      vi.mocked(mockClient.session.abort).mockReturnValue(new Promise<never>(() => undefined))
+      const mockServer = createMockServer()
+      vi.mocked(createOpencode).mockResolvedValue(
+        createMockOpencode({client: mockClient, server: mockServer}) as unknown as Awaited<
+          ReturnType<typeof createOpencode>
+        >,
+      )
+
+      // #when
+      const resultPromise = executeOpenCode(createMockPromptOptions(), logger, {
+        agent: null,
+        model: null,
+        timeoutMs: 25,
+        omoProviders: createDisabledProviders(),
+      })
+      await vi.advanceTimersByTimeAsync(25)
+
+      // #then — the timeout is latched, but the owned server remains open during abort teardown
+      expect(mockClient.session.abort).toHaveBeenCalledOnce()
+      expect(mockServer.close).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1_999)
+      expect(mockServer.close).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      const result = await resultPromise
+      expect(result).toMatchObject({success: false, exitCode: 130})
+      expect(mockServer.close).toHaveBeenCalledOnce()
+      expect(logger.warning).toHaveBeenCalledWith(
+        'OpenCode session abort exceeded teardown budget; continuing teardown',
+        {sessionId: 'ses_123'},
+      )
+      expect(vi.mocked(logger.debug).mock.calls.filter(([message]) => message.includes('session abort'))).toHaveLength(
+        0,
+      )
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('passes model configuration when provided', async () => {
@@ -600,10 +1096,13 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    expect(mockClient.session.update).toHaveBeenCalledWith({
-      path: {id: 'ses_123'},
-      body: {title: 'fro-bot: schedule-c757a308'},
-    })
+    expect(mockClient.session.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: {id: 'ses_123'},
+        body: {title: 'fro-bot: schedule-c757a308'},
+        signal: expect.any(AbortSignal) as AbortSignal,
+      }),
+    )
   })
 
   it('re-asserts session title even when prompt attempt fails', async () => {
@@ -631,10 +1130,13 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    expect(mockClient.session.update).toHaveBeenCalledWith({
-      path: {id: 'ses_123'},
-      body: {title: 'fro-bot: schedule-c757a308'},
-    })
+    expect(mockClient.session.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: {id: 'ses_123'},
+        body: {title: 'fro-bot: schedule-c757a308'},
+        signal: expect.any(AbortSignal) as AbortSignal,
+      }),
+    )
   })
 
   it('returns failure result when prompt fails', async () => {
@@ -2523,6 +3025,188 @@ describe('processEventStream', () => {
     expect(activityTracker.sessionError).toBe('Rate limit exceeded')
   })
 
+  it('preserves bounded allowlisted diagnostics from an object session.error through poll grace', async () => {
+    // #given — the provider error includes useful fields alongside nested and arbitrary secret data
+    const activityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const logger = createMockLogger()
+    const providerMessage = 'DISTINCTIVE_PROVIDER_MESSAGE_SECRET_1252'
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {
+            provider: 'anthropic',
+            name: 'APIError',
+            data: {
+              status: 429,
+              code: 'provider_error',
+              message: providerMessage,
+              accountId: 'acct_super_secret_12345',
+              nested: {token: 'nested-secret'},
+            },
+            arbitrary: 'do-not-copy',
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const streamResult = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      logger,
+      activityTracker,
+    )
+
+    // #then — the event boundary keeps only stable, allowlisted diagnostics
+    expect(activityTracker.sessionError).toBe('provider=anthropic; name=APIError; status=429; code=provider_error')
+    expect(activityTracker.sessionError).not.toContain('[object Object]')
+    expect(activityTracker.sessionError).not.toContain(providerMessage)
+    expect(activityTracker.sessionError).not.toContain('acct_super_secret_12345')
+    expect(activityTracker.sessionError).not.toContain('nested-secret')
+    expect(activityTracker.sessionError).not.toContain('do-not-copy')
+    expect(JSON.stringify(streamResult)).not.toContain(providerMessage)
+
+    vi.useFakeTimers()
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const resultPromise = pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      logger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(2_000)
+    const result = await resultPromise
+    vi.useRealTimers()
+
+    expect(result.completed).toBe(false)
+    expect(result.error).toContain('provider=anthropic; name=APIError; status=429; code=provider_error')
+    expect(result.error).not.toContain(providerMessage)
+    expect(result.error).not.toContain('acct_super_secret_12345')
+    expect(result.error).not.toContain('nested-secret')
+    const loggerCalls = [...vi.mocked(logger.debug).mock.calls, ...vi.mocked(logger.error).mock.calls]
+    expect(JSON.stringify(loggerCalls)).not.toContain('acct_super_secret_12345')
+    expect(JSON.stringify(loggerCalls)).not.toContain('nested-secret')
+    expect(JSON.stringify(loggerCalls)).not.toContain(providerMessage)
+  })
+
+  it('uses a generic safe summary when an object session.error has no usable fields', async () => {
+    // #given — the provider error has no allowlisted diagnostics
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {accountId: 'acct_super_secret_12345', nested: {token: 'nested-secret'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(activityTracker.sessionError).toBe('Unknown session error')
+    expect(result.llmError?.message).toBe('Agent error: Unknown session error')
+    expect(JSON.stringify(result)).not.toContain('acct_super_secret_12345')
+    expect(JSON.stringify(result)).not.toContain('nested-secret')
+  })
+
+  it('keeps object-only fetch signals non-retryable without exposing provider text', async () => {
+    // #given — the provider supplies a fetch-style message only through an object payload
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const logger = createMockLogger()
+    const providerMessage = 'fetch failed: DISTINCTIVE_OBJECT_FETCH_SECRET_1277'
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: {message: providerMessage}},
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      logger,
+      activityTracker,
+    )
+
+    // #then — object message text is neither a safe retry signal nor an emitted diagnostic
+    expect(result.llmError?.type).toBe('configuration')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(result.llmError?.message).toBe('Agent error: Unknown session error')
+    expect(activityTracker.sessionError).toBe('Unknown session error')
+    const loggerCalls = [...vi.mocked(logger.debug).mock.calls, ...vi.mocked(logger.error).mock.calls]
+    expect(JSON.stringify(result)).not.toContain(providerMessage)
+    expect(JSON.stringify(loggerCalls)).not.toContain(providerMessage)
+  })
+
+  it('retains the first normalized session error when a later error is only a string fallback', async () => {
+    // #given — a useful structured error arrives before a weaker repeated error
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {provider: 'anthropic', name: 'APIError', data: {status: 500, message: 'Upstream failed'}},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: 'late generic fallback'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.sessionError).toBe('provider=anthropic; name=APIError; status=500')
+  })
+
   it('never passes the raw session.error payload (message/body/account metadata) into any logger call', async () => {
     // #given — a session.error carrying provider message text, a URL, and account/workspace
     // metadata that must never reach the logger, structured or as a raw string.
@@ -3736,6 +4420,341 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     // #then
     expect(startPrompt).toHaveBeenCalledOnce()
     expect(result.success).toBe(true)
+  })
+
+  it('collects results from and tears down a keep-open SSE stream for each attempt', async () => {
+    // #given — the SSE stream only closes when its attempt-local subscription signal aborts
+    const {createExecutionDeadline} = await import('./retry.js')
+    const {sendPromptToSession} = await import('./prompt-sender.js')
+    const deadline = createExecutionDeadline(10_000, mockLogger)
+    let subscriptionSignal: AbortSignal | undefined
+    let streamClosed = false
+    let releasePromptStarted!: () => void
+    const promptStarted = new Promise<void>(resolve => {
+      releasePromptStarted = resolve
+    })
+    const events: Event[] = [
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'ses_123',
+            role: 'assistant',
+            tokens: {input: 3, output: 2, reasoning: 0, cache: {read: 0, write: 0}},
+            modelID: 'test-model',
+            cost: 0.01,
+          },
+        },
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ]
+    const keepOpenStream: AsyncIterable<Event> = {
+      [Symbol.asyncIterator]() {
+        let index = 0
+        return {
+          next: async (): Promise<IteratorResult<Event>> => {
+            const event = events[index]
+            if (event != null) {
+              if (index === 0) await promptStarted
+              index++
+              return {done: false, value: event}
+            }
+            await new Promise<void>(resolve => {
+              if (subscriptionSignal?.aborted === true) {
+                resolve()
+                return
+              }
+              subscriptionSignal?.addEventListener('abort', () => resolve(), {once: true})
+            })
+            streamClosed = true
+            return {done: true, value: undefined}
+          },
+        }
+      },
+    }
+    const mockClient = {
+      session: {
+        promptAsync: vi.fn().mockImplementation(async () => {
+          releasePromptStarted()
+          return {data: undefined}
+        }),
+        messages: vi.fn().mockResolvedValue({data: []}),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn(async (options: {signal?: AbortSignal}) => {
+          subscriptionSignal = options.signal
+          return {stream: keepOpenStream}
+        }),
+      },
+    }
+
+    // #when
+    let result
+    try {
+      result = await sendPromptToSession(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        'prompt',
+        undefined,
+        '/workspace',
+        undefined,
+        mockLogger,
+        undefined,
+        deadline,
+      )
+    } finally {
+      deadline.dispose()
+    }
+
+    // #then — completion waits for the stream to flush, and attempt cleanup closes its subscription
+    expect(result.success).toBe(true)
+    expect(result.eventStreamResult.tokens).toEqual({
+      input: 3,
+      output: 2,
+      reasoning: 0,
+      cache: {read: 0, write: 0},
+    })
+    expect(subscriptionSignal).toBeInstanceOf(AbortSignal)
+    expect(subscriptionSignal?.aborted).toBe(true)
+    expect(streamClosed).toBe(true)
+  })
+
+  it('waits once for abort-ignoring event processing during teardown', async () => {
+    // #given — the event iterator ignores cancellation and leaves the processor waiting forever
+    vi.useFakeTimers()
+    let resultPromise: Promise<unknown> | undefined
+    try {
+      const {runPromptAttempt} = await import('./retry.js')
+      const events: Event[] = [
+        {
+          type: 'message.part.delta',
+          properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'activity'}},
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ]
+      const eventStream: AsyncIterable<Event> = {
+        [Symbol.asyncIterator]() {
+          let index = 0
+          return {
+            next: async (): Promise<IteratorResult<Event>> => {
+              const event = events[index]
+              if (event != null) {
+                index++
+                return {done: false, value: event}
+              }
+              return new Promise<IteratorResult<Event>>(() => undefined)
+            },
+          }
+        },
+      }
+      const mockClient = {
+        session: {
+          status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+        },
+      }
+
+      // #when
+      resultPromise = runPromptAttempt(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        30_000,
+        mockLogger,
+        eventStream,
+      )
+      await vi.advanceTimersByTimeAsync(500)
+      let settled = false
+      resultPromise
+        .then(
+          () => {
+            settled = true
+          },
+          () => {
+            settled = true
+          },
+        )
+        .catch(() => undefined)
+      await Promise.resolve()
+
+      // #then — one bounded shutdown wait is allowed, but finally must not wait a second time
+      expect(settled).toBe(false)
+      await vi.advanceTimersByTimeAsync(1_999)
+      expect(settled).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(settled).toBe(true)
+      await resultPromise
+    } finally {
+      await vi.advanceTimersByTimeAsync(4_000)
+      if (resultPromise != null) await resultPromise
+      vi.useRealTimers()
+    }
+  })
+
+  it('publishes final stream usage after promptly resolving SSE cleanup', async () => {
+    // #given — terminal events arrive before cleanup, while the iterator resolves one tick later
+    vi.useFakeTimers()
+    try {
+      const {runPromptAttempt} = await import('./retry.js')
+      let releaseStream!: () => void
+      const streamReady = new Promise<void>(resolve => {
+        releaseStream = resolve
+      })
+      const events: Event[] = [
+        {
+          type: 'message.updated',
+          properties: {
+            info: {
+              sessionID: 'ses_123',
+              role: 'assistant',
+              tokens: {input: 3, output: 2, reasoning: 1, cache: {read: 4, write: 5}},
+              modelID: 'test-model',
+              cost: 0.01,
+            },
+          },
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ]
+      const eventStream: AsyncIterable<Event> = {
+        [Symbol.asyncIterator]() {
+          let index = 0
+          return {
+            next: async (): Promise<IteratorResult<Event>> => {
+              const event = events[index]
+              if (event != null) {
+                index++
+                return {done: false, value: event}
+              }
+              await streamReady
+              return {done: true, value: undefined}
+            },
+          }
+        },
+      }
+      const mockClient = {
+        session: {
+          status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+        },
+      }
+      setTimeout(releaseStream, 501)
+
+      // #when
+      const resultPromise = runPromptAttempt(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        30_000,
+        mockLogger,
+        eventStream,
+      )
+      await vi.advanceTimersByTimeAsync(501)
+      const result = await resultPromise
+
+      // #then — final event data is available before the attempt result is published
+      expect(result.success).toBe(true)
+      expect(result.eventStreamResult.tokens).toEqual({
+        input: 3,
+        output: 2,
+        reasoning: 1,
+        cache: {read: 4, write: 5},
+      })
+      expect(result.eventStreamResult.model).toBe('test-model')
+      expect(result.eventStreamResult.cost).toBe(0.01)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects a terminal result when wall-clock expiry precedes the timeout callback', async () => {
+    // #given — the poll result resolves after deadlineAt, while the timeout callback remains unlatched
+    vi.useFakeTimers()
+    try {
+      const {runPromptAttempt} = await import('./retry.js')
+      const deadlineAt = Date.now() + 1_000
+      const deadline: ExecutionDeadline = {
+        timeoutMs: 1_000,
+        signal: new AbortController().signal,
+        isExpired: () => Date.now() >= deadlineAt,
+        isTimedOut: () => false,
+        remainingMs: () => Math.max(0, deadlineAt - Date.now()),
+        run: async operation => operation(),
+        dispose: vi.fn(),
+      }
+      const eventStream = createMockEventStream([
+        {
+          type: 'message.part.delta',
+          properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'activity'}},
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ])
+      const mockClient = createMockClient({
+        statusSequence: [{ses_123: {type: 'idle'}}],
+      })
+
+      // #when
+      const resultPromise = runPromptAttempt(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        30_000,
+        mockLogger,
+        eventStream.stream,
+        undefined,
+        undefined,
+        deadline,
+      )
+      const rejection = (async () => {
+        await expect(resultPromise).rejects.toMatchObject({name: 'DeadlineExceededError'})
+      })()
+      await vi.advanceTimersByTimeAsync(0)
+      vi.setSystemTime(deadlineAt + 1)
+      await vi.advanceTimersByTimeAsync(500)
+
+      // #then — wall-clock expiry is authoritative even though isTimedOut() is still false
+      await rejection
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('removes the poll interval abort listener when the timer wins', async () => {
+    // #given — a deadline-aware poll whose first interval completes normally
+    vi.useFakeTimers()
+    try {
+      const {createExecutionDeadline} = await import('./retry.js')
+      const pollSignalController = new AbortController()
+      const addListener = vi.spyOn(pollSignalController.signal, 'addEventListener')
+      const removeListener = vi.spyOn(pollSignalController.signal, 'removeEventListener')
+      const deadline = createExecutionDeadline(10_000, mockLogger)
+      const mockClient = {
+        session: {
+          status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+        },
+      }
+
+      // #when
+      const pollPromise = pollForSessionCompletion(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        pollSignalController.signal,
+        mockLogger,
+        10_000,
+        undefined,
+        deadline,
+      )
+      await vi.advanceTimersByTimeAsync(500)
+      const result = await pollPromise
+      deadline.dispose()
+
+      // #then — the interval's listener is removed even though its timer resolved first
+      const intervalListener = addListener.mock.calls.find(call => call[0] === 'abort')?.[1]
+      expect(intervalListener).toBeDefined()
+      expect(removeListener).toHaveBeenCalledWith('abort', intervalListener)
+      expect(result).toEqual({completed: true, error: null})
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('prevents wait() resolving before any current-turn activity from declaring success', async () => {
