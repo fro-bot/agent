@@ -64,8 +64,13 @@
 #    runs don't collide. Adjust if you want stricter or looser grouping.
 #
 # 4. TIMEOUT
-#    Default is 30 minutes. Increase timeout-minutes if your agent tasks
-#    routinely take longer (e.g. large code reviews or multi-step work).
+#    The Action's `timeout` input (default 1800000ms / 30 minutes) governs
+#    OpenCode execution only — it is not the whole GitHub Actions job
+#    timeout. The job-level timeout-minutes below (40) is the whole-job/
+#    process backstop, with headroom beyond the 30-minute execution timeout
+#    for setup, fallback response delivery, and cleanup. Increase both if
+#    your agent tasks routinely take longer (e.g. large code reviews or
+#    multi-step work).
 #
 # ── SCHEDULE PROMPT ALTERNATIVES ───────────────────────────────────────
 # The SCHEDULE_PROMPT defined in the env section below uses a read-only
@@ -336,7 +341,7 @@ jobs:
   fro-bot:
     name: Fro Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: write
       discussions: write

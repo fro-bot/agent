@@ -155,7 +155,7 @@ A few inputs most workflows touch:
 
 - **`prompt`** — custom prompt; required for `schedule` and `workflow_dispatch`.
 - **`agent`** / **`model`** — override the agent (a primary agent, not a subagent) or the model (`provider/model`).
-- **`timeout`** — execution timeout in milliseconds. Default `1800000` (30 minutes); `0` disables it.
+- **`timeout`** — OpenCode execution timeout in milliseconds; governs the Action's internal execution deadline only, not the whole GitHub Actions job. Default `1800000` (30 minutes); `0` disables the Action-internal execution deadline. Set the job's `timeout-minutes` as the whole-job/process backstop, with headroom beyond this value for setup, fallback response delivery, and cleanup.
 - **`response-mode`** — `github` (default) posts exactly one comment or review; `none` suppresses all GitHub writes and uses the run log as the response surface.
 - **`enable-omo`** / **`enable-omo-slim`** — opt into extended orchestration (mutually exclusive).
 
@@ -182,7 +182,7 @@ A few inputs most workflows touch:
 | `enable-omo` | No | `false` | Enable Oh My OpenAgent for extended provider and agent support |
 | `enable-omo-slim` | No | `false` | Enable OMO Slim orchestration (mutually exclusive with `enable-omo`) |
 | `model` | No | — | Model override in `provider/model` format |
-| `timeout` | No | `1800000` | Execution timeout in milliseconds (`0` = no timeout) |
+| `timeout` | No | `1800000` | OpenCode execution timeout in milliseconds; Action-internal only, not the job timeout (`0` = no Action-internal deadline) |
 | `opencode-version` | No | Source-pinned | OpenCode CLI version to install |
 | `omo-version` | No | Source-pinned | oMo version to install |
 | `systematic-version` | No | Source-pinned | Systematic plugin version to register |
