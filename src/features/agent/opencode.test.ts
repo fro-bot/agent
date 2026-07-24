@@ -1629,6 +1629,92 @@ describe('executeOpenCode retry behavior', () => {
     )
   })
 
+  it('fails the execution boundary on poll-only auth_unavailable with no SSE auth event', async () => {
+    // #given — SSE emits no events; REST polling observes the issue-derived auth_unavailable retry shape
+    const mockServer = createMockServer()
+    const sentinelProvider = 'sentinel-provider'
+    const sentinelAccount = 'sentinel-account'
+    const sentinelToken = 'sentinel-token'
+    const sentinelUrl = 'https://sentinel.example/account'
+    let promptCallCount = 0
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+        }),
+        status: vi.fn().mockResolvedValue({
+          data: {
+            ses_123: {
+              type: 'retry',
+              attempt: 1,
+              message: `Authentication unavailable for ${sentinelAccount}; ${sentinelToken}`,
+              action: {
+                reason: 'auth_unavailable',
+                provider: sentinelProvider,
+                title: 'Authentication unavailable',
+                message: `Update credentials at ${sentinelUrl} using ${sentinelToken}`,
+                label: 'Update credentials',
+                link: sentinelUrl,
+              },
+              next: Date.now() + 5_000,
+            },
+          },
+        }),
+      },
+      event: {
+        subscribe: vi
+          .fn()
+          .mockImplementation(async () => createPromptStartedEventStream(mockClient.session.promptAsync, [])),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when — run the full Action execution boundary with a bounded deadline
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 2_000,
+      omoProviders: createDisabledProviders(),
+    })
+    await vi.runOnlyPendingTimersAsync()
+    const result = await resultPromise
+
+    // #then — poll-only auth is authoritative, non-retryable, and safely bounded
+    expect(promptCallCount).toBe(1)
+    expect(mockClient.session.status).toHaveBeenCalledOnce()
+    expect(result.success).toBe(false)
+    expect(result.exitCode).toBe(1)
+    expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(result.error).toContain('model provider rejected authentication')
+    expect(result.error).not.toContain(sentinelAccount)
+    expect(result.error).not.toContain(sentinelToken)
+    expect(JSON.stringify(result)).not.toContain(sentinelProvider)
+    expect(JSON.stringify(result)).not.toContain(sentinelAccount)
+    expect(JSON.stringify(result)).not.toContain(sentinelToken)
+    expect(JSON.stringify(result)).not.toContain(sentinelUrl)
+    const capturedLogs = [
+      ...vi.mocked(mockLogger.debug).mock.calls,
+      ...vi.mocked(mockLogger.error).mock.calls,
+      ...vi.mocked(mockLogger.warning).mock.calls,
+      ...vi.mocked(mockLogger.info).mock.calls,
+    ]
+    expect(JSON.stringify(capturedLogs)).not.toContain(sentinelProvider)
+    expect(JSON.stringify(capturedLogs)).not.toContain(sentinelAccount)
+    expect(JSON.stringify(capturedLogs)).not.toContain(sentinelToken)
+    expect(JSON.stringify(capturedLogs)).not.toContain(sentinelUrl)
+    expect(mockLogger.warning).not.toHaveBeenCalledWith(
+      'LLM fetch error detected, retrying with continuation prompt',
+      expect.any(Object),
+    )
+  })
+
   it('stops retrying after MAX_LLM_RETRIES attempts', async () => {
     // #given
     const mockServer = createMockServer()
