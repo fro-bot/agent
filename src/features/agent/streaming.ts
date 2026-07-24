@@ -455,9 +455,6 @@ export async function processEventStream(
           classifyProviderAuthError({
             kind: 'session-error',
             name,
-            status,
-            code,
-            message,
           }) ??
           classifyQuotaError({
             kind: 'session-error',

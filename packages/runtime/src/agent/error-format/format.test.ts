@@ -377,10 +377,13 @@ describe('agent/error-format/format', () => {
 
   describe('provider authentication errors', () => {
     it('keeps only classification fields in the provider auth input type', () => {
+      // #given the provider authentication classifier input type
+      // #when inspecting its shape
       expectTypeOf<ProviderAuthErrorInput>().not.toHaveProperty('status')
       expectTypeOf<ProviderAuthErrorInput>().not.toHaveProperty('code')
       expectTypeOf<ProviderAuthErrorInput>().not.toHaveProperty('providerID')
       expectTypeOf<ProviderAuthErrorInput>().not.toHaveProperty('message')
+      // #then it excludes fields that do not affect classification
     })
 
     it('classifies the exact structured ProviderAuthError marker into fixed non-retryable output', () => {

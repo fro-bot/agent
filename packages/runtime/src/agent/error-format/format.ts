@@ -185,7 +185,7 @@ function normalizeProviderAuthString(value: unknown): string | undefined {
  * `provider_auth_error`. Generic statuses, messages, codes, and retry reasons
  * are intentionally not authentication evidence.
  */
-export function classifyProviderAuthError<T extends ProviderAuthErrorInput>(input: T): ErrorInfo | null {
+export function classifyProviderAuthError(input: ProviderAuthErrorInput): ErrorInfo | null {
   if (input.kind === 'retry-status') {
     if (normalizeProviderAuthString(input.reason) !== 'auth_unavailable') return null
     return createProviderAuthError()
