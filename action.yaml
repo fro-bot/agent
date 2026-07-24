@@ -69,7 +69,7 @@ inputs:
     description: "Model override (format: provider/model). If not set, uses agent's configured model."
     required: false
   timeout:
-    description: 'Execution timeout in milliseconds. 0 = no timeout. Default: 1800000 (30 minutes)'
+    description: 'Execution timeout in milliseconds for OpenCode execution only (not the whole GitHub Actions job). 0 = no Action-internal execution deadline. Default: 1800000 (30 minutes). Set the job-level timeout-minutes as the whole-job backstop, with headroom beyond this value for setup, fallback response delivery, and cleanup.'
     required: false
     default: '1800000'
   opencode-version:
