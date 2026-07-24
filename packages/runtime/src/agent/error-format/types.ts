@@ -5,6 +5,7 @@ export const ERROR_TYPES = [
   'llm_fetch_error',
   'llm_timeout',
   'permission',
+  'provider_auth_error',
   'quota_exceeded',
   'rate_limit',
   'validation',
@@ -40,3 +41,28 @@ export type QuotaErrorInput =
       readonly code?: string
       readonly message?: string
     }
+
+interface ProviderAuthErrorFields {
+  readonly name?: unknown
+  readonly status?: unknown
+  readonly reason?: unknown
+  readonly code?: unknown
+  readonly providerID?: unknown
+  readonly message?: unknown
+}
+
+/**
+ * Provider-neutral normalized input to {@link classifyProviderAuthError}.
+ *
+ * The classifier accepts only these bounded fields from an upstream signal.
+ * Provider identity and message fields are accepted for source-shape parity,
+ * but are ignored and never retained in the returned {@link ErrorInfo}.
+ */
+export type ProviderAuthErrorInput =
+  | (ProviderAuthErrorFields & {
+      readonly kind: 'retry-status'
+      readonly reason: unknown
+    })
+  | (ProviderAuthErrorFields & {
+      readonly kind: 'session-error'
+    })

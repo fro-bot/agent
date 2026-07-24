@@ -1,4 +1,4 @@
-import type {ErrorInfo, ErrorType, QuotaErrorInput} from './types.js'
+import type {ErrorInfo, ErrorType, ProviderAuthErrorInput, QuotaErrorInput} from './types.js'
 
 const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   api_error: 'API Error',
@@ -7,6 +7,7 @@ const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   llm_fetch_error: 'LLM Fetch Error',
   llm_timeout: 'LLM Timeout',
   permission: 'Permission Error',
+  provider_auth_error: 'Provider Authentication Error',
   quota_exceeded: 'Quota Exceeded',
   rate_limit: 'Rate Limit',
   validation: 'Validation Error',
@@ -157,6 +158,66 @@ export function createAgentError(message: string, agent?: string): ErrorInfo {
     details: agent == null ? undefined : `Requested agent: ${agent}`,
     suggestedAction: 'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
   })
+}
+
+const PROVIDER_AUTH_ERROR_MESSAGE = 'The model provider rejected authentication for this run.'
+const PROVIDER_AUTH_ERROR_DETAILS = 'Authentication with the configured model provider is unavailable.'
+const PROVIDER_AUTH_ERROR_ACTION = 'Check the model provider credentials and configuration, then try again.'
+
+/** Create the fixed, non-retryable `provider_auth_error` ErrorInfo. */
+export function createProviderAuthError(): ErrorInfo {
+  return createErrorInfo('provider_auth_error', PROVIDER_AUTH_ERROR_MESSAGE, false, {
+    details: PROVIDER_AUTH_ERROR_DETAILS,
+    suggestedAction: PROVIDER_AUTH_ERROR_ACTION,
+  })
+}
+
+const MAX_PROVIDER_AUTH_FIELD_LENGTH = 128
+
+function normalizeProviderAuthString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  if (value.length === 0 || value.length > MAX_PROVIDER_AUTH_FIELD_LENGTH) return undefined
+  return value
+}
+
+function normalizeProviderAuthStatus(value: unknown): number | undefined {
+  if (typeof value !== 'number') return undefined
+  if (!Number.isInteger(value) || value < 100 || value > 599) return undefined
+  return value
+}
+
+function normalizeProviderAuthInput(input: ProviderAuthErrorInput): {
+  readonly name?: string
+  readonly status?: number
+  readonly reason?: string
+  readonly code?: string
+} {
+  return {
+    name: normalizeProviderAuthString(input.name),
+    status: normalizeProviderAuthStatus(input.status),
+    reason: normalizeProviderAuthString(input.reason),
+    code: normalizeProviderAuthString(input.code),
+  }
+}
+
+/**
+ * Classify exact structured provider authentication markers as a fixed
+ * `provider_auth_error`. Generic statuses, messages, codes, and retry reasons
+ * are intentionally not authentication evidence.
+ */
+export function classifyProviderAuthError(input: ProviderAuthErrorInput): ErrorInfo | null {
+  const normalized = normalizeProviderAuthInput(input)
+
+  if (input.kind === 'retry-status') {
+    if (normalized.reason !== 'auth_unavailable') return null
+    return createProviderAuthError()
+  }
+
+  if (input.kind === 'session-error' && normalized.name === 'ProviderAuthError') {
+    return createProviderAuthError()
+  }
+
+  return null
 }
 
 /** Stable provider error codes that indicate quota exhaustion. */
