@@ -4,7 +4,7 @@ import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {classifyRetryStatusQuota} from './streaming.js'
+import {classifyRetryStatusError, mergeActivityError} from './streaming.js'
 
 const POLL_INTERVAL_MS = 500
 const POLL_REQUEST_TIMEOUT_MS = 5_000
@@ -183,6 +183,10 @@ export async function pollForSessionCompletion(
   let firstSessionError: string | null = null
 
   while (!signal.aborted) {
+    const terminalProviderError = activityTracker?.terminalProviderError
+    if (terminalProviderError != null) {
+      return {completed: false, error: terminalProviderError.message}
+    }
     if (deadline?.isExpired() === true) return {completed: false, error: 'Aborted'}
     try {
       const delay = async () => {
@@ -191,15 +195,23 @@ export async function pollForSessionCompletion(
       if (deadline == null) await delay()
       else await deadline.run(delay, 'poll interval')
     } catch {
+      const terminalError = activityTracker?.terminalProviderError
+      if (terminalError != null) return {completed: false, error: terminalError.message}
       return {completed: false, error: 'Aborted'}
     }
-    if (signal.aborted) return {completed: false, error: 'Aborted'}
+    if (signal.aborted) {
+      const terminalError = activityTracker?.terminalProviderError
+      if (terminalError != null) return {completed: false, error: terminalError.message}
+      return {completed: false, error: 'Aborted'}
+    }
 
     const observedSessionError = activityTracker?.sessionError
     if (firstSessionError == null && observedSessionError != null) {
       firstSessionError = observedSessionError
     }
-    const sessionError = activityTracker?.quotaExceeded?.message ?? firstSessionError
+    const terminalError = activityTracker?.terminalProviderError
+    if (terminalError != null) return {completed: false, error: terminalError.message}
+    const sessionError = firstSessionError
 
     if (sessionError == null) {
       errorGraceCycles = 0
@@ -258,19 +270,19 @@ export async function pollForSessionCompletion(
           return {completed: true, error: null}
         }
       } else if (sessionStatus.type === 'retry') {
-        // Poll-only quota fails fast instead of waiting out the full timeout.
-        const quotaError = classifyRetryStatusQuota(sessionStatus)
-        if (quotaError != null) {
-          logger.error('Session status retry classified as quota exceeded via poll', {
+        // Poll-only terminal provider signals fail fast instead of waiting out the full timeout.
+        const terminalError = classifyRetryStatusError(sessionStatus)
+        if (terminalError != null) {
+          if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null)
+            return {completed: false, error: 'Aborted'}
+          logger.error('Session status retry classified as terminal provider error via poll', {
             sessionId,
             type: sessionStatus.type,
           })
           if (activityTracker != null) {
-            activityTracker.quotaExceeded = quotaError
-            activityTracker.sessionError = quotaError.message
-            activityTracker.currentTurnTerminalSignalReceived = true
+            mergeActivityError(null, terminalError, activityTracker)
           }
-          return {completed: false, error: quotaError.message}
+          return {completed: false, error: activityTracker?.terminalProviderError?.message ?? terminalError.message}
         }
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       } else {

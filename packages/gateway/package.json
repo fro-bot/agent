@@ -15,7 +15,7 @@
     "@fro-bot/runtime": "workspace:*",
     "@hono/node-server": "2.0.10",
     "@octokit/core": "7.0.6",
-    "discord.js": "14.26.5",
+    "discord.js": "14.27.0",
     "effect": "3.22.0",
     "hono": "4.12.31",
     "web-push": "3.6.7",
