@@ -68,7 +68,7 @@ Object `message` text remains available only to the structured quota classifier.
 
 ### Preserve the primary failure when the response file is absent
 
-`src/harness/phases/finalize.ts` uses the fallback only for the exact failure combination:
+`src/harness/phases/finalize.ts` uses the fallback only for the exact failure combination below; the helper names are simplified pseudocode:
 
 ```ts
 if (result.reason === "file-read-failed" && execution.success === false && execution.commentsPosted === 0) {
