@@ -856,22 +856,16 @@ describe('runFinalize quota_exceeded llmError handling', () => {
     })
     const execution = createQuotaExecution()
     const metrics = createMetrics()
+    const logger = createMockLogger()
 
     // #when runFinalize runs
-    const exitCode = await runFinalize(
-      bootstrap,
-      routing,
-      cacheRestore,
-      execution,
-      metrics,
-      Date.now(),
-      createMockLogger(),
-    )
+    const exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), logger)
 
-    // #then no post is attempted, but the run still fails closed
+    // #then no post is attempted, a coarse warning is emitted, and the run still fails closed
     expect(mocks.postComment).not.toHaveBeenCalled()
     expect(exitCode).toBe(1)
     expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+    expect(logger.warning).toHaveBeenCalledWith('Cannot post quota exceeded error comment: missing target context')
   })
 
   it('makes zero postComment calls and fails closed when delivery is none, even with a valid target', async () => {

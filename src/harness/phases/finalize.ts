@@ -121,6 +121,12 @@ export async function runFinalize(
       const safeError = createQuotaExceededError({resetTime: execution.llmError.resetTime})
       const errorCommentBody = formatErrorComment(safeError)
       await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+    } else if (
+      bootstrap.delivery !== 'none' &&
+      execution.commentsPosted === 0 &&
+      !isResolvedCommentTarget(commentTarget)
+    ) {
+      logger.warning('Cannot post quota exceeded error comment: missing target context')
     }
 
     core.setFailed(QUOTA_EXCEEDED_SET_FAILED_MESSAGE)
