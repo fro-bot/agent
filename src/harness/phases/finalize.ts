@@ -7,7 +7,7 @@ import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
 import * as core from '@actions/core'
-import {createQuotaExceededError} from '@fro-bot/runtime'
+import {createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
 import {runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
 import {writeJobSummary} from '../../features/observability/index.js'
@@ -20,6 +20,9 @@ import {setActionOutputs} from '../config/outputs.js'
  */
 const QUOTA_EXCEEDED_SET_FAILED_MESSAGE =
   'Agent execution stopped: provider quota exceeded. Check the provider account/billing settings, wait for the quota to reset, or switch to a different model or provider.'
+
+const PROVIDER_AUTH_SET_FAILED_MESSAGE =
+  'Agent execution stopped: model provider authentication failed. Check the model provider credentials and configuration, then try again.'
 
 const FILE_READ_FAILURE_FALLBACK_ACTION =
   'The agent execution failed before it could write a response artifact, so no response was delivered.'
@@ -121,6 +124,29 @@ export async function runFinalize(
     }
 
     core.setFailed(QUOTA_EXCEEDED_SET_FAILED_MESSAGE)
+    return 1
+  }
+
+  // Rebuilds a safe ErrorInfo instead of trusting the incoming llmError; skips runResponsePost entirely.
+  // Posts at most once, only when delivery isn't 'none' and no response was already posted; always fails closed.
+  if (execution.llmError?.type === 'provider_auth_error') {
+    const commentTarget = resolveCommentTarget(routing)
+    const shouldPost =
+      bootstrap.delivery !== 'none' && execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)
+
+    if (shouldPost) {
+      const safeError = createProviderAuthError()
+      const errorCommentBody = formatErrorComment(safeError)
+      await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+    } else if (
+      bootstrap.delivery !== 'none' &&
+      execution.commentsPosted === 0 &&
+      !isResolvedCommentTarget(commentTarget)
+    ) {
+      logger.warning('Cannot post provider authentication error comment: missing target context')
+    }
+
+    core.setFailed(PROVIDER_AUTH_SET_FAILED_MESSAGE)
     return 1
   }
 
