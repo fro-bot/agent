@@ -704,13 +704,14 @@ describe('executeOpenCode', () => {
   it('does not rewrite a timeout when the remote session abort rejects', async () => {
     // #given
     const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    const logger = createMockLogger()
     vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
     vi.mocked(mockClient.session.abort).mockRejectedValue(new Error('abort unavailable'))
     const mockOpencode = createMockOpencode({client: mockClient})
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, {
+    const result = await executeOpenCode(createMockPromptOptions(), logger, {
       agent: null,
       model: null,
       timeoutMs: 25,
@@ -719,6 +720,13 @@ describe('executeOpenCode', () => {
 
     // #then — teardown is fail-soft and cannot replace the terminal timeout result
     expect(result).toMatchObject({success: false, exitCode: 130})
+    expect(logger.debug).toHaveBeenCalledWith('OpenCode session abort failed; continuing teardown', {
+      sessionId: 'ses_123',
+      error: 'abort unavailable',
+    })
+    expect(vi.mocked(logger.warning).mock.calls.filter(([message]) => message.includes('session abort'))).toHaveLength(
+      0,
+    )
   })
 
   it('awaits a rejecting remote abort before closing the server', async () => {
@@ -771,6 +779,7 @@ describe('executeOpenCode', () => {
     vi.useFakeTimers()
     try {
       const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      const logger = createMockLogger()
       vi.mocked(mockClient.event.subscribe).mockResolvedValue({
         stream: (async function* () {})(),
       } as Awaited<ReturnType<typeof mockClient.event.subscribe>>)
@@ -784,7 +793,7 @@ describe('executeOpenCode', () => {
       )
 
       // #when
-      const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+      const resultPromise = executeOpenCode(createMockPromptOptions(), logger, {
         agent: null,
         model: null,
         timeoutMs: 25,
@@ -801,6 +810,13 @@ describe('executeOpenCode', () => {
       const result = await resultPromise
       expect(result).toMatchObject({success: false, exitCode: 130})
       expect(mockServer.close).toHaveBeenCalledOnce()
+      expect(logger.warning).toHaveBeenCalledWith(
+        'OpenCode session abort exceeded teardown budget; continuing teardown',
+        {sessionId: 'ses_123'},
+      )
+      expect(vi.mocked(logger.debug).mock.calls.filter(([message]) => message.includes('session abort'))).toHaveLength(
+        0,
+      )
     } finally {
       vi.useRealTimers()
     }
@@ -3122,6 +3138,43 @@ describe('processEventStream', () => {
     expect(result.llmError?.message).toBe('Agent error: Unknown session error')
     expect(JSON.stringify(result)).not.toContain('acct_super_secret_12345')
     expect(JSON.stringify(result)).not.toContain('nested-secret')
+  })
+
+  it('keeps object-only fetch signals non-retryable without exposing provider text', async () => {
+    // #given — the provider supplies a fetch-style message only through an object payload
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const logger = createMockLogger()
+    const providerMessage = 'fetch failed: DISTINCTIVE_OBJECT_FETCH_SECRET_1277'
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: {message: providerMessage}},
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      logger,
+      activityTracker,
+    )
+
+    // #then — object message text is neither a safe retry signal nor an emitted diagnostic
+    expect(result.llmError?.type).toBe('configuration')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(result.llmError?.message).toBe('Agent error: Unknown session error')
+    expect(activityTracker.sessionError).toBe('Unknown session error')
+    const loggerCalls = [...vi.mocked(logger.debug).mock.calls, ...vi.mocked(logger.error).mock.calls]
+    expect(JSON.stringify(result)).not.toContain(providerMessage)
+    expect(JSON.stringify(loggerCalls)).not.toContain(providerMessage)
   })
 
   it('retains the first normalized session error when a later error is only a string fallback', async () => {

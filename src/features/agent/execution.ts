@@ -28,20 +28,23 @@ async function abortRemoteSession(
 
   const abortController = new AbortController()
   let timeoutId: ReturnType<typeof setTimeout> | null = null
+  let abortTimedOut = false
   try {
     const abortRequest = client.session.abort({path: {id: sessionId}, signal: abortController.signal})
     const timeout = new Promise<never>((_, reject) => {
       timeoutId = setTimeout(() => {
+        abortTimedOut = true
         abortController.abort()
         reject(new Error(`Session abort timed out after ${SESSION_ABORT_TIMEOUT_MS}ms`))
       }, SESSION_ABORT_TIMEOUT_MS)
     })
     await Promise.race([abortRequest, timeout])
   } catch (error) {
-    logger.debug('Timed-out OpenCode session abort failed; continuing teardown', {
-      sessionId,
-      error: toErrorMessage(error),
-    })
+    if (abortTimedOut) {
+      logger.warning('OpenCode session abort exceeded teardown budget; continuing teardown', {sessionId})
+    } else {
+      logger.debug('OpenCode session abort failed; continuing teardown', {sessionId, error: toErrorMessage(error)})
+    }
   } finally {
     if (timeoutId != null) clearTimeout(timeoutId)
   }

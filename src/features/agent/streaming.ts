@@ -414,6 +414,9 @@ export async function processEventStream(
             getNumberProperty(errorData, 'status') ??
             getNumberProperty(errorData, 'statusCode')
           const code = getStringProperty(sessionError, 'code') ?? getStringProperty(errorData, 'code')
+          // Intentional tradeoff: object message text is classification-only for quota and excluded from safe
+          // fetch-retry classification, so object {message: 'fetch failed'} remains non-retryable; string/thrown
+          // fetch errors remain retryable.
           const structuredMessage =
             getStringProperty(sessionError, 'message') ?? getStringProperty(errorData, 'message')
           const plainMessage = typeof sessionError === 'string' ? sessionError : undefined
