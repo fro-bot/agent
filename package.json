@@ -47,7 +47,7 @@
     "fast-uri": ">=3.1.2",
     "fast-xml-builder": ">=1.1.7",
     "fast-xml-parser": ">=5.7.0",
-    "flatted": "3.4.2",
+    "flatted": "3.4.3",
     "handlebars": ">=4.7.9",
     "ip-address": ">=10.1.1",
     "lodash": ">=4.18.0",
@@ -65,11 +65,11 @@
     "@actions/exec": "3.0.0",
     "@actions/github": "9.1.1",
     "@actions/tool-cache": "4.0.0",
-    "@aws-sdk/client-s3": "3.1091.0",
+    "@aws-sdk/client-s3": "3.1095.0",
     "@bfra.me/es": "0.1.0",
     "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.2.0",
-    "@opencode-ai/sdk": "1.18.4"
+    "@opencode-ai/sdk": "1.18.5"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.51.1",

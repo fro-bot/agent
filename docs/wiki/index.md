@@ -1,6 +1,6 @@
 ---
 type: index
-last-updated: "2026-07-19"
+last-updated: "2026-07-26"
 summary: "Navigable entry point for the Fro Bot Agent project wiki"
 ---
 

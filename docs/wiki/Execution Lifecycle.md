@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-07-19"
-updated-by: "1a2d8b2"
+last-updated: "2026-07-26"
+updated-by: "58dfc3d"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -118,9 +118,11 @@ Processes any file attachments from the triggering context, searches prior sessi
 
 The core phase. Calls `executeOpenCode()` which creates (or continues) an SDK session, sends the assembled prompt, and streams events back in real time. The SDK lifecycle follows the pattern: spawn server, connect client, create session, send prompt, process event stream, close.
 
-If the LLM returns a fetch error (transient provider failure), the system retries up to three times with a continuation prompt. A configurable timeout (default: 30 minutes) aborts execution if the agent runs too long.
+If the LLM returns a fetch error (transient provider failure), the system retries up to three times with a continuation prompt. A configurable timeout (default: 30 minutes) bounds execution if the agent runs too long — but that bound is an internal execution deadline, not the whole GitHub Actions job timeout. The distinction matters: the deadline aborts only the agent's own work so that Finalize and Cleanup still get a bounded budget to preserve outcomes and persist state (`action.yaml` documents this boundary, and the job's own `timeout-minutes` remains the outer backstop). A run that hits the deadline is reported as a genuine terminal failure rather than a silent hang, and a pre-deadline terminal result is kept distinct from the bounded post-result teardown that follows it, so cleanup can never overwrite the real outcome.
 
-Not every provider error is retryable, and the phase distinguishes them. **Provider quota exhaustion is terminal**: the retry loop classifies a `quota_exceeded` error as non-retryable and fails fast rather than burning the remaining attempts on a wall it cannot get past. The subtlety this guards against is that a provider's quota-retry can look like session activity — the underlying `wait()` may even resolve as if it succeeded — so an activity tracker records the quota signal and the phase reconciles it into the authoritative result, reporting a quota failure instead of a false success. A brief poll also merges any quota signal the event stream never emitted, so a quota wall observed only during polling still surfaces as a failure. Transient fetch errors keep their retryable classification and still get their retries; only genuinely terminal conditions like quota short-circuit.
+Not every provider error is retryable, and the phase distinguishes them (`packages/runtime/src/agent/error-format/types.ts` enumerates the terminal error kinds — `quota_exceeded`, `provider_auth_error` — as a closed set that the classifiers accept only bounded, provider-neutral fields to produce). **Provider quota exhaustion is terminal**: the retry loop classifies a `quota_exceeded` error as non-retryable and fails fast rather than burning the remaining attempts on a wall it cannot get past. **Provider authentication failures are treated the same way**: a bad or expired credential is not a transient fetch error, so the phase classifies it as terminal and stops retrying immediately instead of hammering the provider with three doomed attempts. The subtlety both cases guard against is that a provider's error-retry can look like session activity — the underlying `wait()` may even resolve as if it succeeded — so an activity tracker records the terminal signal and the phase reconciles it into the authoritative result, reporting a failure instead of a false success. A brief poll also merges any terminal signal the event stream never emitted, so a wall observed only during polling still surfaces as a failure. Transient fetch errors keep their retryable classification and still get their retries; only genuinely terminal conditions like quota exhaustion or an auth rejection short-circuit.
+
+When a terminal failure reaches the user, its diagnostics are handled carefully: provider-controlled error text is kept out of the trusted failure summary the action delivers, so a hostile or noisy provider message cannot smuggle content into the run's authoritative outcome. The structured session error is preserved through teardown rather than being swallowed by the cleanup path, which is what lets a failed run deliver an accurate, trustworthy failure notice instead of a generic one.
 
 ## 9. Review Reconciliation
 
