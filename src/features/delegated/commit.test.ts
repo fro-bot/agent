@@ -134,6 +134,7 @@ describe('createCommit', () => {
         repo: 'repo',
         branch: 'feature',
         message: 'feat: add files',
+        expectedHeadSha: 'current-sha',
         files: [
           {path: 'src/a.ts', content: 'export const a = 1'},
           {path: 'src/b.ts', content: 'export const b = 2'},
@@ -160,6 +161,45 @@ describe('createCommit', () => {
         force: false,
       }),
     )
+  })
+
+  it('rejects a changed branch head before creating any Git objects', async () => {
+    // #given a branch ref that no longer matches the expected pre-write anchor
+    const getRef = vi.fn().mockResolvedValue({data: {object: {sha: 'current-sha'}}})
+    const getCommit = vi.fn()
+    const createBlob = vi.fn()
+    const createTree = vi.fn()
+    const createCommitFn = vi.fn()
+    const updateRef = vi.fn()
+    const octokit = createMockOctokit({
+      getRef,
+      getCommit,
+      createBlob,
+      createTree,
+      createCommit: createCommitFn,
+      updateRef,
+    })
+
+    // #when / #then commit construction checks the anchor
+    await expect(
+      createCommit(
+        octokit,
+        {
+          owner: 'owner',
+          repo: 'repo',
+          branch: 'feature',
+          message: 'feat: add files',
+          expectedHeadSha: 'expected-sha',
+          files: [{path: 'src/a.ts', content: 'export const a = 1'}],
+        },
+        logger,
+      ),
+    ).rejects.toThrow('Branch head changed before commit construction')
+    expect(getCommit).not.toHaveBeenCalled()
+    expect(createBlob).not.toHaveBeenCalled()
+    expect(createTree).not.toHaveBeenCalled()
+    expect(createCommitFn).not.toHaveBeenCalled()
+    expect(updateRef).not.toHaveBeenCalled()
   })
 
   it('creates one commit containing modifications and deletions', async () => {

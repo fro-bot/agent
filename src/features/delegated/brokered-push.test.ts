@@ -1,4 +1,4 @@
-import type {NormalizedEvent, Octokit} from '../../services/github/types.js'
+import type {Octokit} from '../../services/github/types.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
 
 import {beforeEach, describe, expect, it, vi} from 'vitest'
@@ -35,26 +35,6 @@ const BRANCH = 'feature/brokered-fix'
 const ACTOR = 'maintainer'
 const TRUSTED_HEAD_SHA = 'a'.repeat(40)
 
-function issueCommentEvent(): NormalizedEvent {
-  return {
-    type: 'issue_comment',
-    action: 'created',
-    issue: {
-      number: 42,
-      title: 'Fix the thing',
-      body: null,
-      locked: false,
-      isPullRequest: true,
-    },
-    comment: {
-      id: 1,
-      body: '@fro-bot fix it',
-      author: ACTOR,
-      authorAssociation: 'COLLABORATOR',
-    },
-  }
-}
-
 function createExecAdapter(): ExecAdapter {
   return {
     exec: vi.fn().mockResolvedValue(0),
@@ -89,9 +69,15 @@ async function run(options: {readonly octokit?: Octokit; readonly trustedHeadSha
     octokit: options.octokit ?? createMockOctokit(),
     execAdapter: createExecAdapter(),
     logger: createMockLogger(),
-    event: issueCommentEvent(),
-    owner: OWNER,
-    repo: REPO,
+    eventFacts: {
+      eventType: 'issue_comment',
+      isPullRequest: true,
+      authorAssociation: 'COLLABORATOR',
+      commentAuthor: ACTOR,
+      issueNumber: 42,
+      owner: OWNER,
+      repo: REPO,
+    },
     trustedHeadSha: options.trustedHeadSha ?? TRUSTED_HEAD_SHA,
     expectedHeadBranch: BRANCH,
     repoRoot: '/workspace',
@@ -109,7 +95,7 @@ describe('runBrokeredPush', () => {
     allowGateSequence(changes)
     const updateRef = vi.fn().mockResolvedValue({data: {}})
     const octokit = createMockOctokit({
-      getRef: {object: {sha: 'current-sha'}},
+      getRef: {object: {sha: TRUSTED_HEAD_SHA}},
       getCommit: {tree: {sha: 'base-tree-sha'}},
       createBlob: {sha: 'blob-sha'},
       createTree: {sha: 'tree-sha'},
@@ -136,6 +122,32 @@ describe('runBrokeredPush', () => {
     expect(updateRef).toHaveBeenCalledWith(
       expect.objectContaining({owner: OWNER, repo: REPO, ref: `heads/${BRANCH}`, sha: 'commit-sha', force: false}),
     )
+  })
+
+  it('fails loud when the branch head changes before createCommit constructs the tree', async () => {
+    // #given the live pre-write gate passed, but the commit primitive observes a newer head
+    allowGateSequence([{path: 'src/fix.ts', content: 'fixed'}])
+    const createBlob = vi.fn()
+    const createTree = vi.fn()
+    const updateRef = vi.fn()
+    const octokit = createMockOctokit({
+      getRef: {object: {sha: 'b'.repeat(40)}},
+      getCommit: vi.fn(),
+      createBlob,
+      createTree,
+      updateRef,
+    })
+
+    // #when brokered push delivery runs
+    const outcome = await run({octokit})
+
+    // #then the TOCTOU mismatch is fail-loud and no write-side API is called
+    expect(outcome.kind).toBe('fail-loud')
+    if (outcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(outcome.reason).toContain('Branch head changed before commit construction')
+    expect(createBlob).not.toHaveBeenCalled()
+    expect(createTree).not.toHaveBeenCalled()
+    expect(updateRef).not.toHaveBeenCalled()
   })
 
   it('silently bypasses when the early eligibility gate rejects the event', async () => {
@@ -222,7 +234,7 @@ describe('runBrokeredPush', () => {
     allowGateSequence([{path: 'src/fix.ts', content: 'fixed'}])
     const updateRef = vi.fn().mockRejectedValue(Object.assign(new Error('reference update rejected'), {status: 422}))
     const octokit = createMockOctokit({
-      getRef: {object: {sha: 'current-sha'}},
+      getRef: {object: {sha: TRUSTED_HEAD_SHA}},
       getCommit: {tree: {sha: 'base-tree-sha'}},
       createBlob: {sha: 'blob-sha'},
       createTree: {sha: 'tree-sha'},

@@ -97,4 +97,27 @@ describe('validateBrokeredPushFiles', () => {
     // #then
     expect(result).toEqual({valid: true, errors: []})
   })
+
+  it('accepts the maximum brokered push file count', () => {
+    // #given exactly the configured maximum number of allowlisted changes
+    const files = Array.from({length: 100}, (_, index) => contentChange(`src/file-${index}.ts`))
+
+    // #when validating the change set
+    const result = validateBrokeredPushFiles(files)
+
+    // #then the boundary is accepted
+    expect(result).toEqual({valid: true, errors: []})
+  })
+
+  it('rejects a brokered push that exceeds the maximum file count', () => {
+    // #given one more file than the configured maximum
+    const files = Array.from({length: 101}, (_, index) => contentChange(`src/file-${index}.ts`))
+
+    // #when validating the change set
+    const result = validateBrokeredPushFiles(files)
+
+    // #then validation fails before API fanout can begin
+    expect(result.valid).toBe(false)
+    expect(result.errors).toContain('Brokered push exceeds the maximum of 100 files')
+  })
 })

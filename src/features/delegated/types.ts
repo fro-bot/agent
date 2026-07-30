@@ -59,6 +59,8 @@ export interface CommitOptions {
   readonly branch: string
   readonly message: string
   readonly files: readonly FileChange[]
+  /** Optional branch-head anchor checked immediately before Git object creation. */
+  readonly expectedHeadSha?: string
   readonly author?: {
     readonly name: string
     readonly email: string

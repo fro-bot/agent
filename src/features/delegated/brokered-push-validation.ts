@@ -4,6 +4,7 @@ import {validateFiles} from './commit.js'
 
 const BROKERED_PUSH_ALLOWED_PATHS = [/^src\//, /^packages\/[^/]+\/src\//, /^docs\//]
 const BROKERED_PUSH_ALLOWED_ROOT_FILES = new Set(['README.md', 'ARCHITECTURE.md', 'STRUCTURE.md'])
+export const MAX_BROKERED_PUSH_FILES = 100
 
 /**
  * Validate file changes for brokered push delivery.
@@ -15,6 +16,10 @@ const BROKERED_PUSH_ALLOWED_ROOT_FILES = new Set(['README.md', 'ARCHITECTURE.md'
 export function validateBrokeredPushFiles(files: readonly FileChange[]): {valid: boolean; errors: string[]} {
   const validation = validateFiles(files)
   const errors = [...validation.errors]
+
+  if (files.length > MAX_BROKERED_PUSH_FILES) {
+    errors.push(`Brokered push exceeds the maximum of ${MAX_BROKERED_PUSH_FILES} files`)
+  }
 
   for (const file of files) {
     const allowed =

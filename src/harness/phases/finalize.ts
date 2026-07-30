@@ -1,8 +1,7 @@
 import type {BrokeredPushOutcome} from '../../features/delegated/brokered-push.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CommentSummaryOptions} from '../../features/observability/types.js'
-import type {TriggerContext} from '../../features/triggers/types.js'
-import type {CommentTarget, NormalizedEvent} from '../../services/github/types.js'
+import type {CommentTarget} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
@@ -11,7 +10,7 @@ import type {RoutingPhaseResult} from './routing.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {createErrorInfo, createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
-import {runResponsePost} from '../../features/agent/response-post.js'
+import {readAndParseResponseFile, runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
 import {runBrokeredPush} from '../../features/delegated/brokered-push.js'
 import {writeJobSummary} from '../../features/observability/index.js'
@@ -93,36 +92,6 @@ function formatBrokeredPushFooter(outcome: Extract<BrokeredPushOutcome, {readonl
     `- Changed paths: ${pathSummary}`,
     `- Commit: \`${escapeFooterCode(outcome.commit.sha.slice(0, 7))}\``,
   ].join('\n')
-}
-
-function buildBrokeredPushEvent(context: TriggerContext): NormalizedEvent {
-  if (context.eventType !== 'issue_comment') {
-    return {type: 'unsupported'}
-  }
-
-  const target = context.target
-  return {
-    type: 'issue_comment',
-    action: context.action ?? '',
-    issue: {
-      number: target?.number ?? 0,
-      title: target?.title ?? '',
-      body: target?.body ?? null,
-      locked: target?.locked ?? false,
-      isPullRequest: target?.kind === 'pr',
-    },
-    comment: {
-      id: context.commentId ?? 0,
-      body: context.commentBody ?? '',
-      author: context.author?.login ?? context.actor,
-      authorAssociation: context.author?.association ?? '',
-    },
-  }
-}
-
-function resolveExpectedHeadBranch(routing: RoutingPhaseResult): string {
-  const hydratedContext = routing.agentContext.hydratedContext
-  return hydratedContext?.type === 'pull_request' ? hydratedContext.headBranch : ''
 }
 
 /** Post a formatted error comment to the resolved target, if any. Never throws. */
@@ -229,50 +198,74 @@ export async function runFinalize(
       return 1
     }
 
-    let deliveryFooter: string | undefined
-    if (execution.success === true && execution.commentsPosted === 0) {
-      const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
-      const brokeredPush = await runBrokeredPush({
-        octokit: routing.githubClient,
-        execAdapter: createExecAdapter(),
-        logger,
-        event: buildBrokeredPushEvent(routing.triggerResult.context),
-        owner,
-        repo,
-        trustedHeadSha: bootstrap.trustedHeadSha,
-        expectedHeadBranch: resolveExpectedHeadBranch(routing),
-        repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
-      })
-
-      if (brokeredPush.kind === 'fail-loud') {
-        const commentTarget = resolveCommentTarget(routing)
-        if (execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)) {
-          const safeError = createBrokeredPushError()
-          await postErrorComment(routing, commentTarget, formatErrorComment(safeError), metrics, logger)
-        } else if (execution.commentsPosted === 0 && !isResolvedCommentTarget(commentTarget)) {
-          logger.warning('Cannot post brokered push failure comment: missing target context')
-        }
-
-        core.setFailed(`Brokered push delivery failed: ${brokeredPush.reason}`)
-        return 1
-      }
-
-      if (brokeredPush.kind === 'pushed') {
-        deliveryFooter = formatBrokeredPushFooter(brokeredPush)
-      }
-    }
-
-    const responsePostParams = {
-      octokit: routing.githubClient,
+    const responsePostLogger = createLogger({phase: 'response-post'})
+    const responseFileParams = {
       agentContext: routing.agentContext,
       triggerResult: routing.triggerResult,
-      botLogin: routing.botLogin,
       responseFilePath: bootstrap.responseFilePath,
-      ...(deliveryFooter == null ? {} : {deliveryFooter}),
     }
+    const responsePrecheck = await readAndParseResponseFile(responseFileParams, responsePostLogger)
+    let result: Awaited<ReturnType<typeof runResponsePost>>
 
-    const responsePostLogger = createLogger({phase: 'response-post'})
-    const result = await runResponsePost(responsePostParams, responsePostLogger)
+    if ('success' in responsePrecheck === false) {
+      result = responsePrecheck
+    } else {
+      let deliveryFooter: string | undefined
+      if (execution.success === true && execution.commentsPosted === 0) {
+        const triggerContext = routing.triggerResult.context
+        const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
+        const eventFacts = {
+          eventType: triggerContext.eventType,
+          isPullRequest: routing.agentContext.issueType === 'pr',
+          authorAssociation: triggerContext.author?.association ?? '',
+          commentAuthor: triggerContext.author?.login ?? '',
+          issueNumber: routing.agentContext.issueNumber ?? 0,
+          owner,
+          repo,
+        }
+        const expectedHeadBranch =
+          routing.agentContext.hydratedContext?.type === 'pull_request'
+            ? routing.agentContext.hydratedContext.headBranch
+            : ''
+        const brokeredPush = await runBrokeredPush({
+          octokit: routing.githubClient,
+          execAdapter: createExecAdapter(),
+          logger,
+          eventFacts,
+          trustedHeadSha: bootstrap.trustedHeadSha,
+          expectedHeadBranch,
+          repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
+        })
+
+        if (brokeredPush.kind === 'fail-loud') {
+          const commentTarget = resolveCommentTarget(routing)
+          if (execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)) {
+            const safeError = createBrokeredPushError()
+            await postErrorComment(routing, commentTarget, formatErrorComment(safeError), metrics, logger)
+          } else if (execution.commentsPosted === 0 && !isResolvedCommentTarget(commentTarget)) {
+            logger.warning('Cannot post brokered push failure comment: missing target context')
+          }
+
+          core.setFailed(`Brokered push delivery failed: ${brokeredPush.reason}`)
+          return 1
+        }
+
+        if (brokeredPush.kind === 'pushed') {
+          deliveryFooter = formatBrokeredPushFooter(brokeredPush)
+        }
+      }
+
+      const responsePostParams = {
+        octokit: routing.githubClient,
+        agentContext: routing.agentContext,
+        triggerResult: routing.triggerResult,
+        botLogin: routing.botLogin,
+        responseFilePath: bootstrap.responseFilePath,
+        ...(deliveryFooter == null ? {} : {deliveryFooter}),
+      }
+
+      result = await runResponsePost(responsePostParams, responsePostLogger)
+    }
 
     if (result.delivered === false) {
       if (result.reason === 'file-read-failed' && execution.success === false && execution.commentsPosted === 0) {

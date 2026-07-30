@@ -1,4 +1,4 @@
-import type {NormalizedEvent, Octokit} from '../../services/github/types.js'
+import type {Octokit} from '../../services/github/types.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CommitResult, FileChange} from './types.js'
@@ -8,6 +8,7 @@ import {
   checkBrokeredPushPermission,
   checkBrokeredPushPreWriteGate,
   evaluateBrokeredPushEarlyGate,
+  type BrokeredPushEventFacts,
 } from './brokered-push-gate.js'
 import {validateBrokeredPushFiles} from './brokered-push-validation.js'
 import {createCommit} from './commit.js'
@@ -19,16 +20,13 @@ export interface BrokeredPushParams {
   readonly octokit: Octokit
   readonly execAdapter: ExecAdapter
   readonly logger: Logger
-  readonly event: NormalizedEvent
-  readonly owner: string
-  readonly repo: string
+  readonly eventFacts: BrokeredPushEventFacts
   readonly trustedHeadSha: string
   readonly expectedHeadBranch: string
   readonly repoRoot: string
 }
 
 export type BrokeredPushOutcome =
-  | {readonly kind: 'skipped'}
   | {readonly kind: 'bypass'}
   | {readonly kind: 'nothing-to-deliver'}
   | {readonly kind: 'pushed'; readonly commit: CommitResult; readonly branch: string; readonly paths: readonly string[]}
@@ -42,10 +40,10 @@ export type BrokeredPushOutcome =
  * reported as delivered when createCommit completes, which includes updateRef.
  */
 export async function runBrokeredPush(params: BrokeredPushParams): Promise<BrokeredPushOutcome> {
-  const {octokit, execAdapter, logger, event, owner, repo, trustedHeadSha, expectedHeadBranch, repoRoot} = params
+  const {octokit, execAdapter, logger, eventFacts, trustedHeadSha, expectedHeadBranch, repoRoot} = params
 
   try {
-    const earlyGate = evaluateBrokeredPushEarlyGate({event, owner, repo, trustedHeadSha})
+    const earlyGate = evaluateBrokeredPushEarlyGate({facts: eventFacts, trustedHeadSha})
     if (earlyGate.decision === 'ineligible') {
       logger.debug('Brokered push bypassed by early eligibility gate', {reason: earlyGate.reason})
       return {kind: 'bypass'}
@@ -56,7 +54,7 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
       return failLoud(permission.reason, logger)
     }
 
-    const reconstruction = await reconstructChanges(execAdapter, trustedHeadSha, repoRoot)
+    const reconstruction = await reconstructChanges(execAdapter, trustedHeadSha, repoRoot, logger)
     if (reconstruction.success === false) {
       return failLoud(reconstruction.error.message, logger)
     }
@@ -89,6 +87,7 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
           repo: preWriteGate.target.repo,
           branch: preWriteGate.target.branch,
           message: BROKERED_PUSH_COMMIT_MESSAGE,
+          expectedHeadSha: earlyGate.trustedHeadSha,
           files: changes,
         },
         logger,

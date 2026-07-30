@@ -1,5 +1,6 @@
 import type {Result} from '@bfra.me/es/result'
 import type {ExecAdapter} from '../../services/setup/types.js'
+import type {Logger} from '../../shared/logger.js'
 import type {FileChange} from './types.js'
 
 import {Buffer} from 'node:buffer'
@@ -13,6 +14,12 @@ const SHA1_PATTERN = /^[0-9a-f]{40}$/i
 const ZERO_MODE = '000000'
 const REGULAR_FILE_MODE = '100644'
 const UTF8_DECODER = new TextDecoder('utf-8', {fatal: true})
+const GIT_ENV = {
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_SYSTEM: '/dev/null',
+  GIT_PAGER: 'cat',
+} as const
 
 interface RawDiffEntry {
   readonly oldMode: string
@@ -36,8 +43,10 @@ export async function reconstructChanges(
   execAdapter: ExecAdapter,
   trustedHeadSha: string,
   repoRoot: string,
+  logger: Logger,
 ): Promise<Result<ReconstructChangesOutcome, Error>> {
   if (SHA1_PATTERN.test(trustedHeadSha) === false) {
+    logger.debug('Brokered push reconstruction bypassed because the trusted head SHA is malformed')
     return ok({kind: 'bypass', reason: 'Trusted head SHA is missing or malformed'})
   }
 
@@ -60,23 +69,41 @@ export async function reconstructChanges(
       ],
       {
         cwd: repoRoot,
-        env: {
-          GIT_CONFIG_NOSYSTEM: '1',
-          GIT_CONFIG_GLOBAL: '/dev/null',
-          GIT_CONFIG_SYSTEM: '/dev/null',
-          GIT_PAGER: 'cat',
-        },
+        env: GIT_ENV,
         ignoreReturnCode: true,
         silent: true,
       },
     )
 
     if (diffResult.exitCode !== 0) {
-      return err(new Error(`Unable to diff workspace against trusted head SHA: ${diffResult.stderr.trim()}`.trim()))
+      const detail = diffResult.stderr.trim()
+      logger.warning('Brokered push reconstruction diff failed', {error: detail})
+      return err(new Error(`Unable to diff workspace against trusted head SHA: ${detail}`.trim()))
     }
 
-    const entries = parseRawDiff(diffResult.stdout)
+    const untrackedResult = await execAdapter.getExecOutput(
+      'git',
+      ['--no-pager', '-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard', '-z', '--'],
+      {
+        cwd: repoRoot,
+        env: GIT_ENV,
+        ignoreReturnCode: true,
+        silent: true,
+      },
+    )
+
+    if (untrackedResult.exitCode !== 0) {
+      const detail = untrackedResult.stderr.trim()
+      logger.warning('Brokered push reconstruction untracked-file lookup failed', {error: detail})
+      return err(new Error(`Unable to enumerate untracked workspace files: ${detail}`.trim()))
+    }
+
+    const entries = mergeRawDiffAndUntracked(
+      parseRawDiff(diffResult.stdout),
+      parseUntrackedPaths(untrackedResult.stdout),
+    )
     if (entries.length === 0) {
+      logger.debug('Brokered push reconstruction found no changes')
       return ok({kind: 'nothing-to-deliver'})
     }
 
@@ -95,13 +122,57 @@ export async function reconstructChanges(
 
     const validation = validateFiles(changes)
     if (validation.valid === false) {
-      return err(new Error(`Reconstructed file validation failed: ${validation.errors.join('; ')}`))
+      const detail = `Reconstructed file validation failed: ${validation.errors.join('; ')}`
+      logger.warning('Brokered push reconstruction file validation failed', {error: detail})
+      return err(new Error(detail))
     }
 
     return ok({kind: 'changes', changes})
   } catch (error) {
-    return err(error instanceof Error ? error : new Error(String(error)))
+    const normalizedError = error instanceof Error ? error : new Error(String(error))
+    logger.warning('Brokered push reconstruction failed', {error: normalizedError.message})
+    return err(normalizedError)
   }
+}
+
+function parseUntrackedPaths(stdout: string): string[] {
+  if (stdout.length === 0) {
+    return []
+  }
+
+  const fields = stdout.split('\0')
+  if (fields.at(-1) === '') {
+    fields.pop()
+  }
+
+  if (fields.some(path => path.length === 0)) {
+    throw new Error('Malformed git ls-files output: empty untracked path')
+  }
+
+  return fields
+}
+
+function mergeRawDiffAndUntracked(
+  diffEntries: readonly RawDiffEntry[],
+  untrackedPaths: readonly string[],
+): RawDiffEntry[] {
+  const entriesByPath = new Map<string, RawDiffEntry>()
+  for (const entry of diffEntries) {
+    entriesByPath.set(entry.path, entry)
+  }
+
+  for (const path of untrackedPaths) {
+    if (entriesByPath.has(path) === false) {
+      entriesByPath.set(path, {
+        oldMode: ZERO_MODE,
+        newMode: REGULAR_FILE_MODE,
+        status: 'A',
+        path,
+      })
+    }
+  }
+
+  return [...entriesByPath.values()]
 }
 
 function parseRawDiff(stdout: string): RawDiffEntry[] {
@@ -203,7 +274,8 @@ async function readContentChange(repoRoot: string, relativePath: string): Promis
   }
 
   const stats = await fs.lstat(filePath)
-  if (stats.isSymbolicLink() || stats.isFile() === false) {
+  const isExecutable = typeof stats.mode === 'number' && (stats.mode & 0o111) !== 0
+  if (stats.isSymbolicLink() || stats.isFile() === false || isExecutable) {
     throw new Error(`${relativePath}: only regular files may be reconstructed`)
   }
 

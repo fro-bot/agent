@@ -99,7 +99,7 @@ export function validateFiles(files: readonly FileChange[]): {valid: boolean; er
  * Uses Git Data API: createBlob → createTree → createCommit → updateRef (force: false)
  */
 export async function createCommit(octokit: Octokit, options: CommitOptions, logger: Logger): Promise<CommitResult> {
-  const {owner, repo, branch, message, files, author} = options
+  const {owner, repo, branch, message, files, expectedHeadSha, author} = options
   const commitAuthor = author ?? DEFAULT_AUTHOR
 
   logger.info('Creating commit', {
@@ -119,6 +119,12 @@ export async function createCommit(octokit: Octokit, options: CommitOptions, log
     ref: `heads/${branch}`,
   })
   const currentCommitSha = ref.object.sha
+
+  if (expectedHeadSha != null && currentCommitSha !== expectedHeadSha) {
+    throw new Error(
+      `Branch head changed before commit construction: expected ${expectedHeadSha}, found ${currentCommitSha}`,
+    )
+  }
 
   const {data: currentCommit} = await octokit.rest.git.getCommit({
     owner,

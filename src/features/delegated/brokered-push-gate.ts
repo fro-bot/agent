@@ -1,4 +1,4 @@
-import type {NormalizedEvent, Octokit} from '../../services/github/types.js'
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 
 import {toErrorMessage} from '../../shared/errors.js'
@@ -7,11 +7,20 @@ import {isAuthorizedAssociation} from '../triggers/author-utils.js'
 const AUTHORIZED_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'] as const
 
 export interface BrokeredPushEarlyGateParams {
-  readonly event: NormalizedEvent
-  readonly owner: string
-  readonly repo: string
+  readonly facts: BrokeredPushEventFacts
   /** Captured by the trusted workflow checkout step; empty means no trusted PR anchor exists. */
   readonly trustedHeadSha: string
+}
+
+/** Exact trusted event facts needed by the early brokered-push eligibility gate. */
+export interface BrokeredPushEventFacts {
+  readonly eventType: string
+  readonly isPullRequest: boolean
+  readonly authorAssociation: string
+  readonly commentAuthor: string
+  readonly issueNumber: number
+  readonly owner: string
+  readonly repo: string
 }
 
 export interface BrokeredPushEarlyEligible {
@@ -70,7 +79,8 @@ export type BrokeredPushPreWriteOutcome = BrokeredPushPreWriteAllowed | Brokered
  * Apply the event-time brokered-push filter without consulting live state.
  */
 export function evaluateBrokeredPushEarlyGate(params: BrokeredPushEarlyGateParams): BrokeredPushEarlyGateOutcome {
-  const {event, owner, repo, trustedHeadSha} = params
+  const {facts, trustedHeadSha} = params
+  const {eventType, isPullRequest, authorAssociation, commentAuthor, issueNumber, owner, repo} = facts
 
   if (owner.trim() === '') {
     return {decision: 'ineligible', reason: 'Repository identity is missing'}
@@ -80,15 +90,15 @@ export function evaluateBrokeredPushEarlyGate(params: BrokeredPushEarlyGateParam
     return {decision: 'ineligible', reason: 'Repository identity is missing'}
   }
 
-  if (event.type !== 'issue_comment') {
+  if (eventType !== 'issue_comment') {
     return {decision: 'ineligible', reason: 'Event is not an issue comment'}
   }
 
-  if (event.issue.isPullRequest !== true) {
+  if (isPullRequest !== true) {
     return {decision: 'ineligible', reason: 'Issue comment is not on a pull request'}
   }
 
-  if (isAuthorizedAssociation(event.comment.authorAssociation, AUTHORIZED_ASSOCIATIONS) === false) {
+  if (isAuthorizedAssociation(authorAssociation, AUTHORIZED_ASSOCIATIONS) === false) {
     return {decision: 'ineligible', reason: 'Comment author association is not authorized'}
   }
 
@@ -100,8 +110,8 @@ export function evaluateBrokeredPushEarlyGate(params: BrokeredPushEarlyGateParam
     decision: 'eligible',
     owner,
     repo,
-    prNumber: event.issue.number,
-    actor: event.comment.author,
+    prNumber: issueNumber,
+    actor: commentAuthor,
     trustedHeadSha,
   }
 }

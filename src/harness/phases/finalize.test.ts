@@ -18,6 +18,7 @@ type RunBrokeredPushMock = (params: BrokeredPushParams) => Promise<BrokeredPushO
 const mocks = vi.hoisted(() => ({
   setFailed: vi.fn(),
   runResponsePost: vi.fn(),
+  readAndParseResponseFile: vi.fn(),
   postComment: vi.fn(),
   runBrokeredPush: vi.fn<RunBrokeredPushMock>(),
   createExecAdapter: vi.fn().mockReturnValue({exec: vi.fn(), getExecOutput: vi.fn()}),
@@ -38,6 +39,7 @@ vi.mock('@actions/core', () => ({
 
 vi.mock('../../features/agent/response-post.js', () => ({
   runResponsePost: mocks.runResponsePost,
+  readAndParseResponseFile: mocks.readAndParseResponseFile,
 }))
 
 vi.mock('../../features/comments/index.js', async () => {
@@ -163,6 +165,10 @@ function createMetrics(): MetricsCollector {
 describe('runFinalize file-convention delivery', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.readAndParseResponseFile.mockResolvedValue({
+      success: true,
+      data: {surface: 'pr-comment', parsed: {body: 'prechecked response'}},
+    })
     mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
   })
 
@@ -508,6 +514,62 @@ describe('runFinalize file-convention delivery', () => {
       expect.anything(),
     )
     expect(mocks.runResponsePost).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['malformed', {delivered: false, reason: 'parse-failed', detail: 'malformed response'}],
+    ['unreadable', {delivered: false, reason: 'file-read-failed', detail: 'ENOENT'}],
+  ] as const)('does not push when the response file is %s during the pre-check', async (_label, failure) => {
+    // #given a successful execution whose response file cannot be delivered
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.readAndParseResponseFile.mockResolvedValue(failure)
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the existing fail-closed path runs without mutating the PR
+    expect(exitCode).toBe(1)
+    expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining(bootstrap.responseFilePath as string))
+  })
+
+  it('posts exactly one normal response for a nothing-to-deliver brokered outcome', async () => {
+    // #given an eligible successful run with no workspace changes
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'nothing-to-deliver'})
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the response is posted once without a delivery footer or separate comment
+    expect(exitCode).toBe(0)
+    expect(mocks.runResponsePost).toHaveBeenCalledTimes(1)
+    expect(mocks.runResponsePost.mock.calls[0]?.[0]).not.toHaveProperty('deliveryFooter')
+    expect(mocks.postComment).not.toHaveBeenCalled()
   })
 
   it('fails loud and suppresses the model response when brokered delivery fails', async () => {

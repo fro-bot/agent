@@ -1,4 +1,3 @@
-import type {NormalizedEvent} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it} from 'vitest'
 import {createMockOctokit} from '../../services/github/test-helpers.js'
@@ -8,6 +7,7 @@ import {
   checkBrokeredPushPreWriteGate,
   evaluateBrokeredPushEarlyGate,
   type BrokeredPushEarlyEligible,
+  type BrokeredPushEventFacts,
 } from './brokered-push-gate.js'
 
 const OWNER = 'owner'
@@ -17,46 +17,33 @@ const ACTOR = 'maintainer'
 const BRANCH = 'feature/brokered-fix'
 const TRUSTED_HEAD_SHA = 'a'.repeat(40)
 
-function issueCommentEvent(authorAssociation = 'COLLABORATOR', isPullRequest = true): NormalizedEvent {
+function issueCommentFacts(authorAssociation = 'COLLABORATOR', isPullRequest = true): BrokeredPushEventFacts {
   return {
-    type: 'issue_comment',
-    action: 'created',
-    issue: {
-      number: PR_NUMBER,
-      title: 'Fix the thing',
-      body: null,
-      locked: false,
-      isPullRequest,
-    },
-    comment: {
-      id: 1,
-      body: '@fro-bot fix it',
-      author: ACTOR,
-      authorAssociation,
-    },
+    eventType: 'issue_comment',
+    isPullRequest,
+    authorAssociation,
+    commentAuthor: ACTOR,
+    issueNumber: PR_NUMBER,
+    owner: OWNER,
+    repo: REPO,
   }
 }
 
-function issuesEvent(): NormalizedEvent {
+function issuesFacts(): BrokeredPushEventFacts {
   return {
-    type: 'issues',
-    action: 'opened',
-    issue: {
-      number: PR_NUMBER,
-      title: 'An issue',
-      body: null,
-      locked: false,
-      authorAssociation: 'COLLABORATOR',
-    },
-    sender: {login: ACTOR},
+    eventType: 'issues',
+    isPullRequest: false,
+    authorAssociation: 'COLLABORATOR',
+    commentAuthor: ACTOR,
+    issueNumber: PR_NUMBER,
+    owner: OWNER,
+    repo: REPO,
   }
 }
 
 function eligibleEvent(anchor = TRUSTED_HEAD_SHA): BrokeredPushEarlyEligible {
   const outcome = evaluateBrokeredPushEarlyGate({
-    event: issueCommentEvent(),
-    owner: OWNER,
-    repo: REPO,
+    facts: issueCommentFacts(),
     trustedHeadSha: anchor,
   })
 
@@ -84,13 +71,11 @@ function livePullRequest(overrides: Record<string, unknown> = {}): Record<string
 describe('evaluateBrokeredPushEarlyGate', () => {
   it('admits a trusted same-repo PR issue comment with an anchor', () => {
     // #given a collaborator issue comment on a PR and a trusted checkout anchor
-    const event = issueCommentEvent('COLLABORATOR')
+    const facts = issueCommentFacts('COLLABORATOR')
 
     // #when the event-time gate is evaluated
     const outcome = evaluateBrokeredPushEarlyGate({
-      event,
-      owner: OWNER,
-      repo: REPO,
+      facts,
       trustedHeadSha: TRUSTED_HEAD_SHA,
     })
 
@@ -106,17 +91,15 @@ describe('evaluateBrokeredPushEarlyGate', () => {
   })
 
   it.each([
-    ['unauthorized association', issueCommentEvent('NONE'), TRUSTED_HEAD_SHA],
-    ['non-PR issue comment', issueCommentEvent('COLLABORATOR', false), TRUSTED_HEAD_SHA],
-    ['non-issue-comment event', issuesEvent(), TRUSTED_HEAD_SHA],
-    ['missing trusted anchor', issueCommentEvent(), ''],
-    ['whitespace-only trusted anchor', issueCommentEvent(), '   '],
-  ])('bypasses %s without treating it as a failure', (_label, event, trustedHeadSha) => {
+    ['unauthorized association', issueCommentFacts('NONE'), TRUSTED_HEAD_SHA],
+    ['non-PR issue comment', issueCommentFacts('COLLABORATOR', false), TRUSTED_HEAD_SHA],
+    ['non-issue-comment event', issuesFacts(), TRUSTED_HEAD_SHA],
+    ['missing trusted anchor', issueCommentFacts(), ''],
+    ['whitespace-only trusted anchor', issueCommentFacts(), '   '],
+  ])('bypasses %s without treating it as a failure', (_label, facts, trustedHeadSha) => {
     // #when an event fails one of the early trusted-context checks
     const outcome = evaluateBrokeredPushEarlyGate({
-      event,
-      owner: OWNER,
-      repo: REPO,
+      facts,
       trustedHeadSha,
     })
 
