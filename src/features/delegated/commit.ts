@@ -67,6 +67,23 @@ export function validateFiles(files: readonly FileChange[]): {valid: boolean; er
       errors.push(pathResult.reason)
     }
 
+    if (file.mode != null && file.mode !== '100644') {
+      errors.push(`${file.path}: only regular file mode 100644 is supported`)
+    }
+
+    if (file.type != null && file.type !== 'blob') {
+      errors.push(`${file.path}: only blob tree entries are supported`)
+    }
+
+    if (file.deleted === true) {
+      continue
+    }
+
+    if (!('content' in file) || typeof file.content !== 'string') {
+      errors.push(`${file.path}: file content is required for non-deletion changes`)
+      continue
+    }
+
     const sizeResult = validateFileSize(file.content, file.encoding)
     if (!sizeResult.valid && sizeResult.reason != null) {
       errors.push(`${file.path}: ${sizeResult.reason}`)
@@ -112,6 +129,19 @@ export async function createCommit(octokit: Octokit, options: CommitOptions, log
 
   const treeItems = await Promise.all(
     files.map(async file => {
+      if (file.deleted === true) {
+        return {
+          path: file.path,
+          mode: '100644' as const,
+          type: 'blob' as const,
+          sha: null,
+        }
+      }
+
+      if (!('content' in file) || typeof file.content !== 'string') {
+        throw new Error(`File validation failed: ${file.path}: file content is required for non-deletion changes`)
+      }
+
       const {data: blob} = await octokit.rest.git.createBlob({
         owner,
         repo,

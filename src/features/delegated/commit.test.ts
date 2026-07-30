@@ -162,6 +162,172 @@ describe('createCommit', () => {
     )
   })
 
+  it('creates one commit containing modifications and deletions', async () => {
+    // #given
+    const getRef = vi.fn().mockResolvedValue({data: {object: {sha: 'current-sha'}}})
+    const getCommit = vi.fn().mockResolvedValue({data: {tree: {sha: 'base-tree-sha'}}})
+    const createBlob = vi.fn().mockResolvedValue({data: {sha: 'updated-blob-sha'}})
+    const createTree = vi.fn().mockResolvedValue({data: {sha: 'new-tree-sha'}})
+    const createCommitFn = vi.fn().mockResolvedValue({
+      data: {sha: 'new-commit-sha', html_url: 'https://github.com/...', message: 'feat: update files'},
+    })
+    const updateRef = vi.fn().mockResolvedValue({data: {}})
+    const octokit = createMockOctokit({
+      getRef,
+      getCommit,
+      createBlob,
+      createTree,
+      createCommit: createCommitFn,
+      updateRef,
+    })
+
+    // #when
+    await createCommit(
+      octokit,
+      {
+        owner: 'owner',
+        repo: 'repo',
+        branch: 'feature',
+        message: 'feat: update files',
+        files: [
+          {path: 'src/updated.ts', content: 'export const updated = true'},
+          {path: 'src/removed.ts', deleted: true},
+        ],
+      },
+      logger,
+    )
+
+    // #then
+    expect(createBlob).toHaveBeenCalledTimes(1)
+    expect(createTree).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tree: [
+          {path: 'src/updated.ts', mode: '100644', type: 'blob', sha: 'updated-blob-sha'},
+          {path: 'src/removed.ts', mode: '100644', type: 'blob', sha: null},
+        ],
+      }),
+    )
+    expect(updateRef).toHaveBeenCalledWith(expect.objectContaining({force: false}))
+  })
+
+  it('creates a non-empty commit for a delete-only change set', async () => {
+    // #given
+    const getRef = vi.fn().mockResolvedValue({data: {object: {sha: 'current-sha'}}})
+    const getCommit = vi.fn().mockResolvedValue({data: {tree: {sha: 'base-tree-sha'}}})
+    const createBlob = vi.fn()
+    const createTree = vi.fn().mockResolvedValue({data: {sha: 'new-tree-sha'}})
+    const createCommitFn = vi.fn().mockResolvedValue({
+      data: {sha: 'new-commit-sha', html_url: 'https://github.com/...', message: 'chore: remove file'},
+    })
+    const updateRef = vi.fn().mockResolvedValue({data: {}})
+    const octokit = createMockOctokit({
+      getRef,
+      getCommit,
+      createBlob,
+      createTree,
+      createCommit: createCommitFn,
+      updateRef,
+    })
+
+    // #when
+    await createCommit(
+      octokit,
+      {
+        owner: 'owner',
+        repo: 'repo',
+        branch: 'feature',
+        message: 'chore: remove file',
+        files: [{path: 'src/removed.ts', deleted: true}],
+      },
+      logger,
+    )
+
+    // #then
+    expect(createBlob).not.toHaveBeenCalled()
+    expect(createTree).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tree: [{path: 'src/removed.ts', mode: '100644', type: 'blob', sha: null}],
+      }),
+    )
+    expect(updateRef).toHaveBeenCalledWith(expect.objectContaining({force: false}))
+  })
+
+  it.each(['.env', '.git/config', '../escape.txt'])(
+    'validates forbidden deletion path %s before making an API call',
+    async path => {
+      // #given
+      const getRef = vi.fn()
+      const octokit = createMockOctokit({getRef})
+
+      // #when / #then
+      await expect(
+        createCommit(
+          octokit,
+          {
+            owner: 'owner',
+            repo: 'repo',
+            branch: 'feature',
+            message: 'chore: remove secret',
+            files: [{path, deleted: true}],
+          },
+          logger,
+        ),
+      ).rejects.toThrow('File validation failed')
+      expect(getRef).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    {label: 'symlink', file: {path: 'src/symlink.txt', content: 'content', mode: '120000'}},
+    {label: 'gitlink', file: {path: 'src/gitlink.txt', content: 'content', mode: '160000'}},
+    {label: 'executable', file: {path: 'src/executable.txt', content: 'content', mode: '100755'}},
+    {label: 'type-only change', file: {path: 'src/tree.txt', content: 'content', type: 'tree'}},
+    {label: 'mode-only change', file: {path: 'src/mode-only.txt', mode: '100644'}},
+  ] as const)('rejects $label entries before making an API call', async entry => {
+    // #given
+    const getRef = vi.fn()
+    const octokit = createMockOctokit({getRef})
+
+    // #when / #then
+    await expect(
+      createCommit(
+        octokit,
+        {
+          owner: 'owner',
+          repo: 'repo',
+          branch: 'feature',
+          message: 'chore: reject unsupported tree entry',
+          files: [entry.file],
+        },
+        logger,
+      ),
+    ).rejects.toThrow('File validation failed')
+    expect(getRef).not.toHaveBeenCalled()
+  })
+
+  it('surfaces an API error when deleting a path absent from the base tree', async () => {
+    // #given
+    const getRef = vi.fn().mockResolvedValue({data: {object: {sha: 'current-sha'}}})
+    const getCommit = vi.fn().mockResolvedValue({data: {tree: {sha: 'base-tree-sha'}}})
+    const createTree = vi.fn().mockRejectedValue(new Error('path does not exist in base tree'))
+    const octokit = createMockOctokit({getRef, getCommit, createTree})
+
+    // #when / #then
+    await expect(
+      createCommit(
+        octokit,
+        {
+          owner: 'owner',
+          repo: 'repo',
+          branch: 'feature',
+          message: 'chore: remove missing file',
+          files: [{path: 'src/missing.ts', deleted: true}],
+        },
+        logger,
+      ),
+    ).rejects.toThrow('path does not exist in base tree')
+  })
+
   it('uses custom author when provided', async () => {
     // #given
     const getRef = vi.fn().mockResolvedValue({data: {object: {sha: 'sha'}}})
