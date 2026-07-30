@@ -1,5 +1,6 @@
 import type {ResponsePostResult} from '../../features/agent/response-post.js'
 import type {AgentContext} from '../../features/agent/types.js'
+import type {BrokeredPushOutcome, BrokeredPushParams} from '../../features/delegated/brokered-push.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {TriggerResultProcess} from '../../features/triggers/types.js'
 import type {CommentTarget, Octokit} from '../../services/github/types.js'
@@ -12,10 +13,14 @@ import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {formatErrorComment} from '../../features/comments/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 
+type RunBrokeredPushMock = (params: BrokeredPushParams) => Promise<BrokeredPushOutcome>
+
 const mocks = vi.hoisted(() => ({
   setFailed: vi.fn(),
   runResponsePost: vi.fn(),
   postComment: vi.fn(),
+  runBrokeredPush: vi.fn<RunBrokeredPushMock>(),
+  createExecAdapter: vi.fn().mockReturnValue({exec: vi.fn(), getExecOutput: vi.fn()}),
 }))
 
 vi.mock('@actions/core', () => ({
@@ -40,6 +45,14 @@ vi.mock('../../features/comments/index.js', async () => {
   return {...actual, postComment: mocks.postComment}
 })
 
+vi.mock('../../features/delegated/brokered-push.js', () => ({
+  runBrokeredPush: mocks.runBrokeredPush,
+}))
+
+vi.mock('../../services/setup/adapters.js', () => ({
+  createExecAdapter: mocks.createExecAdapter,
+}))
+
 vi.mock('../../shared/logger.js', () => ({
   createLogger: () => ({debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}),
 }))
@@ -53,6 +66,7 @@ function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): Bootstr
     opencodeResult: {didSetup: false, version: '1.0.0'} as BootstrapPhaseResult['opencodeResult'],
     delivery: 'file-convention',
     responseFilePath: '/tmp/fro-bot-response.md',
+    trustedHeadSha: '',
     ...overrides,
   }
 }
@@ -72,6 +86,39 @@ function createRouting(overrides: Partial<RoutingPhaseResult> = {}): RoutingPhas
     botLogin: 'fro-bot[bot]',
     ...overrides,
   }
+}
+
+function createEligibleRouting(): RoutingPhaseResult {
+  return createRouting({
+    triggerResult: {
+      context: {
+        eventType: 'issue_comment',
+        eventName: 'issue_comment',
+        repo: {owner: 'owner', repo: 'repo'},
+        ref: 'refs/heads/feature/brokered-fix',
+        sha: 'a'.repeat(40),
+        runId: 123,
+        actor: 'maintainer',
+        action: 'created',
+        author: {login: 'maintainer', association: 'COLLABORATOR', isBot: false},
+        target: {kind: 'pr', number: 42, title: 'Fix the thing', body: null, locked: false},
+        commentBody: '@fro-bot fix it',
+        commentId: 1,
+        hasMention: true,
+        command: null,
+        isBotReviewRequested: false,
+        raw: {},
+      },
+    } as TriggerResultProcess,
+    agentContext: {
+      ...createRouting().agentContext,
+      eventName: 'issue_comment',
+      repo: 'owner/repo',
+      issueNumber: 42,
+      issueType: 'pr',
+      hydratedContext: {type: 'pull_request', headBranch: 'feature/brokered-fix'} as AgentContext['hydratedContext'],
+    },
+  })
 }
 
 function createExecution(overrides: Partial<ExecutePhaseResult> = {}): ExecutePhaseResult {
@@ -116,6 +163,7 @@ function createMetrics(): MetricsCollector {
 describe('runFinalize file-convention delivery', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
   })
 
   it('delivers the response file and returns 0 when runResponsePost succeeds', async () => {
@@ -417,6 +465,107 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.setFailed).toHaveBeenCalled()
     expect(mocks.postComment).not.toHaveBeenCalled()
   })
+
+  it('runs brokered push after the response path is resolved and before normal response posting', async () => {
+    // #given a successful trusted PR mention with a response file and no prior comment
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'pushed',
+      branch: 'feature/brokered-fix',
+      commit: {sha: 'commit-sha', url: 'https://example.com/commit-sha', message: 'fix'},
+    })
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the injected in-heap client and exec adapter are used, then existing response delivery proceeds unchanged
+    expect(exitCode).toBe(0)
+    expect(mocks.runBrokeredPush).toHaveBeenCalledWith(
+      expect.objectContaining({
+        octokit: routing.githubClient,
+        trustedHeadSha: bootstrap.trustedHeadSha,
+        expectedHeadBranch: 'feature/brokered-fix',
+        repoRoot: expect.any(String) as unknown as string,
+      }),
+    )
+    expect(mocks.runResponsePost).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails loud and suppresses the model response when brokered delivery fails', async () => {
+    // #given a successful eligible execution whose brokered write is rejected
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'fail-loud', reason: 'head SHA changed'})
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then no happy-path response is posted and the delivery reason fails the run
+    expect(exitCode).toBe(1)
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('head SHA changed'))
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+  })
+
+  it('does not invoke brokered push for failed executions or already-posted responses', async () => {
+    // #given a trusted PR mention whose execution failed
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs after a failed execution
+    await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      createExecution({success: false, exitCode: 1, error: 'primary failure'}),
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then brokered push is skipped and the existing response flow remains in charge
+    expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
+
+    // #when the same execution has already posted a response
+    vi.clearAllMocks()
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+    await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      createExecution({success: true, commentsPosted: 1}),
+      createMetrics(),
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the one-response gate also excludes brokered push
+    expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
+  })
 })
 
 describe('runFinalize non-file-convention delivery', () => {
@@ -469,6 +618,7 @@ describe('runFinalize non-file-convention delivery', () => {
     // #then existing failure behavior is preserved and response-post is untouched
     expect(exitCode).toBe(7)
     expect(mocks.runResponsePost).not.toHaveBeenCalled()
+    expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('7'))
   })
 })

@@ -1,16 +1,20 @@
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CommentSummaryOptions} from '../../features/observability/types.js'
-import type {CommentTarget} from '../../services/github/types.js'
+import type {TriggerContext} from '../../features/triggers/types.js'
+import type {CommentTarget, NormalizedEvent} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
+import process from 'node:process'
 import * as core from '@actions/core'
 import {createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
 import {runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
+import {runBrokeredPush} from '../../features/delegated/brokered-push.js'
 import {writeJobSummary} from '../../features/observability/index.js'
+import {createExecAdapter} from '../../services/setup/adapters.js'
 import {createLogger} from '../../shared/logger.js'
 import {setActionOutputs} from '../config/outputs.js'
 
@@ -60,6 +64,36 @@ function failWithPrimaryExecutionError(execution: ExecutePhaseResult): number {
       : `Agent execution failed with exit code ${execution.exitCode}`
   core.setFailed(failureMessage)
   return execution.exitCode
+}
+
+function buildBrokeredPushEvent(context: TriggerContext): NormalizedEvent {
+  if (context.eventType !== 'issue_comment') {
+    return {type: 'unsupported'}
+  }
+
+  const target = context.target
+  return {
+    type: 'issue_comment',
+    action: context.action ?? '',
+    issue: {
+      number: target?.number ?? 0,
+      title: target?.title ?? '',
+      body: target?.body ?? null,
+      locked: target?.locked ?? false,
+      isPullRequest: target?.kind === 'pr',
+    },
+    comment: {
+      id: context.commentId ?? 0,
+      body: context.commentBody ?? '',
+      author: context.author?.login ?? context.actor,
+      authorAssociation: context.author?.association ?? '',
+    },
+  }
+}
+
+function resolveExpectedHeadBranch(routing: RoutingPhaseResult): string {
+  const hydratedContext = routing.agentContext.hydratedContext
+  return hydratedContext?.type === 'pull_request' ? hydratedContext.headBranch : ''
 }
 
 /** Post a formatted error comment to the resolved target, if any. Never throws. */
@@ -164,6 +198,26 @@ export async function runFinalize(
     if (bootstrap.responseFilePath == null) {
       core.setFailed('File-convention delivery is active but no response file path was resolved at bootstrap')
       return 1
+    }
+
+    if (execution.success === true && execution.commentsPosted === 0) {
+      const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
+      const brokeredPush = await runBrokeredPush({
+        octokit: routing.githubClient,
+        execAdapter: createExecAdapter(),
+        logger,
+        event: buildBrokeredPushEvent(routing.triggerResult.context),
+        owner,
+        repo,
+        trustedHeadSha: bootstrap.trustedHeadSha,
+        expectedHeadBranch: resolveExpectedHeadBranch(routing),
+        repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
+      })
+
+      if (brokeredPush.kind === 'fail-loud') {
+        core.setFailed(`Brokered push delivery failed: ${brokeredPush.reason}`)
+        return 1
+      }
     }
 
     const responsePostLogger = createLogger({phase: 'response-post'})
