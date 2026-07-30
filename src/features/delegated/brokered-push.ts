@@ -31,7 +31,7 @@ export type BrokeredPushOutcome =
   | {readonly kind: 'skipped'}
   | {readonly kind: 'bypass'}
   | {readonly kind: 'nothing-to-deliver'}
-  | {readonly kind: 'pushed'; readonly commit: CommitResult; readonly branch: string}
+  | {readonly kind: 'pushed'; readonly commit: CommitResult; readonly branch: string; readonly paths: readonly string[]}
   | {readonly kind: 'fail-loud'; readonly reason: string}
 
 /**
@@ -94,7 +94,7 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
         logger,
       )
 
-      return {kind: 'pushed', commit, branch: preWriteGate.target.branch}
+      return {kind: 'pushed', commit, branch: preWriteGate.target.branch, paths: changes.map(change => change.path)}
     } catch (error) {
       return failLoud(toErrorMessage(error), logger)
     }

@@ -126,6 +126,7 @@ describe('runBrokeredPush', () => {
     expect(outcome).toEqual({
       kind: 'pushed',
       branch: BRANCH,
+      paths: ['src/fix.ts'],
       commit: {
         sha: 'commit-sha',
         url: 'https://github.com/owner/repo/commit/commit-sha',

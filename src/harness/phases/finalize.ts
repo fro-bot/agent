@@ -1,3 +1,4 @@
+import type {BrokeredPushOutcome} from '../../features/delegated/brokered-push.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CommentSummaryOptions} from '../../features/observability/types.js'
 import type {TriggerContext} from '../../features/triggers/types.js'
@@ -9,7 +10,7 @@ import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
+import {createErrorInfo, createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
 import {runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
 import {runBrokeredPush} from '../../features/delegated/brokered-push.js'
@@ -30,6 +31,10 @@ const PROVIDER_AUTH_SET_FAILED_MESSAGE =
 
 const FILE_READ_FAILURE_FALLBACK_ACTION =
   'The agent execution failed before it could write a response artifact, so no response was delivered.'
+
+const BROKERED_PUSH_ERROR_MESSAGE = 'Brokered push delivery failed. The model response was not posted.'
+const BROKERED_PUSH_ERROR_ACTION = 'Review the workflow logs and retry the run.'
+const MAX_FOOTER_PATHS = 50
 
 /** Resolve the event-bound comment target (issue, PR, or discussion) shared by all error-comment paths. */
 function resolveCommentTarget(routing: RoutingPhaseResult): CommentTarget {
@@ -64,6 +69,30 @@ function failWithPrimaryExecutionError(execution: ExecutePhaseResult): number {
       : `Agent execution failed with exit code ${execution.exitCode}`
   core.setFailed(failureMessage)
   return execution.exitCode
+}
+
+function createBrokeredPushError() {
+  return createErrorInfo('internal', BROKERED_PUSH_ERROR_MESSAGE, false, {
+    suggestedAction: BROKERED_PUSH_ERROR_ACTION,
+  })
+}
+
+function escapeFooterCode(value: string): string {
+  return value.replaceAll('`', '\\`').replaceAll('\n', ' ').replaceAll('\r', ' ')
+}
+
+function formatBrokeredPushFooter(outcome: Extract<BrokeredPushOutcome, {readonly kind: 'pushed'}>): string {
+  const visiblePaths = outcome.paths.slice(0, MAX_FOOTER_PATHS).map(path => `\`${escapeFooterCode(path)}\``)
+  const remainingPathCount = outcome.paths.length - visiblePaths.length
+  const pathSummary =
+    remainingPathCount > 0 ? `${visiblePaths.join(', ')}, … (+${remainingPathCount} more)` : visiblePaths.join(', ')
+
+  return [
+    '### Brokered push delivered',
+    `- Branch: \`${escapeFooterCode(outcome.branch)}\``,
+    `- Changed paths: ${pathSummary}`,
+    `- Commit: \`${escapeFooterCode(outcome.commit.sha.slice(0, 7))}\``,
+  ].join('\n')
 }
 
 function buildBrokeredPushEvent(context: TriggerContext): NormalizedEvent {
@@ -200,6 +229,7 @@ export async function runFinalize(
       return 1
     }
 
+    let deliveryFooter: string | undefined
     if (execution.success === true && execution.commentsPosted === 0) {
       const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
       const brokeredPush = await runBrokeredPush({
@@ -215,22 +245,34 @@ export async function runFinalize(
       })
 
       if (brokeredPush.kind === 'fail-loud') {
+        const commentTarget = resolveCommentTarget(routing)
+        if (execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)) {
+          const safeError = createBrokeredPushError()
+          await postErrorComment(routing, commentTarget, formatErrorComment(safeError), metrics, logger)
+        } else if (execution.commentsPosted === 0 && !isResolvedCommentTarget(commentTarget)) {
+          logger.warning('Cannot post brokered push failure comment: missing target context')
+        }
+
         core.setFailed(`Brokered push delivery failed: ${brokeredPush.reason}`)
         return 1
       }
+
+      if (brokeredPush.kind === 'pushed') {
+        deliveryFooter = formatBrokeredPushFooter(brokeredPush)
+      }
+    }
+
+    const responsePostParams = {
+      octokit: routing.githubClient,
+      agentContext: routing.agentContext,
+      triggerResult: routing.triggerResult,
+      botLogin: routing.botLogin,
+      responseFilePath: bootstrap.responseFilePath,
+      ...(deliveryFooter == null ? {} : {deliveryFooter}),
     }
 
     const responsePostLogger = createLogger({phase: 'response-post'})
-    const result = await runResponsePost(
-      {
-        octokit: routing.githubClient,
-        agentContext: routing.agentContext,
-        triggerResult: routing.triggerResult,
-        botLogin: routing.botLogin,
-        responseFilePath: bootstrap.responseFilePath,
-      },
-      responsePostLogger,
-    )
+    const result = await runResponsePost(responsePostParams, responsePostLogger)
 
     if (result.delivered === false) {
       if (result.reason === 'file-read-failed' && execution.success === false && execution.commentsPosted === 0) {

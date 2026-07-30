@@ -475,6 +475,7 @@ describe('runFinalize file-convention delivery', () => {
     mocks.runBrokeredPush.mockResolvedValue({
       kind: 'pushed',
       branch: 'feature/brokered-fix',
+      paths: ['src/fix.ts', 'docs/README.md'],
       commit: {sha: 'commit-sha', url: 'https://example.com/commit-sha', message: 'fix'},
     })
     mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
@@ -500,6 +501,12 @@ describe('runFinalize file-convention delivery', () => {
         repoRoot: expect.any(String) as unknown as string,
       }),
     )
+    expect(mocks.runResponsePost).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deliveryFooter: expect.stringContaining('feature/brokered-fix') as unknown as string,
+      }),
+      expect.anything(),
+    )
     expect(mocks.runResponsePost).toHaveBeenCalledTimes(1)
   })
 
@@ -510,6 +517,7 @@ describe('runFinalize file-convention delivery', () => {
     const execution = createExecution({success: true, commentsPosted: 0})
     const metrics = createMetrics()
     mocks.runBrokeredPush.mockResolvedValue({kind: 'fail-loud', reason: 'head SHA changed'})
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
 
     // #when finalize runs
     const exitCode = await runFinalize(
@@ -524,7 +532,42 @@ describe('runFinalize file-convention delivery', () => {
 
     // #then no happy-path response is posted and the delivery reason fails the run
     expect(exitCode).toBe(1)
+    expect(mocks.postComment).toHaveBeenCalledTimes(1)
+    const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
+    expect(errorOptions.body).toContain('Brokered push delivery failed')
+    expect(errorOptions.body).not.toContain('head SHA changed')
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('head SHA changed'))
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+  })
+
+  it('fails loud without posting when the brokered-push error target is missing', async () => {
+    // #given a fail-loud brokered outcome but no resolved comment target
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    const logger = createMockLogger()
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'fail-loud', reason: 'provider secret sentinel'})
+
+    // #when finalize runs with the target removed
+    const exitCode = await runFinalize(
+      bootstrap,
+      {
+        ...routing,
+        agentContext: {...routing.agentContext, issueNumber: 0},
+      },
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      logger,
+    )
+
+    // #then no comment is posted, the target failure is logged, and the run still fails
+    expect(exitCode).toBe(1)
+    expect(mocks.postComment).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('missing target context'))
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('provider secret sentinel'))
     expect(mocks.runResponsePost).not.toHaveBeenCalled()
   })
 

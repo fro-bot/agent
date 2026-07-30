@@ -1,11 +1,11 @@
 import type {AgentContext} from '@fro-bot/runtime'
 import type {TriggerResultProcess} from '../../features/triggers/types.js'
-import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {BOT_COMMENT_MARKER, type Octokit} from '../../services/github/types.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {runResponsePost} from './response-post.js'
 
@@ -143,6 +143,34 @@ describe('runResponsePost', () => {
     )
   })
 
+  it('appends a trusted delivery footer after the model body and before response markers', async () => {
+    // #given a valid comment response and an action-generated delivery footer
+    const filePath = await writeFixture('Body from the model.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+    const deliveryFooter = '### Brokered push delivered\n- Branch: `feature/fix`\n- Changed paths: `src/fix.ts`'
+
+    // #when running response-post with the footer
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'issue', issueNumber: 42}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+        deliveryFooter,
+      },
+      logger,
+    )
+
+    // #then the single comment contains the model body, footer, and markers in order
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    const request = octokit.rest.issues.createComment.mock.calls[0]?.[0] as {readonly body: string}
+    expect(request.body).toContain('Body from the model.')
+    expect(request.body).toContain(deliveryFooter)
+    expect(request.body.indexOf(deliveryFooter)).toBeLessThan(request.body.indexOf(BOT_COMMENT_MARKER))
+  })
+
   it('submits a REQUEST_CHANGES review through the shared guard for a pull_request trigger', async () => {
     // #given a valid response file with a request-changes verdict
     const filePath = await writeFixture('---\nverdict: request-changes\n---\n\nPlease fix X.')
@@ -157,6 +185,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
+        deliveryFooter: '### Brokered push delivered\n- Branch: `feature/fix`',
       },
       logger,
     )
@@ -166,6 +195,8 @@ describe('runResponsePost', () => {
     expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({event: 'REQUEST_CHANGES', pull_number: 7, commit_id: 'head-sha'}),
     )
+    const request = octokit.rest.pulls.createReview.mock.calls[0]?.[0] as {readonly body: string}
+    expect(request.body).not.toContain('Brokered push delivered')
   })
 
   it('targets the routing-derived issue number even when the file embeds a different number', async () => {

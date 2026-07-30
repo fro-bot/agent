@@ -58,6 +58,8 @@ export interface RunResponsePostParams {
   readonly triggerResult: TriggerResultProcess
   readonly botLogin: string | null
   readonly responseFilePath: string
+  /** Action-generated delivery text appended only to plain comment responses. */
+  readonly deliveryFooter?: string
 }
 
 function failure(reason: ResponsePostFailureReason, detail: string): ResponsePostFailure {
@@ -66,6 +68,14 @@ function failure(reason: ResponsePostFailureReason, detail: string): ResponsePos
 
 function withMarker(body: string): string {
   return body.includes(BOT_COMMENT_MARKER) ? body : `${body}\n\n${BOT_COMMENT_MARKER}`
+}
+
+function appendDeliveryFooter(body: string, deliveryFooter: string | undefined): string {
+  if (deliveryFooter == null || deliveryFooter.length === 0) {
+    return body
+  }
+
+  return `${body}\n\n${deliveryFooter}`
 }
 
 /**
@@ -173,7 +183,7 @@ async function postCommentWithRetry(
  * writer outage.
  */
 export async function runResponsePost(params: RunResponsePostParams, logger: Logger): Promise<ResponsePostResult> {
-  const {octokit, agentContext, triggerResult, botLogin, responseFilePath} = params
+  const {octokit, agentContext, triggerResult, botLogin, responseFilePath, deliveryFooter} = params
 
   let raw: string
   try {
@@ -212,7 +222,8 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
       return failure('missing-verdict', 'pull_request responses must carry a verdict frontmatter')
     }
 
-    const posted = await postCommentWithRetry(octokit, target, withRunMarker(body), botLogin, logger)
+    const commentBody = withMarker(appendDeliveryFooter(parsed.data.body, deliveryFooter))
+    const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
     if (posted === false) {
       return failure('post-failed', 'postComment returned null after retries')
     }
