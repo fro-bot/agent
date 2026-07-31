@@ -251,6 +251,10 @@ export async function runFinalize(
         }
 
         if (brokeredPush.kind === 'pushed') {
+          // Intentional ordering: the commit is pushed before runResponsePost. The
+          // commit is the substantive delivery; if response-post later fails the run
+          // still exits non-zero, and a re-run reconstructs a clean workspace to
+          // nothing-to-deliver rather than double-pushing. Do not reorder to post first.
           deliveryFooter = formatBrokeredPushFooter(brokeredPush)
         }
       }

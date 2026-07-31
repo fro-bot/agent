@@ -4,11 +4,13 @@ import type {Logger} from '../../shared/logger.js'
 import type {FileChange} from './types.js'
 
 import {Buffer} from 'node:buffer'
+import {constants as fsConstants} from 'node:fs'
 import * as fs from 'node:fs/promises'
 import {resolve, sep} from 'node:path'
 import {TextDecoder} from 'node:util'
 import {err, ok} from '@bfra.me/es/result'
 import {validateFilePath, validateFiles} from './commit.js'
+import {FILE_VALIDATION} from './types.js'
 
 const SHA1_PATTERN = /^[0-9a-f]{40}$/i
 const ZERO_MODE = '000000'
@@ -273,16 +275,36 @@ async function readContentChange(repoRoot: string, relativePath: string): Promis
     throw new Error(`Workspace path escapes repository root: ${relativePath}`)
   }
 
-  const stats = await fs.lstat(filePath)
-  const isExecutable = typeof stats.mode === 'number' && (stats.mode & 0o111) !== 0
-  if (stats.isSymbolicLink() || stats.isFile() === false || isExecutable) {
+  // Open with O_NOFOLLOW so a symlink swapped in after path resolution cannot be
+  // followed, then stat and read from the same handle. This closes the
+  // check-then-use race between an lstat guard and a subsequent path-based read.
+  let handle: fs.FileHandle
+  try {
+    handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+  } catch {
     throw new Error(`${relativePath}: only regular files may be reconstructed`)
   }
 
-  const content = await fs.readFile(filePath)
   try {
-    return {path: relativePath, content: UTF8_DECODER.decode(content)}
-  } catch {
-    return {path: relativePath, content: Buffer.from(content).toString('base64'), encoding: 'base64'}
+    const stats = await handle.stat()
+    const isExecutable = typeof stats.mode === 'number' && (stats.mode & 0o111) !== 0
+    if (stats.isFile() === false || isExecutable) {
+      throw new Error(`${relativePath}: only regular files may be reconstructed`)
+    }
+
+    // Reject oversized files by their on-disk size before reading, so a single
+    // large file is not pulled into memory only to be rejected by validateFiles.
+    if (stats.size > FILE_VALIDATION.MAX_FILE_SIZE_BYTES) {
+      throw new Error(`${relativePath}: File exceeds maximum size of ${FILE_VALIDATION.MAX_FILE_SIZE_BYTES} bytes`)
+    }
+
+    const content = await handle.readFile()
+    try {
+      return {path: relativePath, content: UTF8_DECODER.decode(content)}
+    } catch {
+      return {path: relativePath, content: Buffer.from(content).toString('base64'), encoding: 'base64'}
+    }
+  } finally {
+    await handle.close()
   }
 }

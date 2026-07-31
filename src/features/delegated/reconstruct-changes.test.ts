@@ -1,4 +1,5 @@
 import type {Stats} from 'node:fs'
+import type {FileHandle} from 'node:fs/promises'
 import type {ExecAdapter} from '../../services/setup/types.js'
 
 import {Buffer} from 'node:buffer'
@@ -15,6 +16,7 @@ import {reconstructChanges} from './reconstruct-changes.js'
 
 vi.mock('node:fs/promises', () => ({
   lstat: vi.fn(),
+  open: vi.fn(),
   readFile: vi.fn(),
 }))
 
@@ -40,6 +42,14 @@ function regularFileStats(): Stats {
   } as Stats
 }
 
+function createMockFileHandle(filePath: string): FileHandle {
+  return {
+    stat: vi.fn().mockImplementation(async () => fs.lstat(filePath)),
+    readFile: vi.fn().mockImplementation(async () => fs.readFile(filePath)),
+    close: vi.fn().mockResolvedValue(undefined),
+  } as unknown as FileHandle
+}
+
 function rawDiffEntry(oldMode: string, newMode: string, status: string, path: string): string {
   return `:${oldMode} ${newMode} ${'a'.repeat(40)} ${'b'.repeat(40)} ${status}\0${path}\0`
 }
@@ -49,8 +59,10 @@ describe('reconstructChanges', () => {
 
   beforeEach(() => {
     vi.mocked(fs.lstat).mockReset()
+    vi.mocked(fs.open).mockReset()
     vi.mocked(fs.readFile).mockReset()
     vi.mocked(fs.lstat).mockResolvedValue(regularFileStats())
+    vi.mocked(fs.open).mockImplementation(async filePath => createMockFileHandle(String(filePath)))
   })
 
   it('maps added and modified workspace files to content changes', async () => {
@@ -260,6 +272,28 @@ describe('reconstructChanges', () => {
     expect(result.success).toBe(false)
     expect(result.success === false && result.error.message).toContain('regular files')
     expect(fs.readFile).not.toHaveBeenCalled()
+  })
+
+  it('rejects oversized regular files before reading their full contents', async () => {
+    // #given an added regular file whose handle reports a size above the maximum
+    const execAdapter = createMockExecAdapter(rawDiffEntry('000000', '100644', 'A', 'src/oversized.ts'))
+    const readFile = vi.fn().mockRejectedValue(new Error('readFile should not be called'))
+    const close = vi.fn().mockResolvedValue(undefined)
+    const handle = {
+      stat: vi.fn().mockResolvedValue({size: 6 * 1024 * 1024, isFile: () => true, mode: 0o644}),
+      readFile,
+      close,
+    } as unknown as FileHandle
+    vi.mocked(fs.open).mockResolvedValue(handle)
+
+    // #when reconstruction runs
+    const result = await reconstructChanges(execAdapter, TRUSTED_HEAD_SHA, '/workspace', logger)
+
+    // #then the size limit is reported before the file contents are read
+    expect(result.success).toBe(false)
+    expect(result.success === false && result.error.message).toMatch(/exceeds maximum size/i)
+    expect(readFile).not.toHaveBeenCalled()
+    expect(close).toHaveBeenCalledOnce()
   })
 
   it.each([

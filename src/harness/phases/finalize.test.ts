@@ -516,6 +516,42 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.runResponsePost).toHaveBeenCalledTimes(1)
   })
 
+  it('returns exitCode 1 when response posting fails after a brokered push succeeds', async () => {
+    // #given a successful eligible execution whose brokered push succeeds
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'pushed',
+      branch: 'feature/brokered-fix',
+      paths: ['src/fix.ts'],
+      commit: {sha: 'commit-sha', url: 'https://example.com/commit-sha', message: 'fix'},
+    })
+    mocks.runResponsePost.mockResolvedValue({delivered: false, reason: 'post-failed', detail: 'response post failed'})
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the successful push is not reported as an overall success
+    expect(exitCode).toBe(1)
+    expect(mocks.runResponsePost).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deliveryFooter: expect.stringContaining('feature/brokered-fix') as unknown as string,
+      }),
+      expect.anything(),
+    )
+    expect(mocks.setFailed).toHaveBeenCalled()
+  })
+
   it.each([
     ['malformed', {delivered: false, reason: 'parse-failed', detail: 'malformed response'}],
     ['unreadable', {delivered: false, reason: 'file-read-failed', detail: 'ENOENT'}],

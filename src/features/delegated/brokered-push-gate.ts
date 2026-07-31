@@ -148,6 +148,9 @@ export async function checkBrokeredPushPermission(
     })
     return {decision: 'denied', reason}
   } catch (error) {
+    // Fail closed on any lookup error, including transient 5xx: without a positive
+    // write-permission confirmation the push must not proceed. A transient outage
+    // therefore suppresses delivery and posts a generic error rather than pushing.
     const reason = `Unable to verify live collaborator permission: ${toErrorMessage(error)}`
     logger.warning('Brokered push permission lookup failed', {
       owner: eligible.owner,
