@@ -42,6 +42,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
   return {
     githubToken: 'ghp_test',
     authJson: '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+    trustedHeadSha: '',
     prompt: null,
     sessionRetention: 50,
     opencodeVersion: '1.0.0',
@@ -105,9 +106,10 @@ describe('runBootstrap response-delivery wiring', () => {
   it('resolves file-convention delivery with a non-null response file path under RUNNER_TEMP for an affected trigger with responseMode github', async () => {
     // #given an issues trigger with responseMode github (an affected, posting trigger)
     mocks.githubContext.eventName = 'issues'
+    const trustedHeadSha = 'a'.repeat(40)
     mocks.parseActionInputs.mockReturnValue({
       success: true,
-      data: createActionInputs({responseMode: 'github'}),
+      data: createActionInputs({responseMode: 'github', trustedHeadSha}),
     })
     const {runBootstrap} = await import('./bootstrap.js')
 
@@ -120,6 +122,7 @@ describe('runBootstrap response-delivery wiring', () => {
     expect(result?.responseFilePath).not.toBeNull()
     expect(result?.responseFilePath).toContain(runnerTempDir)
     expect(result?.responseFilePath).toContain('555-2')
+    expect(result?.trustedHeadSha).toBe(trustedHeadSha)
 
     const responseFilePath = result?.responseFilePath
     expect(responseFilePath).not.toBeNull()
