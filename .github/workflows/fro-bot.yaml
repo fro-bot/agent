@@ -275,6 +275,7 @@ jobs:
             }}
         with:
           auth-json: ${{ secrets.AUTH_JSON }}
+          trusted-head-sha: ${{ steps.prehead.outputs.ref }}
           # Same read-only-by-construction switch as the checkout token above, keyed on
           # release-tag (the operation) rather than correlation-id (an audit token) —
           # see the checkout step comment for the full rationale.

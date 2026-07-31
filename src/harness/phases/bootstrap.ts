@@ -39,6 +39,8 @@ export interface BootstrapPhaseResult {
    * runs, closing the workspace-preseed and stale-file-replay attacks.
    */
   readonly responseFilePath: string | null
+  /** Trusted PR head SHA captured by workflow setup; empty when brokered push is unavailable. */
+  readonly trustedHeadSha: string
 }
 
 export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPhaseResult | null> {
@@ -124,6 +126,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     opencodeResult,
     delivery,
     responseFilePath,
+    trustedHeadSha: inputs.trustedHeadSha,
   }
 }
 

@@ -1,3 +1,4 @@
+import type {BrokeredPushOutcome} from '../../features/delegated/brokered-push.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CommentSummaryOptions} from '../../features/observability/types.js'
 import type {CommentTarget} from '../../services/github/types.js'
@@ -6,11 +7,14 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
+import process from 'node:process'
 import * as core from '@actions/core'
-import {createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
-import {runResponsePost} from '../../features/agent/response-post.js'
+import {createErrorInfo, createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
+import {readAndParseResponseFile, runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
+import {runBrokeredPush} from '../../features/delegated/brokered-push.js'
 import {writeJobSummary} from '../../features/observability/index.js'
+import {createExecAdapter} from '../../services/setup/adapters.js'
 import {createLogger} from '../../shared/logger.js'
 import {setActionOutputs} from '../config/outputs.js'
 
@@ -26,6 +30,13 @@ const PROVIDER_AUTH_SET_FAILED_MESSAGE =
 
 const FILE_READ_FAILURE_FALLBACK_ACTION =
   'The agent execution failed before it could write a response artifact, so no response was delivered.'
+
+const BROKERED_PUSH_ERROR_MESSAGE = 'Brokered push delivery failed. The model response was not posted.'
+const BROKERED_PUSH_ERROR_ACTION = 'Review the workflow logs and retry the run.'
+const MAX_FOOTER_PATHS = 50
+/** Keep brokered delivery below the job ceiling and bound reconstruction even when Git cannot observe AbortSignal. */
+export const BROKERED_PUSH_TIMEOUT_MS = 120_000
+const BROKERED_PUSH_TIMEOUT_REASON = 'brokered push exceeded time budget'
 
 /** Resolve the event-bound comment target (issue, PR, or discussion) shared by all error-comment paths. */
 function resolveCommentTarget(routing: RoutingPhaseResult): CommentTarget {
@@ -60,6 +71,30 @@ function failWithPrimaryExecutionError(execution: ExecutePhaseResult): number {
       : `Agent execution failed with exit code ${execution.exitCode}`
   core.setFailed(failureMessage)
   return execution.exitCode
+}
+
+function createBrokeredPushError() {
+  return createErrorInfo('internal', BROKERED_PUSH_ERROR_MESSAGE, false, {
+    suggestedAction: BROKERED_PUSH_ERROR_ACTION,
+  })
+}
+
+function escapeFooterCode(value: string): string {
+  return value.replaceAll('`', '\\`').replaceAll('\n', ' ').replaceAll('\r', ' ')
+}
+
+function formatBrokeredPushFooter(outcome: Extract<BrokeredPushOutcome, {readonly kind: 'pushed'}>): string {
+  const visiblePaths = outcome.paths.slice(0, MAX_FOOTER_PATHS).map(path => `\`${escapeFooterCode(path)}\``)
+  const remainingPathCount = outcome.paths.length - visiblePaths.length
+  const pathSummary =
+    remainingPathCount > 0 ? `${visiblePaths.join(', ')}, … (+${remainingPathCount} more)` : visiblePaths.join(', ')
+
+  return [
+    '### Brokered push delivered',
+    `- Branch: \`${escapeFooterCode(outcome.branch)}\``,
+    `- Changed paths: ${pathSummary}`,
+    `- Commit: \`${escapeFooterCode(outcome.commit.sha.slice(0, 7))}\``,
+  ].join('\n')
 }
 
 /** Post a formatted error comment to the resolved target, if any. Never throws. */
@@ -167,16 +202,109 @@ export async function runFinalize(
     }
 
     const responsePostLogger = createLogger({phase: 'response-post'})
-    const result = await runResponsePost(
-      {
+    const responseFileParams = {
+      agentContext: routing.agentContext,
+      triggerResult: routing.triggerResult,
+      responseFilePath: bootstrap.responseFilePath,
+    }
+    const responsePrecheck = await readAndParseResponseFile(responseFileParams, responsePostLogger)
+    let result: Awaited<ReturnType<typeof runResponsePost>>
+
+    if ('success' in responsePrecheck === false) {
+      result = responsePrecheck
+    } else {
+      let deliveryFooter: string | undefined
+      if (execution.success === true && execution.commentsPosted === 0) {
+        const triggerContext = routing.triggerResult.context
+        const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
+        const eventFacts = {
+          eventType: triggerContext.eventType,
+          isPullRequest: routing.agentContext.issueType === 'pr',
+          authorAssociation: triggerContext.author?.association ?? '',
+          commentAuthor: triggerContext.author?.login ?? '',
+          issueNumber: routing.agentContext.issueNumber ?? 0,
+          owner,
+          repo,
+        }
+        const expectedHeadBranch =
+          routing.agentContext.hydratedContext?.type === 'pull_request'
+            ? routing.agentContext.hydratedContext.headBranch
+            : ''
+        const controller = new AbortController()
+        let timeout: ReturnType<typeof setTimeout> | undefined
+
+        try {
+          // Wall-clock ceiling on the whole brokered-push. The signal aborts the
+          // octokit calls promptly; the git subprocess in reconstruction cannot
+          // observe an AbortSignal (@actions/exec has no signal option), so this
+          // race is the hard bound for a stalled subprocess. The losing promise
+          // is abandoned but never leaks: main.ts exits via process.exit(exitCode)
+          // once run() resolves, which terminates any still-live git child.
+          const brokeredPush = await Promise.race<BrokeredPushOutcome>([
+            runBrokeredPush({
+              octokit: routing.githubClient,
+              execAdapter: createExecAdapter(),
+              logger,
+              eventFacts,
+              trustedHeadSha: bootstrap.trustedHeadSha,
+              expectedHeadBranch,
+              repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
+              signal: controller.signal,
+            }),
+            // This branch only ever resolves (to fail-loud), never rejects — a
+            // load-bearing invariant: runBrokeredPush is async and always resolves
+            // to fail-loud, so the race can never reject and the abandoned losing
+            // promise cannot surface as an unhandled rejection.
+            new Promise<BrokeredPushOutcome>(resolve => {
+              timeout = setTimeout(() => {
+                controller.abort()
+                resolve({kind: 'fail-loud', reason: BROKERED_PUSH_TIMEOUT_REASON})
+              }, BROKERED_PUSH_TIMEOUT_MS)
+            }),
+          ])
+
+          if (brokeredPush.kind === 'fail-loud') {
+            // A timeout that fires after updateRef already landed server-side reports
+            // failure for a commit that may exist on the branch — the same accepted
+            // non-atomic property as the pushed/response-post ordering below. A re-run
+            // reconstructs the updated branch to nothing-to-deliver, so it self-heals.
+            const commentTarget = resolveCommentTarget(routing)
+            if (execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)) {
+              const safeError = createBrokeredPushError()
+              await postErrorComment(routing, commentTarget, formatErrorComment(safeError), metrics, logger)
+            } else if (execution.commentsPosted === 0 && !isResolvedCommentTarget(commentTarget)) {
+              logger.warning('Cannot post brokered push failure comment: missing target context')
+            }
+
+            core.setFailed(`Brokered push delivery failed: ${brokeredPush.reason}`)
+            return 1
+          }
+
+          if (brokeredPush.kind === 'pushed') {
+            // Intentional ordering: the commit is pushed before runResponsePost. The
+            // commit is the substantive delivery; if response-post later fails the run
+            // still exits non-zero, and a re-run reconstructs a clean workspace to
+            // nothing-to-deliver rather than double-pushing. Do not reorder to post first.
+            deliveryFooter = formatBrokeredPushFooter(brokeredPush)
+          }
+        } finally {
+          if (timeout != null) {
+            clearTimeout(timeout)
+          }
+        }
+      }
+
+      const responsePostParams = {
         octokit: routing.githubClient,
         agentContext: routing.agentContext,
         triggerResult: routing.triggerResult,
         botLogin: routing.botLogin,
         responseFilePath: bootstrap.responseFilePath,
-      },
-      responsePostLogger,
-    )
+        ...(deliveryFooter == null ? {} : {deliveryFooter}),
+      }
+
+      result = await runResponsePost(responsePostParams, responsePostLogger)
+    }
 
     if (result.delivered === false) {
       if (result.reason === 'file-read-failed' && execution.success === false && execution.commentsPosted === 0) {

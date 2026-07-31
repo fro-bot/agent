@@ -67,6 +67,23 @@ export function validateFiles(files: readonly FileChange[]): {valid: boolean; er
       errors.push(pathResult.reason)
     }
 
+    if (file.mode != null && file.mode !== '100644') {
+      errors.push(`${file.path}: only regular file mode 100644 is supported`)
+    }
+
+    if (file.type != null && file.type !== 'blob') {
+      errors.push(`${file.path}: only blob tree entries are supported`)
+    }
+
+    if (file.deleted === true) {
+      continue
+    }
+
+    if (!('content' in file) || typeof file.content !== 'string') {
+      errors.push(`${file.path}: file content is required for non-deletion changes`)
+      continue
+    }
+
     const sizeResult = validateFileSize(file.content, file.encoding)
     if (!sizeResult.valid && sizeResult.reason != null) {
       errors.push(`${file.path}: ${sizeResult.reason}`)
@@ -82,8 +99,9 @@ export function validateFiles(files: readonly FileChange[]): {valid: boolean; er
  * Uses Git Data API: createBlob → createTree → createCommit → updateRef (force: false)
  */
 export async function createCommit(octokit: Octokit, options: CommitOptions, logger: Logger): Promise<CommitResult> {
-  const {owner, repo, branch, message, files, author} = options
+  const {owner, repo, branch, message, files, expectedHeadSha, signal, author} = options
   const commitAuthor = author ?? DEFAULT_AUTHOR
+  const requestOptions = signal == null ? {} : {request: {signal}}
 
   logger.info('Creating commit', {
     branch,
@@ -100,23 +118,45 @@ export async function createCommit(octokit: Octokit, options: CommitOptions, log
     owner,
     repo,
     ref: `heads/${branch}`,
+    ...requestOptions,
   })
   const currentCommitSha = ref.object.sha
+
+  if (expectedHeadSha != null && currentCommitSha !== expectedHeadSha) {
+    throw new Error(
+      `Branch head changed before commit construction: expected ${expectedHeadSha}, found ${currentCommitSha}`,
+    )
+  }
 
   const {data: currentCommit} = await octokit.rest.git.getCommit({
     owner,
     repo,
     commit_sha: currentCommitSha,
+    ...requestOptions,
   })
   const baseTreeSha = currentCommit.tree.sha
 
   const treeItems = await Promise.all(
     files.map(async file => {
+      if (file.deleted === true) {
+        return {
+          path: file.path,
+          mode: '100644' as const,
+          type: 'blob' as const,
+          sha: null,
+        }
+      }
+
+      if (!('content' in file) || typeof file.content !== 'string') {
+        throw new Error(`File validation failed: ${file.path}: file content is required for non-deletion changes`)
+      }
+
       const {data: blob} = await octokit.rest.git.createBlob({
         owner,
         repo,
         content: file.content,
         encoding: file.encoding ?? 'utf-8',
+        ...requestOptions,
       })
 
       return {
@@ -133,6 +173,7 @@ export async function createCommit(octokit: Octokit, options: CommitOptions, log
     repo,
     base_tree: baseTreeSha,
     tree: treeItems,
+    ...requestOptions,
   })
 
   const {data: newCommit} = await octokit.rest.git.createCommit({
@@ -146,6 +187,7 @@ export async function createCommit(octokit: Octokit, options: CommitOptions, log
       email: commitAuthor.email,
       date: new Date().toISOString(),
     },
+    ...requestOptions,
   })
 
   await octokit.rest.git.updateRef({
@@ -154,6 +196,7 @@ export async function createCommit(octokit: Octokit, options: CommitOptions, log
     ref: `heads/${branch}`,
     sha: newCommit.sha,
     force: false,
+    ...requestOptions,
   })
 
   logger.info('Commit created', {sha: newCommit.sha})

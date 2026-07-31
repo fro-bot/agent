@@ -72,6 +72,8 @@ export type ResponseMode = 'github' | 'none'
 export interface ActionInputs {
   readonly githubToken: string
   readonly authJson: string
+  /** Trusted same-repository PR head SHA captured before model execution; empty when unavailable. */
+  readonly trustedHeadSha: string
   readonly prompt: string | null
   readonly outputMode: OutputMode
   readonly sessionRetention: number
