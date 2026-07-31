@@ -109,6 +109,8 @@ The agent supports seven event types:
 
 Comment and issue triggers are gated by author association — only `OWNER`, `MEMBER`, and `COLLABORATOR` are processed. Bot accounts are ignored to prevent loops, and fork pull requests are skipped. The full guard expressions, per-trigger behavior, and minimum permissions live in [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
 
+Trusted same-repository, non-fork PR mentions on `issue_comment` from `OWNER`, `MEMBER`, or `COLLABORATOR` can broker a fix commit directly to the PR head branch. Brokered pushes are limited to allowlisted product, docs, and test paths; config, scripts, and CI files are excluded. Keep checkout `persist-credentials: false` as shown in the example.
+
 ### Comment examples
 
 ```markdown

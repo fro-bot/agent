@@ -240,6 +240,8 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     delete process.env['INPUT_AUTH-JSON']
 
     // Optional string inputs (null if empty)
+    const trustedHeadSha = core.getInput('trusted-head-sha').trim()
+
     const promptRaw = core.getInput('prompt').trim()
     const prompt = promptRaw.length > 0 ? promptRaw : null
 
@@ -420,6 +422,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     return ok({
       githubToken,
       authJson,
+      trustedHeadSha,
       prompt,
       outputMode,
       responseMode,

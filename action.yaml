@@ -10,6 +10,10 @@ inputs:
   auth-json:
     description: JSON object mapping provider IDs to auth configs
     required: true
+  trusted-head-sha:
+    description: Trusted same-repository pull request head SHA captured before agent execution; empty when unavailable
+    required: false
+    default: ''
   prompt:
     description: Custom prompt for the agent
     required: false

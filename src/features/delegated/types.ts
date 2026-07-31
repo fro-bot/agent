@@ -5,17 +5,50 @@
  * via the GitHub Git Data API.
  */
 
-/**
- * File change for a commit.
- */
-export interface FileChange {
+/** Git tree modes supported by the delegated commit input. */
+export type FileChangeMode = '040000' | '100644' | '100755' | '120000' | '160000'
+
+/** Git tree entry types supported by the delegated commit input. */
+export type FileChangeType = 'blob' | 'tree' | 'commit'
+
+interface FileChangeMetadata {
   /** Path relative to repo root (validated: no ../, .git/) */
   readonly path: string
+  /** Existing tree mode, when supplied by a change reconstruction. */
+  readonly mode?: FileChangeMode
+  /** Existing tree entry type, when supplied by a change reconstruction. */
+  readonly type?: FileChangeType
+}
+
+interface ContentFileChange extends FileChangeMetadata {
   /** File content */
   readonly content: string
   /** Encoding type (default: utf-8) */
   readonly encoding?: 'utf-8' | 'base64'
+  /** Explicitly marks this as a content change when present. */
+  readonly deleted?: false
 }
+
+interface DeletionFileChange extends FileChangeMetadata {
+  /** Marks this path for removal from the base tree. */
+  readonly deleted: true
+}
+
+interface UnsupportedFileChange extends FileChangeMetadata {
+  /** Metadata-only changes are rejected by the commit primitive. */
+  readonly content?: never
+  readonly deleted?: false
+}
+
+/**
+ * File change for a commit.
+ *
+ * Content changes retain the original `{path, content, encoding?}` shape. A
+ * deletion is represented by `{path, deleted: true}`. Metadata-only entries
+ * are representable so callers can pass through a reconstructed diff, but are
+ * rejected before any GitHub API call.
+ */
+export type FileChange = ContentFileChange | DeletionFileChange | UnsupportedFileChange
 
 /**
  * Options for creating a commit.
@@ -26,6 +59,10 @@ export interface CommitOptions {
   readonly branch: string
   readonly message: string
   readonly files: readonly FileChange[]
+  /** Optional branch-head anchor checked immediately before Git object creation. */
+  readonly expectedHeadSha?: string
+  /** Optional signal used to cancel in-flight GitHub API requests. */
+  readonly signal?: AbortSignal
   readonly author?: {
     readonly name: string
     readonly email: string

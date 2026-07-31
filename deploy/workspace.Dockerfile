@@ -17,7 +17,7 @@
 # packages/runtime/src/shared/constants.ts.
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:24.18.0-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS build
+FROM node:24.18.1-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS build
 
 WORKDIR /workspace
 
@@ -112,7 +112,7 @@ RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
     && bun install --production --frozen-lockfile --ignore-scripts
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM node:24.18.0-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS runtime
+FROM node:24.18.1-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS runtime
 
 WORKDIR /app
 
@@ -121,7 +121,7 @@ WORKDIR /app
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
 ARG OPENCODE_VERSION=1.18.5+harness.3a55d7d2
-ARG SYSTEMATIC_VERSION=3.4.0
+ARG SYSTEMATIC_VERSION=3.5.0
 
 # System packages:
 #   git            — clone.ts runs `git clone` via execFile

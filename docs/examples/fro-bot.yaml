@@ -14,6 +14,10 @@
 #   pull_request               — AI code review on PR open/sync/reopen/ready/review-requested
 #   schedule                   — periodic maintenance (daily by default)
 #   workflow_dispatch          — manual prompt execution via "Run workflow" button
+# Trusted same-repository, non-fork PR mentions (`issue_comment` only) can broker
+# a fix commit to the PR head branch. Keep `persist-credentials: false` on
+# checkout. Brokered pushes are limited to allowlisted product, docs, and test
+# paths; config, scripts, and CI files are excluded.
 #
 # ── TOKENS & IDENTITY ──────────────────────────────────────────────────────
 # Most triggers use FRO_BOT_PAT — a Personal Access Token whose login

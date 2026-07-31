@@ -11,7 +11,7 @@
  * the caller (finalize) is responsible for turning that into a failed run.
  */
 
-import type {AgentContext} from '@fro-bot/runtime'
+import type {AgentContext, ParsedResponse, ResponseSurface} from '@fro-bot/runtime'
 import type {TriggerResultProcess} from '../../features/triggers/types.js'
 import type {Logger} from '../../shared/logger.js'
 
@@ -58,14 +58,62 @@ export interface RunResponsePostParams {
   readonly triggerResult: TriggerResultProcess
   readonly botLogin: string | null
   readonly responseFilePath: string
+  /** Action-generated delivery text appended only to plain comment responses. */
+  readonly deliveryFooter?: string
 }
+
+export interface ReadAndParseResponseFileParams {
+  readonly agentContext: AgentContext
+  readonly triggerResult: TriggerResultProcess
+  readonly responseFilePath: string
+}
+
+export type ReadAndParseResponseFileResult =
+  | {readonly success: true; readonly data: {readonly parsed: ParsedResponse; readonly surface: ResponseSurface}}
+  | ResponsePostFailure
 
 function failure(reason: ResponsePostFailureReason, detail: string): ResponsePostFailure {
   return {delivered: false, reason, detail}
 }
 
+/** Read and validate a response artifact without performing any GitHub mutation. */
+export async function readAndParseResponseFile(
+  params: ReadAndParseResponseFileParams,
+  logger: Logger,
+): Promise<ReadAndParseResponseFileResult> {
+  const {responseFilePath, agentContext, triggerResult} = params
+  let raw: string
+  try {
+    raw = await fs.readFile(responseFilePath, 'utf8')
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    logger.error('Response-post: failed to read response file', {responseFilePath, error: detail})
+    return failure('file-read-failed', detail)
+  }
+
+  const surface = resolveResponseSurface(agentContext, triggerResult)
+  const parsed = parseResponseFile(raw, {surface})
+  if (parsed.success === false) {
+    logger.error('Response-post: response file failed validation', {
+      responseFilePath,
+      reason: parsed.error.reason,
+    })
+    return failure('parse-failed', parsed.error.message)
+  }
+
+  return {success: true, data: {parsed: parsed.data, surface}}
+}
+
 function withMarker(body: string): string {
   return body.includes(BOT_COMMENT_MARKER) ? body : `${body}\n\n${BOT_COMMENT_MARKER}`
+}
+
+function appendDeliveryFooter(body: string, deliveryFooter: string | undefined): string {
+  if (deliveryFooter == null || deliveryFooter.length === 0) {
+    return body
+  }
+
+  return `${body}\n\n${deliveryFooter}`
 }
 
 /**
@@ -93,22 +141,30 @@ function deriveSurfaceAndTarget(
   agentContext: AgentContext,
   triggerResult: TriggerResultProcess,
 ): {readonly surface: 'issue-comment' | 'pr-comment' | 'pr-review'; readonly target: CommentTarget | null} {
+  const surface = resolveResponseSurface(agentContext, triggerResult)
   const [owner, repo] = agentContext.repo.split('/')
   if (owner == null || owner.length === 0 || repo == null || repo.length === 0 || agentContext.issueNumber == null) {
-    return {surface: 'issue-comment', target: null}
+    return {surface, target: null}
   }
 
   const number = agentContext.issueNumber
 
+  return {
+    surface,
+    target: {type: surface === 'issue-comment' ? 'issue' : 'pr', number, owner, repo},
+  }
+}
+
+function resolveResponseSurface(agentContext: AgentContext, triggerResult: TriggerResultProcess): ResponseSurface {
   if (triggerResult.context.eventType === 'pull_request') {
-    return {surface: 'pr-review', target: {type: 'pr', number, owner, repo}}
+    return 'pr-review'
   }
 
   if (agentContext.issueType === 'pr') {
-    return {surface: 'pr-comment', target: {type: 'pr', number, owner, repo}}
+    return 'pr-comment'
   }
 
-  return {surface: 'issue-comment', target: {type: 'issue', number, owner, repo}}
+  return 'issue-comment'
 }
 
 /**
@@ -173,36 +229,24 @@ async function postCommentWithRetry(
  * writer outage.
  */
 export async function runResponsePost(params: RunResponsePostParams, logger: Logger): Promise<ResponsePostResult> {
-  const {octokit, agentContext, triggerResult, botLogin, responseFilePath} = params
+  const {octokit, agentContext, triggerResult, botLogin, responseFilePath, deliveryFooter} = params
 
-  let raw: string
-  try {
-    raw = await fs.readFile(responseFilePath, 'utf8')
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-    logger.error('Response-post: failed to read response file', {responseFilePath, error: detail})
-    return failure('file-read-failed', detail)
+  const prepared = await readAndParseResponseFile({agentContext, triggerResult, responseFilePath}, logger)
+  if ('success' in prepared === false) {
+    return prepared
   }
 
-  const {surface, target} = deriveSurfaceAndTarget(agentContext, triggerResult)
-
-  const parsed = parseResponseFile(raw, {surface})
-  if (parsed.success === false) {
-    logger.error('Response-post: response file failed validation', {
-      responseFilePath,
-      reason: parsed.error.reason,
-    })
-    return failure('parse-failed', parsed.error.message)
-  }
+  const {surface, parsed} = prepared.data
+  const {target} = deriveSurfaceAndTarget(agentContext, triggerResult)
 
   if (target == null) {
     logger.error('Response-post: missing target context', {agentContext: {repo: agentContext.repo}})
     return failure('missing-target-context', 'Cannot post: missing owner/repo/issue number in routing context')
   }
 
-  const body = withMarker(parsed.data.body)
+  const body = withMarker(parsed.body)
 
-  if (parsed.data.verdict == null) {
+  if (parsed.verdict == null) {
     // A pull_request trigger's surface is always 'pr-review' and requires a
     // structured verdict — falling through to a plain comment here would
     // silently downgrade a required review into a comment and still report
@@ -212,7 +256,8 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
       return failure('missing-verdict', 'pull_request responses must carry a verdict frontmatter')
     }
 
-    const posted = await postCommentWithRetry(octokit, target, withRunMarker(body), botLogin, logger)
+    const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+    const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
     if (posted === false) {
       return failure('post-failed', 'postComment returned null after retries')
     }
@@ -224,7 +269,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return failure('missing-target-context', 'Cannot submit a review: bot login is unavailable')
   }
 
-  const reviewEvent = parsed.data.verdict === 'approve' ? 'APPROVE' : 'REQUEST_CHANGES'
+  const reviewEvent = parsed.verdict === 'approve' ? 'APPROVE' : 'REQUEST_CHANGES'
 
   const guard = await checkForkOrSelfGuard(
     {octokit, owner: target.owner, repo: target.repo, prNumber: target.number, botLogin, event: reviewEvent},
