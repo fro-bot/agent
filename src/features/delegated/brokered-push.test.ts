@@ -64,7 +64,9 @@ function allowGateSequence(changes: readonly object[]): void {
   })
 }
 
-async function run(options: {readonly octokit?: Octokit; readonly trustedHeadSha?: string} = {}) {
+async function run(
+  options: {readonly octokit?: Octokit; readonly signal?: AbortSignal; readonly trustedHeadSha?: string} = {},
+) {
   return runBrokeredPush({
     octokit: options.octokit ?? createMockOctokit(),
     execAdapter: createExecAdapter(),
@@ -81,6 +83,7 @@ async function run(options: {readonly octokit?: Octokit; readonly trustedHeadSha
     trustedHeadSha: options.trustedHeadSha ?? TRUSTED_HEAD_SHA,
     expectedHeadBranch: BRANCH,
     repoRoot: '/workspace',
+    signal: options.signal,
   })
 }
 
@@ -249,5 +252,29 @@ describe('runBrokeredPush', () => {
 
     // #then the unreachable commit is never reported as delivered
     expect(outcome).toEqual({kind: 'fail-loud', reason: 'reference update rejected'})
+  })
+
+  it('maps an aborted octokit-backed path to the brokered push budget reason', async () => {
+    // #given a pre-aborted brokered push signal and an octokit-backed gate that observes it
+    const controller = new AbortController()
+    controller.abort()
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockImplementation(async () => {
+      const error = new Error('The operation was aborted')
+      error.name = 'AbortError'
+      throw error
+    })
+
+    // #when brokered push delivery runs with the pre-aborted signal
+    const outcome = await run({signal: controller.signal})
+
+    // #then the raw abort error is replaced with the clear fail-loud budget reason
+    expect(outcome).toEqual({kind: 'fail-loud', reason: 'brokered push exceeded time budget'})
+    expect(mocks.checkPermission).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      controller.signal,
+    )
   })
 })

@@ -15,6 +15,7 @@ import {createCommit} from './commit.js'
 import {reconstructChanges} from './reconstruct-changes.js'
 
 const BROKERED_PUSH_COMMIT_MESSAGE = 'chore: apply brokered changes'
+const BROKERED_PUSH_TIMEOUT_REASON = 'brokered push exceeded time budget'
 
 export interface BrokeredPushParams {
   readonly octokit: Octokit
@@ -24,6 +25,7 @@ export interface BrokeredPushParams {
   readonly trustedHeadSha: string
   readonly expectedHeadBranch: string
   readonly repoRoot: string
+  readonly signal?: AbortSignal
 }
 
 export type BrokeredPushOutcome =
@@ -40,7 +42,7 @@ export type BrokeredPushOutcome =
  * reported as delivered when createCommit completes, which includes updateRef.
  */
 export async function runBrokeredPush(params: BrokeredPushParams): Promise<BrokeredPushOutcome> {
-  const {octokit, execAdapter, logger, eventFacts, trustedHeadSha, expectedHeadBranch, repoRoot} = params
+  const {octokit, execAdapter, logger, eventFacts, trustedHeadSha, expectedHeadBranch, repoRoot, signal} = params
 
   try {
     const earlyGate = evaluateBrokeredPushEarlyGate({facts: eventFacts, trustedHeadSha})
@@ -49,9 +51,9 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
       return {kind: 'bypass'}
     }
 
-    const permission = await checkBrokeredPushPermission(octokit, earlyGate, logger)
+    const permission = await checkBrokeredPushPermission(octokit, earlyGate, logger, signal)
     if (permission.decision === 'denied') {
-      return failLoud(permission.reason, logger)
+      return failLoud(signal?.aborted === true ? BROKERED_PUSH_TIMEOUT_REASON : permission.reason, logger)
     }
 
     const reconstruction = await reconstructChanges(execAdapter, trustedHeadSha, repoRoot, logger)
@@ -74,9 +76,14 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
       return failLoud(validation.errors.join('; '), logger)
     }
 
-    const preWriteGate = await checkBrokeredPushPreWriteGate(octokit, {eligible: earlyGate, expectedHeadBranch}, logger)
+    const preWriteGate = await checkBrokeredPushPreWriteGate(
+      octokit,
+      {eligible: earlyGate, expectedHeadBranch},
+      logger,
+      signal,
+    )
     if (preWriteGate.decision === 'denied') {
-      return failLoud(preWriteGate.reason, logger)
+      return failLoud(signal?.aborted === true ? BROKERED_PUSH_TIMEOUT_REASON : preWriteGate.reason, logger)
     }
 
     try {
@@ -89,17 +96,26 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
           message: BROKERED_PUSH_COMMIT_MESSAGE,
           expectedHeadSha: earlyGate.trustedHeadSha,
           files: changes,
+          signal,
         },
         logger,
       )
 
       return {kind: 'pushed', commit, branch: preWriteGate.target.branch, paths: changes.map(change => change.path)}
     } catch (error) {
-      return failLoud(toErrorMessage(error), logger)
+      return failLoud(getBrokeredPushFailureReason(error, signal), logger)
     }
   } catch (error) {
-    return failLoud(toErrorMessage(error), logger)
+    return failLoud(getBrokeredPushFailureReason(error, signal), logger)
   }
+}
+
+function getBrokeredPushFailureReason(error: unknown, signal?: AbortSignal): string {
+  if (signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) {
+    return BROKERED_PUSH_TIMEOUT_REASON
+  }
+
+  return toErrorMessage(error)
 }
 
 function failLoud(reason: string, logger: Logger): {readonly kind: 'fail-loud'; readonly reason: string} {

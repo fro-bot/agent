@@ -1,5 +1,5 @@
 import type {Logger} from '../../shared/logger.js'
-import {beforeEach, describe, expect, it} from 'vitest'
+import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockOctokit} from '../../services/github/test-helpers.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
@@ -176,6 +176,20 @@ describe('checkBrokeredPushPermission', () => {
     if (outcome.decision !== 'denied') throw new Error('Expected permission denial')
     expect(outcome.reason).toContain('permission')
   })
+
+  it('passes an optional abort signal to the live permission lookup', async () => {
+    // #given a live write permission lookup and an abort signal
+    const signal = new AbortController().signal
+    const getCollaboratorPermissionLevel = vi.fn().mockResolvedValue({data: {permission: 'write'}})
+    const octokit = createMockOctokit({getCollaboratorPermissionLevel})
+
+    // #when the delivery-time permission gate runs with the signal
+    const outcome = await checkBrokeredPushPermission(octokit, eligibleEvent(), logger, signal)
+
+    // #then the signal is included in the Octokit request options
+    expect(outcome).toEqual({decision: 'allowed', permission: 'write'})
+    expect(getCollaboratorPermissionLevel).toHaveBeenCalledWith(expect.objectContaining({request: {signal}}))
+  })
 })
 
 describe('checkBrokeredPushPreWriteGate', () => {
@@ -283,5 +297,24 @@ describe('checkBrokeredPushPreWriteGate', () => {
     expect(outcome.decision).toBe('denied')
     if (outcome.decision !== 'denied') throw new Error('Expected pre-write denial')
     expect(outcome.reason).toContain('PR')
+  })
+
+  it('passes an optional abort signal to the live PR lookup', async () => {
+    // #given a live PR lookup and an abort signal
+    const signal = new AbortController().signal
+    const getPullRequest = vi.fn().mockResolvedValue({data: livePullRequest()})
+    const octokit = createMockOctokit({getPullRequest})
+
+    // #when the pre-write gate runs with the signal
+    const outcome = await checkBrokeredPushPreWriteGate(
+      octokit,
+      {eligible: eligibleEvent(), expectedHeadBranch: BRANCH},
+      logger,
+      signal,
+    )
+
+    // #then the signal is included in the Octokit request options
+    expect(outcome.decision).toBe('allowed')
+    expect(getPullRequest).toHaveBeenCalledWith(expect.objectContaining({request: {signal}}))
   })
 })
