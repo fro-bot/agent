@@ -34,6 +34,9 @@ const FILE_READ_FAILURE_FALLBACK_ACTION =
 const BROKERED_PUSH_ERROR_MESSAGE = 'Brokered push delivery failed. The model response was not posted.'
 const BROKERED_PUSH_ERROR_ACTION = 'Review the workflow logs and retry the run.'
 const MAX_FOOTER_PATHS = 50
+/** Keep brokered delivery below the job ceiling and bound reconstruction even when Git cannot observe AbortSignal. */
+export const BROKERED_PUSH_TIMEOUT_MS = 120_000
+const BROKERED_PUSH_TIMEOUT_REASON = 'brokered push exceeded time budget'
 
 /** Resolve the event-bound comment target (issue, PR, or discussion) shared by all error-comment paths. */
 function resolveCommentTarget(routing: RoutingPhaseResult): CommentTarget {
@@ -227,35 +230,67 @@ export async function runFinalize(
           routing.agentContext.hydratedContext?.type === 'pull_request'
             ? routing.agentContext.hydratedContext.headBranch
             : ''
-        const brokeredPush = await runBrokeredPush({
-          octokit: routing.githubClient,
-          execAdapter: createExecAdapter(),
-          logger,
-          eventFacts,
-          trustedHeadSha: bootstrap.trustedHeadSha,
-          expectedHeadBranch,
-          repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
-        })
+        const controller = new AbortController()
+        let timeout: ReturnType<typeof setTimeout> | undefined
 
-        if (brokeredPush.kind === 'fail-loud') {
-          const commentTarget = resolveCommentTarget(routing)
-          if (execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)) {
-            const safeError = createBrokeredPushError()
-            await postErrorComment(routing, commentTarget, formatErrorComment(safeError), metrics, logger)
-          } else if (execution.commentsPosted === 0 && !isResolvedCommentTarget(commentTarget)) {
-            logger.warning('Cannot post brokered push failure comment: missing target context')
+        try {
+          // Wall-clock ceiling on the whole brokered-push. The signal aborts the
+          // octokit calls promptly; the git subprocess in reconstruction cannot
+          // observe an AbortSignal (@actions/exec has no signal option), so this
+          // race is the hard bound for a stalled subprocess. The losing promise
+          // is abandoned but never leaks: main.ts exits via process.exit(exitCode)
+          // once run() resolves, which terminates any still-live git child.
+          const brokeredPush = await Promise.race<BrokeredPushOutcome>([
+            runBrokeredPush({
+              octokit: routing.githubClient,
+              execAdapter: createExecAdapter(),
+              logger,
+              eventFacts,
+              trustedHeadSha: bootstrap.trustedHeadSha,
+              expectedHeadBranch,
+              repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
+              signal: controller.signal,
+            }),
+            // This branch only ever resolves (to fail-loud), never rejects — a
+            // load-bearing invariant: runBrokeredPush is async and always resolves
+            // to fail-loud, so the race can never reject and the abandoned losing
+            // promise cannot surface as an unhandled rejection.
+            new Promise<BrokeredPushOutcome>(resolve => {
+              timeout = setTimeout(() => {
+                controller.abort()
+                resolve({kind: 'fail-loud', reason: BROKERED_PUSH_TIMEOUT_REASON})
+              }, BROKERED_PUSH_TIMEOUT_MS)
+            }),
+          ])
+
+          if (brokeredPush.kind === 'fail-loud') {
+            // A timeout that fires after updateRef already landed server-side reports
+            // failure for a commit that may exist on the branch — the same accepted
+            // non-atomic property as the pushed/response-post ordering below. A re-run
+            // reconstructs the updated branch to nothing-to-deliver, so it self-heals.
+            const commentTarget = resolveCommentTarget(routing)
+            if (execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)) {
+              const safeError = createBrokeredPushError()
+              await postErrorComment(routing, commentTarget, formatErrorComment(safeError), metrics, logger)
+            } else if (execution.commentsPosted === 0 && !isResolvedCommentTarget(commentTarget)) {
+              logger.warning('Cannot post brokered push failure comment: missing target context')
+            }
+
+            core.setFailed(`Brokered push delivery failed: ${brokeredPush.reason}`)
+            return 1
           }
 
-          core.setFailed(`Brokered push delivery failed: ${brokeredPush.reason}`)
-          return 1
-        }
-
-        if (brokeredPush.kind === 'pushed') {
-          // Intentional ordering: the commit is pushed before runResponsePost. The
-          // commit is the substantive delivery; if response-post later fails the run
-          // still exits non-zero, and a re-run reconstructs a clean workspace to
-          // nothing-to-deliver rather than double-pushing. Do not reorder to post first.
-          deliveryFooter = formatBrokeredPushFooter(brokeredPush)
+          if (brokeredPush.kind === 'pushed') {
+            // Intentional ordering: the commit is pushed before runResponsePost. The
+            // commit is the substantive delivery; if response-post later fails the run
+            // still exits non-zero, and a re-run reconstructs a clean workspace to
+            // nothing-to-deliver rather than double-pushing. Do not reorder to post first.
+            deliveryFooter = formatBrokeredPushFooter(brokeredPush)
+          }
+        } finally {
+          if (timeout != null) {
+            clearTimeout(timeout)
+          }
         }
       }
 

@@ -59,7 +59,7 @@ vi.mock('../../shared/logger.js', () => ({
   createLogger: () => ({debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}),
 }))
 
-const {runFinalize} = await import('./finalize.js')
+const {BROKERED_PUSH_TIMEOUT_MS, runFinalize} = await import('./finalize.js')
 
 function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): BootstrapPhaseResult {
   return {
@@ -485,6 +485,42 @@ describe('runFinalize file-convention delivery', () => {
       commit: {sha: 'commit-sha', url: 'https://example.com/commit-sha', message: 'fix'},
     })
     mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout')
+
+    try {
+      // #when finalize runs
+      const exitCode = await runFinalize(
+        bootstrap,
+        routing,
+        cacheRestore,
+        execution,
+        metrics,
+        Date.now(),
+        createMockLogger(),
+      )
+
+      // #then the injected in-heap client and exec adapter are used, then existing response delivery proceeds unchanged
+      expect(exitCode).toBe(0)
+      // and the deadline timer is cleared on the happy pushed path so it never holds the event loop
+      expect(clearTimeoutSpy).toHaveBeenCalled()
+    } finally {
+      clearTimeoutSpy.mockRestore()
+    }
+  })
+
+  it('threads the in-heap client into brokered push and preserves normal response delivery', async () => {
+    // #given a successful trusted PR mention with a response file and no prior comment
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'pushed',
+      branch: 'feature/brokered-fix',
+      paths: ['src/fix.ts', 'docs/README.md'],
+      commit: {sha: 'commit-sha', url: 'https://example.com/commit-sha', message: 'fix'},
+    })
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
 
     // #when finalize runs
     const exitCode = await runFinalize(
@@ -636,6 +672,107 @@ describe('runFinalize file-convention delivery', () => {
     expect(errorOptions.body).not.toContain('head SHA changed')
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('head SHA changed'))
     expect(mocks.runResponsePost).not.toHaveBeenCalled()
+  })
+
+  it('fails loud when brokered push exceeds its deadline and posts exactly one error comment', async () => {
+    // #given a successful eligible execution whose brokered push never settles
+    vi.useFakeTimers()
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runBrokeredPush.mockReturnValue(new Promise<BrokeredPushOutcome>(() => {}))
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    try {
+      // #when finalize runs past the brokered-push budget
+      const finalizePromise = runFinalize(
+        bootstrap,
+        routing,
+        cacheRestore,
+        execution,
+        metrics,
+        Date.now(),
+        createMockLogger(),
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(BROKERED_PUSH_TIMEOUT_MS + 1)
+      const exitCode = await finalizePromise
+
+      // #then the existing fail-loud path posts one error comment and suppresses the model reply
+      expect(exitCode).toBe(1)
+      expect(mocks.postComment).toHaveBeenCalledTimes(1)
+      expect(mocks.runResponsePost).not.toHaveBeenCalled()
+      expect(mocks.setFailed).toHaveBeenCalledWith('Brokered push delivery failed: brokered push exceeded time budget')
+      expect(mocks.runBrokeredPush.mock.calls[0]?.[0]).toHaveProperty('signal')
+      expect(mocks.runBrokeredPush.mock.calls[0]?.[0]).toMatchObject({signal: {aborted: true}})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('ignores a late brokered-push resolution after the deadline already won the race', async () => {
+    // #given a brokered push that only settles once its signal aborts — mirroring the
+    // real orchestrator, whose outer catch always resolves (never rejects) to fail-loud.
+    // The deadline wins the race first; this asserts the losing late resolution is
+    // harmlessly dropped (no second comment) and surfaces no unhandled rejection.
+    vi.useFakeTimers()
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+    mocks.runBrokeredPush.mockImplementation(
+      async (params: {signal?: AbortSignal}): Promise<BrokeredPushOutcome> =>
+        new Promise<BrokeredPushOutcome>(resolve => {
+          params.signal?.addEventListener('abort', () => {
+            resolve({
+              kind: 'pushed',
+              commit: {sha: 'late', url: 'https://example.com/late', message: 'late commit'},
+              branch: 'feature',
+              paths: ['src/x.ts'],
+            })
+          })
+        }),
+    )
+
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+
+    try {
+      // #when finalize runs past the brokered-push budget and the losing promise settles late on abort
+      const finalizePromise = runFinalize(
+        bootstrap,
+        routing,
+        cacheRestore,
+        execution,
+        metrics,
+        Date.now(),
+        createMockLogger(),
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(BROKERED_PUSH_TIMEOUT_MS + 1)
+      const exitCode = await finalizePromise
+      // flush any late settlement through the microtask queue
+      await Promise.resolve()
+      await Promise.resolve()
+
+      // #then the deadline's fail-loud outcome stands: one comment, exit 1, and the late
+      // 'pushed' resolution neither posts a second comment nor surfaces an unhandled rejection
+      expect(exitCode).toBe(1)
+      expect(mocks.postComment).toHaveBeenCalledTimes(1)
+      expect(mocks.runResponsePost).not.toHaveBeenCalled()
+      expect(mocks.setFailed).toHaveBeenCalledWith('Brokered push delivery failed: brokered push exceeded time budget')
+      expect(unhandled).toHaveLength(0)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+      vi.useRealTimers()
+    }
   })
 
   it('fails loud without posting when the brokered-push error target is missing', async () => {

@@ -61,6 +61,8 @@ export interface CommitOptions {
   readonly files: readonly FileChange[]
   /** Optional branch-head anchor checked immediately before Git object creation. */
   readonly expectedHeadSha?: string
+  /** Optional signal used to cancel in-flight GitHub API requests. */
+  readonly signal?: AbortSignal
   readonly author?: {
     readonly name: string
     readonly email: string

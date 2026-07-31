@@ -121,12 +121,14 @@ export async function checkBrokeredPushPermission(
   octokit: Octokit,
   eligible: BrokeredPushEarlyEligible,
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<BrokeredPushPermissionOutcome> {
   try {
     const {data} = await octokit.rest.repos.getCollaboratorPermissionLevel({
       owner: eligible.owner,
       repo: eligible.repo,
       username: eligible.actor,
+      ...(signal == null ? {} : {request: {signal}}),
     })
 
     if (data.permission === 'admin' || data.permission === 'write') {
@@ -170,6 +172,7 @@ export async function checkBrokeredPushPreWriteGate(
   octokit: Octokit,
   params: BrokeredPushPreWriteGateParams,
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<BrokeredPushPreWriteOutcome> {
   const {eligible, expectedHeadBranch} = params
 
@@ -178,6 +181,7 @@ export async function checkBrokeredPushPreWriteGate(
       owner: eligible.owner,
       repo: eligible.repo,
       pull_number: eligible.prNumber,
+      ...(signal == null ? {} : {request: {signal}}),
     })
 
     if (pullRequest.state !== 'open') {

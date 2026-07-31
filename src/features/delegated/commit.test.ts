@@ -163,6 +163,84 @@ describe('createCommit', () => {
     )
   })
 
+  it('threads an optional abort signal into every Git Data API call', async () => {
+    // #given a complete commit flow and an abort signal
+    const signal = new AbortController().signal
+    const getRef = vi.fn().mockResolvedValue({data: {object: {sha: 'current-sha'}}})
+    const getCommit = vi.fn().mockResolvedValue({data: {tree: {sha: 'base-tree-sha'}}})
+    const createBlob = vi.fn().mockResolvedValue({data: {sha: 'blob-sha'}})
+    const createTree = vi.fn().mockResolvedValue({data: {sha: 'new-tree-sha'}})
+    const createCommitFn = vi.fn().mockResolvedValue({
+      data: {sha: 'new-commit-sha', html_url: 'https://github.com/...', message: 'feat: add file'},
+    })
+    const updateRef = vi.fn().mockResolvedValue({data: {}})
+    const octokit = createMockOctokit({
+      getRef,
+      getCommit,
+      createBlob,
+      createTree,
+      createCommit: createCommitFn,
+      updateRef,
+    })
+
+    // #when the commit is created with the signal
+    await createCommit(
+      octokit,
+      {
+        owner: 'owner',
+        repo: 'repo',
+        branch: 'feature',
+        message: 'feat: add file',
+        files: [{path: 'src/a.ts', content: 'export const a = 1'}],
+        signal,
+      },
+      logger,
+    )
+
+    // #then every network call receives the same abort signal
+    for (const mock of [getRef, getCommit, createBlob, createTree, createCommitFn, updateRef]) {
+      expect(mock).toHaveBeenCalledWith(expect.objectContaining({request: {signal}}))
+    }
+  })
+
+  it('does not add request options when no abort signal is supplied', async () => {
+    // #given a complete commit flow without an abort signal
+    const getRef = vi.fn().mockResolvedValue({data: {object: {sha: 'current-sha'}}})
+    const getCommit = vi.fn().mockResolvedValue({data: {tree: {sha: 'base-tree-sha'}}})
+    const createBlob = vi.fn().mockResolvedValue({data: {sha: 'blob-sha'}})
+    const createTree = vi.fn().mockResolvedValue({data: {sha: 'new-tree-sha'}})
+    const createCommitFn = vi.fn().mockResolvedValue({
+      data: {sha: 'new-commit-sha', html_url: 'https://github.com/...', message: 'feat: add file'},
+    })
+    const updateRef = vi.fn().mockResolvedValue({data: {}})
+    const octokit = createMockOctokit({
+      getRef,
+      getCommit,
+      createBlob,
+      createTree,
+      createCommit: createCommitFn,
+      updateRef,
+    })
+
+    // #when the commit is created without a signal
+    await createCommit(
+      octokit,
+      {
+        owner: 'owner',
+        repo: 'repo',
+        branch: 'feature',
+        message: 'feat: add file',
+        files: [{path: 'src/a.ts', content: 'export const a = 1'}],
+      },
+      logger,
+    )
+
+    // #then the existing request shapes remain unchanged
+    for (const mock of [getRef, getCommit, createBlob, createTree, createCommitFn, updateRef]) {
+      expect(mock.mock.calls[0]?.[0]).not.toHaveProperty('request')
+    }
+  })
+
   it('rejects a changed branch head before creating any Git objects', async () => {
     // #given a branch ref that no longer matches the expected pre-write anchor
     const getRef = vi.fn().mockResolvedValue({data: {object: {sha: 'current-sha'}}})
