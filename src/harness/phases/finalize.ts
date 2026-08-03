@@ -143,6 +143,11 @@ export async function runFinalize(
     agent: bootstrap.inputs.agent ?? 'build (default)',
     resolvedOutputMode: execution.resolvedOutputMode,
   }
+  if (execution.overflowRecovery?.recovered === true) {
+    core.summary.addRaw(
+      `Recovered from context overflow (fresh review session; archived ${execution.overflowRecovery.archivedSessionId})\n`,
+    )
+  }
   await writeJobSummary(summaryOptions, logger)
 
   // Rebuilds a safe ErrorInfo instead of trusting the incoming llmError; skips runResponsePost entirely.
@@ -206,6 +211,7 @@ export async function runFinalize(
       agentContext: routing.agentContext,
       triggerResult: routing.triggerResult,
       responseFilePath: bootstrap.responseFilePath,
+      executionSucceeded: execution.success,
     }
     const responsePrecheck = await readAndParseResponseFile(responseFileParams, responsePostLogger)
     let result: Awaited<ReturnType<typeof runResponsePost>>

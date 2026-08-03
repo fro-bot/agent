@@ -1,3 +1,6 @@
+// Session lifecycle
+export {archiveSession} from './archive.js'
+
 // Backend types (SDK-only)
 export type {SessionClient} from './backend.js'
 

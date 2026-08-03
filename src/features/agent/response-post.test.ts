@@ -7,7 +7,7 @@ import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {BOT_COMMENT_MARKER, type Octokit} from '../../services/github/types.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {runResponsePost} from './response-post.js'
+import {readAndParseResponseFile, runResponsePost} from './response-post.js'
 
 function makeAgentContext(overrides?: Partial<AgentContext>): AgentContext {
   return {
@@ -312,6 +312,57 @@ describe('runResponsePost', () => {
     expect(result.delivered).toBe(false)
     expect((result as {reason: string}).reason).toBe('file-read-failed')
     expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it('logs an expected missing response file at debug level after a failed execution', async () => {
+    // #given a failed execution whose response file was never created
+    const responseFilePath = '/nonexistent/path/response.md'
+
+    // #when reading the response file with the failed-execution context
+    const result = await readAndParseResponseFile(
+      {
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        responseFilePath,
+        executionSucceeded: false,
+      },
+      logger,
+    )
+
+    // #then the typed failure is preserved without emitting a noisy error log
+    expect(result).toMatchObject({delivered: false, reason: 'file-read-failed'})
+    expect(logger.error).not.toHaveBeenCalled()
+    expect(logger.debug).toHaveBeenCalledWith(
+      'Response-post: no response file after failed execution (expected)',
+      expect.objectContaining({responseFilePath}),
+    )
+  })
+
+  it('keeps the response-file read error log for a successful execution', async () => {
+    // #given a successful execution whose response file is unexpectedly absent
+    const responseFilePath = '/nonexistent/path/response.md'
+
+    // #when reading the response file with the successful-execution context
+    const result = await readAndParseResponseFile(
+      {
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        responseFilePath,
+        executionSucceeded: true,
+      },
+      logger,
+    )
+
+    // #then the typed failure and genuine read error remain visible
+    expect(result).toMatchObject({delivered: false, reason: 'file-read-failed'})
+    expect(logger.error).toHaveBeenCalledWith(
+      'Response-post: failed to read response file',
+      expect.objectContaining({responseFilePath}),
+    )
+    expect(logger.debug).not.toHaveBeenCalledWith(
+      'Response-post: no response file after failed execution (expected)',
+      expect.anything(),
+    )
   })
 
   it('fails closed when postComment returns null (writer failure)', async () => {

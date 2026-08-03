@@ -32,6 +32,14 @@ export interface SessionPrepPhaseResult {
   readonly sessionTitle: string | null
 }
 
+export function buildSessionSearchQuery(
+  logicalKey: LogicalSessionKey | null,
+  issueTitle: string | null,
+  repo: string,
+): string {
+  return logicalKey?.key ?? issueTitle ?? repo
+}
+
 export async function runSessionPrep(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
@@ -81,7 +89,7 @@ export async function runSessionPrep(
     }
   }
 
-  const searchQuery = logicalKey?.key ?? routing.agentContext.issueTitle ?? routing.agentContext.repo
+  const searchQuery = buildSessionSearchQuery(logicalKey, routing.agentContext.issueTitle, routing.agentContext.repo)
   const priorWorkContext = await searchSessions(
     searchQuery,
     cacheRestore.serverHandle.client,
