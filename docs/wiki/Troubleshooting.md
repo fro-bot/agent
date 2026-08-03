@@ -1,7 +1,14 @@
 ---
 type: guide
-last-updated: "2026-07-01"
-summary: "Diagnosing common Fro Bot Agent failures — no response, cache persistence, and timeouts"
+last-updated: "2026-08-03"
+updated-by: "b233675"
+sources:
+  - action.yaml
+  - src/features/delegated/brokered-push.ts
+  - src/features/delegated/brokered-push-validation.ts
+  - packages/gateway/src/web/operator-route.ts
+  - docs/solutions/test-failures/gateway-operator-route-health-timeout-flake-2026-07-30.md
+summary: "Diagnosing common Fro Bot Agent failures — no response, cache persistence, timeouts, brokered push, and a known gateway test flake"
 ---
 
 # Troubleshooting
@@ -36,3 +43,23 @@ If the agent times out before completing:
 - Increase the `timeout` input (default `1800000` ms / 30 minutes; `0` disables the limit).
 - Check the run logs for stuck operations or loops.
 - Break large tasks into smaller, focused steps.
+
+## Brokered Push Not Landing
+
+When an authorized `@fro-bot` PR comment produces workspace edits but no commit appears on the PR head branch, the [[Execution Lifecycle|brokered push]] step suppressed itself. It is fail-closed by design, so a missing push almost always means one of its trust gates declined rather than a bug:
+
+- **Missing trust anchor** — the workflow must pass `trusted-head-sha` (from the PR head SHA) for the push to be eligible. Without it the step bypasses silently. See [[Setup and Configuration]].
+- **Path outside the allowlist** — brokered pushes are limited to `src/`, package `src/`, `docs/`, and the top-level `README.md`, `ARCHITECTURE.md`, and `STRUCTURE.md`, capped at 100 files. Edits to config, scripts, or CI files are rejected and the run fails loudly.
+- **Live re-check failed** — the actor's write permission, the PR's open state, and the head branch and SHA are all re-verified immediately before the commit. A moved head, a renamed branch, a closed PR, or a permission lookup error all abort the push.
+- **Not a same-repo PR comment** — the step only runs for `issue_comment` events on a pull request in the same repository from an `OWNER`, `MEMBER`, or `COLLABORATOR`. Fork PRs and other event types never broker a push.
+- **Timed out** — the push has a 120-second ceiling. If it fires after the commit already landed server-side, the run reports failure but the commit exists; a re-run reconstructs a clean workspace and does nothing rather than double-committing.
+
+## Known Gateway Test Flake
+
+A lone timeout in `packages/gateway/src/web/operator-route.test.ts` during a full `bun run test` is a known, non-blocking flake, not a regression. The suite only exercises static route-classification guards with no timing-sensitive logic; under peak parallel load its tasks can be starved past the default 5-second budget. Confirm the flake by checking that the failure is a **timeout** (not an assertion), that it is the only failure in an otherwise-green run, and that the file passes in isolation:
+
+```bash
+bunx vitest run packages/gateway/src/web/operator-route.test.ts
+```
+
+If all three hold, re-run rather than treating it as a signal. An assertion failure, or a timeout that reproduces in isolation, is a different problem and should be investigated normally.
