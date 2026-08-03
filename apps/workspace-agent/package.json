@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@hono/node-server": "2.0.11",
-    "hono": "4.12.31"
+    "hono": "4.12.33"
   },
   "devDependencies": {
     "vitest": "4.1.10"
