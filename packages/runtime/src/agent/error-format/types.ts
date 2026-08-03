@@ -1,6 +1,7 @@
 export const ERROR_TYPES = [
   'api_error',
   'configuration',
+  'context_overflow',
   'internal',
   'llm_fetch_error',
   'llm_timeout',
@@ -56,3 +57,14 @@ export type ProviderAuthErrorInput =
       readonly kind: 'session-error'
       readonly name?: unknown
     }
+
+/**
+ * Provider-neutral normalized input to {@link classifyContextOverflowError}.
+ *
+ * The classifier accepts only the structured session-error name marker; raw
+ * provider response fields are intentionally outside this contract.
+ */
+export interface ContextOverflowErrorInput {
+  readonly kind: 'session-error'
+  readonly name?: unknown
+}

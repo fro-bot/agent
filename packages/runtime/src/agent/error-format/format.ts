@@ -1,8 +1,9 @@
-import type {ErrorInfo, ErrorType, ProviderAuthErrorInput, QuotaErrorInput} from './types.js'
+import type {ContextOverflowErrorInput, ErrorInfo, ErrorType, ProviderAuthErrorInput, QuotaErrorInput} from './types.js'
 
 const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   api_error: 'API Error',
   configuration: 'Configuration Error',
+  context_overflow: 'Context Overflow',
   internal: 'Internal Error',
   llm_fetch_error: 'LLM Fetch Error',
   llm_timeout: 'LLM Timeout',
@@ -196,6 +197,27 @@ export function classifyProviderAuthError(input: ProviderAuthErrorInput): ErrorI
   }
 
   return null
+}
+
+const CONTEXT_OVERFLOW_ERROR_MESSAGE = 'The model context window was exceeded while processing this run.'
+const CONTEXT_OVERFLOW_ERROR_DETAILS = 'The current session reached the model context limit.'
+const CONTEXT_OVERFLOW_ERROR_ACTION = 'Retry the run with a fresh session or reduce the prompt size.'
+
+/** Create the fixed, non-retryable `context_overflow` ErrorInfo. */
+export function createContextOverflowError(): ErrorInfo {
+  return createErrorInfo('context_overflow', CONTEXT_OVERFLOW_ERROR_MESSAGE, false, {
+    details: CONTEXT_OVERFLOW_ERROR_DETAILS,
+    suggestedAction: CONTEXT_OVERFLOW_ERROR_ACTION,
+  })
+}
+
+/**
+ * Classify the exact structured context overflow marker as a fixed
+ * `context_overflow` error without retaining the upstream payload.
+ */
+export function classifyContextOverflowError(input: ContextOverflowErrorInput): ErrorInfo | null {
+  if (normalizeProviderAuthString(input.name) !== 'ContextOverflowError') return null
+  return createContextOverflowError()
 }
 
 /** Stable provider error codes that indicate quota exhaustion. */
