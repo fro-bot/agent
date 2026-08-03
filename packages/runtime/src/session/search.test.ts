@@ -459,6 +459,123 @@ describe('searchSessions', () => {
     expect(results).toHaveLength(1)
     expect(results[0]?.matches.length).toBeLessThanOrEqual(2)
   })
+
+  it('excludes requested session IDs while preserving the default result set', async () => {
+    // #given
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_excluded',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Excluded session',
+        time: {created: 1000, updated: 2000},
+      },
+      {
+        id: 'ses_included',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Included session',
+        time: {created: 2000, updated: 3000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockImplementation(async (_client, sessionId) => [
+      {
+        id: `msg_${sessionId}`,
+        sessionID: sessionId,
+        role: 'user',
+        time: {created: 1000},
+        agent: 'test',
+        model: {providerID: 'test', modelID: 'test'},
+        parts: [
+          {
+            id: `part_${sessionId}`,
+            sessionID: sessionId,
+            messageID: `msg_${sessionId}`,
+            type: 'text',
+            text: 'needle appears here',
+          },
+        ],
+      } as never,
+    ])
+
+    // #when
+    const withoutExclusions = await searchSessions('needle', mockClient, '/workspace', {}, mockLogger)
+    const withExclusion = await searchSessions(
+      'needle',
+      mockClient,
+      '/workspace',
+      {excludeSessionIds: ['ses_excluded']},
+      mockLogger,
+    )
+
+    // #then
+    expect(withoutExclusions.map(result => result.sessionId)).toEqual(['ses_included', 'ses_excluded'])
+    expect(withExclusion.map(result => result.sessionId)).toEqual(['ses_included'])
+  })
+
+  it('treats an absent exclusion as a no-op and still applies the limit cap', async () => {
+    // #given
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 2000},
+      },
+      {
+        id: 'ses_2',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 2',
+        time: {created: 2000, updated: 3000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockImplementation(async (_client, sessionId) => [
+      {
+        id: `msg_${sessionId}`,
+        sessionID: sessionId,
+        role: 'user',
+        time: {created: 1000},
+        agent: 'test',
+        model: {providerID: 'test', modelID: 'test'},
+        parts: [
+          {
+            id: `part_1_${sessionId}`,
+            sessionID: sessionId,
+            messageID: `msg_${sessionId}`,
+            type: 'text',
+            text: 'needle one',
+          },
+          {
+            id: `part_2_${sessionId}`,
+            sessionID: sessionId,
+            messageID: `msg_${sessionId}`,
+            type: 'text',
+            text: 'needle two',
+          },
+        ],
+      } as never,
+    ])
+
+    // #when
+    const results = await searchSessions(
+      'needle',
+      mockClient,
+      '/workspace',
+      {excludeSessionIds: ['ses_absent'], limit: 1},
+      mockLogger,
+    )
+
+    // #then
+    expect(results).toHaveLength(1)
+    expect(results[0]?.sessionId).toBe('ses_2')
+    expect(results[0]?.matches).toHaveLength(1)
+  })
 })
 
 describe('getSessionInfo', () => {

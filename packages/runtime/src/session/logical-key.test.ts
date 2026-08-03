@@ -512,6 +512,30 @@ describe('resolveSessionForLogicalKey', () => {
     expect(result).toEqual({status: 'not-found'})
   })
 
+  it('returns the newest eligible session when a newer same-title session is archived', async () => {
+    // #given
+    const key = {key: 'pr-347', entityType: 'pr' as const, entityId: '347'}
+    const eligible = createSession({id: 'ses_eligible', title: 'fro-bot: pr-347', updated: 500})
+    const archived = createSession({
+      id: 'ses_archived',
+      title: 'fro-bot: pr-347',
+      updated: 600,
+      archived: 1000,
+    })
+    const client = createMockSdkClient({sessionListResponse: {data: [eligible, archived]}})
+
+    // #when
+    const result = await resolveSessionForLogicalKey(
+      client as unknown as SessionClient,
+      '/workspace',
+      key,
+      createMockLogger(),
+    )
+
+    // #then
+    expect(result).toEqual({status: 'found', session: eligible})
+  })
+
   it('returns not-found when matched session is mid-compaction', async () => {
     // #given
     const key = {key: 'pr-347', entityType: 'pr' as const, entityId: '347'}

@@ -83,10 +83,16 @@ export async function searchSessions(
   query: string,
   client: SessionClient,
   workspacePath: string,
-  options: {limit?: number; caseSensitive?: boolean; sessionId?: string},
+  options: {
+    limit?: number
+    caseSensitive?: boolean
+    sessionId?: string
+    excludeSessionIds?: readonly string[]
+  },
   logger: Logger,
 ): Promise<readonly SessionSearchResult[]> {
-  const {limit = 20, caseSensitive = false, sessionId} = options
+  const {limit = 20, caseSensitive = false, sessionId, excludeSessionIds = []} = options
+  const excludedSessionIds = new Set(excludeSessionIds)
 
   logger.debug('Searching sessions', {query, directory: workspacePath, limit, caseSensitive})
 
@@ -95,6 +101,8 @@ export async function searchSessions(
   let totalMatches = 0
 
   if (sessionId != null) {
+    if (excludedSessionIds.has(sessionId)) return results
+
     const matches = await searchSessionContent(client, sessionId, searchPattern, caseSensitive, logger)
     if (matches.length > 0) {
       results.push({sessionId, matches: matches.slice(0, limit)})
@@ -102,7 +110,9 @@ export async function searchSessions(
     return results
   }
 
-  const sessions = await listSessions(client, workspacePath, {}, logger)
+  const sessions = (await listSessions(client, workspacePath, {}, logger)).filter(
+    session => excludedSessionIds.has(session.id) === false,
+  )
 
   for (const session of sessions) {
     if (totalMatches >= limit) break

@@ -135,10 +135,16 @@ export async function resolveSessionForLogicalKey(
     const matchingWorkspaceSessions = sessions.filter(
       session => normalizeWorkspacePath(session.directory) === normalizedWorkspacePath,
     )
-    const matchedSession = findSessionByTitle(matchingWorkspaceSessions, title)
+    const eligibleWorkspaceSessions = matchingWorkspaceSessions.filter(
+      session => session.time.archived == null && session.time.compacting == null,
+    )
+    const matchedSession = findSessionByTitle(eligibleWorkspaceSessions, title)
 
     if (matchedSession == null) {
-      const staleDirectoryMatch = findSessionByTitle(sessions, title)
+      const eligibleSessions = sessions.filter(
+        session => session.time.archived == null && session.time.compacting == null,
+      )
+      const staleDirectoryMatch = findSessionByTitle(eligibleSessions, title)
       if (staleDirectoryMatch != null) {
         logger.warning('Session continuity: matching session has different workspace directory, ignoring', {
           sessionId: staleDirectoryMatch.id,
@@ -146,10 +152,6 @@ export async function resolveSessionForLogicalKey(
           workspacePath,
         })
       }
-      return {status: 'not-found'}
-    }
-
-    if (matchedSession.time.archived != null || matchedSession.time.compacting != null) {
       return {status: 'not-found'}
     }
 
