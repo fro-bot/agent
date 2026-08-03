@@ -66,6 +66,7 @@ export interface ReadAndParseResponseFileParams {
   readonly agentContext: AgentContext
   readonly triggerResult: TriggerResultProcess
   readonly responseFilePath: string
+  /** Only false downgrades missing-file errors to debug; omission keeps the error log for success/unknown runs. */
   readonly executionSucceeded?: boolean
 }
 

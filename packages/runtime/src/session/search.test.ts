@@ -515,6 +515,53 @@ describe('searchSessions', () => {
     expect(withExclusion.map(result => result.sessionId)).toEqual(['ses_included'])
   })
 
+  it('excludes archived sessions from default prior-work search', async () => {
+    // #given an archived matching session and an active matching session
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_archived',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Archived session',
+        time: {created: 1000, updated: 3000, archived: 4000},
+      },
+      {
+        id: 'ses_active',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Active session',
+        time: {created: 2000, updated: 2000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockImplementation(async (_client, sessionId) => [
+      {
+        id: `msg_${sessionId}`,
+        sessionID: sessionId,
+        role: 'user',
+        time: {created: 1000},
+        agent: 'test',
+        model: {providerID: 'test', modelID: 'test'},
+        parts: [
+          {
+            id: `part_${sessionId}`,
+            sessionID: sessionId,
+            messageID: `msg_${sessionId}`,
+            type: 'text',
+            text: 'needle appears here',
+          },
+        ],
+      } as never,
+    ])
+
+    // #when searching prior work without an explicit exclusion list
+    const results = await searchSessions('needle', mockClient, '/workspace', {}, mockLogger)
+
+    // #then archived sessions do not leak into the default search results
+    expect(results.map(result => result.sessionId)).toEqual(['ses_active'])
+  })
+
   it('treats an absent exclusion as a no-op and still applies the limit cap', async () => {
     // #given
     vi.mocked(listSessionsForProject).mockResolvedValue([

@@ -24,6 +24,7 @@ export async function listSessions(
 
   const filtered = sessions.filter(session => {
     if (session.parentID != null) return false
+    if (session.time.archived != null || session.time.compacting != null) return false
 
     if (fromDate != null && session.time.created < fromDate.getTime()) return false
     if (toDate != null && session.time.created > toDate.getTime()) return false

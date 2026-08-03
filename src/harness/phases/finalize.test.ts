@@ -289,7 +289,7 @@ describe('runFinalize file-convention delivery', () => {
     const bootstrap = createBootstrap()
     const routing = createRouting()
     const execution = createExecution({
-      overflowRecovery: {recovered: true, archivedSessionId: 'archived-session-1'},
+      overflowRecovery: {recovered: true, archivedSessionId: 'archived-session-1', archiveSucceeded: true},
     })
     const metrics = createMetrics()
     mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'review'})

@@ -331,7 +331,7 @@ describe('runResponsePost', () => {
 
     // #then the typed failure is preserved without emitting a noisy error log
     expect(result).toMatchObject({delivered: false, reason: 'file-read-failed'})
-    expect(logger.error).not.toHaveBeenCalledWith('Response-post: failed to read response file', expect.anything())
+    expect(logger.error).not.toHaveBeenCalled()
     expect(logger.debug).toHaveBeenCalledWith(
       'Response-post: no response file after failed execution (expected)',
       expect.objectContaining({responseFilePath}),

@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   archiveSession: vi.fn(),
   executeOpenCode: vi.fn(),
   findLatestSession: vi.fn(),
+  removeResponseFile: vi.fn(),
   resolveOutputMode: vi.fn(),
   saveState: vi.fn(),
   searchSessions: vi.fn(),
@@ -26,6 +27,8 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@actions/core', () => ({saveState: mocks.saveState}))
+
+vi.mock('node:fs/promises', () => ({rm: mocks.removeResponseFile}))
 
 vi.mock('@fro-bot/runtime', () => ({
   archiveSession: mocks.archiveSession,
@@ -73,7 +76,10 @@ function createAgentResult(overrides: Partial<AgentResult> = {}): AgentResult {
   }
 }
 
-function createBootstrap(timeoutMs: number): BootstrapPhaseResult {
+function createBootstrap(
+  timeoutMs: number,
+  overrides: Partial<Pick<BootstrapPhaseResult, 'delivery' | 'responseFilePath'>> = {},
+): BootstrapPhaseResult {
   return {
     inputs: {
       githubToken: 'github-token',
@@ -102,8 +108,8 @@ function createBootstrap(timeoutMs: number): BootstrapPhaseResult {
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},
-    delivery: 'model-gh',
-    responseFilePath: null,
+    delivery: overrides.delivery ?? 'model-gh',
+    responseFilePath: overrides.responseFilePath ?? null,
     trustedHeadSha: '',
   }
 }
@@ -202,6 +208,7 @@ describe('runExecute overflow recovery', () => {
     vi.mocked(executeOpenCode).mockReset()
     mocks.resolveOutputMode.mockReturnValue('branch-pr')
     mocks.archiveSession.mockResolvedValue(true)
+    mocks.removeResponseFile.mockResolvedValue(undefined)
     mocks.searchSessions.mockResolvedValue([])
   })
 
@@ -257,12 +264,12 @@ describe('runExecute overflow recovery', () => {
     expect(secondPrompt?.currentThreadSessionId).toBeNull()
     expect(secondPrompt?.isContinuation).toBe(false)
     expect(secondConfig?.continueSessionId).toBeUndefined()
-    expect(secondConfig?.timeoutMs).toBeLessThan(1_000)
+    expect(secondConfig?.timeoutMs).toBe(900)
     expect(result).toMatchObject({
       success: true,
       sessionId: 'recovered-session',
       commentsPosted: 1,
-      overflowRecovery: {recovered: true, archivedSessionId: 'overflowed-session'},
+      overflowRecovery: {recovered: true, archivedSessionId: 'overflowed-session', archiveSucceeded: true},
     })
   })
 
@@ -299,8 +306,123 @@ describe('runExecute overflow recovery', () => {
     expect(result).toMatchObject({
       success: false,
       sessionId: 'recovery-overflowed-session',
-      overflowRecovery: {recovered: false, archivedSessionId: 'overflowed-session'},
+      overflowRecovery: {recovered: false, archivedSessionId: 'overflowed-session', archiveSucceeded: true},
     })
+  })
+
+  it('records a failed first archive and warns while continuing recovery', async () => {
+    // #given the first archive fails but the fresh attempt succeeds
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      llmError: null,
+    })
+    mocks.archiveSession.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(createAgentResult()).mockResolvedValueOnce(recoveredResult)
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs
+    let result: Awaited<ReturnType<typeof runExecute>>
+    try {
+      result = await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        createCacheRestore(),
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then the failed archive is visible in metadata and the run still attempts recovery
+    expect(mocks.logger.warning).toHaveBeenCalledWith(
+      'Overflowed session archive failed; next run may re-continue it',
+      {sessionId: 'overflowed-session'},
+    )
+    expect(result.overflowRecovery).toMatchObject({
+      recovered: true,
+      archivedSessionId: 'overflowed-session',
+      archiveSucceeded: false,
+    })
+  })
+
+  it('deletes a stale file-convention response before the fresh attempt', async () => {
+    // #given the first attempt overflows after writing a response artifact
+    const responseFilePath = '/tmp/fro-bot-response.md'
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      llmError: null,
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(createAgentResult()).mockResolvedValueOnce(recoveredResult)
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs in file-convention delivery mode
+    let result: Awaited<ReturnType<typeof runExecute>>
+    try {
+      result = await runExecute(
+        createBootstrap(1_000, {delivery: 'file-convention', responseFilePath}),
+        createRouting(),
+        createCacheRestore(),
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then the stale artifact is removed before the recovery execution starts
+    expect(mocks.removeResponseFile).toHaveBeenCalledWith(responseFilePath, {force: true})
+    const removeCallOrder = mocks.removeResponseFile.mock.invocationCallOrder[0]
+    const recoveryCallOrder = vi.mocked(executeOpenCode).mock.invocationCallOrder[1]
+    expect(removeCallOrder).toBeLessThan(recoveryCallOrder ?? Number.POSITIVE_INFINITY)
+    expect(result.sessionId).toBe('recovered-session')
+  })
+
+  it('continues recovery with empty prior-work context when the recovery search fails', async () => {
+    // #given recovery prior-work search throws after the overflowed session is archived
+    const searchError = new Error('session search unavailable')
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      llmError: null,
+    })
+    mocks.searchSessions.mockRejectedValue(searchError)
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(createAgentResult()).mockResolvedValueOnce(recoveredResult)
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs
+    let result: Awaited<ReturnType<typeof runExecute>>
+    try {
+      result = await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        createCacheRestore(),
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then the fresh attempt still runs with no prior-work excerpts
+    const recoveryPrompt = vi.mocked(executeOpenCode).mock.calls[1]?.[0]
+    expect(recoveryPrompt?.sessionContext?.priorWorkContext).toEqual([])
+    expect(mocks.logger.warning).toHaveBeenCalledWith(
+      'Recovery prior-work search failed; proceeding with empty context',
+      {error: searchError},
+    )
+    expect(result.sessionId).toBe('recovered-session')
   })
 
   it('keeps the original overflow failure when the shared deadline is exhausted', async () => {
