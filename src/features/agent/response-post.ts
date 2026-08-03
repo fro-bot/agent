@@ -66,6 +66,7 @@ export interface ReadAndParseResponseFileParams {
   readonly agentContext: AgentContext
   readonly triggerResult: TriggerResultProcess
   readonly responseFilePath: string
+  readonly executionSucceeded?: boolean
 }
 
 export type ReadAndParseResponseFileResult =
@@ -81,13 +82,20 @@ export async function readAndParseResponseFile(
   params: ReadAndParseResponseFileParams,
   logger: Logger,
 ): Promise<ReadAndParseResponseFileResult> {
-  const {responseFilePath, agentContext, triggerResult} = params
+  const {responseFilePath, agentContext, triggerResult, executionSucceeded} = params
   let raw: string
   try {
     raw = await fs.readFile(responseFilePath, 'utf8')
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
-    logger.error('Response-post: failed to read response file', {responseFilePath, error: detail})
+    if (executionSucceeded === false) {
+      logger.debug('Response-post: no response file after failed execution (expected)', {
+        responseFilePath,
+        error: detail,
+      })
+    } else {
+      logger.error('Response-post: failed to read response file', {responseFilePath, error: detail})
+    }
     return failure('file-read-failed', detail)
   }
 
