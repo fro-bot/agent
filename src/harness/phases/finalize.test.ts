@@ -17,6 +17,7 @@ type RunBrokeredPushMock = (params: BrokeredPushParams) => Promise<BrokeredPushO
 
 const mocks = vi.hoisted(() => ({
   setFailed: vi.fn(),
+  summaryAddRaw: vi.fn().mockReturnThis(),
   runResponsePost: vi.fn(),
   readAndParseResponseFile: vi.fn(),
   postComment: vi.fn(),
@@ -31,7 +32,7 @@ vi.mock('@actions/core', () => ({
   summary: {
     addHeading: vi.fn().mockReturnThis(),
     addTable: vi.fn().mockReturnThis(),
-    addRaw: vi.fn().mockReturnThis(),
+    addRaw: mocks.summaryAddRaw,
     addList: vi.fn().mockReturnThis(),
     write: vi.fn().mockResolvedValue(undefined),
   },
@@ -273,10 +274,62 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('primary execution failure'))
     expect(mocks.setFailed).toHaveBeenCalledTimes(1)
     expect(mocks.postComment).toHaveBeenCalledTimes(1)
+    expect(mocks.readAndParseResponseFile).toHaveBeenCalledWith(
+      expect.objectContaining({executionSucceeded: false}),
+      expect.anything(),
+    )
     const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
     expect(target).toEqual({type: 'issue', number: 1, owner: 'owner', repo: 'repo'})
     expect(options.body).toContain('response artifact')
     expect(options.body).not.toContain('ENOENT')
+  })
+
+  it('marks a recovered overflow run in the job summary and keeps one response delivery', async () => {
+    // #given a successful execution recovered in a fresh session
+    const bootstrap = createBootstrap()
+    const routing = createRouting()
+    const execution = createExecution({
+      overflowRecovery: {recovered: true, archivedSessionId: 'archived-session-1', archiveSucceeded: true},
+    })
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'review'})
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the recovery marker is visible in the job summary and delivery remains singular
+    expect(exitCode).toBe(0)
+    expect(mocks.summaryAddRaw).toHaveBeenCalledWith(
+      expect.stringContaining('Recovered from context overflow (fresh review session; archived archived-session-1)'),
+    )
+    expect(mocks.runResponsePost).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not add an overflow recovery marker for a normal run', async () => {
+    // #given a normal successful execution
+    const bootstrap = createBootstrap()
+    const routing = createRouting()
+    const execution = createExecution()
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs
+    await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), createMockLogger())
+
+    // #then the job summary has no overflow recovery marker
+    expect(
+      mocks.summaryAddRaw.mock.calls.some(
+        ([value]) => typeof value === 'string' && value.includes('Recovered from context overflow'),
+      ),
+    ).toBe(false)
   })
 
   it('uses a trusted comment instead of a review for a failed pull_request execution', async () => {

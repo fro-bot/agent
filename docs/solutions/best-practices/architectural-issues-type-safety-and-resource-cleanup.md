@@ -2,7 +2,7 @@
 title: "OpenCode SDK Session Backend: Architectural Issues in Type Safety and Resource Cleanup"
 date: 2026-02-16
 category: best-practices
-module: packages/runtime/src/session
+module: runtime
 problem_type: best_practice
 component: assistant
 severity: high

@@ -1,17 +1,20 @@
-import type {ErrorInfo} from '@fro-bot/runtime'
+import type {ErrorInfo, SessionSearchResult} from '@fro-bot/runtime'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
+import type {Logger} from '../../shared/logger.js'
 import type {ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
+import * as fs from 'node:fs/promises'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {findLatestSession, writeSessionSummary} from '@fro-bot/runtime'
+import {archiveSession, findLatestSession, searchSessions, writeSessionSummary} from '@fro-bot/runtime'
 import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
+import {buildSessionSearchQuery} from './session-prep.js'
 
 export interface ExecutePhaseResult {
   readonly success: boolean
@@ -26,6 +29,131 @@ export interface ExecutePhaseResult {
   readonly commentsPosted: number
   readonly llmError: ErrorInfo | null
   readonly resolvedOutputMode: ResolvedOutputMode | null
+  readonly overflowRecovery?: {
+    readonly recovered: boolean
+    readonly archivedSessionId: string
+    readonly archiveSucceeded: boolean
+  }
+}
+
+interface ContextOverflowRecoveryOptions {
+  readonly bootstrap: BootstrapPhaseResult
+  readonly routing: RoutingPhaseResult
+  readonly cacheRestore: CacheRestorePhaseResult
+  readonly sessionPrep: SessionPrepPhaseResult
+  readonly metrics: MetricsCollector
+  readonly execLogger: Logger
+  readonly executionStartTime: number
+  readonly promptOptions: PromptOptions
+  readonly executionConfig: ExecutionConfig
+  readonly overflowedResult: ExecutePhaseResult
+  readonly overflowedSessionId: string
+  readonly resolveSessionId: (candidateSessionId: string | null, afterTimestamp: number) => Promise<string | null>
+}
+
+async function recoverFromContextOverflow(options: ContextOverflowRecoveryOptions): Promise<ExecutePhaseResult> {
+  const {
+    bootstrap,
+    routing,
+    cacheRestore,
+    sessionPrep,
+    metrics,
+    execLogger,
+    executionStartTime,
+    promptOptions,
+    executionConfig,
+    overflowedResult,
+    overflowedSessionId,
+    resolveSessionId,
+  } = options
+
+  const archiveSucceeded = await archiveSession(cacheRestore.serverHandle.server.url, overflowedSessionId, execLogger)
+  if (archiveSucceeded === false) {
+    execLogger.warning('Overflowed session archive failed; next run may re-continue it', {
+      sessionId: overflowedSessionId,
+    })
+  }
+
+  const recoverySearchQuery = buildSessionSearchQuery(
+    sessionPrep.logicalKey,
+    routing.agentContext.issueTitle,
+    routing.agentContext.repo,
+  )
+  let recoveryPriorWorkContext: readonly SessionSearchResult[] = []
+  try {
+    recoveryPriorWorkContext = await searchSessions(
+      recoverySearchQuery,
+      cacheRestore.serverHandle.client,
+      sessionPrep.normalizedWorkspace,
+      {limit: 5, excludeSessionIds: [overflowedSessionId]},
+      execLogger,
+    )
+  } catch (error) {
+    execLogger.warning('Recovery prior-work search failed; proceeding with empty context', {error})
+  }
+  for (const session of recoveryPriorWorkContext) {
+    metrics.addSessionUsed(session.sessionId)
+  }
+
+  const remainingMs = bootstrap.inputs.timeoutMs - (Date.now() - executionStartTime)
+  if (remainingMs <= 0) return overflowedResult
+
+  const recoveryPromptOptions: PromptOptions = {
+    ...promptOptions,
+    sessionContext: {
+      recentSessions: sessionPrep.recentSessions,
+      priorWorkContext: recoveryPriorWorkContext,
+    },
+    currentThreadSessionId: null,
+    isContinuation: false,
+  }
+  const recoveryExecutionConfig: ExecutionConfig = {
+    ...executionConfig,
+    continueSessionId: undefined,
+    timeoutMs: remainingMs,
+  }
+  if (bootstrap.delivery === 'file-convention' && bootstrap.responseFilePath != null) {
+    try {
+      await fs.rm(bootstrap.responseFilePath, {force: true})
+    } catch (error) {
+      execLogger.warning('Failed to clear stale response file before overflow recovery', {
+        responseFilePath: bootstrap.responseFilePath,
+        error,
+      })
+    }
+  }
+  const recoveryStartTime = Date.now()
+  const recoveryExecResult = await executeOpenCode(
+    recoveryPromptOptions,
+    execLogger,
+    recoveryExecutionConfig,
+    cacheRestore.serverHandle,
+  )
+  const recoverySessionId = await resolveSessionId(recoveryExecResult.sessionId, recoveryStartTime)
+
+  if (recoveryExecResult.llmError?.type === 'context_overflow' && recoverySessionId != null) {
+    const recoveryArchiveSucceeded = await archiveSession(
+      cacheRestore.serverHandle.server.url,
+      recoverySessionId,
+      execLogger,
+    )
+    if (recoveryArchiveSucceeded === false) {
+      execLogger.warning('Overflowed recovery session archive failed; next run may re-continue it', {
+        sessionId: recoverySessionId,
+      })
+    }
+  }
+
+  return {
+    ...recoveryExecResult,
+    sessionId: recoverySessionId,
+    resolvedOutputMode: overflowedResult.resolvedOutputMode,
+    overflowRecovery: {
+      recovered: recoveryExecResult.success,
+      archivedSessionId: overflowedSessionId,
+      archiveSucceeded,
+    },
+  }
 }
 
 export async function runExecute(
@@ -97,27 +225,50 @@ export async function runExecute(
       sessionTitle: sessionPrep.sessionTitle ?? undefined,
     }
 
-    const execResult = await executeOpenCode(promptOptions, execLogger, executionConfig, cacheRestore.serverHandle)
+    const resolveSessionId = async (
+      candidateSessionId: string | null,
+      afterTimestamp: number,
+    ): Promise<string | null> => {
+      if (candidateSessionId != null) return candidateSessionId
 
-    let sessionId = execResult.sessionId
-    if (sessionId == null) {
       const sessionLogger = createLogger({phase: 'session'})
       const latestSession = await findLatestSession(
         cacheRestore.serverHandle.client,
         sessionPrep.normalizedWorkspace,
-        executionStartTime,
+        afterTimestamp,
         sessionLogger,
       )
-      if (latestSession != null) {
-        sessionId = latestSession.session.id
-        sessionLogger.debug('Identified session from execution', {sessionId})
-      }
+      if (latestSession == null) return null
+
+      sessionLogger.debug('Identified session from execution', {sessionId: latestSession.session.id})
+      return latestSession.session.id
     }
+
+    const execResult = await executeOpenCode(promptOptions, execLogger, executionConfig, cacheRestore.serverHandle)
+
+    const sessionId = await resolveSessionId(execResult.sessionId, executionStartTime)
 
     result = {
       ...execResult,
       sessionId,
       resolvedOutputMode,
+    }
+
+    if (result.llmError?.type === 'context_overflow' && result.commentsPosted === 0 && sessionId != null) {
+      result = await recoverFromContextOverflow({
+        bootstrap,
+        routing,
+        cacheRestore,
+        sessionPrep,
+        metrics,
+        execLogger,
+        executionStartTime,
+        promptOptions,
+        executionConfig,
+        overflowedResult: result,
+        overflowedSessionId: sessionId,
+        resolveSessionId,
+      })
     }
 
     execLogger.info('Completed OpenCode execution', {

@@ -2,7 +2,7 @@
 title: Classifying an abort by AbortSignal.any's composite reason is racy — use a side-channel
 date: 2026-07-03
 category: logic-errors
-module: gateway/execute
+module: gateway
 problem_type: logic_error
 component: assistant
 symptoms:

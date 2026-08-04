@@ -1,0 +1,1 @@
+import"./rolldown-runtime-DaDcL9Zw.js";import{r as e,t}from"./client-B_PwptpI.js";e();export{t as createOpencodeClient};

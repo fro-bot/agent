@@ -2,7 +2,7 @@
 title: Extend a shared function via an options object, not a positional optional, to survive cross-branch merges
 date: 2026-07-03
 category: best-practices
-module: runtime/coordination
+module: runtime
 problem_type: best_practice
 component: assistant
 severity: medium
