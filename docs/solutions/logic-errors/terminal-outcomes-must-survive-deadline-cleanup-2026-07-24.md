@@ -2,7 +2,7 @@
 title: Terminal outcomes must survive deadline cleanup
 date: 2026-07-24
 category: logic-errors
-module: action/agent-execution
+module: agent-execution
 problem_type: logic_error
 component: assistant
 symptoms:

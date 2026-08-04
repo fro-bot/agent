@@ -2,7 +2,7 @@
 title: Gateway Docker image crash-loop — workspace runtime externalized but not shipped
 date: 2026-05-31
 category: build-errors
-module: packages/gateway
+module: gateway
 problem_type: build_error
 component: tooling
 severity: high

@@ -2,7 +2,7 @@
 title: 'Broadcast repo-neutral notifications to all subscribers when no per-request identity exists at the event seam'
 date: 2026-07-10
 category: best-practices
-module: packages/gateway
+module: gateway
 problem_type: architecture_pattern
 component: assistant
 severity: low
