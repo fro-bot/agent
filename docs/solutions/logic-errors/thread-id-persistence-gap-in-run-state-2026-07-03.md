@@ -2,7 +2,7 @@
 title: A coordination field written empty at creation and never updated silently breaks every reader
 date: 2026-07-03
 category: logic-errors
-module: gateway/coordination
+module: gateway
 problem_type: logic_error
 component: assistant
 symptoms:

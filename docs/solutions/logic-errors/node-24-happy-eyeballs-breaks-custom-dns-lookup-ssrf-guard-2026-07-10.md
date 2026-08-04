@@ -2,7 +2,7 @@
 title: 'Node 24 Happy Eyeballs (autoSelectFamily) breaks a custom-DNS-lookup SSRF guard'
 date: 2026-07-10
 category: logic-errors
-module: packages/gateway
+module: gateway
 problem_type: logic_error
 component: service_object
 severity: high
