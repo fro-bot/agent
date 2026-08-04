@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-07-26"
-updated-by: "58dfc3d"
+last-updated: "2026-08-03"
+updated-by: "b233675"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -20,6 +20,7 @@ sources:
   - packages/runtime/src/shared/constants.ts
   - src/shared/constants.ts
   - src/harness/config/inputs.ts
+  - src/features/delegated/brokered-push-validation.ts
   - action.yaml
   - RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md
   - RFCs/RFC-019-S3-Storage-Backend.md
@@ -151,6 +152,8 @@ Credentials are handled with care:
 
 The GitHub token the agent might use to post is provisioned **conditionally**, driven by the response-delivery decision computed in [[Execution Lifecycle|bootstrap]]. On comment and review flows (`issue_comment`, `pull_request`, `issues`) the credential is **withheld** — `configureGhAuth()` skips setting `GH_TOKEN`, skips writing the `gh` `hosts.yml`, and clears any ambient `GH_CONFIG_DIR` from earlier workflow steps. The rationale is that on those flows the action posts the agent's answer itself (the file-convention delivery path), so the model has no legitimate need to call `gh` — and a credential the model never receives is a credential a prompt-injected model cannot exfiltrate from disk or environment. A preflight check (`git-credential-check.ts`) additionally asserts that no persisted git credential lingers in `.git/config` on these flows, which is why consumers are asked to check out with `persist-credentials: false`. Autonomous flows (`schedule`, `workflow_dispatch`) keep the credential provisioned, because they legitimately create branches, commits, and PRs on their own.
 
+When a same-repo PR comment produces workspace edits, the action still needs a way to land them despite withholding the token — this is what the [[Execution Lifecycle|brokered push]] step provides. It commits on the model's behalf through the action's own Octokit client, so the write is gated by trusted event facts and a path allowlist (`brokered-push-validation.ts`) rather than by handing the agent a credential. Keeping `persist-credentials: false` remains essential: it ensures the withheld token has no residual copy in `.git/config` that a same-user shell inside the agent could read.
+
 ### Environment scrubbing at agent spawn
 
 Independently of whether a credential is provisioned, the OpenCode child process is spawned under a **deny-by-default environment filter** (`packages/runtime/src/agent/filter-env.ts`, applied via `with-scrubbed-env.ts`). Only an enumerated allowlist of keys survives — GitHub Actions context, a handful of standard shell and locale variables, proxy/CA-bundle settings, and the `OPENCODE_*`, `RUNNER_*`, `XDG_*`, `LC_*`, and `NODE_*` prefixes. Anything ending in a credential-shaped suffix (`_TOKEN`, `_API_KEY`, `_SECRET`, `_KEY`, and similar), the `AWS_*` and `INPUT_*` prefixes, and `GITHUB_TOKEN`/`GH_TOKEN` by exact name are stripped even if they would otherwise match. The reduction is scoped: the harness restores its own environment immediately after the spawn so it can still reach the S3 backend, and it fails closed — if the scrub cannot complete, the child is never spawned.
@@ -160,6 +163,7 @@ Independently of whether a credential is provisioned, the OpenCode child process
 The action accepts over 20 inputs defined in `action.yaml`, grouped into core, agent, S3, and configuration categories. The most important ones:
 
 - `github-token` and `auth-json` are required — they provide GitHub API access and LLM provider credentials respectively.
+- `trusted-head-sha` carries a same-repository pull-request head SHA captured before agent execution (empty when unavailable). It is the trust anchor for the [[Execution Lifecycle|brokered push]] step: the harness diffs the workspace against this SHA and re-checks the live PR head against it immediately before committing, so a moved head aborts the push. Consumers wire it from `github.event.pull_request.head.sha` (or the equivalent event field) in the workflow; it has no effect on flows that are not same-repo PR comments.
 - `prompt` provides a custom instruction for the agent. Required for `schedule` and `workflow_dispatch` events.
 - `output-mode` controls the delivery contract for `schedule` and `workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`; default `auto`). When set to `auto`, the resolver in `src/features/agent/output-mode.ts` scans the prompt text for branch/PR-related phrases (e.g., "pull request", "create a pr", "git push") and selects `branch-pr` if any match, otherwise `working-dir`. This heuristic is frozen — new phrases require a code change. The `output-mode` input has no effect on non-manual event types (issue comments, PRs, etc.), which always return `null`. See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md) for the design rationale.
 - `agent` selects the OpenCode agent. When unset, uses OpenCode's built-in `build` agent. Must be a primary agent, not a subagent.

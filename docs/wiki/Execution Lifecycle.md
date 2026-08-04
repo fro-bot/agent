@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-07-26"
-updated-by: "58dfc3d"
+last-updated: "2026-08-03"
+updated-by: "b233675"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -23,6 +23,10 @@ sources:
   - src/features/triggers/skip-conditions-pr.ts
   - src/features/agent/output-mode.ts
   - src/features/agent/response-post.ts
+  - src/features/delegated/brokered-push.ts
+  - src/features/delegated/brokered-push-gate.ts
+  - src/features/delegated/brokered-push-validation.ts
+  - src/features/delegated/reconstruct-changes.ts
   - src/features/reviews/review-reconciliation.ts
   - src/features/reviews/review-guards.ts
   - src/services/github/context.ts
@@ -31,10 +35,11 @@ sources:
   - packages/runtime/src/coordination/lock.ts
   - packages/runtime/src/coordination/types.ts
   - RFCs/RFC-005-GitHub-Triggers-Events.md
+  - RFCs/RFC-010-Delegated-Work.md
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
   - RFCs/RFC-017-Post-Action-Cache-Hook.md
   - RFCs/RFC-019-S3-Storage-Backend.md
-summary: "Phase-by-phase walkthrough of a single action run, including review reconciliation"
+summary: "Phase-by-phase walkthrough of a single action run, including review reconciliation and brokered push"
 ---
 
 # Execution Lifecycle
@@ -139,6 +144,14 @@ Writes a synthetic summary message into the session history so future runs can d
 For `pull_request`/`issue_comment`/`issues` triggers, this phase also **posts the agent's response on the model's behalf** — the file-convention delivery path. The model wrote its response to a run-scoped file (outside the checkout, under `RUNNER_TEMP`, nonce-named and created by the action); Finalize reads it, binds the target and surface to the trusted `NormalizedEvent` (never the file), validates it against a strict allowlist schema, and posts via the Octokit comment/review writers (`src/features/agent/response-post.ts`) — a PR-review verdict goes through the same shared review guards (`src/features/reviews/review-guards.ts`) as reconciliation. This path is **fail-closed**: a missing, malformed, or undeliverable response fails the run (naming the file), and a delivery assertion prevents a green-but-silent run. The dedup marker for these flows is written only after delivery is confirmed, so a failed post followed by a retry cannot dedup-skip into a silent success.
 
 This design exists for a security reason, not just tidiness. Because the model no longer posts its own comment or review, it no longer needs a GitHub credential for those flows — so the credential is withheld from the OpenCode child entirely (see [[Setup and Configuration]]). The response file is treated as _untrusted payload_: it contributes only body content (and, for a review, an `approve`/`request-changes` verdict) within an envelope whose target, surface, and eligibility come from the trusted event. A fork PR cannot preseed a workspace file to redirect a post or forge an approval. `workflow_dispatch`/`schedule` runs keep `model-gh` delivery — they post via the model's own `gh` and are unchanged.
+
+### Brokered push
+
+Finalize also hosts an optional **brokered push** step for the file-convention path (RFC-010, `src/features/delegated/brokered-push.ts`). The credential-withholding design above means a comment-triggered agent cannot commit for itself — it has no `gh` token. Brokered push closes that gap for the narrow, trusted case of a same-repository pull-request comment: after a successful run that produced workspace edits but posted no comment of its own, the harness reconstructs those edits and commits them to the PR head branch on the model's behalf, using the action's own Octokit client rather than any credential the model can reach. This lets an authorized `@fro-bot` fix request land as a real commit while still keeping the token off the agent process.
+
+The step is a fail-closed state machine where every stage re-derives trust from event-time facts rather than the model's output. An **early gate** (`brokered-push-gate.ts`) admits only `issue_comment` events on a same-repo pull request from an `OWNER`, `MEMBER`, or `COLLABORATOR`, and only when a **trusted head SHA** was captured before execution (see [[Setup and Configuration]] for the `trusted-head-sha` input that anchors this). A **live permission re-check** then confirms the triggering actor still has `write` or `admin` on the repository, failing closed on any lookup error so a transient outage suppresses the push rather than allowing it. **Reconstruction** (`reconstruct-changes.ts`) diffs the workspace against that trusted SHA — never local `HEAD`, branches, or remotes — enumerates untracked files, and reads each changed file through an `O_NOFOLLOW` handle to close a symlink swap race. A **path allowlist** (`brokered-push-validation.ts`) restricts delivery to `src/`, package `src/`, `docs/`, and a short set of top-level docs (`README.md`, `ARCHITECTURE.md`, `STRUCTURE.md`), capped at 100 files, so config, scripts, and CI files can never be pushed. A final **pre-write gate** re-resolves the live PR immediately before the Git Data API write, rejecting the push if the PR closed, the base or head repository changed, the head branch was renamed, or the head SHA moved.
+
+The whole step runs under a 120-second wall-clock ceiling enforced by a `Promise.race`. The `AbortSignal` cancels the Octokit calls promptly, but the reconstruction `git` subprocess cannot observe an abort signal, so the race is the hard bound for a stalled subprocess; the abandoned promise never leaks because the process exits once `run()` resolves. Delivery is deliberately **non-atomic**: the commit lands before the response comment is posted, and a timeout firing after `updateRef` already succeeded reports failure for a commit that may exist. This self-heals — a re-run reconstructs the now-updated branch to _nothing-to-deliver_ rather than double-pushing. On success, Finalize appends a "Brokered push delivered" footer (branch, changed paths, commit SHA) to the delivered comment; on failure it fails the run with a generic error and posts no push.
 
 ## 11. Cleanup (Always)
 

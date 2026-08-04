@@ -3646,6 +3646,102 @@ describe('processEventStream', () => {
     },
   )
 
+  it.each([
+    [
+      'properties.error direct name',
+      {
+        properties: {
+          sessionID: 'ses_123',
+          error: {
+            name: 'ContextOverflowError',
+            data: {
+              message: 'context-overflow-provider-message-sentinel',
+              responseBody: 'context-overflow-response-body-sentinel',
+            },
+          },
+        },
+      },
+    ],
+    [
+      'properties.error nested name',
+      {
+        properties: {
+          sessionID: 'ses_123',
+          error: {
+            data: {
+              name: 'ContextOverflowError',
+              message: 'context-overflow-provider-message-sentinel',
+              responseBody: 'context-overflow-response-body-sentinel',
+            },
+          },
+        },
+      },
+    ],
+    [
+      'data.error direct name',
+      {
+        data: {
+          sessionID: 'ses_123',
+          error: {
+            name: 'ContextOverflowError',
+            data: {
+              message: 'context-overflow-provider-message-sentinel',
+              responseBody: 'context-overflow-response-body-sentinel',
+            },
+          },
+        },
+      },
+    ],
+    [
+      'data.error nested name',
+      {
+        data: {
+          sessionID: 'ses_123',
+          error: {
+            data: {
+              name: 'ContextOverflowError',
+              message: 'context-overflow-provider-message-sentinel',
+              responseBody: 'context-overflow-response-body-sentinel',
+            },
+          },
+        },
+      },
+    ],
+  ])(
+    'classifies ContextOverflowError from the %s session.error envelope as a distinct terminal overflow error',
+    async (_label, event) => {
+      // #given — OpenCode's structured context overflow failure in either supported envelope and name location
+      const activityTracker: ActivityTracker = {
+        firstMeaningfulEventReceived: false,
+        currentTurnTerminalSignalReceived: false,
+        sessionIdle: false,
+        sessionError: null,
+      }
+      const eventStream = createMockEventStream([{type: 'session.error', ...event} as unknown as Event])
+
+      // #when
+      const result = await processEventStream(
+        eventStream.stream,
+        'ses_123',
+        new AbortController().signal,
+        createMockLogger(),
+        activityTracker,
+      )
+
+      // #then — overflow is distinct from auth/quota and provider-controlled values do not cross the boundary
+      expect(result.llmError?.type).toBe('context_overflow')
+      expect(result.llmError?.message).toBe('The model context window was exceeded while processing this run.')
+      expect(result.llmError?.retryable).toBe(false)
+      expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
+      expect(activityTracker.sessionError).toBe(result.llmError?.message)
+      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+      expect(JSON.stringify(result)).not.toContain('context-overflow-provider-message-sentinel')
+      expect(JSON.stringify(result)).not.toContain('context-overflow-response-body-sentinel')
+      expect(JSON.stringify(activityTracker)).not.toContain('context-overflow-provider-message-sentinel')
+      expect(JSON.stringify(activityTracker)).not.toContain('context-overflow-response-body-sentinel')
+    },
+  )
+
   it('classifies the exact auth_unavailable retry status as a terminal provider auth error', async () => {
     // #given — issue #1253's retry status marker
     const activityTracker = {

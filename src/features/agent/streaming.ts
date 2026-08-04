@@ -4,6 +4,7 @@ import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
 import type {ExecutionDeadline} from './retry.js'
 import {
+  classifyContextOverflowError,
   classifyProviderAuthError,
   classifyQuotaError,
   createAgentError,
@@ -59,7 +60,7 @@ export function classifyRetryStatusError(status: unknown): ErrorInfo | null {
 }
 
 function isTerminalProviderError(error: ErrorInfo): boolean {
-  return error.type === 'quota_exceeded' || error.type === 'provider_auth_error'
+  return error.type === 'context_overflow' || error.type === 'quota_exceeded' || error.type === 'provider_auth_error'
 }
 
 /** Merge generic and terminal observations while freezing the first terminal provider signal. */
@@ -453,6 +454,10 @@ export async function processEventStream(
 
         const terminalError =
           classifyProviderAuthError({
+            kind: 'session-error',
+            name,
+          }) ??
+          classifyContextOverflowError({
             kind: 'session-error',
             name,
           }) ??

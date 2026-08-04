@@ -1,9 +1,11 @@
-import type {ProviderAuthErrorInput} from './types.js'
+import type {ContextOverflowErrorInput, ProviderAuthErrorInput} from './types.js'
 import {describe, expect, expectTypeOf, it} from 'vitest'
 import {
+  classifyContextOverflowError,
   classifyProviderAuthError,
   classifyQuotaError,
   createAgentError,
+  createContextOverflowError,
   createErrorInfo,
   createLLMFetchError,
   createLLMTimeoutError,
@@ -491,6 +493,81 @@ describe('agent/error-format/format', () => {
       for (const input of nonAuthInputs) {
         expect(classifyProviderAuthError(input)).toBeNull()
       }
+    })
+  })
+
+  describe('context overflow errors', () => {
+    it('keeps only the session-error classification fields in the context overflow input type', () => {
+      // #given the context overflow classifier input type
+      // #when inspecting its shape
+      expectTypeOf<ContextOverflowErrorInput>().toEqualTypeOf<{
+        readonly kind: 'session-error'
+        readonly name?: unknown
+      }>()
+      // #then it excludes raw provider payload fields from the classifier contract
+    })
+
+    it('classifies the exact structured ContextOverflowError marker into fixed non-retryable output', () => {
+      // #given a structured context overflow failure with untrusted provider fields
+      const input = {
+        kind: 'session-error' as const,
+        name: 'ContextOverflowError',
+        message: 'context-overflow-provider-message-sentinel',
+        responseBody: 'context-overflow-response-body-sentinel',
+      }
+
+      // #when classifying the signal
+      const error = classifyContextOverflowError(input)
+
+      // #then it becomes a fixed context overflow error
+      expect(error).toEqual(createContextOverflowError())
+      expect(error?.type).toBe('context_overflow')
+      expect(error?.message).toBe('The model context window was exceeded while processing this run.')
+      expect(error?.retryable).toBe(false)
+    })
+
+    it('does not leak provider payload fields into context overflow output', () => {
+      // #given a structured context overflow marker with hostile provider-controlled values
+      const input = {
+        kind: 'session-error' as const,
+        name: 'ContextOverflowError',
+        message: 'context-overflow-provider-message-sentinel',
+        responseBody: 'context-overflow-response-body-sentinel',
+      }
+
+      // #when classifying and rendering the signal
+      const error = classifyContextOverflowError(input)
+      const rendered = JSON.stringify(error) + formatErrorComment(error ?? createContextOverflowError())
+
+      // #then only harness-owned fixed output crosses the boundary
+      expect(rendered).not.toContain('context-overflow-provider-message-sentinel')
+      expect(rendered).not.toContain('context-overflow-response-body-sentinel')
+    })
+
+    it('classifies only the exact ContextOverflowError marker', () => {
+      // #given names that resemble but do not equal the structured marker
+      const unrelatedNames: unknown[] = [
+        'ContextOverflowError ',
+        'contextoverflowerror',
+        'ContextOverflowErrorRetry',
+        42,
+        {},
+      ]
+
+      // #then none become context overflow errors
+      for (const name of unrelatedNames) {
+        expect(classifyContextOverflowError({kind: 'session-error', name})).toBeNull()
+      }
+    })
+
+    it('does not change auth or quota classification categories', () => {
+      // #given the existing exact auth and quota markers
+      const authError = classifyProviderAuthError({kind: 'session-error', name: 'ProviderAuthError'})
+      const quotaError = classifyQuotaError({kind: 'session-error', status: 402})
+
+      // #then each remains in its original category
+      expect(authError?.type).toBe('provider_auth_error')
+      expect(quotaError?.type).toBe('quota_exceeded')
     })
   })
 
