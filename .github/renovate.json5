@@ -224,4 +224,15 @@
     commands: ['bun install', 'bun run fix', 'bun run build'],
     executionMode: 'branch',
   },
+  vulnerabilityAlerts: {
+    // Security updates bypass minimumReleaseAge by default and open immediately.
+    // But bunfig.toml sets a hard 3-day install gate (minimumReleaseAge = 259200),
+    // so `bun install --frozen-lockfile` refuses to resolve any version younger
+    // than 3 days — a same-day [SECURITY] PR is guaranteed CI-red until the gate
+    // clears. Re-impose the matching 3-day age on the security path so these PRs
+    // open only once the fix is installable (green), not 3 days early as red noise.
+    // For a genuinely exploitable fix that must land sooner, use a deliberate
+    // per-incident bunfig minimumReleaseAgeExcludes bypass instead.
+    minimumReleaseAge: '3 days',
+  },
 }
