@@ -110,6 +110,9 @@ jobs:
       # SYNC: keep the shared merge inputs in step with fro-bot.yaml's Run Fro Bot step
       - name: Run Fro Bot
         uses: ./
+        env:
+          # Keep provider-level failures diagnosable; the pushed ref is this job's only other output.
+          OPENCODE_PROMPT_ARTIFACT: 'true'
         with:
           auth-json: ${{ steps.mint.outputs.auth-json }}
           github-token: ${{ steps.mint-app-token.outputs.github-token }}
