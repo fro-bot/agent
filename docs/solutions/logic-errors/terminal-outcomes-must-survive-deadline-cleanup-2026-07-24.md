@@ -156,6 +156,7 @@ Secondary operations still fail closed where they own the outcome—for example,
 
 - [Issue #1252](https://github.com/fro-bot/agent/issues/1252)
 - [PR #1277](https://github.com/fro-bot/agent/pull/1277)
+- [A failed run reported success because it had no delivery surface](failed-run-reported-success-with-no-delivery-surface-2026-08-07.md) — the adjacent case: this doc keeps an accepted outcome intact through cleanup; that one stops a failure from being reported as success when it could not be delivered anywhere.
 - [Classifying an abort by AbortSignal.any's composite reason is racy — use a side-channel](abortsignal-any-reason-classification-race-2026-07-03.md)
 - [Treat a model-authored response file as untrusted input and bind posting to the trusted event context](../best-practices/response-file-is-untrusted-input-2026-07-11.md)
 - [An injected permission deny blocked the harness's own response-file delivery path](injected-deny-blocks-own-delivery-path-2026-07-13.md)
