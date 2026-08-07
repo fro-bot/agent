@@ -11,13 +11,29 @@ import {createOpencode} from '@opencode-ai/sdk'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {CONTINUATION_PROMPT, sendPromptToSession} from './prompt-sender.js'
+import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
-import {createExecutionDeadline, MAX_LLM_RETRIES, RETRY_DELAYS_MS, type ExecutionDeadline} from './retry.js'
+import {
+  createExecutionDeadline,
+  MAX_LLM_RETRIES,
+  mergeArtifactResults,
+  RETRY_DELAYS_MS,
+  type ExecutionDeadline,
+} from './retry.js'
 import {waitForAbortableDelay} from './session-poll.js'
 
 const SESSION_ABORT_TIMEOUT_MS = 2_000
+
+async function responseFileExists(responseFilePath: string | null | undefined): Promise<boolean> {
+  if (responseFilePath == null) return false
+  try {
+    await fs.access(responseFilePath)
+    return true
+  } catch {
+    return false
+  }
+}
 
 async function abortRemoteSession(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
@@ -160,11 +176,18 @@ export async function executeOpenCode(
     const allFileParts = [...(promptOptions.fileParts ?? []), ...referenceFileParts]
 
     let lastError: string | null = null
+    let promptAccepted = false
+    let nextPrompt: {readonly kind: 'initial'} | {readonly kind: 'continuation'; readonly error: ErrorInfo} = {
+      kind: 'initial',
+    }
     for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
       if (deadline.isExpired()) return timeoutResult()
       const retryDelay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[0]
 
-      const prompt = attempt === 1 ? initialPrompt : CONTINUATION_PROMPT
+      const prompt =
+        nextPrompt.kind === 'initial'
+          ? initialPrompt
+          : buildContinuationPrompt(nextPrompt.error, config?.credentialProvisioned === true)
       const files = allFileParts.length > 0 ? allFileParts : undefined
       const result = await (async () => {
         try {
@@ -191,9 +214,9 @@ export async function executeOpenCode(
         }
       })()
 
-      if (result.success) {
-        final = result.eventStreamResult
+      final = mergeArtifactResults(result.eventStreamResult, final)
 
+      if (result.success) {
         return {
           success: true,
           exitCode: 0,
@@ -212,7 +235,28 @@ export async function executeOpenCode(
 
       lastError = result.error
       lastLlmError = result.llmError
-      if (!result.shouldRetry || attempt >= MAX_LLM_RETRIES || deadline.isExpired()) break
+      const promptWasAccepted = promptAccepted
+      if (result.outcome !== 'submit_failed') promptAccepted = true
+
+      if (await responseFileExists(promptOptions.responseFilePath)) break
+
+      const canResendOriginalPrompt =
+        result.outcome === 'submit_failed' && promptWasAccepted === false && result.llmError?.retryable === true
+      const canContinueTurn = result.outcome === 'turn_failed_retryable'
+      if (
+        (canResendOriginalPrompt === false && canContinueTurn === false) ||
+        attempt >= MAX_LLM_RETRIES ||
+        deadline.isExpired()
+      )
+        break
+
+      if (canContinueTurn) {
+        if (result.llmError == null) break
+        nextPrompt = {kind: 'continuation', error: result.llmError}
+      } else {
+        nextPrompt = {kind: 'initial'}
+      }
+
       shouldAbortRemoteOnTimeout = true
       logger.warning('LLM fetch error detected, retrying with continuation prompt', {
         attempt,

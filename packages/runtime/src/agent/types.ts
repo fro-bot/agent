@@ -302,6 +302,8 @@ export interface ExecutionConfig {
   readonly omoProviders: OmoProviders
   readonly continueSessionId?: string
   readonly sessionTitle?: string
+  /** Whether the agent can directly affect external GitHub state during execution. */
+  readonly credentialProvisioned?: boolean
 }
 
 export interface EnsureOpenCodeResult {

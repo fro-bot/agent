@@ -10,7 +10,13 @@ import type {SessionPrepPhaseResult} from './session-prep.js'
 import * as fs from 'node:fs/promises'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {archiveSession, findLatestSession, searchSessions, writeSessionSummary} from '@fro-bot/runtime'
+import {
+  archiveSession,
+  findLatestSession,
+  resolveResponseDelivery,
+  searchSessions,
+  writeSessionSummary,
+} from '@fro-bot/runtime'
 import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
@@ -49,6 +55,16 @@ interface ContextOverflowRecoveryOptions {
   readonly overflowedResult: ExecutePhaseResult
   readonly overflowedSessionId: string
   readonly resolveSessionId: (candidateSessionId: string | null, afterTimestamp: number) => Promise<string | null>
+}
+
+async function responseFileExists(responseFilePath: string | null): Promise<boolean> {
+  if (responseFilePath == null) return false
+  try {
+    await fs.access(responseFilePath)
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function recoverFromContextOverflow(options: ContextOverflowRecoveryOptions): Promise<ExecutePhaseResult> {
@@ -223,6 +239,9 @@ export async function runExecute(
       omoProviders: bootstrap.inputs.omoProviders,
       continueSessionId: sessionPrep.continueSessionId ?? undefined,
       sessionTitle: sessionPrep.sessionTitle ?? undefined,
+      credentialProvisioned:
+        resolveResponseDelivery(routing.triggerResult.context.eventName, bootstrap.inputs.responseMode).credential ===
+        'provision',
     }
 
     const resolveSessionId = async (
@@ -254,7 +273,14 @@ export async function runExecute(
       resolvedOutputMode,
     }
 
-    if (result.llmError?.type === 'context_overflow' && result.commentsPosted === 0 && sessionId != null) {
+    const credentialProvisioned = executionConfig.credentialProvisioned === true
+    const deliverablePresent = await responseFileExists(bootstrap.responseFilePath)
+    if (
+      result.llmError?.type === 'context_overflow' &&
+      credentialProvisioned === false &&
+      deliverablePresent === false &&
+      sessionId != null
+    ) {
       result = await recoverFromContextOverflow({
         bootstrap,
         routing,

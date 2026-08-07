@@ -1,7 +1,7 @@
 import type {createOpencode, Event} from '@opencode-ai/sdk'
 import type {createOpencodeClient} from '@opencode-ai/sdk/v2'
 import type {Logger} from '../../shared/logger.js'
-import type {AttemptResult} from './prompt-sender.js'
+import type {AttemptOutcome, AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult} from './streaming.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {pollForSessionCompletion, waitForAbortableDelay, waitForEventProcessorShutdown} from './session-poll.js'
@@ -257,6 +257,10 @@ export function mergeArtifactResults(
 export const MAX_LLM_RETRIES = 4
 export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
 
+function shouldRetryFromOutcome(outcome: AttemptOutcome): boolean {
+  return outcome === 'turn_failed_retryable'
+}
+
 /**
  * Create a v2 client attached to an existing OpenCode server URL.
  * Returns null if the import fails (older SDK) or no URL is provided.
@@ -476,11 +480,13 @@ export async function runPromptAttempt(
 
     if (activityTracker.terminalProviderError != null) {
       const terminalError = activityTracker.terminalProviderError
+      const outcome: AttemptOutcome = 'turn_failed_terminal'
       return {
         success: false,
         error: terminalError.message,
         llmError: terminalError,
-        shouldRetry: false,
+        outcome,
+        shouldRetry: shouldRetryFromOutcome(outcome),
         eventStreamResult,
       }
     }
@@ -488,21 +494,26 @@ export async function runPromptAttempt(
     if (!pollResult.completed) {
       const pollError = pollResult.error ?? 'Session did not reach idle state'
       logger.error('Session completion polling failed', {error: pollError, sessionId})
+      const outcome: AttemptOutcome =
+        eventStreamResult.llmError?.retryable === true ? 'turn_failed_retryable' : 'turn_failed_terminal'
       return {
         success: false,
         error: pollError,
         llmError: eventStreamResult.llmError,
-        shouldRetry: eventStreamResult.llmError?.retryable === true,
+        outcome,
+        shouldRetry: shouldRetryFromOutcome(outcome),
         eventStreamResult,
       }
     }
 
     if (deadline?.isTimedOut() === true) {
+      const outcome: AttemptOutcome = 'timeout'
       return {
         success: true,
         error: null,
         llmError: null,
-        shouldRetry: false,
+        outcome,
+        shouldRetry: shouldRetryFromOutcome(outcome),
         eventStreamResult,
       }
     }
@@ -520,20 +531,24 @@ export async function runPromptAttempt(
     if (fallbackMessageParts != null) {
       const fallback = detectArtifactsFromMessageParts(fallbackMessageParts, logger)
       const merged = mergeArtifactResults(eventStreamResult, fallback)
+      const outcome: AttemptOutcome = 'completed'
       return {
         success: true,
         error: null,
         llmError: null,
-        shouldRetry: false,
+        outcome,
+        shouldRetry: shouldRetryFromOutcome(outcome),
         eventStreamResult: merged,
       }
     }
 
+    const outcome: AttemptOutcome = 'completed'
     return {
       success: true,
       error: null,
       llmError: null,
-      shouldRetry: false,
+      outcome,
+      shouldRetry: shouldRetryFromOutcome(outcome),
       eventStreamResult,
     }
   } finally {
