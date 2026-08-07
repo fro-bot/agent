@@ -87,6 +87,10 @@ export function resolveHarnessBinary(): string {
 }
 
 function findPlatformBinary(launcher: string): string | null {
+  // Coupled to the @fro.bot/harness package layout: the platform package is named
+  // `harness-<platform>-<arch>` but its executable is still `bin/opencode`. If that bin
+  // entry is ever renamed, this surfaces as the "not found" error below rather than
+  // silently running a different binary.
   const packageName = `harness-${process.platform}-${process.arch}`
   let current = path.dirname(fs.realpathSync(launcher))
 
@@ -213,12 +217,15 @@ function readBoundedDiagnosticFile(
 
   let fileDescriptor: number | null = null
   try {
-    const size = fs.statSync(filePath).size
-    const bytesToRead = Math.min(size, maxBytes)
+    // Open first, then size the file through that same descriptor. Sizing by path and then
+    // opening by path leaves a window where the entry can be swapped between the two calls,
+    // and these logs are written by the agent under test. `O_NOFOLLOW` additionally refuses
+    // a symlink outright rather than following it somewhere unintended.
+    fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+    const bytesToRead = Math.min(fs.fstatSync(fileDescriptor).size, maxBytes)
     if (bytesToRead === 0) {
       return {text: '', bytesRead: 0}
     }
-    fileDescriptor = fs.openSync(filePath, 'r')
     const buffer = Buffer.alloc(bytesToRead)
     const bytesRead = fs.readSync(fileDescriptor, buffer, 0, bytesToRead, 0)
     return {text: buffer.subarray(0, bytesRead).toString('utf8'), bytesRead}
