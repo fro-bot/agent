@@ -62,6 +62,35 @@ describe('prompt.txt bash snippet syntax', () => {
     expect(allBlocks).toContain('refs/harness-integrate')
   })
 
+  it('strips .github/workflows from the integration commit before pushing', () => {
+    // #given
+    // The integration push authenticates as a GitHub App, and GitHub rejects any
+    // App push that creates or updates a workflow file without the `workflows`
+    // permission. Releases previously survived this only because the agent
+    // improvised a fix after the push was rejected; a run that declined to
+    // improvise failed the whole pipeline. Keep the removal explicit and pinned.
+    const allBlocks = bashBlocks.join('\n')
+
+    // #then
+    expect(allBlocks).toContain('.github/workflows')
+    expect(allBlocks).toMatch(/git rm -r --cached [^\n]*--ignore-unmatch [^\n]*\.github\/workflows/)
+  })
+
+  it('removes workflows from the index only, before the integration commit', () => {
+    // #given
+    const allBlocks = bashBlocks.join('\n')
+    const stripIndex = allBlocks.indexOf('.github/workflows')
+    const commitIndex = allBlocks.indexOf('git commit -m "harness: integrate OpenCode')
+
+    // #then
+    // `--cached` keeps the files on disk so the build step is unaffected.
+    expect(allBlocks).toContain('--cached')
+    // The strip must precede the single integration commit, or the commit still
+    // carries the workflow files and the push is rejected.
+    expect(stripIndex).toBeGreaterThan(-1)
+    expect(commitIndex).toBeGreaterThan(stripIndex)
+  })
+
   it.each(bashBlocks.map((block, i) => ({block, index: i})))(
     'bash block $index passes bash -n syntax check (stderr must be empty)',
     ({block}) => {
