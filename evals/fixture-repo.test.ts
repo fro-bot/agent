@@ -1,17 +1,11 @@
 import {execFileSync} from 'node:child_process'
-import {existsSync, readdirSync, readFileSync, writeFileSync} from 'node:fs'
+import {existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
 import {createFixtureFiles, detectForbiddenMutations, EVAL_CANARY_PLACEHOLDER} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
-
-function temporaryFixtureRepos(): readonly string[] {
-  return readdirSync(os.tmpdir())
-    .filter(entry => entry.startsWith('fro-bot-eval-repo-'))
-    .sort()
-}
 
 describe('createFixtureRepo', () => {
   it('creates nested fixture files in a committed temporary repository', () => {
@@ -99,19 +93,31 @@ describe('createFixtureRepo', () => {
     }
   })
 
-  it.each(['../escape.txt', path.join(os.tmpdir(), 'fro-bot-eval-absolute.txt')])(
-    'rejects fixture path %s and cleans up the temporary repository',
-    filePath => {
-      // #given the set of temporary fixture repositories before construction
-      const before = temporaryFixtureRepos()
+  it.each([false, true])('rejects %s fixture paths and cleans up the temporary repository', absolutePath => {
+    // #given an isolated temporary directory for this synchronous fixture construction
+    const originalTmpDir = process.env.TMPDIR
+    const isolatedTmpDir = mkdtempSync(path.join(os.tmpdir(), 'fro-bot-escape-test-'))
+    process.env.TMPDIR = isolatedTmpDir
+    const fileName = `fro-bot-eval-escape-${Date.now()}.txt`
+    const filePath = absolutePath ? path.join(isolatedTmpDir, fileName) : `../${fileName}`
+    const before = readdirSync(isolatedTmpDir).sort()
 
+    try {
       // #when a fixture file escapes the repository root
       expect(() => createFixtureRepo({[filePath]: 'must not be written'})).toThrow('escapes repository root')
 
-      // #then construction leaves no temporary repository behind
-      expect(temporaryFixtureRepos()).toEqual(before)
-    },
-  )
+      // #then the temporary fixture repository and escaped file are both absent
+      expect(readdirSync(isolatedTmpDir).sort()).toEqual(before)
+      expect(existsSync(path.join(isolatedTmpDir, fileName))).toBe(false)
+    } finally {
+      if (originalTmpDir == null) {
+        delete process.env.TMPDIR
+      } else {
+        process.env.TMPDIR = originalTmpDir
+      }
+      rmSync(isolatedTmpDir, {recursive: true, force: true})
+    }
+  })
 
   it('replaces the canary placeholder with a per-run value in fixture content', () => {
     // #given a scenario containing the canary placeholder

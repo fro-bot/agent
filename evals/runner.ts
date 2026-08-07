@@ -5,6 +5,7 @@ import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/
 import type {GitHubContext} from '../src/services/github/types.js'
 import type {Logger} from '../src/shared/logger.js'
 import type {EvalRunArtifacts, EvalRunReport, ResponseArtifacts, Scenario} from './types.js'
+import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
@@ -41,7 +42,7 @@ const PROVIDER_AUTH_PLUGINS: Readonly<Record<string, string>> = {
  * measuring a different system than the one that ships — the same class of error as pinning
  * an outdated version. Override with `FRO_BOT_EVAL_HARNESS_BIN` when testing a candidate build.
  */
-function resolveHarnessBinary(): string {
+export function resolveHarnessBinary(): string {
   const configured = process.env.FRO_BOT_EVAL_HARNESS_BIN
   if (configured != null && configured.trim().length > 0) {
     const explicitPath = configured.trim()
@@ -90,6 +91,7 @@ function findPlatformBinary(launcher: string): string | null {
   let current = path.dirname(fs.realpathSync(launcher))
 
   for (let depth = 0; depth < 8; depth++) {
+    // Coupled to the harness package layout: its platform package exposes the executable as bin/opencode.
     const candidate = path.join(current, 'node_modules', '@fro.bot', packageName, 'bin', 'opencode')
     if (fs.existsSync(candidate)) {
       return candidate
@@ -197,6 +199,82 @@ function captureDiagnostics(env: IsolatedEvalEnv, scenarioId: string): string | 
   } catch {
     return null
   }
+}
+
+const MAX_DIAGNOSTIC_SCAN_BYTES = 65_536
+
+function readBoundedDiagnosticFile(
+  filePath: string,
+  maxBytes: number,
+): {readonly text: string; readonly bytesRead: number} {
+  if (maxBytes === 0) {
+    return {text: '', bytesRead: 0}
+  }
+
+  let fileDescriptor: number | null = null
+  try {
+    const size = fs.statSync(filePath).size
+    const bytesToRead = Math.min(size, maxBytes)
+    if (bytesToRead === 0) {
+      return {text: '', bytesRead: 0}
+    }
+    fileDescriptor = fs.openSync(filePath, 'r')
+    const buffer = Buffer.alloc(bytesToRead)
+    const bytesRead = fs.readSync(fileDescriptor, buffer, 0, bytesToRead, 0)
+    return {text: buffer.subarray(0, bytesRead).toString('utf8'), bytesRead}
+  } catch {
+    return {text: '', bytesRead: 0}
+  } finally {
+    if (fileDescriptor != null) {
+      try {
+        fs.closeSync(fileDescriptor)
+      } catch {
+        // Diagnostics are fail-soft and must never change the eval result by throwing here.
+      }
+    }
+  }
+}
+
+function readCapturedDiagnostics(diagnosticsPath: string | null): string {
+  if (diagnosticsPath == null) {
+    return ''
+  }
+
+  const chunks: string[] = []
+  let remainingBytes = MAX_DIAGNOSTIC_SCAN_BYTES
+  const visit = (directory: string): void => {
+    if (remainingBytes === 0) {
+      return
+    }
+
+    let entries: readonly fs.Dirent[]
+    try {
+      entries = fs
+        .readdirSync(directory, {withFileTypes: true})
+        .sort((left, right) => left.name.localeCompare(right.name))
+    } catch {
+      return
+    }
+
+    for (const entry of entries) {
+      if (remainingBytes === 0) {
+        return
+      }
+      const entryPath = path.join(directory, entry.name)
+      if (entry.isDirectory()) {
+        visit(entryPath)
+      } else if (entry.isFile()) {
+        const result = readBoundedDiagnosticFile(entryPath, remainingBytes)
+        if (result.bytesRead > 0) {
+          chunks.push(result.text)
+          remainingBytes -= result.bytesRead
+        }
+      }
+    }
+  }
+
+  visit(diagnosticsPath)
+  return chunks.join('\n')
 }
 
 function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: string, model: string): IsolatedEvalEnv {
@@ -359,7 +437,7 @@ function provisionProviderAuth(dataDir: string, model: string, originalEnv: Reco
   fs.writeFileSync(path.join(isolatedAuthDir, 'auth.json'), JSON.stringify({[providerID]: entry}), {mode: 0o600})
 }
 
-function parseModel(model: string): {readonly providerID: string; readonly modelID: string} {
+export function parseModel(model: string): {readonly providerID: string; readonly modelID: string} {
   const parts = model.split('/')
   const providerID = parts[0]
   const modelID = parts[1]
@@ -370,12 +448,14 @@ function parseModel(model: string): {readonly providerID: string; readonly model
   return {providerID, modelID}
 }
 
-function resolveModel(): string {
+export function resolveModel(): string {
   const configuredModel = process.env.FRO_BOT_EVAL_MODEL
-  if (configuredModel == null || configuredModel.trim().length === 0) {
+  if (configuredModel == null) {
     return DEFAULT_EVAL_MODEL
   }
-  return configuredModel.trim()
+  const model = configuredModel.trim()
+  parseModel(model)
+  return model
 }
 
 function buildDiffContext(scenario: Scenario) {
@@ -532,6 +612,7 @@ function collectResponseArtifacts(
   agentResult: AgentResult,
   canary: string,
   configuredTimeoutMs: number,
+  diagnosticsOutput: string,
 ): ResponseArtifacts {
   const responseFiles = fs.existsSync(env.responseDir)
     ? fs
@@ -564,7 +645,7 @@ function collectResponseArtifacts(
     parsedResponse,
     responseFileError,
     deliveryCount: responseFiles.length,
-    output: [rawResponse ?? '', agentResult.error ?? ''].join('\n'),
+    output: [rawResponse ?? '', agentResult.error ?? '', diagnosticsOutput].join('\n'),
     canary,
     executionSucceeded: agentResult.success,
     executionFailureReason: getExecutionFailureReason(agentResult),
@@ -574,7 +655,13 @@ function collectResponseArtifacts(
   }
 }
 
-export async function runScenario(scenario: Scenario, logger: Logger): Promise<EvalRunReport> {
+export type EvalExecution = typeof executeOpenCode
+
+export async function runScenario(
+  scenario: Scenario,
+  logger: Logger,
+  execution: EvalExecution = executeOpenCode,
+): Promise<EvalRunReport> {
   const startedAt = Date.now()
   const model = resolveModel()
   const modelConfig = parseModel(model)
@@ -596,12 +683,14 @@ export async function runScenario(scenario: Scenario, logger: Logger): Promise<E
     let agentResult: AgentResult
     const openCodeVersion = readOpenCodeVersion(environment.opencodeBin)
     try {
-      agentResult = await executeOpenCode(promptOptions, logger, executionConfig)
+      agentResult = await execution(promptOptions, logger, executionConfig)
     } catch (error) {
       // Mutation detection and gates still run when the execution call itself throws.
       agentResult = createExecutionFailure(error)
     }
-    const artifacts = collectResponseArtifacts(environment, agentResult, canary, timeoutMs)
+    const diagnosticsPath = agentResult.success ? null : captureDiagnostics(environment, scenario.id)
+    const diagnosticsOutput = readCapturedDiagnostics(diagnosticsPath)
+    const artifacts = collectResponseArtifacts(environment, agentResult, canary, timeoutMs, diagnosticsOutput)
     const completeArtifacts: EvalRunArtifacts = {
       ...artifacts,
       scenarioId: scenario.id,
@@ -612,8 +701,6 @@ export async function runScenario(scenario: Scenario, logger: Logger): Promise<E
     }
     const promptResult = buildAgentPrompt({...promptOptions, sessionId: agentResult.sessionId ?? undefined}, logger)
     const evaluation = evaluateRun(completeArtifacts)
-    const diagnosticsPath = agentResult.success ? null : captureDiagnostics(environment, scenario.id)
-
     return {
       scenarioId: scenario.id,
       model,
