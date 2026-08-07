@@ -222,7 +222,7 @@ If U1 slips or is abandoned, U5 must not proceed on judgement alone — that is 
 - Baseline captured for current prompt and model across all scenarios, committed as the reference artifact.
 - No gate asserts tool usage, step count, or reasoning order.
 
-- [ ] **U2. Consolidate duplicate execution stacks**
+- [x] **U2. Consolidate duplicate execution stacks**
 
 **Goal:** One owning implementation of execution and retry policy.
 
@@ -263,7 +263,7 @@ If U1 slips or is abandoned, U5 must not proceed on judgement alone — that is 
 - Exactly one declaration of retry count and backoff exists in the tree.
 - No public export is silently dropped.
 
-- [ ] **U3. Structured attempt outcomes and recovery policy**
+- [x] **U3. Structured attempt outcomes and recovery policy**
 
 **Goal:** Make recovery decisions account for observed side effects.
 
