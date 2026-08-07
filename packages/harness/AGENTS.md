@@ -61,13 +61,17 @@ Resolves the base version (dispatch input or tag) and renders the merge prompt f
 
 ### `integrate` job (merge via Fro Bot)
 
-Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/fro-bot.yaml` with `secrets: inherit`, passing `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. The Fro Bot agent:
+Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/harness-integrate.yaml` — a dedicated workflow, **not** `fro-bot.yaml`, and **never** `secrets: inherit`. The caller job declares `permissions: {id-token: write, contents: read}` and passes exactly four secrets explicitly (`APPLICATION_ID`, `APPLICATION_PRIVATE_KEY`, `OPENCODE_CONFIG`, `OMO_PROVIDERS`) plus `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. Withholding the durable model credential is the point: it must never reach this workflow. The Fro Bot agent:
 
 1. Clones `anomalyco/opencode` into a disposable work dir, creates the integration branch at the base version tag, and merges the configured refs.
 2. Builds and verifies the host CLI as a correctness gate.
-3. Pushes the integrated branch to `refs/harness-integrate/<version>` in this repo using the workflow's inherited push credentials (`GH_TOKEN`, never echoed). It posts nothing to GitHub — the summary is plain text in the job log only.
+3. Pushes the integrated branch to `refs/harness-integrate/<version>` in this repo using an **inline-minted, short-lived GitHub App installation token** scoped to `contents: write` on this repo (`scripts/harness/mint-app-token.ts`; the App private key is step-env-only and never touches disk or `GITHUB_ENV`). It posts nothing to GitHub — the summary is plain text in the job log only.
+
+The model credential is likewise minted per run: `scripts/harness/mint-broker-credential.ts` exchanges the job's GitHub OIDC token for a short-lived credential and feeds it in as `auth-json`. Neither credential is a durable secret, and the job's `contents: write` scope is why the integration commit must omit workflow files (see below).
 
 The merge runs with `output-mode: working-dir` so branch/PR delivery semantics do not apply; the prompt itself owns the push to the throwaway ref.
+
+The integration commit **intentionally omits `.github/workflows/`** — the prompt strips it before committing, because the push authenticates as a GitHub App and GitHub rejects App pushes that touch workflow files without the `workflows` permission. Their absence from a `refs/harness-integrate/*` tree is expected, not truncation. See [the incident writeup](../../docs/solutions/workflow-issues/integrate-push-strips-workflow-files-2026-08-07.md).
 
 ### `build` matrix (consumer)
 
@@ -97,7 +101,7 @@ Required for any release that runs an LLM merge (i.e. any release with integrati
 - **Name:** `AUTH_JSON`
 - **Value:** JSON mapping provider to auth config:
   ```json
-  {"anthropic":{"type":"api","key":"sk-ant-..."}}
+  {"anthropic": {"type": "api", "key": "sk-ant-..."}}
   ```
 
 The integrate job maps it to an internal env var, writes it to a 0600 temp file, and passes it to OpenCode as a file-based credential. The value is never echoed to logs or included in any artifact.
@@ -105,6 +109,7 @@ The integrate job maps it to an internal env var, writes it to a 0600 temp file,
 ### Dispatching a release
 
 **Dry run** (validate build infrastructure, skip publish):
+
 ```bash
 gh workflow run harness-release.yaml \
   --repo fro-bot/agent \
@@ -113,6 +118,7 @@ gh workflow run harness-release.yaml \
 ```
 
 **Real patched release** (the merge runs through Fro Bot, which uses the inherited `AUTH_JSON` model credential):
+
 ```bash
 gh workflow run harness-release.yaml \
   --repo fro-bot/agent \
@@ -143,6 +149,7 @@ npm trusted publishing requires a package to **already exist** before it will ac
 The pipeline is the asset; the patch list stays boring. Target 1–3 carried refs max. Every carried ref records: reason, owner, upstream status, drop condition. Re-gauge every upstream release tag.
 
 A ref qualifies to carry only if it is:
+
 1. Merged-to-dev correctness fix not yet in stable (auto-drops on the next release that includes it).
 2. Open/stalled upstream fix for Fro-Bot-critical behavior with a failing fixture or reproducible incident.
 3. Perf/DX/agent-quality patch with before/after evidence (numbers required).
