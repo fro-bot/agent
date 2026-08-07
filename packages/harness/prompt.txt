@@ -45,6 +45,7 @@ git checkout -b {{branch}} refs/tags/{{tag}}
 
 ```bash
 git reset --soft {{tag}}
+git rm -r --cached --quiet --ignore-unmatch .github/workflows
 git commit -m "harness: integrate OpenCode {{version}} carrying {{branches}}"
 ```
 
@@ -52,6 +53,16 @@ git commit -m "harness: integrate OpenCode {{version}} carrying {{branches}}"
    only discards the intermediate merge commits, so this does not change any
    file content — it only flattens history. After this, {{branch}} has exactly
    one commit above {{tag}}, and `git diff {{tag}}..HEAD` shows all carries.
+
+   The `git rm --cached` line drops `.github/workflows/` from the integration
+   commit. It is required: the push in step 6 authenticates as a GitHub App,
+   and GitHub rejects any App push that creates or updates a workflow file
+   unless the token carries the `workflows` permission — which this job's token
+   deliberately does not. `--cached` removes the files from the commit only,
+   leaving them on disk so the step 4 build is unaffected; `--ignore-unmatch`
+   makes the command a no-op if upstream ever ships no workflows directory.
+   The integration ref is a throwaway build input — the release build consumes
+   the source tree to compile the CLI and never reads these files.
 
 4. Build the host CLI. Run from the repo root ({{repo}}) — build.ts does its own chdir into packages/opencode:
 
