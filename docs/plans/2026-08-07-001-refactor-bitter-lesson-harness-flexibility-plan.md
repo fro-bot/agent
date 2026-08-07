@@ -144,7 +144,7 @@ graph TB
   C -.->|side effects unknown| E[may replay pushed commit]
 ```
 
-Proposed shape — a discriminated outcome the recovery policy can reason over:
+Proposed shape — a discriminated outcome the recovery policy can reason over. The signal investigation in U3 dropped `completed_with_side_effects`, because no observable input can populate it honestly; side-effect risk is carried by the credential axis instead, and the decision the lattice actually drives is _resend versus continue_:
 
 ```mermaid
 graph TB
@@ -153,12 +153,14 @@ graph TB
   B --> D[turn_failed_retryable]
   B --> E[turn_failed_terminal]
   B --> F[timeout]
-  B --> G[completed_with_side_effects]
+  B --> G[completed]
   C --> H[resend original prompt]
   D --> I[continuation carrying structured failure]
   E --> J[stop]
   F --> J
-  G --> K[reconcile, never replay]
+  G --> K[done]
+  I -.gated by.-> L{{deliverable present?}}
+  L -->|yes| M[reconcile, never re-run]
 ```
 
 ## Implementation Units
@@ -276,15 +278,39 @@ If U1 slips or is abandoned, U5 must not proceed on judgement alone — that is 
 - Modify: `src/harness/phases/execute.ts`
 - Test: `src/features/agent/opencode.test.ts`
 
+**Signal investigation outcome (2026-08-07): the premise was refuted.**
+
+This unit required naming the side-effect signal before building the lattice, and explicitly allowed for the answer being negative. It is. There is **no sufficient pre-replay detector** for "this attempt caused an external effect."
+
+Evidence, verified against source:
+
+- `prsCreated`, `commitsCreated`, and `commentsPosted` (`src/features/agent/streaming.ts:22-26`) are populated by artifact detection over SSE events and tool-output text, not by a write confirmation. They evidence _attempted_, never _landed_.
+- They read empty exactly when an attempt dies mid-flight, which is the unsafe direction: a write that reached GitHub before the stream died leaves the counters at zero, and a replay keyed on them would duplicate the effect.
+- The signals that genuinely prove an effect — the return values of `createCommit`, `postComment`, `submitReview`, and `runResponsePost` — exist only in the delivery/finalize path, downstream of the retry decision.
+
+The investigation also corrected the shape of the defect. `src/features/agent/execution.ts:167` already sends `CONTINUATION_PROMPT` on every attempt after the first, so the harness never resends the original prompt. The replay hazard is not the harness repeating an instruction — it is the continuation itself, which is a fixed string that both misstates the cause and invites redoing work:
+
+> "The previous request was interrupted by a network error (fetch failed). Please continue where you left off. If you were in the middle of a task, resume it."
+
+Only three error types are retryable (`packages/runtime/src/agent/error-format/format.ts`): `rate_limit`, `llm_timeout`, and `llm_fetch_error`. The prompt asserts a fetch failure for all of them, so it states a cause the harness did not observe in two of the three cases, and "resume it" is the instruction most likely to make a model repeat a write that already landed. This is the unit's core defect: a fabricated narrative substituted for the structured signal the harness already holds.
+
+Two signals _are_ trustworthy, and the design rests only on these:
+
+1. **Credential disposition.** `resolveResponseDelivery` (`packages/runtime/src/agent/response-delivery.ts`) withholds the GitHub credential entirely for `pull_request`, `issue_comment`, and `issues`. On those events the agent structurally cannot write to GitHub, so undetectable external effects are confined to credential-provisioned runs (`workflow_dispatch`, `schedule`, and the unknown-event default).
+2. **Response-file presence.** `src/harness/phases/execute.ts:117` removes the response file before the run, so its presence after a failed attempt proves the model produced a deliverable during _this_ attempt.
+
 **Approach:**
 
-- Replace the boolean `shouldRetry` with a discriminated outcome: `submit_failed`, `turn_failed_retryable`, `turn_failed_terminal`, `timeout`, `completed`, `completed_with_side_effects`.
-- Recovery policy: not accepted resends the original prompt; accepted-but-interrupted with no side effects sends a continuation carrying the structured failure and remaining objective; side effects observed or response file present reconciles rather than replays; terminal stops; unknown never replays irreversible work.
-- **Outcome classification never upgrades run status.** `completed_with_side_effects` describes what happened, not whether the run succeeded. A failed attempt that produced side effects remains a failed run unless delivery independently succeeded. This preserves the invariant from `docs/solutions/logic-errors/failed-run-reported-success-with-no-delivery-surface-2026-08-07.md`: an exit code must not encode a claim that may be false.
+- **Separate the two operations the boolean conflated.** The hazard was never "retry" — it is _resending the original prompt_, which redoes work. A continuation carrying the structured failure and the remaining objective is safe even when effects occurred, because it does not repeat the original instruction. The lattice exists to decide between resend, continue, and stop.
+- Replace the boolean `shouldRetry` with a discriminated outcome: `submit_failed`, `turn_failed_retryable`, `turn_failed_terminal`, `timeout`, `completed`.
+- **`completed_with_side_effects` is dropped.** Nothing can populate it honestly. A variant whose only inputs are inference-derived counters would assert a fact the harness cannot observe, which is the "wider lattice resting on false confidence" this unit was told to avoid. Side-effect risk is carried instead by the credential axis, which is structural.
+- Carry `deliverablePresent` and `credentialProvisioned` as orthogonal facts rather than outcome variants — both are observable, and neither describes _why_ the turn ended.
+- Recovery policy: `submit_failed` resends the original prompt (the sole case where nothing was accepted, so nothing ran); `turn_failed_retryable` sends a continuation carrying the structured failure and never resends; a deliverable present reconciles rather than re-runs; terminal and timeout stop; anything unclassifiable is treated as effect-bearing and never resends.
+- **Replace the fixed continuation string with the observed failure.** The continuation must name the actual error type rather than asserting a fetch failure, and must not instruct the model to "resume" blindly. On a credential-provisioned event it should direct the model to verify what already landed before acting, since that is exactly the case where an unobserved write may have succeeded.
+- **Outcome classification never upgrades run status.** The outcome describes what happened, not whether the run succeeded. A failed attempt remains a failed run unless delivery independently succeeded, preserving the invariant from `docs/solutions/logic-errors/failed-run-reported-success-with-no-delivery-surface-2026-08-07.md`: an exit code must not encode a claim that may be false.
 - **Delivery bookkeeping is authoritative over recovery.** If a response was already delivered, recovery must not produce a second one. The exactly-one-response invariant is enforced by delivery state, never inferred from the outcome variant.
-- **Unknown is treated as side-effect-bearing.** The harness cannot observe every effect an attempt may cause. Where observability is absent, the policy assumes effects occurred and declines to replay.
-- **Name the signal before building the lattice.** `prsCreated`, `commitsCreated`, and `commentsPosted` already exist on the execution result, but they report what was observed after the fact rather than providing a reliable pre-replay detector, and they cannot distinguish a real push from text that resembles one. The first task in this unit is to establish what signal actually proves an external effect occurred. If no sufficient signal exists, the correct outcome is a narrower lattice that treats more cases as unknown — not a wider one resting on false confidence.
-- **Accept that observability is partial.** Effects outside the harness's inspection surface (an external API call, a write the harness does not read) are undetectable by construction. The policy is safe only because unknown declines to replay; it must never be tightened into "unknown means no side effects."
+- **Unknown is treated as side-effect-bearing.** Where observability is absent, the policy assumes effects occurred and declines to resend.
+- **Accept that observability is partial.** Effects outside the harness's inspection surface are undetectable by construction. The policy is safe only because unknown declines to resend; it must never be tightened into "unknown means no side effects."
 - Accumulate artifacts from failed attempts so a later attempt can see what already happened.
 - Instrument the combined attempt budget across OpenCode's internal retries and the harness's own.
 
@@ -298,17 +324,18 @@ If U1 slips or is abandoned, U5 must not proceed on judgement alone — that is 
 **Test scenarios:**
 
 - Happy path: a transport failure before prompt acceptance resends the original prompt.
-- Happy path: an interrupted turn with no side effects sends a continuation containing the structured failure.
-- Error path: an attempt that pushed a commit and then failed does not replay; it reconciles.
+- Happy path: an interrupted turn sends a continuation containing the structured failure rather than the original prompt.
+- Error path: a failed attempt on a credential-provisioned event never resends, because effects are undetectable there.
 - Error path: an attempt that wrote a valid response file and then failed does not overwrite that delivery.
 - Edge case: a terminal provider error stops immediately without consuming the retry budget.
-- Edge case: an unclassifiable failure does not replay irreversible work.
+- Edge case: an unclassifiable failure does not resend the original prompt.
 - Integration: the combined OpenCode-plus-harness attempt count is recorded in the run summary.
 
 **Verification:**
 
-- No path can retry an attempt whose side effects were observed.
+- No path resends the original prompt after the prompt was accepted.
 - The continuation prompt carries the structured failure, not a generic string.
+- No branch consults `prsCreated`, `commitsCreated`, or `commentsPosted` to decide recovery.
 
 - [ ] **U4. Structured-first error classification**
 
