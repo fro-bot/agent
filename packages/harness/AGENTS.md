@@ -61,11 +61,13 @@ Resolves the base version (dispatch input or tag) and renders the merge prompt f
 
 ### `integrate` job (merge via Fro Bot)
 
-Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/fro-bot.yaml` with `secrets: inherit`, passing `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. The Fro Bot agent:
+Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/harness-integrate.yaml` — a dedicated workflow, **not** `fro-bot.yaml`, and **never** `secrets: inherit`. The caller job declares `permissions: {id-token: write, contents: read}` and passes exactly four secrets explicitly (`APPLICATION_ID`, `APPLICATION_PRIVATE_KEY`, `OPENCODE_CONFIG`, `OMO_PROVIDERS`) plus `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. Withholding the durable model credential is the point: it must never reach this workflow. The Fro Bot agent:
 
 1. Clones `anomalyco/opencode` into a disposable work dir, creates the integration branch at the base version tag, and merges the configured refs.
 2. Builds and verifies the host CLI as a correctness gate.
-3. Pushes the integrated branch to `refs/harness-integrate/<version>` in this repo using the workflow's inherited push credentials (`GH_TOKEN`, never echoed). It posts nothing to GitHub — the summary is plain text in the job log only.
+3. Pushes the integrated branch to `refs/harness-integrate/<version>` in this repo using an **inline-minted, short-lived GitHub App installation token** scoped to `contents: write` on this repo (`scripts/harness/mint-app-token.ts`; the App private key is step-env-only and never touches disk or `GITHUB_ENV`). It posts nothing to GitHub — the summary is plain text in the job log only.
+
+The model credential is likewise minted per run: `scripts/harness/mint-broker-credential.ts` exchanges the job's GitHub OIDC token for a short-lived credential and feeds it in as `auth-json`. Neither credential is a durable secret, and the job's `contents: write` scope is why the integration commit must omit workflow files (see below).
 
 The merge runs with `output-mode: working-dir` so branch/PR delivery semantics do not apply; the prompt itself owns the push to the throwaway ref.
 
