@@ -36,7 +36,13 @@ Run the two live scenarios explicitly:
 FRO_BOT_EVAL=1 bunx vitest run evals/corpus.test.ts
 ```
 
-The default model is the free, credentialless `opencode/big-pickle`. Pin a different model with `FRO_BOT_EVAL_MODEL=provider/model`. Override the report location with `FRO_BOT_EVAL_OUTPUT=/path/to/report.json`; otherwise the report is written to the gitignored `evals/output/eval-report.json`.
+The default model is the free, credentialless `opencode/big-pickle`. Pin a different model with `FRO_BOT_EVAL_MODEL=provider/model`. Override the report location with `FRO_BOT_EVAL_OUTPUT=/path/to/report.json`; otherwise the report is written to the gitignored `evals/output/eval-report.json`. `FRO_BOT_EVAL_OPENCODE_VERSION` overrides the OpenCode version, which otherwise tracks the version this harness ships — an eval running a different version than production measures the wrong system, and an older build's model catalog will not resolve a current model name.
+
+### Real-model runs are unverified
+
+Running against a real model is implemented but **has not been demonstrated working**. Locally, `anthropic/claude-sonnet-5` and `anthropic/claude-opus-4-8` both fail in about five seconds with `Session error: name=UnknownError`, while the credential-free default model runs normally. The token was unexpired and both model identifiers are present in the OpenCode catalog, so the cause is the credential shape: the local entry is a Claude subscription OAuth record (`type: oauth`, with `access`/`refresh`/`expires`), whereas CI supplies an API-key-shaped `auth-json`. The provisioning step copies exactly one provider entry into the isolated home rather than the whole host auth file, which typically holds credentials for several unrelated providers this run has no business reaching.
+
+Until a real-model run is shown end to end, treat the corpus as proven only for the credential-free model. Do not assume a green real-model result is achievable by setting the variable alone.
 
 The runner creates a temporary Git repository, isolates `HOME`/`XDG_*`, removes `GH_TOKEN` and `GITHUB_TOKEN`, and gives OpenCode no GitHub credential. It also loads no user plugins in the isolated environment. The fixture repository and temporary response files are cleaned up after each scenario.
 

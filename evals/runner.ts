@@ -19,6 +19,24 @@ import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
 import {evaluateRun} from './gates.js'
 
 const DEFAULT_EVAL_MODEL = 'opencode/big-pickle'
+
+/** The default model's provider serves a free tier that needs no stored credential. */
+const CREDENTIAL_FREE_PROVIDER = 'opencode'
+
+/**
+ * OpenCode version the corpus runs against.
+ *
+ * Must track the version this harness actually ships (`DEFAULT_OPENCODE_VERSION`), not an
+ * arbitrary pin: an older build carries an older model catalog, so a current model name
+ * fails to resolve and surfaces as an opaque session error that looks like an agent problem.
+ * An eval running a different version than production is measuring the wrong system.
+ */
+const DEFAULT_OPENCODE_PACKAGE_VERSION = '1.18.14'
+
+function resolveOpenCodeVersion(): string {
+  const configured = process.env.FRO_BOT_EVAL_OPENCODE_VERSION
+  return configured == null || configured.trim().length === 0 ? DEFAULT_OPENCODE_PACKAGE_VERSION : configured.trim()
+}
 /**
  * Per-scenario execution budget.
  *
@@ -152,10 +170,13 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
   fs.mkdirSync(binDir, {recursive: true})
   fs.mkdirSync(configDir, {recursive: true})
   fs.mkdirSync(responseDir, {recursive: true})
+  provisionProviderAuth(dataDir, model, originalEnv)
 
   const bunBinary = resolveBunBinary()
   const opencodeBin = path.join(binDir, 'opencode')
-  fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${bunBinary}" x opencode-ai@1.17.20 "$@"\n`, {mode: 0o755})
+  fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${bunBinary}" x opencode-ai@${resolveOpenCodeVersion()} "$@"\n`, {
+    mode: 0o755,
+  })
   fs.writeFileSync(
     path.join(configDir, 'opencode.json'),
     JSON.stringify(
@@ -195,6 +216,48 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
   delete process.env.GITHUB_TOKEN
 
   return {home, runnerTemp, responseDir, responseFilePath, opencodeBin, originalEnv}
+}
+
+/**
+ * Copy the single provider credential the configured model needs into the isolated home.
+ *
+ * The runner deliberately isolates HOME and XDG_DATA_HOME, so the sandbox starts with no
+ * `auth.json` at all. That is why only credential-free models run out of the box. When a
+ * real model is pinned, exactly one provider entry is copied — never the whole host auth
+ * file, which typically holds credentials for several unrelated providers that this run
+ * has no business being able to reach.
+ *
+ * Fails loudly rather than running unauthenticated: an auth-less run against a real model
+ * surfaces as a confusing execution failure that looks like an agent problem.
+ */
+function provisionProviderAuth(dataDir: string, model: string, originalEnv: Record<string, string | undefined>): void {
+  const {providerID} = parseModel(model)
+  const hostDataDir = originalEnv.XDG_DATA_HOME ?? path.join(originalEnv.HOME ?? os.homedir(), '.local', 'share')
+  const hostAuthPath = path.join(hostDataDir, 'opencode', 'auth.json')
+
+  if (fs.existsSync(hostAuthPath) === false) {
+    if (providerID === CREDENTIAL_FREE_PROVIDER) return
+    throw new Error(
+      `Model ${model} requires provider credentials but no auth.json was found at ${hostAuthPath}. ` +
+        `Use the credential-free default model, or authenticate that provider first.`,
+    )
+  }
+
+  const parsed: unknown = JSON.parse(fs.readFileSync(hostAuthPath, 'utf8'))
+  const entry =
+    typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>)[providerID] : undefined
+
+  if (entry === undefined) {
+    if (providerID === CREDENTIAL_FREE_PROVIDER) return
+    throw new Error(
+      `Model ${model} requires a '${providerID}' credential but ${hostAuthPath} has no such entry. ` +
+        `Authenticate that provider first, or use the credential-free default model.`,
+    )
+  }
+
+  const isolatedAuthDir = path.join(dataDir, 'opencode')
+  fs.mkdirSync(isolatedAuthDir, {recursive: true})
+  fs.writeFileSync(path.join(isolatedAuthDir, 'auth.json'), JSON.stringify({[providerID]: entry}), {mode: 0o600})
 }
 
 function parseModel(model: string): {readonly providerID: string; readonly modelID: string} {
