@@ -381,6 +381,10 @@ export async function runFinalize(
     await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
   } else {
     logger.warning('Cannot post error comment: missing target context')
+    core.setFailed(
+      'Agent execution failed with a recoverable LLM error, and no delivery surface was available to report it.',
+    )
+    return execution.exitCode === 0 ? 1 : execution.exitCode
   }
 
   return 0

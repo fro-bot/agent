@@ -952,6 +952,73 @@ describe('runFinalize non-file-convention delivery', () => {
     expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('7'))
   })
+
+  it('fails when a recoverable llm error has no delivery surface', async () => {
+    // #given none delivery, a recoverable llmError, and no resolvable comment target
+    const bootstrap = createBootstrap({delivery: 'none', responseFilePath: null})
+    const routing = createRouting({
+      agentContext: {...createRouting().agentContext, issueNumber: 0},
+    })
+    const execution = createExecution({
+      success: false,
+      exitCode: 0,
+      llmError: {
+        type: 'api_error',
+        message: 'APIError; status=400',
+        retryable: true,
+      },
+    })
+    const metrics = createMetrics()
+    const logger = createMockLogger()
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), logger)
+
+    // #then the invisible failure is surfaced as a non-zero run failure without provider text
+    expect(exitCode).toBe(1)
+    expect(mocks.postComment).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('recoverable LLM error'))
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('no delivery surface was available'))
+    expect(mocks.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('APIError; status=400'))
+    expect(logger.warning).toHaveBeenCalledWith('Cannot post error comment: missing target context')
+  })
+
+  it('posts a recoverable llm error comment and returns 0 when a delivery surface is resolvable', async () => {
+    // #given none delivery, a recoverable llmError, and a resolvable issue target
+    const bootstrap = createBootstrap({delivery: 'none', responseFilePath: null})
+    const routing = createRouting()
+    const llmError = {
+      type: 'api_error' as const,
+      message: 'APIError; status=400',
+      retryable: true,
+    }
+    const execution = createExecution({
+      success: false,
+      exitCode: 0,
+      llmError,
+    })
+    const metrics = createMetrics()
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the existing error-comment delivery path remains unchanged
+    expect(exitCode).toBe(0)
+    expect(mocks.postComment).toHaveBeenCalledTimes(1)
+    const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
+    expect(target).toEqual({type: 'issue', number: 1, owner: 'owner', repo: 'repo'})
+    expect(options.body).toBe(formatErrorComment(llmError))
+    expect(mocks.setFailed).not.toHaveBeenCalled()
+  })
 })
 
 describe('runFinalize provider_auth_error handling', () => {
