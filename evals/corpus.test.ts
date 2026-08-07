@@ -1,8 +1,9 @@
+import type {EvalRunReport} from './types.js'
 import {mkdirSync, writeFileSync} from 'node:fs'
 import * as path from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {createLogger} from '../src/shared/logger.js'
-import {runScenario} from './runner.js'
+import {resolveEvalTimeoutMs, runScenario} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
 import {plantedDefectScenario} from './scenarios/planted-defect.js'
 
@@ -11,22 +12,18 @@ const SCENARIOS = [cleanPrScenario, plantedDefectScenario] as const
 
 /**
  * Scenarios run sequentially, so the suite ceiling must cover every scenario's own
- * execution budget plus server startup and teardown. A fixed ceiling below that sum
- * kills a run mid-investigation and reports it as a capability failure.
+ * execution budget plus server startup and teardown. Derive it from the configured budget
+ * rather than hardcoding: a fixed ceiling silently caps a raised per-scenario timeout and
+ * kills the run mid-investigation, which then reads as a capability failure.
  */
-const PER_SCENARIO_CEILING_MS = 360_000
-const SUITE_TIMEOUT_MS = SCENARIOS.length * PER_SCENARIO_CEILING_MS
+const STARTUP_TEARDOWN_ALLOWANCE_MS = 60_000
+const SUITE_TIMEOUT_MS = SCENARIOS.length * (resolveEvalTimeoutMs() + STARTUP_TEARDOWN_ALLOWANCE_MS)
 
 describe.skipIf(!EVAL_ENABLED)('agent outcome eval corpus', {timeout: SUITE_TIMEOUT_MS}, () => {
   it('runs exactly the two frozen U1 scenarios and writes their reports', async () => {
     // #given the two intentionally small frozen scenarios
     const logger = createLogger({component: 'eval-corpus'})
-    const reports = []
-
-    // #when each scenario is evaluated through executeOpenCode
-    for (const scenario of SCENARIOS) {
-      reports.push(await runScenario(scenario, logger))
-    }
+    const reports: EvalRunReport[] = []
 
     const outputOverride = process.env.FRO_BOT_EVAL_OUTPUT
     const outputPath =
@@ -34,18 +31,19 @@ describe.skipIf(!EVAL_ENABLED)('agent outcome eval corpus', {timeout: SUITE_TIME
         ? outputOverride
         : path.join(process.cwd(), 'evals', 'output', 'eval-report.json')
     mkdirSync(path.dirname(outputPath), {recursive: true})
-    writeFileSync(
-      outputPath,
-      JSON.stringify(
-        {
-          generatedAt: new Date().toISOString(),
-          reports,
-        },
-        null,
-        2,
-      ),
-      'utf8',
-    )
+
+    // Persist after every scenario rather than once at the end. Real-model runs take long
+    // enough to be killed by an outer time limit, and a single trailing write loses every
+    // completed scenario when that happens.
+    const persist = (): void => {
+      writeFileSync(outputPath, JSON.stringify({generatedAt: new Date().toISOString(), reports}, null, 2), 'utf8')
+    }
+
+    // #when each scenario is evaluated through executeOpenCode
+    for (const scenario of SCENARIOS) {
+      reports.push(await runScenario(scenario, logger))
+      persist()
+    }
 
     const inconclusiveReports = reports.filter(report => report.state === 'inconclusive')
     for (const report of inconclusiveReports) {

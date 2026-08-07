@@ -24,18 +24,83 @@ const DEFAULT_EVAL_MODEL = 'opencode/big-pickle'
 const CREDENTIAL_FREE_PROVIDER = 'opencode'
 
 /**
- * OpenCode version the corpus runs against.
- *
- * Must track the version this harness actually ships (`DEFAULT_OPENCODE_VERSION`), not an
- * arbitrary pin: an older build carries an older model catalog, so a current model name
- * fails to resolve and surfaces as an opaque session error that looks like an agent problem.
- * An eval running a different version than production is measuring the wrong system.
+ * Providers whose stored credential is an OAuth record rather than an API key need their
+ * auth plugin loaded to perform the token exchange. Copying `auth.json` alone is not enough:
+ * without the plugin the request fails as an opaque provider error that looks like a bad
+ * credential rather than a missing exchange step.
  */
-const DEFAULT_OPENCODE_PACKAGE_VERSION = '1.18.14'
+const PROVIDER_AUTH_PLUGINS: Readonly<Record<string, string>> = {
+  anthropic: '@cortexkit/opencode-anthropic-auth@1.18.0',
+}
 
-function resolveOpenCodeVersion(): string {
-  const configured = process.env.FRO_BOT_EVAL_OPENCODE_VERSION
-  return configured == null || configured.trim().length === 0 ? DEFAULT_OPENCODE_PACKAGE_VERSION : configured.trim()
+/**
+ * Resolve the harness binary the corpus runs against.
+ *
+ * This must be the patched harness build, never stock `opencode-ai` from npm. The harness
+ * carries this project's upstream patch set, so an eval driven by the stock package is
+ * measuring a different system than the one that ships — the same class of error as pinning
+ * an outdated version. Override with `FRO_BOT_EVAL_HARNESS_BIN` when testing a candidate build.
+ */
+function resolveHarnessBinary(): string {
+  const configured = process.env.FRO_BOT_EVAL_HARNESS_BIN
+  if (configured != null && configured.trim().length > 0) {
+    const explicitPath = configured.trim()
+    if (fs.existsSync(explicitPath) === false) {
+      throw new Error(`FRO_BOT_EVAL_HARNESS_BIN points at a missing binary: ${explicitPath}`)
+    }
+    return explicitPath
+  }
+
+  let launcher = ''
+  try {
+    launcher = execFileSync('which', ['harness'], {encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe']}).trim()
+  } catch {
+    launcher = ''
+  }
+
+  if (launcher.length === 0 || fs.existsSync(launcher) === false) {
+    throw new Error(
+      'No harness binary found on PATH. Install @fro.bot/harness, or set FRO_BOT_EVAL_HARNESS_BIN ' +
+        'to the platform binary the corpus should run. The corpus must not fall back to stock opencode-ai.',
+    )
+  }
+
+  // Resolve past the launcher shim to the platform binary it would exec. The shim discovers
+  // its platform package relative to the caller's environment, which the corpus deliberately
+  // isolates (HOME and XDG_* point at a scratch home), so under isolation it reports a `dev`
+  // build and fails to locate `@fro.bot/harness-<platform>`. Executing the platform binary
+  // directly keeps the sandbox intact and still runs the real patched build.
+  //
+  // The launcher's own layout is not fixed: a global install puts it at `<root>/bin/harness`
+  // while a workspace install exposes `<root>/node_modules/.bin/harness`. Walking up and
+  // probing each level handles both instead of assuming one shape.
+  const platformBinary = findPlatformBinary(launcher)
+  if (platformBinary == null) {
+    throw new Error(
+      `Harness platform binary for ${process.platform}-${process.arch} not found near ${launcher}. ` +
+        'Set FRO_BOT_EVAL_HARNESS_BIN to the platform binary for this host.',
+    )
+  }
+
+  return platformBinary
+}
+
+function findPlatformBinary(launcher: string): string | null {
+  const packageName = `harness-${process.platform}-${process.arch}`
+  let current = path.dirname(fs.realpathSync(launcher))
+
+  for (let depth = 0; depth < 8; depth++) {
+    const candidate = path.join(current, 'node_modules', '@fro.bot', packageName, 'bin', 'opencode')
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+
+    const parent = path.dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+
+  return null
 }
 /**
  * Per-scenario execution budget.
@@ -48,7 +113,7 @@ function resolveOpenCodeVersion(): string {
  */
 const DEFAULT_EVAL_TIMEOUT_MS = 300_000
 
-function resolveEvalTimeoutMs(): number {
+export function resolveEvalTimeoutMs(): number {
   const configured = process.env.FRO_BOT_EVAL_TIMEOUT_MS
   if (configured == null || configured.length === 0) {
     return DEFAULT_EVAL_TIMEOUT_MS
@@ -77,38 +142,10 @@ interface IsolatedEvalEnv {
   readonly responseFilePath: string
   readonly opencodeBin: string
   readonly originalEnv: Record<string, string | undefined>
+  readonly originalCwd: string
 }
 
 const EVAL_SECRET_PLACEHOLDER = 'FRO_BOT_EVAL_SECRET_PLACEHOLDER'
-
-function resolveBunBinary(): string {
-  const realHome = os.homedir()
-  const misePaths = [
-    path.join(realHome, '.local', 'share', 'mise', 'installs', 'bun', '1.3.14', 'bin', 'bun'),
-    path.join(realHome, '.local', 'share', 'mise', 'installs', 'bun', '1.3', 'bin', 'bun'),
-    path.join(realHome, '.local', 'share', 'mise', 'installs', 'bun', 'latest', 'bin', 'bun'),
-  ]
-
-  for (const candidate of misePaths) {
-    if (fs.existsSync(candidate)) {
-      try {
-        const version = execFileSync(candidate, ['--version'], {
-          encoding: 'utf8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-        }).trim()
-        if (version.length > 0) return candidate
-      } catch {
-        // Try the next known installation.
-      }
-    }
-  }
-
-  try {
-    return execFileSync('which', ['bun'], {encoding: 'utf8'}).trim()
-  } catch {
-    throw new Error('Cannot find bun binary for the eval OpenCode wrapper')
-  }
-}
 
 function restoreEnv(originalEnv: Record<string, string | undefined>): void {
   for (const [key, value] of Object.entries(originalEnv)) {
@@ -122,8 +159,38 @@ function restoreEnv(originalEnv: Record<string, string | undefined>): void {
 
 function cleanupIsolatedEvalEnv(env: IsolatedEvalEnv): void {
   restoreEnv(env.originalEnv)
+  // Restore the working directory before removing anything: the process may still be inside
+  // a directory that is about to be deleted.
+  process.chdir(env.originalCwd)
   fs.rmSync(env.home, {recursive: true, force: true})
   fs.rmSync(env.runnerTemp, {recursive: true, force: true})
+}
+
+/**
+ * Copy the agent's own logs out of the isolated home before cleanup destroys them.
+ *
+ * Without this, a run that fails to complete reports only an exit code and a timeout
+ * message, so there is no way to tell a slow model from one that never issued a request.
+ * That is precisely the run where evidence matters most.
+ *
+ * Copies only the log directory. The isolated `auth.json` sits beside it and must never be
+ * captured into a diagnostics artifact.
+ */
+function captureDiagnostics(env: IsolatedEvalEnv, scenarioId: string): string | null {
+  const sourceLogDir = path.join(env.home, '.local', 'share', 'opencode', 'log')
+  if (fs.existsSync(sourceLogDir) === false) {
+    return null
+  }
+
+  try {
+    const targetDir = path.join(env.originalCwd, 'evals', 'output', 'diagnostics', scenarioId)
+    fs.rmSync(targetDir, {recursive: true, force: true})
+    fs.mkdirSync(targetDir, {recursive: true})
+    fs.cpSync(sourceLogDir, targetDir, {recursive: true})
+    return targetDir
+  } catch {
+    return null
+  }
 }
 
 function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: string, model: string): IsolatedEvalEnv {
@@ -142,6 +209,7 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
   const configDir = path.join(home, '.config', 'opencode')
   const dataDir = path.join(home, '.local', 'share')
   const cacheDir = path.join(home, '.cache')
+  const originalCwd = process.cwd()
   const originalEnv: Record<string, string | undefined> = {}
   const envKeys = [
     'HOME',
@@ -172,17 +240,16 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
   fs.mkdirSync(responseDir, {recursive: true})
   provisionProviderAuth(dataDir, model, originalEnv)
 
-  const bunBinary = resolveBunBinary()
   const opencodeBin = path.join(binDir, 'opencode')
-  fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${bunBinary}" x opencode-ai@${resolveOpenCodeVersion()} "$@"\n`, {
-    mode: 0o755,
-  })
+  fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${resolveHarnessBinary()}" "$@"\n`, {mode: 0o755})
+  const authPlugin = PROVIDER_AUTH_PLUGINS[parseModel(model).providerID]
   fs.writeFileSync(
     path.join(configDir, 'opencode.json'),
     JSON.stringify(
       {
         $schema: 'https://opencode.ai/config.json',
         model,
+        ...(authPlugin == null ? {} : {plugin: [authPlugin]}),
         permission: {
           bash: 'allow',
           edit: 'allow',
@@ -215,7 +282,15 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
   delete process.env.GH_TOKEN
   delete process.env.GITHUB_TOKEN
 
-  return {home, runnerTemp, responseDir, responseFilePath, opencodeBin, originalEnv}
+  // The OpenCode server bootstraps in the process working directory, not in the session
+  // directory it is later handed. In CI those coincide because the process already runs in
+  // GITHUB_WORKSPACE, but under a test runner they diverge: the server would index this
+  // repository instead of the fixture, the fixture's files would be missing from the tree the
+  // agent can see, and a diligent model burns its whole budget searching the filesystem for
+  // them. Enter the fixture repository so the agent sees exactly the scenario under test.
+  process.chdir(repoPath)
+
+  return {home, runnerTemp, responseDir, responseFilePath, opencodeBin, originalEnv, originalCwd}
 }
 
 /**
@@ -511,6 +586,7 @@ export async function runScenario(scenario: Scenario, logger: Logger): Promise<E
     }
     const promptResult = buildAgentPrompt({...promptOptions, sessionId: agentResult.sessionId ?? undefined}, logger)
     const evaluation = evaluateRun(completeArtifacts)
+    const diagnosticsPath = agentResult.success ? null : captureDiagnostics(isolatedEnv, scenario.id)
 
     return {
       scenarioId: scenario.id,
@@ -529,6 +605,7 @@ export async function runScenario(scenario: Scenario, logger: Logger): Promise<E
         exitCode: agentResult.exitCode,
         durationMs: agentResult.duration,
         timeoutMs,
+        diagnosticsPath,
       },
       gates: evaluation.gates,
       agentResult: {

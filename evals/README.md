@@ -20,7 +20,7 @@ Each scenario report has one of three states:
 
 The safety gates `no-forbidden-mutation` and `no-secret-leak` still run on an inconclusive execution because repository mutation and secret leakage remain observable safety findings even without a completed review outcome. The corpus logs inconclusive scenarios and writes their reason, exit code, execution duration, and configured timeout to the JSON report. If every scenario is inconclusive, the corpus fails because the run produced no information at all.
 
-This distinction exists because real runs measured substantial infrastructure variance on the free shared endpoint: with `opencode/big-pickle`, `clean-pr` took about 73 seconds and then timed out at 300 seconds in separate runs, while `planted-defect` timed out at 120 seconds and passed in about 41 seconds. A future contributor collapsing these states back into a boolean `passed` is the main way this corpus degrades into a noisy artifact nobody trusts.
+This distinction earned its place during development. An early misconfiguration left the agent running outside the fixture repository, so scenarios burned their entire budget searching the filesystem and timed out. With a boolean `passed`, every one of those runs would have read as a catastrophic agent regression; as `inconclusive`, they correctly reported that no outcome was obtainable and sent the investigation at the harness instead of the model. A future contributor collapsing these states back into a boolean is the main way this corpus degrades into a noisy artifact nobody trusts.
 
 ## Run it
 
@@ -36,22 +36,39 @@ Run the two live scenarios explicitly:
 FRO_BOT_EVAL=1 bunx vitest run evals/corpus.test.ts
 ```
 
-The default model is the free, credentialless `opencode/big-pickle`. Pin a different model with `FRO_BOT_EVAL_MODEL=provider/model`. Override the report location with `FRO_BOT_EVAL_OUTPUT=/path/to/report.json`; otherwise the report is written to the gitignored `evals/output/eval-report.json`. `FRO_BOT_EVAL_OPENCODE_VERSION` overrides the OpenCode version, which otherwise tracks the version this harness ships — an eval running a different version than production measures the wrong system, and an older build's model catalog will not resolve a current model name.
+### Environment variables
 
-### Real-model runs are unverified
+| Variable | Effect |
+| --- | --- |
+| `FRO_BOT_EVAL=1` | Required. Without it the corpus is skipped entirely. |
+| `FRO_BOT_EVAL_MODEL` | `provider/model` to run. Defaults to the free, credentialless `opencode/big-pickle`. |
+| `FRO_BOT_EVAL_HARNESS_BIN` | Path to the harness platform binary. Auto-discovered from `harness` on `PATH`; set explicitly when a workspace shim shadows the real install. |
+| `FRO_BOT_EVAL_TIMEOUT_MS` | Per-scenario execution budget. Defaults to 300000. |
+| `FRO_BOT_EVAL_OUTPUT` | Report path. Defaults to the gitignored `evals/output/eval-report.json`. |
 
-Running against a real model is implemented but **has not been demonstrated working**. Locally, `anthropic/claude-sonnet-5` and `anthropic/claude-opus-4-8` both fail in about five seconds with `Session error: name=UnknownError`, while the credential-free default model runs normally. The token was unexpired and both model identifiers are present in the OpenCode catalog, so the cause is the credential shape: the local entry is a Claude subscription OAuth record (`type: oauth`, with `access`/`refresh`/`expires`), whereas CI supplies an API-key-shaped `auth-json`. The provisioning step copies exactly one provider entry into the isolated home rather than the whole host auth file, which typically holds credentials for several unrelated providers this run has no business reaching.
+The corpus runs the patched **harness** build, never stock `opencode-ai` from npm. The harness carries this project's upstream patch set, so an eval driven by the stock package measures a different system than the one that ships.
 
-Until a real-model run is shown end to end, treat the corpus as proven only for the credential-free model. Do not assume a green real-model result is achievable by setting the variable alone.
+### Real-model runs
 
-The runner creates a temporary Git repository, isolates `HOME`/`XDG_*`, removes `GH_TOKEN` and `GITHUB_TOKEN`, and gives OpenCode no GitHub credential. It also loads no user plugins in the isolated environment. The fixture repository and temporary response files are cleaned up after each scenario.
+Both scenarios have been demonstrated end to end against `anthropic/claude-sonnet-5`, completing in roughly 78 and 88 seconds. Providers whose stored credential is an OAuth record rather than an API key also need their auth plugin loaded; see `PROVIDER_AUTH_PLUGINS` in `runner.ts`. Copying `auth.json` alone is not enough, and the resulting failure looks like an opaque provider error rather than a missing exchange step.
+
+Provisioning copies exactly one provider entry into the isolated home, never the whole host auth file, which typically holds credentials for several unrelated providers this run has no business reaching.
+
+### Isolation
+
+The runner creates a temporary Git repository, isolates `HOME`/`XDG_*`, **enters the fixture repository**, removes `GH_TOKEN` and `GITHUB_TOKEN`, and gives OpenCode no GitHub credential. It loads no user plugins beyond a required provider auth plugin. The fixture repository and temporary response files are cleaned up after each scenario.
+
+The working-directory change is load-bearing. The OpenCode server bootstraps in the process working directory rather than the session directory it is handed. In CI those coincide because the process already runs in `GITHUB_WORKSPACE`, but under a test runner they diverge: the server indexes the wrong tree, the fixture's files are missing from what the agent can see, and a diligent model spends its entire budget searching the filesystem for them.
+
+When a scenario does not complete, the agent's logs are copied to `evals/output/diagnostics/<scenario>/` before cleanup destroys the isolated home. Without that capture a failed run reports only an exit code, leaving no way to tell a slow model from one that never issued a request.
 
 ## Add a scenario
 
 1. Add one scenario file under `evals/scenarios/` with a unique id.
 2. Use `createPullRequestOpenedEvent` for the event fixture and provide a small file map, changed-file summary, prompt, expected verdict, and optional planted-defect file path.
-3. Add the scenario to `SCENARIOS` in `corpus.test.ts`.
-4. Add only outcome gates that represent a real observable contract. Never add a method assertion to make a scenario easier to score.
-5. Run the pure gate/helper tests and the gated corpus before changing the frozen baseline.
+3. Keep the planted credential out of the reviewed diff. A secret inside the change under review makes quoting it correct reviewer behaviour, which turns the leak gate into a test of the wrong thing — and stops the scenario being clean, since committing a hardcoded token is itself a real finding.
+4. Add the scenario to `SCENARIOS` in `corpus.test.ts`.
+5. Add only outcome gates that represent a real observable contract. Never add a method assertion to make a scenario easier to score.
+6. Run the pure gate/helper tests and the gated corpus before changing the frozen baseline.
 
 Keep the corpus small. Add a scenario only when a specific agent-facing change needs coverage that the existing scenarios cannot provide.

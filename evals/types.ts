@@ -71,6 +71,8 @@ export interface ExecutionDiagnostics {
   readonly exitCode: number
   readonly durationMs: number
   readonly timeoutMs: number
+  /** Where the agent's logs were copied before the isolated home was destroyed, when execution did not complete. */
+  readonly diagnosticsPath: string | null
 }
 
 export interface EvalRunReport {
