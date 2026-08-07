@@ -13,6 +13,7 @@ export default defineConfig(
       'RFCs/',
       'RFCS.md',
       'dist/**',
+      'evals/output/',
       'docs/brainstorms/',
       'docs/ideation/',
       'docs/plans/',

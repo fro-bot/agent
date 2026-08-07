@@ -1,14 +1,18 @@
 import type {EvalRunReport} from './types.js'
-import {mkdirSync, writeFileSync} from 'node:fs'
+import {execFileSync} from 'node:child_process'
+import * as crypto from 'node:crypto'
+import {mkdirSync, renameSync, rmSync, writeFileSync} from 'node:fs'
 import * as path from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {createLogger} from '../src/shared/logger.js'
+import {evaluateCorpusVerdict} from './corpus-verdict.js'
 import {resolveEvalTimeoutMs, runScenario} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
 import {plantedDefectScenario} from './scenarios/planted-defect.js'
 
 const EVAL_ENABLED = process.env.FRO_BOT_EVAL === '1'
 const SCENARIOS = [cleanPrScenario, plantedDefectScenario] as const
+const REPORT_COMPLETION_MARKER = 'fro-bot-eval-report-complete-v1'
 
 /**
  * Scenarios run sequentially, so the suite ceiling must cover every scenario's own
@@ -19,11 +23,42 @@ const SCENARIOS = [cleanPrScenario, plantedDefectScenario] as const
 const STARTUP_TEARDOWN_ALLOWANCE_MS = 60_000
 const SUITE_TIMEOUT_MS = SCENARIOS.length * (resolveEvalTimeoutMs() + STARTUP_TEARDOWN_ALLOWANCE_MS)
 
-describe.skipIf(!EVAL_ENABLED)('agent outcome eval corpus', {timeout: SUITE_TIMEOUT_MS}, () => {
+function readCorpusHeadSha(): string {
+  return execFileSync('git', ['rev-parse', 'HEAD'], {cwd: process.cwd(), encoding: 'utf8'}).trim()
+}
+
+function warnIfOtherTestsMayRun(logger: ReturnType<typeof createLogger>): void {
+  const testFileArguments = process.argv.slice(2).filter(argument => argument.includes('.test.'))
+  const otherTestArguments = testFileArguments.filter(argument => path.basename(argument) !== 'corpus.test.ts')
+
+  if (otherTestArguments.length > 0 || testFileArguments.length === 0) {
+    logger.warning(
+      'FRO_BOT_EVAL changes process.cwd globally for the duration of each scenario; run corpus.test.ts alone to avoid affecting other tests',
+      {otherTestArguments},
+    )
+  }
+}
+
+function writeReportAtomically(outputPath: string, report: unknown, runId: string): void {
+  const temporaryPath = `${outputPath}.${runId}.tmp`
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(report, null, 2), 'utf8')
+    renameSync(temporaryPath, outputPath)
+  } finally {
+    rmSync(temporaryPath, {force: true})
+  }
+}
+
+describe.skipIf(EVAL_ENABLED === false)('agent outcome eval corpus', {timeout: SUITE_TIMEOUT_MS}, () => {
   it('runs exactly the two frozen U1 scenarios and writes their reports', async () => {
     // #given the two intentionally small frozen scenarios
     const logger = createLogger({component: 'eval-corpus'})
     const reports: EvalRunReport[] = []
+    const runId = crypto.randomUUID()
+    const startedAt = new Date().toISOString()
+    const corpusHeadSha = readCorpusHeadSha()
+
+    warnIfOtherTestsMayRun(logger)
 
     const outputOverride = process.env.FRO_BOT_EVAL_OUTPUT
     const outputPath =
@@ -32,17 +67,33 @@ describe.skipIf(!EVAL_ENABLED)('agent outcome eval corpus', {timeout: SUITE_TIME
         : path.join(process.cwd(), 'evals', 'output', 'eval-report.json')
     mkdirSync(path.dirname(outputPath), {recursive: true})
 
-    // Persist after every scenario rather than once at the end. Real-model runs take long
-    // enough to be killed by an outer time limit, and a single trailing write loses every
-    // completed scenario when that happens.
-    const persist = (): void => {
-      writeFileSync(outputPath, JSON.stringify({generatedAt: new Date().toISOString(), reports}, null, 2), 'utf8')
+    const persist = (completed: boolean): void => {
+      const suiteVerdict = completed === true ? evaluateCorpusVerdict(reports.map(report => report.state)) : null
+      writeReportAtomically(
+        outputPath,
+        {
+          runId,
+          corpusHeadSha,
+          scenarioIds: SCENARIOS.map(scenario => scenario.id),
+          startedAt,
+          updatedAt: new Date().toISOString(),
+          completed,
+          completionMarker: completed ? REPORT_COMPLETION_MARKER : null,
+          suiteVerdict,
+          reports,
+        },
+        runId,
+      )
     }
+
+    // Mark this run as current before any provider or harness work begins, replacing any
+    // complete report left by an older run with an unmistakably incomplete report.
+    persist(false)
 
     // #when each scenario is evaluated through executeOpenCode
     for (const scenario of SCENARIOS) {
       reports.push(await runScenario(scenario, logger))
-      persist()
+      persist(false)
     }
 
     const inconclusiveReports = reports.filter(report => report.state === 'inconclusive')
@@ -57,12 +108,11 @@ describe.skipIf(!EVAL_ENABLED)('agent outcome eval corpus', {timeout: SUITE_TIME
       })
     }
 
-    const failedReports = reports.filter(report => report.state === 'failed')
-    const allInconclusive = reports.every(report => report.state === 'inconclusive')
+    const suiteVerdict = evaluateCorpusVerdict(reports.map(report => report.state))
+    persist(true)
 
-    // #then completed regressions fail, while inconclusive runs remain visible but unscored
+    // #then completed regressions fail, while partial infrastructure loss remains visible
     expect(reports).toHaveLength(2)
-    expect(failedReports).toHaveLength(0)
-    expect(allInconclusive).toBe(false)
+    expect(suiteVerdict.status).toBe('passed')
   })
 })

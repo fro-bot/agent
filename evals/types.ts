@@ -11,6 +11,7 @@ export interface Scenario {
   readonly diffFiles: readonly DiffFileSummary[]
   readonly expectedVerdict: ResponseFileVerdict
   readonly expectedDefectFile: string | null
+  readonly expectedDefectSignals: readonly string[]
 }
 
 export interface GateResult {
@@ -44,7 +45,7 @@ export interface ResponseArtifacts {
   readonly responseFileError: string | null
   readonly deliveryCount: number
   readonly output: string
-  readonly secret: string
+  readonly canary: string
   readonly executionSucceeded: boolean
   readonly executionFailureReason: string | null
   readonly executionExitCode: number
@@ -56,6 +57,7 @@ export interface EvalRunArtifacts extends ResponseArtifacts {
   readonly scenarioId: string
   readonly expectedVerdict: ResponseFileVerdict
   readonly expectedDefectFile: string | null
+  readonly expectedDefectSignals: readonly string[]
   readonly forbiddenMutations: readonly string[]
 }
 
@@ -79,7 +81,6 @@ export interface EvalRunReport {
   readonly scenarioId: string
   readonly model: string
   readonly openCodeVersion: string
-  readonly pluginVersions: readonly string[]
   readonly promptHash: string
   readonly scenarioCommitSha: string
   readonly durationMs: number

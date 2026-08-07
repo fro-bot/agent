@@ -145,7 +145,7 @@ interface IsolatedEvalEnv {
   readonly originalCwd: string
 }
 
-const EVAL_SECRET_PLACEHOLDER = 'FRO_BOT_EVAL_SECRET_PLACEHOLDER'
+export const EVAL_CANARY_PLACEHOLDER = 'EVAL_CANARY_PLACEHOLDER'
 
 function restoreEnv(originalEnv: Record<string, string | undefined>): void {
   for (const [key, value] of Object.entries(originalEnv)) {
@@ -158,12 +158,18 @@ function restoreEnv(originalEnv: Record<string, string | undefined>): void {
 }
 
 function cleanupIsolatedEvalEnv(env: IsolatedEvalEnv): void {
-  restoreEnv(env.originalEnv)
-  // Restore the working directory before removing anything: the process may still be inside
-  // a directory that is about to be deleted.
-  process.chdir(env.originalCwd)
-  fs.rmSync(env.home, {recursive: true, force: true})
-  fs.rmSync(env.runnerTemp, {recursive: true, force: true})
+  try {
+    restoreEnv(env.originalEnv)
+  } finally {
+    try {
+      // Restore the working directory before removing anything: the process may still be inside
+      // a directory that is about to be deleted.
+      process.chdir(env.originalCwd)
+    } finally {
+      fs.rmSync(env.home, {recursive: true, force: true})
+      fs.rmSync(env.runnerTemp, {recursive: true, force: true})
+    }
+  }
 }
 
 /**
@@ -235,62 +241,80 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     originalEnv[key] = process.env[key]
   }
 
-  fs.mkdirSync(binDir, {recursive: true})
-  fs.mkdirSync(configDir, {recursive: true})
-  fs.mkdirSync(responseDir, {recursive: true})
-  provisionProviderAuth(dataDir, model, originalEnv)
+  try {
+    fs.mkdirSync(binDir, {recursive: true})
+    fs.mkdirSync(configDir, {recursive: true})
+    fs.mkdirSync(responseDir, {recursive: true})
+    provisionProviderAuth(dataDir, model, originalEnv)
 
-  const opencodeBin = path.join(binDir, 'opencode')
-  fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${resolveHarnessBinary()}" "$@"\n`, {mode: 0o755})
-  const authPlugin = PROVIDER_AUTH_PLUGINS[parseModel(model).providerID]
-  fs.writeFileSync(
-    path.join(configDir, 'opencode.json'),
-    JSON.stringify(
-      {
-        $schema: 'https://opencode.ai/config.json',
-        model,
-        ...(authPlugin == null ? {} : {plugin: [authPlugin]}),
-        permission: {
-          bash: 'allow',
-          edit: 'allow',
-          read: 'allow',
-          webfetch: 'deny',
-          external_directory: {[`${responseDir}/**`]: 'allow'},
+    const opencodeBin = path.join(binDir, 'opencode')
+    fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${resolveHarnessBinary()}" "$@"\n`, {mode: 0o755})
+    const authPlugin = PROVIDER_AUTH_PLUGINS[parseModel(model).providerID]
+    fs.writeFileSync(
+      path.join(configDir, 'opencode.json'),
+      JSON.stringify(
+        {
+          $schema: 'https://opencode.ai/config.json',
+          model,
+          ...(authPlugin == null ? {} : {plugin: [authPlugin]}),
+          permission: {
+            bash: 'allow',
+            edit: 'allow',
+            read: 'allow',
+            webfetch: 'deny',
+            external_directory: {[`${responseDir}/**`]: 'allow'},
+          },
         },
-      },
-      null,
-      2,
-    ),
-    'utf8',
-  )
+        null,
+        2,
+      ),
+      'utf8',
+    )
 
-  process.env.HOME = home
-  process.env.PATH = `${binDir}:${originalEnv.PATH ?? ''}`
-  process.env.XDG_CONFIG_HOME = path.join(home, '.config')
-  process.env.XDG_DATA_HOME = dataDir
-  process.env.XDG_CACHE_HOME = cacheDir
-  process.env.GITHUB_WORKSPACE = repoPath
-  process.env.GITHUB_REPOSITORY = `fro-bot-eval/${scenario.id}`
-  process.env.GITHUB_REF = 'refs/heads/main'
-  process.env.GITHUB_SHA = headSha
-  process.env.GITHUB_EVENT_NAME = 'pull_request'
-  process.env.GITHUB_RUN_ID = runId
-  process.env.GITHUB_RUN_ATTEMPT = runAttempt
-  process.env.GITHUB_ACTOR = 'fro-bot-eval'
-  process.env.RUNNER_TEMP = runnerTemp
-  process.env.CI = '1'
-  delete process.env.GH_TOKEN
-  delete process.env.GITHUB_TOKEN
+    process.env.HOME = home
+    process.env.PATH = `${binDir}:${originalEnv.PATH ?? ''}`
+    process.env.XDG_CONFIG_HOME = path.join(home, '.config')
+    process.env.XDG_DATA_HOME = dataDir
+    process.env.XDG_CACHE_HOME = cacheDir
+    process.env.GITHUB_WORKSPACE = repoPath
+    process.env.GITHUB_REPOSITORY = `fro-bot-eval/${scenario.id}`
+    process.env.GITHUB_REF = 'refs/heads/main'
+    process.env.GITHUB_SHA = headSha
+    process.env.GITHUB_EVENT_NAME = 'pull_request'
+    process.env.GITHUB_RUN_ID = runId
+    process.env.GITHUB_RUN_ATTEMPT = runAttempt
+    process.env.GITHUB_ACTOR = 'fro-bot-eval'
+    process.env.RUNNER_TEMP = runnerTemp
+    process.env.CI = '1'
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
 
-  // The OpenCode server bootstraps in the process working directory, not in the session
-  // directory it is later handed. In CI those coincide because the process already runs in
-  // GITHUB_WORKSPACE, but under a test runner they diverge: the server would index this
-  // repository instead of the fixture, the fixture's files would be missing from the tree the
-  // agent can see, and a diligent model burns its whole budget searching the filesystem for
-  // them. Enter the fixture repository so the agent sees exactly the scenario under test.
-  process.chdir(repoPath)
+    // The OpenCode server bootstraps in the process working directory, not in the session
+    // directory it is later handed. In CI those coincide because the process already runs in
+    // GITHUB_WORKSPACE, but under a test runner they diverge: the server would index this
+    // repository instead of the fixture, the fixture's files would be missing from the tree the
+    // agent can see, and a diligent model burns its whole budget searching the filesystem for
+    // them. Enter the fixture repository so the agent sees exactly the scenario under test.
+    process.chdir(repoPath)
 
-  return {home, runnerTemp, responseDir, responseFilePath, opencodeBin, originalEnv, originalCwd}
+    return {home, runnerTemp, responseDir, responseFilePath, opencodeBin, originalEnv, originalCwd}
+  } catch (error) {
+    const partialEnv: IsolatedEvalEnv = {
+      home,
+      runnerTemp,
+      responseDir,
+      responseFilePath,
+      opencodeBin: path.join(binDir, 'opencode'),
+      originalEnv,
+      originalCwd,
+    }
+    try {
+      cleanupIsolatedEvalEnv(partialEnv)
+    } catch {
+      // Preserve the setup error; cleanup is best-effort on the failure path.
+    }
+    throw error
+  }
 }
 
 /**
@@ -452,8 +476,8 @@ export function detectForbiddenMutations(repoPath: string, expectedHeadSha: stri
   return mutations.sort()
 }
 
-function createEvalSecret(): string {
-  return `ghp_${crypto.randomBytes(24).toString('hex')}`
+function createEvalCanary(): string {
+  return `eval-canary-${crypto.randomUUID()}`
 }
 
 function createExecutionFailure(error: unknown): AgentResult {
@@ -485,19 +509,19 @@ function getExecutionFailureReason(agentResult: AgentResult): string | null {
   return `OpenCode exited with code ${agentResult.exitCode}`
 }
 
-function createFixtureFiles(scenario: Scenario, secret: string): Readonly<Record<string, string>> {
+export function createFixtureFiles(scenario: Scenario, canary: string): Readonly<Record<string, string>> {
   const files: Record<string, string> = {}
-  let secretPlanted = false
+  let canaryPlanted = false
 
   for (const [filePath, content] of Object.entries(scenario.files)) {
-    if (content.includes(EVAL_SECRET_PLACEHOLDER)) {
-      secretPlanted = true
+    if (content.includes(EVAL_CANARY_PLACEHOLDER)) {
+      canaryPlanted = true
     }
-    files[filePath] = content.replaceAll(EVAL_SECRET_PLACEHOLDER, secret)
+    files[filePath] = content.replaceAll(EVAL_CANARY_PLACEHOLDER, canary)
   }
 
-  if (secretPlanted === false) {
-    throw new Error(`Scenario ${scenario.id} does not contain the eval secret placeholder`)
+  if (canaryPlanted === false) {
+    throw new Error(`Scenario ${scenario.id} does not contain the eval canary placeholder`)
   }
 
   return files
@@ -506,7 +530,7 @@ function createFixtureFiles(scenario: Scenario, secret: string): Readonly<Record
 function collectResponseArtifacts(
   env: IsolatedEvalEnv,
   agentResult: AgentResult,
-  secret: string,
+  canary: string,
   configuredTimeoutMs: number,
 ): ResponseArtifacts {
   const responseFiles = fs.existsSync(env.responseDir)
@@ -541,7 +565,7 @@ function collectResponseArtifacts(
     responseFileError,
     deliveryCount: responseFiles.length,
     output: [rawResponse ?? '', agentResult.error ?? ''].join('\n'),
-    secret,
+    canary,
     executionSucceeded: agentResult.success,
     executionFailureReason: getExecutionFailureReason(agentResult),
     executionExitCode: agentResult.exitCode,
@@ -554,45 +578,46 @@ export async function runScenario(scenario: Scenario, logger: Logger): Promise<E
   const startedAt = Date.now()
   const model = resolveModel()
   const modelConfig = parseModel(model)
-  const secret = createEvalSecret()
-  const fixtureRepo = createFixtureRepo(createFixtureFiles(scenario, secret))
-  const isolatedEnv = createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model)
-  const promptOptions = buildPromptOptions(scenario, fixtureRepo.headSha, isolatedEnv.responseFilePath)
-  const timeoutMs = resolveEvalTimeoutMs()
-  const executionConfig: ExecutionConfig = {
-    agent: 'build',
-    model: modelConfig,
-    timeoutMs,
-    omoProviders: NO_OMO_PROVIDERS,
-  }
-  let agentResult: AgentResult
-  let openCodeVersion = 'unknown'
+  const canary = createEvalCanary()
+  const fixtureRepo = createFixtureRepo(createFixtureFiles(scenario, canary))
+  let isolatedEnv: IsolatedEvalEnv | null = null
 
   try {
-    openCodeVersion = readOpenCodeVersion(isolatedEnv.opencodeBin)
+    const environment = createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model)
+    isolatedEnv = environment
+    const promptOptions = buildPromptOptions(scenario, fixtureRepo.headSha, environment.responseFilePath)
+    const timeoutMs = resolveEvalTimeoutMs()
+    const executionConfig: ExecutionConfig = {
+      agent: 'build',
+      model: modelConfig,
+      timeoutMs,
+      omoProviders: NO_OMO_PROVIDERS,
+    }
+    let agentResult: AgentResult
+    const openCodeVersion = readOpenCodeVersion(environment.opencodeBin)
     try {
       agentResult = await executeOpenCode(promptOptions, logger, executionConfig)
     } catch (error) {
       // Mutation detection and gates still run when the execution call itself throws.
       agentResult = createExecutionFailure(error)
     }
-    const artifacts = collectResponseArtifacts(isolatedEnv, agentResult, secret, timeoutMs)
+    const artifacts = collectResponseArtifacts(environment, agentResult, canary, timeoutMs)
     const completeArtifacts: EvalRunArtifacts = {
       ...artifacts,
       scenarioId: scenario.id,
       expectedVerdict: scenario.expectedVerdict,
       expectedDefectFile: scenario.expectedDefectFile,
+      expectedDefectSignals: scenario.expectedDefectSignals,
       forbiddenMutations: detectForbiddenMutations(fixtureRepo.path, fixtureRepo.headSha),
     }
     const promptResult = buildAgentPrompt({...promptOptions, sessionId: agentResult.sessionId ?? undefined}, logger)
     const evaluation = evaluateRun(completeArtifacts)
-    const diagnosticsPath = agentResult.success ? null : captureDiagnostics(isolatedEnv, scenario.id)
+    const diagnosticsPath = agentResult.success ? null : captureDiagnostics(environment, scenario.id)
 
     return {
       scenarioId: scenario.id,
       model,
       openCodeVersion,
-      pluginVersions: [],
       promptHash: hashPrompt(promptResult.text),
       scenarioCommitSha: fixtureRepo.headSha,
       durationMs: Date.now() - startedAt,
@@ -616,7 +641,12 @@ export async function runScenario(scenario: Scenario, logger: Logger): Promise<E
       },
     }
   } finally {
-    cleanupIsolatedEvalEnv(isolatedEnv)
-    cleanupFixtureRepo(fixtureRepo)
+    try {
+      if (isolatedEnv != null) {
+        cleanupIsolatedEvalEnv(isolatedEnv)
+      }
+    } finally {
+      cleanupFixtureRepo(fixtureRepo)
+    }
   }
 }

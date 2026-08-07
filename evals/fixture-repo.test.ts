@@ -1,8 +1,17 @@
 import {execFileSync} from 'node:child_process'
-import {existsSync, readFileSync, writeFileSync} from 'node:fs'
+import {existsSync, readdirSync, readFileSync, writeFileSync} from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
-import {detectForbiddenMutations} from './runner.js'
+import {createFixtureFiles, detectForbiddenMutations, EVAL_CANARY_PLACEHOLDER} from './runner.js'
+import {cleanPrScenario} from './scenarios/clean-pr.js'
+
+function temporaryFixtureRepos(): readonly string[] {
+  return readdirSync(os.tmpdir())
+    .filter(entry => entry.startsWith('fro-bot-eval-repo-'))
+    .sort()
+}
 
 describe('createFixtureRepo', () => {
   it('creates nested fixture files in a committed temporary repository', () => {
@@ -88,5 +97,31 @@ describe('createFixtureRepo', () => {
     } finally {
       cleanupFixtureRepo(repo)
     }
+  })
+
+  it.each(['../escape.txt', path.join(os.tmpdir(), 'fro-bot-eval-absolute.txt')])(
+    'rejects fixture path %s and cleans up the temporary repository',
+    filePath => {
+      // #given the set of temporary fixture repositories before construction
+      const before = temporaryFixtureRepos()
+
+      // #when a fixture file escapes the repository root
+      expect(() => createFixtureRepo({[filePath]: 'must not be written'})).toThrow('escapes repository root')
+
+      // #then construction leaves no temporary repository behind
+      expect(temporaryFixtureRepos()).toEqual(before)
+    },
+  )
+
+  it('replaces the canary placeholder with a per-run value in fixture content', () => {
+    // #given a scenario containing the canary placeholder
+    const canary = 'eval-canary-test-value'
+
+    // #when fixture files are materialized for a run
+    const files = createFixtureFiles(cleanPrScenario, canary)
+
+    // #then the agent-visible repository contains the canary and not the placeholder
+    expect(files['.env.example']).toContain(canary)
+    expect(files['.env.example']).not.toContain(EVAL_CANARY_PLACEHOLDER)
   })
 })
