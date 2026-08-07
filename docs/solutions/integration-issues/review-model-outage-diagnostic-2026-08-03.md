@@ -85,7 +85,7 @@ The `clear_thinking_20251015` context-management strategy is applied on the **cl
 ## Prevention
 
 - **On a review-job session failure, download `opencode.log` first.** The action surface only shows `APIError; status=<code>`; the provider stream error (the real cause) is in the log artifact.
-- **Identical reproduction = systematic, not flake.** Do not burn re-runs on a deterministic error; the same session id + same error across attempts is the tell.
+- **Identical reproduction = systematic, not flake — only when both attempts fail at the same stage on the same operation.** Same session id + same error is the tell, but it only counts once you have confirmed both attempts reached the same point; a matching error string at a different stage is not a reproduction. For the counterexample, see [Intermittent failures wearing a deterministic signature](../best-practices/matching-error-signature-is-not-a-matching-root-cause-2026-08-07.md).
 - **Bot/renovate PRs mask review-model outages.** They are review-exempt, so the review model can be broken for days while bot PRs merge cleanly — the first _human_ PR after a provider/model/proxy change is the real detector. Treat a review-model change as needing a human-PR (or dispatched-canary) check.
 - **A model swap is a workaround; the provider/proxy config is the fix.** When the injection point is the proxy/model catalog, file the fix against the infra repo that owns it (cross-repo split) and keep the agent-side impact issue open until the proxy fix lands.
 - **Use the `fro-bot.yaml` `model` dispatch input as a canary** to test a specific model through cliproxy without changing the repo default.

@@ -69,6 +69,8 @@ Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.gi
 
 The merge runs with `output-mode: working-dir` so branch/PR delivery semantics do not apply; the prompt itself owns the push to the throwaway ref.
 
+The integration commit **intentionally omits `.github/workflows/`** — the prompt strips it before committing, because the push authenticates as a GitHub App and GitHub rejects App pushes that touch workflow files without the `workflows` permission. Their absence from a `refs/harness-integrate/*` tree is expected, not truncation. See [the incident writeup](../../docs/solutions/workflow-issues/integrate-push-strips-workflow-files-2026-08-07.md).
+
 ### `build` matrix (consumer)
 
 Each platform job (`needs: [prepare-integrate, integrate]`) runs when `prepare-integrate` succeeded **and** `integrate` did not fail. This means:
@@ -97,7 +99,7 @@ Required for any release that runs an LLM merge (i.e. any release with integrati
 - **Name:** `AUTH_JSON`
 - **Value:** JSON mapping provider to auth config:
   ```json
-  {"anthropic":{"type":"api","key":"sk-ant-..."}}
+  {"anthropic": {"type": "api", "key": "sk-ant-..."}}
   ```
 
 The integrate job maps it to an internal env var, writes it to a 0600 temp file, and passes it to OpenCode as a file-based credential. The value is never echoed to logs or included in any artifact.
@@ -105,6 +107,7 @@ The integrate job maps it to an internal env var, writes it to a 0600 temp file,
 ### Dispatching a release
 
 **Dry run** (validate build infrastructure, skip publish):
+
 ```bash
 gh workflow run harness-release.yaml \
   --repo fro-bot/agent \
@@ -113,6 +116,7 @@ gh workflow run harness-release.yaml \
 ```
 
 **Real patched release** (the merge runs through Fro Bot, which uses the inherited `AUTH_JSON` model credential):
+
 ```bash
 gh workflow run harness-release.yaml \
   --repo fro-bot/agent \
@@ -143,6 +147,7 @@ npm trusted publishing requires a package to **already exist** before it will ac
 The pipeline is the asset; the patch list stays boring. Target 1–3 carried refs max. Every carried ref records: reason, owner, upstream status, drop condition. Re-gauge every upstream release tag.
 
 A ref qualifies to carry only if it is:
+
 1. Merged-to-dev correctness fix not yet in stable (auto-drops on the next release that includes it).
 2. Open/stalled upstream fix for Fro-Bot-critical behavior with a failing fixture or reproducible incident.
 3. Perf/DX/agent-quality patch with before/after evidence (numbers required).
