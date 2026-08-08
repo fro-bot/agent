@@ -257,7 +257,13 @@ export function mergeArtifactResults(
 export const MAX_LLM_RETRIES = 4
 export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
 
-function shouldRetryFromOutcome(outcome: AttemptOutcome): boolean {
+/**
+ * Single source of truth for the outcome-to-retry mapping. Lives here rather
+ * than beside the `AttemptOutcome` type because the runtime dependency runs
+ * prompt-sender to retry; exporting it the other way would close that into a
+ * cycle.
+ */
+export function shouldRetryFromOutcome(outcome: AttemptOutcome): boolean {
   return outcome === 'turn_failed_retryable'
 }
 

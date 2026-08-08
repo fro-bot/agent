@@ -247,6 +247,9 @@ export async function executeOpenCode(
         break
 
       if (canContinueTurn) {
+        // Defensive: a retryable turn failure always carries the error that made it
+        // retryable, so this is unreachable today. Without an error there is nothing
+        // to describe, and a continuation must never fall back to the original prompt.
         if (result.llmError == null) break
         nextPrompt = {kind: 'continuation', error: result.llmError}
       } else {

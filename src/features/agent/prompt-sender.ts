@@ -4,14 +4,10 @@ import type {EventStreamResult} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
-import {runPromptAttempt, type ExecutionDeadline, type PromptStartResult} from './retry.js'
+import {runPromptAttempt, shouldRetryFromOutcome, type ExecutionDeadline, type PromptStartResult} from './retry.js'
 
 export type AttemptOutcome =
   'submit_failed' | 'turn_failed_retryable' | 'turn_failed_terminal' | 'timeout' | 'completed'
-
-function shouldRetryFromOutcome(outcome: AttemptOutcome): boolean {
-  return outcome === 'turn_failed_retryable'
-}
 
 export function buildContinuationPrompt(error: ErrorInfo, credentialProvisioned: boolean): string {
   const sideEffectGuidance =
