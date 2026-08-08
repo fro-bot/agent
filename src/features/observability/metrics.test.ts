@@ -234,6 +234,17 @@ describe('createMetricsCollector', () => {
     expect(secondError.recoverable).toBe(false)
   })
 
+  it('records the classification path with an error', () => {
+    // #given a classification path from the agent error classifier
+    const collector = createMetricsCollector()
+
+    // #when recording the error
+    collector.recordError('APIError', 'Provider unavailable', true, 'structured')
+
+    // #then the path is retained in the local metric
+    expect(collector.getMetrics().errors[0]).toHaveProperty('classificationPath', 'structured')
+  })
+
   it('returns frozen metrics snapshot', () => {
     // #given
     const collector = createMetricsCollector()

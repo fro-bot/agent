@@ -3553,6 +3553,166 @@ describe('processEventStream', () => {
     expect(activityTracker.sessionError).toBe('Rate limit exceeded')
   })
 
+  it('records the structured classification path for a provider error without using prose fallback', async () => {
+    // #given a structured provider authentication error with no prose signal
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'ProviderAuthError', data: {providerID: 'provider', message: 'credentials rejected'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when the session error is processed
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the structured classifier wins and records its path
+    expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(result).toHaveProperty('classificationPath', 'structured')
+  })
+
+  it('uses the provider isRetryable signal for an otherwise generic APIError', async () => {
+    // #given an APIError with no prose match, no 429 status, and a structured retry signal
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {
+            name: 'APIError',
+            data: {statusCode: 503, code: 'provider_unavailable', isRetryable: true},
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when the session error is processed
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the provider's retry signal makes it retryable without claiming a network cause
+    expect(result.llmError?.type).toBe('api_error')
+    expect(result.llmError?.retryable).toBe(true)
+    expect(result.llmError?.suggestedAction).not.toContain('network')
+    expect(result).toHaveProperty('classificationPath', 'structured')
+  })
+
+  it('records the name/code classification path for stable fields without a recognized terminal name', async () => {
+    // #given an unrecognized provider name with stable status and code fields
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {
+          sessionID: 'ses_123',
+          error: {name: 'ProviderSpecificError', data: {statusCode: 503, code: 'provider_unavailable'}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when the session error is processed
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the stable structured fields are recorded as the name/code tier
+    expect(result.llmError?.type).toBe('configuration')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(result).toHaveProperty('classificationPath', 'name')
+  })
+
+  it('records unclassified when neither structured fields nor prose patterns match', async () => {
+    // #given an empty provider error payload
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: {}},
+      } as unknown as Event,
+    ])
+
+    // #when the session error is processed
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then it remains the existing terminal generic error, but is not mislabeled as a matched tier
+    expect(result.llmError?.type).toBe('configuration')
+    expect(result.llmError?.retryable).toBe(false)
+    expect(result).toHaveProperty('classificationPath', 'unclassified')
+  })
+
+  it('records fallback for a transport failure without an SDK session error payload', async () => {
+    // #given prompt submission fails with a transport error before an SDK payload exists
+    const {sendPromptToSession} = await import('./prompt-sender.js')
+    const client = {
+      event: {
+        subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
+      },
+      session: {
+        promptAsync: vi.fn().mockResolvedValue({error: 'fetch failed: connection reset'}),
+      },
+    }
+
+    // #when the prompt is submitted
+    const result = await sendPromptToSession(
+      client as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      'prompt',
+      undefined,
+      '/workspace',
+      undefined,
+      createMockLogger(),
+    )
+
+    // #then the bounded prose fallback remains retryable and records its path
+    expect(result.llmError?.type).toBe('llm_fetch_error')
+    expect(result.llmError?.retryable).toBe(true)
+    expect(result.eventStreamResult).toHaveProperty('classificationPath', 'fallback')
+  })
+
+  it.each([
+    ['provider auth', {name: 'ProviderAuthError', data: {isRetryable: true}}, 'provider_auth_error'],
+    ['quota', {name: 'APIError', data: {statusCode: 402, isRetryable: true}}, 'quota_exceeded'],
+  ])('keeps %s terminal even when the provider marks the error retryable', async (_label, error, expectedType) => {
+    // #given a terminal provider error carrying isRetryable=true
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error},
+      } as unknown as Event,
+    ])
+
+    // #when the session error is processed
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the terminal classifier remains authoritative
+    expect(result.llmError?.type).toBe(expectedType)
+    expect(result.llmError?.retryable).toBe(false)
+    expect(result).toHaveProperty('classificationPath', 'structured')
+  })
+
   it('preserves bounded allowlisted diagnostics from an object session.error through poll grace', async () => {
     // #given — the provider error includes useful fields alongside nested and arbitrary secret data
     const activityTracker = {
@@ -3874,6 +4034,7 @@ describe('processEventStream', () => {
     expect(activityTracker.sessionError).not.toContain('https://opencode.ai')
     expect(activityTracker.sessionError).not.toContain('acme')
     expect(JSON.stringify(result)).not.toContain('https://opencode.ai')
+    expect(result).toHaveProperty('classificationPath', 'structured')
   })
 
   it.each([

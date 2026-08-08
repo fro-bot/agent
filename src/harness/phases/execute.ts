@@ -1,4 +1,4 @@
-import type {ErrorInfo, SessionSearchResult} from '@fro-bot/runtime'
+import type {ClassificationPath, ErrorInfo, SessionSearchResult} from '@fro-bot/runtime'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {Logger} from '../../shared/logger.js'
@@ -35,6 +35,7 @@ export interface ExecutePhaseResult {
   readonly commitsCreated: readonly string[]
   readonly commentsPosted: number
   readonly llmError: ErrorInfo | null
+  readonly classificationPath?: ClassificationPath
   readonly resolvedOutputMode: ResolvedOutputMode | null
   readonly overflowRecovery?: {
     readonly recovered: boolean
@@ -306,6 +307,14 @@ export async function runExecute(
   }
   if (result.tokenUsage != null) {
     metrics.setTokenUsage(result.tokenUsage, result.model, result.cost)
+  }
+  if (result.llmError != null) {
+    metrics.recordError(
+      result.llmError.type,
+      result.llmError.message,
+      result.llmError.retryable,
+      result.classificationPath,
+    )
   }
   for (const pr of result.prsCreated) {
     metrics.addPRCreated(pr)

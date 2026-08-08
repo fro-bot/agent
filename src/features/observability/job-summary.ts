@@ -86,7 +86,8 @@ export async function writeJobSummary(options: CommentSummaryOptions, logger: Lo
 
       for (const error of metrics.errors) {
         const status = error.recoverable ? '🔄 Recovered' : '❌ Failed'
-        core.summary.addRaw(`- **${error.type}** (${status}): ${error.message}\n`)
+        const classification = error.classificationPath == null ? '' : `, classification: ${error.classificationPath}`
+        core.summary.addRaw(`- **${error.type}** (${status}${classification}): ${error.message}\n`)
       }
     }
 

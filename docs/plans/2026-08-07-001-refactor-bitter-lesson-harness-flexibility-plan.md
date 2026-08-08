@@ -337,7 +337,7 @@ Two signals _are_ trustworthy, and the design rests only on these:
 - The continuation prompt carries the structured failure, not a generic string.
 - No branch consults `prsCreated`, `commitsCreated`, or `commentsPosted` to decide recovery.
 
-- [ ] **U4. Structured-first error classification**
+- [x] **U4. Structured-first error classification**
 
 **Goal:** Stop parsing provider prose to make control-flow decisions.
 
@@ -352,14 +352,29 @@ Two signals _are_ trustworthy, and the design rests only on these:
 - Modify: `src/features/comments/error-format.ts`
 - Test: `packages/runtime/src/agent/error-format/format.test.ts`
 
+**Investigation outcome (2026-08-08): two assumptions corrected, and the real conversion target is different.**
+
+The structured surface was estimated as roughly `type`, `reason`, `name`, `status`, `code`, `message`, `resetAt`. Verified against the vendored SDK types, `session.error` payloads expose only `name` plus a per-variant `data` object:
+
+- `ProviderAuthError` — `{name, data: {providerID, message}}`
+- `ContextOverflowError` — `{name, data: {message, responseBody?}}`
+- `ApiError` — `{name: 'APIError', data: {message, statusCode?, isRetryable, responseHeaders?, responseBody?, metadata?}}`
+
+There is no top-level `type`, `reason`, or `resetAt` on the SDK error. `reason` and `resetAt` exist only on the harness-normalized retry-status path, and `status` appears as `data.statusCode`. The classification tiers below are written against the real shape.
+
+The prediction that network failures and agent-not-found are not convertible held. Neither has a structured SDK marker, so both prose matchers stay. Their true reach is also narrower than it appears: at `streaming.ts` the generic branch runs `isLlmFetchError` over `normalizeSessionError`'s output, which is a synthesized `provider=…; name=…; status=…; code=…` summary that deliberately excludes raw message text — so that call is already matching structured fields, via regex over a formatted string. Genuine prose matching survives only at `execution.ts` and `prompt-sender.ts`, where the input is a Node/undici transport exception with no SDK payload at all.
+
+The conversion target the estimate missed is **`ApiError.data.isRetryable`** — a required boolean the SDK always populates, consumed nowhere in the harness. Today an `APIError` whose summary matches no pattern and is not a 429 falls through to `createAgentError(…)`, which is `retryable: false`. When such an error carries `isRetryable: true`, the provider has stated the request may succeed on retry and the harness classifies it terminal anyway. That is the concrete instance of deciding from inference while a structured signal sits unread.
+
 **Approach:**
 
-- Classification order: exact structured signal, then stable error `name`/`code`/`status`/`cause`, then narrowly bounded prose fallback, then generic unclassified failure.
-- Extend the pattern already established by `classifyContextOverflowError` and `classifyProviderAuthError`.
-- **Convert only what the SDK actually exposes.** The structured surface is bounded — roughly `type`, `reason`, `name`, `status`, `code`, `message`, `resetAt`. Provider-auth and quota shapes are convertible; general network failures and agent-not-found are not, because the SDK does not expose structured fields for them. This unit does not claim to promote most classification, only the cases with real structured signal.
+- Classification order: exact structured signal, then stable error `name`/`data.statusCode`/`data.code`, then narrowly bounded prose fallback, then generic unclassified failure.
+- Extend the pattern already established by `classifyContextOverflowError` and `classifyProviderAuthError`. Note that `classifyQuotaError` is already the hybrid shape this unit generalizes: structured-first on `statusCode === 402` and an allowlisted `code`, with a bounded message fallback behind them.
+- **Read `ApiError.data.isRetryable` in the generic branch.** It is authoritative for retryability where present, and it applies only after the terminal classifiers have declined, so it can never reach an auth or quota failure.
+- **Keep both prose matchers.** Neither has a structured replacement. Record that removal condition beside each one in code rather than in the plan, so it travels with the fallback.
 - **The removal gate is correctness, not coverage.** A high structured-coverage percentage can coexist with the remaining fallback cases being precisely the critical ones. Removing a fallback requires evidence that the specific error shapes it handles are covered structurally — not that the aggregate percentage looks good.
-- Emit a classification-path metric (`structured` / `name` / `fallback` / `unclassified`) into the job summary as a structured local metric, not external telemetry.
-- Keep the prose fallback until there is evidence the shapes it handles are covered structurally. Record its removal condition alongside the fallback itself, in code.
+- Emit a classification-path metric (`structured` / `name` / `fallback` / `unclassified`) into the job summary as a structured local metric, not external telemetry. This is net-new plumbing: the existing observability layer records error `type`, `message`, and `recoverable`, but nothing records how a classification was reached.
+- Keep the prose fallback until there is evidence the shapes it handles are covered structurally. The metric is what produces that evidence; until it has run against real traffic, no fallback removal is justified.
 - **Auth and quota failures fail closed.** Reclassification must never move a provider-auth or quota failure from terminal to retryable. Retrying a credential failure burns credentials and produces noise; absent an explicit credential-refresh path, these stay terminal regardless of what the structured signal suggests.
 
 **Patterns to follow:**
@@ -369,16 +384,18 @@ Two signals _are_ trustworthy, and the design rests only on these:
 **Test scenarios:**
 
 - Happy path: a structured provider error classifies without touching prose patterns, and the metric records `structured`.
-- Happy path: an error with a stable `code` but no structured payload classifies at the name/code tier.
+- Happy path: an `APIError` carrying `isRetryable: true` that matches no prose pattern classifies as retryable rather than falling through to a terminal configuration error, and the metric records `structured`.
+- Happy path: an error with a stable `data.statusCode` or `data.code` but no recognized `name` classifies at the name/code tier.
 - Edge case: an error with neither structured fields nor a matching prose pattern yields `unclassified` rather than a wrong terminal verdict.
-- Error path: a prose-only network failure still classifies as retryable via fallback, and the metric records `fallback`.
-- Error path: a false-positive-prone message does not classify as agent-not-found unless a structured signal supports it.
+- Error path: a transport failure with no SDK payload still classifies as retryable via fallback, and the metric records `fallback`.
+- Error path: `isRetryable` is never consulted for an auth or quota failure, because the terminal classifiers claim those first — asserted directly, not left to branch ordering.
 - Integration: the classification path appears in the job summary for a full run.
 
 **Verification:**
 
-- No classifier reachable from control flow depends on prose alone when a structured signal is available.
-- Retry and terminal decisions are unchanged for every currently-covered error shape.
+- No classifier reachable from control flow depends on prose when a structured signal for the same decision exists.
+- Retry and terminal decisions are unchanged for every currently-covered error shape, except an `APIError` with `isRetryable: true` that previously became a terminal configuration error.
+- `provider_auth_error` and `quota_exceeded` remain terminal under every input, including one carrying `isRetryable: true`.
 
 - [ ] **U5. Retarget prompt assertions and remove the redundant session ritual**
 
