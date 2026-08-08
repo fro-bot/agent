@@ -8,6 +8,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
 import {describe, expect, it} from 'vitest'
+import {RESPONSE_FILE_DIR_SEGMENT} from '../packages/runtime/src/agent/response-file.js'
 import {buildAgentPrompt} from '../src/features/agent/index.js'
 import {createIssueCommentCreatedEvent} from '../src/features/triggers/__fixtures__/payloads.js'
 import {createLogger} from '../src/shared/logger.js'
@@ -161,6 +162,23 @@ const requiredSignalFailureScenario: Scenario = {
   },
 }
 
+interface SerializedEvalConfig {
+  readonly default_agent?: string
+  readonly permission?: unknown
+  readonly agent?: {
+    readonly build?: {
+      readonly permission?: {
+        readonly bash?: string
+        readonly edit?: string
+        readonly read?: string
+        readonly webfetch?: string
+        readonly external_directory?: Readonly<Record<string, string>>
+      }
+    }
+  }
+  readonly plugin?: readonly string[]
+}
+
 describe('runScenario orchestration', () => {
   it.each([
     ['clean-pr', cleanPrScenario, 'b68fcc5c6f717d8e2fa728772e8f000df814667ef9cc843250a9a5a6ce7f6999'],
@@ -296,6 +314,87 @@ describe('runScenario orchestration', () => {
 
       // #then the full observable outcome passes and process state is restored
       expect(report.state).toBe('passed')
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('denies unmatched external-directory asks so noninteractive runs do not wedge', async () => {
+    // #given a credentialed Anthropic model and an injected execution seam
+    await withTestEnvironment(async setup => {
+      const hostDataDir = path.join(setup.tempDir, 'host-data')
+      fs.mkdirSync(path.join(hostDataDir, 'opencode'), {recursive: true})
+      fs.writeFileSync(
+        path.join(hostDataDir, 'opencode', 'auth.json'),
+        JSON.stringify({anthropic: {type: 'api', key: 'test-key'}}),
+        {mode: 0o600},
+      )
+      process.env.XDG_DATA_HOME = hostDataDir
+      process.env.FRO_BOT_EVAL_MODEL = 'anthropic/claude-sonnet-5'
+
+      const observation: {
+        config: SerializedEvalConfig | null
+        responseFilePath: string | null
+        runnerTemp: string | null
+      } = {
+        config: null,
+        responseFilePath: null,
+        runnerTemp: null,
+      }
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const configHome = process.env.XDG_CONFIG_HOME
+        const responseFilePath = promptOptions.responseFilePath
+        const runnerTemp = process.env.RUNNER_TEMP
+        if (configHome == null || responseFilePath == null || runnerTemp == null) {
+          throw new Error('Injected execution could not locate isolated config or response file')
+        }
+        observation.config = JSON.parse(
+          fs.readFileSync(path.join(configHome, 'opencode', 'opencode.json'), 'utf8'),
+        ) as SerializedEvalConfig
+        observation.responseFilePath = responseFilePath
+        observation.runnerTemp = runnerTemp
+        fs.writeFileSync(
+          responseFilePath,
+          '---\nverdict: approve\nschemaVersion: 1\n---\nNo blocking findings.\n',
+          'utf8',
+        )
+        return createAgentResult()
+      }
+
+      // #when the isolated eval config is serialized for the noninteractive build agent
+      const report = await runScenario(cleanPrScenario, logger, execution)
+
+      // #then the production-parity deny-first policy is present in the actual config
+      const {config, responseFilePath, runnerTemp} = observation
+      if (config == null || responseFilePath == null || runnerTemp == null) {
+        throw new Error(
+          `Injected execution did not observe the serialized eval config: ${report.agentResult.error ?? 'no execution error'}`,
+        )
+      }
+      expect(report.state).toBe('passed')
+      expect(config.default_agent).toBe('build')
+      expect(config).not.toHaveProperty('permission')
+      expect(Object.keys(config.agent ?? {})).toEqual(['build'])
+      const buildPermission = config.agent?.build?.permission
+      if (buildPermission == null || buildPermission.external_directory == null) {
+        throw new Error('Serialized build agent permission block is incomplete')
+      }
+      expect(Object.keys(buildPermission)).toEqual(['bash', 'edit', 'read', 'webfetch', 'external_directory'])
+      expect(buildPermission.bash).toBe('allow')
+      expect(buildPermission.edit).toBe('allow')
+      expect(buildPermission.read).toBe('allow')
+      expect(buildPermission.webfetch).toBe('deny')
+
+      const allowedRoot = path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT)
+      const allowedPattern = path.join(allowedRoot, '*')
+      const externalDirectory = buildPermission.external_directory
+      expect(Object.keys(externalDirectory)).toEqual(['*', allowedPattern])
+      expect(Object.values(externalDirectory)).toEqual(['deny', 'allow'])
+      expect(externalDirectory['*']).toBe('deny')
+      expect(Object.values(externalDirectory)).not.toContain('ask')
+      expect(responseFilePath.startsWith(`${allowedRoot}${path.sep}`)).toBe(true)
+      expect(Object.keys(externalDirectory)).not.toContain(`${path.dirname(responseFilePath)}/**`)
+      expect(externalDirectory[path.join(runnerTemp, 'unmatched-temp-root', 'result.md')]).toBeUndefined()
+      expect(config.plugin).toEqual(['@cortexkit/opencode-anthropic-auth@1.18.0'])
       expectProcessRestored(setup)
     })
   }, 30_000)

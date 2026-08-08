@@ -13,7 +13,11 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
-import {buildResponseFilePath, parseResponseFile} from '../packages/runtime/src/agent/response-file.js'
+import {
+  buildResponseFilePath,
+  parseResponseFile,
+  RESPONSE_FILE_DIR_SEGMENT,
+} from '../packages/runtime/src/agent/response-file.js'
 import {buildAgentPrompt, executeOpenCode} from '../src/features/agent/index.js'
 import {resolveResponseSurface} from '../src/features/agent/response-file.js'
 import {buildTriggerContext} from '../src/features/triggers/context-builders.js'
@@ -413,14 +417,22 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
       JSON.stringify(
         {
           $schema: 'https://opencode.ai/config.json',
+          default_agent: 'build',
           model,
           ...(authPlugin == null ? {} : {plugin: [authPlugin]}),
-          permission: {
-            bash: 'allow',
-            edit: 'allow',
-            read: 'allow',
-            webfetch: 'deny',
-            external_directory: {[`${responseDir}/**`]: 'allow'},
+          agent: {
+            build: {
+              permission: {
+                bash: 'allow',
+                edit: 'allow',
+                read: 'allow',
+                webfetch: 'deny',
+                external_directory: {
+                  '*': 'deny',
+                  [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',
+                },
+              },
+            },
           },
         },
         null,
