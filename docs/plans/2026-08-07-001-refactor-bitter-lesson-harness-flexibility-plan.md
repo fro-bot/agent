@@ -497,6 +497,10 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 
 `server.heartbeat` is not an event. The SDK's server-level events are `server.connected` and `server.instance.disposed`; neither is periodic, so there is no server-level liveness signal to consume. The distinction the approach drew between server-level heartbeat and session-level progress is therefore moot — only session-level evidence exists.
 
+> [!NOTE]
+>
+> These signal claims were verified against upstream `v1.18.14` — the harness `base_version`, so the source checked is the source shipped. The relevant mechanism is unchanged from `v1.17.20`: same absent heartbeat, same bare `{type: 'busy'}`, and `status.set` at identical positions in the prompt loop and run-state. Re-check against the base in force whenever this is revisited; a signal being absent is the kind of claim that ages silently.
+
 The approach also dismissed `busy` as internal pool state. That conflates two different things. `run-state.ts` keeps an internal `busy` flag used to reject concurrent prompts, which is indeed not consumable. But `SessionStatus` is a published union of `{type:'idle'} | {type:'retry', …} | {type:'busy'}`, and the server writes `{type:'busy'}` through `SessionStatus.set` from three call sites. `set` persists every non-idle status in the instance map (idle deletes the entry and returns early), and `list` backs the `/session/status` endpoint.
 
 That makes `busy` observable in the response the poll loop already requests every iteration. But observable is not the same as useful, and a further check refuted the idea of building on it — including an earlier revision of this section, which proposed exactly that.
