@@ -476,7 +476,7 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 - All existing caps are unchanged in value.
 - Truncation is still disclosed in the prompt.
 
-- [ ] **U7. Liveness signals and the carry ledger**
+- [x] **U7. Liveness signals and the carry ledger**
 
 **Goal:** Give the twelve upstream carries an exit path. The silence-as-failure proxy stays; see the investigation below for why replacing it is not currently possible.
 
