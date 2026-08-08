@@ -9,6 +9,7 @@ export type {
   AcknowledgmentState,
   AgentContext,
   AgentResult,
+  ClassificationPath,
   DiffContext,
   DiffFileSummary,
   EnsureOpenCodeResult,

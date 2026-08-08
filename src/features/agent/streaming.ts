@@ -1,4 +1,4 @@
-import type {ErrorInfo} from '@fro-bot/runtime'
+import type {ClassificationPath, ErrorInfo} from '@fro-bot/runtime'
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
@@ -10,6 +10,7 @@ import {
   createAgentError,
   createErrorInfo,
   createLLMFetchError,
+  createRetryableApiError,
   isLlmFetchError,
 } from '@fro-bot/runtime'
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
@@ -24,6 +25,7 @@ export interface EventStreamResult {
   readonly commentsPostedUrls?: string[]
   readonly commentsPosted: number
   readonly llmError: ErrorInfo | null
+  readonly classificationPath?: ClassificationPath
 }
 
 /** Mutable by design — updated in-place during stream processing. */
@@ -179,6 +181,13 @@ function getNumberProperty(value: unknown, property: string): number | null {
   return typeof descriptor?.value === 'number' ? descriptor.value : null
 }
 
+function getBooleanProperty(value: unknown, property: string): boolean | null {
+  if (value == null || typeof value !== 'object') return null
+
+  const descriptor = Object.getOwnPropertyDescriptor(value, property)
+  return typeof descriptor?.value === 'boolean' ? descriptor.value : null
+}
+
 function getObjectProperty(value: unknown, property: string): unknown {
   if (value == null || typeof value !== 'object') return null
 
@@ -268,6 +277,7 @@ export async function processEventStream(
   const commentsPostedUrls: string[] = []
   let commentsPosted = 0
   let llmError: ErrorInfo | null = null
+  let classificationPath: ClassificationPath | undefined
   // V2 sync tool lifecycle: correlate called→success by callID
   const pendingToolCalls = new Map<string, ToolCallInfo>()
 
@@ -422,6 +432,7 @@ export async function processEventStream(
         const status = getObjectProperty(eventPayload, 'status')
         const terminalError = classifyRetryStatusError(status)
         if (terminalError != null) {
+          classificationPath = 'structured'
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
           logger.error('Session status retry classified as terminal provider error', {
             sessionId,
@@ -469,17 +480,36 @@ export async function processEventStream(
           })
 
         if (terminalError != null) {
+          classificationPath = 'structured'
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
           logger.error('Session error classified as terminal provider error', {sessionId, type: terminalError.type})
           llmError = mergeActivityError(llmError, terminalError, activityTracker)
         } else if (llmError == null || isTerminalProviderError(llmError) === false) {
           const errorStr = normalizeSessionError(sessionError)
-          const genericError = isLlmFetchError(errorStr)
-            ? createLLMFetchError(errorStr, model ?? undefined)
-            : status === 429
-              ? // Ordinary 429 without account_rate_limit stays retryable rate_limit.
-                createErrorInfo('rate_limit', errorStr, true)
-              : createAgentError(errorStr)
+          let genericError: ErrorInfo
+          let genericClassificationPath: ClassificationPath
+          if (isLlmFetchError(errorStr)) {
+            genericError = createLLMFetchError(errorStr, model ?? undefined)
+            genericClassificationPath = 'fallback'
+          } else if (status === 429) {
+            // Ordinary 429 without account_rate_limit stays retryable rate_limit.
+            genericError = createErrorInfo('rate_limit', errorStr, true)
+            genericClassificationPath = 'name'
+          } else {
+            const isRetryable =
+              getBooleanProperty(sessionError, 'isRetryable') ?? getBooleanProperty(errorData, 'isRetryable')
+            if (isRetryable === true) {
+              genericError = createRetryableApiError(errorStr, model ?? undefined)
+              genericClassificationPath = 'structured'
+            } else if (isRetryable === false) {
+              genericError = createAgentError(errorStr)
+              genericClassificationPath = 'structured'
+            } else {
+              genericError = createAgentError(errorStr)
+              genericClassificationPath = name != null || status != null || code != null ? 'name' : 'unclassified'
+            }
+          }
+          if (classificationPath == null) classificationPath = genericClassificationPath
           llmError = mergeActivityError(llmError, genericError, activityTracker, errorStr)
         }
       }
@@ -496,7 +526,17 @@ export async function processEventStream(
   }
 
   if (lastText.length > 0) outputTextContent(lastText)
-  return {tokens, model, cost, prsCreated, commitsCreated, commentsPostedUrls, commentsPosted, llmError}
+  return {
+    tokens,
+    model,
+    cost,
+    prsCreated,
+    commitsCreated,
+    commentsPostedUrls,
+    commentsPosted,
+    llmError,
+    classificationPath,
+  }
 }
 
 /**

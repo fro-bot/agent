@@ -100,6 +100,7 @@ export async function executeOpenCode(
     commitsCreated: final.commitsCreated,
     commentsPosted: final.commentsPosted,
     llmError: lastLlmError,
+    classificationPath: final.classificationPath,
   })
 
   try {
@@ -221,6 +222,7 @@ export async function executeOpenCode(
           commitsCreated: final.commitsCreated,
           commentsPosted: final.commentsPosted,
           llmError: null,
+          classificationPath: final.classificationPath,
         }
       }
 
@@ -282,11 +284,13 @@ export async function executeOpenCode(
       commitsCreated: final.commitsCreated,
       commentsPosted: final.commentsPosted,
       llmError: lastLlmError,
+      classificationPath: final.classificationPath,
     }
   } catch (error) {
     if (deadline.isTimedOut()) return timeoutResult()
     const duration = Date.now() - startTime
     const errorMessage = toErrorMessage(error)
+    const transportFailure = isLlmFetchError(error)
     logger.error('OpenCode execution failed', {error: errorMessage, durationMs: duration})
     return {
       success: false,
@@ -300,7 +304,8 @@ export async function executeOpenCode(
       prsCreated: [],
       commitsCreated: [],
       commentsPosted: 0,
-      llmError: isLlmFetchError(error) ? createLLMFetchError(errorMessage) : null,
+      llmError: transportFailure ? createLLMFetchError(errorMessage) : null,
+      classificationPath: transportFailure ? 'fallback' : 'unclassified',
     }
   } finally {
     if (shouldAbortRemoteOnTimeout && deadline.isTimedOut() && client != null && sessionId != null)

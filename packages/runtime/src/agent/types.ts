@@ -218,7 +218,10 @@ export interface AgentResult {
   readonly commitsCreated: readonly string[]
   readonly commentsPosted: number
   readonly llmError: ErrorInfo | null
+  readonly classificationPath?: ClassificationPath
 }
+
+export type ClassificationPath = 'structured' | 'name' | 'fallback' | 'unclassified'
 
 export interface ReactionContext {
   readonly repo: string

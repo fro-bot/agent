@@ -88,6 +88,7 @@ export async function sendPromptToSession(
           commitsCreated: [],
           commentsPosted: 0,
           llmError: promptLlmError,
+          classificationPath: promptLlmError == null ? 'unclassified' : 'fallback',
         },
       }
     }

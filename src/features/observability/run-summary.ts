@@ -119,7 +119,11 @@ export function generateCommentSummary(options: CommentSummaryOptions): string {
   if (metrics.errors.length > 0) {
     const errorCount = metrics.errors.length
     const recoverableCount = metrics.errors.filter(e => e.recoverable).length
-    rows.push(`| Errors | ${errorCount} (${recoverableCount} recovered) |`)
+    const classificationPaths = [
+      ...new Set(metrics.errors.flatMap(error => (error.classificationPath == null ? [] : [error.classificationPath]))),
+    ]
+    const pathSummary = classificationPaths.length > 0 ? `; classifications: ${classificationPaths.join(', ')}` : ''
+    rows.push(`| Errors | ${errorCount} (${recoverableCount} recovered${pathSummary}) |`)
   }
 
   const table = rows.join('\n')
