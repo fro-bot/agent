@@ -439,7 +439,7 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 - `packages/harness/src/prompt-template.test.ts` is untouched and still pins the workflow strip and its ordering.
 - No safety or output-contract assertion was relaxed.
 
-- [ ] **U6. Context page selection**
+- [x] **U6. Context page selection**
 
 **Goal:** Surface the newest evidence rather than the oldest.
 
