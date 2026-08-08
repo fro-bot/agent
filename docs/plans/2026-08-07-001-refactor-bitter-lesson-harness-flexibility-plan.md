@@ -337,7 +337,7 @@ Two signals _are_ trustworthy, and the design rests only on these:
 - The continuation prompt carries the structured failure, not a generic string.
 - No branch consults `prsCreated`, `commitsCreated`, or `commentsPosted` to decide recovery.
 
-- [ ] **U4. Structured-first error classification**
+- [x] **U4. Structured-first error classification**
 
 **Goal:** Stop parsing provider prose to make control-flow decisions.
 

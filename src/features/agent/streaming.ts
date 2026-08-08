@@ -432,12 +432,12 @@ export async function processEventStream(
         const status = getObjectProperty(eventPayload, 'status')
         const terminalError = classifyRetryStatusError(status)
         if (terminalError != null) {
-          classificationPath = 'structured'
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
           logger.error('Session status retry classified as terminal provider error', {
             sessionId,
             type: terminalError.type,
           })
+          classificationPath = 'structured'
           llmError = mergeActivityError(llmError, terminalError, activityTracker)
         }
       }
@@ -480,9 +480,9 @@ export async function processEventStream(
           })
 
         if (terminalError != null) {
-          classificationPath = 'structured'
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
           logger.error('Session error classified as terminal provider error', {sessionId, type: terminalError.type})
+          classificationPath = 'structured'
           llmError = mergeActivityError(llmError, terminalError, activityTracker)
         } else if (llmError == null || isTerminalProviderError(llmError) === false) {
           const errorStr = normalizeSessionError(sessionError)
