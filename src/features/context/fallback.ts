@@ -140,7 +140,8 @@ export async function fallbackPullRequestContext(
         'pull request commits',
         logger,
       ),
-      client.rest.pulls.listFiles({owner, repo, pull_number: number, per_page: budget.maxFiles}),
+      // Over-read by one so a full page is distinguishable from an overflowing one.
+      client.rest.pulls.listFiles({owner, repo, pull_number: number, per_page: budget.maxFiles + 1}),
       fetchRestCollection(
         async page => {
           const response = await client.rest.pulls.listReviews({

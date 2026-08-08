@@ -399,13 +399,15 @@ describe('fallbackPullRequestContext', () => {
             },
           }),
           listCommits: vi.fn().mockResolvedValue({data: commits}),
-          listFiles: vi.fn().mockResolvedValue({
+          listFiles: vi.fn().mockImplementation(async ({per_page: perPage}: {readonly per_page: number}) => ({
+            // The real endpoint honors per_page, so the caller must over-read to see an overflow.
             data: [
               {filename: 'src/a.ts', additions: 1, deletions: 0, status: 'modified'},
               {filename: 'src/b.ts', additions: 2, deletions: 0, status: 'modified'},
               {filename: 'src/c.ts', additions: 3, deletions: 0, status: 'modified'},
-            ],
-          }),
+              {filename: 'src/d.ts', additions: 4, deletions: 0, status: 'modified'},
+            ].slice(0, perPage),
+          })),
           listReviews: vi.fn().mockResolvedValue({data: reviews}),
           listRequestedReviewers: vi.fn().mockResolvedValue({data: {users: [], teams: []}}),
         },
