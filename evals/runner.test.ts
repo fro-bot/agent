@@ -1,6 +1,7 @@
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
 import type {Logger} from '../src/shared/logger.js'
 import type {Scenario} from './types.js'
+import {Buffer} from 'node:buffer'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -19,6 +20,8 @@ import {
   runScenario,
 } from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
+import {continuationIrrelevantNonDegradationScenario} from './scenarios/continuation-irrelevant-non-degradation.js'
+import {continuationRelevantScenario} from './scenarios/continuation-relevant.js'
 import {plantedDefectScenario} from './scenarios/planted-defect.js'
 
 interface TestSetup {
@@ -142,10 +145,19 @@ const issueCommentScenario: Scenario = {
     hydratedContext: null,
   },
   prompt: 'Answer the issue from the repository contents. Do not modify the repository.',
+  priorWork: null,
   expect: {
     verdict: null,
     requiredSignals: [],
-    forbiddenSignals: [],
+  },
+}
+
+const requiredSignalFailureScenario: Scenario = {
+  ...cleanPrScenario,
+  id: 'runner-required-signal-failure',
+  expect: {
+    verdict: 'approve',
+    requiredSignals: [{id: 'required-answer', anyOf: ['this signal is intentionally absent']}],
   },
 }
 
@@ -164,6 +176,32 @@ describe('runScenario orchestration', () => {
     // #then the refactor preserves the exact current-main prompt bytes
     expect(promptHash).toBe(expectedHash)
   })
+
+  it.each([cleanPrScenario, plantedDefectScenario])('omits continuation fields for fresh %s runs', scenario => {
+    // #given a fresh scenario without prior work
+    const promptOptions = buildPromptOptions(scenario, CHARACTERIZATION_HEAD_SHA, CHARACTERIZATION_RESPONSE_PATH)
+
+    // #when prompt options are inspected
+    // #then continuation-only fields are absent rather than undefined placeholders
+    expect('sessionContext' in promptOptions).toBe(false)
+    expect('isContinuation' in promptOptions).toBe(false)
+    expect('currentThreadSessionId' in promptOptions).toBe(false)
+  })
+
+  it.each([continuationRelevantScenario, continuationIrrelevantNonDegradationScenario])(
+    'threads exact continuation inputs for %s',
+    scenario => {
+      // #given a continuation scenario with one supplied current-thread result
+      if (scenario.priorWork == null) throw new Error('Continuation scenario must provide prior work')
+      const promptOptions = buildPromptOptions(scenario, CHARACTERIZATION_HEAD_SHA, CHARACTERIZATION_RESPONSE_PATH)
+
+      // #when prompt options are built
+      // #then the supplied context and continuation identity are passed through unchanged
+      expect(promptOptions.sessionContext).toBe(scenario.priorWork.sessionContext)
+      expect(promptOptions.isContinuation).toBe(true)
+      expect(promptOptions.currentThreadSessionId).toBe(scenario.priorWork.currentThreadSessionId)
+    },
+  )
 
   it('restores cwd and env and removes the fixture when injected execution throws', async () => {
     // #given an injected execution that observes the fixture and then throws
@@ -258,6 +296,132 @@ describe('runScenario orchestration', () => {
 
       // #then the full observable outcome passes and process state is restored
       expect(report.state).toBe('passed')
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('persists the exact response for a completed required-signal failure', async () => {
+    // #given a completed execution whose valid response omits a required signal
+    await withTestEnvironment(async setup => {
+      const response = '---\nverdict: approve\nschemaVersion: 1\n---\nNo blocking findings.\n'
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(responseFilePath, response, 'utf8')
+        return createAgentResult()
+      }
+
+      // #when the completed quality failure is evaluated
+      const report = await runScenario(requiredSignalFailureScenario, logger, execution)
+
+      // #then the failed report points at an exact local response artifact
+      expect(report.state).toBe('failed')
+      expect(getGate(report, 'required-signals-present').status).toBe('failed')
+      expect(report.execution.diagnosticsPath).not.toBeNull()
+      if (report.execution.diagnosticsPath == null) {
+        throw new Error('Expected response diagnostics path')
+      }
+      expect(fs.readFileSync(path.join(report.execution.diagnosticsPath, 'response.md'), 'utf8')).toBe(response)
+      const responseMode = fs.statSync(path.join(report.execution.diagnosticsPath, 'response.md')).mode & 0o777
+      expect(process.platform === 'win32' || responseMode === 0o600).toBe(true)
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('keeps log diagnostics and response evidence together for an incomplete response run', async () => {
+    // #given an incomplete execution that produced both a response and an OpenCode log
+    await withTestEnvironment(async setup => {
+      const response = '---\nverdict: approve\nschemaVersion: 1\n---\nNo blocking findings.\n'
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const dataHome = process.env.XDG_DATA_HOME
+        const responseFilePath = promptOptions.responseFilePath
+        if (dataHome == null || responseFilePath == null) {
+          throw new Error('Injected execution could not locate isolated directories')
+        }
+        fs.writeFileSync(responseFilePath, response, 'utf8')
+        const logDir = path.join(dataHome, 'opencode', 'log')
+        fs.mkdirSync(logDir, {recursive: true})
+        fs.writeFileSync(path.join(logDir, 'agent.log'), 'incomplete execution diagnostic\n', 'utf8')
+        return createAgentResult({success: false, exitCode: 1, error: 'injected incomplete execution'})
+      }
+
+      // #when the incomplete run is evaluated with its response still available
+      const report = await runScenario(cleanPrScenario, logger, execution)
+
+      // #then both evidence sources coexist under one diagnostics directory
+      expect(report.state).toBe('inconclusive')
+      expect(report.execution.diagnosticsPath).not.toBeNull()
+      if (report.execution.diagnosticsPath == null) {
+        throw new Error('Expected incomplete-run diagnostics path')
+      }
+      expect(fs.readFileSync(path.join(report.execution.diagnosticsPath, 'response.md'), 'utf8')).toBe(response)
+      expect(fs.readFileSync(path.join(report.execution.diagnosticsPath, 'agent.log'), 'utf8')).toContain(
+        'incomplete execution diagnostic',
+      )
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('clears stale diagnostics before a passed run and reports no diagnostics path', async () => {
+    // #given stale evidence from an earlier failed run
+    await withTestEnvironment(async setup => {
+      const diagnosticsDir = path.join(process.cwd(), 'evals', 'output', 'diagnostics', cleanPrScenario.id)
+      fs.mkdirSync(diagnosticsDir, {recursive: true, mode: 0o700})
+      fs.writeFileSync(path.join(diagnosticsDir, 'stale.txt'), 'stale evidence', {mode: 0o600})
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(
+          responseFilePath,
+          '---\nverdict: approve\nschemaVersion: 1\n---\nNo blocking findings.\n',
+          'utf8',
+        )
+        return createAgentResult()
+      }
+
+      try {
+        // #when a later successful run completes
+        const report = await runScenario(cleanPrScenario, logger, execution)
+
+        // #then stale evidence is removed and no diagnostics are reported
+        expect(report.state).toBe('passed')
+        expect(report.execution.diagnosticsPath).toBeNull()
+        expect(fs.existsSync(diagnosticsDir)).toBe(false)
+      } finally {
+        fs.rmSync(diagnosticsDir, {recursive: true, force: true})
+      }
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('bounds oversized response diagnostics and appends a truncation marker', async () => {
+    // #given a completed quality failure with a response larger than the diagnostic limit
+    await withTestEnvironment(async setup => {
+      const response = `---\nverdict: approve\nschemaVersion: 1\n---\n${'x'.repeat(70_000)}\n`
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(responseFilePath, response, 'utf8')
+        return createAgentResult()
+      }
+
+      // #when the oversized response is evaluated
+      const report = await runScenario(requiredSignalFailureScenario, logger, execution)
+
+      // #then the persisted artifact is bounded and visibly truncated
+      expect(report.state).toBe('failed')
+      if (report.execution.diagnosticsPath == null) {
+        throw new Error('Expected oversized response diagnostics path')
+      }
+      const diagnosticResponse = fs.readFileSync(path.join(report.execution.diagnosticsPath, 'response.md'), 'utf8')
+      expect(Buffer.byteLength(diagnosticResponse, 'utf8')).toBeLessThanOrEqual(65_536)
+      expect(diagnosticResponse).toContain('[response truncated at 65536 bytes]')
       expectProcessRestored(setup)
     })
   }, 30_000)

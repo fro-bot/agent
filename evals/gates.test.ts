@@ -11,7 +11,6 @@ function createArtifacts(overrides: Partial<EvalRunArtifacts> = {}): EvalRunArti
     expect: {
       verdict: 'approve',
       requiredSignals: [],
-      forbiddenSignals: [],
     },
     responseFileExists: true,
     parsedResponse,
@@ -51,7 +50,6 @@ describe('evaluateGates', () => {
       'verdict-matches',
       'exactly-one-delivery',
       'required-signals-present',
-      'forbidden-signals-absent',
       'no-forbidden-mutation',
       'no-secret-leak',
     ])
@@ -69,7 +67,6 @@ describe('evaluateGates', () => {
           {id: 'changed-file', anyOf: ['src/access.ts']},
           {id: 'defect-signal', anyOf: ['age < 18', 'adults rejected']},
         ],
-        forbiddenSignals: [],
       },
       parsedResponse: {body, verdict: 'request-changes'},
       output: body,
@@ -89,7 +86,6 @@ describe('evaluateGates', () => {
       expect: {
         verdict: 'request-changes',
         requiredSignals: [{id: 'changed-file', anyOf: ['src/access.ts']}],
-        forbiddenSignals: [],
       },
       parsedResponse: {body: 'Please fix the correctness issue.', verdict: 'request-changes'},
       output: 'Please fix the correctness issue.',
@@ -103,32 +99,10 @@ describe('evaluateGates', () => {
     expect(getGate(results, 'required-signals-present').detail).toContain('changed-file')
   })
 
-  it('fails when one alternative in a forbidden signal group appears in the response body', () => {
-    // #given a response containing one alternative from a forbidden signal group
-    const body = 'No blocking findings, but the response mentions the internal-only marker.'
-    const artifacts = createArtifacts({
-      expect: {
-        verdict: 'approve',
-        requiredSignals: [],
-        forbiddenSignals: [{id: 'internal-marker', anyOf: ['internal-only marker', 'private marker']}],
-      },
-      parsedResponse: {body, verdict: 'approve'},
-      output: body,
-    })
-
-    // #when the hard outcome gates are evaluated
-    const results = evaluateGates(artifacts)
-
-    // #then the forbidden signal gate fails
-    expect(getGate(results, 'forbidden-signals-absent').status).toBe('failed')
-    expect(getGate(results, 'forbidden-signals-absent').detail).toContain('internal-marker')
-    expect(getGate(results, 'forbidden-signals-absent').detail).not.toContain('internal-only marker')
-  })
-
   it('accepts a plain response when the expected verdict is null', () => {
     // #given an issue answer with no review verdict frontmatter
     const artifacts = createArtifacts({
-      expect: {verdict: null, requiredSignals: [], forbiddenSignals: []},
+      expect: {verdict: null, requiredSignals: []},
       parsedResponse: {body: 'The issue is caused by the unchecked input.'},
       output: 'The issue is caused by the unchecked input.',
     })
@@ -143,7 +117,7 @@ describe('evaluateGates', () => {
   it('rejects an emitted verdict when the expected verdict is null', () => {
     // #given an issue answer that incorrectly emits review frontmatter
     const artifacts = createArtifacts({
-      expect: {verdict: null, requiredSignals: [], forbiddenSignals: []},
+      expect: {verdict: null, requiredSignals: []},
       parsedResponse: {body: 'The issue is caused by the unchecked input.', verdict: 'approve'},
       output: 'The issue is caused by the unchecked input.',
     })

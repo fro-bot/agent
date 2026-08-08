@@ -1,6 +1,7 @@
 import type {IssueCommentEvent, PullRequestEvent} from '@octokit/webhooks-types'
 import type {AgentResult, DiffFileSummary} from '../packages/runtime/src/agent/index.js'
 import type {ParsedResponse, ResponseFileVerdict} from '../packages/runtime/src/agent/response-file.js'
+import type {SessionContext} from '../packages/runtime/src/agent/types.js'
 import type {HydratedContext} from '../src/features/agent/types.js'
 
 export interface PullRequestSurface {
@@ -26,7 +27,11 @@ export interface SignalGroup {
 export interface OutcomeExpectations {
   readonly verdict: ResponseFileVerdict | null
   readonly requiredSignals: readonly SignalGroup[]
-  readonly forbiddenSignals: readonly SignalGroup[]
+}
+
+export interface PriorWork {
+  readonly sessionContext: SessionContext
+  readonly currentThreadSessionId: string
 }
 
 export interface Scenario {
@@ -35,6 +40,7 @@ export interface Scenario {
   readonly files: Readonly<Record<string, string>>
   readonly surface: ScenarioSurface
   readonly prompt: string
+  readonly priorWork: PriorWork | null
   readonly expect: OutcomeExpectations
 }
 
@@ -95,7 +101,7 @@ export interface ExecutionDiagnostics {
   readonly exitCode: number
   readonly durationMs: number
   readonly timeoutMs: number
-  /** Where the agent's logs were copied before the isolated home was destroyed, when execution did not complete. */
+  /** Where captured logs and/or non-passing response evidence were stored before cleanup. */
   readonly diagnosticsPath: string | null
 }
 

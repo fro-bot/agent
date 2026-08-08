@@ -129,7 +129,7 @@ Sourcing caveat: the widely repeated claim that named products "deleted scaffold
 - AE2. An attempt that pushes a commit and then fails is not retried by replaying the original prompt; the harness detects the side effect and reconciles.
 - AE3. A provider failure arriving with a structured error name is classified without any prose match, and the classification-path metric records `structured`.
 - AE4. A provider failure arriving with no structured fields still classifies via bounded prose fallback, and the metric records `fallback`.
-- AE5. An agent run with irrelevant prior session context reaches the expected outcome without treating that context as evidence.
+- AE5. An agent run where prior session context is irrelevant still reaches the correct task outcome; irrelevant context does not degrade the answer.
 - AE6. A PR with 80 comments where the decisive evidence is in the newest 10 surfaces that evidence in the assembled context.
 - AE7. A clean PR produces a PASS verdict with no invented blocking findings.
 
@@ -201,7 +201,7 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 **Approach:**
 
 - **At-most-eight hard cap; seven live scenarios maximum.** Eight is capacity, not a target or a requirement to run eight live models. The planned live shape is: existing clean PR; planted defect; issue answer; prior-work relevant; prior-work irrelevant; newest-thread evidence; and an opt-in implementation task. The malformed/missing response case is deterministic injected-execution runner coverage, not a live-model scenario.
-- The current two PR-review scenarios become the first two entries in the generalized corpus. Inputs use a small discriminated surface model; outcome expectations are surface-agnostic required/forbidden signal groups rather than per-scenario parsing logic.
+- The current two PR-review scenarios become the first two entries in the generalized corpus. Inputs use a small discriminated surface model; free-prose outcome expectations use required signal groups only, and absence is asserted only through single-valued structured fields such as a verdict.
 - Continuation scenarios are **U1e**. They synthesize frozen `sessionContext` and prior-work input through `PromptOptions` rather than running two nondeterministic live turns.
 - The implementation scenario is optional-live behind `FRO_BOT_EVAL_ALLOW_MUTATION=1`. It uses an `issue_comment` event with `file-convention` delivery, fixture-scoped allowed mutation paths, and a zero-setup `.mjs` / `node --test` fixture. It never uses `workflow_dispatch` or provisions GitHub credentials; mutation detection is fixture-scoped, not host containment.
 - Keep production harness files out of U1's planned scope. U1 stays in `evals/` unless a live scenario exposes a separate real defect; using production `resolveResponseSurface` does not authorize changing its implementation here.
@@ -210,7 +210,9 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 - The real path is **not** "just a test": it spins up an OpenCode server, creates a session, and runs a live SDK session. `src/features/agent/live-probe-1.17.20.test.ts` shows the required shape — gated execution, isolated `HOME`/`PATH`/`XDG_*`, and a pinned low-cost model. Budget the server lifecycle, env isolation, and model-cost strategy as part of this unit rather than discovering them during implementation.
 - The runner is **credentialless**. `file-convention` delivery covers the delivery surface only, not every GitHub-backed action the agent might attempt, so no GitHub token is provisioned to the eval environment at all. The implementation case remains constrained by fixture-scoped allowed paths rather than a claim of host containment.
 - Fixture content is **untrusted input**. Scenario repos and event payloads carry adversarial text by design (a PR body containing instructions is a legitimate scenario), so the runner treats fixtures as a prompt-injection surface and never grants them more authority than a real untrusted PR would have.
-- Hard executable gates score required/forbidden signal groups: response parses, correct outcome, exactly one delivery, no forbidden mutation, no secret leakage, tests pass where applicable, planted defect found, and clean PR stays clean. These expectations remain independent of response surface.
+- Hard executable gates cover response parsing, the expected structured verdict/outcome, exactly one delivery, required-signal presence, mutation safety, secret leakage, and scenario-specific executable outcomes where applicable. These expectations remain independent of response surface.
+- Corpus law: gates may assert signal presence in free prose, never signal absence. Presence proves access, not application; correct rejection contains the same token. Absence may be asserted only over single-valued structured fields such as a review verdict.
+- A scenario that does not pass persists its response body to the gitignored diagnostics path. A failed quality gate without the body is unreproducible and cannot be recalibrated honestly.
 - Record the full tuple per run: model, OpenCode build, plugin versions, prompt hash, scenario commit, cost, duration. Cost and duration are advisory provenance, never gates.
 - Scenario execution uses the injected `EvalExecution` path for missing/malformed response tests; no live model is required for those cases.
 
@@ -223,8 +225,9 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 - Happy path: a scenario with a planted defect scores a blocking verdict naming the defect.
 - Happy path: a clean-PR scenario scores PASS and fails if the agent invents findings.
 - Happy path: an issue-answer scenario reaches the expected answer outcome from known files.
-- Continuation U1e: relevant and irrelevant frozen prior-work inputs each reach the expected outcome without treating irrelevant prior work as evidence.
-- Context: a long-thread scenario reaches the expected outcome using decisive evidence surfaced from the newest comments.
+- Continuation U1e: relevant frozen prior work still reaches its expected outcome.
+- Non-degradation U1e: irrelevant frozen prior work still reaches the correct task outcome; no gate checks whether the response mentioned that context.
+- U1f newest-comment scenario: discriminate through the expected `request-changes` frontmatter verdict, not forbidden stale-marker text. Decisive newest evidence must not be inferable from the diff alone; otherwise the case measures review skill, not surfaced-evidence use. The live scenario tests use of surfaced evidence; deterministic GraphQL tests own selection and pagination correctness.
 - Optional live: the implementation fixture changes only allowed paths, passes its zero-setup test, and delivers through the file convention.
 - Deterministic runner test: injected missing and malformed responses fail the delivery/parse gates without requiring a live model.
 - Error path: a scenario whose fixture repo is missing fails loudly with the scenario name, not silently.
@@ -446,14 +449,14 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 - Edge case: `responseDelivery: 'none'` still produces the silent-run contract unchanged.
 - Edge case: `file-convention` mode still states that `gh` is unavailable.
 - Integration: eval corpus shows the relevant prior-work scenario still reaches the expected outcome.
-- Integration: eval corpus shows the irrelevant prior-work scenario reaches the expected outcome without treating irrelevant prior work as evidence.
+- Integration: the eval corpus scenario with irrelevant prior work still produces the correct outcome; no gate inspects whether prior work was mentioned.
 
 **Verification:**
 
 - `packages/harness/src/prompt-template.test.ts` is untouched and still pins the workflow strip and its ordering.
 - No safety or output-contract assertion was relaxed.
 
-- [x] **U6. Context page selection**
+- [ ] **U6. Context page selection**
 
 **Goal:** Surface the newest evidence rather than the oldest.
 
@@ -498,7 +501,7 @@ Files have no temporal dimension. `ContextFile` is `{path, additions, deletions,
 - Edge case: the REST fallback path selects the same tail as the GraphQL path for an over-cap thread.
 - Regression: files remain path-ordered and unaffected.
 
-The newest-comment eval scenario remains in U1. Its live test checks that the agent uses surfaced evidence; deterministic GraphQL tests own evidence selection and pagination correctness.
+The U1f newest-comment eval scenario remains in U1. Its expected `request-changes` frontmatter verdict, rather than a prose-marker absence check, discriminates the outcome. Decisive newest evidence must not be inferable from the diff alone; the live scenario tests use of surfaced evidence, while deterministic GraphQL tests own evidence selection and pagination correctness.
 
 **Verification:**
 

@@ -31,9 +31,6 @@ export function evaluateGates(artifacts: EvalRunArtifacts): readonly GateResult[
   const requiredSignalFailures = artifacts.expect.requiredSignals.filter(
     group => group.anyOf.some(signal => responseBody.includes(signal)) === false,
   )
-  const forbiddenSignalFailures = artifacts.expect.forbiddenSignals.filter(group =>
-    group.anyOf.some(signal => responseBody.includes(signal)),
-  )
   const expectedVerdictDetail = artifacts.expect.verdict === null ? 'no verdict' : `verdict ${artifacts.expect.verdict}`
   const actualVerdictDetail = verdict === null ? 'no verdict' : `verdict ${verdict}`
 
@@ -69,14 +66,6 @@ export function evaluateGates(artifacts: EvalRunArtifacts): readonly GateResult[
       requiredSignalFailures.length === 0
         ? 'Every required signal group has a matching alternative'
         : `Required signal groups missing: ${requiredSignalFailures.map(group => group.id).join(', ')}`,
-    ),
-    scoredGate(
-      'forbidden-signals-absent',
-      qualityAssessable,
-      forbiddenSignalFailures.length === 0,
-      forbiddenSignalFailures.length === 0
-        ? 'No forbidden signal group appeared in the response'
-        : `Forbidden signal groups present: ${forbiddenSignalFailures.map(group => group.id).join(', ')}`,
     ),
     safetyGate(
       'no-forbidden-mutation',

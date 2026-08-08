@@ -3,16 +3,14 @@ import {describe, expect, it} from 'vitest'
 import {RESPONSE_FILE_VERDICTS} from '../packages/runtime/src/agent/response-file.js'
 import {EVAL_CANARY_PLACEHOLDER} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
+import {continuationIrrelevantNonDegradationScenario} from './scenarios/continuation-irrelevant-non-degradation.js'
+import {continuationRelevantScenario} from './scenarios/continuation-relevant.js'
 import {ALL_SCENARIOS, MAX_SCENARIOS} from './scenarios/index.js'
 import {issueKnownFilesScenario} from './scenarios/issue-known-files.js'
 import {plantedDefectScenario} from './scenarios/planted-defect.js'
 
 function expectationTokens(scenario: Scenario): readonly string[] {
-  return [
-    ...RESPONSE_FILE_VERDICTS,
-    ...scenario.expect.requiredSignals.flatMap(group => group.anyOf),
-    ...scenario.expect.forbiddenSignals.flatMap(group => group.anyOf),
-  ]
+  return [...RESPONSE_FILE_VERDICTS, ...scenario.expect.requiredSignals.flatMap(group => group.anyOf)]
 }
 
 function assertNoExpectationLeakage(scenario: Scenario): void {
@@ -72,23 +70,11 @@ describe('eval scenario registry', () => {
     expect(() => assertNoExpectationLeakage(leakedScenario)).toThrow()
   })
 
-  it('rejects forbidden signal alternatives leaked into prompt or event input', () => {
-    // #given a constructed scenario with a forbidden signal group leaked into its prompt
-    const leakedScenario = {
-      ...cleanPrScenario,
-      prompt: `${cleanPrScenario.prompt} internal-only marker`,
-      expect: {
-        ...cleanPrScenario.expect,
-        forbiddenSignals: [{id: 'internal-marker', anyOf: ['internal-only marker', 'private marker'] as const}],
-      },
-    }
-
-    // #when the table-driven expectation tokens and neutralization guard are exercised
-    // #then every forbidden alternative is represented and leakage is rejected
-    expect(expectationTokens(leakedScenario)).toEqual(
-      expect.arrayContaining(['internal-only marker', 'private marker']),
-    )
-    expect(() => assertNoExpectationLeakage(leakedScenario)).toThrow()
+  it.each(ALL_SCENARIOS)('$id has no forbidden signal expectation mechanism', scenario => {
+    // #given one registered scenario
+    // #when its quality contract is inspected
+    // #then quality scoring asserts presence only
+    expect(Object.keys(scenario.expect).some(key => key.endsWith('Signals') && key !== 'requiredSignals')).toBe(false)
   })
 
   it('keeps the agent-facing prompt, event, files, and diff summary identical', () => {
@@ -125,7 +111,13 @@ describe('eval scenario registry', () => {
     // #given the centralized registry
     // #when scenario IDs are inspected
     // #then the stable corpus order includes the issue-answer scenario
-    expect(ALL_SCENARIOS.map(scenario => scenario.id)).toEqual(['clean-pr', 'planted-defect', 'issue-known-files'])
+    expect(ALL_SCENARIOS.map(scenario => scenario.id)).toEqual([
+      'clean-pr',
+      'planted-defect',
+      'issue-known-files',
+      'continuation-relevant',
+      'continuation-irrelevant-non-degradation',
+    ])
   })
 
   it('models the issue answer scenario as a non-PR issue comment with answer signals', () => {
@@ -151,5 +143,52 @@ describe('eval scenario registry', () => {
     for (const hint of ['src/retry-policy.ts', '2750', '2,750', '2.75 seconds', '2.75s']) {
       expect(promptAndEvent).not.toContain(hint)
     }
+  })
+
+  it('keeps the continuation pair differential and issue-shaped', () => {
+    // #given relevant and irrelevant continuation scenarios
+    // #when their shared agent-facing inputs and continuation metadata are compared
+    // #then only prior work and expectations distinguish the pair
+    expect(continuationRelevantScenario.prompt).toBe(continuationIrrelevantNonDegradationScenario.prompt)
+    expect(continuationRelevantScenario.surface).toBe(continuationIrrelevantNonDegradationScenario.surface)
+    expect(continuationRelevantScenario.files).toBe(continuationIrrelevantNonDegradationScenario.files)
+    expect(continuationRelevantScenario.expect).not.toEqual(continuationIrrelevantNonDegradationScenario.expect)
+    expect(continuationRelevantScenario.priorWork).not.toEqual(continuationIrrelevantNonDegradationScenario.priorWork)
+
+    for (const scenario of [continuationRelevantScenario, continuationIrrelevantNonDegradationScenario]) {
+      expect(scenario.surface.kind).toBe('issue_comment')
+      expect(scenario.surface.hydratedContext).toBeNull()
+      expect('diffFiles' in scenario.surface).toBe(false)
+      expect('mutationAllowance' in scenario).toBe(false)
+    }
+  })
+
+  it('captures the continuation pair expectations without scanning supplied prior work', () => {
+    // #given the two intentionally different prior-work excerpts
+    // #when their outcome contracts are inspected
+    // #then relevant work is required while unrelated prior work has no absence contract
+    expect(continuationRelevantScenario.expect).toEqual({
+      verdict: null,
+      requiredSignals: [
+        {id: 'ordering-field', anyOf: ['seq']},
+        {id: 'prior-decision', anyOf: ['ORBIT-217']},
+      ],
+    })
+    expect(continuationIrrelevantNonDegradationScenario.expect).toEqual({
+      verdict: null,
+      requiredSignals: [{id: 'ordering-field', anyOf: ['seq']}],
+    })
+    expect(JSON.stringify(continuationRelevantScenario.priorWork)).toContain('ORBIT-217')
+    expect(JSON.stringify(continuationIrrelevantNonDegradationScenario.priorWork)).toContain('UTC-ROUNDING-9000')
+    expect(
+      Object.keys(continuationRelevantScenario.expect).some(
+        key => key.endsWith('Signals') && key !== 'requiredSignals',
+      ),
+    ).toBe(false)
+    expect(
+      Object.keys(continuationIrrelevantNonDegradationScenario.expect).some(
+        key => key.endsWith('Signals') && key !== 'requiredSignals',
+      ),
+    ).toBe(false)
   })
 })

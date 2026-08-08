@@ -197,17 +197,88 @@ function captureDiagnostics(env: IsolatedEvalEnv, scenarioId: string): string | 
   }
 
   try {
-    const targetDir = path.join(env.originalCwd, 'evals', 'output', 'diagnostics', scenarioId)
-    fs.rmSync(targetDir, {recursive: true, force: true})
-    fs.mkdirSync(targetDir, {recursive: true})
+    const targetDir = diagnosticsDirectory(env.originalCwd, scenarioId)
+    fs.mkdirSync(targetDir, {recursive: true, mode: 0o700})
     fs.cpSync(sourceLogDir, targetDir, {recursive: true})
+    restrictDiagnosticsDirectory(targetDir)
     return targetDir
   } catch {
     return null
   }
 }
 
+function diagnosticsDirectory(originalCwd: string, scenarioId: string): string {
+  return path.join(originalCwd, 'evals', 'output', 'diagnostics', scenarioId)
+}
+
+function clearScenarioDiagnostics(originalCwd: string, scenarioId: string): void {
+  try {
+    fs.rmSync(diagnosticsDirectory(originalCwd, scenarioId), {recursive: true, force: true})
+  } catch {
+    // Diagnostics are fail-soft evidence and must never block the evaluation itself.
+  }
+}
+
+function restrictDiagnosticsDirectory(directory: string): void {
+  const directories = [directory]
+  while (directories.length > 0) {
+    const current = directories.pop()
+    if (current == null) {
+      continue
+    }
+
+    try {
+      fs.chmodSync(current, 0o700)
+    } catch {
+      // Some platforms or filesystems do not support chmod; preserve best-effort behaviour.
+    }
+
+    let entries: readonly fs.Dirent[]
+    try {
+      entries = fs.readdirSync(current, {withFileTypes: true})
+    } catch {
+      continue
+    }
+
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        directories.push(path.join(current, entry.name))
+      }
+    }
+  }
+}
+
 const MAX_DIAGNOSTIC_SCAN_BYTES = 65_536
+const MAX_RESPONSE_DIAGNOSTIC_BYTES = 65_536
+const RESPONSE_DIAGNOSTIC_TRUNCATION_MARKER = '\n\n[response truncated at 65536 bytes]\n'
+
+function boundResponseDiagnostic(response: string): string {
+  const responseBytes = Buffer.from(response, 'utf8')
+  if (responseBytes.length <= MAX_RESPONSE_DIAGNOSTIC_BYTES) {
+    return response
+  }
+
+  const markerBytes = Buffer.byteLength(RESPONSE_DIAGNOSTIC_TRUNCATION_MARKER, 'utf8')
+  let prefix = responseBytes.subarray(0, MAX_RESPONSE_DIAGNOSTIC_BYTES - markerBytes).toString('utf8')
+  while (Buffer.byteLength(prefix, 'utf8') + markerBytes > MAX_RESPONSE_DIAGNOSTIC_BYTES) {
+    prefix = prefix.slice(0, -1)
+  }
+  return `${prefix}${RESPONSE_DIAGNOSTIC_TRUNCATION_MARKER}`
+}
+
+function persistResponseDiagnostics(originalCwd: string, scenarioId: string, rawResponse: string): string | null {
+  const targetDir = diagnosticsDirectory(originalCwd, scenarioId)
+  try {
+    fs.mkdirSync(targetDir, {recursive: true, mode: 0o700})
+    restrictDiagnosticsDirectory(targetDir)
+    const responsePath = path.join(targetDir, 'response.md')
+    fs.writeFileSync(responsePath, boundResponseDiagnostic(rawResponse), {encoding: 'utf8', mode: 0o600})
+    fs.chmodSync(responsePath, 0o600)
+    return targetDir
+  } catch {
+    return null
+  }
+}
 
 function readBoundedDiagnosticFile(
   filePath: string,
@@ -531,6 +602,14 @@ export function buildPromptOptions(scenario: Scenario, headSha: string, response
   const triggerContext = buildTriggerContextForScenario(scenario, headSha, scenarioInput)
   const target = triggerContext.target
   const author = triggerContext.author
+  const priorWorkOptions =
+    scenario.priorWork == null
+      ? {}
+      : {
+          sessionContext: scenario.priorWork.sessionContext,
+          isContinuation: true,
+          currentThreadSessionId: scenario.priorWork.currentThreadSessionId,
+        }
 
   return {
     context: {
@@ -558,6 +637,7 @@ export function buildPromptOptions(scenario: Scenario, headSha: string, response
     responseMode: 'github',
     responseDelivery: 'file-convention',
     responseFilePath,
+    ...priorWorkOptions,
   }
 }
 
@@ -649,6 +729,11 @@ export function createFixtureFiles(scenario: Scenario, canary: string): Readonly
   return files
 }
 
+interface CollectedResponseArtifacts {
+  readonly artifacts: ResponseArtifacts
+  readonly rawResponse: string | null
+}
+
 function collectResponseArtifacts(
   env: IsolatedEvalEnv,
   agentResult: AgentResult,
@@ -656,7 +741,7 @@ function collectResponseArtifacts(
   configuredTimeoutMs: number,
   responseSurface: ResponseSurface,
   diagnosticsOutput: string,
-): ResponseArtifacts {
+): CollectedResponseArtifacts {
   const responseFiles = fs.existsSync(env.responseDir)
     ? fs
         .readdirSync(env.responseDir, {withFileTypes: true})
@@ -684,17 +769,20 @@ function collectResponseArtifacts(
   }
 
   return {
-    responseFileExists,
-    parsedResponse,
-    responseFileError,
-    deliveryCount: responseFiles.length,
-    output: [rawResponse ?? '', agentResult.error ?? '', diagnosticsOutput].join('\n'),
-    canary,
-    executionSucceeded: agentResult.success,
-    executionFailureReason: getExecutionFailureReason(agentResult),
-    executionExitCode: agentResult.exitCode,
-    executionDurationMs: agentResult.duration,
-    configuredTimeoutMs,
+    artifacts: {
+      responseFileExists,
+      parsedResponse,
+      responseFileError,
+      deliveryCount: responseFiles.length,
+      output: [rawResponse ?? '', agentResult.error ?? '', diagnosticsOutput].join('\n'),
+      canary,
+      executionSucceeded: agentResult.success,
+      executionFailureReason: getExecutionFailureReason(agentResult),
+      executionExitCode: agentResult.exitCode,
+      executionDurationMs: agentResult.duration,
+      configuredTimeoutMs,
+    },
+    rawResponse,
   }
 }
 
@@ -706,6 +794,8 @@ export async function runScenario(
   execution: EvalExecution = executeOpenCode,
 ): Promise<EvalRunReport> {
   const startedAt = Date.now()
+  const originalCwd = process.cwd()
+  clearScenarioDiagnostics(originalCwd, scenario.id)
   const model = resolveModel()
   const modelConfig = parseModel(model)
   const canary = createEvalCanary()
@@ -732,9 +822,9 @@ export async function runScenario(
       // Mutation detection and gates still run when the execution call itself throws.
       agentResult = createExecutionFailure(error)
     }
-    const diagnosticsPath = agentResult.success ? null : captureDiagnostics(environment, scenario.id)
+    let diagnosticsPath = agentResult.success ? null : captureDiagnostics(environment, scenario.id)
     const diagnosticsOutput = readCapturedDiagnostics(diagnosticsPath)
-    const artifacts = collectResponseArtifacts(
+    const collectedResponseArtifacts = collectResponseArtifacts(
       environment,
       agentResult,
       canary,
@@ -742,6 +832,7 @@ export async function runScenario(
       responseSurface,
       diagnosticsOutput,
     )
+    const artifacts = collectedResponseArtifacts.artifacts
     const completeArtifacts: EvalRunArtifacts = {
       ...artifacts,
       scenarioId: scenario.id,
@@ -750,6 +841,11 @@ export async function runScenario(
     }
     const promptResult = buildAgentPrompt({...promptOptions, sessionId: agentResult.sessionId ?? undefined}, logger)
     const evaluation = evaluateRun(completeArtifacts)
+    if (evaluation.state !== 'passed' && collectedResponseArtifacts.rawResponse != null) {
+      diagnosticsPath =
+        persistResponseDiagnostics(environment.originalCwd, scenario.id, collectedResponseArtifacts.rawResponse) ??
+        diagnosticsPath
+    }
     return {
       scenarioId: scenario.id,
       model,
