@@ -14,6 +14,7 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
+import {inspectResponseFile, resolveResponseSurface} from './response-file.js'
 import {
   createExecutionDeadline,
   MAX_LLM_RETRIES,
@@ -24,16 +25,6 @@ import {
 import {waitForAbortableDelay} from './session-poll.js'
 
 const SESSION_ABORT_TIMEOUT_MS = 2_000
-
-async function responseFileExists(responseFilePath: string | null | undefined): Promise<boolean> {
-  if (responseFilePath == null) return false
-  try {
-    await fs.access(responseFilePath)
-    return true
-  } catch {
-    return false
-  }
-}
 
 async function abortRemoteSession(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
@@ -238,7 +229,12 @@ export async function executeOpenCode(
       const promptWasAccepted = promptAccepted
       if (result.outcome !== 'submit_failed') promptAccepted = true
 
-      if (await responseFileExists(promptOptions.responseFilePath)) break
+      const responseFileStatus = await inspectResponseFile(
+        promptOptions.responseFilePath,
+        resolveResponseSurface(promptOptions.context, promptOptions.triggerContext),
+        logger,
+      )
+      if (responseFileStatus !== 'absent') break
 
       const canResendOriginalPrompt =
         result.outcome === 'submit_failed' && promptWasAccepted === false && result.llmError?.retryable === true

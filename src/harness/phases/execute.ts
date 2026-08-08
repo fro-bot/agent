@@ -18,6 +18,7 @@ import {
   writeSessionSummary,
 } from '@fro-bot/runtime'
 import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
+import {inspectResponseFile, resolveResponseSurface} from '../../features/agent/response-file.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {buildSessionSearchQuery} from './session-prep.js'
@@ -55,16 +56,6 @@ interface ContextOverflowRecoveryOptions {
   readonly overflowedResult: ExecutePhaseResult
   readonly overflowedSessionId: string
   readonly resolveSessionId: (candidateSessionId: string | null, afterTimestamp: number) => Promise<string | null>
-}
-
-async function responseFileExists(responseFilePath: string | null): Promise<boolean> {
-  if (responseFilePath == null) return false
-  try {
-    await fs.access(responseFilePath)
-    return true
-  } catch {
-    return false
-  }
 }
 
 async function recoverFromContextOverflow(options: ContextOverflowRecoveryOptions): Promise<ExecutePhaseResult> {
@@ -274,11 +265,16 @@ export async function runExecute(
     }
 
     const credentialProvisioned = executionConfig.credentialProvisioned === true
-    const deliverablePresent = await responseFileExists(bootstrap.responseFilePath)
+    const responseFileStatus = await inspectResponseFile(
+      bootstrap.responseFilePath,
+      resolveResponseSurface(routing.agentContext, routing.triggerResult.context),
+      execLogger,
+    )
+    // Provisioned credentials can hide completed external writes; only a non-provisioned run without a valid response may be replayed.
     if (
       result.llmError?.type === 'context_overflow' &&
       credentialProvisioned === false &&
-      deliverablePresent === false &&
+      responseFileStatus === 'absent' &&
       sessionId != null
     ) {
       result = await recoverFromContextOverflow({

@@ -21,7 +21,7 @@ import {logServerEvent, processEventStream, type ActivityTracker} from './stream
 vi.mock('node:fs/promises', () => ({
   mkdir: vi.fn(),
   writeFile: vi.fn(),
-  access: vi.fn().mockRejectedValue(new Error('ENOENT')),
+  readFile: vi.fn().mockRejectedValue(new Error('ENOENT')),
 }))
 
 // Mock node:crypto
@@ -111,6 +111,24 @@ function createCurrentTurnActivityEvent(sessionID = 'ses_123'): Event {
   } as unknown as Event
 }
 
+function createCompletedPrArtifactEvent(sessionID = 'ses_123'): Event {
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID,
+      part: {
+        type: 'tool',
+        tool: 'bash',
+        state: {
+          status: 'completed',
+          input: {command: 'gh pr create --title "Created during failed turn"'},
+          output: 'https://github.com/owner/repo/pull/42',
+        },
+      },
+    },
+  } as unknown as Event
+}
+
 function createCurrentTurnActivityStream(sessionID = 'ses_123'): {
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
@@ -177,6 +195,39 @@ function createPromptStartedEventStream(
         if (aborted) return
         yield event
       }
+    })(),
+    controller,
+  }
+}
+
+function createPromptStartedErrorEventStream(
+  promptAsync: ReturnType<typeof vi.fn>,
+  events: Event[],
+  releasePromptError: () => void,
+): {
+  stream: AsyncIterable<Event>
+  controller: {abort: ReturnType<typeof vi.fn>}
+} {
+  let aborted = false
+  const controller = {
+    abort: vi.fn(() => {
+      aborted = true
+    }),
+  }
+  return {
+    stream: (async function* () {
+      const callsBeforeSubscribe = promptAsync.mock.calls.length
+      while (promptAsync.mock.calls.length === callsBeforeSubscribe) {
+        if (aborted) return
+        await new Promise<void>(resolve => setTimeout(resolve, 0))
+      }
+      if (aborted) return
+      await Promise.resolve()
+      for (const event of events) {
+        if (aborted) return
+        yield event
+      }
+      releasePromptError()
     })(),
     controller,
   }
@@ -1461,6 +1512,7 @@ describe('executeOpenCode retry behavior', () => {
     // #given
     const mockServer = createMockServer()
     let promptCallCount = 0
+    let subscribeCallCount = 0
     const promptBodies: {parts: {type: string; text?: string}[]}[] = []
 
     const mockClient = {
@@ -1480,9 +1532,12 @@ describe('executeOpenCode retry behavior', () => {
           .mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi
-          .fn()
-          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
+        subscribe: vi.fn().mockImplementation(async () => {
+          subscribeCallCount++
+          return subscribeCallCount === 1
+            ? createPromptStartedEventStream(mockClient.session.promptAsync, [])
+            : createPromptStartedActivityStream(mockClient.session.promptAsync)
+        }),
       },
     }
 
@@ -1505,6 +1560,104 @@ describe('executeOpenCode retry behavior', () => {
       'LLM fetch error detected, retrying with continuation prompt',
       expect.any(Object),
     )
+  })
+
+  it('continues an accepted turn after a retryable prompt response error', async () => {
+    // #given prompt submission reports a retryable error after current-turn activity was observed
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+    const promptBodies: {parts: {type: string; text?: string}[]}[] = []
+    let releasePromptError: (() => void) | null = null
+    const promptError = new Promise<{error: string}>(resolve => {
+      releasePromptError = () => resolve({error: 'fetch failed: network error'})
+    })
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async (args: {body: {parts: {type: string; text?: string}[]}}) => {
+          promptCallCount++
+          promptBodies.push(args.body)
+          if (promptCallCount === 1) return promptError
+          return {data: {parts: [{type: 'text', text: 'Response'}]}}
+        }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () => {
+          if (promptCallCount === 0) {
+            return createPromptStartedErrorEventStream(
+              mockClient.session.promptAsync,
+              [createCurrentTurnActivityEvent()],
+              () => releasePromptError?.(),
+            )
+          }
+          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+        }),
+      },
+    }
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+
+    // #then the accepted turn gets a continuation instead of replaying the original prompt
+    expect(promptCallCount).toBe(2)
+    expect(promptBodies[1]?.parts[0]?.text).toContain('observed failure type `llm_fetch_error`')
+    expect(promptBodies[1]?.parts[0]?.text).not.toBe('Built prompt with sessionId')
+    expect(result.success).toBe(true)
+  })
+
+  it('preserves artifacts observed before a retryable prompt response error', async () => {
+    // #given a failed prompt response arrives after activity and a completed PR artifact
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+    let releasePromptError: (() => void) | null = null
+    const promptError = new Promise<{error: string}>(resolve => {
+      releasePromptError = () => resolve({error: 'fetch failed: network error'})
+    })
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          if (promptCallCount === 1) return promptError
+          return {data: {parts: [{type: 'text', text: 'Response'}]}}
+        }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () => {
+          if (promptCallCount === 0) {
+            return createPromptStartedErrorEventStream(
+              mockClient.session.promptAsync,
+              [createCurrentTurnActivityEvent(), createCompletedPrArtifactEvent()],
+              () => releasePromptError?.(),
+            )
+          }
+          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+        }),
+      },
+    }
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+
+    // #then the artifact from the failed turn survives the continuation
+    expect(result.prsCreated).toEqual(['https://github.com/owner/repo/pull/42'])
+    expect(promptCallCount).toBe(2)
   })
 
   it('does not retry when session.status retry classifies as quota_exceeded (non-retryable)', async () => {
@@ -1982,7 +2135,7 @@ describe('executeOpenCode retry behavior', () => {
 
   it('does not overwrite an existing response-file delivery after a failed turn', async () => {
     // #given the failed attempt already produced the trusted response artifact
-    vi.mocked(fs.access).mockResolvedValue(undefined)
+    vi.mocked(fs.readFile).mockResolvedValue('A valid response body')
     const mockServer = createMockServer()
     let promptCallCount = 0
     const mockClient = {

@@ -424,6 +424,19 @@ export async function runPromptAttempt(
         deadline == null ? await startPrompt() : await deadline.run(startPrompt, 'prompt submission')
       if (promptStartResult != null) {
         await collectEventResults()
+        if (activityTracker.firstMeaningfulEventReceived === true) {
+          const effectiveLlmError = eventStreamResult.llmError ?? promptStartResult.llmError
+          const outcome: AttemptOutcome =
+            effectiveLlmError?.retryable === true ? 'turn_failed_retryable' : 'turn_failed_terminal'
+          return {
+            ...promptStartResult,
+            error: promptStartResult.error,
+            llmError: effectiveLlmError,
+            outcome,
+            shouldRetry: shouldRetryFromOutcome(outcome),
+            eventStreamResult,
+          }
+        }
         return promptStartResult
       }
     }
