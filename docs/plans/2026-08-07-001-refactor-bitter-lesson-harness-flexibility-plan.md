@@ -478,7 +478,7 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 
 - [ ] **U7. Liveness signals and the carry ledger**
 
-**Goal:** Replace the silence-as-failure proxy, and give the twelve upstream carries an exit path.
+**Goal:** Give the twelve upstream carries an exit path. The silence-as-failure proxy stays; see the investigation below for why replacing it is not currently possible.
 
 **Requirements:** R6
 
@@ -499,13 +499,22 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 
 The approach also dismissed `busy` as internal pool state. That conflates two different things. `run-state.ts` keeps an internal `busy` flag used to reject concurrent prompts, which is indeed not consumable. But `SessionStatus` is a published union of `{type:'idle'} | {type:'retry', …} | {type:'busy'}`, and the server writes `{type:'busy'}` through `SessionStatus.set` from three call sites. `set` persists every non-idle status in the instance map (idle deletes the entry and returns early), and `list` backs the `/session/status` endpoint.
 
-That makes `busy` observable in the response the poll loop **already requests every iteration**. `session-poll.ts` switches on `sessionStatus.type` today, handling `idle` and `retry` and letting `busy` fall through to a debug log. The liveness signal was already arriving and being discarded.
+That makes `busy` observable in the response the poll loop already requests every iteration. But observable is not the same as useful, and a further check refuted the idea of building on it — including an earlier revision of this section, which proposed exactly that.
 
-**Approach:**
+`busy` is **latched state, not a heartbeat.** The server sets it at the top of each prompt-loop iteration and clears it only on idle. The payload is `{type: 'busy'}` with no timestamp and no progress field, so an observer cannot distinguish a session that set it one second ago from one that set it twenty minutes ago. Re-setting it to the same value carries no information.
 
-- Prefer real protocol signals over the 90-second no-initial-activity timeout, bounded always by the absolute deadline. Leave the poll interval, race guard, grace cycles, and backoff alone.
-- Use the `busy` session status as the liveness signal. The existing timeout infers a crashed server from silence; a `busy` status is direct evidence the server is alive and the session is advancing, so it must suppress that inference. No new request, event subscription, or plumbing is required — only handling a status the poll already receives.
-- The absolute deadline remains the sole hard bound. Suppressing the silence heuristic must never remove it.
+That matters because of which failure the 90-second timeout actually catches. A crashed server does not answer `session.status()` at all; that path fails and is handled separately. The timeout exists for the case where the process is _responsive_ but the session is wedged mid-prompt — and that is precisely the case where the status stays `busy` forever. Suppressing the timeout on `busy` would delete the only detector for the failure it was written for, trading a 90-second failure for one that burns the entire execution deadline.
+
+This was already settled. `opencode.test.ts` carries a test named "does not treat matching busy session status as activity", added deliberately by an earlier fix. The prior decision considered `busy` and rejected it for these reasons; it was correct.
+
+**Outcome: the liveness half of this unit cannot be implemented as specified.** Of the three signals named, one does not exist, one is declared in the SDK types but never emitted by the server, and the third carries no progress information. The only real progress signal, `message.part.delta`, is already consumed and is what sets the activity flag today. There is no unused signal to promote.
+
+The honest result is therefore the same discipline applied in U3 and U4: where no sufficient signal exists, narrow the unit rather than build on false confidence. The 90-second heuristic stays until a signal that distinguishes _slow_ from _wedged_ becomes available — a per-session progress timestamp, or a tool-progress event the server actually emits.
+
+**Approach (carry ledger only):**
+
+- Leave `session-poll.ts` unchanged. The poll interval, race guard, grace cycles, backoff, and the initial-activity timeout all stay as they are.
+- The absolute deadline remains the sole hard bound, as before.
 - Scope the ledger to the twelve upstream carries only. A generalised "expiry register" covering every accommodation is process overhead ahead of demonstrated need; the carries have that need already — the same carry has been wrongly proposed for removal in two consecutive base-bump audits, each time costing a source-level re-litigation.
 - For each carry, record the capability it provides, which surface it serves, upstream status, the evidence it is still needed, and its removal condition. The exact version pin stays; the liability is fork-delta with no exit path.
 - **Record absent evidence as absent.** A survey of the twelve found that six (`#33134`, `#33159`, `#31922`, `#34975`, `#34977`, `#36361`) have no in-repo test, consumer, or assertion establishing they are still needed — only a line in a prior bump note. No carry has an in-repo record of the upstream version that would contain it. A schema that demands those fields invites inventing them, which is worse than the gap: a fabricated justification survives the next audit unchallenged. Entries state what the repo actually supports and mark the rest unestablished.
@@ -519,17 +528,13 @@ That makes `busy` observable in the response the poll loop **already requests ev
 
 **Test scenarios:**
 
-- Happy path: a session reporting `busy` past the silence threshold is not aborted while the deadline remains.
-- Edge case: a session reporting no status at all past the silence threshold still aborts as it does today.
-- Edge case: a run emitting no signals at all is still bounded by the absolute deadline.
-- Integration: the absolute deadline still terminates a hung run, including one reporting `busy` throughout.
-
-The earlier `Retry-After` scenario is dropped: honoring it would change the backoff this unit's approach explicitly leaves alone, and the `retry` status is already handled separately.
+The polling scenarios are dropped along with the liveness change. The existing coverage stands unmodified, including the test asserting that a `busy` status is not treated as activity — that test now guards a decision this unit re-confirmed rather than one it replaced.
 
 **Verification:**
 
-- No path can wait indefinitely; the absolute deadline remains the hard bound, and a permanently-`busy` session still terminates on it.
+- `session-poll.ts` is unchanged, and its existing tests pass untouched.
 - Every carry in `packages/harness/harness.config.json` has a ledger entry, with either a removal condition or an explicit note that its justification is unestablished in-repo.
+- The ledger is discoverable from where a base-bump operator already reads.
 
 ## System-Wide Impact
 
