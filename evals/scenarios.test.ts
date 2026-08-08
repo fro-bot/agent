@@ -4,6 +4,7 @@ import {RESPONSE_FILE_VERDICTS} from '../packages/runtime/src/agent/response-fil
 import {EVAL_CANARY_PLACEHOLDER} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
 import {ALL_SCENARIOS, MAX_SCENARIOS} from './scenarios/index.js'
+import {issueKnownFilesScenario} from './scenarios/issue-known-files.js'
 import {plantedDefectScenario} from './scenarios/planted-defect.js'
 
 function expectationTokens(scenario: Scenario): readonly string[] {
@@ -118,5 +119,37 @@ describe('eval scenario registry', () => {
     expect(prompt).not.toContain('approve')
     expect(prompt).not.toContain('request-changes')
     expect(prompt).not.toContain('src/access.ts')
+  })
+
+  it('registers the issue answer scenario after the existing review scenarios', () => {
+    // #given the centralized registry
+    // #when scenario IDs are inspected
+    // #then the stable corpus order includes the issue-answer scenario
+    expect(ALL_SCENARIOS.map(scenario => scenario.id)).toEqual(['clean-pr', 'planted-defect', 'issue-known-files'])
+  })
+
+  it('models the issue answer scenario as a non-PR issue comment with answer signals', () => {
+    // #given the issue answer scenario
+    // #when its surface and outcome expectations are inspected
+    // #then it has no PR diff and requires the defining file plus an equivalent delay value
+    expect(issueKnownFilesScenario.surface.kind).toBe('issue_comment')
+    expect(issueKnownFilesScenario.surface.hydratedContext).toBeNull()
+    expect('diffFiles' in issueKnownFilesScenario.surface).toBe(false)
+    expect(issueKnownFilesScenario.expect.verdict).toBeNull()
+    expect(issueKnownFilesScenario.expect.requiredSignals).toEqual([
+      {id: 'defining-file', anyOf: ['src/retry-policy.ts']},
+      {id: 'max-retry-delay', anyOf: ['2750', '2,750', '2.75 seconds', '2.75s']},
+    ])
+  })
+
+  it('keeps issue answer values and source path out of the agent-facing input', () => {
+    // #given the issue answer scenario's typed event and neutral prompt
+    const promptAndEvent = `${issueKnownFilesScenario.prompt}\n${JSON.stringify(issueKnownFilesScenario.surface.event)}`
+
+    // #when answer hints are searched for
+    // #then neither the event nor prompt gives away the expected response
+    for (const hint of ['src/retry-policy.ts', '2750', '2,750', '2.75 seconds', '2.75s']) {
+      expect(promptAndEvent).not.toContain(hint)
+    }
   })
 })

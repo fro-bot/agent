@@ -48,8 +48,8 @@ function writeReportAtomically(outputPath: string, report: unknown, runId: strin
 }
 
 describe.skipIf(EVAL_ENABLED === false)('agent outcome eval corpus', {timeout: SUITE_TIMEOUT_MS}, () => {
-  it('runs exactly the two frozen U1 scenarios and writes their reports', async () => {
-    // #given the two intentionally small frozen scenarios
+  it('runs all frozen U1 scenarios and writes their reports', async () => {
+    // #given the intentionally small frozen scenario corpus
     const logger = createLogger({component: 'eval-corpus'})
     const reports: EvalRunReport[] = []
     const runId = crypto.randomUUID()
@@ -110,7 +110,7 @@ describe.skipIf(EVAL_ENABLED === false)('agent outcome eval corpus', {timeout: S
     persist(true)
 
     // #then completed regressions fail, while partial infrastructure loss remains visible
-    expect(reports).toHaveLength(2)
+    expect(reports).toHaveLength(ALL_SCENARIOS.length)
     expect(suiteVerdict.status).toBe('passed')
   })
 })
