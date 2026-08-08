@@ -493,10 +493,23 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 
 **Approach:**
 
+**Signal investigation outcome (2026-08-08): the named signal does not exist, and the dismissed one does.**
+
+`server.heartbeat` is not an event. The SDK's server-level events are `server.connected` and `server.instance.disposed`; neither is periodic, so there is no server-level liveness signal to consume. The distinction the approach drew between server-level heartbeat and session-level progress is therefore moot — only session-level evidence exists.
+
+The approach also dismissed `busy` as internal pool state. That conflates two different things. `run-state.ts` keeps an internal `busy` flag used to reject concurrent prompts, which is indeed not consumable. But `SessionStatus` is a published union of `{type:'idle'} | {type:'retry', …} | {type:'busy'}`, and the server writes `{type:'busy'}` through `SessionStatus.set` from three call sites. `set` persists every non-idle status in the instance map (idle deletes the entry and returns early), and `list` backs the `/session/status` endpoint.
+
+That makes `busy` observable in the response the poll loop **already requests every iteration**. `session-poll.ts` switches on `sessionStatus.type` today, handling `idle` and `retry` and letting `busy` fall through to a debug log. The liveness signal was already arriving and being discarded.
+
+**Approach:**
+
 - Prefer real protocol signals over the 90-second no-initial-activity timeout, bounded always by the absolute deadline. Leave the poll interval, race guard, grace cycles, and backoff alone.
-- The available signals are `session.idle`, `session.next.tool.progress`, and the server-level `server.heartbeat`; the harness already consumes `session.idle` and `message.part.delta`. Note that `busy` is **internal pool state, not an SSE event** — do not build on it. Distinguish server-level heartbeats (the process is alive) from session-level progress (this run is advancing); only the latter is evidence the agent is working.
+- Use the `busy` session status as the liveness signal. The existing timeout infers a crashed server from silence; a `busy` status is direct evidence the server is alive and the session is advancing, so it must suppress that inference. No new request, event subscription, or plumbing is required — only handling a status the poll already receives.
+- The absolute deadline remains the sole hard bound. Suppressing the silence heuristic must never remove it.
 - Scope the ledger to the twelve upstream carries only. A generalised "expiry register" covering every accommodation is process overhead ahead of demonstrated need; the carries have that need already — the same carry has been wrongly proposed for removal in two consecutive base-bump audits, each time costing a source-level re-litigation.
-- For each carry, record the capability it provides, upstream status, the test proving it is still needed, the first upstream version that would contain it, and its removal condition. The exact version pin stays; the liability is fork-delta with no exit path.
+- For each carry, record the capability it provides, which surface it serves, upstream status, the evidence it is still needed, and its removal condition. The exact version pin stays; the liability is fork-delta with no exit path.
+- **Record absent evidence as absent.** A survey of the twelve found that six (`#33134`, `#33159`, `#31922`, `#34975`, `#34977`, `#36361`) have no in-repo test, consumer, or assertion establishing they are still needed — only a line in a prior bump note. No carry has an in-repo record of the upstream version that would contain it. A schema that demands those fields invites inventing them, which is worse than the gap: a fabricated justification survives the next audit unchallenged. Entries state what the repo actually supports and mark the rest unestablished.
+- The ledger's first job is to stop re-derivation. `#33444` is the worked example: it has been proposed for removal in two consecutive audits and kept both times, because the reason — a downstream consumer reads the aggregate session summary that stock still does not populate — lived only in session history rather than in the repo.
 - Ordinary deadlines, safety gates, and race guards get no entry. Prose-fallback and prompt-coaching removal conditions live with the code that owns them (U4, U5), not in a central register.
 - The ledger is **documentation, not enforcement**, and is explicitly non-authoritative for auth, delivery, and retry policy. An entry never justifies weakening a guard; removal still requires the normal review path.
 
@@ -506,15 +519,17 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 
 **Test scenarios:**
 
-- Happy path: a run emitting protocol progress signals is not aborted while the deadline remains.
+- Happy path: a session reporting `busy` past the silence threshold is not aborted while the deadline remains.
+- Edge case: a session reporting no status at all past the silence threshold still aborts as it does today.
 - Edge case: a run emitting no signals at all is still bounded by the absolute deadline.
-- Error path: a provider supplying `Retry-After` has it honored within the deadline rather than overridden by a fixed backoff.
-- Integration: the absolute deadline still terminates a hung run.
+- Integration: the absolute deadline still terminates a hung run, including one reporting `busy` throughout.
+
+The earlier `Retry-After` scenario is dropped: honoring it would change the backoff this unit's approach explicitly leaves alone, and the `retry` status is already handled separately.
 
 **Verification:**
 
-- No path can wait indefinitely; the absolute deadline remains the hard bound.
-- Every carry in `packages/harness/harness.config.json` has a ledger entry with a removal condition.
+- No path can wait indefinitely; the absolute deadline remains the hard bound, and a permanently-`busy` session still terminates on it.
+- Every carry in `packages/harness/harness.config.json` has a ledger entry, with either a removal condition or an explicit note that its justification is unestablished in-repo.
 
 ## System-Wide Impact
 
