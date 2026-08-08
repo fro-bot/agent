@@ -29,7 +29,8 @@
     "fix": "bun run --filter @fro-bot/runtime fix && bun run --filter @fro-bot/action fix && bun run --filter @fro.bot/harness fix && bun run --filter @fro-bot/gateway fix",
     "postinstall": "simple-git-hooks",
     "lint": "bun run --filter @fro-bot/runtime lint && bun run --filter @fro-bot/action lint && bun run --filter @fro.bot/harness lint && bun run --filter @fro-bot/gateway lint && bun run dist:check-hidden-unicode && bun run check:md-links",
-    "test": "bun run --filter @fro-bot/runtime test && bun run --filter @fro-bot/action test && bun run --filter @fro.bot/harness test && bun run --filter @fro-bot/gateway test",
+    "test": "bun run --filter @fro-bot/runtime test && bun run --filter @fro-bot/action test && bun run --filter @fro.bot/harness test && bun run --filter @fro-bot/gateway test && bun run test:evals",
+    "test:evals": "vitest run evals/",
     "test:scripts": "vitest run scripts/"
   },
   "simple-git-hooks": {
@@ -69,7 +70,7 @@
     "@bfra.me/es": "0.1.0",
     "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.2.0",
-    "@opencode-ai/sdk": "1.18.5"
+    "@opencode-ai/sdk": "1.18.13"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.51.1",
@@ -89,7 +90,7 @@
     "lint-staged": "17.0.8",
     "prettier": "3.9.6",
     "read-package-up": "12.0.0",
-    "semantic-release": "25.0.8",
+    "semantic-release": "25.0.9",
     "simple-git-hooks": "2.13.1",
     "tsdown": "0.22.14",
     "typescript": "6.0.3",

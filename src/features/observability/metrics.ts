@@ -1,3 +1,4 @@
+import type {ClassificationPath} from '@fro-bot/runtime'
 import type {TokenUsage} from '../../shared/types.js'
 import type {ErrorRecord, RunMetrics} from './types.js'
 
@@ -12,7 +13,7 @@ export interface MetricsCollector {
   addCommitCreated: (sha: string) => void
   incrementComments: () => void
   setTokenUsage: (usage: TokenUsage, model: string | null, cost: number | null) => void
-  recordError: (type: string, message: string, recoverable: boolean) => void
+  recordError: (type: string, message: string, recoverable: boolean, classificationPath?: ClassificationPath) => void
   getMetrics: () => RunMetrics
 }
 
@@ -89,13 +90,15 @@ export function createMetricsCollector(): MetricsCollector {
       cost = costValue
     },
 
-    recordError(type: string, message: string, recoverable: boolean): void {
-      errors.push({
+    recordError(type: string, message: string, recoverable: boolean, classificationPath?: ClassificationPath): void {
+      const error: ErrorRecord = {
         timestamp: new Date().toISOString(),
         type,
         message,
         recoverable,
-      })
+        ...(classificationPath == null ? {} : {classificationPath}),
+      }
+      errors.push(error)
     },
 
     getMetrics(): RunMetrics {

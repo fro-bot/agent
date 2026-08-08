@@ -15,7 +15,7 @@
         "@bfra.me/es": "0.1.0",
         "@fro-bot/runtime": "workspace:*",
         "@octokit/auth-app": "8.2.0",
-        "@opencode-ai/sdk": "1.18.5",
+        "@opencode-ai/sdk": "1.18.13",
       },
       "devDependencies": {
         "@bfra.me/eslint-config": "0.51.1",
@@ -35,7 +35,7 @@
         "lint-staged": "17.0.8",
         "prettier": "3.9.6",
         "read-package-up": "12.0.0",
-        "semantic-release": "25.0.8",
+        "semantic-release": "25.0.9",
         "simple-git-hooks": "2.13.1",
         "tsdown": "0.22.14",
         "typescript": "6.0.3",
@@ -89,7 +89,7 @@
       "version": "0.0.0-development",
       "dependencies": {
         "@bfra.me/es": "0.1.0",
-        "@opencode-ai/sdk": "1.18.5",
+        "@opencode-ai/sdk": "1.18.13",
         "zod": "4.4.3",
       },
     },
@@ -325,7 +325,7 @@
 
     "@octokit/webhooks-types": ["@octokit/webhooks-types@7.6.1", "", {}, "sha512-S8u2cJzklBC0FgTwWVLaM8tMrDuDMVE4xiTK4EYXM9GntyvrdbSoxqDQa+Fh57CCNApyIpyeqPhhFEmHPfrXgw=="],
 
-    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.18.5", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-7KgMvP5/1oxbhHj6kYBtPSTEdFKYpUeEYOzBTKdzSaRpapUpFFdn6Hkus3rr0rljO0kukWZIgRd3DrVBwTULGA=="],
+    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.18.13", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-JY9etiVcu1G/pZjaH2vjK/b8z54ujxaWCD1GziO4ADUhRM6m6zm2332bPGcxEfA6TwweiJfNlK6wVZQ0f/X4KQ=="],
 
     "@ota-meshi/ast-token-store": ["@ota-meshi/ast-token-store@0.3.0", "", {}, "sha512-XRO0zi2NIUKq2lUk3T1ecFSld1fMWRKE6naRFGkgkdeosx7IslyUKNv5Dcb5PJTja9tHJoFu0v/7yEpAkrkrTg=="],
 
@@ -1449,7 +1449,7 @@
 
     "scslre": ["scslre@0.3.0", "", { "dependencies": { "@eslint-community/regexpp": "^4.8.0", "refa": "^0.12.0", "regexp-ast-analysis": "^0.7.0" } }, "sha512-3A6sD0WYP7+QrjbfNA2FN3FsOaGGFoekCVgTyypy53gPxhbkCIjtO6YWgdrfM+n/8sI8JeXZOIxsHjMTNxQ4nQ=="],
 
-    "semantic-release": ["semantic-release@25.0.8", "", { "dependencies": { "@semantic-release/commit-analyzer": "^13.0.1", "@semantic-release/error": "^4.0.0", "@semantic-release/github": "^12.0.0", "@semantic-release/npm": "^13.1.1", "@semantic-release/release-notes-generator": "^14.1.0", "aggregate-error": "^5.0.0", "cosmiconfig": "^9.0.0", "debug": "^4.0.0", "env-ci": "^11.0.0", "execa": "^9.0.0", "figures": "^6.0.0", "find-versions": "^6.0.0", "get-stream": "^6.0.0", "git-log-parser": "^1.2.0", "hook-std": "^4.0.0", "hosted-git-info": "^9.0.0", "import-from-esm": "^2.0.0", "lodash-es": "^4.17.21", "marked": "^15.0.0", "marked-terminal": "^7.3.0", "micromatch": "^4.0.2", "p-each-series": "^3.0.0", "p-reduce": "^3.0.0", "read-package-up": "^12.0.0", "resolve-from": "^5.0.0", "semver": "^7.3.2", "signale": "^1.2.1", "yargs": "^18.0.0" }, "bin": { "semantic-release": "bin/semantic-release.js" } }, "sha512-w/iZ0bur36rKffXZYmIUmy068eoBY3Ij1DCCddx2JwWEM5Tg+eU9ld/E9qSInVvPASyyR2Ln/XGfQ9OZrMlhtw=="],
+    "semantic-release": ["semantic-release@25.0.9", "", { "dependencies": { "@semantic-release/commit-analyzer": "^13.0.1", "@semantic-release/error": "^4.0.0", "@semantic-release/github": "^12.0.0", "@semantic-release/npm": "^13.1.1", "@semantic-release/release-notes-generator": "^14.1.0", "aggregate-error": "^5.0.0", "cosmiconfig": "^9.0.0", "debug": "^4.0.0", "env-ci": "^11.0.0", "execa": "^9.0.0", "figures": "^6.0.0", "find-versions": "^6.0.0", "get-stream": "^6.0.0", "git-log-parser": "^1.2.0", "hook-std": "^4.0.0", "hosted-git-info": "^9.0.0", "import-from-esm": "^2.0.0", "lodash-es": "^4.17.21", "marked": "^15.0.0", "marked-terminal": "^7.3.0", "micromatch": "^4.0.2", "p-each-series": "^3.0.0", "p-reduce": "^3.0.0", "read-package-up": "^12.0.0", "resolve-from": "^5.0.0", "semver": "^7.3.2", "signale": "^1.2.1", "yargs": "^18.0.0" }, "bin": { "semantic-release": "bin/semantic-release.js" } }, "sha512-bxve7csK0/Txr++CkfrmV+X1r4jqiSOw2WsSad9E2S68R+ZfLBwDn8IceM8WfiOmKQIHgsQc1cNA8Dzg7U75pg=="],
 
     "semver": ["semver@7.8.5", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA=="],
 

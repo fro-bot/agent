@@ -94,6 +94,7 @@ const LLM_FETCH_ERROR_PATTERNS = [
   /network error/i,
 ] as const
 
+// Retain until transport failures expose a stable structured SDK marker.
 export function isLlmFetchError(error: unknown): boolean {
   if (error == null) return false
 
@@ -126,6 +127,19 @@ export function createLLMFetchError(message: string, model?: string): ErrorInfo 
   })
 }
 
+/**
+ * Build a retryable error for a provider failure the API itself marked as
+ * retryable. Deliberately claims no cause: the provider stated the request may
+ * succeed if repeated, and nothing in that signal identifies the failure as a
+ * network fault, so describing it as one would assert something unobserved.
+ */
+export function createRetryableApiError(message: string, model?: string): ErrorInfo {
+  return createErrorInfo('api_error', `Provider request failed: ${message}`, true, {
+    details: model == null ? undefined : `Model: ${model}`,
+    suggestedAction: 'The provider reported this failure as retryable. The request may succeed on retry.',
+  })
+}
+
 const AGENT_NOT_FOUND_PATTERNS = [
   /agent\s+not\s+found/i,
   /unknown\s+agent/i,
@@ -135,6 +149,7 @@ const AGENT_NOT_FOUND_PATTERNS = [
   /agent\s+\S+\s+is\s+not\s+available/i,
 ] as const
 
+// Retain until agent-not-found failures expose a stable structured SDK marker.
 export function isAgentNotFoundError(error: unknown): boolean {
   if (error == null) return false
 

@@ -43,8 +43,8 @@ export const OMO_PROVIDERS_DISABLED = {
   kimiForCoding: 'no',
 } as const
 
-// Retry configuration lives in agent/retry.ts (RETRY_DELAYS_MS, MAX_LLM_RETRIES)
-// to colocate with the retry logic that consumes the values.
+// Retry configuration lives in the Action layer's src/features/agent/retry.ts,
+// colocated with the retry logic that consumes the values.
 
 // Cache key components
 export const CACHE_PREFIX = 'opencode-storage' as const

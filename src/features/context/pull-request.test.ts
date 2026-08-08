@@ -211,6 +211,85 @@ describe('hydratePullRequestContext', () => {
     expect(result?.totalFiles).toBe(500)
   })
 
+  it('keeps newest comments, commits, and reviews while leaving files path-ordered', async () => {
+    // #given
+    const comments = Array.from({length: 10}, (_, index) => ({
+      id: `c${index + 1}`,
+      body: `Comment ${index + 1}`,
+      createdAt: `2024-01-01T00:${String(index + 1).padStart(2, '0')}:00Z`,
+      author: {login: `commenter${index + 1}`},
+      authorAssociation: 'NONE',
+      isMinimized: false,
+    }))
+    const commits = Array.from({length: 10}, (_, index) => ({
+      commit: {
+        oid: `commit-${index + 1}`,
+        message: `Commit ${index + 1}`,
+        author: {name: `author${index + 1}`},
+      },
+    }))
+    const reviews = Array.from({length: 10}, (_, index) => ({
+      state: 'COMMENTED',
+      body: `Review ${index + 1}`,
+      createdAt: `2024-01-01T01:${String(index + 1).padStart(2, '0')}:00Z`,
+      author: {login: `reviewer${index + 1}`},
+      comments: {nodes: []},
+    }))
+    const mockResponse = {
+      repository: {
+        pullRequest: {
+          number: 1,
+          title: 'Recent Evidence PR',
+          body: 'Body',
+          state: 'OPEN',
+          createdAt: '2024-01-01T00:00:00Z',
+          author: {login: 'user'},
+          baseRefName: 'main',
+          headRefName: 'feature',
+          baseRepository: {owner: {login: 'owner'}},
+          headRepository: {owner: {login: 'owner'}},
+          labels: {nodes: []},
+          assignees: {nodes: []},
+          comments: {totalCount: comments.length, nodes: comments},
+          commits: {totalCount: commits.length, nodes: commits},
+          files: {
+            totalCount: 3,
+            nodes: [
+              {path: 'src/a.ts', additions: 1, deletions: 0},
+              {path: 'src/b.ts', additions: 2, deletions: 0},
+              {path: 'src/c.ts', additions: 3, deletions: 0},
+            ],
+          },
+          reviews: {totalCount: reviews.length, nodes: reviews},
+          authorAssociation: 'MEMBER',
+          reviewRequests: {nodes: []},
+        },
+      },
+    }
+    const octokit = createMockOctokit(mockResponse)
+    const budget: ContextBudget = {
+      ...DEFAULT_CONTEXT_BUDGET,
+      maxComments: 3,
+      maxCommits: 3,
+      maxFiles: 2,
+      maxReviews: 3,
+    }
+
+    // #when
+    const result = await hydratePullRequestContext(octokit, 'owner', 'repo', 1, budget, logger)
+
+    // #then
+    expect(result).not.toBeNull()
+    expect(result?.comments.map(comment => comment.id)).toEqual(['c8', 'c9', 'c10'])
+    expect(result?.commits.map(commit => commit.oid)).toEqual(['commit-8', 'commit-9', 'commit-10'])
+    expect(result?.reviews.map(review => review.body)).toEqual(['Review 8', 'Review 9', 'Review 10'])
+    expect(result?.files.map(file => file.path)).toEqual(['src/a.ts', 'src/b.ts'])
+    expect(result?.commentsTruncated).toBe(true)
+    expect(result?.commitsTruncated).toBe(true)
+    expect(result?.reviewsTruncated).toBe(true)
+    expect(result?.filesTruncated).toBe(true)
+  })
+
   it('handles null headRepository for deleted fork', async () => {
     // #given
     const mockResponse = {

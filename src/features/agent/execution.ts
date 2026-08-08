@@ -11,10 +11,17 @@ import {createOpencode} from '@opencode-ai/sdk'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {CONTINUATION_PROMPT, sendPromptToSession} from './prompt-sender.js'
+import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
-import {createExecutionDeadline, MAX_LLM_RETRIES, RETRY_DELAYS_MS, type ExecutionDeadline} from './retry.js'
+import {inspectResponseFile, resolveResponseSurface} from './response-file.js'
+import {
+  createExecutionDeadline,
+  MAX_LLM_RETRIES,
+  mergeArtifactResults,
+  RETRY_DELAYS_MS,
+  type ExecutionDeadline,
+} from './retry.js'
 import {waitForAbortableDelay} from './session-poll.js'
 
 const SESSION_ABORT_TIMEOUT_MS = 2_000
@@ -93,6 +100,7 @@ export async function executeOpenCode(
     commitsCreated: final.commitsCreated,
     commentsPosted: final.commentsPosted,
     llmError: lastLlmError,
+    classificationPath: final.classificationPath,
   })
 
   try {
@@ -160,11 +168,18 @@ export async function executeOpenCode(
     const allFileParts = [...(promptOptions.fileParts ?? []), ...referenceFileParts]
 
     let lastError: string | null = null
+    let promptAccepted = false
+    let nextPrompt: {readonly kind: 'initial'} | {readonly kind: 'continuation'; readonly error: ErrorInfo} = {
+      kind: 'initial',
+    }
     for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
       if (deadline.isExpired()) return timeoutResult()
       const retryDelay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[0]
 
-      const prompt = attempt === 1 ? initialPrompt : CONTINUATION_PROMPT
+      const prompt =
+        nextPrompt.kind === 'initial'
+          ? initialPrompt
+          : buildContinuationPrompt(nextPrompt.error, config?.credentialProvisioned === true)
       const files = allFileParts.length > 0 ? allFileParts : undefined
       const result = await (async () => {
         try {
@@ -191,9 +206,9 @@ export async function executeOpenCode(
         }
       })()
 
-      if (result.success) {
-        final = result.eventStreamResult
+      final = mergeArtifactResults(result.eventStreamResult, final)
 
+      if (result.success) {
         return {
           success: true,
           exitCode: 0,
@@ -207,12 +222,42 @@ export async function executeOpenCode(
           commitsCreated: final.commitsCreated,
           commentsPosted: final.commentsPosted,
           llmError: null,
+          classificationPath: final.classificationPath,
         }
       }
 
       lastError = result.error
       lastLlmError = result.llmError
-      if (!result.shouldRetry || attempt >= MAX_LLM_RETRIES || deadline.isExpired()) break
+      const promptWasAccepted = promptAccepted
+      if (result.outcome !== 'submit_failed') promptAccepted = true
+
+      const responseFileStatus = await inspectResponseFile(
+        promptOptions.responseFilePath,
+        resolveResponseSurface(promptOptions.context, promptOptions.triggerContext),
+        logger,
+      )
+      if (responseFileStatus !== 'absent') break
+
+      const canResendOriginalPrompt =
+        result.outcome === 'submit_failed' && promptWasAccepted === false && result.llmError?.retryable === true
+      const canContinueTurn = result.outcome === 'turn_failed_retryable'
+      if (
+        (canResendOriginalPrompt === false && canContinueTurn === false) ||
+        attempt >= MAX_LLM_RETRIES ||
+        deadline.isExpired()
+      )
+        break
+
+      if (canContinueTurn) {
+        // Defensive: a retryable turn failure always carries the error that made it
+        // retryable, so this is unreachable today. Without an error there is nothing
+        // to describe, and a continuation must never fall back to the original prompt.
+        if (result.llmError == null) break
+        nextPrompt = {kind: 'continuation', error: result.llmError}
+      } else {
+        nextPrompt = {kind: 'initial'}
+      }
+
       shouldAbortRemoteOnTimeout = true
       logger.warning('LLM fetch error detected, retrying with continuation prompt', {
         attempt,
@@ -239,11 +284,13 @@ export async function executeOpenCode(
       commitsCreated: final.commitsCreated,
       commentsPosted: final.commentsPosted,
       llmError: lastLlmError,
+      classificationPath: final.classificationPath,
     }
   } catch (error) {
     if (deadline.isTimedOut()) return timeoutResult()
     const duration = Date.now() - startTime
     const errorMessage = toErrorMessage(error)
+    const transportFailure = isLlmFetchError(error)
     logger.error('OpenCode execution failed', {error: errorMessage, durationMs: duration})
     return {
       success: false,
@@ -257,7 +304,8 @@ export async function executeOpenCode(
       prsCreated: [],
       commitsCreated: [],
       commentsPosted: 0,
-      llmError: isLlmFetchError(error) ? createLLMFetchError(errorMessage) : null,
+      llmError: transportFailure ? createLLMFetchError(errorMessage) : null,
+      classificationPath: transportFailure ? 'fallback' : 'unclassified',
     }
   } finally {
     if (shouldAbortRemoteOnTimeout && deadline.isTimedOut() && client != null && sessionId != null)

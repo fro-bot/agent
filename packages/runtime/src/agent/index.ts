@@ -4,6 +4,7 @@ export {
   createLLMFetchError,
   createLLMTimeoutError,
   createRateLimitError,
+  createRetryableApiError,
   formatErrorComment,
   isAgentNotFoundError,
   isLlmFetchError,
@@ -12,7 +13,6 @@ export {
 export type {ErrorInfo, ErrorType} from './error-format/types.js'
 
 export {ERROR_TYPES} from './error-format/types.js'
-export {executeOpenCode} from './execution.js'
 export {filterAgentEnv} from './filter-env.js'
 export {createInactivityTimer} from './inactivity-timer.js'
 export type {InactivityTimer} from './inactivity-timer.js'
@@ -37,8 +37,6 @@ export {
   RESPONSE_FILE_DIR_SEGMENT,
 } from './response-file.js'
 export type {ParsedResponse, ResponseFileError, ResponseFileErrorReason, ResponseSurface} from './response-file.js'
-export {MAX_LLM_RETRIES, runPromptAttempt} from './retry.js'
-export type {ActivityTracker, EventStreamResult, PromptAttemptDependencies} from './retry.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
 export type {OpenCodeServerHandle} from './server.js'
 export {createSessionTools, info, list, read, search} from './session-tools.js'
@@ -48,6 +46,7 @@ export type {
   AcknowledgmentState,
   AgentContext,
   AgentResult,
+  ClassificationPath,
   ContextBudget,
   DiffContext,
   DiffFileSummary,
