@@ -1,13 +1,17 @@
 import type {Scenario} from './types.js'
 import {describe, expect, it} from 'vitest'
 import {RESPONSE_FILE_VERDICTS} from '../packages/runtime/src/agent/response-file.js'
-import {EVAL_CANARY_PLACEHOLDER} from './runner.js'
+import {buildAgentPrompt} from '../src/features/agent/index.js'
+import {createLogger} from '../src/shared/logger.js'
+import {buildPromptOptions, EVAL_CANARY_PLACEHOLDER} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
 import {continuationIrrelevantNonDegradationScenario} from './scenarios/continuation-irrelevant-non-degradation.js'
 import {continuationRelevantScenario} from './scenarios/continuation-relevant.js'
 import {ALL_SCENARIOS, MAX_SCENARIOS} from './scenarios/index.js'
 import {issueKnownFilesScenario} from './scenarios/issue-known-files.js'
 import {plantedDefectScenario} from './scenarios/planted-defect.js'
+import {NEUTRAL_REVIEW_PROMPT} from './scenarios/shared.js'
+import {unchangedConstraintViolationScenario} from './scenarios/unchanged-constraint-violation.js'
 
 function expectationTokens(scenario: Scenario): readonly string[] {
   return [...RESPONSE_FILE_VERDICTS, ...scenario.expect.requiredSignals.flatMap(group => group.anyOf)]
@@ -117,7 +121,181 @@ describe('eval scenario registry', () => {
       'issue-known-files',
       'continuation-relevant',
       'continuation-irrelevant-non-degradation',
+      'unchanged-constraint-violation',
     ])
+  })
+
+  it('models an unchanged-constraint violation as an actionable PR review', () => {
+    // #given the unchanged-constraint violation scenario
+    // #when its surface and outcome contract are inspected
+    // #then it identifies the changed violation and unchanged authority without a second quality mechanism
+    expect(unchangedConstraintViolationScenario.surface.kind).toBe('pull_request')
+    expect(unchangedConstraintViolationScenario.prompt).toBe(NEUTRAL_REVIEW_PROMPT)
+    expect(unchangedConstraintViolationScenario.priorWork).toBeNull()
+    expect(unchangedConstraintViolationScenario.expect).toEqual({
+      verdict: 'request-changes',
+      requiredSignals: [
+        {id: 'violating-file', anyOf: ['src/retry-policy.ts']},
+        {id: 'constraint-source', anyOf: ['deploy/lease-policy.json']},
+      ],
+    })
+    expect(Object.keys(unchangedConstraintViolationScenario)).not.toContain('forbiddenSignals')
+    expect(Object.keys(unchangedConstraintViolationScenario.expect)).toEqual(['verdict', 'requiredSignals'])
+  })
+
+  it('keeps hydrated comments chronological, descriptive, and non-normative', () => {
+    // #given the supplied hydrated PR context
+    if (unchangedConstraintViolationScenario.surface.kind !== 'pull_request') {
+      throw new Error('Unchanged-constraint violation must use a pull_request surface')
+    }
+    const context = unchangedConstraintViolationScenario.surface.hydratedContext
+    if (context == null || context.type !== 'pull_request') {
+      throw new Error('Unchanged-constraint violation must provide hydrated pull request context')
+    }
+
+    // #when the context ordering and comment language are inspected
+    // #then exactly three chronological comments contain only descriptions of the visible patch
+    expect(context.comments).toHaveLength(3)
+    expect(context.commentsTruncated).toBe(false)
+    expect(context.totalComments).toBe(3)
+    expect(context.comments.map(comment => comment.createdAt)).toEqual([
+      '2026-08-01T10:00:00Z',
+      '2026-08-02T10:00:00Z',
+      '2026-08-03T10:00:00Z',
+    ])
+    const forbiddenCommentTerms = [
+      'must',
+      'cannot',
+      'require',
+      'should',
+      'block',
+      'ship',
+      'merge',
+      'lgtm',
+      '2500',
+      'EDGE-BUDGET',
+      'deploy/lease-policy.json',
+      'lease budget',
+      'retry ceiling',
+    ]
+    const serializedComments = JSON.stringify(context.comments).toLowerCase()
+    for (const term of forbiddenCommentTerms) {
+      expect(serializedComments).not.toContain(term.toLowerCase())
+    }
+    for (const group of unchangedConstraintViolationScenario.expect.requiredSignals) {
+      for (const signal of group.anyOf) {
+        expect(serializedComments).not.toContain(signal.toLowerCase())
+      }
+    }
+  })
+
+  it('keeps the authoritative policy independent from the visible diff', () => {
+    // #given the unchanged policy fixture and hydrated changed-file metadata
+    if (unchangedConstraintViolationScenario.surface.kind !== 'pull_request') {
+      throw new Error('Unchanged-constraint violation must use a pull_request surface')
+    }
+    const context = unchangedConstraintViolationScenario.surface.hydratedContext
+    if (context == null || context.type !== 'pull_request') {
+      throw new Error('Unchanged-constraint violation must provide hydrated pull request context')
+    }
+    const policyText = unchangedConstraintViolationScenario.files['deploy/lease-policy.json']
+    if (policyText == null) {
+      throw new Error('Unchanged-constraint violation must provide the unchanged policy fixture')
+    }
+
+    // #when the policy content and changed-file metadata are inspected
+    // #then the policy independently supplies the limit and lease relation while staying outside the diff
+    expect(JSON.parse(policyText)).toEqual({
+      authority: 'gateway lease-renewal mechanism',
+      leaseRenewalBudgetMs: 2500,
+      retryBackoff: {
+        maxMs: 2500,
+        constraint:
+          'Retry backoff must not exceed the lease renewal budget because the gateway re-leases between retry attempts; a longer backoff outlives the lease.',
+      },
+    })
+    expect(policyText).toMatch(/retry backoff/i)
+    expect(policyText).toMatch(/2500/)
+    expect(policyText).toMatch(/gateway re-leases between retry attempts/i)
+    expect(policyText).toMatch(/longer backoff outlives the lease/i)
+    expect(unchangedConstraintViolationScenario.surface.diffFiles).not.toContainEqual(
+      expect.objectContaining({filename: 'deploy/lease-policy.json'}),
+    )
+    expect(context.files).not.toContainEqual(expect.objectContaining({path: 'deploy/lease-policy.json'}))
+  })
+
+  it('keeps the visible source and test coherent at 3000ms', () => {
+    // #given the unchanged-constraint violation fixture
+    if (unchangedConstraintViolationScenario.surface.kind !== 'pull_request') {
+      throw new Error('Unchanged-constraint violation must use a pull_request surface')
+    }
+    const source = unchangedConstraintViolationScenario.files['src/retry-policy.ts']
+    const test = unchangedConstraintViolationScenario.files['src/retry-policy.test.ts']
+
+    // #when source, test, and changed-file metadata are compared
+    // #then the visible change is a coherent 3000ms implementation/test update
+    expect(source).toContain('3000')
+    expect(test).toContain('3000')
+    expect(source).not.toContain('2500')
+    expect(test).not.toContain('2500')
+    expect(unchangedConstraintViolationScenario.surface.diffFiles).toEqual([
+      {filename: 'src/retry-policy.ts', status: 'modified', additions: 1, deletions: 1},
+      {filename: 'src/retry-policy.test.ts', status: 'modified', additions: 1, deletions: 1},
+    ])
+  })
+
+  it('keeps policy evidence and the expected outcome out of agent-facing inputs', () => {
+    // #given the scenario inputs visible to the review agent
+    if (unchangedConstraintViolationScenario.surface.kind !== 'pull_request') {
+      throw new Error('Unchanged-constraint violation must use a pull_request surface')
+    }
+    const visibleInputs = [
+      unchangedConstraintViolationScenario.prompt,
+      JSON.stringify(unchangedConstraintViolationScenario.surface.event),
+      JSON.stringify(unchangedConstraintViolationScenario.surface.diffFiles),
+      JSON.stringify(unchangedConstraintViolationScenario.surface.hydratedContext?.comments),
+    ].join('\n')
+
+    // #when policy path, value, relation, and expected verdict hints are searched for
+    // #then the agent must discover trusted policy evidence from the fixture repository
+    for (const hint of [
+      'deploy/lease-policy.json',
+      '2500',
+      'must not exceed',
+      'gateway re-leases between retry attempts',
+      'longer backoff outlives the lease',
+      'request-changes',
+    ]) {
+      expect(visibleInputs).not.toContain(hint)
+    }
+  })
+
+  it('renders hydrated comments as ordered PR-comment attachments', () => {
+    // #given a complete hydrated PR context
+    const promptOptions = buildPromptOptions(
+      unchangedConstraintViolationScenario,
+      '0123456789012345678901234567890123456789',
+      '/tmp/fro-bot-eval-response.md',
+    )
+
+    // #when the agent-facing prompt and reference files are built
+    const prompt = buildAgentPrompt(promptOptions, createLogger({component: 'eval-scenarios-test'}))
+    const commentAttachments = prompt.referenceFiles.filter(file => file.filename.startsWith('pr-comment-'))
+
+    // #then comments remain oldest-to-newest in their attachment filenames and contents
+    if (unchangedConstraintViolationScenario.surface.kind !== 'pull_request') {
+      throw new Error('Unchanged-constraint violation must use a pull_request surface')
+    }
+    const context = unchangedConstraintViolationScenario.surface.hydratedContext
+    if (context == null || context.type !== 'pull_request') {
+      throw new Error('Unchanged-constraint violation must provide hydrated pull request context')
+    }
+    expect(commentAttachments.map(file => file.filename)).toEqual([
+      'pr-comment-001-reviewer-one.txt',
+      'pr-comment-002-reviewer-two.txt',
+      'pr-comment-003-reviewer-three.txt',
+    ])
+    expect(commentAttachments.map(file => file.content)).toEqual(context.comments.map(comment => comment.body))
   })
 
   it('models the issue answer scenario as a non-PR issue comment with answer signals', () => {

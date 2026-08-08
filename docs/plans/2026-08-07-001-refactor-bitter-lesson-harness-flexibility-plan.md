@@ -130,7 +130,7 @@ Sourcing caveat: the widely repeated claim that named products "deleted scaffold
 - AE3. A provider failure arriving with a structured error name is classified without any prose match, and the classification-path metric records `structured`.
 - AE4. A provider failure arriving with no structured fields still classifies via bounded prose fallback, and the metric records `fallback`.
 - AE5. An agent run where prior session context is irrelevant still reaches the correct task outcome; irrelevant context does not degrade the answer.
-- AE6. A PR with 80 comments where the decisive evidence is in the newest 10 surfaces that evidence in the assembled context.
+- AE6. A PR with 80 comments where decisive evidence is in the newest 10 surfaces that evidence in assembled context; selection is verified deterministically, and no live scenario asserts causal effect.
 - AE7. A clean PR produces a PASS verdict with no invented blocking findings.
 
 ## High-Level Technical Design
@@ -200,7 +200,7 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 
 **Approach:**
 
-- **At-most-eight hard cap; seven live scenarios maximum.** Eight is capacity, not a target or a requirement to run eight live models. The planned live shape is: existing clean PR; planted defect; issue answer; prior-work relevant; prior-work irrelevant; newest-thread evidence; and an opt-in implementation task. The malformed/missing response case is deterministic injected-execution runner coverage, not a live-model scenario.
+- **At-most-eight hard cap; seven live scenarios maximum.** Eight is capacity, not a target or a requirement to run eight live models. The planned live shape is: existing clean PR; planted defect; issue answer; prior-work relevant; prior-work irrelevant; constraint outside the diff; and an opt-in implementation task. The malformed/missing response case is deterministic injected-execution runner coverage, not a live-model scenario.
 - The current two PR-review scenarios become the first two entries in the generalized corpus. Inputs use a small discriminated surface model; free-prose outcome expectations use required signal groups only, and absence is asserted only through single-valued structured fields such as a verdict.
 - Continuation scenarios are **U1e**. They synthesize frozen `sessionContext` and prior-work input through `PromptOptions` rather than running two nondeterministic live turns.
 - The implementation scenario is optional-live behind `FRO_BOT_EVAL_ALLOW_MUTATION=1`. It uses an `issue_comment` event with `file-convention` delivery, fixture-scoped allowed mutation paths, and a zero-setup `.mjs` / `node --test` fixture. It never uses `workflow_dispatch` or provisions GitHub credentials; mutation detection is fixture-scoped, not host containment.
@@ -213,6 +213,9 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 - Fixture content is **untrusted input**. Scenario repos and event payloads carry adversarial text by design (a PR body containing instructions is a legitimate scenario), so the runner treats fixtures as a prompt-injection surface and never grants them more authority than a real untrusted PR would have.
 - Hard executable gates cover response parsing, the expected structured verdict/outcome, exactly one delivery, required-signal presence, mutation safety, secret leakage, and scenario-specific executable outcomes where applicable. These expectations remain independent of response surface.
 - Corpus law: gates may assert signal presence in free prose, never signal absence. Presence proves access, not application; correct rejection contains the same token. Absence may be asserted only over single-valued structured fields such as a review verdict.
+- Corpus law — outcome authority. Every expected outcome is fully justified by trusted inputs: committed repo state, harness-supplied structured event, or frozen prior work. Fixture prose (PR bodies/comments/reviews) is untrusted and may never be the sole or marginal justification. If an expected outcome flips based on believing an uncorroborated fixture claim, the scenario scores credulity and false-regresses as injection resistance improves.
+- Corpus law — obligated signals. A required signal is admissible only when a correct complete response cannot omit it; merely available tokens provide no information about absence. Each required signal group must state its task obligation; in the constraint-outside-diff scenario, the changed violating file establishes the visible violation and the unchanged constraint source establishes the authoritative rule.
+- Corpus law — counterfactual limit. Single-run gates observe outcomes and signal access, not causal impact. No scenario name, description, or justification may claim that a supplied input changed the outcome.
 - A scenario that does not pass persists its response body to the gitignored diagnostics path. A failed quality gate without the body is unreproducible and cannot be recalibrated honestly.
 - Record the full tuple per run: model, OpenCode build, plugin versions, prompt hash, scenario commit, cost, duration. Cost and duration are advisory provenance, never gates.
 - Scenario execution uses the injected `EvalExecution` path for missing/malformed response tests; no live model is required for those cases.
@@ -228,7 +231,7 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 - Happy path: an issue-answer scenario reaches the expected answer outcome from known files.
 - Continuation U1e: relevant frozen prior work still reaches its expected outcome.
 - Non-degradation U1e: irrelevant frozen prior work still reaches the correct task outcome; no gate checks whether the response mentioned that context.
-- U1f newest-comment scenario: discriminate through the expected `request-changes` frontmatter verdict, not forbidden stale-marker text. Decisive newest evidence must not be inferable from the diff alone; otherwise the case measures review skill, not surfaced-evidence use. The live scenario tests use of surfaced evidence; deterministic GraphQL tests own selection and pagination correctness.
+- U1f constraint-outside-diff scenario: a visible source/test change is internally consistent but violates a fully authoritative rule in an unchanged committed repo file outside the diff. Expected `request-changes` is fully justified by committed repo state alone. Required signals are the changed violating file and unchanged constraint source. Hydrated comments remain descriptive/non-normative; no expectation depends on them, and no assertion claims supplied thread evidence changed the outcome.
 - Optional live: the implementation fixture changes only allowed paths, passes its zero-setup test, and delivers through the file convention.
 - Edge case: unmatched external-directory access is denied without an approval ask, while the run-scoped response file remains writable.
 - Deterministic runner test: injected missing and malformed responses fail the delivery/parse gates without requiring a live model.
@@ -503,7 +506,7 @@ Files have no temporal dimension. `ContextFile` is `{path, additions, deletions,
 - Edge case: the REST fallback path selects the same tail as the GraphQL path for an over-cap thread.
 - Regression: files remain path-ordered and unaffected.
 
-The U1f newest-comment eval scenario remains in U1. Its expected `request-changes` frontmatter verdict, rather than a prose-marker absence check, discriminates the outcome. Decisive newest evidence must not be inferable from the diff alone; the live scenario tests use of surfaced evidence, while deterministic GraphQL tests own evidence selection and pagination correctness.
+The U1f constraint-outside-diff eval scenario remains in U1. Expected `request-changes` is fully justified by committed repo state alone, with required signals consisting of the changed violating file and unchanged constraint source. Hydrated comments remain descriptive/non-normative; no expectation depends on them. U6 deterministic tests own newest evidence selection and pagination, while a static attachment test owns hydration-to-prompt plumbing.
 
 **Verification:**
 
@@ -605,7 +608,7 @@ The polling scenarios are dropped along with the liveness change. The existing c
 - Is the four-layer architecture over-structured for an agent harness? No. Both architecture reviews were explicit that layers and XML sections express dependency direction and authority, not reasoning constraints.
 - Is pinning an exact upstream OpenCode build a Bitter Lesson problem? No. The pin is good dependency management. The liability is the twelve carries accumulating without exit paths.
 - Is `isAgentNotFoundError` dead code? No. One review claimed it was; verification found it live via `src/features/comments/error-format.ts:11`.
-- What is U1's final scenario shape? Seven live scenarios maximum: the existing clean PR, planted defect, issue answer, relevant and irrelevant prior-work continuations, newest-thread evidence, and an opt-in implementation task. Missing/malformed responses are deterministic injected-execution tests; the at-most-eight cap is capacity, not a live-run target.
+- What is U1's final scenario shape? Seven live scenarios maximum: the existing clean PR, planted defect, issue answer, relevant and irrelevant prior-work continuations, constraint outside the diff, and an opt-in implementation task. Missing/malformed responses are deterministic injected-execution tests; the at-most-eight cap is capacity, not a live-run target.
 
 ### Deferred to Implementation
 
