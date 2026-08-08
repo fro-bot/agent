@@ -27,7 +27,7 @@ export async function hydrateIssueContext(
   const bodyResult = truncateBody(issue.body ?? '', budget.maxBodyBytes)
 
   const allComments = issue.comments.nodes
-  const limitedComments = allComments.slice(0, budget.maxComments)
+  const limitedComments = allComments.slice(Math.max(0, allComments.length - budget.maxComments))
   const commentsTruncated = issue.comments.totalCount > limitedComments.length
 
   const comments = limitedComments.map(c => ({

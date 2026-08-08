@@ -19,7 +19,7 @@ export const ISSUE_QUERY = `
         assignees(first: 10) {
           nodes { login }
         }
-        comments(first: $maxComments) {
+        comments(last: $maxComments) {
           totalCount
           nodes {
             id
@@ -63,7 +63,7 @@ export const PULL_REQUEST_QUERY = `
         assignees(first: 10) {
           nodes { login }
         }
-        comments(first: $maxComments) {
+        comments(last: $maxComments) {
           totalCount
           nodes {
             id
@@ -74,7 +74,7 @@ export const PULL_REQUEST_QUERY = `
             isMinimized
           }
         }
-        commits(first: $maxCommits) {
+        commits(last: $maxCommits) {
           totalCount
           nodes {
             commit {
@@ -92,7 +92,7 @@ export const PULL_REQUEST_QUERY = `
             deletions
           }
         }
-        reviews(first: $maxReviews) {
+        reviews(last: $maxReviews) {
           totalCount
           nodes {
             state

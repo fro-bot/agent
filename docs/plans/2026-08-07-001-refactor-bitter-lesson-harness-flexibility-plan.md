@@ -439,7 +439,7 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 - `packages/harness/src/prompt-template.test.ts` is untouched and still pins the workflow strip and its ordering.
 - No safety or output-contract assertion was relaxed.
 
-- [ ] **U6. Context page selection**
+- [x] **U6. Context page selection**
 
 **Goal:** Surface the newest evidence rather than the oldest.
 
@@ -447,18 +447,29 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 
 **Dependencies:** None
 
+**Investigation outcome (2026-08-08): three premises corrected, and the change is smaller than written.**
+
+The approach warned this is "not a local edit" because `budget.ts` assumes a forward-ordered capped list. It does not. `budget.ts` performs no list slicing or reordering at all — its only `slice` calls are byte-level body truncation and `oid.slice(0, 7)` for display. The formatters iterate whatever list they are given, and the truncation notice is driven by a `commentsTruncated` boolean rather than by position. The budget layer needs no change.
+
+The file list was incomplete. `fallback.ts` is the REST hydration path and applies the same `.slice(0, max)` across five collections. Changing only the GraphQL path would leave oldest-first selection in place whenever the fallback fires — a silent split where the two paths disagree about which evidence the model sees.
+
+Files have no temporal dimension. `ContextFile` is `{path, additions, deletions, status?}`, and a pull request's file list is a set rather than a timeline. "Newest files" is not a meaningful selection, so taking the tail would substitute one arbitrary subset for another while appearing to be an improvement. Only comments and reviews carry `createdAt`; commits have a real chronological order in a pull request even without a timestamp field.
+
 **Files:**
 
 - Modify: `src/features/context/graphql.ts`
 - Modify: `src/features/context/pull-request.ts`
 - Modify: `src/features/context/issue.ts`
+- Modify: `src/features/context/fallback.ts`
 - Test: `src/features/context/graphql.test.ts`
 
 **Approach:**
 
-- Change comment, commit, and file selection from oldest-first to newest-tail while preserving every cap in `src/features/context/types.ts`.
+- Change comment, review, and commit selection from oldest-first to newest-tail while preserving every cap in `src/features/context/types.ts`. Files are excluded: no timestamp exists, so recency cannot be expressed for them.
+- Apply the same tail selection on the REST fallback path so both hydration paths surface the same evidence.
+- `last:` returns the final N of a connection in its natural ascending order, so the returned lists stay chronological. Formatters, truncation math, and the `*Truncated` booleans are unaffected — those compare a total count against a length, not a position.
 - Keep the truncation disclosure in the assembled prompt so the model knows the set is partial.
-- This is **not a local edit**. Moving to `last:` inverts page semantics, and the downstream budget and truncation logic in `src/features/context/budget.ts` assumes a forward-ordered capped list. The change spans the query layer and the budget layer together, and the truncation math and notice behavior must be preserved across both. Scope this unit accordingly.
+- Leave `budget.ts` alone.
 
 **Patterns to follow:**
 
@@ -466,15 +477,21 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 
 **Test scenarios:**
 
-- Happy path: a thread longer than the comment cap yields the newest comments up to the cap.
+- Happy path: a thread longer than the comment cap yields the newest comments up to the cap, still in chronological order.
+- Happy path: reviews and commits past their caps yield the most recent entries.
 - Edge case: a thread shorter than the cap is unchanged.
 - Edge case: an empty comment set produces no error and no misleading truncation notice.
-- Integration: the eval scenario with decisive evidence in the newest comments passes where it previously failed.
+- Edge case: the REST fallback path selects the same tail as the GraphQL path for an over-cap thread.
+- Regression: files remain path-ordered and unaffected.
+
+The previously-proposed eval integration scenario is dropped — the corpus contains `clean-pr` and `planted-defect` only, and adding a decisive-evidence-in-newest-comments scenario belongs to the eval unit rather than this one.
 
 **Verification:**
 
 - All existing caps are unchanged in value.
 - Truncation is still disclosed in the prompt.
+- Both hydration paths agree on which end of an over-cap list is kept.
+- `budget.ts` is unchanged.
 
 - [x] **U7. Liveness signals and the carry ledger**
 
