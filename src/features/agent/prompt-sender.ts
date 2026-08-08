@@ -4,11 +4,23 @@ import type {EventStreamResult} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
-import {runPromptAttempt, type ExecutionDeadline} from './retry.js'
+import {runPromptAttempt, shouldRetryFromOutcome, type ExecutionDeadline, type PromptStartResult} from './retry.js'
 
-export const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
-Please continue where you left off. If you were in the middle of a task, resume it.
-If you had completed the task, confirm the completion.`
+export type AttemptOutcome =
+  'submit_failed' | 'turn_failed_retryable' | 'turn_failed_terminal' | 'timeout' | 'completed'
+
+export function buildContinuationPrompt(error: ErrorInfo, credentialProvisioned: boolean): string {
+  const sideEffectGuidance =
+    credentialProvisioned === true
+      ? 'Before taking any action, verify what has already landed, including external changes and response artifacts, and do not repeat completed side effects.'
+      : 'Inspect the current session state before continuing and do not repeat completed work.'
+
+  return [
+    `The previous turn was accepted but ended with the observed failure type \`${error.type}\`.`,
+    'Continue the remaining objective from the current session; do not resend or replay the original request.',
+    sideEffectGuidance,
+  ].join('\n')
+}
 
 const resolvePromptModel = (config: ExecutionConfig | undefined): {providerID: string; modelID: string} | undefined => {
   if (config?.model != null) return {providerID: config.model.providerID, modelID: config.model.modelID}
@@ -22,6 +34,8 @@ export interface AttemptResult {
   readonly success: boolean
   readonly error: string | null
   readonly llmError: ErrorInfo | null
+  readonly outcome: AttemptOutcome
+  /** Compatibility view derived from outcome; outcome is authoritative. */
   readonly shouldRetry: boolean
   readonly eventStreamResult: EventStreamResult
 }
@@ -57,22 +71,15 @@ export async function sendPromptToSession(
         : AbortSignal.any([attemptAbortController.signal, deadline.signal])
     const subscribe = async () => client.event.subscribe({signal: subscriptionSignal})
     const events = deadline == null ? await subscribe() : await deadline.run(subscribe, 'event subscription')
-    const startPrompt = async () => {
-      const response = await client.session.promptAsync({
-        path: {id: sessionId},
-        body,
-        query: {directory},
-        signal: deadline?.signal,
-      })
-      if (response.error == null) return null
-
-      const promptError = String(response.error)
-      const promptLlmError = isLlmFetchError(response.error) ? createLLMFetchError(promptError) : null
+    const createSubmissionFailure = (promptError: string, error: unknown): AttemptResult => {
+      const promptLlmError = isLlmFetchError(error) ? createLLMFetchError(promptError) : null
+      const outcome: AttemptOutcome = 'submit_failed'
       return {
         success: false,
         error: promptError,
         llmError: promptLlmError,
-        shouldRetry: promptLlmError != null,
+        outcome,
+        shouldRetry: shouldRetryFromOutcome(outcome),
         eventStreamResult: {
           tokens: null,
           model: null,
@@ -83,6 +90,16 @@ export async function sendPromptToSession(
           llmError: promptLlmError,
         },
       }
+    }
+    const startPrompt = async (): Promise<PromptStartResult> => {
+      const response = await client.session.promptAsync({
+        path: {id: sessionId},
+        body,
+        query: {directory},
+        signal: deadline?.signal,
+      })
+      if (response.error == null) return null
+      return createSubmissionFailure(String(response.error), response.error)
     }
 
     const runAttempt = async () =>

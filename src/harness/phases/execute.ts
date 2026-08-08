@@ -10,8 +10,15 @@ import type {SessionPrepPhaseResult} from './session-prep.js'
 import * as fs from 'node:fs/promises'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {archiveSession, findLatestSession, searchSessions, writeSessionSummary} from '@fro-bot/runtime'
+import {
+  archiveSession,
+  findLatestSession,
+  resolveResponseDelivery,
+  searchSessions,
+  writeSessionSummary,
+} from '@fro-bot/runtime'
 import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
+import {inspectResponseFile, resolveResponseSurface} from '../../features/agent/response-file.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {buildSessionSearchQuery} from './session-prep.js'
@@ -223,6 +230,9 @@ export async function runExecute(
       omoProviders: bootstrap.inputs.omoProviders,
       continueSessionId: sessionPrep.continueSessionId ?? undefined,
       sessionTitle: sessionPrep.sessionTitle ?? undefined,
+      credentialProvisioned:
+        resolveResponseDelivery(routing.triggerResult.context.eventName, bootstrap.inputs.responseMode).credential ===
+        'provision',
     }
 
     const resolveSessionId = async (
@@ -254,7 +264,19 @@ export async function runExecute(
       resolvedOutputMode,
     }
 
-    if (result.llmError?.type === 'context_overflow' && result.commentsPosted === 0 && sessionId != null) {
+    const credentialProvisioned = executionConfig.credentialProvisioned === true
+    const responseFileStatus = await inspectResponseFile(
+      bootstrap.responseFilePath,
+      resolveResponseSurface(routing.agentContext, routing.triggerResult.context),
+      execLogger,
+    )
+    // Provisioned credentials can hide completed external writes; only a non-provisioned run without a valid response may be replayed.
+    if (
+      result.llmError?.type === 'context_overflow' &&
+      credentialProvisioned === false &&
+      responseFileStatus === 'absent' &&
+      sessionId != null
+    ) {
       result = await recoverFromContextOverflow({
         bootstrap,
         routing,

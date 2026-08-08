@@ -11,9 +11,12 @@ import {runExecute} from './execute.js'
 
 const mocks = vi.hoisted(() => ({
   archiveSession: vi.fn(),
+  parseResponseFile: vi.fn(),
+  readResponseFile: vi.fn(),
   executeOpenCode: vi.fn(),
   findLatestSession: vi.fn(),
   removeResponseFile: vi.fn(),
+  resolveResponseDelivery: vi.fn(() => ({delivery: 'file-convention', credential: 'withhold'})),
   resolveOutputMode: vi.fn(),
   saveState: vi.fn(),
   searchSessions: vi.fn(),
@@ -28,11 +31,16 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@actions/core', () => ({saveState: mocks.saveState}))
 
-vi.mock('node:fs/promises', () => ({rm: mocks.removeResponseFile}))
+vi.mock('node:fs/promises', () => ({
+  readFile: mocks.readResponseFile,
+  rm: mocks.removeResponseFile,
+}))
 
 vi.mock('@fro-bot/runtime', () => ({
   archiveSession: mocks.archiveSession,
   findLatestSession: mocks.findLatestSession,
+  parseResponseFile: mocks.parseResponseFile,
+  resolveResponseDelivery: mocks.resolveResponseDelivery,
   searchSessions: mocks.searchSessions,
   writeSessionSummary: mocks.writeSessionSummary,
 }))
@@ -206,6 +214,9 @@ describe('runExecute overflow recovery', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(executeOpenCode).mockReset()
+    mocks.readResponseFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mocks.parseResponseFile.mockReset()
+    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
     mocks.resolveOutputMode.mockReturnValue('branch-pr')
     mocks.archiveSession.mockResolvedValue(true)
     mocks.removeResponseFile.mockResolvedValue(undefined)
@@ -453,14 +464,23 @@ describe('runExecute overflow recovery', () => {
     expect(result.overflowRecovery).toBeUndefined()
   })
 
-  it('does not restart an overflow attempt that already delivered a response', async () => {
-    // #given the overflowed attempt already posted a response
-    const deliveredOverflowResult = createAgentResult({commentsPosted: 1})
-    vi.mocked(executeOpenCode).mockResolvedValueOnce(deliveredOverflowResult)
+  it('does not restart an overflow attempt when a response file is already present', async () => {
+    // #given the overflowed attempt has no inferred artifacts but a response file is present
+    const deliveredOverflowResult = createAgentResult({commentsPosted: 0})
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      llmError: null,
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(deliveredOverflowResult).mockResolvedValueOnce(recoveredResult)
+    mocks.readResponseFile.mockResolvedValue('A valid response body')
+    mocks.parseResponseFile.mockReturnValue({success: true, data: {body: 'A valid response body'}})
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -472,7 +492,102 @@ describe('runExecute overflow recovery', () => {
     expect(vi.mocked(executeOpenCode)).toHaveBeenCalledOnce()
     expect(mocks.archiveSession).not.toHaveBeenCalled()
     expect(mocks.searchSessions).not.toHaveBeenCalled()
-    expect(result.commentsPosted).toBe(1)
+    expect(mocks.readResponseFile).toHaveBeenCalledOnce()
+    expect(result.commentsPosted).toBe(0)
+  })
+
+  it('recovers when a response file exists but is not a valid deliverable', async () => {
+    // #given the overflowed attempt left an empty response file
+    const overflowResult = createAgentResult({commentsPosted: 0})
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      llmError: null,
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(overflowResult).mockResolvedValueOnce(recoveredResult)
+    mocks.readResponseFile.mockResolvedValue('')
+    mocks.parseResponseFile.mockReturnValue({
+      success: false,
+      error: {reason: 'empty', message: 'Response file is empty'},
+    })
+
+    // #when the execute phase runs
+    const result = await runExecute(
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createRouting(),
+      createCacheRestore(),
+      createSessionPrep(),
+      createMetrics(),
+      0,
+    )
+
+    // #then recovery replaces the invalid artifact
+    expect(vi.mocked(executeOpenCode)).toHaveBeenCalledTimes(2)
+    expect(mocks.archiveSession).toHaveBeenCalledOnce()
+    expect(result.overflowRecovery?.recovered).toBe(true)
+  })
+
+  it('does not recover when response-file status is unknown', async () => {
+    // #given response-file inspection fails with an error other than missing-file
+    const overflowResult = createAgentResult({commentsPosted: 0})
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      llmError: null,
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(overflowResult).mockResolvedValueOnce(recoveredResult)
+    mocks.readResponseFile.mockRejectedValue(Object.assign(new Error('permission denied'), {code: 'EACCES'}))
+
+    // #when the execute phase runs
+    const result = await runExecute(
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createRouting(),
+      createCacheRestore(),
+      createSessionPrep(),
+      createMetrics(),
+      0,
+    )
+
+    // #then unknown delivery status conservatively suppresses recovery
+    expect(vi.mocked(executeOpenCode)).toHaveBeenCalledOnce()
+    expect(mocks.archiveSession).not.toHaveBeenCalled()
+    expect(mocks.searchSessions).not.toHaveBeenCalled()
+    expect(result.overflowRecovery).toBeUndefined()
+  })
+
+  it('does not recover a credential-provisioned overflow without a response file', async () => {
+    // #given the overflowed attempt has no inferred artifacts and no response file
+    const overflowResult = createAgentResult({commentsPosted: 0})
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      llmError: null,
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(overflowResult).mockResolvedValueOnce(recoveredResult)
+    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'provision'})
+
+    // #when the execute phase runs
+    const result = await runExecute(
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createRouting(),
+      createCacheRestore(),
+      createSessionPrep(),
+      createMetrics(),
+      0,
+    )
+
+    // #then credential provisioning prevents a fresh recovery attempt
+    expect(vi.mocked(executeOpenCode)).toHaveBeenCalledOnce()
+    expect(mocks.archiveSession).not.toHaveBeenCalled()
+    expect(mocks.searchSessions).not.toHaveBeenCalled()
+    expect(mocks.resolveResponseDelivery).toHaveBeenCalledOnce()
+    expect(result.commentsPosted).toBe(0)
   })
 
   it('does not recover non-context-overflow terminal errors', async () => {

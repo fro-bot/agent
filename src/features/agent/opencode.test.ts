@@ -21,6 +21,7 @@ import {logServerEvent, processEventStream, type ActivityTracker} from './stream
 vi.mock('node:fs/promises', () => ({
   mkdir: vi.fn(),
   writeFile: vi.fn(),
+  readFile: vi.fn().mockRejectedValue(new Error('ENOENT')),
 }))
 
 // Mock node:crypto
@@ -110,6 +111,24 @@ function createCurrentTurnActivityEvent(sessionID = 'ses_123'): Event {
   } as unknown as Event
 }
 
+function createCompletedPrArtifactEvent(sessionID = 'ses_123'): Event {
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID,
+      part: {
+        type: 'tool',
+        tool: 'bash',
+        state: {
+          status: 'completed',
+          input: {command: 'gh pr create --title "Created during failed turn"'},
+          output: 'https://github.com/owner/repo/pull/42',
+        },
+      },
+    },
+  } as unknown as Event
+}
+
 function createCurrentTurnActivityStream(sessionID = 'ses_123'): {
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
@@ -176,6 +195,39 @@ function createPromptStartedEventStream(
         if (aborted) return
         yield event
       }
+    })(),
+    controller,
+  }
+}
+
+function createPromptStartedErrorEventStream(
+  promptAsync: ReturnType<typeof vi.fn>,
+  events: Event[],
+  releasePromptError: () => void,
+): {
+  stream: AsyncIterable<Event>
+  controller: {abort: ReturnType<typeof vi.fn>}
+} {
+  let aborted = false
+  const controller = {
+    abort: vi.fn(() => {
+      aborted = true
+    }),
+  }
+  return {
+    stream: (async function* () {
+      const callsBeforeSubscribe = promptAsync.mock.calls.length
+      while (promptAsync.mock.calls.length === callsBeforeSubscribe) {
+        if (aborted) return
+        await new Promise<void>(resolve => setTimeout(resolve, 0))
+      }
+      if (aborted) return
+      await Promise.resolve()
+      for (const event of events) {
+        if (aborted) return
+        yield event
+      }
+      releasePromptError()
     })(),
     controller,
   }
@@ -1460,12 +1512,15 @@ describe('executeOpenCode retry behavior', () => {
     // #given
     const mockServer = createMockServer()
     let promptCallCount = 0
+    let subscribeCallCount = 0
+    const promptBodies: {parts: {type: string; text?: string}[]}[] = []
 
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        promptAsync: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async (args: {body: {parts: {type: string; text?: string}[]}}) => {
           promptCallCount++
+          promptBodies.push(args.body)
           if (promptCallCount === 1) {
             return Promise.resolve({error: 'fetch failed: network error'})
           }
@@ -1477,9 +1532,12 @@ describe('executeOpenCode retry behavior', () => {
           .mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi
-          .fn()
-          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
+        subscribe: vi.fn().mockImplementation(async () => {
+          subscribeCallCount++
+          return subscribeCallCount === 1
+            ? createPromptStartedEventStream(mockClient.session.promptAsync, [])
+            : createPromptStartedActivityStream(mockClient.session.promptAsync)
+        }),
       },
     }
 
@@ -1496,11 +1554,110 @@ describe('executeOpenCode retry behavior', () => {
 
     // #then
     expect(promptCallCount).toBe(2)
+    expect(promptBodies[1]?.parts[0]?.text).toBe('Built prompt with sessionId')
     expect(result.success).toBe(true)
     expect(mockLogger.warning).toHaveBeenCalledWith(
       'LLM fetch error detected, retrying with continuation prompt',
       expect.any(Object),
     )
+  })
+
+  it('continues an accepted turn after a retryable prompt response error', async () => {
+    // #given prompt submission reports a retryable error after current-turn activity was observed
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+    const promptBodies: {parts: {type: string; text?: string}[]}[] = []
+    let releasePromptError: (() => void) | null = null
+    const promptError = new Promise<{error: string}>(resolve => {
+      releasePromptError = () => resolve({error: 'fetch failed: network error'})
+    })
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async (args: {body: {parts: {type: string; text?: string}[]}}) => {
+          promptCallCount++
+          promptBodies.push(args.body)
+          if (promptCallCount === 1) return promptError
+          return {data: {parts: [{type: 'text', text: 'Response'}]}}
+        }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () => {
+          if (promptCallCount === 0) {
+            return createPromptStartedErrorEventStream(
+              mockClient.session.promptAsync,
+              [createCurrentTurnActivityEvent()],
+              () => releasePromptError?.(),
+            )
+          }
+          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+        }),
+      },
+    }
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+
+    // #then the accepted turn gets a continuation instead of replaying the original prompt
+    expect(promptCallCount).toBe(2)
+    expect(promptBodies[1]?.parts[0]?.text).toContain('observed failure type `llm_fetch_error`')
+    expect(promptBodies[1]?.parts[0]?.text).not.toBe('Built prompt with sessionId')
+    expect(result.success).toBe(true)
+  })
+
+  it('preserves artifacts observed before a retryable prompt response error', async () => {
+    // #given a failed prompt response arrives after activity and a completed PR artifact
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+    let releasePromptError: (() => void) | null = null
+    const promptError = new Promise<{error: string}>(resolve => {
+      releasePromptError = () => resolve({error: 'fetch failed: network error'})
+    })
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          if (promptCallCount === 1) return promptError
+          return {data: {parts: [{type: 'text', text: 'Response'}]}}
+        }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () => {
+          if (promptCallCount === 0) {
+            return createPromptStartedErrorEventStream(
+              mockClient.session.promptAsync,
+              [createCurrentTurnActivityEvent(), createCompletedPrArtifactEvent()],
+              () => releasePromptError?.(),
+            )
+          }
+          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+        }),
+      },
+    }
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+
+    // #then the artifact from the failed turn survives the continuation
+    expect(result.prsCreated).toEqual(['https://github.com/owner/repo/pull/42'])
+    expect(promptCallCount).toBe(2)
   })
 
   it('does not retry when session.status retry classifies as quota_exceeded (non-retryable)', async () => {
@@ -1859,15 +2016,13 @@ describe('executeOpenCode retry behavior', () => {
     // #given
     const mockServer = createMockServer()
     const promptBodies: unknown[] = []
+    let subscribeCallCount = 0
 
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
         promptAsync: vi.fn().mockImplementation(async (args: {body: unknown}) => {
           promptBodies.push(args.body)
-          if (promptBodies.length === 1) {
-            return Promise.resolve({error: 'fetch failed'})
-          }
           return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
         }),
         status: vi
@@ -1876,9 +2031,21 @@ describe('executeOpenCode retry behavior', () => {
           .mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi
-          .fn()
-          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
+        subscribe: vi.fn().mockImplementation(async () => {
+          subscribeCallCount++
+          if (subscribeCallCount === 1) {
+            return createPromptStartedEventStream(mockClient.session.promptAsync, [
+              {
+                type: 'session.error',
+                properties: {
+                  sessionID: 'ses_123',
+                  error: {status: 429, message: 'rate limited'},
+                },
+              } as unknown as Event,
+            ])
+          }
+          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+        }),
       },
     }
 
@@ -1904,7 +2071,119 @@ describe('executeOpenCode retry behavior', () => {
     expect(firstPart).toBeDefined()
     expect(secondPart).toBeDefined()
     expect(firstPart?.text).toBe('Built prompt with sessionId')
-    expect(secondPart?.text).toContain('interrupted by a network error')
+    expect(secondPart?.text).toContain('rate_limit')
+    expect(secondPart?.text).not.toContain('fetch failed')
+    expect(secondPart?.text).not.toContain('resume it')
+    expect(secondPart?.text).not.toBe('Built prompt with sessionId')
+  })
+
+  it('does not replay the original prompt after a credential-provisioned turn fails', async () => {
+    // #given the accepted turn fails after the agent may have caused an external effect
+    const mockServer = createMockServer()
+    const promptBodies: {parts: {type: string; text?: string}[]}[] = []
+    let subscribeCallCount = 0
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async (args: {body: {parts: {type: string; text?: string}[]}}) => {
+          promptBodies.push(args.body)
+          return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+        }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () => {
+          subscribeCallCount++
+          if (subscribeCallCount === 1) {
+            return createPromptStartedEventStream(mockClient.session.promptAsync, [
+              {
+                type: 'session.error',
+                properties: {
+                  sessionID: 'ses_123',
+                  error: {status: 429, message: 'rate limited'},
+                },
+              } as unknown as Event,
+            ])
+          }
+          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+        }),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: createDisabledProviders(),
+      credentialProvisioned: true,
+    })
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    await resultPromise
+
+    // #then the continuation verifies existing effects instead of replaying the original task
+    expect(promptBodies).toHaveLength(2)
+    expect(promptBodies[1]?.parts[0]?.text).toContain('verify what has already landed')
+    expect(promptBodies[1]?.parts[0]?.text).not.toBe('Built prompt with sessionId')
+  })
+
+  it('does not overwrite an existing response-file delivery after a failed turn', async () => {
+    // #given the failed attempt already produced the trusted response artifact
+    vi.mocked(fs.readFile).mockResolvedValue('A valid response body')
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+        }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () =>
+          createPromptStartedEventStream(mockClient.session.promptAsync, [
+            {
+              type: 'session.error',
+              properties: {
+                sessionID: 'ses_123',
+                error: {status: 429, message: 'rate limited'},
+              },
+            } as unknown as Event,
+          ]),
+        ),
+      },
+    }
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(
+      createMockPromptOptions({responseFilePath: '/tmp/fro-bot-response.md', responseDelivery: 'file-convention'}),
+      mockLogger,
+      {
+        agent: null,
+        model: null,
+        timeoutMs: 1800000,
+        omoProviders: createDisabledProviders(),
+      },
+    )
+    await vi.advanceTimersByTimeAsync(5000)
+    const result = await resultPromise
+
+    // #then the existing delivery wins and no continuation can overwrite it
+    expect(promptCallCount).toBe(1)
+    expect(result.success).toBe(false)
+    expect(result.exitCode).toBe(1)
   })
 
   it('keeps all file parts on retry attempts', async () => {
@@ -1960,7 +2239,7 @@ describe('executeOpenCode retry behavior', () => {
     expect(promptBodies).toHaveLength(2)
     expect(promptBodies[0]?.parts[1]).toEqual(attachedFile)
     expect(promptBodies[1]?.parts[1]).toEqual(attachedFile)
-    expect(promptBodies[1]?.parts[0]?.text).toContain('interrupted by a network error')
+    expect(promptBodies[1]?.parts[0]?.text).toBe('Built prompt with sessionId')
   })
 })
 
@@ -6005,6 +6284,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(waitFn).toHaveBeenCalled()
     expect(result.success).toBe(false)
     expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(result.outcome).toBe('turn_failed_terminal')
     expect(result.shouldRetry).toBe(false)
     expect(JSON.stringify(result)).not.toContain('sentinel-provider')
     expect(JSON.stringify(result)).not.toContain('sentinel-token')
@@ -6048,6 +6328,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(result.success).toBe(false)
     expect(result.llmError).not.toBeNull()
     expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(result.outcome).toBe('turn_failed_terminal')
     expect(result.shouldRetry).toBe(false)
     expect(result.eventStreamResult.llmError).not.toBeNull()
     expect(result.eventStreamResult.llmError?.type).toBe('quota_exceeded')
@@ -6488,6 +6769,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       expect(result.llmError).not.toBeNull()
       expect(result.llmError?.type).toBe('llm_fetch_error')
       expect(result.llmError?.retryable).toBe(true)
+      expect(result.outcome).toBe('turn_failed_retryable')
       expect(result.shouldRetry).toBe(true)
     } finally {
       vi.useRealTimers()
@@ -6518,6 +6800,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     // #then
     expect(result.success).toBe(false)
     expect(result.llmError).toBeNull()
+    expect(result.outcome).toBe('turn_failed_terminal')
     expect(result.shouldRetry).toBe(false)
   })
 

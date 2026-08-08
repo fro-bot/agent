@@ -81,6 +81,8 @@ export interface ResponseArtifacts {
   readonly executionSucceeded: boolean
   readonly executionFailureReason: string | null
   readonly executionExitCode: number
+  readonly executionDurationMs: number
+  readonly configuredTimeoutMs: number
 }
 
 export interface EvalRunArtifacts extends ResponseArtifacts {
