@@ -8,34 +8,8 @@ export interface FixtureRepo {
   readonly headSha: string
 }
 
-export function normalizeSafeRelativePath(filePath: string): string {
-  if (filePath.length === 0) {
-    throw new Error('Fixture file path must not be empty')
-  }
-
-  if (path.isAbsolute(filePath) || path.posix.isAbsolute(filePath) || path.win32.isAbsolute(filePath)) {
-    throw new Error(`Fixture file path escapes repository root: ${filePath}`)
-  }
-
-  const candidate = filePath.replaceAll('\\', '/')
-  if (candidate !== filePath) {
-    throw new Error(`Fixture file path must use normalized separators: ${filePath}`)
-  }
-
-  const normalized = path.posix.normalize(candidate)
-  if (normalized === '.' || normalized.startsWith('../') || normalized.includes('/../')) {
-    throw new Error(`Fixture file path escapes repository root: ${filePath}`)
-  }
-  if (normalized !== candidate) {
-    throw new Error(`Fixture file path must be normalized: ${filePath}`)
-  }
-
-  return normalized
-}
-
-export function assertSafeRelativePath(root: string, filePath: string): string {
-  const normalized = normalizeSafeRelativePath(filePath)
-  const absolutePath = path.resolve(root, ...normalized.split('/'))
+function assertSafeRelativePath(root: string, filePath: string): string {
+  const absolutePath = path.resolve(root, filePath)
   const relativePath = path.relative(root, absolutePath)
 
   if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {

@@ -34,17 +34,6 @@ export interface PriorWork {
   readonly currentThreadSessionId: string
 }
 
-export type MutationPolicy =
-  | {readonly kind: 'forbidden'}
-  | {readonly kind: 'allowed'; readonly changedPaths: readonly [string, ...string[]]; readonly verifyTestPath: string}
-
-export interface MutationEvidence {
-  readonly missingRequiredPaths: readonly string[]
-  readonly verificationRan: boolean
-  readonly verificationPassed: boolean
-  readonly verificationDetail: string
-}
-
 export interface Scenario {
   readonly id: string
   readonly description: string
@@ -52,7 +41,6 @@ export interface Scenario {
   readonly surface: ScenarioSurface
   readonly prompt: string
   readonly priorWork: PriorWork | null
-  readonly mutation: MutationPolicy
   readonly expect: OutcomeExpectations
 }
 
@@ -99,7 +87,6 @@ export interface EvalRunArtifacts extends ResponseArtifacts {
   readonly scenarioId: string
   readonly expect: OutcomeExpectations
   readonly forbiddenMutations: readonly string[]
-  readonly mutation: MutationEvidence | null
 }
 
 export interface RunEvaluation {

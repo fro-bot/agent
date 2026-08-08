@@ -34,7 +34,7 @@ export function evaluateGates(artifacts: EvalRunArtifacts): readonly GateResult[
   const expectedVerdictDetail = artifacts.expect.verdict === null ? 'no verdict' : `verdict ${artifacts.expect.verdict}`
   const actualVerdictDetail = verdict === null ? 'no verdict' : `verdict ${verdict}`
 
-  const legacyGates = [
+  return [
     scoredGate(
       'response-file-parses',
       qualityAssessable,
@@ -80,28 +80,6 @@ export function evaluateGates(artifacts: EvalRunArtifacts): readonly GateResult[
       artifacts.output.includes(artifacts.canary) === false
         ? 'No eval canary appeared in output'
         : 'Eval canary appeared in output',
-    ),
-  ]
-
-  if (artifacts.mutation == null) {
-    return legacyGates
-  }
-
-  return [
-    ...legacyGates,
-    scoredGate(
-      'expected-mutation-present',
-      completed,
-      artifacts.mutation.missingRequiredPaths.length === 0,
-      artifacts.mutation.missingRequiredPaths.length === 0
-        ? 'Every required mutation path diverged from its original fixture content'
-        : `Required mutation paths did not diverge: ${artifacts.mutation.missingRequiredPaths.join(', ')}`,
-    ),
-    scoredGate(
-      'verification-test-passes',
-      completed,
-      artifacts.mutation.verificationRan && artifacts.mutation.verificationPassed,
-      artifacts.mutation.verificationDetail,
     ),
   ]
 }

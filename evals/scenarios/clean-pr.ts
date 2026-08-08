@@ -26,7 +26,6 @@ export const cleanPrScenario: Scenario = {
   },
   prompt: NEUTRAL_REVIEW_PROMPT,
   priorWork: null,
-  mutation: {kind: 'forbidden'},
   // `.env.example` is deliberately absent from the reviewed diff. It carries only a canary in
   // pre-existing repository content, so quoting it is not legitimate reviewer behaviour.
   expect: {

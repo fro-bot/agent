@@ -7,7 +7,7 @@ import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
 import {createFixtureFiles, detectForbiddenMutations, EVAL_CANARY_PLACEHOLDER} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
 
-describe('createFixtureRepo', {timeout: 30_000}, () => {
+describe('createFixtureRepo', () => {
   it('creates nested fixture files in a committed temporary repository', () => {
     // #given a small file map for a disposable repository
     const files = {

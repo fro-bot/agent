@@ -29,7 +29,6 @@ export const continuationIrrelevantNonDegradationScenario: Scenario = {
   surface: CONTINUATION_SURFACE,
   prompt: CONTINUATION_PROMPT,
   priorWork: IRRELEVANT_PRIOR_WORK,
-  mutation: {kind: 'forbidden'},
   expect: {
     verdict: null,
     requiredSignals: [{id: 'ordering-field', anyOf: ['seq']}],

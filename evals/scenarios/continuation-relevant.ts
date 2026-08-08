@@ -29,7 +29,6 @@ export const continuationRelevantScenario: Scenario = {
   surface: CONTINUATION_SURFACE,
   prompt: CONTINUATION_PROMPT,
   priorWork: RELEVANT_PRIOR_WORK,
-  mutation: {kind: 'forbidden'},
   expect: {
     verdict: null,
     requiredSignals: [

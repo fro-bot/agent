@@ -112,7 +112,6 @@ export const unchangedConstraintViolationScenario: Scenario = {
   surface: UNCHANGED_CONSTRAINT_SURFACE,
   prompt: NEUTRAL_REVIEW_PROMPT,
   priorWork: null,
-  mutation: {kind: 'forbidden'},
   expect: {
     verdict: 'request-changes',
     requiredSignals: [
