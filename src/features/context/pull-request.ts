@@ -41,7 +41,7 @@ export async function hydratePullRequestContext(
   const isFork = headOwner == null || baseOwner !== headOwner
 
   const allComments = pr.comments.nodes
-  const limitedComments = allComments.slice(0, budget.maxComments)
+  const limitedComments = allComments.slice(Math.max(0, allComments.length - budget.maxComments))
   const commentsTruncated = pr.comments.totalCount > limitedComments.length
 
   const comments = limitedComments.map(c => ({
@@ -54,7 +54,7 @@ export async function hydratePullRequestContext(
   }))
 
   const allCommits = pr.commits.nodes
-  const limitedCommits = allCommits.slice(0, budget.maxCommits)
+  const limitedCommits = allCommits.slice(Math.max(0, allCommits.length - budget.maxCommits))
   const commitsTruncated = pr.commits.totalCount > limitedCommits.length
 
   const commits = limitedCommits.map(c => ({
@@ -74,7 +74,7 @@ export async function hydratePullRequestContext(
   }))
 
   const allReviews = pr.reviews.nodes
-  const limitedReviews = allReviews.slice(0, budget.maxReviews)
+  const limitedReviews = allReviews.slice(Math.max(0, allReviews.length - budget.maxReviews))
   const reviewsTruncated = pr.reviews.totalCount > limitedReviews.length
 
   const reviews = limitedReviews.map(r => ({

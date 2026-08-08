@@ -129,3 +129,6 @@ deploy/compose.override.yaml
 
 # Stray review/tool JSON dumps written to the repo root
 /output.json
+
+# Agent outcome eval reports
+/evals/output/
