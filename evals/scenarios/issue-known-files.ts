@@ -28,6 +28,7 @@ export const issueKnownFilesScenario: Scenario = {
   prompt:
     'Answer the issue from repository evidence. Do not modify the repository. Deliver the required issue response.',
   priorWork: null,
+  mutation: {kind: 'forbidden'},
   expect: {
     verdict: null,
     requiredSignals: [

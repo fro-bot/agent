@@ -24,6 +24,7 @@ import {buildTriggerContext} from '../src/features/triggers/context-builders.js'
 import {normalizeEvent} from '../src/services/github/context.js'
 import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
 import {evaluateRun} from './gates.js'
+import {classifyMutations, observeMutations, runVerificationTest, validateAllowedMutationPolicy} from './mutations.js'
 
 const DEFAULT_EVAL_MODEL = 'opencode/big-pickle'
 
@@ -662,32 +663,12 @@ function readOpenCodeVersion(opencodeBin: string): string {
 }
 
 export function detectForbiddenMutations(repoPath: string, expectedHeadSha: string): readonly string[] {
-  const mutations: string[] = []
-
-  try {
-    const status = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
-      cwd: repoPath,
-      encoding: 'utf8',
-    })
-    for (const line of status.split('\n')) {
-      if (line.length > 0) {
-        mutations.push(`git status: ${line}`)
-      }
-    }
-  } catch (error) {
-    mutations.push(`git status unavailable: ${error instanceof Error ? error.message : String(error)}`)
-  }
-
-  try {
-    const actualHeadSha = execFileSync('git', ['rev-parse', 'HEAD'], {cwd: repoPath, encoding: 'utf8'}).trim()
-    if (actualHeadSha !== expectedHeadSha) {
-      mutations.push(`HEAD moved from ${expectedHeadSha} to ${actualHeadSha}`)
-    }
-  } catch (error) {
-    mutations.push(`HEAD unavailable: ${error instanceof Error ? error.message : String(error)}`)
-  }
-
-  return mutations.sort()
+  const result = classifyMutations({kind: 'forbidden'}, observeMutations(repoPath, expectedHeadSha, {}))
+  return result.forbiddenMutations.map(mutation =>
+    mutation.startsWith('HEAD moved') || mutation.startsWith('Mutation observation error')
+      ? mutation
+      : `git status: ${mutation}`,
+  )
 }
 
 function createEvalCanary(): string {
@@ -805,13 +786,19 @@ export async function runScenario(
   logger: Logger,
   execution: EvalExecution = executeOpenCode,
 ): Promise<EvalRunReport> {
+  validateAllowedMutationPolicy(scenario)
+  if (scenario.mutation.kind === 'allowed' && process.env.FRO_BOT_EVAL_ALLOW_MUTATION !== '1') {
+    throw new Error('FRO_BOT_EVAL_ALLOW_MUTATION=1 is required for allowed mutation scenarios')
+  }
+
   const startedAt = Date.now()
   const originalCwd = process.cwd()
   clearScenarioDiagnostics(originalCwd, scenario.id)
   const model = resolveModel()
   const modelConfig = parseModel(model)
   const canary = createEvalCanary()
-  const fixtureRepo = createFixtureRepo(createFixtureFiles(scenario, canary))
+  const fixtureFiles = createFixtureFiles(scenario, canary)
+  const fixtureRepo = createFixtureRepo(fixtureFiles)
   let isolatedEnv: IsolatedEvalEnv | null = null
 
   try {
@@ -845,11 +832,27 @@ export async function runScenario(
       diagnosticsOutput,
     )
     const artifacts = collectedResponseArtifacts.artifacts
+    let verification: Awaited<ReturnType<typeof runVerificationTest>> | null = null
+    if (scenario.mutation.kind === 'allowed' && agentResult.success === true) {
+      verification = await runVerificationTest(fixtureRepo.path, scenario.mutation.verifyTestPath)
+    }
+    const mutationObservation = observeMutations(fixtureRepo.path, fixtureRepo.headSha, fixtureFiles)
+    const mutationClassification = classifyMutations(scenario.mutation, mutationObservation)
+    let mutationEvidence = mutationClassification.mutation
+    if (mutationEvidence != null && agentResult.success === false) {
+      mutationEvidence = {
+        ...mutationEvidence,
+        verificationDetail: 'Verification was not run because execution did not complete',
+      }
+    } else if (mutationEvidence != null && verification != null) {
+      mutationEvidence = {...mutationEvidence, ...verification}
+    }
     const completeArtifacts: EvalRunArtifacts = {
       ...artifacts,
       scenarioId: scenario.id,
       expect: scenario.expect,
-      forbiddenMutations: detectForbiddenMutations(fixtureRepo.path, fixtureRepo.headSha),
+      forbiddenMutations: mutationClassification.forbiddenMutations,
+      mutation: mutationEvidence,
     }
     const promptResult = buildAgentPrompt({...promptOptions, sessionId: agentResult.sessionId ?? undefined}, logger)
     const evaluation = evaluateRun(completeArtifacts)

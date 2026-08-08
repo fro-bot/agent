@@ -34,6 +34,14 @@ describe('eval scenario registry', () => {
     // #then the corpus remains bounded and every scenario is addressable once
     expect(ALL_SCENARIOS.length).toBeLessThanOrEqual(MAX_SCENARIOS)
     expect(new Set(ids).size).toBe(ids.length)
+    expect(MAX_SCENARIOS).toBe(8)
+  })
+
+  it.each(ALL_SCENARIOS)('$id declares an explicit forbidden mutation policy', scenario => {
+    // #given one of the currently registered read-only scenarios
+    // #when its mutation contract is inspected
+    // #then every existing scenario remains explicitly forbidden
+    expect(scenario.mutation).toEqual({kind: 'forbidden'})
   })
 
   it.each(ALL_SCENARIOS)('$id contains the eval canary placeholder in fixture files', scenario => {
@@ -337,7 +345,7 @@ describe('eval scenario registry', () => {
       expect(scenario.surface.kind).toBe('issue_comment')
       expect(scenario.surface.hydratedContext).toBeNull()
       expect('diffFiles' in scenario.surface).toBe(false)
-      expect('mutationAllowance' in scenario).toBe(false)
+      expect(scenario.mutation).toEqual({kind: 'forbidden'})
     }
   })
 
