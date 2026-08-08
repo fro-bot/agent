@@ -1,4 +1,5 @@
-import type {ParsedResponse} from '../packages/runtime/src/agent/response-file.js'
+import type {DiffFileSummary} from '../packages/runtime/src/agent/index.js'
+import type {ParsedResponse, ResponseSurface} from '../packages/runtime/src/agent/response-file.js'
 import type {TriggerContext} from '../packages/runtime/src/agent/types.js'
 import type {OmoProviders} from '../packages/runtime/src/shared/types.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
@@ -14,6 +15,7 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {buildResponseFilePath, parseResponseFile} from '../packages/runtime/src/agent/response-file.js'
 import {buildAgentPrompt, executeOpenCode} from '../src/features/agent/index.js'
+import {resolveResponseSurface} from '../src/features/agent/response-file.js'
 import {buildTriggerContext} from '../src/features/triggers/context-builders.js'
 import {normalizeEvent} from '../src/services/github/context.js'
 import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
@@ -365,7 +367,7 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     process.env.GITHUB_REPOSITORY = `fro-bot-eval/${scenario.id}`
     process.env.GITHUB_REF = 'refs/heads/main'
     process.env.GITHUB_SHA = headSha
-    process.env.GITHUB_EVENT_NAME = 'pull_request'
+    process.env.GITHUB_EVENT_NAME = scenario.surface.kind
     process.env.GITHUB_RUN_ID = runId
     process.env.GITHUB_RUN_ATTEMPT = runAttempt
     process.env.GITHUB_ACTOR = 'fro-bot-eval'
@@ -465,35 +467,68 @@ export function resolveModel(): string {
   return model
 }
 
-function buildDiffContext(scenario: Scenario) {
+function buildDiffContext(diffFiles: readonly DiffFileSummary[]) {
   return {
-    changedFiles: scenario.diffFiles.length,
-    additions: scenario.diffFiles.reduce((total, file) => total + file.additions, 0),
-    deletions: scenario.diffFiles.reduce((total, file) => total + file.deletions, 0),
+    changedFiles: diffFiles.length,
+    additions: diffFiles.reduce((total, file) => total + file.additions, 0),
+    deletions: diffFiles.reduce((total, file) => total + file.deletions, 0),
     truncated: false,
-    files: scenario.diffFiles,
+    files: diffFiles,
   }
 }
 
-function buildTriggerContextForScenario(scenario: Scenario, headSha: string): TriggerContext {
-  const event = normalizeEvent('pull_request', scenario.event)
+interface ScenarioInput {
+  readonly eventType: 'pull_request' | 'issue_comment'
+  readonly payload: unknown
+  readonly event: GitHubContext['event']
+  readonly diffContext: ReturnType<typeof buildDiffContext> | null
+  readonly hydratedContext: PromptOptions['context']['hydratedContext']
+}
+
+function buildScenarioInput(scenario: Scenario): ScenarioInput {
+  switch (scenario.surface.kind) {
+    case 'pull_request':
+      return {
+        eventType: 'pull_request',
+        payload: scenario.surface.event,
+        event: normalizeEvent('pull_request', scenario.surface.event),
+        diffContext: buildDiffContext(scenario.surface.diffFiles),
+        hydratedContext: scenario.surface.hydratedContext,
+      }
+    case 'issue_comment':
+      return {
+        eventType: 'issue_comment',
+        payload: scenario.surface.event,
+        event: normalizeEvent('issue_comment', scenario.surface.event),
+        diffContext: null,
+        hydratedContext: scenario.surface.hydratedContext,
+      }
+  }
+}
+
+function buildTriggerContextForScenario(
+  scenario: Scenario,
+  headSha: string,
+  scenarioInput: ScenarioInput = buildScenarioInput(scenario),
+): TriggerContext {
   const githubContext: GitHubContext = {
-    eventName: 'pull_request',
-    eventType: 'pull_request',
+    eventName: scenarioInput.eventType,
+    eventType: scenarioInput.eventType,
     repo: {owner: 'fro-bot-eval', repo: scenario.id},
     ref: 'refs/heads/main',
     sha: headSha,
     runId: 1,
     actor: 'fro-bot-eval',
-    payload: scenario.event,
-    event,
+    payload: scenarioInput.payload,
+    event: scenarioInput.event,
   }
 
   return buildTriggerContext(githubContext, null, null)
 }
 
-function buildPromptOptions(scenario: Scenario, headSha: string, responseFilePath: string): PromptOptions {
-  const triggerContext = buildTriggerContextForScenario(scenario, headSha)
+export function buildPromptOptions(scenario: Scenario, headSha: string, responseFilePath: string): PromptOptions {
+  const scenarioInput = buildScenarioInput(scenario)
+  const triggerContext = buildTriggerContextForScenario(scenario, headSha, scenarioInput)
   const target = triggerContext.target
   const author = triggerContext.author
 
@@ -511,8 +546,8 @@ function buildPromptOptions(scenario: Scenario, headSha: string, responseFilePat
       commentAuthor: author?.login ?? null,
       commentId: triggerContext.commentId,
       defaultBranch: 'main',
-      diffContext: buildDiffContext(scenario),
-      hydratedContext: null,
+      diffContext: scenarioInput.diffContext,
+      hydratedContext: scenarioInput.hydratedContext,
       authorAssociation: author?.association ?? null,
       isRequestedReviewer: triggerContext.isBotReviewRequested,
     },
@@ -619,6 +654,7 @@ function collectResponseArtifacts(
   agentResult: AgentResult,
   canary: string,
   configuredTimeoutMs: number,
+  responseSurface: ResponseSurface,
   diagnosticsOutput: string,
 ): ResponseArtifacts {
   const responseFiles = fs.existsSync(env.responseDir)
@@ -634,7 +670,7 @@ function collectResponseArtifacts(
   if (responseFileExists) {
     try {
       rawResponse = fs.readFileSync(env.responseFilePath, 'utf8')
-      const parsed = parseResponseFile(rawResponse, {surface: 'pr-review'})
+      const parsed = parseResponseFile(rawResponse, {surface: responseSurface})
       if (parsed.success) {
         parsedResponse = parsed.data
       } else {
@@ -680,6 +716,7 @@ export async function runScenario(
     const environment = createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model)
     isolatedEnv = environment
     const promptOptions = buildPromptOptions(scenario, fixtureRepo.headSha, environment.responseFilePath)
+    const responseSurface = resolveResponseSurface(promptOptions.context, promptOptions.triggerContext)
     const timeoutMs = resolveEvalTimeoutMs()
     const executionConfig: ExecutionConfig = {
       agent: 'build',
@@ -697,13 +734,18 @@ export async function runScenario(
     }
     const diagnosticsPath = agentResult.success ? null : captureDiagnostics(environment, scenario.id)
     const diagnosticsOutput = readCapturedDiagnostics(diagnosticsPath)
-    const artifacts = collectResponseArtifacts(environment, agentResult, canary, timeoutMs, diagnosticsOutput)
+    const artifacts = collectResponseArtifacts(
+      environment,
+      agentResult,
+      canary,
+      timeoutMs,
+      responseSurface,
+      diagnosticsOutput,
+    )
     const completeArtifacts: EvalRunArtifacts = {
       ...artifacts,
       scenarioId: scenario.id,
-      expectedVerdict: scenario.expectedVerdict,
-      expectedDefectFile: scenario.expectedDefectFile,
-      expectedDefectSignals: scenario.expectedDefectSignals,
+      expect: scenario.expect,
       forbiddenMutations: detectForbiddenMutations(fixtureRepo.path, fixtureRepo.headSha),
     }
     const promptResult = buildAgentPrompt({...promptOptions, sessionId: agentResult.sessionId ?? undefined}, logger)

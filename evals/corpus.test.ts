@@ -7,11 +7,9 @@ import {describe, expect, it} from 'vitest'
 import {createLogger} from '../src/shared/logger.js'
 import {evaluateCorpusVerdict} from './corpus-verdict.js'
 import {resolveEvalTimeoutMs, runScenario} from './runner.js'
-import {cleanPrScenario} from './scenarios/clean-pr.js'
-import {plantedDefectScenario} from './scenarios/planted-defect.js'
+import {ALL_SCENARIOS} from './scenarios/index.js'
 
 const EVAL_ENABLED = process.env.FRO_BOT_EVAL === '1'
-const SCENARIOS = [cleanPrScenario, plantedDefectScenario] as const
 const REPORT_COMPLETION_MARKER = 'fro-bot-eval-report-complete-v1'
 
 /**
@@ -21,7 +19,7 @@ const REPORT_COMPLETION_MARKER = 'fro-bot-eval-report-complete-v1'
  * kills the run mid-investigation, which then reads as a capability failure.
  */
 const STARTUP_TEARDOWN_ALLOWANCE_MS = 60_000
-const SUITE_TIMEOUT_MS = SCENARIOS.length * (resolveEvalTimeoutMs() + STARTUP_TEARDOWN_ALLOWANCE_MS)
+const SUITE_TIMEOUT_MS = ALL_SCENARIOS.length * (resolveEvalTimeoutMs() + STARTUP_TEARDOWN_ALLOWANCE_MS)
 
 function readCorpusHeadSha(): string {
   return execFileSync('git', ['rev-parse', 'HEAD'], {cwd: process.cwd(), encoding: 'utf8'}).trim()
@@ -74,7 +72,7 @@ describe.skipIf(EVAL_ENABLED === false)('agent outcome eval corpus', {timeout: S
         {
           runId,
           corpusHeadSha,
-          scenarioIds: SCENARIOS.map(scenario => scenario.id),
+          scenarioIds: ALL_SCENARIOS.map(scenario => scenario.id),
           startedAt,
           updatedAt: new Date().toISOString(),
           completed,
@@ -91,7 +89,7 @@ describe.skipIf(EVAL_ENABLED === false)('agent outcome eval corpus', {timeout: S
     persist(false)
 
     // #when each scenario is evaluated through executeOpenCode
-    for (const scenario of SCENARIOS) {
+    for (const scenario of ALL_SCENARIOS) {
       reports.push(await runScenario(scenario, logger))
       persist(false)
     }

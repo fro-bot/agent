@@ -1,17 +1,41 @@
-import type {PullRequestEvent} from '@octokit/webhooks-types'
+import type {IssueCommentEvent, PullRequestEvent} from '@octokit/webhooks-types'
 import type {AgentResult, DiffFileSummary} from '../packages/runtime/src/agent/index.js'
 import type {ParsedResponse, ResponseFileVerdict} from '../packages/runtime/src/agent/response-file.js'
+import type {HydratedContext} from '../src/features/agent/types.js'
+
+export interface PullRequestSurface {
+  readonly kind: 'pull_request'
+  readonly event: PullRequestEvent
+  readonly diffFiles: readonly DiffFileSummary[]
+  readonly hydratedContext: HydratedContext | null
+}
+
+export interface IssueCommentSurface {
+  readonly kind: 'issue_comment'
+  readonly event: IssueCommentEvent
+  readonly hydratedContext: HydratedContext | null
+}
+
+export type ScenarioSurface = PullRequestSurface | IssueCommentSurface
+
+export interface SignalGroup {
+  readonly id: string
+  readonly anyOf: readonly [string, ...string[]]
+}
+
+export interface OutcomeExpectations {
+  readonly verdict: ResponseFileVerdict | null
+  readonly requiredSignals: readonly SignalGroup[]
+  readonly forbiddenSignals: readonly SignalGroup[]
+}
 
 export interface Scenario {
   readonly id: string
   readonly description: string
   readonly files: Readonly<Record<string, string>>
-  readonly event: PullRequestEvent
+  readonly surface: ScenarioSurface
   readonly prompt: string
-  readonly diffFiles: readonly DiffFileSummary[]
-  readonly expectedVerdict: ResponseFileVerdict
-  readonly expectedDefectFile: string | null
-  readonly expectedDefectSignals: readonly string[]
+  readonly expect: OutcomeExpectations
 }
 
 export interface GateResult {
@@ -55,9 +79,7 @@ export interface ResponseArtifacts {
 
 export interface EvalRunArtifacts extends ResponseArtifacts {
   readonly scenarioId: string
-  readonly expectedVerdict: ResponseFileVerdict
-  readonly expectedDefectFile: string | null
-  readonly expectedDefectSignals: readonly string[]
+  readonly expect: OutcomeExpectations
   readonly forbiddenMutations: readonly string[]
 }
 

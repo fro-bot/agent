@@ -1,13 +1,25 @@
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
 import type {Logger} from '../src/shared/logger.js'
+import type {Scenario} from './types.js'
+import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
 import {describe, expect, it} from 'vitest'
+import {buildAgentPrompt} from '../src/features/agent/index.js'
+import {createIssueCommentCreatedEvent} from '../src/features/triggers/__fixtures__/payloads.js'
 import {createLogger} from '../src/shared/logger.js'
-import {parseModel, resolveEvalTimeoutMs, resolveHarnessBinary, resolveModel, runScenario} from './runner.js'
+import {
+  buildPromptOptions,
+  parseModel,
+  resolveEvalTimeoutMs,
+  resolveHarnessBinary,
+  resolveModel,
+  runScenario,
+} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
+import {plantedDefectScenario} from './scenarios/planted-defect.js'
 
 interface TestSetup {
   readonly originalCwd: string
@@ -117,8 +129,42 @@ function getGate(report: Awaited<ReturnType<typeof runScenario>>, id: string) {
 }
 
 const logger = createLogger({component: 'eval-runner-test'})
+const CHARACTERIZATION_HEAD_SHA = '0123456789012345678901234567890123456789'
+const CHARACTERIZATION_RESPONSE_PATH = '/tmp/fro-bot-eval-response.md'
+
+const issueCommentScenario: Scenario = {
+  id: 'issue-comment-answer-test',
+  description: 'A deterministic issue answer used to exercise the non-review response surface.',
+  files: cleanPrScenario.files,
+  surface: {
+    kind: 'issue_comment',
+    event: createIssueCommentCreatedEvent({commentBody: 'Where is the age check implemented?'}),
+    hydratedContext: null,
+  },
+  prompt: 'Answer the issue from the repository contents. Do not modify the repository.',
+  expect: {
+    verdict: null,
+    requiredSignals: [],
+    forbiddenSignals: [],
+  },
+}
 
 describe('runScenario orchestration', () => {
+  it.each([
+    ['clean-pr', cleanPrScenario, 'b68fcc5c6f717d8e2fa728772e8f000df814667ef9cc843250a9a5a6ce7f6999'],
+    ['planted-defect', plantedDefectScenario, 'c1c432a27be6b7c18bd27de36b708ec199368080a41fdcad00ac67a6ad31f285'],
+  ] as const)('retains the current-main prompt hash for %s', (_id, scenario, expectedHash) => {
+    // #given a deterministic no-model prompt construction seam
+    const promptOptions = buildPromptOptions(scenario, CHARACTERIZATION_HEAD_SHA, CHARACTERIZATION_RESPONSE_PATH)
+
+    // #when the agent-facing prompt is built and hashed
+    const prompt = buildAgentPrompt(promptOptions, logger).text
+    const promptHash = crypto.createHash('sha256').update(prompt, 'utf8').digest('hex')
+
+    // #then the refactor preserves the exact current-main prompt bytes
+    expect(promptHash).toBe(expectedHash)
+  })
+
   it('restores cwd and env and removes the fixture when injected execution throws', async () => {
     // #given an injected execution that observes the fixture and then throws
     await withTestEnvironment(async setup => {
@@ -212,6 +258,60 @@ describe('runScenario orchestration', () => {
 
       // #then the full observable outcome passes and process state is restored
       expect(report.state).toBe('passed')
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('parses a plain-body issue-comment response with no verdict', async () => {
+    // #given an issue-comment surface and injected execution that writes a plain response
+    await withTestEnvironment(async setup => {
+      let observedEventType: string | undefined
+      let observedIssueType: string | null | undefined
+      let observedGitHubEventName: string | undefined
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        observedEventType = promptOptions.triggerContext?.eventType
+        observedIssueType = promptOptions.context.issueType
+        observedGitHubEventName = process.env.GITHUB_EVENT_NAME
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(responseFilePath, 'The age check is implemented in src/access.ts.', 'utf8')
+        return createAgentResult()
+      }
+
+      // #when the issue-comment scenario runs through the injected execution seam
+      const report = await runScenario(issueCommentScenario, logger, execution)
+
+      // #then the runner builds the issue-comment input and accepts its plain response
+      expect(observedEventType).toBe('issue_comment')
+      expect(observedIssueType).toBeNull()
+      expect(observedGitHubEventName).toBe('issue_comment')
+      expect(report.state).toBe('passed')
+      expect(getGate(report, 'verdict-matches').status).toBe('passed')
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('reports a malformed response as a parser failure without throwing', async () => {
+    // #given an issue-comment execution that writes invalid review frontmatter
+    await withTestEnvironment(async setup => {
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(responseFilePath, '---\nverdict: approve\n---\nThis is not a review surface.\n', 'utf8')
+        return createAgentResult()
+      }
+
+      // #when the malformed response is parsed by the runner
+      const report = await runScenario(issueCommentScenario, logger, execution)
+
+      // #then parsing is represented as a failed gate rather than an exception
+      expect(report.state).toBe('failed')
+      expect(getGate(report, 'response-file-parses').status).toBe('failed')
+      expect(report.agentResult.success).toBe(true)
       expectProcessRestored(setup)
     })
   }, 30_000)
