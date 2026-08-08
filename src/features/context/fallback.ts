@@ -4,6 +4,32 @@ import type {ContextBudget, IssueContext, PullRequestContext} from './types.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {truncateBody} from './budget.js'
 
+const REST_PAGE_SIZE = 100
+const REST_MAX_PAGES = 50
+
+async function fetchRestCollection<T>(
+  fetchPage: (page: number, perPage: number) => Promise<readonly T[]>,
+  collection: string,
+  logger: Logger,
+): Promise<readonly T[]> {
+  const items: T[] = []
+
+  for (let page = 1; page <= REST_MAX_PAGES; page++) {
+    const pageItems = await fetchPage(page, REST_PAGE_SIZE)
+    items.push(...pageItems)
+
+    if (pageItems.length < REST_PAGE_SIZE) {
+      return items
+    }
+  }
+
+  logger.warning('REST collection pagination limit reached', {
+    collection,
+    maxPages: REST_MAX_PAGES,
+  })
+  return items
+}
+
 export async function fallbackIssueContext(
   client: Octokit,
   owner: string,
@@ -13,15 +39,28 @@ export async function fallbackIssueContext(
   logger: Logger,
 ): Promise<IssueContext | null> {
   try {
-    const [issueResponse, commentsResponse] = await Promise.all([
+    const [issueResponse, comments] = await Promise.all([
       client.rest.issues.get({owner, repo, issue_number: number}),
-      client.rest.issues.listComments({owner, repo, issue_number: number, per_page: budget.maxComments}),
+      fetchRestCollection(
+        async page => {
+          const response = await client.rest.issues.listComments({
+            owner,
+            repo,
+            issue_number: number,
+            per_page: REST_PAGE_SIZE,
+            page,
+          })
+          return response.data
+        },
+        'issue comments',
+        logger,
+      ),
     ])
 
     const issue = issueResponse.data
     const bodyResult = truncateBody(issue.body ?? '', budget.maxBodyBytes)
 
-    const comments = commentsResponse.data.slice(0, budget.maxComments).map(c => ({
+    const limitedComments = comments.slice(Math.max(0, comments.length - budget.maxComments)).map(c => ({
       id: c.node_id ?? String(c.id),
       author: c.user?.login ?? null,
       body: c.body ?? '',
@@ -52,9 +91,9 @@ export async function fallbackIssueContext(
       createdAt: issue.created_at,
       labels,
       assignees,
-      comments,
-      commentsTruncated: commentsResponse.data.length >= budget.maxComments,
-      totalComments: commentsResponse.data.length,
+      comments: limitedComments,
+      commentsTruncated: comments.length >= budget.maxComments,
+      totalComments: comments.length,
     }
   } catch (error) {
     logger.warning('REST issue fallback failed', {
@@ -76,12 +115,51 @@ export async function fallbackPullRequestContext(
   logger: Logger,
 ): Promise<PullRequestContext | null> {
   try {
-    const [prResponse, commitsResponse, filesResponse, reviewsResponse, commentsResponse] = await Promise.all([
-      client.rest.pulls.get({owner, repo, pull_number: number}),
-      client.rest.pulls.listCommits({owner, repo, pull_number: number, per_page: budget.maxCommits}),
+    const prResponse = await client.rest.pulls.get({owner, repo, pull_number: number})
+    const [commits, filesResponse, reviews, comments] = await Promise.all([
+      fetchRestCollection(
+        async page => {
+          const response = await client.rest.pulls.listCommits({
+            owner,
+            repo,
+            pull_number: number,
+            per_page: REST_PAGE_SIZE,
+            page,
+          })
+          return response.data
+        },
+        'pull request commits',
+        logger,
+      ),
       client.rest.pulls.listFiles({owner, repo, pull_number: number, per_page: budget.maxFiles}),
-      client.rest.pulls.listReviews({owner, repo, pull_number: number, per_page: budget.maxReviews}),
-      client.rest.issues.listComments({owner, repo, issue_number: number, per_page: budget.maxComments}),
+      fetchRestCollection(
+        async page => {
+          const response = await client.rest.pulls.listReviews({
+            owner,
+            repo,
+            pull_number: number,
+            per_page: REST_PAGE_SIZE,
+            page,
+          })
+          return response.data
+        },
+        'pull request reviews',
+        logger,
+      ),
+      fetchRestCollection(
+        async page => {
+          const response = await client.rest.issues.listComments({
+            owner,
+            repo,
+            issue_number: number,
+            per_page: REST_PAGE_SIZE,
+            page,
+          })
+          return response.data
+        },
+        'pull request comments',
+        logger,
+      ),
     ])
 
     // Isolated from Promise.all — insufficient permissions should not lose all PR context
@@ -104,7 +182,7 @@ export async function fallbackPullRequestContext(
     const headOwner = pr.head.repo?.owner.login
     const isFork = headOwner == null || baseOwner !== headOwner
 
-    const comments = commentsResponse.data.slice(0, budget.maxComments).map(c => ({
+    const limitedComments = comments.slice(Math.max(0, comments.length - budget.maxComments)).map(c => ({
       id: c.node_id ?? String(c.id),
       author: c.user?.login ?? null,
       body: c.body ?? '',
@@ -113,7 +191,7 @@ export async function fallbackPullRequestContext(
       isMinimized: false,
     }))
 
-    const commits = commitsResponse.data.slice(0, budget.maxCommits).map(c => ({
+    const limitedCommits = commits.slice(Math.max(0, commits.length - budget.maxCommits)).map(c => ({
       oid: c.sha,
       message: c.commit.message,
       author: c.commit.author?.name ?? null,
@@ -126,7 +204,7 @@ export async function fallbackPullRequestContext(
       status: f.status,
     }))
 
-    const reviews = reviewsResponse.data.slice(0, budget.maxReviews).map(r => ({
+    const limitedReviews = reviews.slice(Math.max(0, reviews.length - budget.maxReviews)).map(r => ({
       author: r.user?.login ?? null,
       state: r.state,
       body: r.body ?? '',
@@ -160,18 +238,18 @@ export async function fallbackPullRequestContext(
       isFork,
       labels,
       assignees,
-      comments,
-      commentsTruncated: commentsResponse.data.length >= budget.maxComments,
-      totalComments: commentsResponse.data.length,
-      commits,
-      commitsTruncated: commitsResponse.data.length >= budget.maxCommits,
-      totalCommits: commitsResponse.data.length,
+      comments: limitedComments,
+      commentsTruncated: comments.length >= budget.maxComments,
+      totalComments: comments.length,
+      commits: limitedCommits,
+      commitsTruncated: commits.length >= budget.maxCommits,
+      totalCommits: commits.length,
       files,
       filesTruncated: filesResponse.data.length >= budget.maxFiles,
       totalFiles: filesResponse.data.length,
-      reviews,
-      reviewsTruncated: reviewsResponse.data.length >= budget.maxReviews,
-      totalReviews: reviewsResponse.data.length,
+      reviews: limitedReviews,
+      reviewsTruncated: reviews.length >= budget.maxReviews,
+      totalReviews: reviews.length,
       authorAssociation: pr.author_association,
       requestedReviewers,
       requestedReviewerTeams,

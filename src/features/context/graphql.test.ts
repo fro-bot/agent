@@ -15,6 +15,14 @@ describe('ISSUE_QUERY', () => {
     expect(ISSUE_QUERY).toContain('labels')
     expect(ISSUE_QUERY).toContain('assignees')
   })
+
+  it('requests the newest comments while preserving chronological order', () => {
+    // #given
+    // #when
+    // #then
+    expect(ISSUE_QUERY).toContain('comments(last: $maxComments)')
+    expect(ISSUE_QUERY).not.toContain('comments(first: $maxComments)')
+  })
 })
 
 describe('PULL_REQUEST_QUERY', () => {
@@ -29,6 +37,20 @@ describe('PULL_REQUEST_QUERY', () => {
     expect(PULL_REQUEST_QUERY).toContain('isMinimized')
     expect(PULL_REQUEST_QUERY).toContain('baseRepository')
     expect(PULL_REQUEST_QUERY).toContain('headRepository')
+  })
+
+  it('requests newest comments, commits, and reviews without changing file selection', () => {
+    // #given
+    // #when
+    // #then
+    expect(PULL_REQUEST_QUERY).toContain('comments(last: $maxComments)')
+    expect(PULL_REQUEST_QUERY).toContain('commits(last: $maxCommits)')
+    expect(PULL_REQUEST_QUERY).toContain('reviews(last: $maxReviews)')
+    expect(PULL_REQUEST_QUERY).not.toContain('comments(first: $maxComments)')
+    expect(PULL_REQUEST_QUERY).not.toContain('commits(first: $maxCommits)')
+    expect(PULL_REQUEST_QUERY).not.toContain('reviews(first: $maxReviews)')
+    expect(PULL_REQUEST_QUERY).toContain('files(first: $maxFiles)')
+    expect(PULL_REQUEST_QUERY).not.toContain('files(last: $maxFiles)')
   })
 })
 
