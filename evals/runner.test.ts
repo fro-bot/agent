@@ -316,6 +316,80 @@ describe('runScenario orchestration', () => {
     })
   }, 30_000)
 
+  it.each([
+    {
+      name: 'no response file',
+      response: null,
+      expectedDeliveryStatus: 'failed',
+      deliveryDetail: /found 0/,
+      responseError: /does not exist/i,
+    },
+    {
+      name: 'an empty response file',
+      response: '',
+      expectedDeliveryStatus: 'passed',
+      deliveryDetail: /Exactly one response artifact/,
+      responseError: /empty/i,
+    },
+    {
+      name: 'malformed frontmatter',
+      response: '---\nverdict: approve\n---',
+      expectedDeliveryStatus: 'passed',
+      deliveryDetail: /Exactly one response artifact/,
+      responseError: /frontmatter/i,
+    },
+    {
+      name: 'an unknown verdict on the PR-review surface',
+      response: '---\nverdict: definitely-approve\n---\nNo blocking findings.\n',
+      expectedDeliveryStatus: 'passed',
+      deliveryDetail: /Exactly one response artifact/,
+      responseError: /unknown verdict/i,
+    },
+  ] as const)(
+    'fails deterministically when successful execution produces $name',
+    async testCase => {
+      // #given a successful injected execution that optionally writes a response artifact
+      await withTestEnvironment(async setup => {
+        let workspaceDuringRun: string | undefined
+        const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+          workspaceDuringRun = process.env.GITHUB_WORKSPACE
+          if (testCase.response != null) {
+            const responseFilePath = promptOptions.responseFilePath
+            if (responseFilePath == null) {
+              throw new Error('Injected execution did not receive a response file path')
+            }
+            fs.writeFileSync(responseFilePath, testCase.response, 'utf8')
+          }
+          return createAgentResult()
+        }
+
+        // #when the successful execution result is evaluated by the runner
+        const reportPromise = runScenario(cleanPrScenario, logger, execution)
+        await expect(reportPromise).resolves.toBeDefined()
+        const report = await reportPromise
+
+        // #then execution remains successful while response quality determines a failed report
+        expect(report.agentResult.success).toBe(true)
+        expect(report.state).toBe('failed')
+        const responseGate = getGate(report, 'response-file-parses')
+        expect(responseGate.status).toBe('failed')
+        expect(responseGate.detail).toMatch(testCase.responseError)
+
+        const deliveryGate = getGate(report, 'exactly-one-delivery')
+        expect(deliveryGate.status).toBe(testCase.expectedDeliveryStatus)
+        expect(deliveryGate.detail).toMatch(testCase.deliveryDetail)
+
+        // #then process state and the isolated fixture are restored after the report resolves
+        expectProcessRestored(setup)
+        if (workspaceDuringRun == null) {
+          throw new Error('Injected execution did not observe GITHUB_WORKSPACE')
+        }
+        expect(fs.existsSync(workspaceDuringRun)).toBe(false)
+      })
+    },
+    30_000,
+  )
+
   it('restores cwd, env, and fixture state when setup throws after isolation mutates process state', async () => {
     // #given an invalid timeout that throws after isolated env and cwd setup
     await withTestEnvironment(async setup => {
