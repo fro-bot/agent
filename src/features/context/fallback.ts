@@ -7,15 +7,24 @@ import {truncateBody} from './budget.js'
 const REST_PAGE_SIZE = 100
 const REST_MAX_PAGES = 50
 
+/**
+ * Walk a REST collection to its end so the caller can select the most recent
+ * entries. These endpoints expose no ordering parameter, so the newest items
+ * are only reachable by paging to the last one.
+ *
+ * Collection totals derived from the result are bounded by
+ * `REST_PAGE_SIZE * REST_MAX_PAGES`; past that the walk stops and the reported
+ * total undercounts, unlike the GraphQL path which reads a true total.
+ */
 async function fetchRestCollection<T>(
-  fetchPage: (page: number, perPage: number) => Promise<readonly T[]>,
+  fetchPage: (page: number) => Promise<readonly T[]>,
   collection: string,
   logger: Logger,
 ): Promise<readonly T[]> {
   const items: T[] = []
 
   for (let page = 1; page <= REST_MAX_PAGES; page++) {
-    const pageItems = await fetchPage(page, REST_PAGE_SIZE)
+    const pageItems = await fetchPage(page)
     items.push(...pageItems)
 
     if (pageItems.length < REST_PAGE_SIZE) {
@@ -92,7 +101,7 @@ export async function fallbackIssueContext(
       labels,
       assignees,
       comments: limitedComments,
-      commentsTruncated: comments.length >= budget.maxComments,
+      commentsTruncated: comments.length > limitedComments.length,
       totalComments: comments.length,
     }
   } catch (error) {
@@ -239,16 +248,16 @@ export async function fallbackPullRequestContext(
       labels,
       assignees,
       comments: limitedComments,
-      commentsTruncated: comments.length >= budget.maxComments,
+      commentsTruncated: comments.length > limitedComments.length,
       totalComments: comments.length,
       commits: limitedCommits,
-      commitsTruncated: commits.length >= budget.maxCommits,
+      commitsTruncated: commits.length > limitedCommits.length,
       totalCommits: commits.length,
       files,
-      filesTruncated: filesResponse.data.length >= budget.maxFiles,
+      filesTruncated: filesResponse.data.length > files.length,
       totalFiles: filesResponse.data.length,
       reviews: limitedReviews,
-      reviewsTruncated: reviews.length >= budget.maxReviews,
+      reviewsTruncated: reviews.length > limitedReviews.length,
       totalReviews: reviews.length,
       authorAssociation: pr.author_association,
       requestedReviewers,

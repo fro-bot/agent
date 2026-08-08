@@ -56,6 +56,89 @@ describe('fallbackIssueContext', () => {
     expect(result?.comments).toHaveLength(1)
   })
 
+  it('does not report truncation when the fetched comments exactly fill the cap', async () => {
+    // #given a thread holding exactly maxComments entries, so nothing is dropped
+    const comments = Array.from({length: DEFAULT_CONTEXT_BUDGET.maxComments}, (_, index) => ({
+      id: index + 1,
+      node_id: `c${index + 1}`,
+      body: `Comment ${index + 1}`,
+      created_at: `2024-01-01T00:${String(index + 1).padStart(2, '0')}:00Z`,
+      user: {login: `commenter${index + 1}`},
+      author_association: 'NONE',
+    }))
+    const mockOctokit = {
+      rest: {
+        issues: {
+          get: vi.fn().mockResolvedValue({
+            data: {
+              number: 7,
+              title: 'Exactly At Cap',
+              body: 'Body',
+              state: 'open',
+              created_at: '2024-01-01T00:00:00Z',
+              user: {login: 'user'},
+              labels: [],
+              assignees: [],
+            },
+          }),
+          listComments: vi.fn().mockResolvedValue({data: comments}),
+        },
+      },
+    } as unknown as Octokit
+
+    // #when
+    const result = await fallbackIssueContext(mockOctokit, 'owner', 'repo', 7, DEFAULT_CONTEXT_BUDGET, logger)
+
+    // #then every comment is present, so the set is complete rather than truncated
+    expect(result?.comments).toHaveLength(DEFAULT_CONTEXT_BUDGET.maxComments)
+    expect(result?.commentsTruncated).toBe(false)
+    expect(result?.totalComments).toBe(DEFAULT_CONTEXT_BUDGET.maxComments)
+  })
+
+  it('stops walking and warns once a collection exceeds the page ceiling', async () => {
+    // #given a collection that never returns a short page, so the walk hits its own limit
+    const fullPage = Array.from({length: 100}, (_, index) => ({
+      id: index + 1,
+      node_id: `c${index + 1}`,
+      body: `Comment ${index + 1}`,
+      created_at: '2024-01-01T00:00:00Z',
+      user: {login: 'commenter'},
+      author_association: 'NONE',
+    }))
+    const listComments = vi.fn().mockResolvedValue({data: fullPage})
+    const mockOctokit = {
+      rest: {
+        issues: {
+          get: vi.fn().mockResolvedValue({
+            data: {
+              number: 8,
+              title: 'Unbounded Thread',
+              body: 'Body',
+              state: 'open',
+              created_at: '2024-01-01T00:00:00Z',
+              user: {login: 'user'},
+              labels: [],
+              assignees: [],
+            },
+          }),
+          listComments,
+        },
+      },
+    } as unknown as Octokit
+
+    // #when
+    const result = await fallbackIssueContext(mockOctokit, 'owner', 'repo', 8, DEFAULT_CONTEXT_BUDGET, logger)
+
+    // #then the walk is bounded, still yields a capped tail, and says it gave up
+    expect(listComments).toHaveBeenCalledTimes(50)
+    expect(result?.comments).toHaveLength(DEFAULT_CONTEXT_BUDGET.maxComments)
+    expect(result?.commentsTruncated).toBe(true)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'REST collection pagination limit reached',
+      expect.objectContaining({collection: 'issue comments'}),
+    )
+  })
+
   it('returns null on REST API error', async () => {
     // #given
     const mockOctokit = {
