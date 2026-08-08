@@ -6,6 +6,8 @@
 
 The harness embeds [cortexkit/orw](https://github.com/cortexkit/orw)'s integration method: on each deliberately-pinned upstream OpenCode release, it bases an integration branch on the release tag, fetches a configured set of integration refs (stalled/closed upstream PRs, branch URLs), and runs an LLM merge (`opencode run`) to carry those refs onto the release tag — resolving the base drift that `git am`/cherry-pick cannot handle. The produced per-platform binary is the `harness` binary (the patched OpenCode), shipped in the package dist.
 
+Why each carried ref exists, which surface it serves, and what would make it safe to drop are recorded in the [carry ledger](../../docs/reference/carry-ledger.md). Read it before proposing a removal during a base bump — an unmerged upstream PR is not grounds for dropping a carry, and at least one entry has been wrongly proposed for removal twice by audits that checked the type and not the write path.
+
 ## CLI Contract
 
 ```
