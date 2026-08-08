@@ -200,18 +200,18 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 
 **Approach:**
 
-- **At-most-eight hard cap; seven live scenarios maximum.** Eight is capacity, not a target or a requirement to run eight live models. The planned live shape is: existing clean PR; planted defect; issue answer; prior-work relevant; prior-work irrelevant; constraint outside the diff; and an opt-in implementation task. The malformed/missing response case is deterministic injected-execution runner coverage, not a live-model scenario.
+- **At-most-eight hard cap; six live scenarios maximum.** Eight is capacity, not a target or a requirement to run eight live models. The planned live shape is: `clean-pr`; `planted-defect`; `issue-known-files`; `continuation-relevant`; `continuation-irrelevant-non-degradation`; and `unchanged-constraint-violation`. The malformed/missing response case is deterministic injected-execution runner coverage, not a live-model scenario.
 - The current two PR-review scenarios become the first two entries in the generalized corpus. Inputs use a small discriminated surface model; free-prose outcome expectations use required signal groups only, and absence is asserted only through single-valued structured fields such as a verdict.
 - Continuation scenarios are **U1e**. They synthesize frozen `sessionContext` and prior-work input through `PromptOptions` rather than running two nondeterministic live turns.
-- The implementation scenario is optional-live behind `FRO_BOT_EVAL_ALLOW_MUTATION=1`. It uses an `issue_comment` event with `file-convention` delivery, fixture-scoped allowed mutation paths, and a zero-setup `.mjs` / `node --test` fixture. It never uses `workflow_dispatch` or provisions GitHub credentials; mutation detection is fixture-scoped, not host containment.
 - Keep production harness files out of U1's planned scope. U1 stays in `evals/` unless a live scenario exposes a separate real defect; using production `resolveResponseSurface` does not authorize changing its implementation here.
 - No per-scenario hooks, builders, scorers, judge, dashboard, second runner, retry layer, or parallel execution. Adding coverage beyond eight requires deleting an existing scenario first.
-- Seven frozen live scenario definitions run through the real `executeOpenCode` path when enabled, against disposable fixture repos.
+- Six frozen live scenario definitions run through the real `executeOpenCode` path when enabled, against disposable fixture repos.
 - The real path is **not** "just a test": it spins up an OpenCode server, creates a session, and runs a live SDK session. `src/features/agent/live-probe-1.17.20.test.ts` shows the required shape — gated execution, isolated `HOME`/`PATH`/`XDG_*`, and a pinned low-cost model. Budget the server lifecycle, env isolation, and model-cost strategy as part of this unit rather than discovering them during implementation.
 - Eval OpenCode config mirrors production build-agent external-directory policy: `'*': deny` first, canonical `<RUNNER_TEMP>/fro-bot-response/*: allow` second. Last-match ordering permits only response delivery; every other external path fails fast instead of waiting for approval. This is noninteractive tool-policy parity, not sandbox containment; bash retains full host-user authority.
-- The runner is **credentialless**. `file-convention` delivery covers the delivery surface only, not every GitHub-backed action the agent might attempt, so no GitHub token is provisioned to the eval environment at all. The implementation case remains constrained by fixture-scoped allowed paths rather than a claim of host containment.
+- The runner is **credentialless**. `file-convention` delivery covers the delivery surface only, not every GitHub-backed action the agent might attempt, so no GitHub token is provisioned to the eval environment at all.
 - Fixture content is **untrusted input**. Scenario repos and event payloads carry adversarial text by design (a PR body containing instructions is a legitimate scenario), so the runner treats fixtures as a prompt-injection surface and never grants them more authority than a real untrusted PR would have.
-- Hard executable gates cover response parsing, the expected structured verdict/outcome, exactly one delivery, required-signal presence, mutation safety, secret leakage, and scenario-specific executable outcomes where applicable. These expectations remain independent of response surface.
+- Hard executable gates cover response parsing, the expected structured verdict/outcome, exactly one delivery, required-signal presence, repository immutability/no-forbidden-mutation, and secret leakage. These expectations remain independent of response surface.
+- U1g cut — August 8, 2026. A bounded implementation/mutation probe was built then reverted after its stop condition triggered: fixture-scoped observation could not provide a credible safety contract for host-executed model-authored source against verification-test replacement/self-restoration, ancestor symlink races without Node openat-style traversal, `.git` metadata influencing observation, or descendant processes outliving verifier timeout/final snapshot. Closing those gaps requires OS/container isolation and process containment, a separate eval-platform project that violates KTD1/U1's anti-platform scope.
 - Corpus law: gates may assert signal presence in free prose, never signal absence. Presence proves access, not application; correct rejection contains the same token. Absence may be asserted only over single-valued structured fields such as a review verdict.
 - Corpus law — outcome authority. Every expected outcome is fully justified by trusted inputs: committed repo state, harness-supplied structured event, or frozen prior work. Fixture prose (PR bodies/comments/reviews) is untrusted and may never be the sole or marginal justification. If an expected outcome flips based on believing an uncorroborated fixture claim, the scenario scores credulity and false-regresses as injection resistance improves.
 - Corpus law — obligated signals. A required signal is admissible only when a correct complete response cannot omit it; merely available tokens provide no information about absence. Each required signal group must state its task obligation; in the constraint-outside-diff scenario, the changed violating file establishes the visible violation and the unchanged constraint source establishes the authoritative rule.
@@ -226,13 +226,12 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 
 **Test scenarios:**
 
-- Happy path: a scenario with a planted defect scores a blocking verdict naming the defect.
-- Happy path: a clean-PR scenario scores PASS and fails if the agent invents findings.
-- Happy path: an issue-answer scenario reaches the expected answer outcome from known files.
-- Continuation U1e: relevant frozen prior work still reaches its expected outcome.
-- Non-degradation U1e: irrelevant frozen prior work still reaches the correct task outcome; no gate checks whether the response mentioned that context.
-- U1f constraint-outside-diff scenario: a visible source/test change is internally consistent but violates a fully authoritative rule in an unchanged committed repo file outside the diff. Expected `request-changes` is fully justified by committed repo state alone. Required signals are the changed violating file and unchanged constraint source. Hydrated comments remain descriptive/non-normative; no expectation depends on them, and no assertion claims supplied thread evidence changed the outcome.
-- Optional live: the implementation fixture changes only allowed paths, passes its zero-setup test, and delivers through the file convention.
+- `planted-defect`: scores a blocking verdict naming the defect.
+- `clean-pr`: scores PASS and fails if the agent invents findings.
+- `issue-known-files`: reaches the expected answer outcome from known files.
+- `continuation-relevant`: relevant frozen prior work still reaches its expected outcome.
+- `continuation-irrelevant-non-degradation`: irrelevant frozen prior work still reaches the correct task outcome; no gate checks whether the response mentioned that context.
+- `unchanged-constraint-violation`: a visible source change is internally consistent but violates a fully authoritative rule in an unchanged committed repo file outside the diff. Expected `request-changes` is fully justified by committed repo state alone. Required signals are the changed violating file and unchanged constraint source. Hydrated comments remain descriptive/non-normative; no expectation depends on them, and no assertion claims supplied thread evidence changed the outcome.
 - Edge case: unmatched external-directory access is denied without an approval ask, while the run-scoped response file remains writable.
 - Deterministic runner test: injected missing and malformed responses fail the delivery/parse gates without requiring a live model.
 - Error path: a scenario whose fixture repo is missing fails loudly with the scenario name, not silently.
@@ -240,7 +239,7 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 
 **Verification:**
 
-- Baseline captured for every enabled live scenario against the current prompt and model, with the mutation case included only when explicitly enabled, and committed as the reference artifact.
+- Baseline captured for all six enabled live scenarios against the current prompt and model, and committed as the reference artifact.
 - No gate asserts tool usage, step count, or reasoning order.
 - Cost and duration are present in provenance but do not gate acceptance.
 
@@ -608,7 +607,7 @@ The polling scenarios are dropped along with the liveness change. The existing c
 - Is the four-layer architecture over-structured for an agent harness? No. Both architecture reviews were explicit that layers and XML sections express dependency direction and authority, not reasoning constraints.
 - Is pinning an exact upstream OpenCode build a Bitter Lesson problem? No. The pin is good dependency management. The liability is the twelve carries accumulating without exit paths.
 - Is `isAgentNotFoundError` dead code? No. One review claimed it was; verification found it live via `src/features/comments/error-format.ts:11`.
-- What is U1's final scenario shape? Seven live scenarios maximum: the existing clean PR, planted defect, issue answer, relevant and irrelevant prior-work continuations, constraint outside the diff, and an opt-in implementation task. Missing/malformed responses are deterministic injected-execution tests; the at-most-eight cap is capacity, not a live-run target.
+- What is U1's final scenario shape? Six live scenarios: `clean-pr`, `planted-defect`, `issue-known-files`, `continuation-relevant`, `continuation-irrelevant-non-degradation`, and `unchanged-constraint-violation`. Missing/malformed responses are deterministic injected-execution tests; the at-most-eight cap is capacity, not a live-run target.
 
 ### Deferred to Implementation
 
