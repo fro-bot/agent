@@ -314,11 +314,26 @@ describe('runScenario orchestration', () => {
     // #given a real-provider-shaped auth entry and diagnostic files containing its secret
     await withTestEnvironment(async setup => {
       const secret = 'synthetic-anthropic-credential-1234567890'
+      const accessTokenSecret = 'synthetic-anthropic-access-token-1234567890'
+      const refreshTokenSecret = 'synthetic-anthropic-refresh-token-1234567890'
+      const visibleMetadata = 'visible-auth-metadata'
+      const credentialValues = [secret, accessTokenSecret, refreshTokenSecret]
       const hostDataDir = path.join(setup.tempDir, 'host-data')
       fs.mkdirSync(path.join(hostDataDir, 'opencode'), {recursive: true})
       fs.writeFileSync(
         path.join(hostDataDir, 'opencode', 'auth.json'),
-        JSON.stringify({anthropic: {type: 'api', key: secret}}),
+        JSON.stringify({
+          anthropic: {
+            type: 'api',
+            key: secret,
+            accessToken: accessTokenSecret,
+            refresh_token: refreshTokenSecret,
+            accessibility: visibleMetadata,
+            accessMode: visibleMetadata,
+            refreshRate: visibleMetadata,
+            apiKeyName: visibleMetadata,
+          },
+        }),
         {mode: 0o600},
       )
       process.env.XDG_DATA_HOME = hostDataDir
@@ -331,8 +346,16 @@ describe('runScenario orchestration', () => {
         }
         const logDir = path.join(dataHome, 'opencode', 'log')
         fs.mkdirSync(logDir, {recursive: true})
-        fs.writeFileSync(path.join(logDir, 'agent.log'), `useful diagnostic ${secret} ghp_fake-token-value\n`, 'utf8')
-        fs.writeFileSync(path.join(logDir, 'agent.jsonl'), `{"message":"useful jsonl ${secret}"}\n`, 'utf8')
+        fs.writeFileSync(
+          path.join(logDir, 'agent.log'),
+          `useful diagnostic ${secret} ${accessTokenSecret} ${refreshTokenSecret} ${visibleMetadata} ghp_fake-token-value\n`,
+          'utf8',
+        )
+        fs.writeFileSync(
+          path.join(logDir, 'agent.jsonl'),
+          `{"message":"useful jsonl ${secret} ${accessTokenSecret} ${refreshTokenSecret} ${visibleMetadata}"}\n`,
+          'utf8',
+        )
         fs.writeFileSync(path.join(logDir, 'auth.json'), `unexpected auth ${secret}\n`, 'utf8')
         fs.writeFileSync(path.join(logDir, 'unexpected.txt'), `unexpected ${secret}\n`, 'utf8')
         fs.symlinkSync(path.join(logDir, 'agent.log'), path.join(logDir, 'linked.log'))
@@ -349,11 +372,15 @@ describe('runScenario orchestration', () => {
       }
       const diagnosticPath = report.execution.diagnosticsPath
       expect(fs.readFileSync(path.join(diagnosticPath, 'agent.log'), 'utf8')).toContain('useful diagnostic')
-      expect(fs.readFileSync(path.join(diagnosticPath, 'agent.log'), 'utf8')).not.toContain(secret)
+      for (const credentialValue of credentialValues) {
+        expect(fs.readFileSync(path.join(diagnosticPath, 'agent.log'), 'utf8')).not.toContain(credentialValue)
+        expect(fs.readFileSync(path.join(diagnosticPath, 'agent.jsonl'), 'utf8')).not.toContain(credentialValue)
+        expect(report.agentResult.error).not.toContain(credentialValue)
+        expect(report.stateReason).not.toContain(credentialValue)
+      }
       expect(fs.readFileSync(path.join(diagnosticPath, 'agent.log'), 'utf8')).not.toContain('ghp_fake-token-value')
-      expect(fs.readFileSync(path.join(diagnosticPath, 'agent.jsonl'), 'utf8')).not.toContain(secret)
-      expect(report.agentResult.error).not.toContain(secret)
-      expect(report.stateReason).not.toContain(secret)
+      expect(fs.readFileSync(path.join(diagnosticPath, 'agent.log'), 'utf8')).toContain(visibleMetadata)
+      expect(fs.readFileSync(path.join(diagnosticPath, 'agent.jsonl'), 'utf8')).toContain(visibleMetadata)
       expect(fs.existsSync(path.join(diagnosticPath, 'auth.json'))).toBe(false)
       expect(fs.existsSync(path.join(diagnosticPath, 'unexpected.txt'))).toBe(false)
       expect(fs.existsSync(path.join(diagnosticPath, 'linked.log'))).toBe(false)

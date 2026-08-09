@@ -108,13 +108,12 @@ function requiredPassedGateIds(report: Record<string, unknown>, index: number): 
 function buildScenarioProvenance(
   scenario: Scenario,
   provenance: ReturnType<typeof buildDeterministicScenarioProvenance>,
-): BaselineScenario {
+): Omit<BaselineScenario, 'passedGateIds'> {
   return {
     id: scenario.id,
     promptHash: provenance.promptHash,
     scenarioCommitSha: provenance.scenarioCommitSha,
     state: 'passed',
-    passedGateIds: [],
   }
 }
 

@@ -271,8 +271,8 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
 
     const opencodeBin = path.join(binDir, 'opencode')
     fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${resolveHarnessBinary()}" "$@"\n`, {mode: 0o755})
-    const authPlugin = resolveConfiguredPluginVersions(model)[0]
     const pluginVersions = resolveConfiguredPluginVersions(model)
+    const authPlugin = pluginVersions[0]
     fs.writeFileSync(
       path.join(configDir, 'opencode.json'),
       JSON.stringify(
@@ -372,9 +372,27 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
  * Fails loudly rather than running unauthenticated: an auth-less run against a real model
  * surfaces as a confusing execution failure that looks like an agent problem.
  */
+const CREDENTIAL_KEY_FORMS: ReadonlySet<string> = new Set([
+  'key',
+  'token',
+  'secret',
+  'password',
+  'credential',
+  'access',
+  'refresh',
+  'apikey',
+  'clientsecret',
+  'accesstoken',
+  'refreshtoken',
+])
+
+function isCredentialKey(keyName: string): boolean {
+  return CREDENTIAL_KEY_FORMS.has(keyName.replaceAll(/[-_]/g, '').toLowerCase())
+}
+
 function collectCredentialValues(value: unknown, keyName: string | null = null): readonly string[] {
   if (typeof value === 'string') {
-    return keyName != null && /key|token|secret|password|credential|access|refresh/i.test(keyName) ? [value] : []
+    return keyName != null && isCredentialKey(keyName) ? [value] : []
   }
   if (typeof value !== 'object' || value === null) {
     return []
