@@ -1,11 +1,11 @@
 ---
 type: subsystem
-last-updated: "2026-07-19"
-updated-by: "1a2d8b2"
+last-updated: "2026-08-09"
+updated-by: "c006768"
 sources:
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/prompt-thread.ts
-  - packages/runtime/src/agent/prompt-sender.ts
+  - src/features/agent/prompt-sender.ts
   - packages/runtime/src/agent/output-mode.ts
   - packages/runtime/src/agent/response-delivery.ts
   - packages/runtime/src/agent/types.ts
@@ -49,7 +49,9 @@ The prompt is assembled in this order:
 
 10. **`<output_contract>`** — For PR review events only. Specifies whether to approve, request changes, or comment, and includes the author's association level.
 
-11. **`<agent_context>`** — Operating environment description, session management instructions, response protocol template, and `gh` CLI reference examples. The session-management block enumerates the four always-on session tools by name — `session_list`, `session_search`, `session_read`, and `session_info` — so the model knows the exact surface it can call before investigating (see the [native session tools](Session%20Persistence.md#native-agent-session-tools) in [[Session Persistence]]). Listing them in the prompt keeps discovery in sync with the tools the harness actually registers, rather than leaving the model to guess.
+11. **`<agent_context>`** — Operating environment description, session context, response protocol template, and `gh` CLI reference examples. The session block enumerates the four always-on session tools by name — `session_list`, `session_search`, `session_read`, and `session_info` — so the model knows the exact surface it can call (see the [native session tools](Session%20Persistence.md#native-agent-session-tools) in [[Session Persistence]]). Listing them in the prompt keeps discovery in sync with the tools the harness actually registers, rather than leaving the model to guess.
+
+This section deliberately **offers** session context rather than **prescribing** a search ritual (`packages/runtime/src/agent/prompt.ts`, refactored by commit `995f866`). An earlier version issued a fixed procedure — call `session_search`, then `session_read` the hits, then avoid repeating prior work — even though the harness has _already_ run `listSessions` and `searchSessions` during session prep and injected the results as the `<session_context>` and `<current_thread>` blocks above. Prescribing the retrieval a second time pushed the model to redo work the harness had done. The wording now states that prior session context may already be supplied and that the tools remain available when additional history would help, leaving the model to decide whether to re-search rather than mandating a method. The delivery contracts (response-file path, verdict tokens, the one-response rule, credential semantics) are unaffected by the change.
 
 ## Trigger Directive System
 
@@ -95,4 +97,4 @@ Keeping this branch in the prompt builder (rather than in a separate agent instr
 
 ## Prompt Sender
 
-The assembled prompt text and reference files are sent to an OpenCode SDK session by `sendPromptToSession()` in `prompt-sender.ts`. This function handles model resolution (if a model override is configured), directory scoping to the GitHub workspace, and the construction of the SDK message payload with both text and file parts. For retry attempts after LLM failures, a short continuation prompt is sent instead of the full initial prompt, since the session already has the full context.
+The assembled prompt text and reference files are sent to an OpenCode SDK session by `sendPromptToSession()` in `src/features/agent/prompt-sender.ts`. (This module lives in the action layer — the runtime no longer carries a parallel prompt-sender after the execution stack was consolidated; see [[Architecture Overview]].) The function handles model resolution (if a model override is configured), directory scoping to the GitHub workspace, and the construction of the SDK message payload with both text and file parts. For retry attempts after LLM failures, a short continuation prompt is sent instead of the full initial prompt, since the session already has the full context. That continuation text is built from the observed error type rather than a fixed string, and asks the model to continue the remaining objective rather than blindly resume — the [[Execution Lifecycle]] covers how the attempt outcome is classified and how the continuation is phrased.
