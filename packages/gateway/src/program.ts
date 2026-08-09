@@ -21,6 +21,7 @@ import {
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
   err,
+  redactSensitiveFields,
 } from '@fro-bot/runtime'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Effect} from 'effect'
@@ -89,17 +90,17 @@ export function makeLogger(level: 'debug' | 'info' | 'warn' | 'error'): GatewayL
   return {
     debug: (ctx, msg) => {
       // eslint-disable-next-line no-console
-      if (minLevel <= levels.debug) console.log(JSON.stringify({level: 'debug', ...ctx, msg}))
+      if (minLevel <= levels.debug) console.log(JSON.stringify({level: 'debug', ...redactSensitiveFields(ctx), msg}))
     },
     info: (ctx, msg) => {
       // eslint-disable-next-line no-console
-      if (minLevel <= levels.info) console.log(JSON.stringify({level: 'info', ...ctx, msg}))
+      if (minLevel <= levels.info) console.log(JSON.stringify({level: 'info', ...redactSensitiveFields(ctx), msg}))
     },
     warn: (ctx, msg) => {
-      if (minLevel <= levels.warn) console.warn(JSON.stringify({level: 'warn', ...ctx, msg}))
+      if (minLevel <= levels.warn) console.warn(JSON.stringify({level: 'warn', ...redactSensitiveFields(ctx), msg}))
     },
     error: (ctx, msg) => {
-      if (minLevel <= levels.error) console.error(JSON.stringify({level: 'error', ...ctx, msg}))
+      if (minLevel <= levels.error) console.error(JSON.stringify({level: 'error', ...redactSensitiveFields(ctx), msg}))
     },
   }
 }
