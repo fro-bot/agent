@@ -97,7 +97,19 @@ env:
 
     Sections (in order):
     - Summary metrics (issues opened since last run, currently open PRs, stale
-      issues/PRs count, main branch check status, security alerts if accessible)
+      issues/PRs count, main branch check status, security alerts)
+
+    For the security alert counts, query both sources explicitly and report each
+    total separately:
+      gh api "repos/{owner}/{repo}/dependabot/alerts?state=open&per_page=100" --paginate
+      gh api "repos/{owner}/{repo}/code-scanning/alerts?state=open&per_page=100" --paginate
+    The `state` field is the only authority on whether an alert is open. Report an
+    alert as resolved only when its own state says so — never because it is missing
+    from a narrower view. Repo-level findings (Scorecard rules such as branch
+    protection or known vulnerabilities) legitimately have no file location and
+    still count toward the total, so never filter on the presence of a file path.
+    If a source is genuinely inaccessible, write "data unavailable" for that source
+    rather than reporting a partial count as complete.
     - Stale issues (no activity >30 days; recommend next step)
     - Stale PRs (no activity >7 days; stale >14 days)
     - Unassigned bugs (label bug, no assignee)
