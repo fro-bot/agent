@@ -183,8 +183,8 @@ interface SerializedEvalConfig {
 
 describe('runScenario orchestration', () => {
   it.each([
-    ['clean-pr', cleanPrScenario, '05b7906f4a55ab1768da4946d0aeaaa596e0d9eb1c0035e618b1ca1c1a766c2e'],
-    ['planted-defect', plantedDefectScenario, 'b915f0c6ec49033614bf083dec7936f58c4cb21fbc9c3294db319a006a36b664'],
+    ['clean-pr', cleanPrScenario, 'c474c8296f43f8b78bbf969b6b8dddf45750e254db6e59363a3cd722055c5781'],
+    ['planted-defect', plantedDefectScenario, 'f8122d62a15d100d612de23f829e007cffcbd29e5f14f8e1304adbfd637c07a3'],
   ] as const)('pins the exact current prompt hash for %s', (_id, scenario, expectedHash) => {
     // #given a deterministic no-model prompt construction seam
     const promptOptions = buildPromptOptions(scenario, CHARACTERIZATION_HEAD_SHA, CHARACTERIZATION_RESPONSE_PATH)

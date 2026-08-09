@@ -1,8 +1,12 @@
+import {mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import * as prettier from 'prettier'
 import {describe, expect, it} from 'vitest'
 import {createLogger} from '../src/shared/logger.js'
 import {buildDeterministicScenarioProvenance} from './runner.js'
 import {ALL_SCENARIOS} from './scenarios/index.js'
-import {buildBaselineFromReport} from './update-baseline.js'
+import {buildBaselineFromReport, updateBaselineFromReportPath} from './update-baseline.js'
 
 interface SyntheticScenario {
   readonly scenarioId: string
@@ -174,5 +178,33 @@ describe('buildBaselineFromReport', {timeout: 60_000}, () => {
     expect(baseline.scenarios).toHaveLength(ALL_SCENARIOS.length)
     expect(baseline.scenarios.every(scenario => scenario.state === 'passed')).toBe(true)
     expect(baseline.scenarios.every(scenario => scenario.passedGateIds.length === 2)).toBe(true)
+  }, 30_000)
+
+  it('writes a sanitized, Prettier-clean baseline artifact', async () => {
+    // #given a valid completed report and temporary input/output paths
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'fro-bot-baseline-update-'))
+    const reportPath = path.join(tempDir, 'report.json')
+    const outputPath = path.join(tempDir, 'baseline.json')
+    const report = createReport()
+    writeFileSync(reportPath, JSON.stringify(report), 'utf8')
+
+    try {
+      // #when the baseline updater writes the sanitized artifact
+      const update = updateBaselineFromReportPath(reportPath, outputPath)
+
+      // #then the updater is asynchronous and emits the expected sanitized data in repo format
+      expect(update).toBeInstanceOf(Promise)
+      await update
+      const raw = readFileSync(outputPath, 'utf8')
+      const baseline = JSON.parse(raw) as unknown
+      const expectedBaseline = buildBaselineFromReport(report)
+
+      expect(baseline).toEqual(expectedBaseline)
+      expect(raw).toBe(await prettier.format(raw, {filepath: outputPath, parser: 'json'}))
+      expect(raw).not.toContain('raw response')
+      expect(raw).not.toContain('sk-secret-value')
+    } finally {
+      rmSync(tempDir, {recursive: true, force: true})
+    }
   }, 30_000)
 })

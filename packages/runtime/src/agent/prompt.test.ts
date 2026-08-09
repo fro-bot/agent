@@ -468,7 +468,7 @@ describe('buildAgentPrompt', () => {
 
     // #then
     expect(prompt).toContain('<agent_context>')
-    expect(prompt).toContain('### Session Management (REQUIRED)')
+    expect(prompt).toContain('### Session Context')
     expect(prompt).toContain('session_list')
     expect(prompt).toContain('session_search')
     expect(prompt).toContain('session_read')
@@ -526,7 +526,7 @@ describe('buildAgentPrompt', () => {
 
     // #then
     const agentContextBlock = getXmlBlock(prompt, 'agent_context')
-    const sessionMgmtIndex = agentContextBlock.indexOf('### Session Management (REQUIRED)')
+    const sessionMgmtIndex = agentContextBlock.indexOf('### Session Context')
     const responseProtocolIndex = agentContextBlock.indexOf('### Response Protocol (REQUIRED)')
     const ghOpsIndex = agentContextBlock.indexOf('### GitHub Operations')
 
@@ -786,7 +786,7 @@ describe('buildAgentPrompt', () => {
     expect(prompt).not.toContain('### Response Protocol (REQUIRED)')
     expect(prompt).not.toContain('exactly ONE comment or review')
     expect(prompt).not.toContain('See **Response Protocol** above')
-    expect(prompt).toContain('### Session Management (REQUIRED)')
+    expect(prompt).toContain('### Session Context')
     expect(prompt).toContain('### GitHub Operations')
     expect(prompt).not.toContain('<user_supplied_instructions>\n')
     expect(getXmlBlock(prompt, 'task')).toContain('Run weekly maintenance')
@@ -1528,7 +1528,7 @@ describe('buildAgentPrompt', () => {
       const prompt = result.text
 
       // #then
-      expect(prompt).toContain('### Session Management (REQUIRED)')
+      expect(prompt).toContain('### Session Context')
       expect(prompt).toContain('session_list')
       expect(prompt).toContain('session_search')
       expect(prompt).toContain('session_read')
@@ -2326,6 +2326,8 @@ describe('buildAgentPrompt response delivery gating', () => {
   it('keeps each response delivery contract item exact in generated prompt text', () => {
     // #given
     const responseFilePath = '/tmp/fro-bot-response/1-1/nonce123.md'
+
+    // #when
     const filePrompt = buildPromptForDelivery('file-convention', responseFilePath)
     const silentPrompt = buildPromptForDelivery('none', null, 'pull_request')
     const modelPrompt = buildPromptForDelivery('model-gh', null)

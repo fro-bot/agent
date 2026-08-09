@@ -216,7 +216,7 @@ function buildAgentContextSection(
 
   lines.push(
     '',
-    '### Session Management (REQUIRED)',
+    '### Session Context',
     'Tools: `session_list` (recent sessions), `session_search` (find relevant sessions by query), `session_read` (read a session in full), `session_info` (metadata for one session).',
     '',
     'Prior session context may already be supplied in this prompt.',

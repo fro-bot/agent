@@ -1,10 +1,11 @@
 import type {Logger} from '../src/shared/logger.js'
 import type {Scenario} from './types.js'
-import {execFileSync} from 'node:child_process'
 import {mkdirSync, readFileSync, writeFileSync} from 'node:fs'
 import * as path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
+// eslint-disable-next-line import-x/no-extraneous-dependencies -- evals are dev-only tooling
+import * as prettier from 'prettier'
 import {createLogger} from '../src/shared/logger.js'
 import {buildDeterministicScenarioProvenance} from './runner.js'
 import {ALL_SCENARIOS} from './scenarios/index.js'
@@ -219,30 +220,30 @@ export function buildBaselineFromReport(
   }
 }
 
-export function updateBaselineFromReportPath(reportPath: string, outputPath = BASELINE_PATH): void {
+export async function updateBaselineFromReportPath(reportPath: string, outputPath = BASELINE_PATH): Promise<void> {
   const source = JSON.parse(readFileSync(reportPath, 'utf8')) as unknown
   const baseline = buildBaselineFromReport(source)
-  const formatted = execFileSync('bunx', ['prettier', '--parser', 'json', '--stdin-filepath', outputPath], {
-    input: JSON.stringify(baseline),
-    encoding: 'utf8',
+  const config = await prettier.resolveConfig(BASELINE_PATH)
+  const formatted = await prettier.format(JSON.stringify(baseline), {
+    ...(config ?? {}),
+    filepath: outputPath,
+    parser: 'json',
   })
   mkdirSync(path.dirname(outputPath), {recursive: true})
   writeFileSync(outputPath, formatted, 'utf8')
 }
 
-function runCommand(): void {
+async function runCommand(): Promise<void> {
   const reportPath = process.argv[2]
   if (reportPath == null || reportPath.trim().length === 0) {
     throw new Error('Usage: bun run evals:baseline:update -- <completed-report.json>')
   }
-  updateBaselineFromReportPath(reportPath)
+  await updateBaselineFromReportPath(reportPath)
 }
 
 if (process.argv[1] != null && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try {
-    runCommand()
-  } catch (error) {
+  runCommand().catch(error => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
-  }
+  })
 }
