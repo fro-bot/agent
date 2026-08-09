@@ -53,6 +53,8 @@ describe('U1 committed baseline integrity', () => {
     // #given the committed baseline and the live scenario registry
     const {baseline} = readBaseline()
     const provenanceLogger = createLogger({component: 'u1-baseline-provenance-test'})
+
+    // #when live provenance is computed in registry order
     const liveProvenance = ALL_SCENARIOS.map(scenario =>
       buildDeterministicScenarioProvenance(scenario, provenanceLogger),
     )
