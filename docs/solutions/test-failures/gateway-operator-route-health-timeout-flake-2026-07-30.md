@@ -32,6 +32,10 @@ tags:
 - The failure is the whole-file 5s ceiling being exceeded under parallel load; it is not tied to one specific `it()`.
 - Re-running the full suite, or running just the file, passes: `bunx vitest run packages/gateway/src/web/operator-route.test.ts` → 35/35 in ~1.4s.
 
+## Not Every 5s Timeout Is This Flake
+
+A timeout is only this flake when the test is normally fast and fails under parallel load. A test that legitimately costs more than the default budget every time it runs — for example one that builds several temporary git repositories — fails deterministically in isolation too, and needs an explicit timeout rather than a re-run. Check isolation first: passing alone points here, failing alone points at the test's own cost.
+
 ## What Didn't Work
 
 Treating a single occurrence as a code failure. The test exercises static route-classification guards (public/health vs privileged) with no timing-sensitive production logic — there is nothing in the assertions that legitimately takes 5s. The timeout is scheduler contention when many gateway suites run concurrently, not a bug in the code under test or the test itself.

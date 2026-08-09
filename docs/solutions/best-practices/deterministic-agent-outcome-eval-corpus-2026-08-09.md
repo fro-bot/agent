@@ -100,6 +100,15 @@ Delete duplicated constants that a live value can reproduce. Keep a constant onl
 
 A prompt change therefore has an honest cost — a fresh run, a re-recorded baseline, and updated byte pins. Document those steps together, because a contributor who follows a partial checklist hits an unexplained failure in a test they did not touch.
 
+The order matters, because the baseline is legitimately stale in the middle of it:
+
+1. Commit the code change. The recorded run commit is read from `HEAD`, so the tree must be clean and the change must already be in history.
+2. Run the corpus once at that commit.
+3. Promote the baseline from the completed report.
+4. Commit the baseline, and update the recorded run commit that is pinned by hand.
+
+Between steps 1 and 4 the integrity check fails on purpose, and any hook that runs it fails with it. Expect that window, keep it short, and do not resolve it by editing the baseline directly — a hand-edited baseline is no longer evidence of a run that happened.
+
 ### Capture diagnostics as bounded evidence, not proof of isolation
 
 Failed and inconclusive runs need enough evidence to distinguish a provider failure, wrong working directory, permission stall, and model regression. `captureDiagnostics()` therefore accepts only immediate expected log files, skips directories and symlinks, redacts known and credential-shaped secrets before bounding content, caps the total retained bytes, and writes files with restrictive permissions.
