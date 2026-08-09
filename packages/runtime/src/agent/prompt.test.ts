@@ -127,6 +127,31 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('**Cache Status:** hit')
   })
 
+  it('offers prior session context and tools without prescribing a tool-call order', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger).text
+
+    // #then
+    expect(prompt).toContain('Prior session context may already be supplied in this prompt.')
+    expect(prompt).toContain(
+      'When additional history would help, the session tools `session_list`, `session_search`, `session_read`, and `session_info` are available.',
+    )
+    expect(prompt).toContain(
+      'Your session should contain a summary of the work done, including key decisions, findings, and outcomes, so it can be searched later.',
+    )
+    expect(prompt).not.toContain('Before investigating any issue:')
+    expect(prompt).not.toContain('1. Use `session_search` (or `session_list`)')
+    expect(prompt).not.toContain('2. Use `session_read` to review prior work if found')
+    expect(prompt).not.toContain('Before completing:')
+  })
+
   it('includes harness rules at top without constraint reminder', () => {
     // #given
     const options: PromptOptions = {
@@ -443,7 +468,7 @@ describe('buildAgentPrompt', () => {
 
     // #then
     expect(prompt).toContain('<agent_context>')
-    expect(prompt).toContain('### Session Management (REQUIRED)')
+    expect(prompt).toContain('### Session Context')
     expect(prompt).toContain('session_list')
     expect(prompt).toContain('session_search')
     expect(prompt).toContain('session_read')
@@ -501,7 +526,7 @@ describe('buildAgentPrompt', () => {
 
     // #then
     const agentContextBlock = getXmlBlock(prompt, 'agent_context')
-    const sessionMgmtIndex = agentContextBlock.indexOf('### Session Management (REQUIRED)')
+    const sessionMgmtIndex = agentContextBlock.indexOf('### Session Context')
     const responseProtocolIndex = agentContextBlock.indexOf('### Response Protocol (REQUIRED)')
     const ghOpsIndex = agentContextBlock.indexOf('### GitHub Operations')
 
@@ -761,7 +786,7 @@ describe('buildAgentPrompt', () => {
     expect(prompt).not.toContain('### Response Protocol (REQUIRED)')
     expect(prompt).not.toContain('exactly ONE comment or review')
     expect(prompt).not.toContain('See **Response Protocol** above')
-    expect(prompt).toContain('### Session Management (REQUIRED)')
+    expect(prompt).toContain('### Session Context')
     expect(prompt).toContain('### GitHub Operations')
     expect(prompt).not.toContain('<user_supplied_instructions>\n')
     expect(getXmlBlock(prompt, 'task')).toContain('Run weekly maintenance')
@@ -1503,7 +1528,7 @@ describe('buildAgentPrompt', () => {
       const prompt = result.text
 
       // #then
-      expect(prompt).toContain('### Session Management (REQUIRED)')
+      expect(prompt).toContain('### Session Context')
       expect(prompt).toContain('session_list')
       expect(prompt).toContain('session_search')
       expect(prompt).toContain('session_read')
@@ -2296,6 +2321,54 @@ describe('buildAgentPrompt response delivery gating', () => {
     for (const verdict of RESPONSE_FILE_VERDICTS) {
       expect(prompt).toContain(`${RESPONSE_FILE_VERDICT_KEY}: ${verdict}`)
     }
+  })
+
+  it('keeps each response delivery contract item exact in generated prompt text', () => {
+    // #given
+    const responseFilePath = '/tmp/fro-bot-response/1-1/nonce123.md'
+
+    // #when
+    const filePrompt = buildPromptForDelivery('file-convention', responseFilePath)
+    const silentPrompt = buildPromptForDelivery('none', null, 'pull_request')
+    const modelPrompt = buildPromptForDelivery('model-gh', null)
+
+    // #then
+    expect(filePrompt).toContain(`**Write to this exact path:** \`${responseFilePath}\``)
+    expect(filePrompt).toContain(
+      'You MUST deliver exactly ONE response per invocation by writing it to the response file.',
+    )
+    expect(filePrompt).toContain(`\`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\``)
+    expect(filePrompt).toContain(`\`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\``)
+    expect(filePrompt).toContain(
+      '1. **The `gh` CLI is NOT available.** A `gh` call will fail — write the response file instead.',
+    )
+    expect(modelPrompt).toContain(
+      '4. **Include the bot marker.** Your response must contain `<!-- fro-bot-agent -->` (inside the Run Summary block) so the system can identify your comment.',
+    )
+    expect(silentPrompt).toContain(
+      'This run is silent: do not post a comment or review, do not write a response file, and do not call `gh` to post anything. Report your findings only in your assistant message and session summary.',
+    )
+  })
+
+  it('keeps delivery-mode authority over user-supplied instructions in generated prompt text', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({eventName: 'schedule'}),
+      customPrompt: 'Commit and open a pull request.',
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'schedule', eventName: 'schedule'}),
+      resolvedOutputMode: 'working-dir',
+      responseMode: 'github',
+      responseDelivery: 'model-gh',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger).text
+
+    // #then
+    expect(prompt).toContain(
+      'For `schedule` and `workflow_dispatch` triggers, the `## Delivery Mode` block in `<task>` is the operator-level delivery contract. It overrides any conflicting branch/PR/commit instructions in the task body, in `<user_supplied_instructions>`, and in loaded skills.',
+    )
   })
 
   it('renders no response-file instruction and no gh-posting instruction for pull_request delivery none', () => {

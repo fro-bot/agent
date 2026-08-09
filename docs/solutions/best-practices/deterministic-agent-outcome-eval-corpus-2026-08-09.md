@@ -84,6 +84,22 @@ The committed baseline contains only allowlisted outcome and provenance fields. 
 
 Pinned provenance makes a result reviewable and comparable. It does not guarantee identical provider behavior across machines or dates.
 
+### Validate the committed baseline against independently derived provenance
+
+Promotion-time validation is not a standing gate. Between promotions, an ordinary prompt edit silently invalidates every recorded hash, and nothing fails until someone re-records the baseline.
+
+The first version of the integrity check compared the committed baseline against a table of constants that had been copied out of that same baseline. It could only ever confirm the file agreed with itself. A later prompt change drifted all six recorded prompt hashes while the check stayed green — the same self-confirming failure described in [non-failing gates are worse than no gates](../workflow-issues/non-failing-gates-are-worse-than-no-gates-2026-08-07.md).
+
+The fix is to derive the expected value independently rather than restate it. The check now recomputes provenance from the live scenario registry and hard-compares, naming the scenario and both hashes on failure:
+
+```ts
+const liveProvenance = ALL_SCENARIOS.map(scenario => buildDeterministicScenarioProvenance(scenario, logger))
+```
+
+Delete duplicated constants that a live value can reproduce. Keep a constant only where nothing can derive it: the recorded run commit identifies which commit produced the reviewed run, so it stays pinned by hand and forces a conscious update whenever the baseline is re-recorded.
+
+A prompt change therefore has an honest cost — a fresh run, a re-recorded baseline, and updated byte pins. Document those steps together, because a contributor who follows a partial checklist hits an unexplained failure in a test they did not touch.
+
 ### Capture diagnostics as bounded evidence, not proof of isolation
 
 Failed and inconclusive runs need enough evidence to distinguish a provider failure, wrong working directory, permission stall, and model regression. `captureDiagnostics()` therefore accepts only immediate expected log files, skips directories and symlinks, redacts known and credential-shaped secrets before bounding content, caps the total retained bytes, and writes files with restrictive permissions.
