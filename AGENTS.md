@@ -53,8 +53,9 @@ Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full d
 
 ```bash
 bun install                          # Install dependencies
-bun run test                         # Run workspace + scripts/ tests (vitest from repo root)
+bun run test                         # Run workspace package tests + evals/ (vitest from repo root)
 bun run test:scripts                 # Run only scripts/ tests
+bun run test:evals                   # Run only evals/ tests (live scenarios need FRO_BOT_EVAL=1)
 bun run lint                         # ESLint check (also checks the committed dist/ for hidden Unicode)
 bun run fix                          # ESLint auto-fix
 bun run check-types                  # TypeScript type check (tsc --noEmit)
