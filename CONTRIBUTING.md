@@ -22,8 +22,9 @@ This installs workspace dependencies and registers the git hooks (via `simple-gi
 ## Command Surface
 
 ```bash
-bun run test          # Run the workspace package test suites (Vitest)
+bun run test          # Run the workspace package test suites plus evals/ (Vitest)
 bun run test:scripts  # Run the repo-root scripts/ test suite (Vitest)
+bun run test:evals    # Run only the evals/ suite (Vitest)
 bun run lint          # ESLint check (also scans committed dist/ for hidden Unicode)
 bun run fix           # ESLint auto-fix
 bun run check-types   # TypeScript type check (tsc --noEmit)
@@ -37,6 +38,7 @@ bun run build         # Type-check + bundle to dist/ (dist/ is committed and mus
 - **Vitest** for the workspace; test files are colocated as `<name>.test.ts` next to the code they cover.
 - **BDD comments** mark the phases of each test: `// #given`, `// #when`, `// #then`.
 - **`deploy/scripts/`** is a carve-out: plain Node ESM (`.mjs`) run with the built-in `node --test` runner, not Vitest. It is exercised in CI by the `workspace-smoke` job.
+- **`evals/`** holds a gated agent-outcome corpus. Its pure gate, scenario, and baseline-integrity tests run as part of `bun run test`; the live scenarios execute a real model and only run when `FRO_BOT_EVAL=1` is set explicitly, so ordinary contributions never trigger them. Changing the agent prompt invalidates the recorded baseline — see [`evals/README.md`](evals/README.md) for the re-recording procedure.
 - Write the test alongside the change in the same PR; behavior changes need a test that pins the new behavior.
 
 ## Type Safety

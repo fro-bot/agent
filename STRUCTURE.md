@@ -6,7 +6,7 @@ This document maps the repository's directory layout and explains where code liv
 
 ```text
 fro-bot/agent/
-├── src/                        # GitHub Action logic — 4-layer architecture (~14.6k lines)
+├── src/                        # GitHub Action logic — 4-layer architecture (~17.4k lines, excluding tests)
 │   ├── shared/                 # Layer 0: pure types, utils, constants (only @bfra.me/es Result; no heavy deps)
 │   ├── services/               # Layer 1: external adapters (GitHub, cache, setup, object-store, artifact)
 │   │   ├── github/             # Octokit client, context parsing, NormalizedEvent
@@ -59,12 +59,21 @@ fro-bot/agent/
 ├── .github/
 │   └── workflows/              # 11 CI/CD workflow files
 │
+├── evals/                      # Gated agent-outcome eval corpus (live runs need FRO_BOT_EVAL=1)
+│   ├── scenarios/             # Frozen scenario definitions and fixture repos
+│   └── baselines/             # Committed reviewed baseline + provenance integrity test
+│
 ├── RFCs/                       # 19 RFC documents (architecture specs)
 ├── docs/
 │   ├── wiki/                   # 8 Obsidian deep-dive pages
 │   ├── plans/                  # Architecture plans and design docs
 │   ├── solutions/              # Documented solutions to past problems
-│   └── decisions/              # Architecture decision records
+│   ├── product/                # Product requirements and feature docs
+│   ├── brainstorms/            # Requirements documents from design sessions
+│   ├── decisions/              # Architecture decision records
+│   └── …                       # audits/, examples/, ideation/, privacy/, reference/
+│
+├── assets/                     # Repository images and branding
 │
 ├── action.yaml                 # GitHub Action definition (node24 runtime)
 ├── dist/                       # Committed bundled output — must stay in sync with src/
@@ -88,9 +97,12 @@ fro-bot/agent/
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
 - **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations; uses `node --test`, not Vitest.
 - **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch.
+- **`evals/`** — Gated agent-outcome eval corpus that runs the real execution path against disposable fixture repos; the pure gate and baseline tests run in normal CI, while live scenarios require `FRO_BOT_EVAL=1`.
 - **`.github/workflows/`** — All CI/CD automation; 11 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.
 - **`docs/wiki/`** — 8 Obsidian deep-dive pages covering architecture, execution lifecycle, prompt design, and operator surface.
+- **`docs/solutions/`** — Documented solutions to past problems, organized by category with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing or debugging in a documented area.
+- **`assets/`** — Repository images and branding referenced by `README.md`.
 - **`dist/`** — Committed bundle output; CI fails if a fresh build produces a diff here.
 
 ## Key File Locations
