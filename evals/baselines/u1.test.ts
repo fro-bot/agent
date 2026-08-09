@@ -89,7 +89,7 @@ describe('U1 committed baseline integrity', () => {
     // promptHash/scenarioCommitSha are recomputable; duplicating them hid drift. corpusHeadSha records the commit
     // that produced the reviewed run and cannot be derived, so pinning it forces a conscious update on re-recording.
     expect(baseline.sourceRun).toEqual({
-      corpusHeadSha: 'a00f05c5953bae32a8b9998d478ee4c274b14bba',
+      corpusHeadSha: '5598461587ff7f0c6f9976d9626dff53303c644a',
       completionMarker: 'fro-bot-eval-report-complete-v1',
       suiteVerdict: 'passed',
     })
