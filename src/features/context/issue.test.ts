@@ -1,6 +1,7 @@
 import type {Logger} from '../../shared/logger.js'
 import type {ContextBudget} from './types.js'
 import {beforeEach, describe, expect, it} from 'vitest'
+import {formatContextForPrompt} from './budget.js'
 import {hydrateIssueContext} from './issue.js'
 import {createFailingMockOctokit, createMockLogger, createMockOctokit} from './test-helpers.js'
 import {DEFAULT_CONTEXT_BUDGET} from './types.js'
@@ -208,5 +209,126 @@ describe('hydrateIssueContext', () => {
     expect(result?.comments.length).toBeLessThanOrEqual(10)
     expect(result?.commentsTruncated).toBe(true)
     expect(result?.totalComments).toBe(500)
+  })
+
+  it('keeps the newest comments in chronological order when the thread exceeds the cap', async () => {
+    // #given
+    const comments = Array.from({length: 10}, (_, index) => ({
+      id: `c${index + 1}`,
+      body: `Comment ${index + 1}`,
+      createdAt: `2024-01-01T00:${String(index + 1).padStart(2, '0')}:00Z`,
+      author: {login: `user${index + 1}`},
+      authorAssociation: 'NONE',
+      isMinimized: false,
+    }))
+    const mockResponse = {
+      repository: {
+        issue: {
+          number: 1,
+          title: 'Recent Comments Issue',
+          body: 'Body',
+          state: 'OPEN',
+          createdAt: '2024-01-01T00:00:00Z',
+          author: {login: 'user'},
+          labels: {nodes: []},
+          assignees: {nodes: []},
+          comments: {totalCount: comments.length, nodes: comments},
+        },
+      },
+    }
+    const octokit = createMockOctokit(mockResponse)
+    const budget: ContextBudget = {...DEFAULT_CONTEXT_BUDGET, maxComments: 3}
+
+    // #when
+    const result = await hydrateIssueContext(octokit, 'owner', 'repo', 1, budget, logger)
+
+    // #then
+    expect(result).not.toBeNull()
+    expect(result?.comments.map(comment => comment.id)).toEqual(['c8', 'c9', 'c10'])
+    expect(result?.comments.map(comment => comment.createdAt)).toEqual([
+      '2024-01-01T00:08:00Z',
+      '2024-01-01T00:09:00Z',
+      '2024-01-01T00:10:00Z',
+    ])
+    expect(result?.commentsTruncated).toBe(true)
+    expect(result?.totalComments).toBe(10)
+  })
+
+  it('keeps a thread shorter than the cap unchanged', async () => {
+    // #given
+    const comments = [
+      {
+        id: 'c1',
+        body: 'Comment 1',
+        createdAt: '2024-01-01T00:01:00Z',
+        author: {login: 'user1'},
+        authorAssociation: 'NONE',
+        isMinimized: false,
+      },
+      {
+        id: 'c2',
+        body: 'Comment 2',
+        createdAt: '2024-01-01T00:02:00Z',
+        author: {login: 'user2'},
+        authorAssociation: 'NONE',
+        isMinimized: false,
+      },
+    ]
+    const mockResponse = {
+      repository: {
+        issue: {
+          number: 1,
+          title: 'Short Comments Issue',
+          body: 'Body',
+          state: 'OPEN',
+          createdAt: '2024-01-01T00:00:00Z',
+          author: {login: 'user'},
+          labels: {nodes: []},
+          assignees: {nodes: []},
+          comments: {totalCount: comments.length, nodes: comments},
+        },
+      },
+    }
+    const octokit = createMockOctokit(mockResponse)
+    const budget: ContextBudget = {...DEFAULT_CONTEXT_BUDGET, maxComments: 3}
+
+    // #when
+    const result = await hydrateIssueContext(octokit, 'owner', 'repo', 1, budget, logger)
+
+    // #then
+    expect(result).not.toBeNull()
+    expect(result?.comments.map(comment => comment.id)).toEqual(['c1', 'c2'])
+    expect(result?.commentsTruncated).toBe(false)
+    expect(result?.totalComments).toBe(2)
+  })
+
+  it('does not report truncation for an empty comment set', async () => {
+    // #given
+    const mockResponse = {
+      repository: {
+        issue: {
+          number: 1,
+          title: 'Empty Comments Issue',
+          body: 'Body',
+          state: 'OPEN',
+          createdAt: '2024-01-01T00:00:00Z',
+          author: {login: 'user'},
+          labels: {nodes: []},
+          assignees: {nodes: []},
+          comments: {totalCount: 0, nodes: []},
+        },
+      },
+    }
+    const octokit = createMockOctokit(mockResponse)
+
+    // #when
+    const result = await hydrateIssueContext(octokit, 'owner', 'repo', 1, DEFAULT_CONTEXT_BUDGET, logger)
+
+    // #then
+    expect(result).not.toBeNull()
+    if (result == null) throw new Error('Expected issue context')
+    expect(result.comments).toEqual([])
+    expect(result.commentsTruncated).toBe(false)
+    expect(formatContextForPrompt(result)).not.toContain('Comments were truncated')
   })
 })

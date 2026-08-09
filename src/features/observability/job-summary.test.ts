@@ -220,6 +220,23 @@ describe('writeJobSummary', () => {
     expect(core.summary.addRaw).toHaveBeenCalledWith('- **NetworkError** (❌ Failed): Timeout\n')
   })
 
+  it('includes the classification path for errors in the job summary', async () => {
+    // #given an error record with a structured classification path
+    const error = Object.assign(
+      {timestamp: '2024-01-01T00:00:00Z', type: 'APIError', message: 'Provider unavailable', recoverable: true},
+      {classificationPath: 'structured' as const},
+    )
+    const options = createMockOptions({metrics: createMockMetrics({errors: [error]})})
+
+    // #when writing the job summary
+    await writeJobSummary(options, logger)
+
+    // #then the classification path is visible alongside the error
+    expect(core.summary.addRaw).toHaveBeenCalledWith(
+      '- **APIError** (🔄 Recovered, classification: structured): Provider unavailable\n',
+    )
+  })
+
   it('omits optional sections when empty', async () => {
     // #given
     const options = createMockOptions({

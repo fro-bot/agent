@@ -1,3 +1,4 @@
+import type {ClassificationPath} from '@fro-bot/runtime'
 import type {ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 
 export interface ErrorRecord {
@@ -5,6 +6,7 @@ export interface ErrorRecord {
   readonly type: string
   readonly message: string
   readonly recoverable: boolean
+  readonly classificationPath?: ClassificationPath
 }
 
 export interface RunMetrics {

@@ -22,6 +22,7 @@ import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../servic
 import {readThread} from '../comments/reader.js'
 import {postComment} from '../comments/writer.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../reviews/review-guards.js'
+import {resolveResponseSurface} from './response-file.js'
 
 /**
  * Bounded retry count for transient (5xx/network) writer failures. A small
@@ -100,7 +101,7 @@ export async function readAndParseResponseFile(
     return failure('file-read-failed', detail)
   }
 
-  const surface = resolveResponseSurface(agentContext, triggerResult)
+  const surface = resolveResponseSurface(agentContext, triggerResult.context)
   const parsed = parseResponseFile(raw, {surface})
   if (parsed.success === false) {
     logger.error('Response-post: response file failed validation', {
@@ -150,7 +151,7 @@ function deriveSurfaceAndTarget(
   agentContext: AgentContext,
   triggerResult: TriggerResultProcess,
 ): {readonly surface: 'issue-comment' | 'pr-comment' | 'pr-review'; readonly target: CommentTarget | null} {
-  const surface = resolveResponseSurface(agentContext, triggerResult)
+  const surface = resolveResponseSurface(agentContext, triggerResult.context)
   const [owner, repo] = agentContext.repo.split('/')
   if (owner == null || owner.length === 0 || repo == null || repo.length === 0 || agentContext.issueNumber == null) {
     return {surface, target: null}
@@ -162,18 +163,6 @@ function deriveSurfaceAndTarget(
     surface,
     target: {type: surface === 'issue-comment' ? 'issue' : 'pr', number, owner, repo},
   }
-}
-
-function resolveResponseSurface(agentContext: AgentContext, triggerResult: TriggerResultProcess): ResponseSurface {
-  if (triggerResult.context.eventType === 'pull_request') {
-    return 'pr-review'
-  }
-
-  if (agentContext.issueType === 'pr') {
-    return 'pr-comment'
-  }
-
-  return 'issue-comment'
 }
 
 /**

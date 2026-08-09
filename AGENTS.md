@@ -13,17 +13,17 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full directory layout and where-to-add-code map, and [ARCHITECTURE.md](ARCHITECTURE.md) for the complete code map.
 
-| Task | Location |
-| --- | --- |
-| Action orchestration | `src/harness/run.ts` (`run`) |
-| Agent SDK execution | `src/features/agent/execution.ts` (`executeOpenCode`) |
-| Event routing | `src/features/triggers/router.ts` (`routeEvent`) |
-| Event parsing / types | `src/services/github/context.ts`, `src/services/github/types.ts` (`NormalizedEvent`) |
-| Prompt building | `packages/runtime/src/agent/prompt.ts` (`buildAgentPrompt`) |
-| Setup / CI config | `src/services/setup/` (`runSetup`, `buildCIConfig`) |
-| Comment / review posting | `src/features/comments/writer.ts`, `src/features/reviews/reviewer.ts` |
-| Gateway mention loop | `packages/gateway/src/execute/run.ts` (`runMention`) |
-| Version pins | `packages/runtime/src/shared/constants.ts` |
+| Task                     | Location                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------ |
+| Action orchestration     | `src/harness/run.ts` (`run`)                                                         |
+| Agent SDK execution      | `src/features/agent/execution.ts` (`executeOpenCode`)                                |
+| Event routing            | `src/features/triggers/router.ts` (`routeEvent`)                                     |
+| Event parsing / types    | `src/services/github/context.ts`, `src/services/github/types.ts` (`NormalizedEvent`) |
+| Prompt building          | `packages/runtime/src/agent/prompt.ts` (`buildAgentPrompt`)                          |
+| Setup / CI config        | `src/services/setup/` (`runSetup`, `buildCIConfig`)                                  |
+| Comment / review posting | `src/features/comments/writer.ts`, `src/features/reviews/reviewer.ts`                |
+| Gateway mention loop     | `packages/gateway/src/execute/run.ts` (`runMention`)                                 |
+| Version pins             | `packages/runtime/src/shared/constants.ts`                                           |
 
 ## CONVENTIONS
 
@@ -53,8 +53,9 @@ Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full d
 
 ```bash
 bun install                          # Install dependencies
-bun run test                         # Run workspace + scripts/ tests (vitest from repo root)
+bun run test                         # Run workspace package tests + evals/ (vitest from repo root)
 bun run test:scripts                 # Run only scripts/ tests
+bun run test:evals                   # Run only evals/ tests (live scenarios need FRO_BOT_EVAL=1)
 bun run lint                         # ESLint check (also checks the committed dist/ for hidden Unicode)
 bun run fix                          # ESLint auto-fix
 bun run check-types                  # TypeScript type check (tsc --noEmit)
@@ -97,8 +98,9 @@ For architecture (the four-layer rule, committed `dist/`, NormalizedEvent, dual 
 
 ## Cloned Dependency Source
 
-Read-only dependency source repositories are available under
-`.slim/clonedeps/repos/` for inspection. Do not edit these clones.
+Read-only dependency source repositories are available under `.slim/clonedeps/repos/` for inspection. Do not edit these clones.
 
-- `.slim/clonedeps/repos/anomalyco__opencode/packages/opencode/` — `anomalyco/opencode` at `v1.17.20`; OpenCode server source. Read `src/session/{prompt,message,message-v2,processor}.ts` to understand how `message.part.updated` bus events transition through the tool-part lifecycle (pending → running → completed) the Fro Bot harness consumes.
-- `.slim/clonedeps/repos/anomalyco__opencode/packages/sdk/js/` — `@opencode-ai/sdk` at `v1.17.20`; thin HTTP + SSE client over the server. Useful for confirming event shapes pass through unchanged and for verifying our `processEventStream` consumer matches the SSE subscription contract.
+Both are pinned to the `base_version` in `packages/harness/harness.config.json`, so what you read is what the harness ships. Re-pin them when that base moves — a source check against a stale clone can be confidently wrong.
+
+- `.slim/clonedeps/repos/anomalyco__opencode/packages/opencode/` — `anomalyco/opencode` at `v1.18.14`; OpenCode server source. Read `src/session/{prompt,message,message-v2,processor}.ts` to understand how `message.part.updated` bus events transition through the tool-part lifecycle (pending → running → completed) the Fro Bot harness consumes, and `src/session/{status,run-state}.ts` for how session status is written and cleared.
+- `.slim/clonedeps/repos/anomalyco__opencode/packages/sdk/js/` — `@opencode-ai/sdk` at `v1.18.14`; thin HTTP + SSE client over the server. Useful for confirming event shapes pass through unchanged, verifying our `processEventStream` consumer matches the SSE subscription contract, and checking error/status payload shapes in `src/v2/gen/types.gen.ts`.
