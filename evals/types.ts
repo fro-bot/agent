@@ -109,6 +109,7 @@ export interface EvalRunReport {
   readonly scenarioId: string
   readonly model: string
   readonly openCodeVersion: string
+  readonly pluginVersions: readonly string[]
   readonly promptHash: string
   readonly scenarioCommitSha: string
   readonly durationMs: number

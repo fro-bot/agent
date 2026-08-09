@@ -395,6 +395,43 @@ describe('runScenario orchestration', () => {
       expect(Object.keys(externalDirectory)).not.toContain(`${path.dirname(responseFilePath)}/**`)
       expect(externalDirectory[path.join(runnerTemp, 'unmatched-temp-root', 'result.md')]).toBeUndefined()
       expect(config.plugin).toEqual(['@cortexkit/opencode-anthropic-auth@1.18.0'])
+      expect(report.pluginVersions).toEqual(['@cortexkit/opencode-anthropic-auth@1.18.0'])
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('records no auth plugins for a provider without configured plugin support', async () => {
+    // #given a credentialed provider that has no configured eval auth plugin
+    await withTestEnvironment(async setup => {
+      const hostDataDir = path.join(setup.tempDir, 'host-data')
+      fs.mkdirSync(path.join(hostDataDir, 'opencode'), {recursive: true})
+      fs.writeFileSync(
+        path.join(hostDataDir, 'opencode', 'auth.json'),
+        JSON.stringify({openai: {type: 'api', key: 'test-key'}}),
+        {mode: 0o600},
+      )
+      process.env.XDG_DATA_HOME = hostDataDir
+      process.env.FRO_BOT_EVAL_MODEL = 'openai/test-model'
+
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(
+          responseFilePath,
+          '---\nverdict: approve\nschemaVersion: 1\n---\nNo blocking findings.\n',
+          'utf8',
+        )
+        return createAgentResult()
+      }
+
+      // #when the provider runs through the injected execution seam
+      const report = await runScenario(cleanPrScenario, logger, execution)
+
+      // #then provenance records an empty configured plugin set without a live model
+      expect(report.state).toBe('passed')
+      expect(report.pluginVersions).toEqual([])
       expectProcessRestored(setup)
     })
   }, 30_000)

@@ -60,6 +60,12 @@ The original `clean-pr` / `planted-defect` pair has completed end to end against
 
 Provisioning copies exactly one provider entry into the isolated home, never the whole host auth file, which typically holds credentials for several unrelated providers this run has no business reaching.
 
+### Reviewed baseline
+
+The committed reference is [`evals/baselines/u1.json`](baselines/u1.json). It contains outcome and provenance only; live outputs and diagnostics remain under the gitignored `evals/output/` directory. Stable comparison fields are scenario IDs, model, harness/plugin versions, prompt hashes, fixture SHAs, states, and passed gate IDs. Duration, cost, and token usage are advisory provenance and never equality gates.
+
+Any model, harness, plugin, prompt, or corpus change requires a new reviewed baseline; do not silently replace this file. To update it, run the corpus once, require the completed marker, a passed suite, all six scenarios passed, and no diagnostics, then sanitize the report to the allowed fields and run the baseline-integrity and static eval tests. The initial plugin provenance is taken from the runner configuration at the source corpus SHA because the report field was added immediately after that run; future reports record it directly.
+
 ### Isolation
 
 **This is not a sandbox.** The corpus runs an LLM-controlled agent with `bash: allow` as your own OS user. Changing `HOME`, `XDG_*`, and the working directory limits where OpenCode looks by default; it does not restrict what the agent can reach. A misbehaving or prompt-injected agent can still read any file your user can read — SSH keys, the host OpenCode auth file, other repositories — and could write what it finds into its response, logs, or the diagnostics artifact. OpenCode's bash permission check inspects the command string only and is advisory, not a containment boundary.

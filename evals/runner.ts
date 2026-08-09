@@ -153,6 +153,7 @@ interface IsolatedEvalEnv {
   readonly responseDir: string
   readonly responseFilePath: string
   readonly opencodeBin: string
+  readonly pluginVersions: readonly string[]
   readonly originalEnv: Record<string, string | undefined>
   readonly originalCwd: string
 }
@@ -412,6 +413,7 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     const opencodeBin = path.join(binDir, 'opencode')
     fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${resolveHarnessBinary()}" "$@"\n`, {mode: 0o755})
     const authPlugin = PROVIDER_AUTH_PLUGINS[parseModel(model).providerID]
+    const pluginVersions = authPlugin == null ? [] : [authPlugin]
     fs.writeFileSync(
       path.join(configDir, 'opencode.json'),
       JSON.stringify(
@@ -467,7 +469,7 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     // them. Enter the fixture repository so the agent sees exactly the scenario under test.
     process.chdir(repoPath)
 
-    return {home, runnerTemp, responseDir, responseFilePath, opencodeBin, originalEnv, originalCwd}
+    return {home, runnerTemp, responseDir, responseFilePath, opencodeBin, pluginVersions, originalEnv, originalCwd}
   } catch (error) {
     const partialEnv: IsolatedEvalEnv = {
       home,
@@ -475,6 +477,7 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
       responseDir,
       responseFilePath,
       opencodeBin: path.join(binDir, 'opencode'),
+      pluginVersions: [],
       originalEnv,
       originalCwd,
     }
@@ -862,6 +865,7 @@ export async function runScenario(
       scenarioId: scenario.id,
       model,
       openCodeVersion,
+      pluginVersions: environment.pluginVersions,
       promptHash: hashPrompt(promptResult.text),
       scenarioCommitSha: fixtureRepo.headSha,
       durationMs: Date.now() - startedAt,

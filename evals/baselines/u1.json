@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 1,
+  "sourceRun": {
+    "runId": "7a99a05c-b589-4707-b916-e2e1e56edab8",
+    "corpusHeadSha": "2e58f3bd662b0102d853ffae7d2f0bcf0bf4be71",
+    "startedAt": "2026-08-08T23:40:14.169Z",
+    "completedAt": "2026-08-08T23:46:45.804Z",
+    "completionMarker": "fro-bot-eval-report-complete-v1",
+    "suiteVerdict": "passed"
+  },
+  "runtime": {
+    "model": "anthropic/claude-sonnet-5",
+    "openCodeVersion": "1.18.14+harness.202732ae",
+    "configuredTimeoutMs": 600000,
+    "pluginVersions": ["@cortexkit/opencode-anthropic-auth@1.18.0"]
+  },
+  "scenarios": [
+    {
+      "id": "clean-pr",
+      "promptHash": "c931108224b647965698bce33895321dda4f36196f3a0cf08e614318b8c64ab3",
+      "scenarioCommitSha": "a943c8487eb4b3a9f5d2eac5011c99f8d5cdd0c7",
+      "state": "passed",
+      "durationMs": 55847,
+      "cost": 0,
+      "executionDurationMs": 53247,
+      "tokenUsage": {
+        "input": 2,
+        "output": 124,
+        "reasoning": 0,
+        "cache": {
+          "read": 15181,
+          "write": 1064
+        }
+      },
+      "passedGateIds": [
+        "response-file-parses",
+        "verdict-matches",
+        "exactly-one-delivery",
+        "required-signals-present",
+        "no-forbidden-mutation",
+        "no-secret-leak"
+      ]
+    },
+    {
+      "id": "planted-defect",
+      "promptHash": "e95b23271f5f4c0968bf9991549c77795e800d0da72e9b4650be2e354b02433e",
+      "scenarioCommitSha": "935e9a0454b58682fa700f2060540d0075abb9e4",
+      "state": "passed",
+      "durationMs": 75267,
+      "cost": 0,
+      "executionDurationMs": 72895,
+      "tokenUsage": {
+        "input": 2,
+        "output": 183,
+        "reasoning": 0,
+        "cache": {
+          "read": 15454,
+          "write": 890
+        }
+      },
+      "passedGateIds": [
+        "response-file-parses",
+        "verdict-matches",
+        "exactly-one-delivery",
+        "required-signals-present",
+        "no-forbidden-mutation",
+        "no-secret-leak"
+      ]
+    },
+    {
+      "id": "issue-known-files",
+      "promptHash": "0f22b91506e74c20eb2e6a81e8c475b4b243dd0aab2e2df5adbe1ebab7f1be42",
+      "scenarioCommitSha": "82900e7f5e0b91bb563f6d356f55e978ba6b55c9",
+      "state": "passed",
+      "durationMs": 69900,
+      "cost": 0,
+      "executionDurationMs": 67566,
+      "tokenUsage": {
+        "input": 2,
+        "output": 192,
+        "reasoning": 0,
+        "cache": {
+          "read": 15380,
+          "write": 732
+        }
+      },
+      "passedGateIds": [
+        "response-file-parses",
+        "verdict-matches",
+        "exactly-one-delivery",
+        "required-signals-present",
+        "no-forbidden-mutation",
+        "no-secret-leak"
+      ]
+    },
+    {
+      "id": "continuation-relevant",
+      "promptHash": "252d5edf42487cef19331318f237e4d84052bf2653bc07c50e7631b13c16b4bc",
+      "scenarioCommitSha": "dca3771ea0d4897a6319349ec5540d868e26246f",
+      "state": "passed",
+      "durationMs": 44799,
+      "cost": 0,
+      "executionDurationMs": 42407,
+      "tokenUsage": {
+        "input": 2,
+        "output": 100,
+        "reasoning": 0,
+        "cache": {
+          "read": 14232,
+          "write": 597
+        }
+      },
+      "passedGateIds": [
+        "response-file-parses",
+        "verdict-matches",
+        "exactly-one-delivery",
+        "required-signals-present",
+        "no-forbidden-mutation",
+        "no-secret-leak"
+      ]
+    },
+    {
+      "id": "continuation-irrelevant-non-degradation",
+      "promptHash": "5dadff0e901f47658588a5850605a5bdf1ae5ee2f5c72384a5154ee6c13a2c6d",
+      "scenarioCommitSha": "5a8ccb832cfa476454a9d1c87bb7b6347003a935",
+      "state": "passed",
+      "durationMs": 66337,
+      "cost": 0,
+      "executionDurationMs": 63940,
+      "tokenUsage": {
+        "input": 2,
+        "output": 251,
+        "reasoning": 0,
+        "cache": {
+          "read": 14876,
+          "write": 792
+        }
+      },
+      "passedGateIds": [
+        "response-file-parses",
+        "verdict-matches",
+        "exactly-one-delivery",
+        "required-signals-present",
+        "no-forbidden-mutation",
+        "no-secret-leak"
+      ]
+    },
+    {
+      "id": "unchanged-constraint-violation",
+      "promptHash": "fe4b49d4dace5eb41372a037e1539f8fed44cec3d6ca1afe59bf84fdb2ac83c0",
+      "scenarioCommitSha": "c4645b169220949c5f72408c3c3d33d0f24b519b",
+      "state": "passed",
+      "durationMs": 71723,
+      "cost": 0,
+      "executionDurationMs": 69233,
+      "tokenUsage": {
+        "input": 2,
+        "output": 297,
+        "reasoning": 0,
+        "cache": {
+          "read": 17787,
+          "write": 1621
+        }
+      },
+      "passedGateIds": [
+        "response-file-parses",
+        "verdict-matches",
+        "exactly-one-delivery",
+        "required-signals-present",
+        "no-forbidden-mutation",
+        "no-secret-leak"
+      ]
+    }
+  ]
+}

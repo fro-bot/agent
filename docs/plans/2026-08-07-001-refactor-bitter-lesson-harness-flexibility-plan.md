@@ -182,7 +182,7 @@ graph TB
 
 If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is the failure mode where prompt refactors become unverifiable edits.
 
-- [ ] **U1. Differential eval corpus and baseline**
+- [x] **U1. Differential eval corpus and baseline**
 
 **Goal:** Make agent-facing change measurable before anything is deleted.
 
@@ -197,6 +197,10 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 - Create: `evals/gates.ts`
 - Test: `evals/runner.test.ts`
 - Test: `evals/gates.test.ts`
+- Modify: `evals/types.ts`
+- Modify: `evals/README.md`
+- Create: `evals/baselines/u1.json`
+- Test: `evals/baselines/u1.test.ts`
 
 **Approach:**
 
@@ -239,7 +243,7 @@ If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is
 
 **Verification:**
 
-- Baseline captured for all six enabled live scenarios against the current prompt and model, and committed as the reference artifact.
+- Reviewed baseline committed at `evals/baselines/u1.json` for all six enabled live scenarios against the current prompt and model; the integrity test validates its source run, runtime/plugin provenance, registry order, stable hashes/fixture SHAs, passed states, passed gate IDs, and sanitized shape.
 - No gate asserts tool usage, step count, or reasoning order.
 - Cost and duration are present in provenance but do not gate acceptance.
 
