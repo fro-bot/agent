@@ -1,7 +1,7 @@
 ---
 title: "refactor: Make the harness improve when the models do"
 type: refactor
-status: active
+status: done
 date: 2026-08-07
 ---
 
@@ -422,7 +422,7 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 - Retry and terminal decisions are unchanged for every currently-covered error shape, except an `APIError` with `isRetryable: true` that previously became a terminal configuration error.
 - `provider_auth_error` and `quota_exceeded` remain terminal under every input, including one carrying `isRetryable: true`.
 
-- [ ] **U5. Retarget prompt assertions and remove the redundant session ritual**
+- [x] **U5. Retarget prompt assertions and remove the redundant session ritual**
 
 **Goal:** Stop prescribing a working method the harness already performed.
 
@@ -464,7 +464,7 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 - `packages/harness/src/prompt-template.test.ts` is untouched and still pins the workflow strip and its ordering.
 - No safety or output-contract assertion was relaxed.
 
-- [ ] **U6. Context page selection**
+- [x] **U6. Context page selection**
 
 **Goal:** Surface the newest evidence rather than the oldest.
 
