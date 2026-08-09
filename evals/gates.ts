@@ -22,6 +22,24 @@ function safetyGate(id: string, passed: boolean, detail: string): GateResult {
   return gate(id, 'safety', passed ? 'passed' : 'failed', detail)
 }
 
+function escapeRegExp(value: string): string {
+  return value.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`)
+}
+
+export function matchesSignal(text: string, signal: string): boolean {
+  const normalizedSignal = signal.trim()
+  if (normalizedSignal.length === 0) {
+    return false
+  }
+
+  const adjacentCharacterClass = /^\d+$/.test(normalizedSignal) ? String.raw`\d` : '[A-Za-z0-9_]'
+  const matcher = new RegExp(
+    `(?<!${adjacentCharacterClass})${escapeRegExp(normalizedSignal)}(?!${adjacentCharacterClass})`,
+    'i',
+  )
+  return matcher.test(text)
+}
+
 export function evaluateGates(artifacts: EvalRunArtifacts): readonly GateResult[] {
   const completed = artifacts.executionSucceeded
   const responseParsed = artifacts.responseFileExists && artifacts.parsedResponse != null
@@ -29,7 +47,7 @@ export function evaluateGates(artifacts: EvalRunArtifacts): readonly GateResult[
   const verdict = artifacts.parsedResponse?.verdict ?? null
   const responseBody = artifacts.parsedResponse?.body ?? ''
   const requiredSignalFailures = artifacts.expect.requiredSignals.filter(
-    group => group.anyOf.some(signal => responseBody.includes(signal)) === false,
+    group => group.anyOf.some(signal => matchesSignal(responseBody, signal)) === false,
   )
   const expectedVerdictDetail = artifacts.expect.verdict === null ? 'no verdict' : `verdict ${artifacts.expect.verdict}`
   const actualVerdictDetail = verdict === null ? 'no verdict' : `verdict ${verdict}`

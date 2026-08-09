@@ -1,7 +1,7 @@
 import type {ParsedResponse} from '../packages/runtime/src/agent/response-file.js'
 import type {EvalRunArtifacts} from './types.js'
 import {describe, expect, it} from 'vitest'
-import {evaluateGates, evaluateRun} from './gates.js'
+import {evaluateGates, evaluateRun, matchesSignal} from './gates.js'
 
 function createArtifacts(overrides: Partial<EvalRunArtifacts> = {}): EvalRunArtifacts {
   const parsedResponse: ParsedResponse = {body: 'No blocking findings.', verdict: 'approve'}
@@ -78,6 +78,20 @@ describe('evaluateGates', () => {
     // #then every required group accepts any matching alternative
     expect(getGate(results, 'required-signals-present').status).toBe('passed')
     expect(results.every(result => result.status === 'passed')).toBe(true)
+  })
+
+  it('matches required signals case-insensitively at character-class boundaries', () => {
+    // #given signal text that exercises word, numeric, path, and punctuation boundaries
+    // #when each signal is matched against the observable response body
+    // #then only valid boundary matches are accepted
+    expect(matchesSignal('left.seq', 'seq')).toBe(true)
+    expect(matchesSignal('sequence subsequently consequently', 'seq')).toBe(false)
+    expect(matchesSignal('limit is 2750ms', '2750')).toBe(true)
+    expect(matchesSignal('12750 27500', '2750')).toBe(false)
+    expect(matchesSignal('release-manager', 'lease')).toBe(false)
+    expect(matchesSignal('Adults are rejected', 'adults are rejected')).toBe(true)
+    expect(matchesSignal('See `src/retry-policy.ts` and src/retry-policy.ts:12', 'src/retry-policy.ts')).toBe(true)
+    expect(matchesSignal('anything at all', '')).toBe(false)
   })
 
   it('fails when a required signal group has no matching alternative', () => {

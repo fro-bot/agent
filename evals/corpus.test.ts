@@ -5,6 +5,7 @@ import {mkdirSync, renameSync, rmSync, writeFileSync} from 'node:fs'
 import * as path from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {createLogger} from '../src/shared/logger.js'
+import {runScenarioSequence} from './corpus-runner.js'
 import {evaluateCorpusVerdict} from './corpus-verdict.js'
 import {resolveEvalTimeoutMs, runScenario} from './runner.js'
 import {ALL_SCENARIOS} from './scenarios/index.js'
@@ -89,10 +90,14 @@ describe.skipIf(EVAL_ENABLED === false)('agent outcome eval corpus', {timeout: S
     persist(false)
 
     // #when each scenario is evaluated through executeOpenCode
-    for (const scenario of ALL_SCENARIOS) {
-      reports.push(await runScenario(scenario, logger))
-      persist(false)
-    }
+    await runScenarioSequence(
+      ALL_SCENARIOS,
+      async scenario => runScenario(scenario, logger),
+      report => {
+        reports.push(report)
+        persist(false)
+      },
+    )
 
     const inconclusiveReports = reports.filter(report => report.state === 'inconclusive')
     for (const report of inconclusiveReports) {

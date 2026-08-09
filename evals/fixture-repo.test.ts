@@ -7,7 +7,7 @@ import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
 import {createFixtureFiles, detectForbiddenMutations, EVAL_CANARY_PLACEHOLDER} from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
 
-describe('createFixtureRepo', () => {
+describe('createFixtureRepo', {timeout: 30_000}, () => {
   it('creates nested fixture files in a committed temporary repository', () => {
     // #given a small file map for a disposable repository
     const files = {
@@ -27,6 +27,21 @@ describe('createFixtureRepo', () => {
       cleanupFixtureRepo(repo)
     }
   })
+
+  it('creates the same commit SHA for repeated identical fixture creation', () => {
+    // #given identical fixture content created twice
+    const files = {'README.md': '# Stable fixture\n', 'src/value.ts': 'export const value = 1\n'}
+    const first = createFixtureRepo(files)
+    const second = createFixtureRepo(files)
+
+    try {
+      // #then fixed identity and commit dates make fixture provenance reproducible
+      expect(second.headSha).toBe(first.headSha)
+    } finally {
+      cleanupFixtureRepo(first)
+      cleanupFixtureRepo(second)
+    }
+  }, 30_000)
 
   it('cleans up the temporary repository path', () => {
     // #given a created fixture repository

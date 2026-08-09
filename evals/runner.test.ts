@@ -7,13 +7,15 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {RESPONSE_FILE_DIR_SEGMENT} from '../packages/runtime/src/agent/response-file.js'
 import {buildAgentPrompt} from '../src/features/agent/index.js'
 import {createIssueCommentCreatedEvent} from '../src/features/triggers/__fixtures__/payloads.js'
 import {createLogger} from '../src/shared/logger.js'
 import {
+  buildDeterministicScenarioProvenance,
   buildPromptOptions,
+  hashEvalPrompt,
   parseModel,
   resolveEvalTimeoutMs,
   resolveHarnessBinary,
@@ -195,6 +197,37 @@ describe('runScenario orchestration', () => {
     expect(promptHash).toBe(expectedHash)
   })
 
+  it('hashes identical canonical prompts independently of response paths and session IDs', () => {
+    // #given equivalent prompt options with runtime-only values changed
+    const first = {
+      ...buildPromptOptions(cleanPrScenario, CHARACTERIZATION_HEAD_SHA, '/tmp/first-response.md'),
+      sessionId: 'session-one',
+    }
+    const second = {
+      ...buildPromptOptions(cleanPrScenario, CHARACTERIZATION_HEAD_SHA, '/tmp/second-response.md'),
+      sessionId: 'session-two',
+    }
+
+    // #when deterministic eval prompt hashes are computed
+    const firstHash = hashEvalPrompt(first, logger)
+    const secondHash = hashEvalPrompt(second, logger)
+    const changedHash = hashEvalPrompt({...first, customPrompt: 'A meaningful prompt change.'}, logger)
+
+    // #then runtime paths and IDs do not affect provenance, but prompt changes do
+    expect(secondHash).toBe(firstHash)
+    expect(changedHash).not.toBe(firstHash)
+  })
+
+  it('reuses the deterministic prompt and fixture provenance helper', () => {
+    // #given one frozen scenario
+    // #when deterministic provenance is constructed repeatedly without execution
+    const first = buildDeterministicScenarioProvenance(cleanPrScenario, logger)
+    const second = buildDeterministicScenarioProvenance(cleanPrScenario, logger)
+
+    // #then both stable provenance fields are reproducible
+    expect(second).toEqual(first)
+  }, 30_000)
+
   it.each([cleanPrScenario, plantedDefectScenario])('omits continuation fields for fresh %s runs', scenario => {
     // #given a fresh scenario without prior work
     const promptOptions = buildPromptOptions(scenario, CHARACTERIZATION_HEAD_SHA, CHARACTERIZATION_RESPONSE_PATH)
@@ -277,6 +310,60 @@ describe('runScenario orchestration', () => {
     })
   }, 30_000)
 
+  it('redacts provisioned credentials and rejects unexpected diagnostic entries', async () => {
+    // #given a real-provider-shaped auth entry and diagnostic files containing its secret
+    await withTestEnvironment(async setup => {
+      const secret = 'synthetic-anthropic-credential-1234567890'
+      const hostDataDir = path.join(setup.tempDir, 'host-data')
+      fs.mkdirSync(path.join(hostDataDir, 'opencode'), {recursive: true})
+      fs.writeFileSync(
+        path.join(hostDataDir, 'opencode', 'auth.json'),
+        JSON.stringify({anthropic: {type: 'api', key: secret}}),
+        {mode: 0o600},
+      )
+      process.env.XDG_DATA_HOME = hostDataDir
+      process.env.FRO_BOT_EVAL_MODEL = 'anthropic/claude-sonnet-5'
+
+      const execution = async (_promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const dataHome = process.env.XDG_DATA_HOME
+        if (dataHome == null) {
+          throw new Error('Injected execution could not locate isolated data')
+        }
+        const logDir = path.join(dataHome, 'opencode', 'log')
+        fs.mkdirSync(logDir, {recursive: true})
+        fs.writeFileSync(path.join(logDir, 'agent.log'), `useful diagnostic ${secret} ghp_fake-token-value\n`, 'utf8')
+        fs.writeFileSync(path.join(logDir, 'agent.jsonl'), `{"message":"useful jsonl ${secret}"}\n`, 'utf8')
+        fs.writeFileSync(path.join(logDir, 'auth.json'), `unexpected auth ${secret}\n`, 'utf8')
+        fs.writeFileSync(path.join(logDir, 'unexpected.txt'), `unexpected ${secret}\n`, 'utf8')
+        fs.symlinkSync(path.join(logDir, 'agent.log'), path.join(logDir, 'linked.log'))
+        return createAgentResult({success: false, exitCode: 1, error: `injected failure ${secret}`})
+      }
+
+      // #when diagnostic files are captured after provider provisioning
+      const report = await runScenario(cleanPrScenario, logger, execution)
+
+      // #then useful expected logs survive while secrets and unexpected files do not
+      expect(report.execution.diagnosticsPath).not.toBeNull()
+      if (report.execution.diagnosticsPath == null) {
+        throw new Error('Expected diagnostic path')
+      }
+      const diagnosticPath = report.execution.diagnosticsPath
+      expect(fs.readFileSync(path.join(diagnosticPath, 'agent.log'), 'utf8')).toContain('useful diagnostic')
+      expect(fs.readFileSync(path.join(diagnosticPath, 'agent.log'), 'utf8')).not.toContain(secret)
+      expect(fs.readFileSync(path.join(diagnosticPath, 'agent.log'), 'utf8')).not.toContain('ghp_fake-token-value')
+      expect(fs.readFileSync(path.join(diagnosticPath, 'agent.jsonl'), 'utf8')).not.toContain(secret)
+      expect(report.agentResult.error).not.toContain(secret)
+      expect(report.stateReason).not.toContain(secret)
+      expect(fs.existsSync(path.join(diagnosticPath, 'auth.json'))).toBe(false)
+      expect(fs.existsSync(path.join(diagnosticPath, 'unexpected.txt'))).toBe(false)
+      expect(fs.existsSync(path.join(diagnosticPath, 'linked.log'))).toBe(false)
+      expect(
+        process.platform === 'win32' || (fs.statSync(path.join(diagnosticPath, 'agent.log')).mode & 0o777) === 0o600,
+      ).toBe(true)
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
   it('returns an inconclusive report when injected execution returns failure without logs', async () => {
     // #given an injected failure result and no diagnostics directory
     await withTestEnvironment(async setup => {
@@ -315,6 +402,76 @@ describe('runScenario orchestration', () => {
       // #then the full observable outcome passes and process state is restored
       expect(report.state).toBe('passed')
       expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('fails a valid response when a sibling markdown artifact is delivered', async () => {
+    // #given successful injected execution that writes the valid response and a duplicate artifact
+    await withTestEnvironment(async setup => {
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(
+          responseFilePath,
+          '---\nverdict: approve\nschemaVersion: 1\n---\nNo blocking findings.\n',
+          'utf8',
+        )
+        fs.writeFileSync(path.join(path.dirname(responseFilePath), 'duplicate.md'), 'duplicate response\n', 'utf8')
+        return createAgentResult()
+      }
+
+      // #when the real response directory scan collects delivered artifacts
+      const report = await runScenario(cleanPrScenario, logger, execution)
+
+      // #then the valid response parses but exactly-one-delivery fails for two artifacts
+      expect(report.agentResult.success).toBe(true)
+      expect(getGate(report, 'response-file-parses').status).toBe('passed')
+      expect(report.state).toBe('failed')
+      expect(getGate(report, 'exactly-one-delivery').status).toBe('failed')
+      expect(getGate(report, 'exactly-one-delivery').detail).toContain('found 2')
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('preserves completed evidence and reports cleanup failure after successful execution', async () => {
+    // #given successful execution followed by a forced cleanup failure
+    await withTestEnvironment(async setup => {
+      const originalChdir = process.chdir.bind(process)
+      const cleanupSpy = vi.spyOn(process, 'chdir').mockImplementation(directory => {
+        if (directory === setup.originalCwd) {
+          throw new Error('forced cleanup failure')
+        }
+        originalChdir(directory)
+      })
+
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(
+          responseFilePath,
+          '---\nverdict: approve\nschemaVersion: 1\n---\nNo blocking findings.\n',
+          'utf8',
+        )
+        return createAgentResult()
+      }
+
+      try {
+        // #when cleanup fails after the completed report has been assembled
+        const report = await runScenario(cleanPrScenario, logger, execution)
+
+        // #then completed evidence remains observable but the scenario is fail-closed
+        expect(report.agentResult.success).toBe(true)
+        expect(report.state).toBe('failed')
+        expect(report.execution.cleanupError).toContain('forced cleanup failure')
+        expect(getGate(report, 'response-file-parses').status).toBe('passed')
+      } finally {
+        cleanupSpy.mockRestore()
+        process.chdir(setup.originalCwd)
+      }
     })
   }, 30_000)
 

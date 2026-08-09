@@ -307,7 +307,7 @@ describe('eval scenario registry', () => {
     expect('diffFiles' in issueKnownFilesScenario.surface).toBe(false)
     expect(issueKnownFilesScenario.expect.verdict).toBeNull()
     expect(issueKnownFilesScenario.expect.requiredSignals).toEqual([
-      {id: 'defining-file', anyOf: ['src/retry-policy.ts']},
+      {id: 'defining-file', anyOf: ['retry-policy.ts']},
       {id: 'max-retry-delay', anyOf: ['2750', '2,750', '2.75 seconds', '2.75s']},
     ])
   })

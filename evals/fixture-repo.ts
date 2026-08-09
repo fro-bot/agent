@@ -2,6 +2,9 @@ import {execFileSync} from 'node:child_process'
 import {mkdirSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import process from 'node:process'
+
+const FIXTURE_COMMIT_DATE = '2000-01-01T00:00:00.000Z'
 
 export interface FixtureRepo {
   readonly path: string
@@ -30,6 +33,7 @@ export function createFixtureRepo(files: Readonly<Record<string, string>>): Fixt
     execFileSync('git', ['init', '-b', 'main'], {cwd: repoPath, stdio: 'pipe'})
     execFileSync('git', ['config', 'user.name', 'Fro Bot Eval'], {cwd: repoPath, stdio: 'pipe'})
     execFileSync('git', ['config', 'user.email', 'fro-bot-eval@example.test'], {cwd: repoPath, stdio: 'pipe'})
+    execFileSync('git', ['config', 'commit.gpgsign', 'false'], {cwd: repoPath, stdio: 'pipe'})
 
     for (const [filePath, content] of Object.entries(files)) {
       const absolutePath = assertSafeRelativePath(repoPath, filePath)
@@ -38,7 +42,15 @@ export function createFixtureRepo(files: Readonly<Record<string, string>>): Fixt
     }
 
     execFileSync('git', ['add', '--all'], {cwd: repoPath, stdio: 'pipe'})
-    execFileSync('git', ['commit', '-m', 'fixture'], {cwd: repoPath, stdio: 'pipe'})
+    execFileSync('git', ['commit', '-m', 'fixture'], {
+      cwd: repoPath,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_DATE: FIXTURE_COMMIT_DATE,
+        GIT_COMMITTER_DATE: FIXTURE_COMMIT_DATE,
+      },
+      stdio: 'pipe',
+    })
     const headSha = execFileSync('git', ['rev-parse', 'HEAD'], {cwd: repoPath, encoding: 'utf8'}).trim()
 
     return {path: repoPath, headSha}

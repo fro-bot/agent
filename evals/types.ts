@@ -103,6 +103,7 @@ export interface ExecutionDiagnostics {
   readonly timeoutMs: number
   /** Where captured logs and/or non-passing response evidence were stored before cleanup. */
   readonly diagnosticsPath: string | null
+  readonly cleanupError: string | null
 }
 
 export interface EvalRunReport {

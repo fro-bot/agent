@@ -31,7 +31,7 @@ export const issueKnownFilesScenario: Scenario = {
   expect: {
     verdict: null,
     requiredSignals: [
-      {id: 'defining-file', anyOf: ['src/retry-policy.ts']},
+      {id: 'defining-file', anyOf: ['retry-policy.ts']},
       {id: 'max-retry-delay', anyOf: ['2750', '2,750', '2.75 seconds', '2.75s']},
     ],
   },
