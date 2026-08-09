@@ -1,25 +1,43 @@
-import type {ParsedResponse} from '../packages/runtime/src/agent/response-file.js'
+import type {DiffFileSummary} from '../packages/runtime/src/agent/index.js'
+import type {ParsedResponse, ResponseSurface} from '../packages/runtime/src/agent/response-file.js'
 import type {TriggerContext} from '../packages/runtime/src/agent/types.js'
 import type {OmoProviders} from '../packages/runtime/src/shared/types.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
 import type {GitHubContext} from '../src/services/github/types.js'
 import type {Logger} from '../src/shared/logger.js'
 import type {EvalRunArtifacts, EvalRunReport, ResponseArtifacts, Scenario} from './types.js'
-import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
-import {buildResponseFilePath, parseResponseFile} from '../packages/runtime/src/agent/response-file.js'
+import {redactSecrets} from '../packages/harness/src/format-error.js'
+import {
+  buildResponseFilePath,
+  parseResponseFile,
+  RESPONSE_FILE_DIR_SEGMENT,
+} from '../packages/runtime/src/agent/response-file.js'
 import {buildAgentPrompt, executeOpenCode} from '../src/features/agent/index.js'
+import {resolveResponseSurface} from '../src/features/agent/response-file.js'
 import {buildTriggerContext} from '../src/features/triggers/context-builders.js'
 import {normalizeEvent} from '../src/services/github/context.js'
+import {
+  captureDiagnostics,
+  clearScenarioDiagnostics,
+  persistResponseDiagnostics,
+  readCapturedDiagnostics,
+} from './diagnostics.js'
 import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
 import {evaluateRun} from './gates.js'
 
 const DEFAULT_EVAL_MODEL = 'opencode/big-pickle'
+export const EVAL_RESPONSE_PATH_SENTINEL = '/__fro-bot_eval__/response.md'
+const EVAL_PROVENANCE_CANARY = 'eval-provenance-canary-v1'
+const deterministicProvenanceCache = new Map<
+  string,
+  {readonly promptHash: string; readonly scenarioCommitSha: string}
+>()
 
 /** The default model's provider serves a free tier that needs no stored credential. */
 const CREDENTIAL_FREE_PROVIDER = 'opencode'
@@ -32,6 +50,11 @@ const CREDENTIAL_FREE_PROVIDER = 'opencode'
  */
 const PROVIDER_AUTH_PLUGINS: Readonly<Record<string, string>> = {
   anthropic: '@cortexkit/opencode-anthropic-auth@1.18.0',
+}
+
+export function resolveConfiguredPluginVersions(model: string): readonly string[] {
+  const authPlugin = PROVIDER_AUTH_PLUGINS[parseModel(model).providerID]
+  return authPlugin == null ? [] : [authPlugin]
 }
 
 /**
@@ -147,6 +170,8 @@ interface IsolatedEvalEnv {
   readonly responseDir: string
   readonly responseFilePath: string
   readonly opencodeBin: string
+  readonly pluginVersions: readonly string[]
+  readonly authSecretValues: readonly string[]
   readonly originalEnv: Record<string, string | undefined>
   readonly originalCwd: string
 }
@@ -164,124 +189,36 @@ function restoreEnv(originalEnv: Record<string, string | undefined>): void {
 }
 
 function cleanupIsolatedEvalEnv(env: IsolatedEvalEnv): void {
+  const errors: unknown[] = []
   try {
     restoreEnv(env.originalEnv)
-  } finally {
-    try {
-      // Restore the working directory before removing anything: the process may still be inside
-      // a directory that is about to be deleted.
-      process.chdir(env.originalCwd)
-    } finally {
-      fs.rmSync(env.home, {recursive: true, force: true})
-      fs.rmSync(env.runnerTemp, {recursive: true, force: true})
-    }
+  } catch (error) {
+    errors.push(error)
   }
-}
-
-/**
- * Copy the agent's own logs out of the isolated home before cleanup destroys them.
- *
- * Without this, a run that fails to complete reports only an exit code and a timeout
- * message, so there is no way to tell a slow model from one that never issued a request.
- * That is precisely the run where evidence matters most.
- *
- * Copies only the log directory. The isolated `auth.json` sits beside it and must never be
- * captured into a diagnostics artifact.
- */
-function captureDiagnostics(env: IsolatedEvalEnv, scenarioId: string): string | null {
-  const sourceLogDir = path.join(env.home, '.local', 'share', 'opencode', 'log')
-  if (fs.existsSync(sourceLogDir) === false) {
-    return null
-  }
-
   try {
-    const targetDir = path.join(env.originalCwd, 'evals', 'output', 'diagnostics', scenarioId)
-    fs.rmSync(targetDir, {recursive: true, force: true})
-    fs.mkdirSync(targetDir, {recursive: true})
-    fs.cpSync(sourceLogDir, targetDir, {recursive: true})
-    return targetDir
-  } catch {
-    return null
+    // Restore the working directory before removing anything: the process may still be inside
+    // a directory that is about to be deleted.
+    process.chdir(env.originalCwd)
+  } catch (error) {
+    errors.push(error)
   }
-}
-
-const MAX_DIAGNOSTIC_SCAN_BYTES = 65_536
-
-function readBoundedDiagnosticFile(
-  filePath: string,
-  maxBytes: number,
-): {readonly text: string; readonly bytesRead: number} {
-  if (maxBytes === 0) {
-    return {text: '', bytesRead: 0}
-  }
-
-  let fileDescriptor: number | null = null
   try {
-    // Open first, then size the file through that same descriptor. Sizing by path and then
-    // opening by path leaves a window where the entry can be swapped between the two calls,
-    // and these logs are written by the agent under test. `O_NOFOLLOW` additionally refuses
-    // a symlink outright rather than following it somewhere unintended.
-    fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
-    const bytesToRead = Math.min(fs.fstatSync(fileDescriptor).size, maxBytes)
-    if (bytesToRead === 0) {
-      return {text: '', bytesRead: 0}
-    }
-    const buffer = Buffer.alloc(bytesToRead)
-    const bytesRead = fs.readSync(fileDescriptor, buffer, 0, bytesToRead, 0)
-    return {text: buffer.subarray(0, bytesRead).toString('utf8'), bytesRead}
-  } catch {
-    return {text: '', bytesRead: 0}
-  } finally {
-    if (fileDescriptor != null) {
-      try {
-        fs.closeSync(fileDescriptor)
-      } catch {
-        // Diagnostics are fail-soft and must never change the eval result by throwing here.
-      }
-    }
+    fs.rmSync(env.home, {recursive: true, force: true})
+  } catch (error) {
+    errors.push(error)
   }
-}
-
-function readCapturedDiagnostics(diagnosticsPath: string | null): string {
-  if (diagnosticsPath == null) {
-    return ''
+  try {
+    fs.rmSync(env.runnerTemp, {recursive: true, force: true})
+  } catch (error) {
+    errors.push(error)
   }
 
-  const chunks: string[] = []
-  let remainingBytes = MAX_DIAGNOSTIC_SCAN_BYTES
-  const visit = (directory: string): void => {
-    if (remainingBytes === 0) {
-      return
-    }
-
-    let entries: readonly fs.Dirent[]
-    try {
-      entries = fs
-        .readdirSync(directory, {withFileTypes: true})
-        .sort((left, right) => left.name.localeCompare(right.name))
-    } catch {
-      return
-    }
-
-    for (const entry of entries) {
-      if (remainingBytes === 0) {
-        return
-      }
-      const entryPath = path.join(directory, entry.name)
-      if (entry.isDirectory()) {
-        visit(entryPath)
-      } else if (entry.isFile()) {
-        const result = readBoundedDiagnosticFile(entryPath, remainingBytes)
-        if (result.bytesRead > 0) {
-          chunks.push(result.text)
-          remainingBytes -= result.bytesRead
-        }
-      }
-    }
+  if (errors.length > 0) {
+    const firstError = errors[0]
+    throw new Error(
+      `Isolated eval cleanup failed: ${firstError instanceof Error ? firstError.message : String(firstError)}`,
+    )
   }
-
-  visit(diagnosticsPath)
-  return chunks.join('\n')
 }
 
 function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: string, model: string): IsolatedEvalEnv {
@@ -330,24 +267,33 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     fs.mkdirSync(binDir, {recursive: true})
     fs.mkdirSync(configDir, {recursive: true})
     fs.mkdirSync(responseDir, {recursive: true})
-    provisionProviderAuth(dataDir, model, originalEnv)
+    const authSecretValues = provisionProviderAuth(dataDir, model, originalEnv)
 
     const opencodeBin = path.join(binDir, 'opencode')
     fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${resolveHarnessBinary()}" "$@"\n`, {mode: 0o755})
-    const authPlugin = PROVIDER_AUTH_PLUGINS[parseModel(model).providerID]
+    const pluginVersions = resolveConfiguredPluginVersions(model)
+    const authPlugin = pluginVersions[0]
     fs.writeFileSync(
       path.join(configDir, 'opencode.json'),
       JSON.stringify(
         {
           $schema: 'https://opencode.ai/config.json',
+          default_agent: 'build',
           model,
           ...(authPlugin == null ? {} : {plugin: [authPlugin]}),
-          permission: {
-            bash: 'allow',
-            edit: 'allow',
-            read: 'allow',
-            webfetch: 'deny',
-            external_directory: {[`${responseDir}/**`]: 'allow'},
+          agent: {
+            build: {
+              permission: {
+                bash: 'allow',
+                edit: 'allow',
+                read: 'allow',
+                webfetch: 'deny',
+                external_directory: {
+                  '*': 'deny',
+                  [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',
+                },
+              },
+            },
           },
         },
         null,
@@ -365,7 +311,7 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     process.env.GITHUB_REPOSITORY = `fro-bot-eval/${scenario.id}`
     process.env.GITHUB_REF = 'refs/heads/main'
     process.env.GITHUB_SHA = headSha
-    process.env.GITHUB_EVENT_NAME = 'pull_request'
+    process.env.GITHUB_EVENT_NAME = scenario.surface.kind
     process.env.GITHUB_RUN_ID = runId
     process.env.GITHUB_RUN_ATTEMPT = runAttempt
     process.env.GITHUB_ACTOR = 'fro-bot-eval'
@@ -382,7 +328,17 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     // them. Enter the fixture repository so the agent sees exactly the scenario under test.
     process.chdir(repoPath)
 
-    return {home, runnerTemp, responseDir, responseFilePath, opencodeBin, originalEnv, originalCwd}
+    return {
+      home,
+      runnerTemp,
+      responseDir,
+      responseFilePath,
+      opencodeBin,
+      pluginVersions,
+      authSecretValues,
+      originalEnv,
+      originalCwd,
+    }
   } catch (error) {
     const partialEnv: IsolatedEvalEnv = {
       home,
@@ -390,6 +346,8 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
       responseDir,
       responseFilePath,
       opencodeBin: path.join(binDir, 'opencode'),
+      pluginVersions: [],
+      authSecretValues: [],
       originalEnv,
       originalCwd,
     }
@@ -414,13 +372,50 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
  * Fails loudly rather than running unauthenticated: an auth-less run against a real model
  * surfaces as a confusing execution failure that looks like an agent problem.
  */
-function provisionProviderAuth(dataDir: string, model: string, originalEnv: Record<string, string | undefined>): void {
+const CREDENTIAL_KEY_FORMS: ReadonlySet<string> = new Set([
+  'key',
+  'token',
+  'secret',
+  'password',
+  'credential',
+  'access',
+  'refresh',
+  'apikey',
+  'clientsecret',
+  'accesstoken',
+  'refreshtoken',
+])
+
+function isCredentialKey(keyName: string): boolean {
+  return CREDENTIAL_KEY_FORMS.has(keyName.replaceAll(/[-_]/g, '').toLowerCase())
+}
+
+function collectCredentialValues(value: unknown, keyName: string | null = null): readonly string[] {
+  if (typeof value === 'string') {
+    return keyName != null && isCredentialKey(keyName) ? [value] : []
+  }
+  if (typeof value !== 'object' || value === null) {
+    return []
+  }
+
+  const values: string[] = []
+  for (const [key, nestedValue] of Object.entries(value)) {
+    values.push(...collectCredentialValues(nestedValue, key))
+  }
+  return values
+}
+
+function provisionProviderAuth(
+  dataDir: string,
+  model: string,
+  originalEnv: Record<string, string | undefined>,
+): readonly string[] {
   const {providerID} = parseModel(model)
   const hostDataDir = originalEnv.XDG_DATA_HOME ?? path.join(originalEnv.HOME ?? os.homedir(), '.local', 'share')
   const hostAuthPath = path.join(hostDataDir, 'opencode', 'auth.json')
 
   if (fs.existsSync(hostAuthPath) === false) {
-    if (providerID === CREDENTIAL_FREE_PROVIDER) return
+    if (providerID === CREDENTIAL_FREE_PROVIDER) return []
     throw new Error(
       `Model ${model} requires provider credentials but no auth.json was found at ${hostAuthPath}. ` +
         `Use the credential-free default model, or authenticate that provider first.`,
@@ -432,7 +427,7 @@ function provisionProviderAuth(dataDir: string, model: string, originalEnv: Reco
     typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>)[providerID] : undefined
 
   if (entry === undefined) {
-    if (providerID === CREDENTIAL_FREE_PROVIDER) return
+    if (providerID === CREDENTIAL_FREE_PROVIDER) return []
     throw new Error(
       `Model ${model} requires a '${providerID}' credential but ${hostAuthPath} has no such entry. ` +
         `Authenticate that provider first, or use the credential-free default model.`,
@@ -442,6 +437,7 @@ function provisionProviderAuth(dataDir: string, model: string, originalEnv: Reco
   const isolatedAuthDir = path.join(dataDir, 'opencode')
   fs.mkdirSync(isolatedAuthDir, {recursive: true})
   fs.writeFileSync(path.join(isolatedAuthDir, 'auth.json'), JSON.stringify({[providerID]: entry}), {mode: 0o600})
+  return collectCredentialValues(entry)
 }
 
 export function parseModel(model: string): {readonly providerID: string; readonly modelID: string} {
@@ -465,37 +461,78 @@ export function resolveModel(): string {
   return model
 }
 
-function buildDiffContext(scenario: Scenario) {
+function buildDiffContext(diffFiles: readonly DiffFileSummary[]) {
   return {
-    changedFiles: scenario.diffFiles.length,
-    additions: scenario.diffFiles.reduce((total, file) => total + file.additions, 0),
-    deletions: scenario.diffFiles.reduce((total, file) => total + file.deletions, 0),
+    changedFiles: diffFiles.length,
+    additions: diffFiles.reduce((total, file) => total + file.additions, 0),
+    deletions: diffFiles.reduce((total, file) => total + file.deletions, 0),
     truncated: false,
-    files: scenario.diffFiles,
+    files: diffFiles,
   }
 }
 
-function buildTriggerContextForScenario(scenario: Scenario, headSha: string): TriggerContext {
-  const event = normalizeEvent('pull_request', scenario.event)
+interface ScenarioInput {
+  readonly eventType: 'pull_request' | 'issue_comment'
+  readonly payload: unknown
+  readonly event: GitHubContext['event']
+  readonly diffContext: ReturnType<typeof buildDiffContext> | null
+  readonly hydratedContext: PromptOptions['context']['hydratedContext']
+}
+
+function buildScenarioInput(scenario: Scenario): ScenarioInput {
+  switch (scenario.surface.kind) {
+    case 'pull_request':
+      return {
+        eventType: 'pull_request',
+        payload: scenario.surface.event,
+        event: normalizeEvent('pull_request', scenario.surface.event),
+        diffContext: buildDiffContext(scenario.surface.diffFiles),
+        hydratedContext: scenario.surface.hydratedContext,
+      }
+    case 'issue_comment':
+      return {
+        eventType: 'issue_comment',
+        payload: scenario.surface.event,
+        event: normalizeEvent('issue_comment', scenario.surface.event),
+        diffContext: null,
+        hydratedContext: scenario.surface.hydratedContext,
+      }
+  }
+}
+
+function buildTriggerContextForScenario(
+  scenario: Scenario,
+  headSha: string,
+  scenarioInput: ScenarioInput = buildScenarioInput(scenario),
+): TriggerContext {
   const githubContext: GitHubContext = {
-    eventName: 'pull_request',
-    eventType: 'pull_request',
+    eventName: scenarioInput.eventType,
+    eventType: scenarioInput.eventType,
     repo: {owner: 'fro-bot-eval', repo: scenario.id},
     ref: 'refs/heads/main',
     sha: headSha,
     runId: 1,
     actor: 'fro-bot-eval',
-    payload: scenario.event,
-    event,
+    payload: scenarioInput.payload,
+    event: scenarioInput.event,
   }
 
   return buildTriggerContext(githubContext, null, null)
 }
 
-function buildPromptOptions(scenario: Scenario, headSha: string, responseFilePath: string): PromptOptions {
-  const triggerContext = buildTriggerContextForScenario(scenario, headSha)
+export function buildPromptOptions(scenario: Scenario, headSha: string, responseFilePath: string): PromptOptions {
+  const scenarioInput = buildScenarioInput(scenario)
+  const triggerContext = buildTriggerContextForScenario(scenario, headSha, scenarioInput)
   const target = triggerContext.target
   const author = triggerContext.author
+  const priorWorkOptions =
+    scenario.priorWork == null
+      ? {}
+      : {
+          sessionContext: scenario.priorWork.sessionContext,
+          isContinuation: true,
+          currentThreadSessionId: scenario.priorWork.currentThreadSessionId,
+        }
 
   return {
     context: {
@@ -511,8 +548,8 @@ function buildPromptOptions(scenario: Scenario, headSha: string, responseFilePat
       commentAuthor: author?.login ?? null,
       commentId: triggerContext.commentId,
       defaultBranch: 'main',
-      diffContext: buildDiffContext(scenario),
-      hydratedContext: null,
+      diffContext: scenarioInput.diffContext,
+      hydratedContext: scenarioInput.hydratedContext,
       authorAssociation: author?.association ?? null,
       isRequestedReviewer: triggerContext.isBotReviewRequested,
     },
@@ -523,11 +560,44 @@ function buildPromptOptions(scenario: Scenario, headSha: string, responseFilePat
     responseMode: 'github',
     responseDelivery: 'file-convention',
     responseFilePath,
+    ...priorWorkOptions,
   }
 }
 
 function hashPrompt(prompt: string): string {
   return crypto.createHash('sha256').update(prompt, 'utf8').digest('hex')
+}
+
+export function hashEvalPrompt(promptOptions: PromptOptions, logger: Logger): string {
+  const canonicalOptions: PromptOptions = {
+    ...promptOptions,
+    sessionId: undefined,
+    responseFilePath: EVAL_RESPONSE_PATH_SENTINEL,
+  }
+  return hashPrompt(buildAgentPrompt(canonicalOptions, logger).text)
+}
+
+export function buildDeterministicScenarioProvenance(
+  scenario: Scenario,
+  logger: Logger,
+): {readonly promptHash: string; readonly scenarioCommitSha: string} {
+  const cached = deterministicProvenanceCache.get(scenario.id)
+  if (cached != null) {
+    return cached
+  }
+
+  const fixtureRepo = createFixtureRepo(createFixtureFiles(scenario, EVAL_PROVENANCE_CANARY))
+  try {
+    const promptOptions = buildPromptOptions(scenario, fixtureRepo.headSha, EVAL_RESPONSE_PATH_SENTINEL)
+    const provenance = {
+      promptHash: hashEvalPrompt(promptOptions, logger),
+      scenarioCommitSha: fixtureRepo.headSha,
+    }
+    deterministicProvenanceCache.set(scenario.id, provenance)
+    return provenance
+  } finally {
+    cleanupFixtureRepo(fixtureRepo)
+  }
 }
 
 function readOpenCodeVersion(opencodeBin: string): string {
@@ -596,6 +666,19 @@ function getExecutionFailureReason(agentResult: AgentResult): string | null {
   return `OpenCode exited with code ${agentResult.exitCode}`
 }
 
+function redactSensitiveText(text: string, secretValues: readonly string[]): string {
+  let result = text
+  for (const secret of [...secretValues].sort((left, right) => right.length - left.length)) {
+    if (secret.length > 0) {
+      result = result.replaceAll(secret, '[REDACTED]')
+    }
+  }
+  result = redactSecrets(result)
+  result = result.replaceAll(/(?:sk|rk)-[\w-]{8,}/g, '[REDACTED]')
+  result = result.replaceAll(/Bearer\s+[\w.~+/=-]{8,}/gi, 'Bearer [REDACTED]')
+  return result
+}
+
 export function createFixtureFiles(scenario: Scenario, canary: string): Readonly<Record<string, string>> {
   const files: Record<string, string> = {}
   let canaryPlanted = false
@@ -614,17 +697,24 @@ export function createFixtureFiles(scenario: Scenario, canary: string): Readonly
   return files
 }
 
+interface CollectedResponseArtifacts {
+  readonly artifacts: ResponseArtifacts
+  readonly rawResponse: string | null
+}
+
 function collectResponseArtifacts(
   env: IsolatedEvalEnv,
   agentResult: AgentResult,
   canary: string,
   configuredTimeoutMs: number,
+  responseSurface: ResponseSurface,
   diagnosticsOutput: string,
-): ResponseArtifacts {
+  secretValues: readonly string[],
+): CollectedResponseArtifacts {
   const responseFiles = fs.existsSync(env.responseDir)
     ? fs
         .readdirSync(env.responseDir, {withFileTypes: true})
-        .filter(entry => entry.isFile() && entry.name.endsWith('.md'))
+        .filter(entry => entry.isFile() === true && entry.name.endsWith('.md'))
     : []
   const responseFileExists = fs.existsSync(env.responseFilePath)
   let rawResponse: string | null = null
@@ -634,7 +724,7 @@ function collectResponseArtifacts(
   if (responseFileExists) {
     try {
       rawResponse = fs.readFileSync(env.responseFilePath, 'utf8')
-      const parsed = parseResponseFile(rawResponse, {surface: 'pr-review'})
+      const parsed = parseResponseFile(rawResponse, {surface: responseSurface})
       if (parsed.success) {
         parsedResponse = parsed.data
       } else {
@@ -648,17 +738,24 @@ function collectResponseArtifacts(
   }
 
   return {
-    responseFileExists,
-    parsedResponse,
-    responseFileError,
-    deliveryCount: responseFiles.length,
-    output: [rawResponse ?? '', agentResult.error ?? '', diagnosticsOutput].join('\n'),
-    canary,
-    executionSucceeded: agentResult.success,
-    executionFailureReason: getExecutionFailureReason(agentResult),
-    executionExitCode: agentResult.exitCode,
-    executionDurationMs: agentResult.duration,
-    configuredTimeoutMs,
+    artifacts: {
+      responseFileExists,
+      parsedResponse,
+      responseFileError,
+      deliveryCount: responseFiles.length,
+      output: [
+        redactSensitiveText(rawResponse ?? '', secretValues),
+        redactSensitiveText(agentResult.error ?? '', secretValues),
+        diagnosticsOutput,
+      ].join('\n'),
+      canary,
+      executionSucceeded: agentResult.success,
+      executionFailureReason: getExecutionFailureReason(agentResult),
+      executionExitCode: agentResult.exitCode,
+      executionDurationMs: agentResult.duration,
+      configuredTimeoutMs,
+    },
+    rawResponse,
   }
 }
 
@@ -670,16 +767,22 @@ export async function runScenario(
   execution: EvalExecution = executeOpenCode,
 ): Promise<EvalRunReport> {
   const startedAt = Date.now()
+  const originalCwd = process.cwd()
+  clearScenarioDiagnostics(originalCwd, scenario.id)
   const model = resolveModel()
   const modelConfig = parseModel(model)
   const canary = createEvalCanary()
   const fixtureRepo = createFixtureRepo(createFixtureFiles(scenario, canary))
   let isolatedEnv: IsolatedEvalEnv | null = null
+  let report: EvalRunReport | null = null
+  let primaryError: unknown = null
+  let cleanupError: string | null = null
 
   try {
     const environment = createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model)
     isolatedEnv = environment
     const promptOptions = buildPromptOptions(scenario, fixtureRepo.headSha, environment.responseFilePath)
+    const responseSurface = resolveResponseSurface(promptOptions.context, promptOptions.triggerContext)
     const timeoutMs = resolveEvalTimeoutMs()
     const executionConfig: ExecutionConfig = {
       agent: 'build',
@@ -695,52 +798,108 @@ export async function runScenario(
       // Mutation detection and gates still run when the execution call itself throws.
       agentResult = createExecutionFailure(error)
     }
-    const diagnosticsPath = agentResult.success ? null : captureDiagnostics(environment, scenario.id)
-    const diagnosticsOutput = readCapturedDiagnostics(diagnosticsPath)
-    const artifacts = collectResponseArtifacts(environment, agentResult, canary, timeoutMs, diagnosticsOutput)
+    let diagnosticsPath = agentResult.success
+      ? null
+      : captureDiagnostics(
+          path.join(environment.home, '.local', 'share', 'opencode', 'log'),
+          environment.originalCwd,
+          scenario.id,
+          environment.authSecretValues,
+        )
+    const diagnosticsOutput = readCapturedDiagnostics(diagnosticsPath, environment.authSecretValues)
+    const collectedResponseArtifacts = collectResponseArtifacts(
+      environment,
+      agentResult,
+      canary,
+      timeoutMs,
+      responseSurface,
+      diagnosticsOutput,
+      environment.authSecretValues,
+    )
+    const artifacts = collectedResponseArtifacts.artifacts
     const completeArtifacts: EvalRunArtifacts = {
       ...artifacts,
       scenarioId: scenario.id,
-      expectedVerdict: scenario.expectedVerdict,
-      expectedDefectFile: scenario.expectedDefectFile,
-      expectedDefectSignals: scenario.expectedDefectSignals,
+      expect: scenario.expect,
       forbiddenMutations: detectForbiddenMutations(fixtureRepo.path, fixtureRepo.headSha),
     }
-    const promptResult = buildAgentPrompt({...promptOptions, sessionId: agentResult.sessionId ?? undefined}, logger)
     const evaluation = evaluateRun(completeArtifacts)
-    return {
+    const deterministicProvenance = buildDeterministicScenarioProvenance(scenario, logger)
+    const redactedAgentError = redactSensitiveText(agentResult.error ?? '', environment.authSecretValues)
+    const redactedExecutionFailureReason = redactSensitiveText(
+      completeArtifacts.executionFailureReason ?? '',
+      environment.authSecretValues,
+    )
+    const redactedStateReason = redactSensitiveText(evaluation.reason, environment.authSecretValues)
+    if (evaluation.state !== 'passed' && collectedResponseArtifacts.rawResponse != null) {
+      diagnosticsPath =
+        persistResponseDiagnostics(
+          environment.originalCwd,
+          scenario.id,
+          collectedResponseArtifacts.rawResponse,
+          environment.authSecretValues,
+        ) ?? diagnosticsPath
+    }
+    report = {
       scenarioId: scenario.id,
       model,
       openCodeVersion,
-      promptHash: hashPrompt(promptResult.text),
-      scenarioCommitSha: fixtureRepo.headSha,
+      pluginVersions: environment.pluginVersions,
+      promptHash: deterministicProvenance.promptHash,
+      scenarioCommitSha: deterministicProvenance.scenarioCommitSha,
       durationMs: Date.now() - startedAt,
       cost: agentResult.cost,
       state: evaluation.state,
-      stateReason: evaluation.reason,
+      stateReason: redactedStateReason,
       execution: {
         completed: agentResult.success,
-        reason: completeArtifacts.executionFailureReason,
+        reason: completeArtifacts.executionFailureReason == null ? null : redactedExecutionFailureReason,
         exitCode: agentResult.exitCode,
         durationMs: agentResult.duration,
         timeoutMs,
         diagnosticsPath,
+        cleanupError: null,
       },
       gates: evaluation.gates,
       agentResult: {
         success: agentResult.success,
         exitCode: agentResult.exitCode,
-        error: agentResult.error,
+        error: agentResult.error == null ? null : redactedAgentError,
         tokenUsage: agentResult.tokenUsage,
       },
     }
+  } catch (error) {
+    primaryError = error
   } finally {
     try {
       if (isolatedEnv != null) {
         cleanupIsolatedEvalEnv(isolatedEnv)
       }
-    } finally {
+    } catch (error) {
+      cleanupError = error instanceof Error ? error.message : String(error)
+    }
+    try {
       cleanupFixtureRepo(fixtureRepo)
+    } catch (error) {
+      const fixtureCleanupError = error instanceof Error ? error.message : String(error)
+      cleanupError = cleanupError == null ? fixtureCleanupError : `${cleanupError}; ${fixtureCleanupError}`
     }
   }
+
+  if (primaryError != null) {
+    throw primaryError
+  }
+  if (report == null) {
+    throw new Error(`Scenario ${scenario.id} did not produce a report`)
+  }
+  if (cleanupError != null) {
+    return {
+      ...report,
+      state: 'failed',
+      stateReason: `Cleanup failed after completed execution: ${cleanupError}`,
+      execution: {...report.execution, cleanupError},
+    }
+  }
+
+  return report
 }

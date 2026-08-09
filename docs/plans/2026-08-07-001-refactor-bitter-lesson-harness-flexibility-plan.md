@@ -77,6 +77,9 @@ These are load-bearing and unproven. Each is a place the plan could be wrong.
 - `src/harness/phases/session-prep.ts:52,93` — already calls `listSessions` and `searchSessions` and injects results as `priorWorkContext`.
 - `src/features/agent/live-probe-1.17.20.test.ts` — exercises the real SDK, event, and poll path. The correct seed for an eval runner; it tests transport, not effectiveness.
 - `src/features/context/graphql.ts:22,66,77,87` — uses `first:` for comments, commits, and files.
+- The current eval corpus has exactly two scenarios, with PR-review-specific types, runner logic, and gates. U1 generalizes the eval-only surface rather than changing production harness files.
+- `PromptOptions` can inject `sessionContext`, `isContinuation`, `currentThreadSessionId`, `logicalKey`, and `hydratedContext` without GitHub calls; `EvalExecution` injection already supports deterministic missing/malformed response tests.
+- The eval runner currently hardcodes the `pr-review` response surface; U1 replaces that local choice with production `resolveResponseSurface`.
 - Duplicate execution stacks:
 
 | Path                                      | Live                                        | Lines |
@@ -126,8 +129,8 @@ Sourcing caveat: the widely repeated claim that named products "deleted scaffold
 - AE2. An attempt that pushes a commit and then fails is not retried by replaying the original prompt; the harness detects the side effect and reconciles.
 - AE3. A provider failure arriving with a structured error name is classified without any prose match, and the classification-path metric records `structured`.
 - AE4. A provider failure arriving with no structured fields still classifies via bounded prose fallback, and the metric records `fallback`.
-- AE5. An agent run where prior session context is irrelevant does not spend tool calls re-searching session history.
-- AE6. A PR with 80 comments where the decisive evidence is in the newest 10 surfaces that evidence in the assembled context.
+- AE5. An agent run where prior session context is irrelevant still reaches the correct task outcome; irrelevant context does not degrade the answer.
+- AE6. A PR with 80 comments where decisive evidence is in the newest 10 surfaces that evidence in assembled context; selection is verified deterministically, and no live scenario asserts causal effect.
 - AE7. A clean PR produces a PASS verdict with no invented blocking findings.
 
 ## High-Level Technical Design
@@ -165,20 +168,21 @@ graph TB
 
 ## Implementation Units
 
-U1 and U2 are independent and may run in parallel. U3 → U4 → U7 is a serial chain. U5 cannot start before U1, because the eval corpus is its only meaningful verification path — without it, prompt edits are unverifiable opinion. U6 is independent but should be validated against the U1 corpus once that exists.
+U1 and U2 are independent and may run in parallel. U3 → U4 → U7 is a serial chain. U5 cannot start before U1e, because the continuation scenarios are its only meaningful verification path — without them, prompt edits are unverifiable opinion. U6 is independent but should be validated against the U1 corpus once that exists.
 
 ```mermaid
 graph TB
-  U1[U1 eval corpus + baseline] --> U5[U5 prompt: retarget tests, remove ritual]
+  U1[U1 eval corpus + baseline] --> U1e[U1e continuation scenarios]
+  U1e --> U5[U5 prompt: retarget tests, remove ritual]
   U1 -.validates.-> U6[U6 context page selection]
   U2[U2 consolidate execution stacks] --> U3[U3 structured attempt outcomes]
   U3 --> U4[U4 structured-first classification]
   U4 --> U7[U7 liveness signals + carry ledger]
 ```
 
-If U1 slips or is abandoned, U5 must not proceed on judgement alone — that is the failure mode where prompt refactors become unverifiable edits.
+If U1e slips or is abandoned, U5 must not proceed on judgement alone — that is the failure mode where prompt refactors become unverifiable edits.
 
-- [ ] **U1. Differential eval corpus and baseline**
+- [x] **U1. Differential eval corpus and baseline**
 
 **Goal:** Make agent-facing change measurable before anything is deleted.
 
@@ -191,19 +195,34 @@ If U1 slips or is abandoned, U5 must not proceed on judgement alone — that is 
 - Create: `evals/scenarios/` (fixture repos and normalized event payloads)
 - Create: `evals/runner.ts`
 - Create: `evals/gates.ts`
+- Test: `evals/runner.test.ts`
 - Test: `evals/gates.test.ts`
+- Modify: `evals/types.ts`
+- Modify: `evals/README.md`
+- Create: `evals/baselines/u1.json`
+- Test: `evals/baselines/u1.test.ts`
 
 **Approach:**
 
-- **Hard cap: eight scenarios.** The corpus exists to validate U3, U4, U5, and U6 — nothing more. Coverage expansion is deferred until a specific change needs a scenario that does not exist. A corpus that grows to satisfy completeness becomes the platform KTD1 forbids.
-- Eight frozen scenarios run through the real `executeOpenCode` path against disposable fixture repos.
+- **At-most-eight hard cap; six live scenarios maximum.** Eight is capacity, not a target or a requirement to run eight live models. The planned live shape is: `clean-pr`; `planted-defect`; `issue-known-files`; `continuation-relevant`; `continuation-irrelevant-non-degradation`; and `unchanged-constraint-violation`. The malformed/missing response case is deterministic injected-execution runner coverage, not a live-model scenario.
+- The current two PR-review scenarios become the first two entries in the generalized corpus. Inputs use a small discriminated surface model; free-prose outcome expectations use required signal groups only, and absence is asserted only through single-valued structured fields such as a verdict.
+- Continuation scenarios are **U1e**. They synthesize frozen `sessionContext` and prior-work input through `PromptOptions` rather than running two nondeterministic live turns.
+- Keep production harness files out of U1's planned scope. U1 stays in `evals/` unless a live scenario exposes a separate real defect; using production `resolveResponseSurface` does not authorize changing its implementation here.
+- No per-scenario hooks, builders, scorers, judge, dashboard, second runner, retry layer, or parallel execution. Adding coverage beyond eight requires deleting an existing scenario first.
+- Six frozen live scenario definitions run through the real `executeOpenCode` path when enabled, against disposable fixture repos.
 - The real path is **not** "just a test": it spins up an OpenCode server, creates a session, and runs a live SDK session. `src/features/agent/live-probe-1.17.20.test.ts` shows the required shape — gated execution, isolated `HOME`/`PATH`/`XDG_*`, and a pinned low-cost model. Budget the server lifecycle, env isolation, and model-cost strategy as part of this unit rather than discovering them during implementation.
-- The runner is **credentialless**. `file-convention` delivery covers the delivery surface only, not every GitHub-backed action the agent might attempt, so no GitHub token is provisioned to the eval environment at all. A misconfigured eval must be incapable of mutating a real repository, not merely discouraged from it.
+- Eval OpenCode config mirrors production build-agent external-directory policy: `'*': deny` first, canonical `<RUNNER_TEMP>/fro-bot-response/*: allow` second. Last-match ordering permits only response delivery; every other external path fails fast instead of waiting for approval. This is noninteractive tool-policy parity, not sandbox containment; bash retains full host-user authority.
+- The runner is **credentialless**. `file-convention` delivery covers the delivery surface only, not every GitHub-backed action the agent might attempt, so no GitHub token is provisioned to the eval environment at all.
 - Fixture content is **untrusted input**. Scenario repos and event payloads carry adversarial text by design (a PR body containing instructions is a legitimate scenario), so the runner treats fixtures as a prompt-injection surface and never grants them more authority than a real untrusted PR would have.
-- Hard executable gates score the run: response file parses, correct verdict enum, exactly one delivery, no forbidden mutation, no secret leakage, tests pass where applicable, planted defect found, clean PR stays clean.
-- Record the full tuple per run: model, OpenCode build, plugin versions, prompt hash, scenario commit, cost, duration. This tuple is what makes a model upgrade measurable.
-- An LLM judge may score clarity as a secondary signal, never as the merge gate.
-- Scenario set covers: issue answerable from known files; PR with one planted defect; clean PR; implementation task with a failing test; continuation where prior work is relevant; continuation where prior work is irrelevant; long thread with decisive evidence in the newest comments; malformed or missing response file.
+- Hard executable gates cover response parsing, the expected structured verdict/outcome, exactly one delivery, required-signal presence, repository immutability/no-forbidden-mutation, and secret leakage. These expectations remain independent of response surface.
+- U1g cut — August 8, 2026. A bounded implementation/mutation probe was built then reverted after its stop condition triggered: fixture-scoped observation could not provide a credible safety contract for host-executed model-authored source against verification-test replacement/self-restoration, ancestor symlink races without Node openat-style traversal, `.git` metadata influencing observation, or descendant processes outliving verifier timeout/final snapshot. Closing those gaps requires OS/container isolation and process containment, a separate eval-platform project that violates KTD1/U1's anti-platform scope.
+- Corpus law: gates may assert signal presence in free prose, never signal absence. Presence proves access, not application; correct rejection contains the same token. Absence may be asserted only over single-valued structured fields such as a review verdict.
+- Corpus law — outcome authority. Every expected outcome is fully justified by trusted inputs: committed repo state, harness-supplied structured event, or frozen prior work. Fixture prose (PR bodies/comments/reviews) is untrusted and may never be the sole or marginal justification. If an expected outcome flips based on believing an uncorroborated fixture claim, the scenario scores credulity and false-regresses as injection resistance improves.
+- Corpus law — obligated signals. A required signal is admissible only when a correct complete response cannot omit it; merely available tokens provide no information about absence. Each required signal group must state its task obligation; in the constraint-outside-diff scenario, the changed violating file establishes the visible violation and the unchanged constraint source establishes the authoritative rule.
+- Corpus law — counterfactual limit. Single-run gates observe outcomes and signal access, not causal impact. No scenario name, description, or justification may claim that a supplied input changed the outcome.
+- A scenario that does not pass persists its response body to the gitignored diagnostics path. A failed quality gate without the body is unreproducible and cannot be recalibrated honestly.
+- Record the full tuple per run: model, OpenCode build, plugin versions, prompt hash, scenario commit, cost, duration. Cost and duration are advisory provenance, never gates.
+- Scenario execution uses the injected `EvalExecution` path for missing/malformed response tests; no live model is required for those cases.
 
 **Patterns to follow:**
 
@@ -211,16 +230,22 @@ If U1 slips or is abandoned, U5 must not proceed on judgement alone — that is 
 
 **Test scenarios:**
 
-- Happy path: a scenario with a planted defect scores a blocking verdict naming the defect.
-- Happy path: a clean-PR scenario scores PASS and fails if the agent invents findings.
-- Edge case: a scenario producing no response file fails the delivery gate rather than erroring the runner.
+- `planted-defect`: scores a blocking verdict naming the defect.
+- `clean-pr`: scores PASS and fails if the agent invents findings.
+- `issue-known-files`: reaches the expected answer outcome from known files.
+- `continuation-relevant`: relevant frozen prior work still reaches its expected outcome.
+- `continuation-irrelevant-non-degradation`: irrelevant frozen prior work still reaches the correct task outcome; no gate checks whether the response mentioned that context.
+- `unchanged-constraint-violation`: a visible source change is internally consistent but violates a fully authoritative rule in an unchanged committed repo file outside the diff. Expected `request-changes` is fully justified by committed repo state alone. Required signals are the changed violating file and unchanged constraint source. Hydrated comments remain descriptive/non-normative; no expectation depends on them, and no assertion claims supplied thread evidence changed the outcome.
+- Edge case: unmatched external-directory access is denied without an approval ask, while the run-scoped response file remains writable.
+- Deterministic runner test: injected missing and malformed responses fail the delivery/parse gates without requiring a live model.
 - Error path: a scenario whose fixture repo is missing fails loudly with the scenario name, not silently.
 - Integration: the runner captures the full provenance tuple and writes a JSON report consumable in CI.
 
 **Verification:**
 
-- Baseline captured for current prompt and model across all scenarios, committed as the reference artifact.
+- Reviewed baseline committed at `evals/baselines/u1.json` for all six enabled live scenarios against the current prompt and model; the integrity test validates its source run, runtime/plugin provenance, registry order, stable hashes/fixture SHAs, passed states, passed gate IDs, and sanitized shape.
 - No gate asserts tool usage, step count, or reasoning order.
+- Cost and duration are present in provenance but do not gate acceptance.
 
 - [x] **U2. Consolidate duplicate execution stacks**
 
@@ -403,7 +428,7 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 
 **Requirements:** R4, R8
 
-**Dependencies:** U1 (baseline required before prompt changes)
+**Dependencies:** U1e (continuation baseline required before prompt changes)
 
 **Files:**
 
@@ -431,15 +456,15 @@ The conversion target the estimate missed is **`ApiError.data.isRetryable`** —
 - Happy path: the prompt no longer mandates a tool call order.
 - Edge case: `responseDelivery: 'none'` still produces the silent-run contract unchanged.
 - Edge case: `file-convention` mode still states that `gh` is unavailable.
-- Integration: eval corpus shows no regression on continuation scenarios where prior work is relevant.
-- Integration: eval corpus shows reduced tool calls on the scenario where prior work is irrelevant.
+- Integration: eval corpus shows the relevant prior-work scenario still reaches the expected outcome.
+- Integration: the eval corpus scenario with irrelevant prior work still produces the correct outcome; no gate inspects whether prior work was mentioned.
 
 **Verification:**
 
 - `packages/harness/src/prompt-template.test.ts` is untouched and still pins the workflow strip and its ordering.
 - No safety or output-contract assertion was relaxed.
 
-- [x] **U6. Context page selection**
+- [ ] **U6. Context page selection**
 
 **Goal:** Surface the newest evidence rather than the oldest.
 
@@ -484,7 +509,7 @@ Files have no temporal dimension. `ContextFile` is `{path, additions, deletions,
 - Edge case: the REST fallback path selects the same tail as the GraphQL path for an over-cap thread.
 - Regression: files remain path-ordered and unaffected.
 
-The previously-proposed eval integration scenario is dropped — the corpus contains `clean-pr` and `planted-defect` only, and adding a decisive-evidence-in-newest-comments scenario belongs to the eval unit rather than this one.
+The U1f constraint-outside-diff eval scenario remains in U1. Expected `request-changes` is fully justified by committed repo state alone, with required signals consisting of the changed violating file and unchanged constraint source. Hydrated comments remain descriptive/non-normative; no expectation depends on them. U6 deterministic tests own newest evidence selection and pagination, while a static attachment test owns hydration-to-prompt plumbing.
 
 **Verification:**
 
@@ -563,7 +588,7 @@ The polling scenarios are dropped along with the liveness change. The existing c
 - **Error propagation:** U3 and U4 change how failures are represented but must not change which failures are terminal for any currently-covered shape.
 - **State lifecycle risks:** U3 is the highest-risk unit. A mistake in side-effect detection could either duplicate an external effect or wrongly suppress a legitimate retry.
 - **API surface parity:** `packages/runtime` exports are consumed by both the Action and the gateway. U2 must not silently drop an export.
-- **Integration coverage:** U5's effect on agent behavior is only observable through the U1 corpus; unit tests cannot prove it.
+- **Integration coverage:** U5's continuation behavior is only observable through U1e; unit tests cannot prove it.
 - **Unchanged invariants:** the exactly-one-response rule, response-file trust boundary, review guards, credential scrubbing, execution deadline, fail-closed delivery, and the workflow strip are explicitly unchanged by every unit above.
 
 ## Risks & Dependencies
@@ -573,9 +598,9 @@ The polling scenarios are dropped along with the liveness change. The existing c
 | The eval corpus encodes today's behavior as the ceiling | Medium | High | Assert outcomes only; explicitly forbid assertions on tool usage, step count, or reasoning order (KTD2) |
 | Removing prose fallback turns recoverable failures terminal | Medium | High | Demote rather than delete; gate removal on the classification-path metric (KTD4) |
 | Side-effect detection in U3 is wrong in either direction | Medium | High | Test-first on side-effect-bearing failures; characterization baseline from U2 first |
-| Prompt change regresses continuation quality | Medium | Medium | U5 depends on U1; one block per change, measured against baseline |
+| Prompt change regresses continuation quality | Medium | Medium | U5 depends on U1e; one block per change, measured against baseline |
 | Execution-stack consolidation drops a consumed export | Low | Medium | Characterization-first; verify both entry points before removal |
-| Eval corpus grows into a platform | Medium | Medium | Corpus and runner only; JSON report and CI artifacts, no dashboard or service (KTD1) |
+| Eval corpus grows into a platform | Medium | Medium | One eval runner only; no per-scenario extension points, judge, dashboard, second runner, retry layer, or parallel execution; adding a ninth case requires deletion (KTD1) |
 
 ## Open Questions
 
@@ -586,13 +611,13 @@ The polling scenarios are dropped along with the liveness change. The existing c
 - Is the four-layer architecture over-structured for an agent harness? No. Both architecture reviews were explicit that layers and XML sections express dependency direction and authority, not reasoning constraints.
 - Is pinning an exact upstream OpenCode build a Bitter Lesson problem? No. The pin is good dependency management. The liability is the twelve carries accumulating without exit paths.
 - Is `isAgentNotFoundError` dead code? No. One review claimed it was; verification found it live via `src/features/comments/error-format.ts:11`.
+- What is U1's final scenario shape? Six live scenarios: `clean-pr`, `planted-defect`, `issue-known-files`, `continuation-relevant`, `continuation-irrelevant-non-degradation`, and `unchanged-constraint-violation`. Missing/malformed responses are deterministic injected-execution tests; the at-most-eight cap is capacity, not a live-run target.
 
 ### Deferred to Implementation
 
 - Which execution stack should own policy after U2 — the action layer or the runtime package. Requires reading both call graphs against current consumers.
 - Whether the automatic session writeback can be extended to capture qualitative decisions, which would let the completion-summary requirement drop from the prompt.
 - The exact protocol signals available for liveness in the current OpenCode build, and whether they cover the cases the 90-second timeout currently catches.
-- Final scenario count for the eval corpus. Eight is the floor; twelve is the working ceiling.
 
 ## Documentation / Operational Notes
 

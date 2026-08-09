@@ -1,17 +1,47 @@
-import type {PullRequestEvent} from '@octokit/webhooks-types'
+import type {IssueCommentEvent, PullRequestEvent} from '@octokit/webhooks-types'
 import type {AgentResult, DiffFileSummary} from '../packages/runtime/src/agent/index.js'
 import type {ParsedResponse, ResponseFileVerdict} from '../packages/runtime/src/agent/response-file.js'
+import type {SessionContext} from '../packages/runtime/src/agent/types.js'
+import type {HydratedContext} from '../src/features/agent/types.js'
+
+export interface PullRequestSurface {
+  readonly kind: 'pull_request'
+  readonly event: PullRequestEvent
+  readonly diffFiles: readonly DiffFileSummary[]
+  readonly hydratedContext: HydratedContext | null
+}
+
+export interface IssueCommentSurface {
+  readonly kind: 'issue_comment'
+  readonly event: IssueCommentEvent
+  readonly hydratedContext: HydratedContext | null
+}
+
+export type ScenarioSurface = PullRequestSurface | IssueCommentSurface
+
+export interface SignalGroup {
+  readonly id: string
+  readonly anyOf: readonly [string, ...string[]]
+}
+
+export interface OutcomeExpectations {
+  readonly verdict: ResponseFileVerdict | null
+  readonly requiredSignals: readonly SignalGroup[]
+}
+
+export interface PriorWork {
+  readonly sessionContext: SessionContext
+  readonly currentThreadSessionId: string
+}
 
 export interface Scenario {
   readonly id: string
   readonly description: string
   readonly files: Readonly<Record<string, string>>
-  readonly event: PullRequestEvent
+  readonly surface: ScenarioSurface
   readonly prompt: string
-  readonly diffFiles: readonly DiffFileSummary[]
-  readonly expectedVerdict: ResponseFileVerdict
-  readonly expectedDefectFile: string | null
-  readonly expectedDefectSignals: readonly string[]
+  readonly priorWork: PriorWork | null
+  readonly expect: OutcomeExpectations
 }
 
 export interface GateResult {
@@ -55,9 +85,7 @@ export interface ResponseArtifacts {
 
 export interface EvalRunArtifacts extends ResponseArtifacts {
   readonly scenarioId: string
-  readonly expectedVerdict: ResponseFileVerdict
-  readonly expectedDefectFile: string | null
-  readonly expectedDefectSignals: readonly string[]
+  readonly expect: OutcomeExpectations
   readonly forbiddenMutations: readonly string[]
 }
 
@@ -73,14 +101,16 @@ export interface ExecutionDiagnostics {
   readonly exitCode: number
   readonly durationMs: number
   readonly timeoutMs: number
-  /** Where the agent's logs were copied before the isolated home was destroyed, when execution did not complete. */
+  /** Where captured logs and/or non-passing response evidence were stored before cleanup. */
   readonly diagnosticsPath: string | null
+  readonly cleanupError: string | null
 }
 
 export interface EvalRunReport {
   readonly scenarioId: string
   readonly model: string
   readonly openCodeVersion: string
+  readonly pluginVersions: readonly string[]
   readonly promptHash: string
   readonly scenarioCommitSha: string
   readonly durationMs: number
