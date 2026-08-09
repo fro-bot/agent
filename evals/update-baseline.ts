@@ -1,5 +1,6 @@
 import type {Logger} from '../src/shared/logger.js'
 import type {Scenario} from './types.js'
+import {execFileSync} from 'node:child_process'
 import {mkdirSync, readFileSync, writeFileSync} from 'node:fs'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -221,8 +222,12 @@ export function buildBaselineFromReport(
 export function updateBaselineFromReportPath(reportPath: string, outputPath = BASELINE_PATH): void {
   const source = JSON.parse(readFileSync(reportPath, 'utf8')) as unknown
   const baseline = buildBaselineFromReport(source)
+  const formatted = execFileSync('bunx', ['prettier', '--parser', 'json', '--stdin-filepath', outputPath], {
+    input: JSON.stringify(baseline),
+    encoding: 'utf8',
+  })
   mkdirSync(path.dirname(outputPath), {recursive: true})
-  writeFileSync(outputPath, `${JSON.stringify(baseline, null, 2)}\n`, 'utf8')
+  writeFileSync(outputPath, formatted, 'utf8')
 }
 
 function runCommand(): void {

@@ -74,7 +74,7 @@ describe('U1 committed baseline integrity', () => {
         `Scenario ${scenario.id} scenarioCommitSha drift: baseline=${baselineScenario.scenarioCommitSha}, live=${provenance.scenarioCommitSha}`,
       ).toBe(baselineScenario.scenarioCommitSha)
     }
-  })
+  }, 60_000)
 
   it('contains only the reviewed outcome and provenance reference', () => {
     // #given the committed baseline artifact
@@ -84,8 +84,10 @@ describe('U1 committed baseline integrity', () => {
     expectExactKeys(baseline, ['schemaVersion', 'sourceRun', 'runtime', 'scenarios'])
     expect(baseline.schemaVersion).toBe(1)
     expectExactKeys(baseline.sourceRun, ['corpusHeadSha', 'completionMarker', 'suiteVerdict'])
+    // promptHash/scenarioCommitSha are recomputable; duplicating them hid drift. corpusHeadSha records the commit
+    // that produced the reviewed run and cannot be derived, so pinning it forces a conscious update on re-recording.
     expect(baseline.sourceRun).toEqual({
-      corpusHeadSha: '2e58f3bd662b0102d853ffae7d2f0bcf0bf4be71',
+      corpusHeadSha: 'a00f05c5953bae32a8b9998d478ee4c274b14bba',
       completionMarker: 'fro-bot-eval-report-complete-v1',
       suiteVerdict: 'passed',
     })

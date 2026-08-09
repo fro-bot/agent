@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "sourceRun": {
-    "corpusHeadSha": "2e58f3bd662b0102d853ffae7d2f0bcf0bf4be71",
+    "corpusHeadSha": "a00f05c5953bae32a8b9998d478ee4c274b14bba",
     "completionMarker": "fro-bot-eval-report-complete-v1",
     "suiteVerdict": "passed"
   },
@@ -14,7 +14,7 @@
   "scenarios": [
     {
       "id": "clean-pr",
-      "promptHash": "48d15b4fd97bf026d20fb03bca19314a58b3031278a126d2cf56fc90ccdac7ac",
+      "promptHash": "602f8047336b9a91023a3f52f9554c170a0f1dc88b866ce72ae851bd5d0703ab",
       "scenarioCommitSha": "62a462da9bb73b8b97f9e0cd44e8252ceda3f978",
       "state": "passed",
       "passedGateIds": [
@@ -28,7 +28,7 @@
     },
     {
       "id": "planted-defect",
-      "promptHash": "0d5990b3d28f6d7cb9337058c80ac28daf5627a3fbb1b1d7be2da6bb0d37acb4",
+      "promptHash": "24537612d0ca81b84dde41301b152b36cdfdde627058d90532026818d3b6186e",
       "scenarioCommitSha": "61f263fd5706ff26297d09bc247b8e82046e658d",
       "state": "passed",
       "passedGateIds": [
@@ -42,7 +42,7 @@
     },
     {
       "id": "issue-known-files",
-      "promptHash": "ee155352b166322796402585b374008e7f3a5d021d9ad00832c6b2425ea92609",
+      "promptHash": "e85a7882f383f298f7116d9a2ade75332461a119f8b4dc2baf41f3fb469454d6",
       "scenarioCommitSha": "07a4cc53a1c110b6432d6228c63011c8d210b847",
       "state": "passed",
       "passedGateIds": [
@@ -56,7 +56,7 @@
     },
     {
       "id": "continuation-relevant",
-      "promptHash": "09a2503aef5fe4b3e2dffab36ccea61a6ee1cd8ed293de5a403d00bd316b6e62",
+      "promptHash": "000461059e5421d7a443310e7f20d25604c81d7febc859e60107e280eb737e93",
       "scenarioCommitSha": "c4fa14cfe1b2e137d5813c356412a58e24523584",
       "state": "passed",
       "passedGateIds": [
@@ -70,7 +70,7 @@
     },
     {
       "id": "continuation-irrelevant-non-degradation",
-      "promptHash": "6dea1071c92f3748a1e19843e0604a960084b7d60d42ac233d27d2cbc261a809",
+      "promptHash": "1b0d61f3287d9b8c0f47914d77b232d5149999efd2e4e9e053140ce971d03fe3",
       "scenarioCommitSha": "c4fa14cfe1b2e137d5813c356412a58e24523584",
       "state": "passed",
       "passedGateIds": [
@@ -84,7 +84,7 @@
     },
     {
       "id": "unchanged-constraint-violation",
-      "promptHash": "68b5219165c34ea7d77988931f2eb01757bee57e6de32723e6f69f92feaa6218",
+      "promptHash": "30ddbf785e65ea0b3e3314caf316e7abf8a60fc00eefe082ba5fc358a5475c88",
       "scenarioCommitSha": "c6c546c63c2df8b16bb5c112f909d1c685e55ba4",
       "state": "passed",
       "passedGateIds": [
