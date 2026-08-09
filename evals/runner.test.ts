@@ -183,9 +183,9 @@ interface SerializedEvalConfig {
 
 describe('runScenario orchestration', () => {
   it.each([
-    ['clean-pr', cleanPrScenario, 'b68fcc5c6f717d8e2fa728772e8f000df814667ef9cc843250a9a5a6ce7f6999'],
-    ['planted-defect', plantedDefectScenario, 'c1c432a27be6b7c18bd27de36b708ec199368080a41fdcad00ac67a6ad31f285'],
-  ] as const)('retains the current-main prompt hash for %s', (_id, scenario, expectedHash) => {
+    ['clean-pr', cleanPrScenario, '05b7906f4a55ab1768da4946d0aeaaa596e0d9eb1c0035e618b1ca1c1a766c2e'],
+    ['planted-defect', plantedDefectScenario, 'b915f0c6ec49033614bf083dec7936f58c4cb21fbc9c3294db319a006a36b664'],
+  ] as const)('pins the exact current prompt hash for %s', (_id, scenario, expectedHash) => {
     // #given a deterministic no-model prompt construction seam
     const promptOptions = buildPromptOptions(scenario, CHARACTERIZATION_HEAD_SHA, CHARACTERIZATION_RESPONSE_PATH)
 
@@ -193,7 +193,7 @@ describe('runScenario orchestration', () => {
     const prompt = buildAgentPrompt(promptOptions, logger).text
     const promptHash = crypto.createHash('sha256').update(prompt, 'utf8').digest('hex')
 
-    // #then the refactor preserves the exact current-main prompt bytes
+    // #then the exact current prompt bytes remain pinned for this scenario
     expect(promptHash).toBe(expectedHash)
   })
 

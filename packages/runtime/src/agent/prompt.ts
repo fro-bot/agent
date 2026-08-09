@@ -219,15 +219,10 @@ function buildAgentContextSection(
     '### Session Management (REQUIRED)',
     'Tools: `session_list` (recent sessions), `session_search` (find relevant sessions by query), `session_read` (read a session in full), `session_info` (metadata for one session).',
     '',
-    'Before investigating any issue:',
-    '1. Use `session_search` (or `session_list`) to find relevant prior sessions for this repository',
-    '2. Use `session_read` to review prior work if found',
-    '3. Avoid repeating investigation already completed in previous sessions',
+    'Prior session context may already be supplied in this prompt.',
+    'When additional history would help, the session tools `session_list`, `session_search`, `session_read`, and `session_info` are available.',
     '',
-    'Before completing:',
-    '1. Ensure your session contains a summary of work done',
-    '2. Include key decisions, findings, and outcomes',
-    '3. This summary will be searchable in future agent runs',
+    'Your session should contain a summary of the work done, including key decisions, findings, and outcomes, so it can be searched later.',
   )
 
   if (hasResponseProtocol) {
@@ -760,6 +755,7 @@ ${runSummaryBlock}
 
   if (responseDelivery === 'file-convention') {
     return `### Response Protocol (REQUIRED)
+This is the authoritative delivery contract for this run.
 You MUST deliver exactly ONE response per invocation by writing it to the response file. All of your output — your response content AND the Run Summary — goes into that single file.
 **Rules:**
 1. **The \`gh\` CLI is NOT available.** A \`gh\` call will fail — write the response file instead.
@@ -782,6 +778,7 @@ ${runSummaryBlock}
   }
 
   return `### Response Protocol (REQUIRED)
+This is the authoritative delivery contract for this run.
 You MUST post exactly ONE comment or review per invocation. All of your output — your response content AND the Run Summary — goes into that single artifact.
 **Rules:**
 1. **One output per run.** Post exactly ONE comment (via \`gh issue comment\` or \`gh pr comment\`) or ONE review (via \`gh pr review\`). Never both. Never multiple comments.
