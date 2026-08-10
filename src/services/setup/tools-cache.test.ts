@@ -2,7 +2,7 @@ import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {
   buildCachePaths,
   buildToolsCacheKey,
@@ -616,6 +616,39 @@ describe('saveToolsCache', () => {
 
     // #then save succeeds
     expect(result).toBe(true)
+  })
+
+  it('returns false and warns when save returns the failure sentinel', async () => {
+    // #given an adapter that reports an unsuccessful save
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const adapter = createMockToolsCacheAdapter({saveResult: -1})
+
+    // #when saving the tools cache
+    const result = await saveToolsCache({
+      logger,
+      os: 'Linux',
+      bunVersion: '1.3.14',
+      opencodeVersion: '1.0.0',
+      omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
+      cacheMode: 'enabled',
+      toolCachePath,
+      bunCachePath,
+      omoConfigPath,
+      opencodeCachePath,
+      cacheAdapter: adapter,
+    })
+
+    // #then the failure sentinel is reported as an unpersisted cache
+    expect(result).toBe(false)
+    expect(logger.warning).toHaveBeenCalledWith('Tools cache save did not persist', {
+      saveKey: 'opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0-bun-1.3.14',
+    })
   })
 
   it('saves cache successfully in disabled mode', async () => {
