@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-08-03"
-updated-by: "b233675"
+last-updated: "2026-08-09"
+updated-by: "c006768"
 sources:
   - src/main.ts
   - src/post.ts
@@ -115,7 +115,7 @@ The workspace-agent is a sandboxed Hono HTTP service that runs as a sidecar to t
 
 The runtime package exports five module groups:
 
-**Agent** (`agent/`) — Prompt construction, SDK execution, output-mode and response-delivery resolution, server bootstrapping, retry logic, and reference file management (see [[Prompt Architecture]]). Spawns of the OpenCode child are wrapped in a deny-by-default environment filter (`filter-env.ts` / `with-scrubbed-env.ts`) so credential-shaped variables never reach the agent process (see [[Setup and Configuration]]). Error classification lives in a dedicated `error-format/` submodule that canonically owns the `ErrorType` union and `ErrorInfo` shape (re-exported from `types.ts` for callers), so the action and gateway format agent failures identically and the terminal-vs-transient distinction stays in one place (see [[Execution Lifecycle]]). The terminal kinds are a closed set — quota exhaustion and provider authentication failures — and their classifiers accept only bounded, provider-neutral fields, keeping provider-controlled text out of the trusted failure summary. Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
+**Agent** (`agent/`) — Prompt construction, output-mode and response-delivery resolution, server bootstrapping, and reference file management (see [[Prompt Architecture]]). The runtime supplies the _primitives_ an execution needs; it no longer owns an execution orchestrator. A `refactor(agent)` pass (commit `f5b8d69`) collapsed a previously duplicated execution stack — the runtime once exported its own `executeOpenCode`, retry, and prompt-sender modules that ran in parallel with the action layer's — down to a single owning implementation in `src/features/agent/`. That layer now drives the SDK session, retry policy, and continuation prompt itself, calling the runtime for the lower-level pieces below; the retry backoff constants live beside the retry logic that consumes them rather than being declared in two places. Spawns of the OpenCode child are wrapped in a deny-by-default environment filter (`filter-env.ts` / `with-scrubbed-env.ts`) so credential-shaped variables never reach the agent process (see [[Setup and Configuration]]). Error classification lives in a dedicated `error-format/` submodule that canonically owns the `ErrorType` union and `ErrorInfo` shape (re-exported from `types.ts` for callers), so the action and gateway format agent failures identically and the terminal-vs-transient distinction stays in one place (see [[Execution Lifecycle]]). The terminal kinds are a closed set — quota exhaustion and provider authentication failures — and their classifiers accept only bounded, provider-neutral fields, keeping provider-controlled text out of the trusted failure summary. Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
 
 **Session** (`session/`) — SDK-backed session storage, search, pruning, writeback, and mapper layers (see [[Session Persistence]]).
 
