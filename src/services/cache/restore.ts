@@ -62,31 +62,37 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
     }
   }
 
-  const adapter = storeAdapter ?? createS3Adapter(storeConfig, logger)
-  const syncResult = await syncSessionsFromStore(
-    adapter,
-    storeConfig,
-    components.agentIdentity,
-    components.repo,
-    storagePath,
-    logger,
-  )
+  try {
+    const adapter = storeAdapter ?? createS3Adapter(storeConfig, logger)
+    const syncResult = await syncSessionsFromStore(
+      adapter,
+      storeConfig,
+      components.agentIdentity,
+      components.repo,
+      storagePath,
+      logger,
+    )
 
-  if (syncResult.mainDbRestored === true) {
-    await fs.mkdir(storagePath, {recursive: true})
-    return {
-      hit: true,
-      key: null,
-      restoredPath: storagePath,
-      corrupted: false,
-      source: 'storage',
+    if (syncResult.mainDbRestored === true) {
+      await fs.mkdir(storagePath, {recursive: true})
+      return {
+        hit: true,
+        key: null,
+        restoredPath: storagePath,
+        corrupted: false,
+        source: 'storage',
+      }
     }
-  }
 
-  if (syncResult.downloaded > 0) {
-    logger.warning('Object store returned session sidecar files without main DB - treating as miss', {
-      downloaded: syncResult.downloaded,
-      failed: syncResult.failed,
+    if (syncResult.downloaded > 0) {
+      logger.warning('Object store returned session sidecar files without main DB - treating as miss', {
+        downloaded: syncResult.downloaded,
+        failed: syncResult.failed,
+      })
+    }
+  } catch (error) {
+    logger.warning('Object store restore failed - treating as miss', {
+      error: toErrorMessage(error),
     })
   }
 
@@ -99,10 +105,10 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
   }
 }
 
-async function restoreAfterCorruption(options: RestoreCacheOptions, restoredKey: string): Promise<CacheResult> {
-  const fallback = await restoreFromObjectStore(options)
-  if (fallback.hit === true) {
-    return fallback
+function restoreAfterCorruption(restoredKey: string, objectStoreResult: CacheResult): CacheResult {
+  // The object store was already consulted before the Actions cache. Reuse that result instead of syncing twice.
+  if (objectStoreResult.hit === true) {
+    return objectStoreResult
   }
 
   return {
@@ -143,13 +149,18 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
   logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 
+  const objectStoreResult = await restoreFromObjectStore(options)
+  if (objectStoreResult.hit === true) {
+    return objectStoreResult
+  }
+
   try {
     const restoredKey = await cacheAdapter.restoreCache(cachePaths, primaryKey, [...restoreKeys])
 
     if (restoredKey == null) {
       logger.info('Cache miss - starting with fresh state')
       await fs.mkdir(storagePath, {recursive: true})
-      return await restoreFromObjectStore(options)
+      return objectStoreResult
     }
 
     logger.info('Cache restored', {restoredKey})
@@ -158,14 +169,14 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     if (isCorrupted === true) {
       logger.warning('Cache corruption detected - proceeding with clean state')
       await cleanStorage(storagePath)
-      return await restoreAfterCorruption(options, restoredKey)
+      return restoreAfterCorruption(restoredKey, objectStoreResult)
     }
 
     const versionMatch = await checkStorageVersion(storagePath, logger)
     if (versionMatch === false) {
       logger.warning('Storage version mismatch - proceeding with clean state')
       await cleanStorage(storagePath)
-      return await restoreAfterCorruption(options, restoredKey)
+      return restoreAfterCorruption(restoredKey, objectStoreResult)
     }
 
     await deleteAuthJson(authPath, storagePath, logger)
@@ -181,6 +192,6 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     logger.warning('Cache restore failed', {
       error: toErrorMessage(error),
     })
-    return restoreFromObjectStore(options)
+    return objectStoreResult
   }
 }

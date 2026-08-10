@@ -207,11 +207,11 @@ describe('restore/save object-store integration flow', () => {
     expect((await fs.stat(storagePath)).isDirectory()).toBe(true)
   })
 
-  it('prefers cache hit over object-store restore and still uploads on save', async () => {
+  it('prefers fresh object-store restore over stale cache and still uploads on save', async () => {
     const cache = createMockCacheAdapter('restored-cache-key')
     const store = createInMemoryStoreAdapter({
       initialObjects: new Map([
-        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('stale-store-db')],
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('fresh-store-db')],
       ]),
     })
 
@@ -230,17 +230,18 @@ describe('restore/save object-store integration flow', () => {
       storeAdapter: store.adapter,
     }
 
-    // #given a cache hit and a populated object store
+    // #given a stale cache hit and a fresher object store
 
     // #when restoring cache
     const restoreResult = await restoreCache(restoreOptions)
 
-    // #then cache is used and object store is not consulted for restore
+    // #then object storage is authoritative and the cache is not consulted for restore
     expect(restoreResult).toMatchObject({
       hit: true,
-      source: 'cache',
+      source: 'storage',
     })
-    expect(store.list).not.toHaveBeenCalled()
+    expect(cache.restoreCache).not.toHaveBeenCalled()
+    expect(await fs.readFile(dbPath, 'utf8')).toBe('fresh-store-db')
 
     const saveOptions: SaveCacheOptions = {
       components: testComponents,
@@ -254,13 +255,13 @@ describe('restore/save object-store integration flow', () => {
       storeAdapter: store.adapter,
     }
 
-    // #when saving cache after the cache-hit restore
+    // #when saving cache after the object-store restore
     const saveResult = await saveCache(saveOptions)
 
-    // #then both object store and cache receive the updated session database
+    // #then both object store and cache receive the authoritative session database
     expect(saveResult).toBe(true)
     expect(store.objects.get('fro-bot-state/github/owner/repo/sessions/opencode.db')?.toString('utf8')).toBe(
-      'cache-hit-db',
+      'fresh-store-db',
     )
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
   })
