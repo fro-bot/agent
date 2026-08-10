@@ -15,8 +15,12 @@ on:
 permissions: {}
 
 jobs:
+  # Pull requests only. The upstream PR workflow reports what a change introduces
+  # by checking out GITHUB_BASE_REF and diffing against it. Neither that ref nor
+  # the pull_request payload exists in a merge queue, so merge_group runs the full
+  # scan below instead.
   scan-pr:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    if: ${{ github.event_name == 'pull_request' }}
     name: OSV-Scanner PR scan
     permissions:
       actions: read
@@ -34,7 +38,7 @@ jobs:
       fail-on-vuln: false
 
   scan-scheduled:
-    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'merge_group' }}
     name: OSV-Scanner full scan
     permissions:
       actions: read
