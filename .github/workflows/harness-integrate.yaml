@@ -15,6 +15,13 @@
 # ---------------------------------------------------------------------------
 name: harness-integrate
 
+# Deny every scope by default. The single `integrate` job below declares the two
+# scopes it needs, and a job-level block replaces this one rather than merging
+# with it, so the existing mint and checkout are unaffected. A future job added
+# without its own block gets nothing and fails loudly at checkout, which is the
+# intended outcome for a file where adding a job is security-critical.
+permissions: {}
+
 on:
   workflow_call:
     inputs:

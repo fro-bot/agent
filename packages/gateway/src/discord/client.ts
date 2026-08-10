@@ -1,3 +1,4 @@
+import {redactSensitiveFields} from '@fro-bot/runtime'
 import {Client, GatewayIntentBits} from 'discord.js'
 
 export interface GatewayLogger {
@@ -85,8 +86,10 @@ export const NOOP_GATEWAY_LOGGER: GatewayLogger = Object.freeze({
 export const CONSOLE_GATEWAY_LOGGER: GatewayLogger = Object.freeze({
   debug: () => undefined,
   info: () => undefined,
-  warn: (ctx: Record<string, unknown>, msg: string) => console.warn(JSON.stringify({level: 'warn', ...ctx, msg})),
-  error: (ctx: Record<string, unknown>, msg: string) => console.error(JSON.stringify({level: 'error', ...ctx, msg})),
+  warn: (ctx: Record<string, unknown>, msg: string) =>
+    console.warn(JSON.stringify({level: 'warn', ...redactSensitiveFields(ctx), msg})),
+  error: (ctx: Record<string, unknown>, msg: string) =>
+    console.error(JSON.stringify({level: 'error', ...redactSensitiveFields(ctx), msg})),
 })
 
 /**

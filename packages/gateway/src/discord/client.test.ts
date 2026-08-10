@@ -3,9 +3,9 @@ import type {EventEmitter} from 'node:events'
 import type {Client} from 'discord.js'
 
 import {GatewayIntentBits} from 'discord.js'
-import {beforeAll, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeAll, describe, expect, it, vi} from 'vitest'
 
-import {createDiscordClient, DEFAULT_INTENTS, withLogContext} from './client.js'
+import {CONSOLE_GATEWAY_LOGGER, createDiscordClient, DEFAULT_INTENTS, withLogContext} from './client.js'
 import {validateTokenIsFake} from './test-token-guard.js'
 
 // discord.js Client constructor makes no network calls — safe to instantiate in tests.
@@ -116,6 +116,78 @@ describe('createDiscordClient', () => {
       GatewayIntentBits.GuildMembers,
     ]
     expectClientIntents(client, expected)
+  })
+})
+
+describe('CONSOLE_GATEWAY_LOGGER', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('redacts sensitive fields from warn output while preserving exempt and ordinary fields', () => {
+    // #given caller context containing a token, an exempt cache key, and an ordinary request id
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    // #when the console gateway logger emits a warning
+    CONSOLE_GATEWAY_LOGGER.warn(
+      {token: 'warn-token', cacheKey: 'cache-key-123', requestId: 'request-123'},
+      'warn message',
+    )
+
+    // #then the token is redacted, while cacheKey, requestId, level, and msg are preserved
+    expect(warnSpy).toHaveBeenCalledWith(
+      '{"level":"warn","token":"[REDACTED]","cacheKey":"cache-key-123","requestId":"request-123","msg":"warn message"}',
+    )
+  })
+
+  it('redacts sensitive fields from nested error context', () => {
+    // #given an error context containing a token and nested auth/clientSecret fields
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    // #when the console gateway logger emits an error
+    CONSOLE_GATEWAY_LOGGER.error(
+      {token: 'error-token', nested: {auth: {clientSecret: 'nested-secret'}}},
+      'error message',
+    )
+
+    // #then both the direct and nested sensitive values are redacted
+    expect(errorSpy).toHaveBeenCalledWith(
+      '{"level":"error","token":"[REDACTED]","nested":{"auth":{"clientSecret":"[REDACTED]"}},"msg":"error message"}',
+    )
+  })
+
+  it('keeps debug and info silent', () => {
+    // #given spies on every console output method
+    const spies = [
+      vi.spyOn(console, 'log').mockImplementation(() => undefined),
+      vi.spyOn(console, 'info').mockImplementation(() => undefined),
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined),
+      vi.spyOn(console, 'error').mockImplementation(() => undefined),
+      vi.spyOn(console, 'debug').mockImplementation(() => undefined),
+    ]
+
+    // #when debug and info receive caller context
+    CONSOLE_GATEWAY_LOGGER.debug({token: 'debug-token'}, 'debug message')
+    CONSOLE_GATEWAY_LOGGER.info({token: 'info-token'}, 'info message')
+
+    // #then no console output is emitted
+    for (const spy of spies) {
+      expect(spy).not.toHaveBeenCalled()
+    }
+  })
+
+  it('redacts context through withLogContext before reaching the console sink', () => {
+    // #given a scoped logger backed by the console gateway logger
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const scopedLogger = withLogContext(CONSOLE_GATEWAY_LOGGER, {command: 'ping'})
+
+    // #when the wrapped logger emits a warning with a sensitive token
+    scopedLogger.warn({token: 'wrapped-token', cacheKey: 'cache-key-456'}, 'wrapped warning')
+
+    // #then the scoped context is forwarded and the sink redacts the token
+    expect(warnSpy).toHaveBeenCalledWith(
+      '{"level":"warn","command":"ping","token":"[REDACTED]","cacheKey":"cache-key-456","msg":"wrapped warning"}',
+    )
   })
 })
 
