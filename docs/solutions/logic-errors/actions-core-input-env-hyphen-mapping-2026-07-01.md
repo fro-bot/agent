@@ -2,7 +2,7 @@
 title: '@actions/core input env scrub targeted the wrong key — hyphens survive in INPUT_ names'
 date: 2026-07-01
 category: logic-errors
-module: src/harness/config
+module: setup
 problem_type: logic_error
 component: tooling
 severity: high

@@ -1,0 +1,59 @@
+---
+name: OSV-Scanner
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, ready_for_review, reopened]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '12 12 * * 1'
+
+permissions: {}
+
+jobs:
+  # Pull requests only. The upstream PR workflow reports what a change introduces
+  # by checking out GITHUB_BASE_REF and diffing against it. Neither that ref nor
+  # the pull_request payload exists in a merge queue, so merge_group runs the full
+  # scan below instead.
+  scan-pr:
+    if: ${{ github.event_name == 'pull_request' }}
+    name: OSV-Scanner PR scan
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@8deb546fdb875b9996d27d4950be7312dac076a1 # v2.5.0
+    with:
+      scan-args: |-
+        --include-git-root
+        -r
+        ./
+      upload-sarif: true
+      # Fails only on vulnerabilities this pull request introduces. The upstream
+      # workflow scans the base ref and the head ref, then reports the difference,
+      # so a previously known finding cannot fail an unrelated change.
+      fail-on-vuln: true
+
+  scan-scheduled:
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'merge_group' }}
+    name: OSV-Scanner full scan
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@8deb546fdb875b9996d27d4950be7312dac076a1 # v2.5.0
+    with:
+      scan-args: |-
+        --include-git-root
+        -r
+        ./
+      upload-sarif: true
+      # Report-only, deliberately. This scans the whole tree with no baseline to
+      # compare against, so failing here would break pushes to main and merge
+      # queue entries whenever a new advisory is published against a dependency
+      # nobody touched. Findings go to code scanning instead.
+      fail-on-vuln: false

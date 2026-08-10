@@ -2,7 +2,7 @@
 title: 'Sender-substituted author association silently changes whose authority hasMention carries'
 date: 2026-07-17
 category: logic-errors
-module: src/features/triggers
+module: event-routing
 problem_type: logic_error
 component: trigger_routing
 severity: high

@@ -6,7 +6,7 @@ import type {CoordinationLogger} from './runtime-effect.js'
 
 import {GatewayIntentBits} from 'discord.js'
 import {Effect} from 'effect'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 // Spy on createDiscordClient so we can assert the intents wiring without
 // touching the network or requiring a real Discord token.
@@ -115,7 +115,7 @@ vi.mock('./web/operator-push/subscription-store.js', async importOriginal => {
   }
 })
 
-const {makeDiscordClientFromConfig, makeGatewayProgram} = await import('./program.js')
+const {makeDiscordClientFromConfig, makeGatewayProgram, makeLogger} = await import('./program.js')
 const {createDiscordClient} = await import('./discord/client.js')
 const createDiscordClientSpy = vi.mocked(createDiscordClient)
 
@@ -187,6 +187,68 @@ describe('makeDiscordClientFromConfig', () => {
       intents: [GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers],
       logger: stubLogger,
     })
+  })
+})
+
+describe('makeLogger', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('redacts sensitive context across every log level while preserving the structured output shape', () => {
+    // #given a logger receiving sensitive, nested, exempt, and ordinary context
+    const logger = makeLogger('debug')
+    const context = {
+      token: 'sensitive-token',
+      nested: {auth: {clientSecret: 'sensitive-client-secret'}},
+      cacheKey: 'cache-key-123',
+      requestId: 'request-123',
+    }
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    // #when each enabled log method receives that context
+    logger.debug(context, 'debug message')
+    logger.info(context, 'info message')
+    logger.warn(context, 'warn message')
+    logger.error(context, 'error message')
+
+    // #then each level redacts sensitive fields, preserves cacheKey and requestId,
+    // and keeps level/context/message ordering and values intact
+    expect(logSpy).toHaveBeenNthCalledWith(
+      1,
+      '{"level":"debug","token":"[REDACTED]","nested":{"auth":{"clientSecret":"[REDACTED]"}},"cacheKey":"cache-key-123","requestId":"request-123","msg":"debug message"}',
+    )
+    expect(logSpy).toHaveBeenNthCalledWith(
+      2,
+      '{"level":"info","token":"[REDACTED]","nested":{"auth":{"clientSecret":"[REDACTED]"}},"cacheKey":"cache-key-123","requestId":"request-123","msg":"info message"}',
+    )
+    expect(warnSpy).toHaveBeenCalledWith(
+      '{"level":"warn","token":"[REDACTED]","nested":{"auth":{"clientSecret":"[REDACTED]"}},"cacheKey":"cache-key-123","requestId":"request-123","msg":"warn message"}',
+    )
+    expect(errorSpy).toHaveBeenCalledWith(
+      '{"level":"error","token":"[REDACTED]","nested":{"auth":{"clientSecret":"[REDACTED]"}},"cacheKey":"cache-key-123","requestId":"request-123","msg":"error message"}',
+    )
+  })
+
+  it('suppresses calls below the configured level without changing enabled output', () => {
+    // #given a warn-level logger
+    const logger = makeLogger('warn')
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    // #when debug and info are below threshold, while warn and error are enabled
+    logger.debug({token: 'debug-token'}, 'debug message')
+    logger.info({token: 'info-token'}, 'info message')
+    logger.warn({token: 'warn-token'}, 'warn message')
+    logger.error({token: 'error-token'}, 'error message')
+
+    // #then below-threshold calls are suppressed and enabled calls retain their level/msg
+    expect(logSpy).not.toHaveBeenCalled()
+    expect(warnSpy).toHaveBeenCalledWith('{"level":"warn","token":"[REDACTED]","msg":"warn message"}')
+    expect(errorSpy).toHaveBeenCalledWith('{"level":"error","token":"[REDACTED]","msg":"error message"}')
   })
 })
 

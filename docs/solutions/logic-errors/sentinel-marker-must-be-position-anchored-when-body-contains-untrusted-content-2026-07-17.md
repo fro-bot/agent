@@ -2,7 +2,7 @@
 title: Idempotency sentinel markers must be position-anchored when the body contains untrusted content
 date: 2026-07-17
 category: logic-errors
-module: release-notes-narration
+module: release-notes
 problem_type: logic_error
 component: tooling
 symptoms:

@@ -2,7 +2,7 @@
 title: Preview-dependency release recovery requires provenance checks and single-use reruns
 date: "2026-07-30"
 category: workflow-issues
-module: harness/release-pipeline
+module: harness-release
 problem_type: workflow_issue
 component: development_workflow
 severity: medium

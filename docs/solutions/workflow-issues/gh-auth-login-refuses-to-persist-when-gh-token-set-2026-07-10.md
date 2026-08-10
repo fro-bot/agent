@@ -2,7 +2,7 @@
 title: 'gh auth login --with-token refuses to persist credentials when GH_TOKEN is set, silently breaking the CI review bot'
 date: 2026-07-10
 category: workflow-issues
-module: src/services/setup
+module: setup
 problem_type: workflow_issue
 component: tooling
 severity: high

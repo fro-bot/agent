@@ -2,7 +2,7 @@
 title: Key a CI credential switch on the operation input, not an audit token
 date: 2026-07-17
 category: best-practices
-module: release-notes-narration
+module: release-notes
 problem_type: best_practice
 component: development_workflow
 severity: high

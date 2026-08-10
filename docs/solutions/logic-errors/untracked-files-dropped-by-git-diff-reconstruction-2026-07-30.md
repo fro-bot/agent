@@ -2,7 +2,7 @@
 title: Reconstructing a change set from git diff silently drops untracked files
 date: 2026-07-30
 category: logic-errors
-module: delegated
+module: delegated-work
 problem_type: logic_error
 component: service_object
 symptoms:

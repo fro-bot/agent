@@ -2,7 +2,7 @@
 title: Monorepo aggregate npm-script lanes must cover the same package set
 date: 2026-07-06
 category: workflow-issues
-module: root-package-json
+module: build-tooling
 problem_type: workflow_issue
 component: development_workflow
 severity: medium

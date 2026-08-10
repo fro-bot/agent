@@ -3,7 +3,7 @@ title: 'Re-run bun install after rebasing onto dependency changes before rebuild
 date: 2026-06-26
 last_updated: 2026-07-10
 category: workflow-issues
-module: dist-bundle-pipeline
+module: build-tooling
 problem_type: workflow_issue
 component: development_workflow
 severity: medium

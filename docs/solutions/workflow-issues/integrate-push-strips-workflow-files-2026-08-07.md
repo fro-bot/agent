@@ -2,7 +2,7 @@
 title: A pipeline step that only works because the agent improvises is not a working pipeline step
 date: 2026-08-07
 category: workflow-issues
-module: harness/release-pipeline
+module: harness-release
 problem_type: workflow_issue
 component: development_workflow
 symptoms:

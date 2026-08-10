@@ -1,5 +1,5 @@
 ---
-module: harness/release-pipeline
+module: harness-release
 date: 2026-06-14
 category: best-practices
 problem_type: best_practice
