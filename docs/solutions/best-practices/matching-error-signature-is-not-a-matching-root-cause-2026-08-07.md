@@ -2,7 +2,7 @@
 title: Intermittent failures wearing a deterministic signature
 date: 2026-08-07
 category: best-practices
-module: harness/release-pipeline
+module: harness-release
 problem_type: best_practice
 component: development_workflow
 severity: medium

@@ -2,7 +2,7 @@
 title: A credential-gated action's eligible surface is the intersection of credential-withheld events and resource-bearing events
 date: 2026-07-30
 category: best-practices
-module: runtime
+module: response-delivery
 problem_type: best_practice
 component: authentication
 severity: medium

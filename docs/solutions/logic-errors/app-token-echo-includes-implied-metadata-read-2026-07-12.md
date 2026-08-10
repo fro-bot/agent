@@ -2,7 +2,7 @@
 title: App installation token responses echo an implied metadata:read grant, breaking strict echo validation
 date: 2026-07-12
 category: logic-errors
-module: scripts/harness
+module: harness-release
 problem_type: logic_error
 component: tooling
 severity: high

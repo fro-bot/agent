@@ -2,7 +2,7 @@
 title: Bun's local cache can mask the minimumReleaseAge gate
 date: 2026-07-13
 category: workflow-issues
-module: tooling
+module: build-tooling
 problem_type: workflow_issue
 component: tooling
 severity: medium

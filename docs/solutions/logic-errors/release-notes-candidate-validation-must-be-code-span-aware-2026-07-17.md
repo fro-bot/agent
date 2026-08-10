@@ -2,7 +2,7 @@
 title: Structural validators over markdown bodies must be code-span aware
 date: 2026-07-17
 category: logic-errors
-module: release-notes-narration
+module: release-notes
 problem_type: logic_error
 component: tooling
 symptoms:

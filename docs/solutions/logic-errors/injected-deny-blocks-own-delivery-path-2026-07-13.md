@@ -2,7 +2,7 @@
 title: An injected permission deny blocked the harness's own response-file delivery path
 date: 2026-07-13
 category: logic-errors
-module: agent-response-delivery
+module: response-delivery
 problem_type: logic_error
 component: development_workflow
 severity: high

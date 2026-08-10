@@ -3,7 +3,7 @@ title: You cannot caller-mint a GitHub App token and pass it into a reusable wor
 date: 2026-07-04
 last_updated: 2026-07-12
 category: workflow-issues
-module: harness/release-pipeline
+module: harness-release
 problem_type: workflow_issue
 component: development_workflow
 severity: high

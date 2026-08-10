@@ -2,7 +2,7 @@
 title: 'Committed-bundle attribution and SBOM hygiene'
 date: 2026-06-21
 category: workflow-issues
-module: scripts/
+module: build-tooling
 problem_type: workflow_issue
 component: tooling
 severity: medium

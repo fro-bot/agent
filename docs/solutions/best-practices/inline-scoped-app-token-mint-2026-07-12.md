@@ -2,7 +2,7 @@
 title: Mint a scoped App installation token inline when an injectable step needs a credential
 date: 2026-07-12
 category: best-practices
-module: harness-integrate
+module: harness-release
 problem_type: best_practice
 component: authentication
 severity: high
