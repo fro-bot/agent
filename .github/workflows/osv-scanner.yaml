@@ -1,0 +1,52 @@
+---
+name: OSV-Scanner
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, ready_for_review, reopened]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '12 12 * * 1'
+
+permissions: {}
+
+jobs:
+  scan-pr:
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    name: OSV-Scanner PR scan
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@8deb546fdb875b9996d27d4950be7312dac076a1 # v2.5.0
+    with:
+      scan-args: |-
+        --include-git-root
+        -r
+        ./
+      upload-sarif: true
+      # Report-only on purpose: existing findings must not block every PR.
+      # Change this to true only as a deliberate fail-on-new policy decision.
+      fail-on-vuln: false
+
+  scan-scheduled:
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+    name: OSV-Scanner full scan
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@8deb546fdb875b9996d27d4950be7312dac076a1 # v2.5.0
+    with:
+      scan-args: |-
+        --include-git-root
+        -r
+        ./
+      upload-sarif: true
+      # Report-only on purpose: known findings are uploaded to code scanning.
+      # Change this to true only as a deliberate fail-on-new policy decision.
+      fail-on-vuln: false
