@@ -470,6 +470,36 @@ describe('saveCache', () => {
     expect(result).toBe(true)
   })
 
+  it('returns false and warns when save returns the failure sentinel', async () => {
+    // #given storage with content and an adapter that reports an unsuccessful save
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const adapter = createMockCacheAdapter({saveResult: -1})
+
+    // #when saving cache
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
+
+    // #then the failure sentinel is reported as an unpersisted cache
+    expect(result).toBe(false)
+    expect(logger.warning).toHaveBeenCalledWith('Cache save did not persist', {
+      saveKey: 'opencode-storage-github-owner-repo-main-Linux-98765',
+    })
+  })
+
   it('writes to object store and cache when configured', async () => {
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')

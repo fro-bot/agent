@@ -137,6 +137,25 @@ describe('saveDeduplicationMarker', () => {
     expect(saveCache).toHaveBeenCalledWith([testEntityDir], `${DEDUP_CACHE_PREFIX}-owner-repo-pr-42-3003`)
   })
 
+  it('returns false and warns when save returns the failure sentinel', async () => {
+    // #given a marker and an adapter that reports an unsuccessful save
+    const marker = createMarker(3503)
+    const logger = createMockLogger()
+    const cacheAdapter: CacheAdapter = {
+      restoreCache: vi.fn(async () => undefined),
+      saveCache: vi.fn(async () => -1),
+    }
+
+    // #when saving the deduplication marker
+    const result = await saveDeduplicationMarker(testRepo, testEntity, marker, logger, cacheAdapter)
+
+    // #then the failure sentinel is reported as an unpersisted marker
+    expect(result).toBe(false)
+    expect(logger.warning).toHaveBeenCalledWith('Dedup marker cache save did not persist', {
+      saveKey: `${DEDUP_CACHE_PREFIX}-owner-repo-pr-42-3503`,
+    })
+  })
+
   it('writes sentinel file with marker json content', async () => {
     // #given marker and save adapter
     const marker = createMarker(4004)
