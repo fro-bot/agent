@@ -2,7 +2,7 @@
 title: 'Handle non-blocking review concerns with judgment, batching, and clean public PR artifacts'
 date: 2026-06-26
 category: workflow-issues
-module: pr-review-discipline
+module: development-workflow
 problem_type: workflow_issue
 component: development_workflow
 severity: low

@@ -2,7 +2,7 @@
 title: Comment-post retry that updates the last marker comment clobbers a previous invocation's response
 date: 2026-07-11
 category: logic-errors
-module: agent-response-delivery
+module: response-delivery
 problem_type: logic_error
 component: development_workflow
 severity: medium

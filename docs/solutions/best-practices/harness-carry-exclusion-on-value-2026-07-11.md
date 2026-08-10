@@ -2,7 +2,7 @@
 title: A harness carry must clear a value bar, not just a safety bar
 date: 2026-07-11
 category: best-practices
-module: harness-carries
+module: harness-release
 problem_type: tooling_decision
 component: tooling
 severity: medium

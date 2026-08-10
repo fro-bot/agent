@@ -2,7 +2,7 @@
 title: Promise.race bounds the await, not a non-abortable subprocess — process exit is the hard bound
 date: 2026-07-30
 category: best-practices
-module: harness
+module: delegated-work
 problem_type: best_practice
 component: development_workflow
 severity: medium

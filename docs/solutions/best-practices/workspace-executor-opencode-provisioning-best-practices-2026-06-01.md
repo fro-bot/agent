@@ -2,7 +2,7 @@
 title: Provisioning OpenCode model, provider config, and auth into a workspace container
 date: 2026-06-01
 category: best-practices
-module: workspace-executor
+module: workspace
 problem_type: best_practice
 component: tooling
 severity: medium

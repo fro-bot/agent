@@ -3,7 +3,7 @@ title: Sequential steps in one GitHub Actions job are not a security boundary
 date: 2026-07-04
 last_updated: 2026-07-12
 category: best-practices
-module: ci-security
+module: ci-workflows
 problem_type: best_practice
 component: development_workflow
 severity: high
