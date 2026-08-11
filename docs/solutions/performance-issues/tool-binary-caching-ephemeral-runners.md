@@ -2,7 +2,7 @@
 title: Tool Cache Separation - Persistent Binary Caching Across Ephemeral GitHub Actions Runners
 date: 2026-02-15
 category: performance-issues
-module: src/services/setup
+module: setup
 problem_type: performance_issue
 component: tooling
 severity: medium

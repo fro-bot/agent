@@ -2,7 +2,7 @@
 title: Build pipelines — fallible work is a preflight, cleanup is a finally
 date: 2026-06-22
 category: workflow-issues
-module: packages/harness
+module: build-tooling
 problem_type: workflow_issue
 component: tooling
 severity: low

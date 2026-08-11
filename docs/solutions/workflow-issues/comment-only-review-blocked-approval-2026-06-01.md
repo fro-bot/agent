@@ -3,7 +3,7 @@ title: Couple the review verdict to the GitHub review event so PR reviews satisf
 date: 2026-06-01
 last_updated: 2026-07-11
 category: workflow-issues
-module: pr-review-prompt-contract
+module: response-delivery
 problem_type: workflow_issue
 component: assistant
 severity: medium

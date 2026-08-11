@@ -2,7 +2,7 @@
 title: harden-runner allowed-endpoints as a YAML literal scalar silently drops all but the first endpoint
 date: 2026-07-07
 category: workflow-issues
-module: .github/workflows/harness-integrate.yaml
+module: harness-release
 problem_type: workflow_issue
 component: tooling
 severity: high

@@ -2,7 +2,7 @@
 title: Escape committed dist/ artifacts independently of the bundler lifecycle
 date: 2026-06-22
 category: workflow-issues
-module: scripts/
+module: build-tooling
 problem_type: workflow_issue
 component: tooling
 severity: low

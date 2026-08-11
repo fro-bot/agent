@@ -2,7 +2,7 @@
 title: File existence is not deliverable existence, and an unknown status must fail closed
 date: 2026-08-08
 category: logic-errors
-module: agent-execution
+module: response-delivery
 problem_type: logic_error
 component: service_object
 symptoms:

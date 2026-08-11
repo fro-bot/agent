@@ -15,8 +15,12 @@ on:
 permissions: {}
 
 jobs:
+  # Pull requests only. The upstream PR workflow reports what a change introduces
+  # by checking out GITHUB_BASE_REF and diffing against it. Neither that ref nor
+  # the pull_request payload exists in a merge queue, so merge_group runs the full
+  # scan below instead.
   scan-pr:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    if: ${{ github.event_name == 'pull_request' }}
     name: OSV-Scanner PR scan
     permissions:
       actions: read
@@ -29,12 +33,13 @@ jobs:
         -r
         ./
       upload-sarif: true
-      # Report-only on purpose: existing findings must not block every PR.
-      # Change this to true only as a deliberate fail-on-new policy decision.
-      fail-on-vuln: false
+      # Fails only on vulnerabilities this pull request introduces. The upstream
+      # workflow scans the base ref and the head ref, then reports the difference,
+      # so a previously known finding cannot fail an unrelated change.
+      fail-on-vuln: true
 
   scan-scheduled:
-    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'merge_group' }}
     name: OSV-Scanner full scan
     permissions:
       actions: read
@@ -47,6 +52,8 @@ jobs:
         -r
         ./
       upload-sarif: true
-      # Report-only on purpose: known findings are uploaded to code scanning.
-      # Change this to true only as a deliberate fail-on-new policy decision.
+      # Report-only, deliberately. This scans the whole tree with no baseline to
+      # compare against, so failing here would break pushes to main and merge
+      # queue entries whenever a new advisory is published against a dependency
+      # nobody touched. Findings go to code scanning instead.
       fail-on-vuln: false

@@ -2,7 +2,7 @@
 title: Treat a model-authored response file as untrusted input and bind posting to the trusted event context
 date: 2026-07-11
 category: best-practices
-module: agent-response-delivery
+module: response-delivery
 problem_type: best_practice
 component: authentication
 severity: critical

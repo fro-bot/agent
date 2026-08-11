@@ -1,7 +1,7 @@
 ---
 type: guide
-last-updated: "2026-08-03"
-updated-by: "b233675"
+last-updated: "2026-08-09"
+updated-by: "c006768"
 sources:
   - action.yaml
   - src/features/delegated/brokered-push.ts
@@ -63,3 +63,5 @@ bunx vitest run packages/gateway/src/web/operator-route.test.ts
 ```
 
 If all three hold, re-run rather than treating it as a signal. An assertion failure, or a timeout that reproduces in isolation, is a different problem and should be investigated normally.
+
+The isolation check is what separates this flake from an ordinary slow test. A test that legitimately costs more than the default budget on _every_ run — for example one that builds several temporary git repositories — fails deterministically when run alone, not just under parallel load. That kind of timeout wants an explicit per-test budget, not a re-run. The rule of thumb: passing in isolation points back to this scheduler-contention flake; failing in isolation points at the test's own cost.

@@ -87,7 +87,14 @@ export async function saveDeduplicationMarker(
   try {
     await fs.mkdir(entityDir, {recursive: true})
     await fs.writeFile(sentinelPath, JSON.stringify(marker), 'utf8')
-    await cacheAdapter.saveCache([entityDir], saveKey)
+    const cacheId = await cacheAdapter.saveCache([entityDir], saveKey)
+    // @actions/cache returns -1 for both write failures and reservation collisions. The
+    // adapter exposes no reason, so report the marker as unpersisted rather than claiming success.
+    if (cacheId === -1) {
+      logger.warning('Dedup marker cache save did not persist', {saveKey})
+      return false
+    }
+
     return true
   } catch (error) {
     const message = toErrorMessage(error).toLowerCase()

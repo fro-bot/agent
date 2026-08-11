@@ -113,7 +113,14 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
       }
     }
 
-    await cacheAdapter.saveCache(cachePaths, saveKey)
+    const cacheId = await cacheAdapter.saveCache(cachePaths, saveKey)
+    // @actions/cache returns -1 for both write failures and reservation collisions. The
+    // adapter exposes no reason, so report the save as unpersisted rather than claiming success.
+    if (cacheId === -1) {
+      logger.warning('Cache save did not persist', {saveKey})
+      return false
+    }
+
     logger.info('Cache saved', {saveKey})
     return true
   } catch (error) {

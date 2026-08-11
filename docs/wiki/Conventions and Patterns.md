@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-07-19"
-updated-by: "1a2d8b2"
+last-updated: "2026-08-09"
+updated-by: "c006768"
 sources:
   - AGENTS.md
   - packages/runtime/src/shared/logger.ts
@@ -11,7 +11,6 @@ sources:
   - src/services/github/context.ts
   - src/services/github/types.ts
   - src/features/triggers/router.ts
-  - src/features/agent/execution-adapter.ts
 summary: "Coding conventions, architectural patterns, and anti-patterns enforced across the project"
 ---
 

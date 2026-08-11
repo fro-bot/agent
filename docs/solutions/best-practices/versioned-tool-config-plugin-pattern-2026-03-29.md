@@ -2,7 +2,7 @@
 title: "Adding a Config-Declared Plugin to the Versioned Tool Pattern"
 date: 2026-03-29
 category: best-practices
-module: src/services/setup
+module: setup
 problem_type: best_practice
 component: tooling
 severity: medium

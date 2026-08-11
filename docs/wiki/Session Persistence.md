@@ -1,12 +1,13 @@
 ---
 type: subsystem
-last-updated: "2026-07-19"
-updated-by: "1a2d8b2"
+last-updated: "2026-08-09"
+updated-by: "c006768"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
   - packages/runtime/src/session/prune.ts
   - packages/runtime/src/session/logical-key.ts
+  - packages/runtime/src/session/archive.ts
   - packages/runtime/src/session/writeback.ts
   - packages/runtime/src/session/types.ts
   - packages/runtime/src/session/discovery.ts
@@ -120,14 +121,18 @@ The local types in `types.ts` are authoritative — they define the canonical sh
 
 The search module (`packages/runtime/src/session/search.ts`) provides two capabilities consumed by both the prompt builder and the native `session_list` / `session_search` agent tools:
 
-- **`listSessions`** — Returns recent non-child sessions sorted by `updatedAt`. Child sessions (those with a `parentID`, representing agent-spawned branches) are filtered out of the main listing.
-- **`searchSessions`** — Full-text search across session message content. Returns excerpts with context so the agent can decide which prior sessions are relevant without reading every message.
+- **`listSessions`** — Returns recent non-child sessions sorted by `updatedAt`. Child sessions (those with a `parentID`, representing agent-spawned branches) are filtered out of the main listing, and so are sessions marked _archived_ or _compacting_ (`session.time.archived` or `session.time.compacting` set). A session that has been retired by overflow recovery (below) therefore disappears from the listing while remaining in storage for history.
+- **`searchSessions`** — Full-text search across session message content. Returns excerpts with context so the agent can decide which prior sessions are relevant without reading every message. Callers can pass an `excludeSessionIds` set to skip specific sessions — used by recovery flows that must not re-surface the session they are replacing.
 
 During the session-prep phase of each run (see [[Execution Lifecycle]]), the system searches for sessions related to the current issue or PR. Matching excerpts are injected into the prompt as "Relevant Prior Work," giving the agent a lightweight summary of past interactions. Mid-run, the agent can additionally reach for the same search directly via the native `session_search` tool instead of waiting on the pre-injected excerpts.
 
+### Archiving and Overflow Recovery
+
+When a session grows past the model's context window, continuing to resume it would fail on every attempt. The archive helper (`packages/runtime/src/session/archive.ts`) retires such a session by stamping `time.archived` on it. Because the v1 SDK session client can _read_ `time.archived` but its typed update body only exposes `{title?}`, archiving is written through the v2 `session.update` endpoint — this is the one place the runtime reaches past v1 for a write. Once archived, the session is invisible to `listSessions` and, crucially, to logical-key resolution (below), so the next run resolves to a fresh thread instead of resuming the overflowed one. The retired session is not deleted; it stays available for audit and for `searchSessions` history until pruning eventually reclaims it.
+
 ## Logical Session Keys
 
-Continuity depends on each run resolving to a stable _logical session key_ derived from the triggering context (`packages/runtime/src/session/logical-key.ts`). For entity-bound events — issue comments, PR reviews, and the like — the key is built from the issue or PR identity, so a follow-up comment resumes the same thread the agent was already working in.
+Continuity depends on each run resolving to a stable _logical session key_ derived from the triggering context (`packages/runtime/src/session/logical-key.ts`). For entity-bound events — issue comments, PR reviews, and the like — the key is built from the issue or PR identity, so a follow-up comment resumes the same thread the agent was already working in. Resolution filters candidate sessions for eligibility — dropping any that are archived or compacting — _before_ matching by title, in both the workspace-scoped and global lookups. This means an overflowed session that was archived by recovery can never be re-selected by title, even though its title still matches; the resolver skips past it to an eligible thread or starts fresh.
 
 Time-based triggers are subtler. Earlier, `schedule` runs keyed their logical session on the cron expression alone. Every scheduled run therefore resumed one ever-growing thread. As that single session's history bloated, the agent would read it, conclude the work was already done, and exit without making any tool calls — reporting success while silently doing nothing. To fix this, the schedule key now appends the workflow run ID to the cron-derived hash. Each scheduled run starts a fresh thread, while same-run reruns (which share a run ID) still resume correctly. The trade-off is deliberate: scheduled maintenance tasks are expected to be idempotent against the repository state they inspect, not against an accumulating conversation, so cross-run memory still flows through [run summary writeback](#run-summary-writeback) and `searchSessions` rather than through a shared thread.
 

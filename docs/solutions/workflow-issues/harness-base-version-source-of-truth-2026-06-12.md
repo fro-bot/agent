@@ -2,7 +2,7 @@
 title: "Duplicate Version Sources Cause Silently-Missed Bumps"
 date: 2026-06-12
 category: workflow-issues
-module: packages/harness
+module: harness-release
 problem_type: workflow_issue
 component: tooling
 severity: medium
