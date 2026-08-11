@@ -10126,7 +10126,7 @@ Apache License
    limitations under the License.
 
 
-effect@3.22.0
+effect@3.22.1
 MIT
 MIT License
 
