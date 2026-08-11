@@ -2,7 +2,7 @@
 title: A failed run reported success because it had no delivery surface
 date: 2026-08-07
 category: logic-errors
-module: agent-execution
+module: response-delivery
 problem_type: logic_error
 component: development_workflow
 symptoms:

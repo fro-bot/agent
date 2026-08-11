@@ -130,26 +130,218 @@ describe('restoreCache', () => {
     expect(result.source).toBe('cache')
   })
 
-  it('does not call object store on cache hit', async () => {
+  it('uses an object-store main DB before a cache hit', async () => {
+    // #given a cache hit and an object store containing the main session database
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
 
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
     const storeAdapter = createMockStoreAdapter({
-      list: vi.fn(async () => ok([])),
+      list: vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db'])),
+      download: vi.fn(async (_key: string, localPath: string) => {
+        await fs.mkdir(path.dirname(localPath), {recursive: true})
+        await fs.writeFile(localPath, 'fresh-store-db')
+        return ok(undefined)
+      }),
     })
 
+    // #when restoring cache
     const result = await restoreCache({
       components: testComponents,
       logger: createTestLogger(),
       storagePath,
       authPath,
-      cacheAdapter: createMockCacheAdapter({restoreResult: 'cache-key'}),
+      cacheAdapter: {
+        restoreCache: cacheRestore,
+        saveCache: async () => 1,
+      },
       storeConfig: testStoreConfig,
       storeAdapter,
     })
 
-    expect(result).toMatchObject({hit: true, source: 'cache'})
-    expect(storeAdapter.list).not.toHaveBeenCalled()
+    // #then the object store wins and the Actions cache is not consulted
+    expect(result).toMatchObject({hit: true, source: 'storage', restoredPath: storagePath})
+    expect(cacheRestore).not.toHaveBeenCalled()
+    await expect(fs.readFile(path.join(path.dirname(storagePath), 'opencode.db'), 'utf8')).resolves.toBe(
+      'fresh-store-db',
+    )
+  })
+
+  it('falls through to cache when object-store storage is corrupt', async () => {
+    // #given a cache hit and an object store containing a corrupt session restore
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
+
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => {
+      await fs.chmod(storagePath, 0o700)
+      return 'cache-key'
+    })
+    const storeAdapter = createMockStoreAdapter({
+      list: vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db'])),
+      download: vi.fn(async (_key: string, localPath: string) => {
+        await fs.mkdir(path.dirname(localPath), {recursive: true})
+        await fs.writeFile(localPath, 'corrupt-store-db')
+        return ok(undefined)
+      }),
+    })
+    // Make the restored storage path unreadable so checkStorageCorruption reports it as corrupt.
+    await fs.chmod(storagePath, 0o000)
+
+    try {
+      // #when restoring cache
+      const result = await restoreCache({
+        components: testComponents,
+        logger: createTestLogger(),
+        storagePath,
+        authPath,
+        cacheAdapter: {
+          restoreCache: cacheRestore,
+          saveCache: async () => 1,
+        },
+        storeConfig: testStoreConfig,
+        storeAdapter,
+      })
+
+      // #then corrupt object-store state falls through to the usable cache
+      expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
+      expect(cacheRestore).toHaveBeenCalledTimes(1)
+    } finally {
+      await fs.chmod(storagePath, 0o700)
+    }
+  })
+
+  it('falls through to cache when object store restores only sidecars', async () => {
+    // #given an object store with a sidecar but no main session database
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
+
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
+    const storeList = vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db-wal']))
+    const storeDownload = vi.fn<ObjectStoreAdapter['download']>(async (_key, localPath) => {
+      await fs.mkdir(path.dirname(localPath), {recursive: true})
+      await fs.writeFile(localPath, 'sidecar')
+      return ok(undefined)
+    })
+    const storeAdapter = createMockStoreAdapter({
+      list: storeList,
+      download: storeDownload,
+    })
+
+    // #when restoring cache
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {
+        restoreCache: cacheRestore,
+        saveCache: async () => 1,
+      },
+      storeConfig: testStoreConfig,
+      storeAdapter,
+    })
+
+    // #then sidecars are not authoritative and the Actions cache is used
+    expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
+    expect(storeList).toHaveBeenCalledTimes(1)
+    expect(storeDownload).toHaveBeenCalledTimes(1)
+    await expect(fs.readFile(path.join(path.dirname(storagePath), 'opencode.db-wal'), 'utf8')).resolves.toBe('sidecar')
+    expect(cacheRestore).toHaveBeenCalledTimes(1)
+    expect(storeList.mock.invocationCallOrder[0]).toBeLessThan(cacheRestore.mock.invocationCallOrder[0] ?? 0)
+  })
+
+  it('falls through to cache when object store is disabled', async () => {
+    // #given a cache hit and a disabled object store
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
+
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
+    const storeList = vi.fn(async () => ok([]))
+
+    // #when restoring cache
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {
+        restoreCache: cacheRestore,
+        saveCache: async () => 1,
+      },
+      storeConfig: {...testStoreConfig, enabled: false},
+      storeAdapter: createMockStoreAdapter({list: storeList}),
+    })
+
+    // #then disabled object storage is a no-op and cache restore remains unchanged
+    expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
+    expect(cacheRestore).toHaveBeenCalledTimes(1)
+    expect(storeList).not.toHaveBeenCalled()
+  })
+
+  it('falls through to cache when object store restore throws', async () => {
+    // #given a cache hit and an object store that throws while listing
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
+
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
+    const storeList = vi.fn(async () => {
+      throw new Error('object store unavailable')
+    })
+    const storeAdapter = createMockStoreAdapter({
+      list: storeList,
+    })
+
+    // #when restoring cache
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {
+        restoreCache: cacheRestore,
+        saveCache: async () => 1,
+      },
+      storeConfig: testStoreConfig,
+      storeAdapter,
+    })
+
+    // #then the object-store failure is non-fatal and cache restore succeeds
+    expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
+    expect(storeList).toHaveBeenCalledTimes(1)
+    expect(cacheRestore).toHaveBeenCalledTimes(1)
+    expect(storeList.mock.invocationCallOrder[0]).toBeLessThan(cacheRestore.mock.invocationCallOrder[0] ?? 0)
+  })
+
+  it('returns a clean miss when cache and object store are both empty', async () => {
+    // #given an empty cache and an empty enabled object store
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => undefined)
+    const storeList = vi.fn(async () => ok([]))
+
+    // #when restoring cache
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {
+        restoreCache: cacheRestore,
+        saveCache: async () => 1,
+      },
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter({list: storeList}),
+    })
+
+    // #then the restore remains a clean miss
+    expect(result).toEqual({
+      hit: false,
+      key: null,
+      restoredPath: null,
+      corrupted: false,
+      source: null,
+    })
+    expect(storeList).toHaveBeenCalledTimes(1)
+    expect(cacheRestore).toHaveBeenCalledTimes(1)
+    expect(storeList.mock.invocationCallOrder[0]).toBeLessThan(cacheRestore.mock.invocationCallOrder[0] ?? 0)
   })
 
   it('detects corruption when storage is not a directory', async () => {
@@ -468,6 +660,36 @@ describe('saveCache', () => {
 
     // #then returns success
     expect(result).toBe(true)
+  })
+
+  it('returns false and warns when save returns the failure sentinel', async () => {
+    // #given storage with content and an adapter that reports an unsuccessful save
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const adapter = createMockCacheAdapter({saveResult: -1})
+
+    // #when saving cache
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
+
+    // #then the failure sentinel is reported as an unpersisted cache
+    expect(result).toBe(false)
+    expect(logger.warning).toHaveBeenCalledWith('Cache save did not persist', {
+      saveKey: 'opencode-storage-github-owner-repo-main-Linux-98765',
+    })
   })
 
   it('writes to object store and cache when configured', async () => {

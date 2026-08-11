@@ -2,7 +2,7 @@
 title: harden-runner enforces egress via a pre-job hook, so reordering its step is ineffective
 date: 2026-07-07
 category: workflow-issues
-module: .github/workflows/harness-integrate.yaml
+module: harness-release
 problem_type: workflow_issue
 component: development_workflow
 severity: medium

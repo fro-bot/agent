@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-08-03"
-updated-by: "b233675"
+last-updated: "2026-08-09"
+updated-by: "c006768"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -90,21 +90,21 @@ These can be overridden per-run via action inputs (`opencode-version`, `omo-vers
 
 Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
 
-The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.5+harness.3a55d7d2`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.14+harness.202732ae`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.18.5`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.18.5+harness.3a55d7d2`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries twelve such refs on top of the `1.18.5` base, spanning provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, and several memory-leak and stability patches; as the base advanced through the `1.17.x` line and up to `1.18.5`, superseded and low-value carries were retired so the set stays lean. The exact carry set is defined in `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.18.14`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.18.14+harness.202732ae`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries twelve such refs on top of the `1.18.14` base, spanning provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, and several memory-leak and stability patches; as the base advanced up the `1.18.x` line to `1.18.14`, superseded and low-value carries were retired so the set stays lean. The exact carry set is defined in `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
 The presence of the `+harness.` marker drives three behavioral differences in `src/services/setup/opencode.ts`:
 
 - **Download source** — Harness versions are routed to the `fro-bot/agent` releases URL instead of the upstream `anomalyco/opencode` releases. Because harness release tags are non-`v`-prefixed and GitHub stores tags URL-encoded, the `+` in the version is percent-encoded as `%2B` when building the download path. Stock versions keep their conventional `v`-prefixed upstream URL.
 
-- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary; the stock fallback (`FALLBACK_VERSION`, currently `1.18.5`) is reached only on the `latest`-resolution path.
+- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary; the stock fallback (`FALLBACK_VERSION`, currently `1.18.14`) is reached only on the `latest`-resolution path.
 
 - **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build-metadata and would collapse a harness build onto a stock cache entry of the same base version. To preserve identity, the `+harness.` marker is rewritten to a `-harness.` prerelease segment (`toolCacheVersion()`) _only_ at tool-cache call sites. Download URLs, checksums, logs, and return values keep the raw `+harness.` form. This guarantees a harness build and a stock build of the same base version never share a cache slot.
 
-If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`, currently `1.18.5`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
+If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`, currently `1.18.14`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
 
 ## Configuration Assembly
 

@@ -2,7 +2,7 @@
 title: A mechanism that can deliver any tracked change needs a path allowlist, not a denylist
 date: 2026-07-30
 category: best-practices
-module: delegated
+module: delegated-work
 problem_type: best_practice
 component: development_workflow
 severity: medium

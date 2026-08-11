@@ -2,7 +2,7 @@
 title: A fork/self PR review guard must refuse APPROVE only, not all review events
 date: 2026-07-11
 category: workflow-issues
-module: pr-review-guards
+module: response-delivery
 problem_type: workflow_issue
 component: development_workflow
 severity: high

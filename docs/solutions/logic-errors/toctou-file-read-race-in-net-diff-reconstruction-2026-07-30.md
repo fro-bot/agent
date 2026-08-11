@@ -2,7 +2,7 @@
 title: An lstat-then-readFile guard is a TOCTOU file-system race; use an O_NOFOLLOW handle
 date: 2026-07-30
 category: logic-errors
-module: delegated
+module: delegated-work
 problem_type: logic_error
 component: service_object
 symptoms:

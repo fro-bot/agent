@@ -170,7 +170,14 @@ export async function saveToolsCache(options: SaveToolsCacheOptions): Promise<bo
   logger.info('Saving tools cache', {saveKey, paths: cachePaths})
 
   try {
-    await cacheAdapter.saveCache([...cachePaths], saveKey)
+    const cacheId = await cacheAdapter.saveCache([...cachePaths], saveKey)
+    // @actions/cache returns -1 for both write failures and reservation collisions. The
+    // adapter exposes no reason, so report the save as unpersisted rather than claiming success.
+    if (cacheId === -1) {
+      logger.warning('Tools cache save did not persist', {saveKey})
+      return false
+    }
+
     logger.info('Tools cache saved', {saveKey})
     return true
   } catch (error) {
