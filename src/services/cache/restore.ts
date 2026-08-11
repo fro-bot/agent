@@ -62,31 +62,52 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
     }
   }
 
-  const adapter = storeAdapter ?? createS3Adapter(storeConfig, logger)
-  const syncResult = await syncSessionsFromStore(
-    adapter,
-    storeConfig,
-    components.agentIdentity,
-    components.repo,
-    storagePath,
-    logger,
-  )
+  try {
+    const adapter = storeAdapter ?? createS3Adapter(storeConfig, logger)
+    const syncResult = await syncSessionsFromStore(
+      adapter,
+      storeConfig,
+      components.agentIdentity,
+      components.repo,
+      storagePath,
+      logger,
+    )
 
-  if (syncResult.mainDbRestored === true) {
-    await fs.mkdir(storagePath, {recursive: true})
-    return {
-      hit: true,
-      key: null,
-      restoredPath: storagePath,
-      corrupted: false,
-      source: 'storage',
+    if (syncResult.mainDbRestored === true) {
+      // The object store sync writes opencode.db beside storagePath; ensure this cache directory exists before returning.
+      await fs.mkdir(storagePath, {recursive: true})
+
+      const isCorrupted = await checkStorageCorruption(storagePath, logger)
+      if (isCorrupted === true) {
+        logger.warning('Object store restore produced corrupt storage - falling back to cache')
+        await cleanStorage(storagePath)
+        return {
+          hit: false,
+          key: null,
+          restoredPath: null,
+          corrupted: true,
+          source: null,
+        }
+      }
+
+      return {
+        hit: true,
+        key: null,
+        restoredPath: storagePath,
+        corrupted: false,
+        source: 'storage',
+      }
     }
-  }
 
-  if (syncResult.downloaded > 0) {
-    logger.warning('Object store returned session sidecar files without main DB - treating as miss', {
-      downloaded: syncResult.downloaded,
-      failed: syncResult.failed,
+    if (syncResult.downloaded > 0) {
+      logger.warning('Object store returned session sidecar files without main DB - treating as miss', {
+        downloaded: syncResult.downloaded,
+        failed: syncResult.failed,
+      })
+    }
+  } catch (error) {
+    logger.warning('Object store restore failed - treating as miss', {
+      error: toErrorMessage(error),
     })
   }
 
@@ -99,12 +120,7 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
   }
 }
 
-async function restoreAfterCorruption(options: RestoreCacheOptions, restoredKey: string): Promise<CacheResult> {
-  const fallback = await restoreFromObjectStore(options)
-  if (fallback.hit === true) {
-    return fallback
-  }
-
+function restoreAfterCorruption(restoredKey: string): CacheResult {
   return {
     hit: false,
     key: restoredKey,
@@ -143,13 +159,18 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
   logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 
+  const objectStoreResult = await restoreFromObjectStore(options)
+  if (objectStoreResult.hit === true) {
+    return objectStoreResult
+  }
+
   try {
     const restoredKey = await cacheAdapter.restoreCache(cachePaths, primaryKey, [...restoreKeys])
 
     if (restoredKey == null) {
       logger.info('Cache miss - starting with fresh state')
       await fs.mkdir(storagePath, {recursive: true})
-      return await restoreFromObjectStore(options)
+      return objectStoreResult
     }
 
     logger.info('Cache restored', {restoredKey})
@@ -158,14 +179,14 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     if (isCorrupted === true) {
       logger.warning('Cache corruption detected - proceeding with clean state')
       await cleanStorage(storagePath)
-      return await restoreAfterCorruption(options, restoredKey)
+      return restoreAfterCorruption(restoredKey)
     }
 
     const versionMatch = await checkStorageVersion(storagePath, logger)
     if (versionMatch === false) {
       logger.warning('Storage version mismatch - proceeding with clean state')
       await cleanStorage(storagePath)
-      return await restoreAfterCorruption(options, restoredKey)
+      return restoreAfterCorruption(restoredKey)
     }
 
     await deleteAuthJson(authPath, storagePath, logger)
@@ -181,6 +202,6 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     logger.warning('Cache restore failed', {
       error: toErrorMessage(error),
     })
-    return restoreFromObjectStore(options)
+    return objectStoreResult
   }
 }
