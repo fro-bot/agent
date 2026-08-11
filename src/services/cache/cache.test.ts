@@ -167,6 +167,49 @@ describe('restoreCache', () => {
     )
   })
 
+  it('falls through to cache when object-store storage is corrupt', async () => {
+    // #given a cache hit and an object store containing a corrupt session restore
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
+
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => {
+      await fs.chmod(storagePath, 0o700)
+      return 'cache-key'
+    })
+    const storeAdapter = createMockStoreAdapter({
+      list: vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db'])),
+      download: vi.fn(async (_key: string, localPath: string) => {
+        await fs.mkdir(path.dirname(localPath), {recursive: true})
+        await fs.writeFile(localPath, 'corrupt-store-db')
+        return ok(undefined)
+      }),
+    })
+    // Make the restored storage path unreadable so checkStorageCorruption reports it as corrupt.
+    await fs.chmod(storagePath, 0o000)
+
+    try {
+      // #when restoring cache
+      const result = await restoreCache({
+        components: testComponents,
+        logger: createTestLogger(),
+        storagePath,
+        authPath,
+        cacheAdapter: {
+          restoreCache: cacheRestore,
+          saveCache: async () => 1,
+        },
+        storeConfig: testStoreConfig,
+        storeAdapter,
+      })
+
+      // #then corrupt object-store state falls through to the usable cache
+      expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
+      expect(cacheRestore).toHaveBeenCalledTimes(1)
+    } finally {
+      await fs.chmod(storagePath, 0o700)
+    }
+  })
+
   it('falls through to cache when object store restores only sidecars', async () => {
     // #given an object store with a sidecar but no main session database
     await fs.mkdir(storagePath, {recursive: true})

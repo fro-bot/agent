@@ -74,7 +74,22 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
     )
 
     if (syncResult.mainDbRestored === true) {
+      // The object store sync writes opencode.db beside storagePath; ensure this cache directory exists before returning.
       await fs.mkdir(storagePath, {recursive: true})
+
+      const isCorrupted = await checkStorageCorruption(storagePath, logger)
+      if (isCorrupted === true) {
+        logger.warning('Object store restore produced corrupt storage - falling back to cache')
+        await cleanStorage(storagePath)
+        return {
+          hit: false,
+          key: null,
+          restoredPath: null,
+          corrupted: true,
+          source: null,
+        }
+      }
+
       return {
         hit: true,
         key: null,
@@ -105,12 +120,7 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
   }
 }
 
-function restoreAfterCorruption(restoredKey: string, objectStoreResult: CacheResult): CacheResult {
-  // The object store was already consulted before the Actions cache. Reuse that result instead of syncing twice.
-  if (objectStoreResult.hit === true) {
-    return objectStoreResult
-  }
-
+function restoreAfterCorruption(restoredKey: string): CacheResult {
   return {
     hit: false,
     key: restoredKey,
@@ -169,14 +179,14 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     if (isCorrupted === true) {
       logger.warning('Cache corruption detected - proceeding with clean state')
       await cleanStorage(storagePath)
-      return restoreAfterCorruption(restoredKey, objectStoreResult)
+      return restoreAfterCorruption(restoredKey)
     }
 
     const versionMatch = await checkStorageVersion(storagePath, logger)
     if (versionMatch === false) {
       logger.warning('Storage version mismatch - proceeding with clean state')
       await cleanStorage(storagePath)
-      return restoreAfterCorruption(restoredKey, objectStoreResult)
+      return restoreAfterCorruption(restoredKey)
     }
 
     await deleteAuthJson(authPath, storagePath, logger)
