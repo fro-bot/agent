@@ -11,7 +11,7 @@ Include a description of the issue, the affected component (the Action, `@fro-bo
 
 ## Supported Versions
 
-This project follows continuous delivery from `main` via semantic-release; fixes land in the latest release. Only the most recent release line receives security updates.
+Releases are prepared and landed on the `release` branch and published by semantic-release; `main` is not the continuous-delivery branch. Fixes land in the latest release. Only the most recent release line receives security updates.
 
 | Version        | Supported |
 | -------------- | --------- |
