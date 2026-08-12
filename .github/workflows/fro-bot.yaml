@@ -275,6 +275,12 @@ jobs:
         uses: ./
         env:
           OPENCODE_PROMPT_ARTIFACT: 'true'
+          # The S3 adapter resolves credentials through the ambient AWS SDK chain --
+          # parseActionInputs never populates storeConfig.credentials -- so these must
+          # be job env, not action inputs. filterAgentEnv denies AWS_* from the agent
+          # child, so the harness keeps them while the model's bash never sees them.
+          AWS_ACCESS_KEY_ID: ${{ secrets.FRO_BOT_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.FRO_BOT_S3_SECRET_ACCESS_KEY }}
           PROMPT: >-
             ${{
               (inputs.prompt != '' && inputs.prompt)
@@ -288,6 +294,18 @@ jobs:
         with:
           auth-json: ${{ secrets.AUTH_JSON }}
           trusted-head-sha: ${{ steps.prehead.outputs.ref }}
+          # Durable session state. The Actions cache alone is not sufficient: GitHub
+          # issues read-only cache tokens for issue_comment and issues runs, so the
+          # mention flows cannot persist state through the cache at all.
+          s3-backup: 'true'
+          s3-bucket: ${{ vars.FRO_BOT_S3_BUCKET }}
+          aws-region: ${{ vars.FRO_BOT_S3_REGION }}
+          s3-prefix: ${{ vars.FRO_BOT_S3_PREFIX }}
+          s3-expected-bucket-owner: ${{ vars.FRO_BOT_S3_EXPECTED_BUCKET_OWNER }}
+          # Required. Left unset, getEffectiveEncryption defaults to aws:kms on real
+          # AWS, which would demand KMS grants the session-state policy does not have.
+          # The bucket is SSE-S3.
+          s3-sse-encryption: 'AES256'
           # Same read-only-by-construction switch as the checkout token above, keyed on
           # release-tag (the operation) rather than correlation-id (an audit token) —
           # see the checkout step comment for the full rationale.
