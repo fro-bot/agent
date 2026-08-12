@@ -6,14 +6,13 @@ This document maps the repository's directory layout and explains where code liv
 
 ```text
 fro-bot/agent/
-├── src/                        # GitHub Action logic — 4-layer architecture (~17.4k lines, excluding tests)
+├── src/                        # GitHub Action logic — 4-layer architecture (~53.3k lines, 53,287 including tests)
 │   ├── shared/                 # Layer 0: pure types, utils, constants (only @bfra.me/es Result; no heavy deps)
 │   ├── services/               # Layer 1: external adapters (GitHub, cache, setup, object-store, artifact)
 │   │   ├── github/             # Octokit client, context parsing, NormalizedEvent
 │   │   ├── cache/              # Restore/save with corruption detection
 │   │   ├── setup/              # Bun, oMo, OpenCode + Systematic install/config
-│   │   ├── artifact/           # Artifact upload
-│   │   └── session/            # (stub — session types migrated to packages/runtime)
+│   │   └── artifact/           # Artifact upload
 │   ├── features/               # Layer 2: business logic
 │   │   ├── agent/              # SDK execution, prompts, streaming, retry
 │   │   ├── triggers/           # Event routing, skip conditions, context builders
@@ -57,7 +56,7 @@ fro-bot/agent/
 │   └── release/                # Release dispatch scripts
 │
 ├── .github/
-│   └── workflows/              # 11 CI/CD workflow files
+│   └── workflows/              # 12 CI/CD workflow files
 │
 ├── evals/                      # Gated agent-outcome eval corpus (live runs need FRO_BOT_EVAL=1)
 │   ├── scenarios/             # Frozen scenario definitions and fixture repos
@@ -98,7 +97,7 @@ fro-bot/agent/
 - **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations; uses `node --test`, not Vitest.
 - **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch.
 - **`evals/`** — Gated agent-outcome eval corpus that runs the real execution path against disposable fixture repos; the pure gate and baseline tests run in normal CI, while live scenarios require `FRO_BOT_EVAL=1`.
-- **`.github/workflows/`** — All CI/CD automation; 11 workflow files covering tests, releases, security scanning, and bot triggers.
+- **`.github/workflows/`** — All CI/CD automation; 12 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.
 - **`docs/wiki/`** — 8 Obsidian deep-dive pages covering architecture, execution lifecycle, prompt design, and operator surface.
 - **`docs/solutions/`** — Documented solutions to past problems, organized by category with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing or debugging in a documented area.
@@ -122,15 +121,16 @@ fro-bot/agent/
 | Workflow | Trigger | Role |
 | --- | --- | --- |
 | `auto-release.yaml` | `pull_request` | Automated release preparation on PR merge |
-| `ci.yaml` | `push`, `pull_request`, `workflow_dispatch`, `release` | Main CI: test, lint, type-check, build, dist diff |
+| `ci.yaml` | `merge_group`, `pull_request`, `push`, `workflow_dispatch` | Main CI: test, lint, type-check, build, dist diff |
 | `codeql-analysis.yaml` | `push`, `pull_request`, `schedule`, `workflow_dispatch` | CodeQL security scanning |
 | `copilot-setup-steps.yaml` | `push`, `pull_request`, `workflow_dispatch` | Copilot environment setup steps |
 | `fro-bot.yaml` | `issue_comment`, `issues`, `schedule`, `workflow_dispatch` | Fro Bot agent invocation (the Action under development) |
 | `harness-integrate.yaml` | `workflow_call` | LLM-merge integration of OpenCode refs into the harness build; called by `harness-release.yaml` |
-| `harness-release.yaml` | `push`, `workflow_dispatch` | Build matrix and publish for `@fro.bot/harness` |
+| `harness-release.yaml` | `push (harness-v* tags), workflow_dispatch` | Build matrix and publish for `@fro.bot/harness` |
+| `osv-scanner.yaml` | `merge_group`, `pull_request`, `push`, `schedule` | PR-differential vulnerability enforcement plus report-only full scans for merge queue/main/scheduled runs |
 | `prepare-release-pr.yaml` | `schedule`, `workflow_dispatch` | Opens release PR via semantic-release |
 | `renovate.yaml` | `issues`, `pull_request`, `push`, `workflow_dispatch`, `workflow_run` | Renovate dependency update automation |
-| `scorecard.yaml` | `schedule`, `push` | OpenSSF Scorecard security posture |
+| `scorecard.yaml` | `branch_protection_rule`, `schedule`, `push` | OpenSSF Scorecard security posture |
 | `update-repo-settings.yaml` | `push`, `schedule`, `workflow_dispatch` | Sync repository settings from config |
 
 ### Deploy
