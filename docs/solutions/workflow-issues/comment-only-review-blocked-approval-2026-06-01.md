@@ -1,7 +1,7 @@
 ---
 title: Couple the review verdict to the GitHub review event so PR reviews satisfy branch protection
 date: 2026-06-01
-last_updated: 2026-07-11
+last_updated: 2026-08-12
 category: workflow-issues
 module: response-delivery
 problem_type: workflow_issue
@@ -103,7 +103,14 @@ That triggered the deferred backstop — a harness reconciliation phase (PR #808
 
 Lesson: when a verdict maps to a side-effecting platform event the agent emits itself, the prompt is the first control point but not the last. A post-action reconciliation that reads the **posted artifact** (not the agent's private log) is the durable guarantee — and it must verify *which* state it is approving, or it becomes a wrongful-approval vector itself.
 
+## Scope note (2026-08-12)
+
+Everything below — the prompt contract and the reconciliation backstop — applies only to runs triggered by a `pull_request` event. Those are the runs that reach the review surface at all.
+
+A mention (`issue_comment`) resolves to a comment surface and can never emit a review, so neither lever reaches it: the reconciliation phase no-ops on `isPullRequestReviewTrigger === false`. That is a deliberate security boundary, not a gap to close. See [A mention-triggered run cannot clear a blocking review, by design](./mention-triggered-run-cannot-clear-changes-requested-review-2026-08-12.md).
+
 ## Related
 
+- [A mention-triggered run cannot clear a blocking review, by design](./mention-triggered-run-cannot-clear-changes-requested-review-2026-08-12.md) — the structural counterpart: this doc covers an agent choosing the wrong delivery when the right one was available; that one covers the right delivery being unreachable from the triggering event.
 - [Delivery-mode contract for manual triggers](./delivery-mode-contract-for-manual-triggers-2026-04-17.md) — the same principle applied to a different prompt contract: make the intended action explicit rather than leaving the agent to infer it from heuristics.
 - [Discord slash-command orchestration patterns](../best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md) — agent-driven actions that must couple a decision to a platform side effect.
