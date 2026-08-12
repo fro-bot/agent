@@ -96,7 +96,7 @@ main.ts
   └─→ harness/run.ts (run)
         │
         ├─→ bootstrap phase
-        │     parseActionInputs → ensureOpenCodeAvailable → restoreCache
+        │     parseActionInputs → ensureOpenCodeAvailable
         │
         ├─→ routing phase
         │     parseGitHubContext → normalizeEvent → routeEvent
@@ -104,14 +104,15 @@ main.ts
         │
         ├─→ dedup phase
         │     skip if agent already ran for this PR/issue within dedup window
-        │     (happy path shown; lock acquisition and review reconciliation
-        │      phases also run where applicable)
+
+        ├─→ coordination-lock phase
+        │     acquire per-repo cross-surface lock when S3 is enabled
         │
         ├─→ acknowledge phase
         │     acknowledgeReceipt (reaction + comment stub)
         │
         ├─→ cache-restore phase
-        │     dedicated session state restore from S3 / Actions cache
+        │     restore from S3 first → fall back to Actions cache when needed
         │
         ├─→ session-prep phase
         │     processAttachments → buildAgentPrompt (packages/runtime)
@@ -120,11 +121,15 @@ main.ts
         │     executeOpenCode → bootstrapOpenCodeServer → sendPromptToSession
         │       → runPromptAttempt → processEventStream (SSE)
         │
+        ├─→ review-reconciliation phase
+        │     reconcile formal review state after agent execution
+
         ├─→ finalize phase
-        │     writeSessionSummary → pruneSessions
+        │     set outputs → writeJobSummary → enforce/deliver response contract
         │
         └─→ cleanup phase
-              saveCache → writeJobSummary
+              prune sessions → shutdown server → sync artifacts and metadata
+              → saveCache (S3 before Actions cache) → release lock in finally
 
 post.ts (separate Action step)
   └─→ harness/post.ts (runPost)
@@ -177,10 +182,10 @@ Discord messageCreate event
 
 ### 3. Harness Release Pipeline
 
-Triggered by `workflow_dispatch` on `.github/workflows/harness-release.yaml`.
+Triggered by `workflow_dispatch` or a push of a `harness-v*` tag on `.github/workflows/harness-release.yaml`.
 
 ```
-harness-release.yaml (workflow_dispatch)
+harness-release.yaml (workflow_dispatch OR push: harness-v* tag)
   │
   ├─→ prepare-integrate job
   │     resolve base_version → render prompt from packages/harness/prompt.txt
@@ -238,9 +243,9 @@ Session persistence spans two distinct layers that are easy to conflate. During 
 
 The harness release workflow publishes to npm via OIDC (no long-lived npm token). `id-token: write` is scoped to the `publish` job only; `integrate` and `build` jobs run with `contents: read` and no `id-token`. Each of the five packages (`@fro.bot/harness` + four per-platform packages) requires a one-time trusted-publisher configuration on npmjs.com before OIDC publishes can succeed.
 
-### S3 Conditional-Write Lock (Gateway)
+### S3 Conditional-Write Lock (Action + Gateway)
 
-The gateway uses S3 conditional writes (`If-None-Match` / `If-Match`) as a distributed coordination lock for per-repo execution. Lock acquisition, lease renewal (heartbeat), and release live in `packages/runtime/src/coordination/lock.ts` (runtime-owned, called by the gateway). The lock is always released in a `finally` block. Stale locks (expired lease + stale heartbeat) are recovered by `packages/gateway/src/execute/recovery.ts` on gateway startup.
+The Action and Gateway use the same runtime-owned S3 conditional-write lock (`If-None-Match` / `If-Match`) to coordinate per-repo execution so GitHub and Discord surfaces cannot overlap. Action acquisition lives in `src/harness/phases/acquire-lock.ts` and uses a 15-minute TTL without a heartbeat or `RunState`; `src/harness/phases/cleanup.ts` releases it in a cleanup `finally` block. The shared lock implementation is `packages/runtime/src/coordination/lock.ts`. The Gateway adds heartbeat and run state during execution, with startup stale recovery in `packages/gateway/src/execute/recovery.ts`.
 
 ### Mitmproxy Egress Topology (Workspace)
 

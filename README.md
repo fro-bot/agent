@@ -18,11 +18,11 @@
 
 Fro Bot Agent is a Bun monorepo that runs an [OpenCode](https://opencode.ai/) agent across several surfaces: a **GitHub Action** that responds to repository events (issues, pull requests, comments, reviews, and scheduled runs), a **Discord-first Gateway** daemon with an authenticated operator web/API surface for launching and observing runs outside of CI, a **sandboxed workspace executor** that clones and runs the agent in an isolated container, a **patched OpenCode harness** build/publish pipeline, and shared **runtime/session primitives** used across all of the above. The GitHub Action **preserves OpenCode session state across runs**, while the Gateway starts a fresh OpenCode session per run but persists coordination and run state through its S3-backed control plane.
 
-Traditional CI-based AI agents are stateless: each run starts from scratch, repeating investigations and burning tokens. The GitHub Action persists its session state across runs (GitHub Actions cache, with optional S3 backup), so it builds context over time, references prior work instead of redoing it, and resumes interrupted tasks.
+Traditional CI-based AI agents are stateless: each run starts from scratch, repeating investigations and burning tokens. The GitHub Action persists its session state across runs using GitHub Actions cache by default when S3 is disabled. When `s3-backup` is enabled, S3-compatible storage is the canonical durable backend, with Actions cache serving only as the fallback when the S3 restore is unavailable or unusable.
 
 ### Key Features
 
-- **Persistent memory** — session state survives workflow runs via cache, with optional S3 write-through backup that outlives cache eviction.
+- **Persistent memory** — session state survives workflow runs via GitHub Actions cache when S3 is disabled; with `s3-backup`, S3-compatible storage is canonical and durable while Actions cache remains the fallback.
 - **Multiple triggers** — responds to comments, issues, pull requests, review threads, and scheduled or manually dispatched runs.
 - **Discord Gateway** — a daemon that runs OpenCode work from authorized `@fro-bot` mentions and exposes slash commands for setup and operator controls (e.g. adding a project, clearing the queue).
 - **Operator web surface** — an authenticated HTTP/SSE control surface for launching, observing, and approving gateway agent runs from a browser.
@@ -168,6 +168,7 @@ A few inputs most workflows touch:
 | --- | --- | --- | --- |
 | `github-token` | Yes | — | GitHub token (App installation token or PAT) with write permissions |
 | `auth-json` | Yes | — | JSON object mapping provider IDs to auth configs |
+| `trusted-head-sha` | No | — | Trusted same-repository PR head SHA anchor used for brokered pushes; empty when unavailable |
 | `prompt` | No | — | Custom prompt for the agent |
 | `output-mode` | No | `auto` | Requested delivery mode for `schedule`/`workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`) |
 | `session-retention` | No | `50` | Number of sessions to retain before pruning |
@@ -210,7 +211,7 @@ A few inputs most workflows touch:
 
 ### Durable object storage (S3)
 
-Set `s3-backup: true` to use S3-compatible storage as the canonical backend. The Actions cache stays a hot accelerator; S3 is the source of truth and survives cache eviction. Restore tries cache first and falls back to S3 on miss or corruption; S3 failures are logged but never fail the run.
+GitHub Actions cache is the default backend when S3 is disabled. Set `s3-backup: true` to make S3-compatible storage the canonical durable backend; Actions cache remains the fallback. Restore tries S3 first, then falls back to Actions cache when S3 misses, fails, finds sidecars without the main database, or contains a corrupt database. Saves write S3 before Actions cache; failures in either storage path are non-fatal and logged honestly.
 
 ```yaml
 - uses: fro-bot/agent@v0
@@ -226,7 +227,7 @@ Set `s3-backup: true` to use S3-compatible storage as the canonical backend. The
     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 ```
 
-For Cloudflare R2, Backblaze B2, or MinIO, set `s3-endpoint` and `s3-sse-encryption: AES256` (see the S3 inputs above and [`action.yaml`](action.yaml)). Credentials must come from env vars or IAM roles, never action inputs; the principal needs `s3:GetObject`, `s3:PutObject`, and `s3:ListBucket`. The [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) deep dive covers the cache and storage strategy in full.
+For Cloudflare R2, Backblaze B2, or MinIO, set `s3-endpoint` and `s3-sse-encryption: AES256` (see the S3 inputs above and [`action.yaml`](action.yaml)). Credentials must come from env vars or IAM roles, never action inputs; the principal needs `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the scoped object-key prefix, plus `s3:ListBucket` on the bucket constrained to that prefix. The [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) deep dive covers the cache and storage strategy in full.
 
 ## Repository Structure
 
