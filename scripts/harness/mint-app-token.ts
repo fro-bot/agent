@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-// Mints a short-lived, single-repo, contents:write-only GitHub App
-// installation token for the harness-integrate merge agent.
+// Mints a short-lived GitHub App installation token for autonomous workflow runs.
 //
 // Security contract (docs/plans/2026-07-11-002-feat-inline-app-token-mint-integrate-plan.md),
 // mirroring scripts/harness/mint-broker-credential.ts:
@@ -47,13 +46,51 @@ const REPO = 'agent'
 const MINT_TIMEOUT_MS = 30_000
 const JWT_BACKDATE_SECONDS = 60
 const JWT_LIFETIME_SECONDS = 540
-const REQUESTED_PERMISSIONS: Readonly<Record<string, string>> = {contents: 'write'}
+const MAX_TOKEN_LIFETIME_MS = 60 * 60 * 1000
+const SINGLE_REPO_PROFILE = 'single-repo'
+const OWNER_WIDE_PROFILE = 'owner-wide-workflow'
+const SINGLE_REPO_PERMISSIONS: Readonly<Record<string, string>> = {contents: 'write'}
+const OWNER_WIDE_PERMISSIONS: Readonly<Record<string, string>> = {
+  contents: 'write',
+  pull_requests: 'write',
+  issues: 'write',
+  security_events: 'read',
+  vulnerability_alerts: 'read',
+}
 // GitHub always adds the implied `metadata: read` grant to every installation
 // access token — it is not requestable or declinable in the request body, but
 // it is always present in the response echo. The validator pins the echo to
 // exactly the requested grant plus that implied read; any other extra,
 // missing, or different grant still rejects.
-const EXPECTED_PERMISSIONS_ECHO: Readonly<Record<string, string>> = {contents: 'write', metadata: 'read'}
+const SINGLE_REPO_PERMISSIONS_ECHO: Readonly<Record<string, string>> = {
+  ...SINGLE_REPO_PERMISSIONS,
+  metadata: 'read',
+}
+const OWNER_WIDE_PERMISSIONS_ECHO: Readonly<Record<string, string>> = {
+  ...OWNER_WIDE_PERMISSIONS,
+  metadata: 'read',
+}
+
+export type AppTokenProfile = typeof SINGLE_REPO_PROFILE | typeof OWNER_WIDE_PROFILE
+
+export function resolveAppTokenProfile(value: string | undefined): AppTokenProfile {
+  const profile = value?.trim() ?? ''
+  if (profile === '' || profile === SINGLE_REPO_PROFILE) {
+    return SINGLE_REPO_PROFILE
+  }
+  if (profile === OWNER_WIDE_PROFILE) {
+    return OWNER_WIDE_PROFILE
+  }
+  throw new Error('unknown-app-token-profile')
+}
+
+function profilePermissions(profile: AppTokenProfile): Readonly<Record<string, string>> {
+  return profile === OWNER_WIDE_PROFILE ? OWNER_WIDE_PERMISSIONS : SINGLE_REPO_PERMISSIONS
+}
+
+function profilePermissionEcho(profile: AppTokenProfile): Readonly<Record<string, string>> {
+  return profile === OWNER_WIDE_PROFILE ? OWNER_WIDE_PERMISSIONS_ECHO : SINGLE_REPO_PERMISSIONS_ECHO
+}
 
 function base64url(input: Buffer | string): string {
   const buffer = typeof input === 'string' ? Buffer.from(input, 'utf8') : input
@@ -85,7 +122,11 @@ export type ValidateTokenResponseResult =
  * I/O, never throws; every branch returns a discriminated result. Mirrors
  * validateBrokerResponse in mint-broker-credential.ts.
  */
-export function validateTokenResponse(parsed: unknown): ValidateTokenResponseResult {
+export function validateTokenResponse(
+  parsed: unknown,
+  profile: AppTokenProfile = SINGLE_REPO_PROFILE,
+  nowMs = Date.now(),
+): ValidateTokenResponseResult {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     return {ok: false, reason: 'token response is not an object'}
   }
@@ -97,13 +138,17 @@ export function validateTokenResponse(parsed: unknown): ValidateTokenResponseRes
   if (typeof body.expires_at !== 'string' || body.expires_at.length === 0) {
     return {ok: false, reason: 'token response has an empty or missing expires_at'}
   }
+  const expiresAtMs = Date.parse(body.expires_at)
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs || expiresAtMs - nowMs > MAX_TOKEN_LIFETIME_MS) {
+    return {ok: false, reason: 'token response expires_at is outside the allowed lifetime'}
+  }
 
   const permissions = body.permissions
   if (typeof permissions !== 'object' || permissions === null || Array.isArray(permissions)) {
     return {ok: false, reason: 'token response permissions is not an object'}
   }
   const permissionEntries = Object.entries(permissions as Record<string, unknown>)
-  const expectedEntries = Object.entries(EXPECTED_PERMISSIONS_ECHO)
+  const expectedEntries = Object.entries(profilePermissionEcho(profile))
   if (permissionEntries.length !== expectedEntries.length) {
     return {ok: false, reason: 'token response permissions do not match the requested scope exactly'}
   }
@@ -113,13 +158,19 @@ export function validateTokenResponse(parsed: unknown): ValidateTokenResponseRes
     }
   }
 
-  const repositories = body.repositories
-  if (!Array.isArray(repositories) || repositories.length !== 1) {
-    return {ok: false, reason: 'token response repositories does not name exactly one repository'}
-  }
-  const repository: unknown = repositories[0]
-  if (typeof repository !== 'object' || repository === null || (repository as Record<string, unknown>).name !== REPO) {
-    return {ok: false, reason: 'token response repository echo does not match the requested repository'}
+  if (profile === SINGLE_REPO_PROFILE) {
+    const repositories = body.repositories
+    if (!Array.isArray(repositories) || repositories.length !== 1) {
+      return {ok: false, reason: 'token response repositories does not name exactly one repository'}
+    }
+    const repository: unknown = repositories[0]
+    if (
+      typeof repository !== 'object' ||
+      repository === null ||
+      (repository as Record<string, unknown>).name !== REPO
+    ) {
+      return {ok: false, reason: 'token response repository echo does not match the requested repository'}
+    }
   }
 
   return {ok: true, token: body.token}
@@ -144,6 +195,7 @@ export async function main(): Promise<void> {
     if (privateKey.length > 0) {
       core.setSecret(privateKey)
     }
+    const profile = resolveAppTokenProfile(process.env.FRO_BOT_APP_TOKEN_PROFILE)
     if (appId.length === 0 || privateKey.trim().length === 0) {
       throw new Error('missing-app-credentials')
     }
@@ -202,7 +254,11 @@ export async function main(): Promise<void> {
           'X-GitHub-Api-Version': '2022-11-28',
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({repositories: [REPO], permissions: REQUESTED_PERMISSIONS}),
+        body: JSON.stringify(
+          profile === OWNER_WIDE_PROFILE
+            ? {permissions: profilePermissions(profile)}
+            : {repositories: [REPO], permissions: profilePermissions(profile)},
+        ),
         // Single attempt — no retry loop.
         signal,
       })
@@ -219,7 +275,7 @@ export async function main(): Promise<void> {
       throw new Error('token-mint-failed')
     }
 
-    const result = validateTokenResponse(tokenBody)
+    const result = validateTokenResponse(tokenBody, profile)
     if (!result.ok) {
       throw new Error('token-mint-failed')
     }
