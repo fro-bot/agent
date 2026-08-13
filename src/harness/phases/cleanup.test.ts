@@ -142,6 +142,42 @@ describe('runCleanup', () => {
     expect(syncMetadataToStore).not.toHaveBeenCalled()
   })
 
+  it.each([
+    {missing: 'repo', repo: '', runId: 'run-123'},
+    {missing: 'runId', repo: 'owner/repo', runId: ''},
+  ])(
+    'skips object-store sync when $missing is missing while preserving cache and prompt artifact cleanup',
+    async ({repo, runId}) => {
+      const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
+      const {saveCache} = await import('../../services/cache/index.js')
+      const {uploadLogArtifact} = await import('../../services/artifact/index.js')
+      const {runCleanup} = await import('./cleanup.js')
+      process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+
+      await runCleanup({
+        bootstrapLogger: createMockLogger(),
+        reactionCtx: null,
+        githubClient: null,
+        agentSuccess: true,
+        attachmentResult: null,
+        serverHandle: null,
+        detectedOpencodeVersion: '1.0.0',
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        metrics: createMetricsCollector(),
+        agentIdentity: 'github',
+        repo,
+        runId,
+        lockEtag: null,
+      })
+
+      expect(createS3Adapter).not.toHaveBeenCalled()
+      expect(syncArtifactsToStore).not.toHaveBeenCalled()
+      expect(syncMetadataToStore).not.toHaveBeenCalled()
+      expect(saveCache).toHaveBeenCalled()
+      expect(uploadLogArtifact).toHaveBeenCalled()
+    },
+  )
+
   it('does not fail cleanup when artifact upload fails', async () => {
     const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
     vi.mocked(createS3Adapter).mockReturnValue({
