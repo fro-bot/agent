@@ -119,7 +119,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
       }
     }
 
-    if (storeConfig.enabled === true) {
+    if (storeConfig.enabled === true && repo !== '' && runId !== '') {
       const objectStoreLogger = createLogger({phase: 'object-store-artifacts'})
       try {
         const adapter = createS3Adapter(storeConfig, objectStoreLogger)
