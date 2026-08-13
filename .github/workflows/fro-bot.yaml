@@ -254,22 +254,30 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ steps.prehead.outputs.ref }}
-          # Release-notes narration runs (release-tag set) are read-only by construction:
-          # checkout uses the workflow's own GITHUB_TOKEN instead of the write-capable PAT.
-          # The trusted apply-release-notes job (below) is the only place FRO_BOT_PAT appears
-          # for this flow. All other dispatch paths (mention/comment/schedule/workflow_call)
-          # are unaffected.
-          # Keyed on release-tag (the operation), not correlation-id (an audit token):
-          #   (a) a manual dispatch that sets release-tag without correlation-id must NOT
-          #       hand the generation agent the PAT;
-          #   (b) deploy-window compatibility — an old dispatcher (checked out from a
-          #       released tag) that sets correlation-id but not release-tag keeps the old
-          #       PAT + old mutation-prompt behavior working unchanged, instead of
-          #       403-hard-failing the release job.
-          token: ${{ github.event.inputs.release-tag != '' && github.token || secrets.FRO_BOT_PAT }}
+          # Direct autonomous schedule/dispatch and release-tag narration use
+          # github.token. Reusable callers and all other triggers retain the PAT.
+          token: ${{ github.event.inputs.release-tag != '' && github.token || ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.workflow_ref == format('{0}/.github/workflows/fro-bot.yaml@{1}', github.repository, github.ref) && github.token) || secrets.FRO_BOT_PAT }}
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
+
+      # Direct autonomous schedule/dispatch runs mint a short-lived owner-wide
+      # App token after checkout. App credentials are scoped to this plain run
+      # step only; release narration and reusable callers retain their existing
+      # token paths.
+      - name: Mint owner-wide workflow App token
+        id: mint-app-token
+        if: >-
+          ${{
+            github.workflow_ref == format('{0}/.github/workflows/fro-bot.yaml@{1}', github.repository, github.ref) &&
+            ((github.event_name == 'schedule' && github.event.inputs.release-tag == '') ||
+             (github.event_name == 'workflow_dispatch' && github.event.inputs.release-tag == ''))
+          }}
+        run: node --experimental-strip-types scripts/harness/mint-app-token.ts
+        env:
+          APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
+          APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+          FRO_BOT_APP_TOKEN_PROFILE: owner-wide-workflow
 
       - name: Run Fro Bot
         uses: ./
@@ -305,11 +313,10 @@ jobs:
           # Required. Left unset, getEffectiveEncryption defaults to aws:kms on real
           # AWS, which would demand KMS grants the session-state policy does not have.
           # The bucket is SSE-S3.
-          s3-sse-encryption: 'AES256'
-          # Same read-only-by-construction switch as the checkout token above, keyed on
-          # release-tag (the operation) rather than correlation-id (an audit token) —
-          # see the checkout step comment for the full rationale.
-          github-token: ${{ github.event.inputs.release-tag != '' && github.token || secrets.FRO_BOT_PAT }}
+          s3-sse-encryption: AES256
+          # Direct autonomous runs use the minted owner-wide App token;
+          # release-tag narration uses github.token; all other paths retain the PAT.
+          github-token: ${{ steps.mint-app-token.outputs.github-token || (github.event.inputs.release-tag != '' && github.token) || secrets.FRO_BOT_PAT }}
           model: ${{ inputs.model || vars.FRO_BOT_MODEL }}
           # Release-notes narration (correlation-id-tagged) uses an explicit model
           # override; oMo is skipped so its provider routing does not interfere with

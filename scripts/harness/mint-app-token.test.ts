@@ -2,17 +2,20 @@ import {Buffer} from 'node:buffer'
 import {generateKeyPairSync} from 'node:crypto'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-const mocks = vi.hoisted(() => ({
+vi.mock('@actions/core', () => ({
   setSecret: vi.fn<(value: string) => void>(),
   setOutput: vi.fn<(name: string, value: unknown) => void>(),
 }))
 
-vi.mock('@actions/core', () => ({
-  setSecret: mocks.setSecret,
-  setOutput: mocks.setOutput,
-}))
+type CoreMock = ReturnType<typeof vi.fn>
 
-const {buildAppJwt, main, validateTokenResponse} = await import('./mint-app-token.js')
+const mockedCore = await import('@actions/core')
+const mocks = {
+  setSecret: mockedCore.setSecret as unknown as CoreMock,
+  setOutput: mockedCore.setOutput as unknown as CoreMock,
+}
+
+const {buildAppJwt, main, resolveAppTokenProfile, validateTokenResponse} = await import('./mint-app-token.js')
 
 const {privateKey, publicKey} = generateKeyPairSync('rsa', {
   modulusLength: 2048,
@@ -30,6 +33,16 @@ function jsonResponse(status: number, body: unknown): Response {
   } as Response
 }
 
+const originalFetch = globalThis.fetch
+
+function installFetchMock(fetchMock: typeof fetch): void {
+  globalThis.fetch = fetchMock
+}
+
+function restoreFetch(): void {
+  globalThis.fetch = originalFetch
+}
+
 function decodeJwtSegment(segment: string | undefined): Record<string, unknown> {
   if (segment === undefined) {
     throw new Error('missing JWT segment')
@@ -38,12 +51,39 @@ function decodeJwtSegment(segment: string | undefined): Record<string, unknown> 
   return JSON.parse(Buffer.from(padded, 'base64').toString('utf8')) as Record<string, unknown>
 }
 
-const VALID_TOKEN_BODY = {
-  token: 'ghs_faketoken123',
-  expires_at: '2026-07-11T13:00:00Z',
-  permissions: {contents: 'write', metadata: 'read'},
-  repositories: [{name: 'agent'}],
+function pastExpiry(): string {
+  return new Date(Date.now() - 60_000).toISOString()
 }
+
+const SINGLE_REPO_PERMISSIONS = {contents: 'write', metadata: 'read'}
+const OWNER_WIDE_PERMISSIONS = {
+  contents: 'write',
+  pull_requests: 'write',
+  issues: 'write',
+  security_events: 'read',
+  vulnerability_alerts: 'read',
+  metadata: 'read',
+}
+
+function futureExpiry(minutes = 30): string {
+  return new Date(Date.now() + minutes * 60_000).toISOString()
+}
+
+function tokenBody(
+  profile: 'single-repo' | 'owner-wide-workflow' = 'single-repo',
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    token: 'ghs_faketoken123',
+    expires_at: futureExpiry(),
+    permissions: profile === 'single-repo' ? SINGLE_REPO_PERMISSIONS : OWNER_WIDE_PERMISSIONS,
+    ...(profile === 'single-repo' ? {repositories: [{name: 'agent'}]} : {}),
+    ...overrides,
+  }
+}
+
+const VALID_TOKEN_BODY = tokenBody()
+const VALID_OWNER_TOKEN_BODY = tokenBody('owner-wide-workflow')
 
 describe('buildAppJwt', () => {
   it('produces a JWT with RS256 header, correct iss, and backdated iat', () => {
@@ -79,6 +119,67 @@ describe('validateTokenResponse', () => {
     // #then
     expect(result.ok).toBe(true)
     expect((result as {ok: true; token: string}).token).toBe('ghs_faketoken123')
+  })
+
+  it('accepts the owner-wide profile with only the implicit metadata grant added', () => {
+    // #given / #when
+    const result = validateTokenResponse(VALID_OWNER_TOKEN_BODY, 'owner-wide-workflow')
+
+    // #then
+    expect(result.ok).toBe(true)
+  })
+
+  it('does not use repository metadata as an owner-wide security boundary', () => {
+    // #given
+    const body = tokenBody('owner-wide-workflow', {repositories: [{name: 'some-other-repository'}]})
+
+    // #when
+    const result = validateTokenResponse(body, 'owner-wide-workflow')
+
+    // #then
+    expect(result.ok).toBe(true)
+  })
+
+  it.each([
+    ['missing contents', {...OWNER_WIDE_PERMISSIONS, contents: undefined}],
+    ['different contents grant', {...OWNER_WIDE_PERMISSIONS, contents: 'read'}],
+    ['missing implicit metadata', {...OWNER_WIDE_PERMISSIONS, metadata: undefined}],
+    ['extra grant', {...OWNER_WIDE_PERMISSIONS, discussions: 'write'}],
+  ])('rejects owner-wide permission echo with %s', (_label, permissions) => {
+    // #given
+    const body = tokenBody('owner-wide-workflow', {permissions})
+
+    // #when
+    const result = validateTokenResponse(body, 'owner-wide-workflow')
+
+    // #then
+    expect(result.ok).toBe(false)
+  })
+
+  it.each([
+    ['expired', pastExpiry()],
+    ['malformed', 'not-a-timestamp'],
+    ['too far in the future', new Date(Date.now() + 2 * 60 * 60_000).toISOString()],
+  ])('rejects a %s token expiration for the single-repo profile', (_label, expiresAt) => {
+    // #given
+    const body = tokenBody('single-repo', {expires_at: expiresAt})
+
+    // #when
+    const result = validateTokenResponse(body, 'single-repo')
+
+    // #then
+    expect(result.ok).toBe(false)
+  })
+
+  it('rejects an expired owner-wide token', () => {
+    // #given / #when
+    const result = validateTokenResponse(
+      tokenBody('owner-wide-workflow', {expires_at: pastExpiry()}),
+      'owner-wide-workflow',
+    )
+
+    // #then
+    expect(result.ok).toBe(false)
   })
 
   it('rejects a response missing token', () => {
@@ -163,19 +264,36 @@ describe('validateTokenResponse', () => {
   })
 })
 
+describe('resolveAppTokenProfile', () => {
+  it('defaults to the existing single-repo profile', () => {
+    expect(resolveAppTokenProfile(undefined)).toBe('single-repo')
+    expect(resolveAppTokenProfile('')).toBe('single-repo')
+  })
+
+  it('selects the explicit owner-wide workflow profile', () => {
+    expect(resolveAppTokenProfile('owner-wide-workflow')).toBe('owner-wide-workflow')
+  })
+
+  it('fails closed for an unknown profile', () => {
+    expect(() => resolveAppTokenProfile('untrusted-profile')).toThrow('unknown-app-token-profile')
+  })
+})
+
 describe('main — happy path', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    process.exitCode = undefined
+    process.exitCode = 0
     process.env.APPLICATION_ID = 'app-123'
     process.env.APPLICATION_PRIVATE_KEY = privateKey
+    delete process.env.FRO_BOT_APP_TOKEN_PROFILE
   })
 
   afterEach(() => {
-    vi.unstubAllGlobals()
-    process.exitCode = undefined
+    restoreFetch()
+    process.exitCode = 0
     delete process.env.APPLICATION_ID
     delete process.env.APPLICATION_PRIVATE_KEY
+    delete process.env.FRO_BOT_APP_TOKEN_PROFILE
   })
 
   it('emits the masked token as a step output', async () => {
@@ -184,13 +302,13 @@ describe('main — happy path', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(201, VALID_TOKEN_BODY))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
 
     // #then
-    expect(process.exitCode).toBeUndefined()
+    expect(process.exitCode).toBe(0)
     expect(mocks.setOutput).toHaveBeenCalledWith('github-token', 'ghs_faketoken123')
     expect(mocks.setSecret).toHaveBeenCalledWith('ghs_faketoken123')
   })
@@ -208,7 +326,7 @@ describe('main — happy path', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(201, VALID_TOKEN_BODY))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -229,13 +347,13 @@ describe('main — happy path', () => {
       callCount += 1
       return callCount === 1 ? jsonResponse(200, {id: 999}) : jsonResponse(201, VALID_TOKEN_BODY)
     })
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
 
     // #then
-    expect(process.exitCode).toBeUndefined()
+    expect(process.exitCode).toBe(0)
     expect(mocks.setOutput).toHaveBeenCalledWith('github-token', 'ghs_faketoken123')
     expect(callOrder[0]).toBe('setSecret(key)')
     expect(callOrder).toContain('fetch')
@@ -247,7 +365,7 @@ describe('main — happy path', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(201, VALID_TOKEN_BODY))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -278,7 +396,7 @@ describe('main — happy path', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(201, VALID_TOKEN_BODY))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -290,13 +408,40 @@ describe('main — happy path', () => {
     expect(JSON.parse(init.body as string)).toEqual({repositories: ['agent'], permissions: {contents: 'write'}})
   })
 
+  it('mints the owner-wide profile without repository restrictions', async () => {
+    // #given
+    process.env.FRO_BOT_APP_TOKEN_PROFILE = 'owner-wide-workflow'
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
+      .mockResolvedValueOnce(jsonResponse(201, VALID_OWNER_TOKEN_BODY))
+    installFetchMock(fetchMock)
+
+    // #when
+    await main()
+
+    // #then
+    expect(process.exitCode).toBe(0)
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(JSON.parse(init.body as string)).toEqual({
+      permissions: {
+        contents: 'write',
+        pull_requests: 'write',
+        issues: 'write',
+        security_events: 'read',
+        vulnerability_alerts: 'read',
+      },
+    })
+    expect(mocks.setOutput).toHaveBeenCalledWith('github-token', 'ghs_faketoken123')
+  })
+
   it('verifies the JWT signature using the public key', async () => {
     // #given
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(201, VALID_TOKEN_BODY))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -320,23 +465,25 @@ describe('main — happy path', () => {
 describe('main — error paths (fail closed)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    process.exitCode = undefined
+    process.exitCode = 0
     process.env.APPLICATION_ID = 'app-123'
     process.env.APPLICATION_PRIVATE_KEY = privateKey
+    delete process.env.FRO_BOT_APP_TOKEN_PROFILE
   })
 
   afterEach(() => {
-    vi.unstubAllGlobals()
-    process.exitCode = undefined
+    restoreFetch()
+    process.exitCode = 0
     delete process.env.APPLICATION_ID
     delete process.env.APPLICATION_PRIVATE_KEY
+    delete process.env.FRO_BOT_APP_TOKEN_PROFILE
   })
 
   it('exits non-zero and never fetches when APPLICATION_ID is missing', async () => {
     // #given
     delete process.env.APPLICATION_ID
     const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -351,7 +498,22 @@ describe('main — error paths (fail closed)', () => {
     // #given
     process.env.APPLICATION_PRIVATE_KEY = ''
     const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
+
+    // #when
+    await main()
+
+    // #then
+    expect(process.exitCode).toBe(1)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(mocks.setOutput).not.toHaveBeenCalled()
+  })
+
+  it('exits non-zero and emits no output for an unknown profile', async () => {
+    // #given
+    process.env.FRO_BOT_APP_TOKEN_PROFILE = 'untrusted-profile'
+    const fetchMock = vi.fn()
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -365,7 +527,7 @@ describe('main — error paths (fail closed)', () => {
   it('exits non-zero when the installation lookup returns non-200', async () => {
     // #given
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(404, {message: 'Not Found'}))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -384,7 +546,7 @@ describe('main — error paths (fail closed)', () => {
     async (_label, body) => {
       // #given
       const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(200, body))
-      vi.stubGlobal('fetch', fetchMock)
+      installFetchMock(fetchMock)
 
       // #when
       await main()
@@ -399,7 +561,7 @@ describe('main — error paths (fail closed)', () => {
   it('never issues the token POST fetch when the installation lookup fails', async () => {
     // #given
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(404, {message: 'Not Found'}))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -414,7 +576,7 @@ describe('main — error paths (fail closed)', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(201, {...VALID_TOKEN_BODY, token: undefined}))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -430,7 +592,7 @@ describe('main — error paths (fail closed)', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(201, {...VALID_TOKEN_BODY, expires_at: undefined}))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -448,7 +610,7 @@ describe('main — error paths (fail closed)', () => {
       .mockResolvedValueOnce(
         jsonResponse(201, {...VALID_TOKEN_BODY, permissions: {contents: 'write', metadata: 'read', issues: 'write'}}),
       )
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -466,7 +628,7 @@ describe('main — error paths (fail closed)', () => {
       .mockResolvedValueOnce(
         jsonResponse(201, {...VALID_TOKEN_BODY, permissions: {contents: 'read', metadata: 'read'}}),
       )
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -486,7 +648,7 @@ describe('main — error paths (fail closed)', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(201, {...VALID_TOKEN_BODY, repositories}))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -500,7 +662,7 @@ describe('main — error paths (fail closed)', () => {
     // #given
     process.env.APPLICATION_PRIVATE_KEY = MALFORMED_PEM
     const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
     const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
 
     // #when
@@ -519,7 +681,7 @@ describe('main — error paths (fail closed)', () => {
   it('fails closed without retrying when the installation fetch throws', async () => {
     // #given
     const fetchMock = vi.fn().mockRejectedValue(new TypeError('fetch failed: ECONNRESET'))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -535,7 +697,7 @@ describe('main — error paths (fail closed)', () => {
     const fetchMock = vi.fn().mockImplementation(async () => {
       throw new DOMException('The operation was aborted due to timeout', 'TimeoutError')
     })
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -552,7 +714,7 @@ describe('main — error paths (fail closed)', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(403, {message: 'Forbidden'}))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
@@ -568,7 +730,7 @@ describe('main — error paths (fail closed)', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(200, {id: 999}))
       .mockResolvedValueOnce(jsonResponse(200, VALID_TOKEN_BODY))
-    vi.stubGlobal('fetch', fetchMock)
+    installFetchMock(fetchMock)
 
     // #when
     await main()
