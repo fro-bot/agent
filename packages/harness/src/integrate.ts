@@ -8,14 +8,18 @@
  * not invoke a model to perform deterministic work.
  */
 
+import type {ConflictResolutionRequest, ConflictResolverResult} from './conflict-resolver.js'
 import type {IntegrationRefRecord} from './provenance.js'
 import type {IntegrationSource} from './sources.js'
+import {Buffer} from 'node:buffer'
 import {execFile} from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {promisify} from 'node:util'
+import {resolveConflict as resolveConflictAttempt} from './conflict-resolver.js'
 import {formatPipelineError} from './format-error.js'
 import {resolveSources} from './sources.js'
 
@@ -57,6 +61,9 @@ export interface IntegrationConfig {
   readonly agent?: string
   readonly model?: string
   readonly opencodeBin?: string
+  /** Short-lived broker-minted model auth JSON; U7 wires the production input. */
+  readonly brokerAuthJson?: string
+  readonly runnerTempDir?: string
   readonly promptPath?: string
 }
 
@@ -70,6 +77,7 @@ export interface IntegrationConflict {
   readonly preMergeCommit: string
   readonly conflictPaths: readonly string[]
   readonly message: string
+  readonly resolver?: ConflictResolverResult
 }
 
 export interface PushCredential {
@@ -103,10 +111,17 @@ export type IntegrationStage =
   | 'version'
   | 'tree'
   | 'provenance'
+  | 'cleanup'
   | 'push'
 
 export type IntegrationResult =
-  | {readonly ok: true; readonly manifest: ProvenanceManifest; readonly dryRun?: boolean; readonly pushed?: boolean}
+  | {
+      readonly ok: true
+      readonly manifest: ProvenanceManifest
+      readonly dryRun?: boolean
+      readonly pushed?: boolean
+      readonly conflictDiagnostics?: readonly ConflictResolverResult[]
+    }
   | {readonly ok: false; readonly kind?: 'failure'; readonly stage?: IntegrationStage; readonly error: string}
   | {
       readonly ok: false
@@ -133,6 +148,16 @@ export interface IntegrationAdapters {
   readonly createBranch: (workDir: string, branch: string, tag: string) => Promise<void>
   /** Run one deterministic no-ff merge. Conflicts are returned, not thrown. */
   readonly mergeRef: (workDir: string, mergeRef: string) => Promise<MergeOutcome>
+  /** Resolve one actual merge conflict in a disposable broker-scoped checkout. */
+  readonly resolveConflict?: (request: ConflictResolutionRequest) => Promise<ConflictResolverResult>
+  /** Stage only the validated regular-file conflict paths. */
+  readonly stagePaths?: (workDir: string, paths: readonly string[]) => Promise<void>
+  /** Verify each staged blob is byte-identical to the resolver's accepted bytes. */
+  readonly verifyStagedPaths?: (workDir: string, expectedDigests: Readonly<Record<string, string>>) => Promise<void>
+  /** Require the target merge index to contain no unmerged entries after staging. */
+  readonly assertNoUnmerged: (workDir: string) => Promise<void>
+  /** Complete the code-owned merge after validated paths are staged. */
+  readonly completeMerge?: (workDir: string) => Promise<void>
   /** @deprecated U5 never calls the legacy model-owned merge path. */
   readonly runMerge?: (
     workDir: string,
@@ -171,6 +196,8 @@ export interface IntegrationAdapters {
     target: IntegrationPushTarget,
     credential: PushCredential,
   ) => Promise<void>
+  /** Dispose integration-owned subprocess state after every run outcome. */
+  readonly dispose?: () => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -270,11 +297,18 @@ const TRUSTED_GIT_DENY_KEYS = [
   'GIT_TRACE_SETUP',
 ] as const
 
+const GIT_NON_GIT_DENY_KEYS = new Set(['ALL_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'SSH_AUTH_SOCK'])
+
 function publicGitEnv(): NodeJS.ProcessEnv {
   const env = {...process.env}
   for (const key of PUBLIC_GIT_DENY_KEYS) delete env[key]
+  for (const key of Object.keys(env)) {
+    const uppercase = key.toUpperCase()
+    if (uppercase.startsWith('GIT_') || GIT_NON_GIT_DENY_KEYS.has(uppercase)) delete env[key]
+  }
   env.GIT_TERMINAL_PROMPT = '0'
   env.GIT_CONFIG_NOSYSTEM = '1'
+  env.GIT_CONFIG_SYSTEM = process.platform === 'win32' ? 'NUL' : '/dev/null'
   env.GIT_CONFIG_GLOBAL = process.platform === 'win32' ? 'NUL' : '/dev/null'
   return env
 }
@@ -291,18 +325,117 @@ function trustedGitEnv(): NodeJS.ProcessEnv {
   return env
 }
 
-async function gitExec(args: readonly string[], cwd: string | undefined, env: NodeJS.ProcessEnv): Promise<string> {
-  const result = await execFileAsync('git', ['-c', 'credential.helper=', '-c', 'core.askPass=', ...args], {
-    cwd,
-    encoding: 'utf8',
-    env,
-  })
-  return result.stdout.trim()
+export interface RealAdapterOptions {
+  readonly hooksRoot?: string
 }
 
-async function gitAuthExec(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): Promise<string> {
-  const result = await execFileAsync('git', ['-c', 'credential.helper=', ...args], {cwd, encoding: 'utf8', env})
-  return result.stdout.trim()
+interface GitSubprocess {
+  readonly exec: (args: readonly string[], cwd: string | undefined, env: NodeJS.ProcessEnv) => Promise<string>
+  readonly execBytes: (args: readonly string[], cwd: string, env: NodeJS.ProcessEnv) => Promise<Buffer>
+  readonly authExec: (args: readonly string[], cwd: string, env: NodeJS.ProcessEnv) => Promise<string>
+  readonly dispose: () => Promise<void>
+}
+
+function makeGitSubprocess(hooksRoot: string): GitSubprocess {
+  let hooksPathPromise: Promise<string> | undefined
+  let disposePromise: Promise<void> | undefined
+  let disposeRequested = false
+  let disposed = false
+  let inFlight = 0
+  let resolveDrain: (() => void) | undefined
+
+  const begin = (): void => {
+    if (disposeRequested || disposed) throw new Error('integration Git lifecycle is already disposed')
+    inFlight += 1
+  }
+
+  const end = (): void => {
+    inFlight -= 1
+    if (inFlight === 0 && resolveDrain !== undefined) {
+      const resolve = resolveDrain
+      resolveDrain = undefined
+      resolve()
+    }
+  }
+
+  const hooksPath = async (): Promise<string> => {
+    hooksPathPromise ??= fs.mkdtemp(path.join(hooksRoot, 'fro-bot-integrate-hooks-'))
+    return hooksPathPromise
+  }
+
+  const exec = async (args: readonly string[], cwd: string | undefined, env: NodeJS.ProcessEnv): Promise<string> => {
+    begin()
+    try {
+      const disabledHooksPath = await hooksPath()
+      const result = await execFileAsync(
+        'git',
+        ['-c', 'credential.helper=', '-c', 'core.askPass=', '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
+        {cwd, encoding: 'utf8', env},
+      )
+      return result.stdout.trim()
+    } finally {
+      end()
+    }
+  }
+
+  const execBytes = async (args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): Promise<Buffer> => {
+    begin()
+    try {
+      const disabledHooksPath = await hooksPath()
+      const result = await execFileAsync(
+        'git',
+        ['-c', 'credential.helper=', '-c', 'core.askPass=', '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
+        {cwd, encoding: 'buffer', env},
+      )
+      return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout)
+    } finally {
+      end()
+    }
+  }
+
+  const authExec = async (args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): Promise<string> => {
+    begin()
+    try {
+      const disabledHooksPath = await hooksPath()
+      const result = await execFileAsync(
+        'git',
+        ['-c', 'credential.helper=', '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
+        {cwd, encoding: 'utf8', env},
+      )
+      return result.stdout.trim()
+    } finally {
+      end()
+    }
+  }
+
+  const dispose = async (): Promise<void> => {
+    if (disposePromise !== undefined) return disposePromise
+    disposeRequested = true
+    disposePromise = (async () => {
+      if (inFlight > 0) await new Promise<void>(resolve => (resolveDrain = resolve))
+      if (hooksPathPromise !== undefined) await fs.rm(await hooksPathPromise, {recursive: true, force: true})
+      disposed = true
+    })()
+    return disposePromise
+  }
+
+  return {exec, execBytes, authExec, dispose}
+}
+
+async function verifyStagedPathsReal(
+  git: GitSubprocess,
+  workDir: string,
+  expectedDigests: Readonly<Record<string, string>>,
+): Promise<void> {
+  const entries = Object.entries(expectedDigests)
+  if (entries.length === 0) throw new Error('cannot verify an empty staged path set')
+  for (const [relative, expectedDigest] of entries) {
+    const staged = await git.execBytes(['show', `:${relative}`], workDir, publicGitEnv())
+    const actualDigest = crypto.createHash('sha256').update(staged).digest('hex')
+    if (actualDigest !== expectedDigest) {
+      throw new Error(`staged bytes mismatch for ${relative}: expected ${expectedDigest}, received ${actualDigest}`)
+    }
+  }
 }
 
 function splitLines(value: string): string[] {
@@ -312,16 +445,16 @@ function splitLines(value: string): string[] {
     .filter(line => line.length > 0)
 }
 
-async function listUnmergedPaths(workDir: string): Promise<string[]> {
+async function listUnmergedPaths(git: GitSubprocess, workDir: string): Promise<string[]> {
   try {
-    return splitLines(await gitExec(['diff', '--name-only', '--diff-filter=U'], workDir, publicGitEnv()))
+    return splitLines(await git.exec(['diff', '--name-only', '--diff-filter=U'], workDir, publicGitEnv()))
   } catch {
     return []
   }
 }
 
-async function listTreePaths(workDir: string, commit: string, prefix: string): Promise<string[]> {
-  return splitLines(await gitExec(['ls-tree', '-r', '--name-only', commit, '--', prefix], workDir, publicGitEnv()))
+async function listTreePaths(git: GitSubprocess, workDir: string, commit: string, prefix: string): Promise<string[]> {
+  return splitLines(await git.exec(['ls-tree', '-r', '--name-only', commit, '--', prefix], workDir, publicGitEnv()))
 }
 
 async function copyGitObjects(sourceWorkDir: string, trustedWorkDir: string): Promise<void> {
@@ -359,21 +492,25 @@ function resolveCliPath(workDir: string): string {
   return path.join(workDir, 'packages', 'opencode', 'dist', name, 'bin', binary)
 }
 
-async function validateCommitTree(workDir: string, expectation: FinalTreeExpectation): Promise<void> {
-  const unmergedPaths = await listUnmergedPaths(workDir)
+async function validateCommitTree(
+  git: GitSubprocess,
+  workDir: string,
+  expectation: FinalTreeExpectation,
+): Promise<void> {
+  const unmergedPaths = await listUnmergedPaths(git, workDir)
   if (unmergedPaths.length > 0) {
     throw new Error(`final integration tree contains unmerged paths: ${unmergedPaths.join(', ')}`)
   }
 
-  const tagCommit = await gitExec(['rev-parse', `refs/tags/${expectation.baseTag}^{commit}`], workDir, trustedGitEnv())
-  const integrationCommit = await gitExec(
+  const tagCommit = await git.exec(['rev-parse', `refs/tags/${expectation.baseTag}^{commit}`], workDir, trustedGitEnv())
+  const integrationCommit = await git.exec(
     ['rev-parse', `${expectation.integrationCommit}^{commit}`],
     workDir,
     trustedGitEnv(),
   )
 
   if (expectation.squashed) {
-    const parentLine = await gitExec(['rev-list', '--parents', '-n', '1', integrationCommit], workDir, trustedGitEnv())
+    const parentLine = await git.exec(['rev-list', '--parents', '-n', '1', integrationCommit], workDir, trustedGitEnv())
     const parents = parentLine.split(' ').filter(value => value.length > 0)
     if (parents.length !== 2 || parents[1] !== tagCommit) {
       throw new Error(`final integration commit is not one squash commit on ${expectation.baseTag}`)
@@ -384,7 +521,7 @@ async function validateCommitTree(workDir: string, expectation: FinalTreeExpecta
 
   if (expectation.workflowsStripped) {
     const workflowPaths = splitLines(
-      await gitExec(
+      await git.exec(
         ['ls-tree', '-r', '--name-only', integrationCommit, '--', '.github/workflows'],
         workDir,
         trustedGitEnv(),
@@ -396,13 +533,21 @@ async function validateCommitTree(workDir: string, expectation: FinalTreeExpecta
   }
 }
 
-async function validateFinalTreeReal(workDir: string, expectation: FinalTreeExpectation): Promise<void> {
-  await validateCommitTree(workDir, expectation)
+async function validateFinalTreeReal(
+  git: GitSubprocess,
+  workDir: string,
+  expectation: FinalTreeExpectation,
+): Promise<void> {
+  await validateCommitTree(git, workDir, expectation)
 
   if (expectation.workflowsStripped) {
-    const tagCommit = await gitExec(['rev-parse', `refs/tags/${expectation.baseTag}^{commit}`], workDir, publicGitEnv())
+    const tagCommit = await git.exec(
+      ['rev-parse', `refs/tags/${expectation.baseTag}^{commit}`],
+      workDir,
+      publicGitEnv(),
+    )
 
-    const sourceWorkflowPaths = await listTreePaths(workDir, tagCommit, '.github/workflows')
+    const sourceWorkflowPaths = await listTreePaths(git, workDir, tagCommit, '.github/workflows')
     if (sourceWorkflowPaths.length > 0) {
       const workflowDir = path.join(workDir, '.github', 'workflows')
       const stat = await fs.stat(workflowDir)
@@ -426,6 +571,7 @@ function assertCommitSha(commit: string): void {
 }
 
 async function prepareTrustedPushRepositoryReal(
+  git: GitSubprocess,
   sourceWorkDir: string,
   integrationCommit: string,
   manifest: ProvenanceManifest,
@@ -443,23 +589,23 @@ async function prepareTrustedPushRepositoryReal(
 
   try {
     await fs.mkdir(trustedWorkDir, {recursive: true})
-    await gitExec(['init', '--quiet', trustedWorkDir], undefined, trustedGitEnv())
+    await git.exec(['init', '--quiet', trustedWorkDir], undefined, trustedGitEnv())
 
-    const baseCommit = await gitExec(
+    const baseCommit = await git.exec(
       ['rev-parse', `refs/tags/${expectation.baseTag}^{commit}`],
       sourceWorkDir,
       publicGitEnv(),
     )
     await copyGitObjects(sourceWorkDir, trustedWorkDir)
-    await gitExec(['update-ref', `refs/tags/${expectation.baseTag}`, baseCommit], trustedWorkDir, trustedGitEnv())
-    await gitExec(['update-ref', 'refs/harness/frozen', integrationCommit], trustedWorkDir, trustedGitEnv())
-    await gitExec(['symbolic-ref', 'HEAD', 'refs/harness/frozen'], trustedWorkDir, trustedGitEnv())
+    await git.exec(['update-ref', `refs/tags/${expectation.baseTag}`, baseCommit], trustedWorkDir, trustedGitEnv())
+    await git.exec(['update-ref', 'refs/harness/frozen', integrationCommit], trustedWorkDir, trustedGitEnv())
+    await git.exec(['symbolic-ref', 'HEAD', 'refs/harness/frozen'], trustedWorkDir, trustedGitEnv())
 
-    const actualCommit = await gitExec(['rev-parse', 'refs/harness/frozen^{commit}'], trustedWorkDir, trustedGitEnv())
+    const actualCommit = await git.exec(['rev-parse', 'refs/harness/frozen^{commit}'], trustedWorkDir, trustedGitEnv())
     if (actualCommit !== integrationCommit) {
       throw new Error(`trusted push repository resolved ${actualCommit}, expected ${integrationCommit}`)
     }
-    await validateCommitTree(trustedWorkDir, expectation)
+    await validateCommitTree(git, trustedWorkDir, expectation)
 
     const sourceManifest = await readProvenanceManifest(sourceWorkDir)
     if (sourceManifest === null || JSON.stringify(sourceManifest) !== JSON.stringify(manifest)) {
@@ -487,42 +633,43 @@ async function prepareTrustedPushRepositoryReal(
   }
 }
 
-export function makeRealAdapters(): IntegrationAdapters {
+export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationAdapters {
+  const git = makeGitSubprocess(options.hooksRoot ?? os.tmpdir())
   return {
     cloneRepo: async (repoUrl, workDir, tag) => {
       await fs.rm(workDir, {recursive: true, force: true})
       await fs.mkdir(path.dirname(workDir), {recursive: true})
       const cloneArgs =
         tag === undefined ? ['clone', repoUrl, workDir] : ['clone', '--depth', '1', '--branch', tag, repoUrl, workDir]
-      await gitExec(cloneArgs, undefined, publicGitEnv())
+      await git.exec(cloneArgs, undefined, publicGitEnv())
     },
 
     fetchTags: async workDir => {
-      await gitExec(['fetch', 'origin', '--tags'], workDir, publicGitEnv())
+      await git.exec(['fetch', 'origin', '--tags'], workDir, publicGitEnv())
     },
 
     fetchRef: async (workDir, remoteUrl, fetchRef, localRef) => {
-      await gitExec(['fetch', '--no-tags', remoteUrl, `${fetchRef}:${localRef}`], workDir, publicGitEnv())
+      await git.exec(['fetch', '--no-tags', remoteUrl, `${fetchRef}:${localRef}`], workDir, publicGitEnv())
     },
 
     captureRefSha: async workDir => {
       try {
-        return await gitExec(['rev-parse', 'FETCH_HEAD'], workDir, publicGitEnv())
+        return await git.exec(['rev-parse', 'FETCH_HEAD'], workDir, publicGitEnv())
       } catch {
         return null
       }
     },
 
     createBranch: async (workDir, branch, tag) => {
-      await gitExec(['checkout', '-B', branch, `refs/tags/${tag}`], workDir, publicGitEnv())
+      await git.exec(['checkout', '-B', branch, `refs/tags/${tag}`], workDir, publicGitEnv())
     },
 
     mergeRef: async (workDir, mergeRef) => {
       try {
-        await gitExec(['merge', '--no-ff', '--no-edit', mergeRef], workDir, publicGitEnv())
+        await git.exec(['merge', '--no-ff', '--no-edit', mergeRef], workDir, publicGitEnv())
         return {kind: 'clean'}
       } catch (error) {
-        const conflictPaths = await listUnmergedPaths(workDir)
+        const conflictPaths = await listUnmergedPaths(git, workDir)
         if (conflictPaths.length === 0) throw error
         return {
           kind: 'conflict',
@@ -532,12 +679,42 @@ export function makeRealAdapters(): IntegrationAdapters {
       }
     },
 
+    resolveConflict: async request => resolveConflictAttempt(request),
+
+    stagePaths: async (workDir, paths) => {
+      if (paths.length === 0) throw new Error('cannot stage an empty conflict path set')
+      await git.exec(['add', '--', ...paths], workDir, publicGitEnv())
+    },
+
+    verifyStagedPaths: async (workDir, expectedDigests) => verifyStagedPathsReal(git, workDir, expectedDigests),
+
+    assertNoUnmerged: async workDir => {
+      const unresolved = await git.exec(['ls-files', '-u'], workDir, publicGitEnv())
+      if (unresolved.length > 0) throw new Error(`merge still contains unmerged entries: ${unresolved}`)
+    },
+
+    completeMerge: async workDir => {
+      await git.exec(
+        [
+          '-c',
+          'user.name=fro-bot harness integrate',
+          '-c',
+          'user.email=github-actions[bot]@users.noreply.github.com',
+          'commit',
+          '--no-verify',
+          '--no-edit',
+        ],
+        workDir,
+        publicGitEnv(),
+      )
+    },
+
     resetToBase: async (workDir, tag) => {
-      await gitExec(['reset', '--soft', `refs/tags/${tag}`], workDir, publicGitEnv())
+      await git.exec(['reset', '--soft', `refs/tags/${tag}`], workDir, publicGitEnv())
     },
 
     stripWorkflowFiles: async workDir => {
-      await gitExec(
+      await git.exec(
         ['rm', '-r', '--cached', '--quiet', '--ignore-unmatch', '.github/workflows'],
         workDir,
         publicGitEnv(),
@@ -545,7 +722,7 @@ export function makeRealAdapters(): IntegrationAdapters {
     },
 
     commitIntegration: async (workDir, message) => {
-      await gitExec(
+      await git.exec(
         [
           '-c',
           'user.name=fro-bot harness integrate',
@@ -588,11 +765,12 @@ export function makeRealAdapters(): IntegrationAdapters {
       }
     },
 
-    getCommitSha: async workDir => gitExec(['rev-parse', 'HEAD'], workDir, publicGitEnv()),
+    getCommitSha: async workDir => git.exec(['rev-parse', 'HEAD'], workDir, publicGitEnv()),
 
-    validateFinalTree: validateFinalTreeReal,
+    validateFinalTree: async (workDir, expectation) => validateFinalTreeReal(git, workDir, expectation),
 
-    prepareTrustedPushRepository: prepareTrustedPushRepositoryReal,
+    prepareTrustedPushRepository: async (sourceWorkDir, integrationCommit, manifest, expectation) =>
+      prepareTrustedPushRepositoryReal(git, sourceWorkDir, integrationCommit, manifest, expectation),
 
     acquirePushCredential: async () => {
       const ghToken = process.env.GH_TOKEN
@@ -624,7 +802,7 @@ export function makeRealAdapters(): IntegrationAdapters {
         env.HARNESS_PUSH_TOKEN = credential.token
         env.GIT_ASKPASS = askpass
         env.GIT_TERMINAL_PROMPT = '0'
-        await gitAuthExec(
+        await git.authExec(
           ['push', '--no-verify', target.repository, `${sourceRef}:${target.ref}`],
           trustedRepository.workDir,
           env,
@@ -633,6 +811,8 @@ export function makeRealAdapters(): IntegrationAdapters {
         await fs.rm(tempDir, {recursive: true, force: true})
       }
     },
+
+    dispose: git.dispose,
   }
 }
 
@@ -717,7 +897,7 @@ function validateManifest(
  * squash/build so U6 can own the bounded contextual repair contract. Artifact
  * packaging and the credentialed trusted push are owned by the command layer.
  */
-export async function runIntegration(
+async function runIntegrationPipeline(
   config: IntegrationConfig,
   adapters: IntegrationAdapters,
 ): Promise<IntegrationResult> {
@@ -766,6 +946,7 @@ export async function runIntegration(
   }
 
   const resolvedShas: string[] = []
+  const conflictDiagnostics: ConflictResolverResult[] = []
   for (const source of sources) {
     try {
       await adapters.fetchRef(workDir, source.repo, source.fetchRef, source.fetch)
@@ -806,12 +987,82 @@ export async function runIntegration(
         conflictPaths: mergeOutcome.conflictPaths,
         message: mergeOutcome.message ?? `merge ref ${source.label} reported conflicts`,
       }
-      return {
-        ok: false,
-        kind: 'conflict',
-        stage: 'merge',
-        error: `merge ref ${source.label} requires conflict resolution: ${formatPipelineError(conflict.message)}`,
-        conflict,
+
+      // Keep the pre-U6 typed boundary for injected adapters that do not opt
+      // into model repair. Production adapters always provide the resolver.
+      if (adapters.resolveConflict === undefined) {
+        return {
+          ok: false,
+          kind: 'conflict',
+          stage: 'merge',
+          error: `merge ref ${source.label} requires conflict resolution: ${formatPipelineError(conflict.message)}`,
+          conflict,
+        }
+      }
+
+      let resolution: ConflictResolverResult
+      try {
+        resolution = await adapters.resolveConflict({
+          integrationWorkDir: workDir,
+          preConflictCommit: preMergeCommit,
+          mergeRef: source.merge,
+          sourceLabel: source.label,
+          conflictPaths: conflict.conflictPaths,
+          conflictMessage: conflict.message,
+          agent: config.agent ?? 'build',
+          model: config.model ?? '',
+          opencodeBin: config.opencodeBin ?? 'opencode',
+          brokerAuthJson: config.brokerAuthJson,
+          runnerTempDir: config.runnerTempDir,
+        })
+      } catch (error) {
+        return {
+          ok: false,
+          kind: 'conflict',
+          stage: 'merge',
+          error: `merge ref ${source.label} conflict resolver failed: ${formatPipelineError(error)}`,
+          conflict,
+        }
+      }
+
+      conflictDiagnostics.push(resolution)
+      if (resolution.ok === false) {
+        return {
+          ok: false,
+          kind: 'conflict',
+          stage: 'merge',
+          error: `merge ref ${source.label} conflict resolver failed: ${formatPipelineError(resolution.error)}`,
+          conflict: {...conflict, resolver: resolution},
+        }
+      }
+
+      if (
+        adapters.stagePaths === undefined ||
+        adapters.verifyStagedPaths === undefined ||
+        adapters.completeMerge === undefined
+      ) {
+        return {
+          ok: false,
+          kind: 'conflict',
+          stage: 'merge',
+          error: `merge ref ${source.label} resolved but the code-owned staging boundary is unavailable`,
+          conflict: {...conflict, resolver: resolution},
+        }
+      }
+
+      try {
+        await adapters.stagePaths(workDir, resolution.resolvedPaths)
+        await adapters.verifyStagedPaths(workDir, resolution.resolvedDigests)
+        await adapters.assertNoUnmerged(workDir)
+        await adapters.completeMerge(workDir)
+      } catch (error) {
+        return {
+          ok: false,
+          kind: 'conflict',
+          stage: 'merge',
+          error: `merge ref ${source.label} completion failed: ${formatPipelineError(error)}`,
+          conflict: {...conflict, resolver: resolution},
+        }
       }
     }
   }
@@ -901,5 +1152,37 @@ export async function runIntegration(
   const persistedError = validateManifest(persistedManifest, config, sources, resolvedShas, integrationCommit)
   if (persistedError !== null) return failure('provenance', persistedError)
 
-  return {ok: true, manifest: persistedManifest, dryRun, pushed: false}
+  return {ok: true, manifest: persistedManifest, dryRun, pushed: false, conflictDiagnostics}
+}
+
+export async function runIntegration(
+  config: IntegrationConfig,
+  adapters: IntegrationAdapters,
+): Promise<IntegrationResult> {
+  let pipelineResult: IntegrationResult | undefined
+  let pipelineError: unknown
+  let pipelineThrew = false
+  let disposeError: unknown
+  let disposeThrew = false
+
+  try {
+    try {
+      pipelineResult = await runIntegrationPipeline(config, adapters)
+    } catch (error) {
+      pipelineThrew = true
+      pipelineError = error
+    }
+  } finally {
+    try {
+      await adapters.dispose?.()
+    } catch (error) {
+      disposeThrew = true
+      disposeError = error
+    }
+  }
+
+  if (pipelineThrew) throw pipelineError
+  if (pipelineResult === undefined) throw new Error('integration pipeline returned no result')
+  if (disposeThrew && pipelineResult.ok) return failure('cleanup', disposeError)
+  return pipelineResult
 }
