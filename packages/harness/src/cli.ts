@@ -26,9 +26,12 @@ Usage:
   harness info                 Print provenance (base version, integration refs, build sha)
   harness patches              List configured integration refs
   harness doctor               Check the resolved binary is present and runnable
-  harness integrate            Run the LLM merge integration pipeline
+  harness integrate            Run the deterministic integration pipeline
+                                  --dry-run             Validate/build without acquiring push credentials
+                                  --push-repo <url>     Push target repository (non-dry-run)
+                                  --push-ref <ref>      Push target ref (non-dry-run)
                                  --work-dir <dir>     (required) Working directory for the clone
-                                 --prompt-path <path> (required) Path to the merge prompt template
+                                 --prompt-path <path> (legacy compatibility; ignored)
                                  --out <path>         (required) Artifact output path
   harness --version            Print harness provenance version
   harness --help               Print this help

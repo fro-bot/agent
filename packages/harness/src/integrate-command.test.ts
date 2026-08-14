@@ -119,6 +119,7 @@ describe('cmdIntegrate — happy path', () => {
     const [calledConfig] = vi.mocked(runIntegration).mock.calls[0] as [IntegrationConfig, unknown]
     expect(calledConfig.baseVersion).toBe('1.15.13')
     expect(calledConfig.releaseRepo).toBe('anomalyco/opencode')
+    expect(calledConfig.sourceRepo).toBe('https://github.com/anomalyco/opencode.git')
     expect(calledConfig.integrationRefs).toEqual(['https://github.com/anomalyco/opencode/pull/30182'])
     expect(calledConfig.agent).toBe('build')
     expect(calledConfig.model).toBe('anthropic/claude-sonnet-4-6')
@@ -271,6 +272,240 @@ describe('cmdIntegrate — error path', () => {
 
     errorSpy.mockRestore()
   })
+
+  it('does not finalize, acquire credentials, or push when artifact packaging fails', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'frozen-commit', buildSha: 'dev'},
+    })
+    const credentialsRequested = vi.fn()
+    const pushCalled = vi.fn()
+    vi.mocked(makeRealAdapters).mockReturnValue({
+      acquirePushCredential: credentialsRequested,
+      pushIntegration: pushCalled,
+    } as never)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const stubPackage = vi.fn<() => Promise<void>>().mockRejectedValue(new Error('artifact archive failed'))
+
+    // #when
+    const code = await cmdIntegrate(
+      ['--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath],
+      configPath,
+      stubPackage,
+    )
+
+    // #then
+    expect(code).toBe(1)
+    expect(credentialsRequested).not.toHaveBeenCalled()
+    expect(pushCalled).not.toHaveBeenCalled()
+    errorSpy.mockRestore()
+  })
+
+  it('finalizes only after artifact packaging succeeds', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'frozen-commit', buildSha: 'dev'},
+    })
+    let artifactComplete = false
+    const cleanup = vi.fn().mockResolvedValue(undefined)
+    const prepareTrusted = vi.fn(async () => {
+      expect(artifactComplete).toBe(true)
+      return {workDir: 'trusted-push', integrationCommit: 'frozen-commit', cleanup}
+    })
+    const fakeAdapters = {
+      getCommitSha: vi.fn().mockResolvedValue('frozen-commit'),
+      validateFinalTree: vi.fn().mockResolvedValue(undefined),
+      prepareTrustedPushRepository: prepareTrusted,
+      acquirePushCredential: vi.fn().mockResolvedValue({token: 'test-token'}),
+      pushIntegration: vi.fn().mockResolvedValue(undefined),
+    }
+    vi.mocked(makeRealAdapters).mockReturnValue(fakeAdapters as never)
+    const stubPackage = vi.fn<() => Promise<void>>().mockImplementation(async () => {
+      artifactComplete = true
+    })
+
+    // #when
+    const code = await cmdIntegrate(
+      [
+        '--work-dir',
+        workDir,
+        '--prompt-path',
+        promptPath,
+        '--out',
+        outPath,
+        '--push-repo',
+        'https://github.com/fro-bot/agent.git',
+        '--push-ref',
+        'refs/harness-integrate/1.15.13',
+      ],
+      configPath,
+      stubPackage,
+    )
+
+    // #then
+    expect(code).toBe(0)
+    expect(stubPackage).toHaveBeenCalledOnce()
+    expect(prepareTrusted).toHaveBeenCalledOnce()
+    expect(fakeAdapters.pushIntegration).toHaveBeenCalledOnce()
+    expect(fakeAdapters.pushIntegration.mock.calls[0]?.[1]).toBe('frozen-commit')
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('fails closed when the final push credential is refused', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'frozen-commit', buildSha: 'dev'},
+    })
+    const cleanup = vi.fn().mockResolvedValue(undefined)
+    const pushCalled = vi.fn()
+    const fakeAdapters = {
+      getCommitSha: vi.fn().mockResolvedValue('frozen-commit'),
+      validateFinalTree: vi.fn().mockResolvedValue(undefined),
+      prepareTrustedPushRepository: vi.fn().mockResolvedValue({
+        workDir: 'trusted-push',
+        integrationCommit: 'frozen-commit',
+        cleanup,
+      }),
+      acquirePushCredential: vi.fn().mockRejectedValue(new Error('GH_TOKEN is required for harness push')),
+      pushIntegration: pushCalled,
+    }
+    vi.mocked(makeRealAdapters).mockReturnValue(fakeAdapters as never)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+
+    // #when
+    const code = await cmdIntegrate(
+      [
+        '--work-dir',
+        workDir,
+        '--prompt-path',
+        promptPath,
+        '--out',
+        outPath,
+        '--push-repo',
+        'https://github.com/fro-bot/agent.git',
+        '--push-ref',
+        'refs/harness-integrate/1.15.13',
+      ],
+      configPath,
+      stubPackage,
+    )
+
+    // #then
+    expect(code).toBe(1)
+    expect(pushCalled).not.toHaveBeenCalled()
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(errorSpy).toHaveBeenCalledOnce()
+    errorSpy.mockRestore()
+  })
+
+  it('keeps a successful push successful when trusted-repository cleanup fails', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'frozen-commit', buildSha: 'dev'},
+    })
+    const cleanup = vi.fn().mockRejectedValue(new Error('trusted cleanup failed'))
+    const logger = {warning: vi.fn()}
+    const fakeAdapters = {
+      getCommitSha: vi.fn().mockResolvedValue('frozen-commit'),
+      validateFinalTree: vi.fn().mockResolvedValue(undefined),
+      prepareTrustedPushRepository: vi.fn().mockResolvedValue({
+        workDir: 'trusted-push',
+        integrationCommit: 'frozen-commit',
+        cleanup,
+      }),
+      acquirePushCredential: vi.fn().mockResolvedValue({token: 'test-token'}),
+      pushIntegration: vi.fn().mockResolvedValue(undefined),
+    }
+    vi.mocked(makeRealAdapters).mockReturnValue(fakeAdapters as never)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+
+    // #when
+    const code = await cmdIntegrate(
+      [
+        '--work-dir',
+        workDir,
+        '--prompt-path',
+        promptPath,
+        '--out',
+        outPath,
+        '--push-repo',
+        'https://github.com/fro-bot/agent.git',
+        '--push-ref',
+        'refs/harness-integrate/1.15.13',
+      ],
+      configPath,
+      stubPackage,
+      logger,
+    )
+
+    // #then
+    expect(code).toBe(0)
+    expect(fakeAdapters.pushIntegration).toHaveBeenCalledOnce()
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(logger.warning).toHaveBeenCalledOnce()
+    expect(errorSpy).not.toHaveBeenCalled()
+    errorSpy.mockRestore()
+  })
+
+  it('preserves the original push error when trusted-repository cleanup also fails', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'frozen-commit', buildSha: 'dev'},
+    })
+    const cleanup = vi.fn().mockRejectedValue(new Error('trusted cleanup failed'))
+    const logger = {warning: vi.fn()}
+    const fakeAdapters = {
+      getCommitSha: vi.fn().mockResolvedValue('frozen-commit'),
+      validateFinalTree: vi.fn().mockResolvedValue(undefined),
+      prepareTrustedPushRepository: vi.fn().mockResolvedValue({
+        workDir: 'trusted-push',
+        integrationCommit: 'frozen-commit',
+        cleanup,
+      }),
+      acquirePushCredential: vi.fn().mockRejectedValue(new Error('credential acquisition refused')),
+      pushIntegration: vi.fn(),
+    }
+    vi.mocked(makeRealAdapters).mockReturnValue(fakeAdapters as never)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+
+    // #when
+    const code = await cmdIntegrate(
+      [
+        '--work-dir',
+        workDir,
+        '--prompt-path',
+        promptPath,
+        '--out',
+        outPath,
+        '--push-repo',
+        'https://github.com/fro-bot/agent.git',
+        '--push-ref',
+        'refs/harness-integrate/1.15.13',
+      ],
+      configPath,
+      stubPackage,
+      logger,
+    )
+
+    // #then
+    expect(code).toBe(1)
+    expect(fakeAdapters.pushIntegration).not.toHaveBeenCalled()
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(logger.warning).toHaveBeenCalledOnce()
+    expect(errorSpy).toHaveBeenCalledOnce()
+    const [errorLine] = errorSpy.mock.calls[0] as [string]
+    expect(errorLine).toContain('credential acquisition refused')
+    expect(errorLine).not.toContain('trusted cleanup failed')
+    errorSpy.mockRestore()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -290,16 +525,22 @@ describe('cmdIntegrate — missing required flags', () => {
     errorSpy.mockRestore()
   })
 
-  it('returns non-zero when --prompt-path is missing', async () => {
-    // #given / #when
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const code = await cmdIntegrate(['--work-dir', workDir, '--out', outPath], configPath)
+  it('allows --prompt-path to be omitted during the deterministic-driver cutover', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'abc', buildSha: 'dev'},
+      dryRun: true,
+      pushed: false,
+    })
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+
+    // #when
+    const code = await cmdIntegrate(['--work-dir', workDir, '--out', outPath, '--dry-run'], configPath, stubPackage)
 
     // #then
-    expect(code).not.toBe(0)
-    expect(runIntegration).not.toHaveBeenCalled()
-
-    errorSpy.mockRestore()
+    expect(code).toBe(0)
+    expect(runIntegration).toHaveBeenCalledOnce()
   })
 
   it('returns non-zero when --out is missing', async () => {
@@ -315,6 +556,32 @@ describe('cmdIntegrate — missing required flags', () => {
     expect(errorLine).toContain('--out')
 
     errorSpy.mockRestore()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// U5 RED: deterministic driver CLI contract
+// ---------------------------------------------------------------------------
+
+describe('cmdIntegrate — U5 deterministic driver contract', () => {
+  it('does not require a prompt template and forwards --dry-run to the driver', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'abc', buildSha: 'dev'},
+      dryRun: true,
+      pushed: false,
+    })
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+
+    // #when
+    const code = await cmdIntegrate(['--work-dir', workDir, '--out', outPath, '--dry-run'], configPath, stubPackage)
+
+    // #then
+    expect(code).toBe(0)
+    const [calledConfig] = vi.mocked(runIntegration).mock.calls[0] as [IntegrationConfig, unknown]
+    expect(calledConfig.dryRun).toBe(true)
+    expect(calledConfig.promptPath).toBeUndefined()
   })
 })
 
