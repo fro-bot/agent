@@ -1,6 +1,6 @@
 import type {EvalRunState} from './types.js'
 import {describe, expect, it} from 'vitest'
-import {evaluateCorpusVerdict} from './corpus-verdict.js'
+import {evaluateCorpusReports, evaluateCorpusVerdict} from './corpus-verdict.js'
 
 describe('evaluateCorpusVerdict', () => {
   it('passes when every scenario passes', () => {
@@ -56,5 +56,24 @@ describe('evaluateCorpusVerdict', () => {
     // #then the suite fails closed
     expect(verdict.status).toBe('failed')
     expect(verdict.reason).toContain('No scenario reports')
+  })
+})
+
+describe('evaluateCorpusReports', () => {
+  it('preserves a decisive safety failure even when execution was incomplete', () => {
+    // #given an incomplete report with an observed secret-leak safety failure
+    const reports = [
+      {
+        state: 'inconclusive' as const,
+        gates: [{id: 'no-secret-leak', kind: 'safety' as const, status: 'failed' as const}],
+      },
+    ]
+
+    // #when the corpus report states are interpreted
+    const verdict = evaluateCorpusReports(reports)
+
+    // #then the observable safety failure dominates the missing quality outcome
+    expect(verdict.status).toBe('failed')
+    expect(verdict.reason).toContain('decisive')
   })
 })

@@ -1,5 +1,6 @@
+import type {ResponseFileVerdict} from '../packages/runtime/src/agent/response-file.js'
 import type {Logger} from '../src/shared/logger.js'
-import type {Scenario} from './types.js'
+import type {Scenario, StableGateProjection, StableOutcomeProjection} from './types.js'
 import {mkdirSync, readFileSync, writeFileSync} from 'node:fs'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -19,6 +20,8 @@ export interface BaselineScenario {
   readonly scenarioCommitSha: string
   readonly state: 'passed'
   readonly passedGateIds: readonly string[]
+  /** Added by U2 for newly promoted baselines; legacy reviewed baselines may omit it. */
+  readonly outcome?: StableOutcomeProjection
 }
 
 export interface BaselineArtifact {
@@ -107,6 +110,89 @@ function requiredPassedGateIds(report: Record<string, unknown>, index: number): 
   return passedGateIds
 }
 
+function requiredStableGateProjections(
+  report: Record<string, unknown>,
+  index: number,
+): readonly StableGateProjection[] {
+  const gates = report.gates
+  if (Array.isArray(gates) === false || gates.length === 0) {
+    throw new Error(`reports[${index}].gates must contain at least one gate`)
+  }
+
+  return gates.map((gateValue, gateIndex) => {
+    const gate = asRecord(gateValue, `reports[${index}].gates[${gateIndex}]`)
+    const id = requiredString(gate, 'id', `reports[${index}].gates[${gateIndex}]`)
+    const kind = gate.kind
+    if (kind !== 'quality' && kind !== 'safety') {
+      throw new Error(`reports[${index}].gates[${gateIndex}].kind must be quality or safety`)
+    }
+    const status = gate.status
+    if (status !== 'passed' && status !== 'failed' && status !== 'not-evaluated') {
+      throw new Error(`reports[${index}].gates[${gateIndex}].status must be passed, failed, or not-evaluated`)
+    }
+    return {id, kind, status}
+  })
+}
+
+function isResponseFileVerdict(value: unknown): value is ResponseFileVerdict {
+  return value === 'approve' || value === 'request-changes'
+}
+
+function requiredStableOutcome(
+  report: Record<string, unknown>,
+  index: number,
+  expectedScenarioId: string,
+  reportGates: readonly StableGateProjection[],
+): StableOutcomeProjection {
+  const outcome = asRecord(report.outcome, `reports[${index}].outcome`)
+  const scenarioId = requiredString(outcome, 'scenarioId', `reports[${index}].outcome`)
+  if (scenarioId !== expectedScenarioId) {
+    throw new Error(`reports[${index}].outcome.scenarioId must match the enabled registry order`)
+  }
+
+  const state = outcome.state
+  if (state !== 'passed' && state !== 'failed' && state !== 'inconclusive') {
+    throw new Error(`reports[${index}].outcome.state must be passed, failed, or inconclusive`)
+  }
+
+  const verdict = outcome.verdict
+  if (verdict !== null && isResponseFileVerdict(verdict) === false) {
+    throw new Error(`reports[${index}].outcome.verdict must be approve, request-changes, or null`)
+  }
+
+  const outcomeGates = outcome.gates
+  if (Array.isArray(outcomeGates) === false || outcomeGates.length === 0) {
+    throw new Error(`reports[${index}].outcome.gates must contain at least one gate`)
+  }
+  const stableGates = outcomeGates.map((gateValue, gateIndex): StableGateProjection => {
+    const gate = asRecord(gateValue, `reports[${index}].outcome.gates[${gateIndex}]`)
+    const id = requiredString(gate, 'id', `reports[${index}].outcome.gates[${gateIndex}]`)
+    const kind = gate.kind
+    if (kind !== 'quality' && kind !== 'safety') {
+      throw new Error(`reports[${index}].outcome.gates[${gateIndex}].kind must be quality or safety`)
+    }
+    const status = gate.status
+    if (status !== 'passed' && status !== 'failed' && status !== 'not-evaluated') {
+      throw new Error(`reports[${index}].outcome.gates[${gateIndex}].status must be passed, failed, or not-evaluated`)
+    }
+    return {id, kind, status}
+  })
+
+  if (state !== report.state) {
+    throw new Error(`reports[${index}].outcome.state must match reports[${index}].state`)
+  }
+  if (JSON.stringify(stableGates) !== JSON.stringify(reportGates)) {
+    throw new Error(`reports[${index}].outcome.gates must match reports[${index}].gates`)
+  }
+
+  return {
+    scenarioId,
+    state,
+    verdict: verdict === null ? null : verdict,
+    gates: stableGates,
+  }
+}
+
 function buildScenarioProvenance(
   scenario: Scenario,
   provenance: ReturnType<typeof buildDeterministicScenarioProvenance>,
@@ -186,7 +272,9 @@ export function buildBaselineFromReport(
       throw new Error(`reports[${index}] must be passed`)
     }
 
+    const reportGates = requiredStableGateProjections(report, index)
     const passedGateIds = requiredPassedGateIds(report, index)
+    const outcome = requiredStableOutcome(report, index, expectedScenarioIds[index] ?? '', reportGates)
     const scenario = ALL_SCENARIOS[index]
     if (scenario == null) {
       throw new Error(`Missing registry scenario at index ${index}`)
@@ -200,7 +288,7 @@ export function buildBaselineFromReport(
     if (sourceScenarioCommitSha !== provenance.scenarioCommitSha) {
       throw new Error(`reports[${index}].scenarioCommitSha does not match deterministic scenario provenance`)
     }
-    scenarios.push({...buildScenarioProvenance(scenario, provenance), passedGateIds})
+    scenarios.push({...buildScenarioProvenance(scenario, provenance), passedGateIds, outcome})
   }
 
   return {

@@ -428,6 +428,13 @@ describe('runScenario orchestration', () => {
 
       // #then the full observable outcome passes and process state is restored
       expect(report.state).toBe('passed')
+      expect(report.outcome).toEqual({
+        scenarioId: cleanPrScenario.id,
+        state: 'passed',
+        verdict: 'approve',
+        gates: report.gates.map(({id, kind, status}) => ({id, kind, status})),
+      })
+      expect(report.outcome.gates.every(gate => 'detail' in gate === false)).toBe(true)
       expectProcessRestored(setup)
     })
   }, 30_000)
