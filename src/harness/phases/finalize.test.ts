@@ -17,6 +17,7 @@ type RunBrokeredPushMock = (params: BrokeredPushParams) => Promise<BrokeredPushO
 
 const mocks = vi.hoisted(() => ({
   setFailed: vi.fn(),
+  setOutput: vi.fn(),
   summaryAddRaw: vi.fn().mockReturnThis(),
   runResponsePost: vi.fn(),
   readAndParseResponseFile: vi.fn(),
@@ -27,7 +28,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@actions/core', () => ({
   setFailed: mocks.setFailed,
-  setOutput: vi.fn(),
+  setOutput: mocks.setOutput,
   warning: vi.fn(),
   summary: {
     addHeading: vi.fn().mockReturnThis(),
@@ -138,6 +139,11 @@ function createExecution(overrides: Partial<ExecutePhaseResult> = {}): ExecutePh
     commentsPosted: 0,
     llmError: null,
     resolvedOutputMode: 'branch-pr',
+    outputModeMigration: {
+      requested: 'explicit',
+      resolved: 'branch-pr',
+      legacyWouldSelectBranchPr: false,
+    },
     ...overrides,
   }
 }
@@ -200,6 +206,34 @@ describe('runFinalize file-convention delivery', () => {
       expect.anything(),
     )
     expect(mocks.setFailed).not.toHaveBeenCalled()
+  })
+
+  it('writes the execute migration record with the scalar output exactly once', async () => {
+    // #given a successful execution carrying the resolved output-mode migration state
+    const bootstrap = createBootstrap()
+    const routing = createRouting()
+    const execution = {
+      ...createExecution(),
+      outputModeMigration: {
+        requested: 'auto' as const,
+        resolved: 'branch-pr' as const,
+        legacyWouldSelectBranchPr: true,
+      },
+    } as ExecutePhaseResult
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize writes the normal action outputs
+    await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), createMockLogger())
+
+    // #then both fields are written once without a duplicate migration write
+    expect(mocks.setOutput).toHaveBeenCalledWith('resolved-output-mode', 'branch-pr')
+    expect(mocks.setOutput).toHaveBeenCalledWith(
+      'output-mode-migration',
+      JSON.stringify({requested: 'auto', resolved: 'branch-pr', legacyWouldSelectBranchPr: true}),
+    )
+    expect(mocks.setOutput.mock.calls.filter(([name]) => name === 'resolved-output-mode')).toHaveLength(1)
+    expect(mocks.setOutput.mock.calls.filter(([name]) => name === 'output-mode-migration')).toHaveLength(1)
   })
 
   it('fails the run when runResponsePost reports delivered: false', async () => {

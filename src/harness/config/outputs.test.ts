@@ -108,4 +108,45 @@ describe('setActionOutputs', () => {
 
     expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', '')
   })
+
+  it('emits the stable machine-readable output-mode migration record when provided', () => {
+    const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
+    const outputModeMigration = {
+      requested: 'auto' as const,
+      resolved: 'working-dir' as const,
+      legacyWouldSelectBranchPr: true,
+    }
+    const outputs: ActionOutputs = {
+      sessionId: 'ses_output_mode_migration',
+      resolvedOutputMode: 'working-dir',
+      outputModeMigration,
+      cacheStatus: 'hit',
+      duration: 42,
+    }
+
+    setActionOutputs(outputs)
+
+    expect(mockSetOutput).toHaveBeenCalledWith('output-mode-migration', JSON.stringify(outputModeMigration))
+  })
+
+  it('emits an explicit null migration and empty scalar when resolution is unavailable', () => {
+    const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
+    const outputModeMigration = {
+      requested: 'omitted' as const,
+      resolved: null,
+      legacyWouldSelectBranchPr: false,
+    }
+    const outputs: ActionOutputs = {
+      sessionId: null,
+      resolvedOutputMode: null,
+      outputModeMigration,
+      cacheStatus: 'miss',
+      duration: 0,
+    }
+
+    setActionOutputs(outputs)
+
+    expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', '')
+    expect(mockSetOutput).toHaveBeenCalledWith('output-mode-migration', JSON.stringify(outputModeMigration))
+  })
 })

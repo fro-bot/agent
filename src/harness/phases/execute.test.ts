@@ -19,6 +19,9 @@ const mocks = vi.hoisted(() => ({
   resolveResponseDelivery: vi.fn(() => ({delivery: 'file-convention', credential: 'withhold'})),
   resolveOutputMode: vi.fn(),
   saveState: vi.fn(),
+  getInput: vi.fn(),
+  setOutput: vi.fn(),
+  warning: vi.fn(),
   searchSessions: vi.fn(),
   writeSessionSummary: vi.fn(),
   logger: {
@@ -29,7 +32,12 @@ const mocks = vi.hoisted(() => ({
   },
 }))
 
-vi.mock('@actions/core', () => ({saveState: mocks.saveState}))
+vi.mock('@actions/core', () => ({
+  getInput: mocks.getInput,
+  saveState: mocks.saveState,
+  setOutput: mocks.setOutput,
+  warning: mocks.warning,
+}))
 
 vi.mock('node:fs/promises', () => ({
   readFile: mocks.readResponseFile,
@@ -218,12 +226,93 @@ describe('runExecute overflow recovery', () => {
     mocks.parseResponseFile.mockReset()
     mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
     mocks.resolveOutputMode.mockReturnValue('branch-pr')
+    mocks.getInput.mockReturnValue('branch-pr')
     mocks.archiveSession.mockResolvedValue(true)
     mocks.removeResponseFile.mockResolvedValue(undefined)
     mocks.searchSessions.mockResolvedValue([])
   })
 
+  it('warns on legacy branch/PR language while resolving auto safely and emitting migration state', async () => {
+    // #given a manual auto request whose prompt would have selected branch-pr under the legacy matcher
+    vi.stubEnv('SKIP_AGENT_EXECUTION', 'true')
+    mocks.getInput.mockReturnValue('auto')
+    mocks.resolveOutputMode.mockReturnValue('working-dir')
+    const baseBootstrap = createBootstrap(1_000)
+    const bootstrap: BootstrapPhaseResult = {
+      ...baseBootstrap,
+      inputs: {...baseBootstrap.inputs, outputMode: 'auto', prompt: 'please create a pr'},
+    }
+    const baseRouting = createRouting()
+    const routing: RoutingPhaseResult = {
+      ...baseRouting,
+      triggerResult: {
+        ...baseRouting.triggerResult,
+        context: {...baseRouting.triggerResult.context, eventType: 'workflow_dispatch', eventName: 'workflow_dispatch'},
+      },
+    }
+
+    // #when the execute phase resolves the delivery contract
+    const result = await runExecute(bootstrap, routing, createCacheRestore(), createSessionPrep(), createMetrics(), 0)
+
+    // #then legacy inference is observable but cannot select branch-pr
+    expect(result.resolvedOutputMode).toBe('working-dir')
+    expect(mocks.warning).toHaveBeenCalledOnce()
+    const warning = JSON.parse(String(mocks.warning.mock.calls[0]?.[0])) as Record<string, unknown>
+    expect(warning).toMatchObject({
+      type: 'output-mode-migration',
+      requested: 'auto',
+      resolved: 'working-dir',
+      legacyWouldSelectBranchPr: true,
+    })
+    expect(result.outputModeMigration).toEqual({
+      requested: 'auto',
+      resolved: 'working-dir',
+      legacyWouldSelectBranchPr: true,
+    })
+    expect(mocks.setOutput).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {input: '', configured: 'auto', resolved: 'working-dir', requested: 'omitted'},
+    {input: 'auto', configured: 'auto', resolved: 'working-dir', requested: 'auto'},
+    {input: 'branch-pr', configured: 'branch-pr', resolved: 'branch-pr', requested: 'explicit'},
+  ] as const)(
+    'emits the requested-state migration record for $requested',
+    async ({input, configured, resolved, requested}) => {
+      // #given a valid manual output-mode request in each public compatibility state
+      vi.stubEnv('SKIP_AGENT_EXECUTION', 'true')
+      mocks.getInput.mockReturnValue(input)
+      mocks.resolveOutputMode.mockReturnValue(resolved)
+      const baseBootstrap = createBootstrap(1_000)
+      const bootstrap: BootstrapPhaseResult = {
+        ...baseBootstrap,
+        inputs: {...baseBootstrap.inputs, outputMode: configured},
+      }
+      const baseRouting = createRouting()
+      const routing: RoutingPhaseResult = {
+        ...baseRouting,
+        triggerResult: {
+          ...baseRouting.triggerResult,
+          context: {
+            ...baseRouting.triggerResult.context,
+            eventType: 'workflow_dispatch',
+            eventName: 'workflow_dispatch',
+          },
+        },
+      }
+
+      // #when the execute phase resolves and publishes the migration contract
+      const result = await runExecute(bootstrap, routing, createCacheRestore(), createSessionPrep(), createMetrics(), 0)
+
+      // #then the scalar result and structured output preserve the requested state
+      expect(result.resolvedOutputMode).toBe(resolved)
+      expect(result.outputModeMigration).toEqual({requested, resolved, legacyWouldSelectBranchPr: false})
+      expect(mocks.setOutput).not.toHaveBeenCalled()
+    },
+  )
+
   afterEach(() => {
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
   })
 

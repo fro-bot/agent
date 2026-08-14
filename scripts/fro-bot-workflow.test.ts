@@ -23,6 +23,10 @@ interface Workflow {
 interface RoutingScenario {
   readonly eventName: string
   readonly releaseTag: string
+  readonly correlationId: string
+  readonly prompt: string
+  readonly useWikiPrompt: boolean
+  readonly schedule: string
   readonly workflowRef: string
   readonly repository: string
   readonly ref: string
@@ -37,6 +41,7 @@ interface RoutingResult {
 type ExpressionValue = boolean | string
 
 const WORKFLOW_PATH = process.env.FRO_BOT_WORKFLOW_TEST_PATH ?? '.github/workflows/fro-bot.yaml'
+const HARNESS_INTEGRATE_WORKFLOW_PATH = '.github/workflows/harness-integrate.yaml'
 const REPOSITORY = 'fro-bot/agent'
 const DIRECT_REF = 'refs/heads/main'
 const DIRECT_WORKFLOW_REF = `${REPOSITORY}/.github/workflows/fro-bot.yaml@${DIRECT_REF}`
@@ -45,8 +50,8 @@ const GITHUB_TOKEN = 'github-token'
 const MINTED_TOKEN = 'minted-token'
 const PAT = 'pat-token'
 
-function loadWorkflow(): Workflow {
-  const parsed = parse(readFileSync(WORKFLOW_PATH, 'utf8')) as Record<string, unknown>
+function loadWorkflow(path = WORKFLOW_PATH): Workflow {
+  const parsed = parse(readFileSync(path, 'utf8')) as Record<string, unknown>
   return {jobs: parsed.jobs as Record<string, WorkflowJob>}
 }
 
@@ -166,6 +171,18 @@ function evaluateAtom(atom: string, scenario: RoutingScenario, mintOutput: strin
   if (atom === "github.event.inputs.release-tag == ''") {
     return scenario.releaseTag === ''
   }
+  if (atom === "github.event.inputs.correlation-id != ''") {
+    return scenario.correlationId !== ''
+  }
+  if (atom === "inputs.prompt != ''") {
+    return scenario.prompt !== ''
+  }
+  if (atom === "github.event.inputs.use-wiki-prompt == 'true'") {
+    return scenario.useWikiPrompt
+  }
+  if (atom === "github.event.schedule == '0 20 * * 0'") {
+    return scenario.schedule === '0 20 * * 0'
+  }
   if (atom === 'github.token') {
     return GITHUB_TOKEN
   }
@@ -174,6 +191,11 @@ function evaluateAtom(atom: string, scenario: RoutingScenario, mintOutput: strin
   }
   if (atom === 'secrets.FRO_BOT_PAT') {
     return PAT
+  }
+
+  const stringLiteralMatch = /^'([^']*)'$/.exec(atom)
+  if (stringLiteralMatch !== null) {
+    return stringLiteralMatch[1] ?? ''
   }
 
   const eventNameMatch = /^github\.event_name == '([^']*)'$/.exec(atom)
@@ -243,10 +265,20 @@ function resolveRouting(job: WorkflowJob, scenario: RoutingScenario): RoutingRes
   }
 }
 
+function resolveOutputModeCaller(job: WorkflowJob, routingScenario: RoutingScenario): string {
+  const runFroBot = findStep(job, step => step.uses === './')
+  const outputModeExpression = expressionFrom(runFroBot.with?.['output-mode'], 'output-mode')
+  return String(evaluateExpression(outputModeExpression, routingScenario, ''))
+}
+
 function scenario(overrides: Partial<RoutingScenario>): RoutingScenario {
   return {
     eventName: 'issue_comment',
     releaseTag: '',
+    correlationId: '',
+    prompt: '',
+    useWikiPrompt: false,
+    schedule: '',
     workflowRef: DIRECT_WORKFLOW_REF,
     repository: REPOSITORY,
     ref: DIRECT_REF,
@@ -398,5 +430,43 @@ describe('fro-bot workflow — owner-wide App token routing', () => {
     // #then only the trusted apply command receives FRO_BOT_PAT in its job
     expect(applyPatSteps).toHaveLength(1)
     expect(applyPatSteps[0]?.env?.GH_TOKEN).toBe(`\${{ secrets.FRO_BOT_PAT }}`)
+  })
+
+  it('keeps confirmed manual output-mode callers explicit in the checked-in expression', () => {
+    // #given the actual Fro Bot action call and representative manual trigger contexts
+    const job = loadFroBotJob()
+
+    // #when the workflow expression is evaluated for each confirmed caller path
+    const wikiDispatch = resolveOutputModeCaller(job, scenario({eventName: 'workflow_dispatch', useWikiPrompt: true}))
+    const wikiSchedule = resolveOutputModeCaller(job, scenario({eventName: 'schedule', schedule: '0 20 * * 0'}))
+    const correlationDispatch = resolveOutputModeCaller(
+      job,
+      scenario({eventName: 'workflow_dispatch', correlationId: 'release-123'}),
+    )
+    const customPromptDispatch = resolveOutputModeCaller(
+      job,
+      scenario({eventName: 'workflow_dispatch', prompt: 'write a release summary'}),
+    )
+    const ordinaryManualDispatch = resolveOutputModeCaller(job, scenario({eventName: 'workflow_dispatch'}))
+
+    // #then wiki paths request branch-pr, controlled local paths request working-dir, and fallback stays auto
+    expect(wikiDispatch).toBe('branch-pr')
+    expect(wikiSchedule).toBe('branch-pr')
+    expect(correlationDispatch).toBe('working-dir')
+    expect(customPromptDispatch).toBe('working-dir')
+    expect(ordinaryManualDispatch).toBe('auto')
+  })
+
+  it('keeps harness integration on explicit working-dir output mode', () => {
+    // #given the checked-in harness integration workflow
+    const workflow = loadWorkflow(HARNESS_INTEGRATE_WORKFLOW_PATH)
+    const job = workflow.jobs.integrate
+    if (job === undefined) {
+      throw new TypeError('integrate job is missing')
+    }
+    const runFroBot = findStep(job, step => step.uses === './')
+
+    // #then the integration caller cannot fall back to prompt-sensitive inference
+    expect(runFroBot.with?.['output-mode']).toBe('working-dir')
   })
 })

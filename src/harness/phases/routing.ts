@@ -8,7 +8,6 @@ import {routeEvent} from '../../features/triggers/index.js'
 import {getRepositoryPermission} from '../../services/github/api.js'
 import {createClient, getBotLogin, parseGitHubContext} from '../../services/github/index.js'
 import {createLogger} from '../../shared/logger.js'
-import {setActionOutputs} from '../config/outputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 
 export interface RoutingPhaseResult {
@@ -20,7 +19,7 @@ export interface RoutingPhaseResult {
 
 export async function runRouting(
   bootstrap: BootstrapPhaseResult,
-  startTime: number,
+  _startTime: number,
 ): Promise<RoutingPhaseResult | null> {
   const contextLogger = createLogger({phase: 'context'})
   const githubContext = parseGitHubContext(contextLogger)
@@ -55,12 +54,6 @@ export async function runRouting(
     triggerLogger.info('Skipping event', {
       reason: triggerResult.skipReason,
       message: triggerResult.skipMessage,
-    })
-    setActionOutputs({
-      sessionId: null,
-      resolvedOutputMode: null,
-      cacheStatus: 'miss',
-      duration: Date.now() - startTime,
     })
     return null
   }

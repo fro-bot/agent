@@ -342,17 +342,12 @@ describe('runDedup', () => {
     // #when running dedup phase
     const result = await runDedup(10_000, context, 'fro-bot/agent', 5_000, createMockLogger())
 
-    // #then processing is skipped, outputs set, and job summary written
+    // #then processing is skipped and the top-level run lifecycle owns action outputs
     expect(result).toEqual({
       shouldProceed: false,
       entity: {entityType: 'pr', entityNumber: 42},
     })
-    expect(vi.mocked(setActionOutputs)).toHaveBeenCalledWith({
-      sessionId: null,
-      resolvedOutputMode: null,
-      cacheStatus: 'miss',
-      duration: 25_000,
-    })
+    expect(vi.mocked(setActionOutputs)).not.toHaveBeenCalled()
     // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(core.summary.write).toHaveBeenCalled()
   })
