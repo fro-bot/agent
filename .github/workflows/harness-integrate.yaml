@@ -46,7 +46,7 @@ on:
       OMO_PROVIDERS:
         description: Comma-separated oMo providers passed through to the merge (enable-omo is true on this path). Optional.
         required: false
-      # NO AUTH_JSON. NO secrets: inherit. The durable model credential must
+      # NO OPENCODE_AUTH_JSON. NO secrets: inherit. The durable model credential must
       # never reach this workflow — see docs/plans/2026-07-01-001-feat-harness-merge-credential-broker-plan.md.
 
 jobs:

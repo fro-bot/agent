@@ -300,7 +300,7 @@ jobs:
               || ''
             }}
         with:
-          auth-json: ${{ secrets.AUTH_JSON }}
+          auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           trusted-head-sha: ${{ steps.prehead.outputs.ref }}
           # Durable session state. The Actions cache alone is not sufficient: GitHub
           # issues read-only cache tokens for issue_comment and issues runs, so the

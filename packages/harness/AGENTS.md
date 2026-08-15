@@ -96,11 +96,11 @@ The `--source-tree` flag is explicit and fail-closed: if the directory is missin
 - The release is maintainer-gated `workflow_dispatch`.
 - `build` and `publish` are commit-pinned to a single resolved `integration_commit` (resolved once in `build`, consumed by `publish`).
 
-### `AUTH_JSON` secret
+### `OPENCODE_AUTH_JSON` secret
 
-Required for any release that runs an LLM merge (i.e. any release with integration refs configured). The integrate job reuses the repository's existing `AUTH_JSON` secret (the same model credential the action uses), so no separate secret is needed:
+Required for any release that runs an LLM merge (i.e. any release with integration refs configured). The integrate job reuses the repository's existing `OPENCODE_AUTH_JSON` secret (the same model credential the action uses), so no separate secret is needed:
 
-- **Name:** `AUTH_JSON`
+- **Name:** `OPENCODE_AUTH_JSON`
 - **Value:** JSON mapping provider to auth config:
   ```json
   {"anthropic": {"type": "api", "key": "sk-ant-..."}}
@@ -119,7 +119,7 @@ gh workflow run harness-release.yaml \
   --field dry_run=true
 ```
 
-**Real patched release** (the merge runs through Fro Bot, which uses the inherited `AUTH_JSON` model credential):
+**Real patched release** (the merge runs through Fro Bot, which uses the inherited `OPENCODE_AUTH_JSON` model credential):
 
 ```bash
 gh workflow run harness-release.yaml \
