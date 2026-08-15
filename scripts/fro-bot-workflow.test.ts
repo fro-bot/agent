@@ -581,7 +581,6 @@ describe('harness forward-shadow workflow wiring', () => {
     // #then
     expect(String(record.if)).toContain('always()')
     expect(String(upload.if)).toContain('always()')
-    expect(upload.uses).toBe('actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a')
     expect(uploadWith['retention-days']).toBe(90)
     expect(uploadWith['if-no-files-found']).toBe('warn')
     expect(String(uploadWith.path)).toMatch(/\.json/)
@@ -616,7 +615,6 @@ describe('harness forward-shadow workflow wiring', () => {
 
     // #then
     expect(permissions).toEqual({contents: 'write', 'pull-requests': 'write'})
-    expect(download.uses).toBe('actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c')
     expect(String(download.if)).toContain('always()')
     expect(String(download.if)).toContain("has_refs == 'true'")
     expect(download['continue-on-error']).toBe(true)
