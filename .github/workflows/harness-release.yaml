@@ -208,7 +208,6 @@ jobs:
       APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
       APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
       OPENCODE_CONFIG: ${{ secrets.OPENCODE_CONFIG }}
-      OMO_PROVIDERS: ${{ secrets.OMO_PROVIDERS }}
     with:
       model: ${{ vars.HARNESS_MODEL }}
       prompt: ${{ needs.prepare-integrate.outputs.rendered_prompt }}
