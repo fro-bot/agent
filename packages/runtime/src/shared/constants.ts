@@ -25,7 +25,7 @@ export const DEFAULT_MODEL = {
 // FALLBACK_VERSION (in opencode.ts) is the plain stock base used when latest-fetch fails.
 export const DEFAULT_OPENCODE_VERSION = '1.18.18+harness.417b2b35'
 export const DEFAULT_BUN_VERSION = '1.3.14'
-export const DEFAULT_OMO_VERSION = '3.17.15'
+export const DEFAULT_OMO_VERSION = '4.19.4'
 // OMO Slim (oh-my-opencode-slim) pinned version. Stable line only — the 2.0.0-beta
 // channel is not the default. Renovate tracks this via .github/renovate.json5.
 export const DEFAULT_OMO_SLIM_VERSION = '1.1.2'
