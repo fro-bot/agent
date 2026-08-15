@@ -126,6 +126,8 @@ jobs:
           model: ${{ inputs.model || vars.HARNESS_MODEL }}
           prompt: ${{ inputs.prompt }}
           response-mode: none
+          # Integration delivery is always local; keep this caller explicit so
+          # prompt wording cannot change the output contract.
           output-mode: working-dir
           # Preserve the current integrate behavior: the merge runs with oMo
           # enabled (the correlation-id-gated disable in fro-bot.yaml applies
