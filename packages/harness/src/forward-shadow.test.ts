@@ -9,7 +9,9 @@ import {
   buildIntegrationOutcomeFile,
   compareForwardShadow,
   deriveForwardShadowConflictMetrics,
+  evaluateForwardShadowDirectory,
   evaluateForwardShadowGate,
+  forwardShadowEvidencePath,
   makeAnonymousGitEnv,
   validateForwardShadowRecord,
   writeForwardShadowRecord,
@@ -413,6 +415,66 @@ describe('forward shadow gate', () => {
     )
     expect(evaluateForwardShadowGate(noConflict).ok).toBe(false)
     expect(evaluateForwardShadowGate(noConflict, {ackNoConflictEvidence: true}).ok).toBe(true)
+  })
+
+  it('distinguishes insufficient no-conflict evidence from contradictory evidence', () => {
+    // #given three strict matches without conflict evidence and a divergent record
+    const noConflict = ['1.15.13', '1.15.14', '1.15.15'].map(baseVersion =>
+      buildForwardShadowRecord({
+        ...baseInput(),
+        baseVersion,
+        conflictMetrics: {...baseInput().conflictMetrics, hadConflict: false},
+      }),
+    )
+    const mismatch = buildForwardShadowRecord(
+      baseInput({
+        baseVersion: '1.15.16',
+        authoritative: {ref: 'refs/tags/v1.15.16', commit: OID_A, tree: OID_C},
+      }),
+    )
+
+    // #when
+    const insufficient = evaluateForwardShadowGate(noConflict)
+    const contradictory = evaluateForwardShadowGate([...noConflict, mismatch])
+
+    // #then
+    expect(insufficient.status).toBe('insufficient-evidence')
+    expect(insufficient.reasons).toContain(
+      'no conflict evidence; pass --ack-no-conflict-evidence only with explicit review',
+    )
+    expect(contradictory.status).toBe('evidence-contradicts')
+    expect(contradictory.reasons).toContain('record 4 is mismatch')
+  })
+
+  it('keeps non-match evidence in a diagnostic directory outside the gate scan', async () => {
+    // #given three countable matches and one non-match retained through the hygiene path
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-evidence-test-'))
+    const matches = ['1.15.13', '1.15.14', '1.15.15'].map(baseVersion =>
+      buildForwardShadowRecord({...baseInput(), baseVersion}),
+    )
+    const mismatch = buildForwardShadowRecord(
+      baseInput({
+        baseVersion: '1.15.16',
+        authoritative: {ref: 'refs/tags/v1.15.16', commit: OID_A, tree: OID_C},
+      }),
+    )
+
+    try {
+      // #when
+      for (const record of matches) {
+        await writeForwardShadowRecord(forwardShadowEvidencePath(directory, record, 'run-match'), record)
+      }
+      const mismatchPath = forwardShadowEvidencePath(directory, mismatch, 'run-mismatch')
+      await writeForwardShadowRecord(mismatchPath, mismatch)
+      const result = await evaluateForwardShadowDirectory(directory)
+
+      // #then
+      expect(result.ok).toBe(true)
+      expect(mismatchPath).toBe(path.join(directory, 'non-matches', '1.15.16-run-mismatch.json'))
+      expect(await fs.readFile(mismatchPath, 'utf8')).toContain('"verdict": "mismatch"')
+    } finally {
+      await fs.rm(directory, {recursive: true, force: true})
+    }
   })
 })
 

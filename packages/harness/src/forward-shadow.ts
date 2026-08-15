@@ -75,6 +75,8 @@ export interface ForwardShadowRecord {
   readonly failureError?: string
 }
 
+export type ForwardShadowGateStatus = 'ready' | 'insufficient-evidence' | 'evidence-contradicts'
+
 export interface ForwardShadowRecordInput {
   readonly baseVersion: string
   readonly releaseRepo: string
@@ -138,11 +140,27 @@ export interface ForwardShadowGateOptions {
 
 export interface ForwardShadowGateResult {
   readonly ok: boolean
+  readonly status: ForwardShadowGateStatus
   readonly matchCount: number
   readonly distinctBaseVersions: readonly string[]
   readonly conflictEvidenceCount: number
   readonly invalidRecordCount: number
   readonly reasons: readonly string[]
+}
+
+function safeEvidencePathSegment(value: string): string {
+  const sanitized = value.replaceAll(/[^\w.-]+/g, '-').replaceAll(/^-+|-+$/g, '')
+  return sanitized.length === 0 ? 'unknown' : sanitized.slice(0, 128)
+}
+
+export function forwardShadowEvidencePath(
+  directory: string,
+  record: Pick<ForwardShadowRecord, 'baseVersion' | 'verdict'>,
+  evidenceKey: string,
+): string {
+  const baseVersion = safeEvidencePathSegment(record.baseVersion)
+  if (record.verdict === 'match') return path.join(directory, `${baseVersion}.json`)
+  return path.join(directory, 'non-matches', `${baseVersion}-${safeEvidencePathSegment(evidenceKey)}.json`)
 }
 
 export interface IntegrationOutcomeFile {
@@ -704,8 +722,15 @@ export function evaluateForwardShadowGate(
     versions.length >= FORWARD_SHADOW_MIN_MATCHES &&
     hasDuplicate === false &&
     (options.ackNoConflictEvidence === true || conflictEvidenceCount > 0)
+  const hasContradictoryEvidence = invalidRecordCount > 0 || matches.length !== validRecords.length
+  const status: ForwardShadowGateStatus = ok
+    ? 'ready'
+    : hasContradictoryEvidence
+      ? 'evidence-contradicts'
+      : 'insufficient-evidence'
   return {
     ok,
+    status,
     matchCount: matches.length,
     distinctBaseVersions: versions,
     conflictEvidenceCount,

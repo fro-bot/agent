@@ -1113,7 +1113,10 @@ jobs:
   #
   # Replaces Renovate tracking for the harness version (Renovate can't order
   # +harness.<sha> tags). Runs only after a successful real publish; never on
-  # dry-run. The release is already done — this job is best-effort.
+  # dry-run. The release is already done — this job is best-effort. Forward
+  # shadow records from dry-runs and failed publishes remain in their 90-day
+  # workflow artifacts, but are not durable release evidence because the record
+  # schema does not identify a published release.
   # ---------------------------------------------------------------------------
   sync-default-version:
     name: sync-default-version (bump DEFAULT_OPENCODE_VERSION)
@@ -1182,23 +1185,99 @@ jobs:
           set -euo pipefail
           SOURCE="${RUNNER_TEMP}/harness-shadow/harness-shadow-${BASE_VERSION}.json"
           if [ ! -f "${SOURCE}" ]; then
-            echo "pr-line=" >> "$GITHUB_OUTPUT"
-            echo "Forward shadow evidence artifact was unavailable; continuing without evidence."
+            MESSAGE="Forward shadow evidence artifact was unavailable for ${BASE_VERSION}; continuing without evidence."
+            echo "::warning title=Forward shadow evidence unavailable::${MESSAGE}"
+            {
+              echo "### Forward-shadow evidence"
+              echo "- ⚠️ ${MESSAGE}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "pr-line=- ⚠️ ${MESSAGE}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          bun -e "
-            import fs from 'node:fs';
-            import {validateForwardShadowRecord} from './packages/harness/src/forward-shadow.ts';
-            const value = JSON.parse(fs.readFileSync(process.env.SOURCE, 'utf8'));
-            const validation = validateForwardShadowRecord(value);
-            if (validation.ok !== true || validation.value?.baseVersion !== process.env.BASE_VERSION) {
-              throw new Error('forward shadow record failed strict retention validation');
-            }
-          "
-          DEST="docs/evidence/harness-shadow/${BASE_VERSION}.json"
+          DEST=$(
+            SOURCE="${SOURCE}" \
+            BASE_VERSION="${BASE_VERSION}" \
+            RETENTION_ROOT="docs/evidence/harness-shadow" \
+            RETENTION_KEY="run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}" \
+              bun -e "
+                import fs from 'node:fs';
+                import {forwardShadowEvidencePath, validateForwardShadowRecord} from './packages/harness/src/forward-shadow.ts';
+                const source = process.env.SOURCE;
+                if (source === undefined) throw new Error('SOURCE is missing');
+                const value = JSON.parse(fs.readFileSync(source, 'utf8'));
+                const validation = validateForwardShadowRecord(value);
+                if (validation.ok !== true || validation.value === undefined || validation.value.baseVersion !== process.env.BASE_VERSION) {
+                  throw new Error('forward shadow record failed strict retention validation');
+                }
+                const root = process.env.RETENTION_ROOT;
+                const key = process.env.RETENTION_KEY;
+                if (root === undefined || key === undefined) throw new Error('retention path inputs are missing');
+                process.stdout.write(forwardShadowEvidencePath(root, validation.value, key));
+              "
+          )
+          if [ -z "${DEST}" ]; then
+            echo "ERROR: forward shadow retention path was empty" >&2
+            exit 1
+          fi
           mkdir -p "$(dirname "${DEST}")"
           cp "${SOURCE}" "${DEST}"
-          echo "pr-line=- Retains forward-shadow evidence in docs/evidence/harness-shadow/${BASE_VERSION}.json." >> "$GITHUB_OUTPUT"
+          if [[ "${DEST}" == */non-matches/* ]]; then
+            echo "pr-line=- Retains non-countable forward-shadow evidence in ${DEST} for diagnosis; it is excluded from the cutover gate." >> "$GITHUB_OUTPUT"
+          else
+            echo "pr-line=- Retains countable forward-shadow evidence in ${DEST}." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report forward shadow gate
+        id: forward-shadow-gate
+        if: ${{ always() && needs.prepare-integrate.outputs.has_refs == 'true' }}
+        continue-on-error: true
+        env:
+          GATE_JSON: ${{ runner.temp }}/forward-shadow-gate.json
+        run: |
+          set -euo pipefail
+          RECORDS_DIR="docs/evidence/harness-shadow"
+          mkdir -p "${RECORDS_DIR}"
+          set +e
+          bun run packages/harness/src/forward-shadow-gate.ts \
+            --records-dir "${RECORDS_DIR}" \
+            > "${GATE_JSON}"
+          GATE_EXIT=$?
+          set -e
+          if [ ! -s "${GATE_JSON}" ]; then
+            MESSAGE="Forward-shadow evidence gate could not produce a result; continuing without blocking the release."
+            echo "::warning title=Forward-shadow evidence gate unavailable::${MESSAGE}"
+            {
+              echo "### Forward-shadow evidence gate"
+              echo "- ⚠️ ${MESSAGE}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "pr-line=- ⚠️ ${MESSAGE}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cat "${GATE_JSON}"
+          if [ "${GATE_EXIT}" -ne 0 ]; then
+            echo "::warning title=Forward-shadow evidence gate incomplete::See the job summary for the current evidence count and reason."
+          fi
+          GATE_JSON="${GATE_JSON}" node -e "
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync(process.env.GATE_JSON, 'utf8'));
+            const status = result.ok === true ? 'ready' : result.status;
+            const versions = result.distinctBaseVersions.length === 0 ? 'none' : result.distinctBaseVersions.join(', ');
+            const reason = result.reasons.length === 0
+              ? 'all strict gate requirements are satisfied'
+              : result.reasons.map(value => String(value).replaceAll(/\\s+/g, ' ')).join('; ');
+            const summary = [
+              '### Forward-shadow evidence gate',
+              '',
+              '- Status: **' + status + '**',
+              '- Distinct matching base versions: ' + result.distinctBaseVersions.length + '/3 (' + versions + ')',
+              '- Conflict evidence records: ' + result.conflictEvidenceCount,
+              '- Reason: ' + reason,
+              '',
+            ].join('\\n');
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'pr-line=- Forward-shadow gate: ' + status + '; ' + result.distinctBaseVersions.length + '/3 distinct matching base versions; ' + reason + '\\n');
+          "
+          exit 0
 
       - name: Compute NEW_VERSION and check idempotency
         id: version
@@ -1342,6 +1421,7 @@ jobs:
             prior build.
 
             ${{ steps.retain-shadow-evidence.outputs.pr-line }}
+            ${{ steps.forward-shadow-gate.outputs.pr-line }}
           base: main
           author: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
           committer: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
