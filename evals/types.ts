@@ -62,6 +62,29 @@ export type GateKind = 'quality' | 'safety'
 export type EvalRunState = 'passed' | 'failed' | 'inconclusive'
 
 /**
+ * The quality-relevant portion of a gate. Details are intentionally omitted:
+ * they are useful diagnostics, but free-form text is not a stable comparison
+ * contract.
+ */
+export interface StableGateProjection {
+  readonly id: string
+  readonly kind: GateKind
+  readonly status: GateStatus
+}
+
+/**
+ * The outcome projection used for candidate-vs-baseline comparison. Runtime,
+ * prompt, timing, cost, and token data stay on the report as provenance or
+ * advisory evidence and never become quality equality gates.
+ */
+export interface StableOutcomeProjection {
+  readonly scenarioId: string
+  readonly state: EvalRunState
+  readonly verdict: ResponseFileVerdict | null
+  readonly gates: readonly StableGateProjection[]
+}
+
+/**
  * The slice of a run that is observable from the response file and agent result alone.
  *
  * Kept separate from {@link EvalRunArtifacts} deliberately: a collector that knows only
@@ -118,6 +141,7 @@ export interface EvalRunReport {
   readonly state: EvalRunState
   readonly stateReason: string
   readonly execution: ExecutionDiagnostics
+  readonly outcome: StableOutcomeProjection
   readonly gates: readonly GateResult[]
   readonly agentResult: Pick<AgentResult, 'success' | 'exitCode' | 'error' | 'tokenUsage'>
 }
