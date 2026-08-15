@@ -281,6 +281,7 @@ interface BuildEnvironmentOptions {
 /** Build env without copying provider keys or the caller's OpenCode config. */
 export function buildConflictResolverEnv(options: BuildEnvironmentOptions): NodeJS.ProcessEnv {
   const result = buildRuntimeEnv(options.source)
+  // Model turns use the private attempt sandbox as HOME.
   result.HOME = options.workspace.home
   result.XDG_CONFIG_HOME = options.workspace.xdgConfigHome
   result.XDG_DATA_HOME = options.workspace.xdgDataHome
@@ -315,6 +316,7 @@ function resolverGitEnv(): NodeJS.ProcessEnv {
   const source = process.env
   const env: NodeJS.ProcessEnv = {
     PATH: source.PATH ?? '',
+    // Internal Git plumbing uses a nonexistent HOME to exclude ambient config.
     HOME: process.platform === 'win32' ? 'NUL' : '/nonexistent',
     GIT_TERMINAL_PROMPT: '0',
     GIT_CONFIG_NOSYSTEM: '1',
@@ -517,13 +519,17 @@ async function recreateConflictAttempt(
   return baselines
 }
 
-async function readRegularFile(root: string, relative: string): Promise<Uint8Array> {
+async function openRegularFile(
+  root: string,
+  relative: string,
+  flags: number,
+): Promise<import('node:fs/promises').FileHandle> {
   const normalized = safeRelativePath(relative)
   const parts = normalized.split('/')
   let current = root
   // Node does not expose openat, so parent-component traversal remains a path-based
   // check with a residual race. The final component is opened with O_NOFOLLOW and
-  // read through that handle to close the check-then-read gap at the extraction boundary.
+  // read or write through that handle to close the check-then-access gap at the boundary.
   for (const part of parts) {
     current = path.join(current, part)
     const stat = await fs.lstat(current)
@@ -534,7 +540,7 @@ async function readRegularFile(root: string, relative: string): Promise<Uint8Arr
   }
   let handle: import('node:fs/promises').FileHandle
   try {
-    handle = await fs.open(current, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+    handle = await fs.open(current, flags, 0o666)
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ELOOP') {
       throw new Error(`conflict path follows a symlink: ${relative}`)
@@ -544,8 +550,30 @@ async function readRegularFile(root: string, relative: string): Promise<Uint8Arr
   try {
     const finalStat = await handle.stat()
     if (finalStat.isFile() === false) throw new Error(`conflict path is not a regular file: ${relative}`)
-    const bytes = await handle.readFile()
-    return bytes
+    return handle
+  } catch (error) {
+    await handle.close()
+    throw error
+  }
+}
+
+async function readRegularFile(root: string, relative: string): Promise<Uint8Array> {
+  const handle = await openRegularFile(root, relative, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+  try {
+    return await handle.readFile()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function writeRegularFile(root: string, relative: string, bytes: Uint8Array): Promise<void> {
+  const handle = await openRegularFile(
+    root,
+    relative,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
+  )
+  try {
+    await handle.writeFile(bytes)
   } finally {
     await handle.close()
   }
@@ -658,11 +686,7 @@ async function readContextRequests(workDir: string): Promise<string[]> {
 }
 
 async function applyAcceptedBlobs(integrationWorkDir: string, blobs: readonly AcceptedBlob[]): Promise<void> {
-  for (const blob of blobs) await readRegularFile(integrationWorkDir, blob.path)
-  for (const blob of blobs) {
-    const target = path.join(integrationWorkDir, safeRelativePath(blob.path))
-    await fs.writeFile(target, blob.content)
-  }
+  for (const blob of blobs) await writeRegularFile(integrationWorkDir, blob.path, blob.content)
 }
 
 function failure(

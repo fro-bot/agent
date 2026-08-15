@@ -107,11 +107,13 @@ export interface ForwardShadowGitAdapter {
   readonly resolveCommitTree: (
     workDir: string,
     ref: string,
+    env: NodeJS.ProcessEnv,
   ) => Promise<{readonly commit: string; readonly tree: string}>
   readonly diffTrees: (
     workDir: string,
     shadowCommit: string,
     authoritativeCommit: string,
+    env: NodeJS.ProcessEnv,
   ) => Promise<ForwardShadowDivergence>
 }
 
@@ -353,6 +355,74 @@ export function validateForwardShadowRecord(value: unknown): ForwardShadowValida
     : {ok: false, errors}
 }
 
+function validateIntegrationOutcomeFile(value: unknown): readonly string[] {
+  const errors: string[] = []
+  if (!isRecord(value)) return ['outcome is not an object']
+  checkKeys(
+    value,
+    [
+      'schemaVersion',
+      'ok',
+      'startedAt',
+      'endedAt',
+      'elapsedMs',
+      'manifest',
+      'conflictDiagnostics',
+      'conflictMetrics',
+      'failure',
+    ],
+    'outcome',
+    errors,
+  )
+  if (value.schemaVersion !== FORWARD_SHADOW_SCHEMA_VERSION) errors.push('outcome.schemaVersion is not 1')
+  if (typeof value.ok !== 'boolean') errors.push('outcome.ok is invalid')
+  if (!isDateString(value.startedAt) || !isDateString(value.endedAt))
+    errors.push('outcome.startedAt/endedAt are invalid')
+  if (!isNonNegativeInteger(value.elapsedMs)) errors.push('outcome.elapsedMs is invalid')
+
+  if (value.manifest !== undefined) {
+    if (isRecord(value.manifest)) {
+      checkKeys(
+        value.manifest,
+        ['baseVersion', 'integrationRefs', 'integrationCommit', 'buildSha'],
+        'outcome.manifest',
+        errors,
+      )
+      if (typeof value.manifest.baseVersion !== 'string' || value.manifest.baseVersion.length === 0) {
+        errors.push('outcome.manifest.baseVersion is invalid')
+      }
+      if (value.manifest.integrationCommit !== null && typeof value.manifest.integrationCommit !== 'string') {
+        errors.push('outcome.manifest.integrationCommit is invalid')
+      }
+      if (typeof value.manifest.buildSha !== 'string') errors.push('outcome.manifest.buildSha is invalid')
+      if (Array.isArray(value.manifest.integrationRefs) === false) {
+        errors.push('outcome.manifest.integrationRefs is invalid')
+      }
+    } else {
+      errors.push('outcome.manifest is not an object')
+    }
+  }
+
+  if (value.conflictDiagnostics !== undefined && Array.isArray(value.conflictDiagnostics) === false) {
+    errors.push('outcome.conflictDiagnostics is invalid')
+  }
+  if (value.conflictMetrics !== undefined) validateConflictMetrics(value.conflictMetrics, errors)
+  if (value.failure !== undefined) {
+    if (isRecord(value.failure)) {
+      checkKeys(value.failure, ['stage', 'error'], 'outcome.failure', errors)
+      if (typeof value.failure.stage !== 'string' || value.failure.stage.length === 0) {
+        errors.push('outcome.failure.stage is invalid')
+      }
+      if (typeof value.failure.error !== 'string' || value.failure.error.length > FORWARD_SHADOW_MAX_TEXT) {
+        errors.push('outcome.failure.error is invalid')
+      }
+    } else {
+      errors.push('outcome.failure is not an object')
+    }
+  }
+  return errors
+}
+
 function endpointValue(value: ForwardShadowEndpoint): ForwardShadowEndpoint {
   return {
     ref: boundedText(value.ref),
@@ -484,14 +554,12 @@ const defaultForwardShadowGitAdapter: ForwardShadowGitAdapter = {
     )
     return localRef
   },
-  resolveCommitTree: async (workDir, ref) => {
-    const env = makeAnonymousGitEnv()
+  resolveCommitTree: async (workDir, ref, env) => {
     const commit = (await runGit(['rev-parse', '--verify', `${ref}^{commit}`], workDir, env)).trim()
     const tree = (await runGit(['rev-parse', '--verify', `${ref}^{tree}`], workDir, env)).trim()
     return {commit, tree}
   },
-  diffTrees: async (workDir, shadowCommit, authoritativeCommit) => {
-    const env = makeAnonymousGitEnv()
+  diffTrees: async (workDir, shadowCommit, authoritativeCommit, env) => {
     const paths = parseNameStatus(
       await runGit(['diff', '--name-status', '-z', '--no-renames', shadowCommit, authoritativeCommit], workDir, env),
     )
@@ -543,14 +611,14 @@ export async function compareForwardShadow(
 
   try {
     const env = makeAnonymousGitEnv()
-    const shadow = await adapter.resolveCommitTree(input.shadowWorkDir, input.shadowRef)
+    const shadow = await adapter.resolveCommitTree(input.shadowWorkDir, input.shadowRef, env)
     const authoritativeRef = await adapter.fetchAuthoritativeRef({
       workDir: input.shadowWorkDir,
       repository: input.authoritativeRepository,
       ref: input.authoritativeRef,
       env,
     })
-    const authoritative = await adapter.resolveCommitTree(input.shadowWorkDir, authoritativeRef)
+    const authoritative = await adapter.resolveCommitTree(input.shadowWorkDir, authoritativeRef, env)
     const common = {
       baseVersion: input.baseVersion,
       releaseRepo: input.releaseRepo,
@@ -567,7 +635,7 @@ export async function compareForwardShadow(
       if (shadow.tree.toLowerCase() === authoritative.tree.toLowerCase()) {
         return buildForwardShadowRecord({...common, divergence: {summary: 'trees match', paths: [], shortstat: ''}})
       }
-      const divergence = await adapter.diffTrees(input.shadowWorkDir, shadow.commit, authoritative.commit)
+      const divergence = await adapter.diffTrees(input.shadowWorkDir, shadow.commit, authoritative.commit, env)
       return buildForwardShadowRecord({...common, divergence})
     }
     return buildForwardShadowRecord({
@@ -722,5 +790,7 @@ export function buildIntegrationOutcomeFile(
 }
 
 export async function writeIntegrationOutcomeFile(outputPath: string, outcome: IntegrationOutcomeFile): Promise<void> {
+  const errors = validateIntegrationOutcomeFile(outcome)
+  if (errors.length > 0) throw new Error(`cannot write invalid integration outcome: ${errors.join('; ')}`)
   await writeAtomicJson(outputPath, outcome)
 }

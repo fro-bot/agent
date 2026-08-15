@@ -13,6 +13,7 @@ import {
   makeAnonymousGitEnv,
   validateForwardShadowRecord,
   writeForwardShadowRecord,
+  writeIntegrationOutcomeFile,
 } from './forward-shadow.js'
 
 const OID_A = 'a'.repeat(40)
@@ -138,6 +139,32 @@ describe('forward shadow records', () => {
     expect(outcome.conflictMetrics).toEqual(deriveForwardShadowConflictMetrics(successfulIntegrationResult()))
     expect(outcome.failure?.stage).toBe('artifact')
   })
+
+  it('rejects an invalid integration outcome at the write boundary', async () => {
+    // #given
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-outcome-test-'))
+    const outputPath = path.join(directory, 'outcome.json')
+    const outcome = buildIntegrationOutcomeFile(
+      successfulIntegrationResult(),
+      '2026-08-14T00:00:00.000Z',
+      '2026-08-14T00:00:01.000Z',
+    )
+    const invalidOutcome = {...outcome, schemaVersion: 2} as unknown as Parameters<
+      typeof writeIntegrationOutcomeFile
+    >[1]
+
+    try {
+      // #when
+      await expect(writeIntegrationOutcomeFile(outputPath, invalidOutcome)).rejects.toThrow(
+        /invalid integration outcome|schemaVersion/i,
+      )
+
+      // #then
+      await expect(fs.access(outputPath)).rejects.toThrow()
+    } finally {
+      await fs.rm(directory, {recursive: true, force: true})
+    }
+  })
 })
 
 describe('forward shadow comparator', () => {
@@ -222,6 +249,49 @@ describe('forward shadow comparator', () => {
     expect(repositories).toEqual(['fro-bot/agent'])
   })
 
+  it('treats a non-OID shadow resolve as inconclusive after a successful fetch', async () => {
+    // #given
+    const calls: string[] = []
+    const adapter = {
+      fetchAuthoritativeRef: async () => {
+        calls.push('fetch')
+        return 'refs/harness-shadow/authoritative'
+      },
+      resolveCommitTree: async (_workDir: string, ref: string) => {
+        calls.push(`resolve:${ref}`)
+        return ref === 'HEAD' ? {commit: 'not-an-oid', tree: OID_B} : {commit: OID_A, tree: OID_B}
+      },
+      diffTrees: async () => {
+        throw new Error('diff must not run for an inconclusive resolve')
+      },
+    }
+
+    // #when
+    const record = await compareForwardShadow(
+      {
+        baseVersion: '1.15.13',
+        releaseRepo: 'anomalyco/opencode',
+        authoritativeRepository: 'fro-bot/agent',
+        integrationRefs: [],
+        shadowWorkDir: '/tmp/shadow',
+        shadowRef: 'HEAD',
+        authoritativeRef: 'refs/tags/v1.15.13',
+        runIdentity: 'run-123',
+        startedAt: '2026-08-14T00:00:00.000Z',
+        endedAt: '2026-08-14T00:00:01.000Z',
+        conflictMetrics: baseInput().conflictMetrics,
+        result: successfulIntegrationResult(),
+      },
+      adapter,
+    )
+
+    // #then
+    expect(record.verdict).toBe('inconclusive')
+    expect(record.failureStage).toBe('shadow-compare')
+    expect(record.failureError).toMatch(/OID/i)
+    expect(calls).toEqual(['resolve:HEAD', 'fetch', 'resolve:refs/harness-shadow/authoritative'])
+  })
+
   it('reports bounded divergence for unequal trees and never turns comparator errors into matches', async () => {
     // #given
     const adapter = {
@@ -297,6 +367,24 @@ describe('forward shadow gate', () => {
     expect(result.ok).toBe(true)
     expect(result.matchCount).toBe(3)
     expect(result.distinctBaseVersions).toEqual(['1.15.13', '1.15.14', '1.15.15'])
+  })
+
+  it('rejects one inconclusive record even with three distinct matching records', () => {
+    // #given
+    const matches = ['1.15.13', '1.15.14', '1.15.15'].map(baseVersion =>
+      buildForwardShadowRecord({...baseInput(), baseVersion}),
+    )
+    const inconclusive = buildForwardShadowRecord(
+      baseInput({shadow: {ref: 'refs/harness-shadow/inconclusive', commit: null, tree: null}}),
+    )
+
+    // #when
+    const result = evaluateForwardShadowGate([...matches, inconclusive])
+
+    // #then
+    expect(result.ok).toBe(false)
+    expect(result.matchCount).toBe(3)
+    expect(result.reasons).toContain('record 4 is inconclusive')
   })
 
   it('fails on insufficient matches, duplicates, malformed records, or missing conflict evidence', () => {

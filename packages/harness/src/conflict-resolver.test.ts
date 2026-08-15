@@ -287,6 +287,43 @@ describe('resolveConflict', () => {
     expect(await fs.readFile(path.join(repo.workDir, 'conflict.txt'), 'utf8')).toContain('<<<<<<<')
   })
 
+  it('writes through the open handle when the target path is swapped', async () => {
+    // #given
+    if (repo === undefined) throw new Error('test repository was not created')
+    const targetPath = path.join(repo.workDir, 'conflict.txt')
+    const redirectPath = path.join(repo.workDir, 'write-redirect.txt')
+    let swapped = false
+    const originalOpen = fs.open.bind(fs)
+    const openSpy = vi.spyOn(fs, 'open').mockImplementation(async (target, flags, mode) => {
+      const handle = await originalOpen(target, flags, mode)
+      if (swapped === false && typeof target === 'string' && path.resolve(target) === path.resolve(targetPath)) {
+        swapped = true
+        await fs.writeFile(redirectPath, 'redirected\n', 'utf8')
+        await fs.rm(target)
+        await fs.symlink(path.basename(redirectPath), target)
+      }
+      return handle
+    })
+
+    // #when
+    let result: ConflictResolverResult
+    try {
+      result = await resolveConflict(makeRequest(repo), {
+        runModel: async turn => {
+          await fs.writeFile(path.join(turn.workDir, 'conflict.txt'), 'accepted\n', 'utf8')
+        },
+      })
+    } finally {
+      openSpy.mockRestore()
+    }
+
+    // #then
+    if (result.ok === false) throw new Error(JSON.stringify(result))
+    expect(swapped).toBe(true)
+    expect((await fs.lstat(targetPath)).isSymbolicLink()).toBe(true)
+    expect(await fs.readFile(redirectPath, 'utf8')).toBe('redirected\n')
+  })
+
   it('does not treat ignored, untracked, metadata, or mode changes in scratch as artifact authority', async () => {
     // #given
     if (repo === undefined) throw new Error('test repository was not created')
