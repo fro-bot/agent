@@ -38,6 +38,14 @@ Safety and response-contract failures are decisive and block without stochastic 
 
 The committed `u1.json` artifact predates the stable outcome projection. Until a newly reviewed baseline includes those observations, comparison returns explicit missing-evidence rather than copying candidate values into the baseline or inferring an observed verdict from expected metadata.
 
+### Bounded session-presearch experiment
+
+U4 is an eval-only differential seam, not a public feature. `runSessionPrep` keeps the current eager behavior when its strategy is omitted. The runner may inject the treatment strategy for only the existing `continuation-relevant` and `continuation-irrelevant-non-degradation` scenarios; the treatment removes eager recent/prior-work context while preserving the logical key, continuation identity, and native `session_*` capability.
+
+The treatment is selected by dependency injection through the runner path. There is no Action input, general feature flag, environment switch, or global state. Reports may include advisory `sessionPresearch` accounting for strategy, logical/continuation identity, context result counts, and injected-context bytes. That provenance is never a quality gate and contains no tool-call, call-count, ordering, or reasoning claim.
+
+The comparison reuses the stable outcome projection and the existing lazy four-vs-four repeat bound. A clean result means only that no large regression was observed on these two covered scenarios. If both modes pass, the corpus cannot attribute causal improvement; deleting eager presearch would be a documented simplicity/cost judgment rather than evidence that the model reasoned better.
+
 ## Run it
 
 Normal test runs do not start OpenCode and do not cost anything:

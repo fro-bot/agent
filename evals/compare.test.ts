@@ -174,7 +174,7 @@ describe('compareCandidateToBaseline', () => {
     {
       label: 'a registry-order mismatch',
       reports: (baselineReports: readonly EvalRunReport[]): readonly EvalRunReport[] => [...baselineReports].reverse(),
-      expectedReason: 'Reviewed baseline reports must exactly match the enabled scenario registry in order',
+      expectedReason: 'Reviewed baseline reports must exactly match the enabled or selected scenario registry in order',
     },
   ])('rejects reviewed baseline reports with $label', ({reports, expectedReason}) => {
     // #given a reviewed baseline report set with one invalid validation condition
@@ -190,6 +190,64 @@ describe('compareCandidateToBaseline', () => {
     // #then the specific baseline validation rejection is returned
     expect(comparison.status).toBe('failed')
     expect(comparison.reason).toBe(expectedReason)
+  })
+
+  it('compares the two existing continuation scenarios without expanding the corpus', () => {
+    // #given a reviewed six-scenario baseline and candidate reports for only the bounded experiment slice
+    const baselineReports = createCorpusReports()
+    const scenarioIds = ['continuation-relevant', 'continuation-irrelevant-non-degradation'] as const
+    const candidateReports = baselineReports.filter(report =>
+      scenarioIds.includes(report.scenarioId as (typeof scenarioIds)[number]),
+    )
+
+    // #when the bounded scenario slice is compared through the existing stable machinery
+    const comparison = compareCandidateToBaseline({
+      candidateReports,
+      reviewedBaseline: createBaseline(baselineReports),
+      reviewedBaselineReports: baselineReports,
+      scenarioIds,
+    })
+
+    // #then only the two selected outcomes participate and the result remains non-regression evidence
+    expect(comparison.status).toBe('passed')
+    expect(comparison.scenarios.map(scenario => scenario.scenarioId)).toEqual(scenarioIds)
+    expect(comparison.statement).toBe('No large observed regression across the two covered scenarios')
+  })
+
+  it('keeps presearch accounting advisory rather than stable quality evidence', () => {
+    // #given identical stable outcomes with different context accounting between modes
+    const baselineReports = createCorpusReports().map(report => ({
+      ...report,
+      sessionPresearch: {
+        strategy: 'production-default' as const,
+        logicalKey: 'issue-1',
+        continuationSessionId: 'continuation-session-42',
+        recentSessionCount: 2,
+        priorWorkResultCount: 1,
+        injectedContextBytes: 512,
+      },
+    }))
+    const candidateReports = baselineReports.map(report => ({
+      ...report,
+      sessionPresearch: {
+        ...report.sessionPresearch,
+        strategy: 'treatment' as const,
+        recentSessionCount: 0,
+        priorWorkResultCount: 0,
+        injectedContextBytes: 0,
+      },
+    }))
+
+    // #when the treatment is compared with the eager baseline
+    const comparison = compareCandidateToBaseline({
+      candidateReports,
+      reviewedBaseline: createBaseline(baselineReports),
+      reviewedBaselineReports: baselineReports,
+    })
+
+    // #then accounting differences are visible without changing the stable result
+    expect(comparison.status).toBe('passed')
+    expect(comparison.advisoryDifferences.some(difference => difference.field === 'sessionPresearch')).toBe(true)
   })
 
   it('blocks on safety or response-contract failure without a stochastic retry request', () => {

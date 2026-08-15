@@ -14,3 +14,8 @@ export const ALL_SCENARIOS = [
   continuationIrrelevantNonDegradationScenario,
   unchangedConstraintViolationScenario,
 ] as const
+
+export const PRESEARCH_EXPERIMENT_SCENARIO_IDS = [
+  'continuation-relevant',
+  'continuation-irrelevant-non-degradation',
+] as const

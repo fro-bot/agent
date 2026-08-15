@@ -34,6 +34,17 @@ export interface PriorWork {
   readonly currentThreadSessionId: string
 }
 
+export type SessionPresearchStrategy = 'production-default' | 'treatment'
+
+export interface SessionPresearchAccounting {
+  readonly strategy: SessionPresearchStrategy
+  readonly logicalKey: string | null
+  readonly continuationSessionId: string | null
+  readonly recentSessionCount: number
+  readonly priorWorkResultCount: number
+  readonly injectedContextBytes: number
+}
+
 export interface Scenario {
   readonly id: string
   readonly description: string
@@ -144,4 +155,6 @@ export interface EvalRunReport {
   readonly outcome: StableOutcomeProjection
   readonly gates: readonly GateResult[]
   readonly agentResult: Pick<AgentResult, 'success' | 'exitCode' | 'error' | 'tokenUsage'>
+  /** Advisory context provenance for the bounded presearch experiment; never a quality gate. */
+  readonly sessionPresearch?: SessionPresearchAccounting
 }
