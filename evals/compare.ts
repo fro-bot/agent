@@ -2,7 +2,7 @@ import type {EvalRunReport, StableGateProjection, StableOutcomeProjection} from 
 import type {BaselineArtifact} from './update-baseline.js'
 import {evaluateCorpusReports} from './corpus-verdict.js'
 import {isDecisiveGateFailure, isStochasticQualityGateFailure} from './gates.js'
-import {ALL_SCENARIOS, MAX_SCENARIOS} from './scenarios/index.js'
+import {ALL_SCENARIOS, MAX_SCENARIOS, PRESEARCH_EXPERIMENT_SCENARIO_IDS} from './scenarios/index.js'
 
 export const MAX_COMPARISON_SAMPLES = 4
 
@@ -37,6 +37,8 @@ export interface ComparisonInput {
   readonly reviewedBaselineReports?: readonly EvalRunReport[]
   /** Additional samples exclude the initial candidate and baseline observations. */
   readonly samples?: Readonly<Record<string, ComparisonSamples>>
+  /** Optional explicit scenario slice for a bounded experiment; defaults to the full registry. */
+  readonly scenarioIds?: readonly string[]
 }
 
 export interface RepeatRequest {
@@ -190,6 +192,7 @@ function buildAdvisoryDifferences(
     compare('durationMs', candidate.durationMs, baseline.durationMs)
     compare('cost', candidate.cost, baseline.cost)
     compare('tokenUsage', candidate.agentResult.tokenUsage, baseline.agentResult.tokenUsage)
+    compare('sessionPresearch', candidate.sessionPresearch, baseline.sessionPresearch)
   }
 
   return differences
@@ -209,46 +212,91 @@ function invalidReport(reason: string): ComparisonReport {
   }
 }
 
-function scenarioRegistryError(candidateReports: readonly EvalRunReport[], baseline: BaselineArtifact): string | null {
+function scenarioRegistryError(
+  candidateReports: readonly EvalRunReport[],
+  baseline: BaselineArtifact,
+  selectedScenarioIds: readonly string[],
+): string | null {
   const registryIds = ALL_SCENARIOS.map(scenario => scenario.id)
   if (ALL_SCENARIOS.length > MAX_SCENARIOS) {
     return `The scenario registry exceeds the ${MAX_SCENARIOS}-scenario capacity`
   }
   if (
+    new Set(selectedScenarioIds).size !== selectedScenarioIds.length ||
+    selectedScenarioIds.length === 0 ||
+    selectedScenarioIds.some(scenarioId => registryIds.includes(scenarioId) === false)
+  ) {
+    return 'Selected scenario IDs must be unique members of the enabled scenario registry'
+  }
+  if (
+    idsEqual(selectedScenarioIds, PRESEARCH_EXPERIMENT_SCENARIO_IDS) === false &&
+    idsEqual(selectedScenarioIds, registryIds) === false
+  ) {
+    return 'The only supported bounded scenario slice is the continuation presearch experiment'
+  }
+  if (
     idsEqual(
       candidateReports.map(report => report.scenarioId),
-      registryIds,
+      selectedScenarioIds,
     ) === false
   ) {
-    return 'Candidate scenario IDs must exactly match the enabled scenario registry in order'
+    return 'Candidate scenario IDs must exactly match the selected scenario registry in order'
   }
   if (
     idsEqual(
       baseline.scenarios.map(scenario => scenario.id),
       registryIds,
+    ) === false &&
+    idsEqual(
+      baseline.scenarios.map(scenario => scenario.id),
+      selectedScenarioIds,
     ) === false
   ) {
-    return 'Reviewed baseline scenario IDs must exactly match the enabled scenario registry in order'
+    return 'Reviewed baseline scenario IDs must exactly match the enabled or selected scenario registry in order'
   }
   return null
 }
 
+function comparisonLimitations(scenarioCount: number): readonly string[] {
+  if (scenarioCount === ALL_SCENARIOS.length) {
+    return CORPUS_LIMITATIONS
+  }
+
+  return [
+    `The comparison covers only the ${scenarioCount} explicitly selected scenarios and never expands the corpus automatically.`,
+    'A clean result means no large observed regression on the covered slice; it does not prove improvement or production-surface quality.',
+    'Quality ignores raw prose, prompt hashes, runtime/plugin versions, duration, cost, token counts, tool calls, call counts, and reasoning order.',
+  ]
+}
+
+function noRegressionStatement(scenarioCount: number): string {
+  const countLabels: Readonly<Record<number, string>> = {
+    1: 'one',
+    2: 'two',
+    3: 'three',
+    4: 'four',
+    5: 'five',
+    6: 'six',
+    7: 'seven',
+    8: 'eight',
+  }
+  const countLabel = countLabels[scenarioCount] ?? String(scenarioCount)
+  return `No large observed regression across the ${countLabel} covered scenario${scenarioCount === 1 ? '' : 's'}`
+}
+
 function validatedBaselineReports(
   reports: readonly EvalRunReport[] | undefined,
-  registryIds: readonly string[],
+  selectedScenarioIds: readonly string[],
 ): {readonly reports: ReadonlyMap<string, EvalRunReport>; readonly error: string | null} {
   if (reports == null) {
     return {reports: new Map(), error: null}
   }
-  if (
-    idsEqual(
-      reports.map(report => report.scenarioId),
-      registryIds,
-    ) === false
-  ) {
+  const reportIds = reports.map(report => report.scenarioId)
+  const allScenarioIds = ALL_SCENARIOS.map(scenario => scenario.id)
+  if (idsEqual(reportIds, selectedScenarioIds) === false && idsEqual(reportIds, allScenarioIds) === false) {
     return {
       reports: new Map(),
-      error: 'Reviewed baseline reports must exactly match the enabled scenario registry in order',
+      error: 'Reviewed baseline reports must exactly match the enabled or selected scenario registry in order',
     }
   }
   for (const report of reports) {
@@ -553,17 +601,24 @@ function scenarioComparison(
 }
 
 export function compareCandidateToBaseline(input: ComparisonInput): ComparisonReport {
-  const registryError = scenarioRegistryError(input.candidateReports, input.reviewedBaseline)
+  const selectedScenarioIds = input.scenarioIds ?? ALL_SCENARIOS.map(scenario => scenario.id)
+  const registryError = scenarioRegistryError(input.candidateReports, input.reviewedBaseline, selectedScenarioIds)
   if (registryError != null) {
     return invalidReport(`Invalid scenario registry: ${registryError}`)
+  }
+
+  const selectedScenarios = selectedScenarioIds.map(scenarioId =>
+    ALL_SCENARIOS.find(scenario => scenario.id === scenarioId),
+  )
+  if (selectedScenarios.includes(undefined)) {
+    return invalidReport('Invalid scenario registry: selected scenario could not be resolved')
   }
 
   if (input.reviewedBaseline.sourceRun.suiteVerdict !== 'passed') {
     return invalidReport('Reviewed baseline suite verdict must be passed')
   }
 
-  const registryIds = ALL_SCENARIOS.map(scenario => scenario.id)
-  const baselineReports = validatedBaselineReports(input.reviewedBaselineReports, registryIds)
+  const baselineReports = validatedBaselineReports(input.reviewedBaselineReports, selectedScenarioIds)
   if (baselineReports.error != null) {
     return invalidReport(baselineReports.error)
   }
@@ -579,9 +634,15 @@ export function compareCandidateToBaseline(input: ComparisonInput): ComparisonRe
 
   const baselineOutcomes = new Map<string, StableOutcomeProjection>()
   const missingEvidence: string[] = []
-  for (const scenario of input.reviewedBaseline.scenarios) {
+  for (const scenario of selectedScenarios) {
+    if (scenario === undefined) continue
+    const baselineScenario = input.reviewedBaseline.scenarios.find(item => item.id === scenario.id)
+    if (baselineScenario === undefined) {
+      missingEvidence.push(scenario.id)
+      continue
+    }
     const report = baselineReports.reports.get(scenario.id)
-    const outcome = report == null ? scenario.outcome : reportOutcome(report)
+    const outcome = report == null ? baselineScenario.outcome : reportOutcome(report)
     if (outcome == null || isReviewedBaselineOutcome(scenario.id, outcome) === false) {
       missingEvidence.push(scenario.id)
     } else {
@@ -610,7 +671,7 @@ export function compareCandidateToBaseline(input: ComparisonInput): ComparisonRe
       repeatRequests: [],
       rerunScenarioIds: [],
       missingEvidence,
-      limitations: CORPUS_LIMITATIONS,
+      limitations: comparisonLimitations(selectedScenarios.length),
     }
   }
 
@@ -619,7 +680,8 @@ export function compareCandidateToBaseline(input: ComparisonInput): ComparisonRe
   const rerunScenarioIds: string[] = []
   const advisoryDifferences: AdvisoryDifference[] = []
 
-  for (const scenario of ALL_SCENARIOS) {
+  for (const scenario of selectedScenarios) {
+    if (scenario === undefined) continue
     const candidateReport = input.candidateReports.find(report => report.scenarioId === scenario.id)
     const candidate = candidateOutcomes.get(scenario.id)
     const baseline = baselineOutcomes.get(scenario.id)
@@ -664,7 +726,7 @@ export function compareCandidateToBaseline(input: ComparisonInput): ComparisonRe
       repeatRequests,
       rerunScenarioIds,
       missingEvidence: [],
-      limitations: CORPUS_LIMITATIONS,
+      limitations: comparisonLimitations(selectedScenarios.length),
     }
   }
   if (inconclusiveScenarios.length > 0) {
@@ -680,19 +742,19 @@ export function compareCandidateToBaseline(input: ComparisonInput): ComparisonRe
       repeatRequests,
       rerunScenarioIds,
       missingEvidence: [],
-      limitations: CORPUS_LIMITATIONS,
+      limitations: comparisonLimitations(selectedScenarios.length),
     }
   }
 
   return {
     status: 'passed',
-    statement: 'No large observed regression across the six covered scenarios',
-    reason: 'All six candidate stable outcome projections passed without a large observed regression',
+    statement: noRegressionStatement(selectedScenarios.length),
+    reason: `All ${selectedScenarios.length} candidate stable outcome projections passed without a large observed regression`,
     scenarios: scenarioResults,
     advisoryDifferences,
     repeatRequests: [],
     rerunScenarioIds: [],
     missingEvidence: [],
-    limitations: CORPUS_LIMITATIONS,
+    limitations: comparisonLimitations(selectedScenarios.length),
   }
 }
