@@ -19,7 +19,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {promisify} from 'node:util'
-import {resolveConflict as resolveConflictAttempt} from './conflict-resolver.js'
+import {HARNESS_GIT_IDENTITY, resolveConflict as resolveConflictAttempt} from './conflict-resolver.js'
 import {formatPipelineError} from './format-error.js'
 import {resolveSources} from './sources.js'
 
@@ -369,7 +369,16 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
       const disabledHooksPath = await hooksPath()
       const result = await execFileAsync(
         'git',
-        ['-c', 'credential.helper=', '-c', 'core.askPass=', '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
+        [
+          '-c',
+          'credential.helper=',
+          '-c',
+          'core.askPass=',
+          ...HARNESS_GIT_IDENTITY,
+          '-c',
+          `core.hooksPath=${disabledHooksPath}`,
+          ...args,
+        ],
         {cwd, encoding: 'utf8', env},
       )
       return result.stdout.trim()
@@ -384,7 +393,16 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
       const disabledHooksPath = await hooksPath()
       const result = await execFileAsync(
         'git',
-        ['-c', 'credential.helper=', '-c', 'core.askPass=', '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
+        [
+          '-c',
+          'credential.helper=',
+          '-c',
+          'core.askPass=',
+          ...HARNESS_GIT_IDENTITY,
+          '-c',
+          `core.hooksPath=${disabledHooksPath}`,
+          ...args,
+        ],
         {cwd, encoding: 'buffer', env},
       )
       return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout)
@@ -399,7 +417,7 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
       const disabledHooksPath = await hooksPath()
       const result = await execFileAsync(
         'git',
-        ['-c', 'credential.helper=', '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
+        ['-c', 'credential.helper=', ...HARNESS_GIT_IDENTITY, '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
         {cwd, encoding: 'utf8', env},
       )
       return result.stdout.trim()
@@ -694,19 +712,7 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
     },
 
     completeMerge: async workDir => {
-      await git.exec(
-        [
-          '-c',
-          'user.name=fro-bot harness integrate',
-          '-c',
-          'user.email=github-actions[bot]@users.noreply.github.com',
-          'commit',
-          '--no-verify',
-          '--no-edit',
-        ],
-        workDir,
-        publicGitEnv(),
-      )
+      await git.exec(['commit', '--no-verify', '--no-edit'], workDir, publicGitEnv())
     },
 
     resetToBase: async (workDir, tag) => {
@@ -722,21 +728,7 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
     },
 
     commitIntegration: async (workDir, message) => {
-      await git.exec(
-        [
-          '-c',
-          'user.name=fro-bot harness integrate',
-          '-c',
-          'user.email=github-actions[bot]@users.noreply.github.com',
-          'commit',
-          '--no-verify',
-          '--allow-empty',
-          '-m',
-          message,
-        ],
-        workDir,
-        publicGitEnv(),
-      )
+      await git.exec(['commit', '--no-verify', '--allow-empty', '-m', message], workDir, publicGitEnv())
     },
 
     buildCli: async (workDir, version, channel) => {

@@ -5,7 +5,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildConflictResolverConfig, resolveConflict} from './conflict-resolver.js'
 
 interface ConflictRepository {
@@ -242,6 +242,49 @@ describe('resolveConflict', () => {
     expect(result.error).toMatch(/regular|symlink|attempt/i)
     expect(await fs.readFile(path.join(repo.workDir, 'conflict.txt'), 'utf8')).toContain('<<<<<<<')
     expect(await fs.readdir(repo.runnerTempDir)).toEqual([])
+  })
+
+  it('rejects a final-component swap between validation and extraction read', async () => {
+    // #given
+    if (repo === undefined) throw new Error('test repository was not created')
+    let scratchWorkDir: string | undefined
+    const validatedStats = new Map<string, Awaited<ReturnType<typeof fs.lstat>>>()
+    const originalLstat = fs.lstat.bind(fs)
+    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async target => {
+      if (scratchWorkDir === undefined || typeof target !== 'string') return originalLstat(target)
+      const targetPath = path.resolve(target)
+      const conflictPath = path.resolve(scratchWorkDir, 'conflict.txt')
+      if (targetPath !== conflictPath) return originalLstat(target)
+
+      const previouslyValidated = validatedStats.get(targetPath)
+      if (previouslyValidated !== undefined) return previouslyValidated
+
+      const stat = await originalLstat(target)
+      validatedStats.set(targetPath, stat)
+      await fs.writeFile(path.join(scratchWorkDir, 'replacement.txt'), 'swapped\n', 'utf8')
+      await fs.rm(target)
+      await fs.symlink('replacement.txt', target)
+      return stat
+    })
+
+    // #when
+    let result: ConflictResolverResult
+    try {
+      result = await resolveConflict(makeRequest(repo), {
+        runModel: async turn => {
+          scratchWorkDir = turn.workDir
+          await fs.writeFile(path.join(turn.workDir, 'conflict.txt'), 'accepted\n', 'utf8')
+        },
+      })
+    } finally {
+      lstatSpy.mockRestore()
+    }
+
+    // #then
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected a raced final path to be rejected')
+    expect(result.error).toMatch(/symlink|regular|attempt/i)
+    expect(await fs.readFile(path.join(repo.workDir, 'conflict.txt'), 'utf8')).toContain('<<<<<<<')
   })
 
   it('does not treat ignored, untracked, metadata, or mode changes in scratch as artifact authority', async () => {

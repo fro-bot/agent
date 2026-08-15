@@ -10,6 +10,7 @@
 
 import {execFile} from 'node:child_process'
 import crypto from 'node:crypto'
+import {constants as fsConstants} from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
@@ -17,6 +18,16 @@ import {promisify} from 'node:util'
 import {formatPipelineError} from './format-error.js'
 
 const execFileAsync = promisify(execFile)
+
+// Runners have no global git identity, so every commit-producing invocation
+// carries its own. Matches DEFAULT_AUTHOR in src/features/delegated/types.ts;
+// the harness package is standalone and cannot import it.
+export const HARNESS_GIT_IDENTITY = [
+  '-c',
+  'user.name=Fro Bot',
+  '-c',
+  'user.email=fro-bot[bot]@users.noreply.github.com',
+] as const
 
 export const MAX_CONFLICT_RESOLUTION_ATTEMPTS = 2
 export const MAX_CONFLICT_FILE_BYTES = 1_048_576
@@ -314,17 +325,21 @@ function resolverGitEnv(): NodeJS.ProcessEnv {
 }
 
 async function gitOutput(root: string | undefined, args: readonly string[], maxBuffer = 1_048_576): Promise<string> {
-  const result = await execFileAsync('git', ['-c', 'credential.helper=', '-c', 'core.askPass=', ...args], {
-    cwd: root,
-    env: resolverGitEnv(),
-    encoding: 'utf8',
-    maxBuffer,
-  })
+  const result = await execFileAsync(
+    'git',
+    ['-c', 'credential.helper=', '-c', 'core.askPass=', ...HARNESS_GIT_IDENTITY, ...args],
+    {
+      cwd: root,
+      env: resolverGitEnv(),
+      encoding: 'utf8',
+      maxBuffer,
+    },
+  )
   return result.stdout
 }
 
 async function gitRun(root: string | undefined, args: readonly string[], cwd = root): Promise<void> {
-  await execFileAsync('git', ['-c', 'credential.helper=', '-c', 'core.askPass=', ...args], {
+  await execFileAsync('git', ['-c', 'credential.helper=', '-c', 'core.askPass=', ...HARNESS_GIT_IDENTITY, ...args], {
     cwd,
     env: resolverGitEnv(),
     encoding: 'utf8',
@@ -506,6 +521,9 @@ async function readRegularFile(root: string, relative: string): Promise<Uint8Arr
   const normalized = safeRelativePath(relative)
   const parts = normalized.split('/')
   let current = root
+  // Node does not expose openat, so parent-component traversal remains a path-based
+  // check with a residual race. The final component is opened with O_NOFOLLOW and
+  // read through that handle to close the check-then-read gap at the extraction boundary.
   for (const part of parts) {
     current = path.join(current, part)
     const stat = await fs.lstat(current)
@@ -514,9 +532,23 @@ async function readRegularFile(root: string, relative: string): Promise<Uint8Arr
       throw new Error(`conflict path has a non-directory parent: ${relative}`)
     }
   }
-  const finalStat = await fs.lstat(current)
-  if (finalStat.isFile() === false) throw new Error(`conflict path is not a regular file: ${relative}`)
-  return fs.readFile(current)
+  let handle: import('node:fs/promises').FileHandle
+  try {
+    handle = await fs.open(current, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ELOOP') {
+      throw new Error(`conflict path follows a symlink: ${relative}`)
+    }
+    throw error
+  }
+  try {
+    const finalStat = await handle.stat()
+    if (finalStat.isFile() === false) throw new Error(`conflict path is not a regular file: ${relative}`)
+    const bytes = await handle.readFile()
+    return bytes
+  } finally {
+    await handle.close()
+  }
 }
 
 function hasConflictMarker(bytes: Uint8Array): boolean {
