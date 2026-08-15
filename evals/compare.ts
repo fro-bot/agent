@@ -150,6 +150,8 @@ function classifySample(outcome: StableOutcomeProjection): SampleClassification 
     return 'quality-failed'
   }
   if (outcome.state === 'failed') {
+    // Fail closed: an unclassifiable failure is decisive rather than sampled.
+    // Retrying it could launder a real defect into a flake.
     return 'decisive-failed'
   }
   return 'passed'
@@ -190,11 +192,7 @@ function buildAdvisoryDifferences(
     compare('tokenUsage', candidate.agentResult.tokenUsage, baseline.agentResult.tokenUsage)
   }
 
-  return differences.map(difference => ({
-    ...difference,
-    candidate: difference.candidate,
-    baseline: difference.baseline,
-  }))
+  return differences
 }
 
 function invalidReport(reason: string): ComparisonReport {

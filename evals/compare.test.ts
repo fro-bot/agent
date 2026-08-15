@@ -152,6 +152,46 @@ describe('compareCandidateToBaseline', () => {
     expect(comparison.advisoryDifferences.some(difference => difference.field === 'tokenUsage')).toBe(true)
   })
 
+  it.each([
+    {
+      label: 'an incomplete execution',
+      reports: (baselineReports: readonly EvalRunReport[]): readonly EvalRunReport[] =>
+        baselineReports.map(report =>
+          report.scenarioId === 'clean-pr' ? {...report, execution: {...report.execution, completed: false}} : report,
+        ),
+      expectedReason: 'Reviewed baseline report clean-pr is not a completed validated pass',
+    },
+    {
+      label: 'an invalid stable outcome',
+      reports: (baselineReports: readonly EvalRunReport[]): readonly EvalRunReport[] =>
+        baselineReports.map(report =>
+          report.scenarioId === 'clean-pr'
+            ? {...report, outcome: {...report.outcome, scenarioId: 'wrong-scenario'}}
+            : report,
+        ),
+      expectedReason: 'Reviewed baseline report clean-pr is missing a valid stable outcome',
+    },
+    {
+      label: 'a registry-order mismatch',
+      reports: (baselineReports: readonly EvalRunReport[]): readonly EvalRunReport[] => [...baselineReports].reverse(),
+      expectedReason: 'Reviewed baseline reports must exactly match the enabled scenario registry in order',
+    },
+  ])('rejects reviewed baseline reports with $label', ({reports, expectedReason}) => {
+    // #given a reviewed baseline report set with one invalid validation condition
+    const baselineReports = createCorpusReports()
+
+    // #when the candidate is compared with the invalid reviewed baseline reports
+    const comparison = compareCandidateToBaseline({
+      candidateReports: baselineReports,
+      reviewedBaseline: createBaseline(baselineReports),
+      reviewedBaselineReports: reports(baselineReports),
+    })
+
+    // #then the specific baseline validation rejection is returned
+    expect(comparison.status).toBe('failed')
+    expect(comparison.reason).toBe(expectedReason)
+  })
+
   it('blocks on safety or response-contract failure without a stochastic retry request', () => {
     // #given a candidate with an observed response-contract failure and a separate safety failure
     const baselineReports = createCorpusReports()
@@ -304,6 +344,32 @@ describe('compareCandidateToBaseline', () => {
     expect(comparison.reason).toContain('bounded stochastic quality loss')
   })
 
+  it('keeps a full four-vs-four mixed-quality comparison inconclusive', () => {
+    // #given two candidate quality failures mixed with two passing samples at the full budget
+    const baselineReports = createCorpusReports()
+    const candidateReports = createCorpusReports({
+      'clean-pr': createQualityFailureOutcome('clean-pr'),
+    })
+
+    // #when four candidate and four reviewed baseline samples are compared
+    const comparison = compareCandidateToBaseline({
+      candidateReports,
+      reviewedBaseline: createBaseline(baselineReports),
+      samples: {
+        'clean-pr': {
+          candidate: [createQualityFailureOutcome('clean-pr'), createOutcome('clean-pr'), createOutcome('clean-pr')],
+          baseline: [createOutcome('clean-pr'), createOutcome('clean-pr'), createOutcome('clean-pr')],
+        },
+      },
+    })
+
+    // #then mixed full-budget evidence stays inconclusive without another repeat request
+    expect(comparison.status).toBe('inconclusive')
+    expect(comparison.repeatRequests).toEqual([])
+    expect(comparison.reason).toContain('Repeated samples were mixed')
+    expect(comparison.scenarios.find(scenario => scenario.scenarioId === 'clean-pr')?.status).toBe('inconclusive')
+  })
+
   it.each(['quality-failed', 'inconclusive'] as const)(
     'reruns when reviewed-baseline repeats are %s despite a passing candidate',
     baselineRepeatState => {
@@ -365,6 +431,45 @@ describe('compareCandidateToBaseline', () => {
     expect(comparison.scenarios.find(scenario => scenario.scenarioId === 'clean-pr')?.reason).toContain(
       'comparison budget',
     )
+    expect(comparison.repeatRequests).toEqual([])
+  })
+
+  it.each([
+    {
+      label: 'five baseline samples',
+      samples: {
+        candidate: [],
+        baseline: [
+          createOutcome('clean-pr'),
+          createOutcome('clean-pr'),
+          createOutcome('clean-pr'),
+          createOutcome('clean-pr'),
+        ],
+      },
+      expectedReason: 'comparison budget',
+    },
+    {
+      label: 'a baseline sample for another scenario',
+      samples: {
+        candidate: [],
+        baseline: [createOutcome('planted-defect')],
+      },
+      expectedReason: 'different scenario',
+    },
+  ])('fails closed for $label', ({samples, expectedReason}) => {
+    // #given a valid candidate and reviewed baseline with malformed baseline-side samples
+    const baselineReports = createCorpusReports()
+
+    // #when the malformed samples are compared
+    const comparison = compareCandidateToBaseline({
+      candidateReports: baselineReports,
+      reviewedBaseline: createBaseline(baselineReports),
+      samples: {'clean-pr': samples},
+    })
+
+    // #then the baseline-side sample contract rejects the comparison
+    expect(comparison.status).toBe('failed')
+    expect(comparison.scenarios.find(scenario => scenario.scenarioId === 'clean-pr')?.reason).toContain(expectedReason)
     expect(comparison.repeatRequests).toEqual([])
   })
 
