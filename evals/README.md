@@ -46,6 +46,14 @@ The treatment is selected by dependency injection through the runner path. There
 
 The comparison reuses the stable outcome projection and the existing lazy four-vs-four repeat bound. A clean result means only that no large regression was observed on these two covered scenarios. If both modes pass, the corpus cannot attribute causal improvement; deleting eager presearch would be a documented simplicity/cost judgment rather than evidence that the model reasoned better.
 
+Run the differential experiment explicitly; it is skipped without the same `FRO_BOT_EVAL=1` gate as the corpus:
+
+```bash
+FRO_BOT_EVAL=1 bun run evals:presearch
+```
+
+The driver compares treatment reports with live production-mode reports and uses `evals/baselines/u1.json` for reviewed registry/provenance validation. The default artifact is `evals/output/presearch-differential-report.json`; `FRO_BOT_EVAL_OUTPUT` overrides that path. A missing stable outcome in `u1.json` is filled only by independently validated live production reports; no treatment value is copied into the reviewed baseline. Infrastructure-inconclusive scenarios remain rerun requests, not regressions.
+
 ## Run it
 
 Normal test runs do not start OpenCode and do not cost anything:
