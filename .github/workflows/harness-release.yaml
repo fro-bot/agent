@@ -1184,6 +1184,7 @@ jobs:
         run: |
           set -euo pipefail
           SOURCE="${RUNNER_TEMP}/harness-shadow/harness-shadow-${BASE_VERSION}.json"
+          echo "retained=false" >> "$GITHUB_OUTPUT"
           if [ ! -f "${SOURCE}" ]; then
             MESSAGE="Forward shadow evidence artifact was unavailable for ${BASE_VERSION}; continuing without evidence."
             echo "::warning title=Forward shadow evidence unavailable::${MESSAGE}"
@@ -1221,6 +1222,7 @@ jobs:
           fi
           mkdir -p "$(dirname "${DEST}")"
           cp "${SOURCE}" "${DEST}"
+          echo "retained=true" >> "$GITHUB_OUTPUT"
           if [[ "${DEST}" == */non-matches/* ]]; then
             echo "pr-line=- Retains non-countable forward-shadow evidence in ${DEST} for diagnosis; it is excluded from the cutover gate." >> "$GITHUB_OUTPUT"
           else
@@ -1260,11 +1262,17 @@ jobs:
           GATE_JSON="${GATE_JSON}" node -e "
             const fs = require('fs');
             const result = JSON.parse(fs.readFileSync(process.env.GATE_JSON, 'utf8'));
-            const status = result.ok === true ? 'ready' : result.status;
+            const status = result.status;
             const versions = result.distinctBaseVersions.length === 0 ? 'none' : result.distinctBaseVersions.join(', ');
+            const markdownHtmlControls = ['<', '>', '&', '#', '*', '_', '[', ']', '(', ')', '!', '|', String.fromCharCode(96)];
+            const sanitizeReason = value => {
+              let sanitized = String(value).replaceAll(/\\s+/g, ' ');
+              for (const character of markdownHtmlControls) sanitized = sanitized.replaceAll(character, '');
+              return sanitized.slice(0, 512);
+            };
             const reason = result.reasons.length === 0
               ? 'all strict gate requirements are satisfied'
-              : result.reasons.map(value => String(value).replaceAll(/\\s+/g, ' ')).join('; ');
+              : result.reasons.map(sanitizeReason).join('; ').slice(0, 512);
             const summary = [
               '### Forward-shadow evidence gate',
               '',
@@ -1392,6 +1400,12 @@ jobs:
         run: bun run build
 
       - name: Open PR via peter-evans/create-pull-request
+        id: open-sync-pr
+        # Only opens on a real version bump. An idempotent (skip) run cannot advance
+        # the forward-shadow counter anyway: NEW_VERSION embeds BASE_VERSION, so
+        # skip == 'true' implies the base version is unchanged and its evidence file
+        # already exists. Committing it would overwrite the same path, not add a
+        # distinct match. The report step below makes that non-advance visible.
         if: steps.version.outputs.skip != 'true' && steps.build.outcome == 'success' && steps.dockerfile.outcome == 'success'
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
@@ -1425,3 +1439,25 @@ jobs:
           base: main
           author: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
           committer: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
+
+      - name: Report skipped version evidence sync
+        id: report-retained-shadow
+        # An idempotent run retains a record on the runner that nothing commits,
+        # because no sync PR is opened. Say so rather than letting the counter
+        # stall silently.
+        if: >-
+          ${{
+            always() &&
+            steps.version.outputs.skip == 'true' &&
+            steps.retain-shadow-evidence.outputs.retained == 'true'
+          }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          MESSAGE="Forward-shadow evidence was retained on the runner but not committed, because DEFAULT_OPENCODE_VERSION is already current and no sync PR was opened. The cutover counter did not advance for this run; the record remains in the 90-day workflow artifact."
+          echo "::warning title=Forward-shadow evidence not durably retained::${MESSAGE}"
+          {
+            echo "### Forward-shadow evidence"
+            echo "- ⚠️ ${MESSAGE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0

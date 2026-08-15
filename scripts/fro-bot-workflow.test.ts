@@ -649,7 +649,36 @@ describe('harness forward-shadow workflow wiring', () => {
     expect(String(gate.run)).toContain('RECORDS_DIR="docs/evidence/harness-shadow"')
     expect(String(gate.run)).toContain(['--records-dir "', '$', '{RECORDS_DIR}"'].join(''))
     expect(String(gate.run)).toContain('GITHUB_STEP_SUMMARY')
+    expect(String(gate.run)).toContain('const status = result.status')
+    expect(String(gate.run)).not.toContain("result.ok === true ? 'ready' : result.status")
+    expect(String(gate.run)).toContain('slice(0, 512)')
     expect(String(gate.run)).not.toContain('--ack-no-conflict-evidence')
     expect(String(gate.run)).toContain('exit 0')
+  })
+
+  it('announces rather than hides an idempotent run that cannot advance the evidence counter', () => {
+    // #given the retained evidence step, version guard, PR step, and non-advance report
+    const steps = stepsFor(releasePath, 'sync-default-version')
+    const retain = stepById(steps, 'retain-shadow-evidence')
+    const version = stepById(steps, 'version')
+    const pullRequest = stepById(steps, 'open-sync-pr')
+    const outcomeReport = stepById(steps, 'report-retained-shadow')
+
+    // #then retention reports whether a record was written
+    expect(String(retain.run)).toContain('retained=false')
+    expect(String(retain.run)).toContain('retained=true')
+    expect(String(version.run)).toContain('skip=true')
+
+    // #then the sync PR stays bound to a real version bump. NEW_VERSION embeds
+    // BASE_VERSION, so an idempotent run has no distinct base version to contribute
+    // and opening a PR for it would rewrite an existing evidence path.
+    expect(String(pullRequest.if)).toContain("steps.version.outputs.skip != 'true'")
+    expect(String(pullRequest.if)).not.toContain("steps.version.outputs.skip == 'true'")
+
+    // #then the non-advance is surfaced instead of passing silently
+    expect(String(outcomeReport.if)).toContain("steps.retain-shadow-evidence.outputs.retained == 'true'")
+    expect(String(outcomeReport.if)).toContain("steps.version.outputs.skip == 'true'")
+    expect(String(outcomeReport.run)).toContain('::warning')
+    expect(String(outcomeReport.run)).toContain('GITHUB_STEP_SUMMARY')
   })
 })
