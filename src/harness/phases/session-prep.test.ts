@@ -59,6 +59,12 @@ const priorWorkContext: readonly SessionSearchResult[] = [
     matches: [],
   },
 ]
+const sessionLogger = {
+  debug: vi.fn(),
+  info: vi.fn(),
+  warning: vi.fn(),
+  error: vi.fn(),
+}
 
 function createBootstrap(): BootstrapPhaseResult {
   return {inputs: {githubToken: 'token'}} as BootstrapPhaseResult
@@ -117,7 +123,7 @@ function createTreatmentStrategy() {
 describe('runSessionPrep', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mocks.createLogger.mockReturnValue({debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()})
+    mocks.createLogger.mockReturnValue(sessionLogger)
     mocks.getGitHubWorkspace.mockReturnValue('/workspace')
     mocks.normalizeWorkspacePath.mockImplementation((value: string) => value)
     mocks.parseAttachmentUrls.mockReturnValue([])
@@ -195,5 +201,33 @@ describe('runSessionPrep', () => {
     expect(result.priorWorkContext).toEqual([])
     expect(result.continueSessionId).toBe('session-continuation')
     expect(result.isContinuation).toBe(true)
+  })
+
+  it('fails soft when the injected strategy throws while preserving continuity', async () => {
+    // #given an injected session-prep strategy throws while logical-key resolution finds the continuation
+    const throwingStrategy = vi.fn(async () => {
+      throw new Error('strategy unavailable')
+    })
+
+    // #when session preparation runs with the failing strategy
+    const result = await runSessionPrep(
+      createBootstrap(),
+      createRouting(),
+      createCacheRestore(),
+      createMetrics(),
+      throwingStrategy,
+    )
+
+    // #then context is empty, continuation identity survives, and the failure is logged
+    expect(result.recentSessions).toEqual([])
+    expect(result.priorWorkContext).toEqual([])
+    expect(result.logicalKey).toEqual(logicalKey)
+    expect(result.continueSessionId).toBe('session-continuation')
+    expect(result.isContinuation).toBe(true)
+    expect(throwingStrategy).toHaveBeenCalledOnce()
+    expect(sessionLogger.warning).toHaveBeenCalledWith(
+      'Session presearch strategy failed; proceeding with empty context',
+      {error: 'strategy unavailable'},
+    )
   })
 })

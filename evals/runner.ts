@@ -518,6 +518,8 @@ function buildSessionPresearchAccounting(
     continuationSessionId: priorWork?.currentThreadSessionId ?? null,
     recentSessionCount: sessionContext.recentSessions.length,
     priorWorkResultCount: sessionContext.priorWorkContext.length,
+    // JSON-size approximation for diagnosis only; it does not measure rendered prompt weight
+    // and must not become a quality gate.
     injectedContextBytes: hasInjectedContext ? Buffer.byteLength(JSON.stringify(sessionContext), 'utf8') : 0,
   }
 }
