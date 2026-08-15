@@ -191,8 +191,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Integrate job — calls harness-integrate.yaml as a reusable workflow.
   # harness-integrate.yaml mints a short-lived credential from the OIDC
-  # credential broker (no secrets: inherit, no AUTH_JSON) and runs the LLM
-  # merge on it via the Fro Bot action.
+  # credential broker (no secrets: inherit, no OPENCODE_AUTH_JSON) and runs the
+  # LLM merge on it via the Fro Bot action.
   # vars.HARNESS_MODEL must be set to anthropic/claude-sonnet-5 in repo vars.
   # Skipped when the carry set is empty (has_refs == 'false').
   # ---------------------------------------------------------------------------
@@ -208,7 +208,6 @@ jobs:
       APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
       APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
       OPENCODE_CONFIG: ${{ secrets.OPENCODE_CONFIG }}
-      OMO_PROVIDERS: ${{ secrets.OMO_PROVIDERS }}
     with:
       model: ${{ vars.HARNESS_MODEL }}
       prompt: ${{ needs.prepare-integrate.outputs.rendered_prompt }}

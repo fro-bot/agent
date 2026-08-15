@@ -46,7 +46,7 @@ on:
       OMO_PROVIDERS:
         description: Comma-separated oMo providers passed through to the merge (enable-omo is true on this path). Optional.
         required: false
-      # NO AUTH_JSON. NO secrets: inherit. The durable model credential must
+      # NO OPENCODE_AUTH_JSON. NO secrets: inherit. The durable model credential must
       # never reach this workflow — see docs/plans/2026-07-01-001-feat-harness-merge-credential-broker-plan.md.
 
 jobs:
@@ -129,10 +129,5 @@ jobs:
           # Integration delivery is always local; keep this caller explicit so
           # prompt wording cannot change the output contract.
           output-mode: working-dir
-          # Preserve the current integrate behavior: the merge runs with oMo
-          # enabled (the correlation-id-gated disable in fro-bot.yaml applies
-          # only to release-notes narration, not this path).
-          enable-omo: true
-          omo-providers: ${{ secrets.OMO_PROVIDERS }}
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           timeout: '0'
