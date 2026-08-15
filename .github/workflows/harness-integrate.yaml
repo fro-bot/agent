@@ -33,6 +33,10 @@ on:
         description: The rendered integration prompt to run.
         type: string
         required: false
+      base-version:
+        description: Resolved base release version used by authoritative and shadow integration paths.
+        type: string
+        required: true
     secrets:
       APPLICATION_ID:
         description: GitHub App id used to mint the scoped installation token for the merge push. Required.
@@ -131,3 +135,61 @@ jobs:
           output-mode: working-dir
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           timeout: '0'
+
+      - name: Run forward shadow integration
+        id: shadow-integrate
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          BASE_VERSION: ${{ inputs.base-version }}
+          SHADOW_WORK_DIR: ${{ runner.temp }}/harness-shadow-work
+          SHADOW_ARTIFACT: ${{ runner.temp }}/harness-shadow-artifact.tar
+          SHADOW_RESULT: ${{ runner.temp }}/harness-shadow-result.json
+          HARNESS_BROKER_AUTH_JSON: ${{ steps.mint.outputs.auth-json }}
+          GH_TOKEN: ''
+          GITHUB_TOKEN: ''
+        run: >-
+          bun run packages/harness/src/cli.ts integrate
+          --dry-run
+          --base-version "$BASE_VERSION"
+          --work-dir "$SHADOW_WORK_DIR"
+          --out "$SHADOW_ARTIFACT"
+          --result-out "$SHADOW_RESULT"
+
+      - name: Record forward shadow evidence
+        id: shadow-record
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          BASE_VERSION: ${{ inputs.base-version }}
+          SHADOW_WORK_DIR: ${{ runner.temp }}/harness-shadow-work
+          SHADOW_RESULT: ${{ runner.temp }}/harness-shadow-result.json
+          SHADOW_RECORD: ${{ runner.temp }}/harness-shadow-${{ inputs.base-version }}.json
+          GH_TOKEN: ''
+          GITHUB_TOKEN: ''
+          RELEASE_REPO: anomalyco/opencode
+          AUTHORITATIVE_REPOSITORY: fro-bot/agent
+          RUN_IDENTITY: ${{ github.run_id }}/${{ github.run_attempt }}/${{ github.workflow_ref }}/${{ github.server_url }}/${{ github.repository }}
+        run: >-
+          bun run packages/harness/src/forward-shadow-command.ts
+          --result-out "$SHADOW_RESULT"
+          --record-out "$SHADOW_RECORD"
+          --base-version "$BASE_VERSION"
+          --shadow-work-dir "$SHADOW_WORK_DIR"
+          --release-repo "$RELEASE_REPO"
+          --authoritative-repository "$AUTHORITATIVE_REPOSITORY"
+          --authoritative-ref "refs/harness-integrate/$BASE_VERSION"
+          --run-identity "$RUN_IDENTITY"
+
+      - name: Upload forward shadow evidence
+        id: upload-shadow-record
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ''
+          GITHUB_TOKEN: ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: harness-shadow-${{ inputs.base-version }}
+          path: ${{ runner.temp }}/harness-shadow-${{ inputs.base-version }}.json
+          if-no-files-found: warn
+          retention-days: 90
