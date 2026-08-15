@@ -4,12 +4,15 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import {describe, expect, it} from 'vitest'
+import {runForwardShadowGate} from './forward-shadow-gate.js'
 import {
   buildForwardShadowRecord,
   buildIntegrationOutcomeFile,
   compareForwardShadow,
   deriveForwardShadowConflictMetrics,
+  evaluateForwardShadowDirectory,
   evaluateForwardShadowGate,
+  forwardShadowEvidencePath,
   makeAnonymousGitEnv,
   validateForwardShadowRecord,
   writeForwardShadowRecord,
@@ -402,7 +405,13 @@ describe('forward shadow gate', () => {
     // #then
     expect(evaluateForwardShadowGate([match, inconclusive]).ok).toBe(false)
     expect(evaluateForwardShadowGate(duplicateRecords).reasons.join(' ')).toContain('duplicate')
-    expect(evaluateForwardShadowGate([match, match, match, {missing: 'schema'}]).ok).toBe(false)
+
+    const distinctMatches = ['1.15.13', '1.15.14', '1.15.15'].map(baseVersion =>
+      buildForwardShadowRecord({...baseInput(), baseVersion}),
+    )
+    const invalidRecordResult = evaluateForwardShadowGate([...distinctMatches, {missing: 'schema'}])
+    expect(invalidRecordResult.status).toBe('evidence-contradicts')
+    expect(invalidRecordResult.invalidRecordCount).toBe(1)
 
     const noConflict = ['1.15.13', '1.15.14', '1.15.15'].map(baseVersion =>
       buildForwardShadowRecord({
@@ -413,6 +422,130 @@ describe('forward shadow gate', () => {
     )
     expect(evaluateForwardShadowGate(noConflict).ok).toBe(false)
     expect(evaluateForwardShadowGate(noConflict, {ackNoConflictEvidence: true}).ok).toBe(true)
+  })
+
+  it('distinguishes insufficient no-conflict evidence from contradictory evidence', () => {
+    // #given three strict matches without conflict evidence and a divergent record
+    const noConflict = ['1.15.13', '1.15.14', '1.15.15'].map(baseVersion =>
+      buildForwardShadowRecord({
+        ...baseInput(),
+        baseVersion,
+        conflictMetrics: {...baseInput().conflictMetrics, hadConflict: false},
+      }),
+    )
+    const mismatch = buildForwardShadowRecord(
+      baseInput({
+        baseVersion: '1.15.16',
+        authoritative: {ref: 'refs/tags/v1.15.16', commit: OID_A, tree: OID_C},
+      }),
+    )
+
+    // #when
+    const insufficient = evaluateForwardShadowGate(noConflict)
+    const contradictory = evaluateForwardShadowGate([...noConflict, mismatch])
+
+    // #then
+    expect(insufficient.status).toBe('insufficient-evidence')
+    expect(insufficient.reasons).toContain(
+      'no conflict evidence; pass --ack-no-conflict-evidence only with explicit review',
+    )
+    expect(contradictory.status).toBe('evidence-contradicts')
+    expect(contradictory.reasons).toContain('record 4 is mismatch')
+  })
+
+  it('keeps non-match evidence in a diagnostic directory outside the gate scan', async () => {
+    // #given three countable matches and one non-match retained through the hygiene path
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-evidence-test-'))
+    const matches = ['1.15.13', '1.15.14', '1.15.15'].map(baseVersion =>
+      buildForwardShadowRecord({...baseInput(), baseVersion}),
+    )
+    const mismatch = buildForwardShadowRecord(
+      baseInput({
+        baseVersion: '1.15.16',
+        authoritative: {ref: 'refs/tags/v1.15.16', commit: OID_A, tree: OID_C},
+      }),
+    )
+
+    try {
+      // #when
+      for (const record of matches) {
+        await writeForwardShadowRecord(forwardShadowEvidencePath(directory, record, 'run-match'), record)
+      }
+      const mismatchPath = forwardShadowEvidencePath(directory, mismatch, 'run-mismatch')
+      await writeForwardShadowRecord(mismatchPath, mismatch)
+      const result = await evaluateForwardShadowDirectory(directory)
+
+      // #then
+      expect(result.ok).toBe(true)
+      expect(mismatchPath).toBe(path.join(directory, 'non-matches', '1.15.16-run-mismatch.json'))
+      expect(await fs.readFile(mismatchPath, 'utf8')).toContain('"verdict": "mismatch"')
+    } finally {
+      await fs.rm(directory, {recursive: true, force: true})
+    }
+  })
+})
+
+describe('forward shadow gate CLI', () => {
+  it('writes valid JSON and returns non-zero for an insufficient record set', async () => {
+    // #given an empty readable records directory
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-gate-cli-test-'))
+    const stdout: string[] = []
+    const stderr: string[] = []
+
+    try {
+      // #when
+      const exitCode = await runForwardShadowGate(['--records-dir', directory], {
+        stdout: value => stdout.push(value),
+        stderr: value => stderr.push(value),
+      })
+
+      // #then
+      expect(exitCode).toBe(1)
+      expect(stderr).toEqual([])
+      expect(JSON.parse(stdout.join(''))).toMatchObject({ok: false, status: 'insufficient-evidence'})
+    } finally {
+      await fs.rm(directory, {recursive: true, force: true})
+    }
+  })
+
+  it('writes no stdout and returns non-zero for an argument-parse failure', async () => {
+    // #when
+    const stdout: string[] = []
+    const stderr: string[] = []
+    const exitCode = await runForwardShadowGate([], {
+      stdout: value => stdout.push(value),
+      stderr: value => stderr.push(value),
+    })
+
+    // #then
+    expect(exitCode).toBe(1)
+    expect(stdout).toEqual([])
+    expect(stderr.join('')).toMatch(/^usage:/)
+  })
+
+  it('writes no stdout and returns non-zero when the records directory is unreadable', async () => {
+    // #given a records directory without read permissions
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-gate-unreadable-test-'))
+
+    try {
+      await fs.chmod(directory, 0o000)
+
+      // #when
+      const stdout: string[] = []
+      const stderr: string[] = []
+      const exitCode = await runForwardShadowGate(['--records-dir', directory], {
+        stdout: value => stdout.push(value),
+        stderr: value => stderr.push(value),
+      })
+
+      // #then
+      expect(exitCode).toBe(1)
+      expect(stdout).toEqual([])
+      expect(stderr.join('')).toContain('failed to read records directory')
+    } finally {
+      await fs.chmod(directory, 0o700)
+      await fs.rm(directory, {recursive: true, force: true})
+    }
   })
 })
 
