@@ -27,6 +27,7 @@ Usage:
   harness patches              List configured integration refs
   harness doctor               Check the resolved binary is present and runnable
   harness integrate            Run the deterministic integration pipeline
+                                   --base-version <ver> Override harness.config.json base version
                                   --dry-run             Validate/build without acquiring push credentials
                                   --push-repo <url>     Push target repository (non-dry-run)
                                   --push-ref <ref>      Push target ref (non-dry-run)

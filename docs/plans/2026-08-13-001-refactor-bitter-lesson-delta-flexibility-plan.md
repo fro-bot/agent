@@ -523,53 +523,54 @@ U1 is independent. U2 and U3 may proceed independently. U4 waits for U2 and runs
 
 **Test-first note:** Test-first. The dangerous contract is the post-model boundary, not the prompt wording. Write failing tests for unmerged paths, marker remnants, out-of-scope edits, credential absence, and two-attempt exhaustion before wiring the resolver into the driver.
 
-### U7 — Historical shadow verification and production cutover
+### U7a — Forward-shadow evidence collection (implemented)
 
-**Goal:** Prove the code-owned driver reproduces the known integration artifact shape before retiring the bash/YAML/English duplication.
+**Goal:** Collect durable, credentialless forward-shadow records beside the existing authoritative prompt-driven release path without changing production authority.
+
+**Status:** Implemented in the code-owned comparator, strict record/gate core, integrate result seam, reusable-workflow wiring, and 90-day artifact/version-sync retention path.
 
 **Requirements:** R1, R2, R3, R4, R5, R6, R15, R16
 
 **Dependencies:** U5 and U6.
 
-**Repo-relative files:**
+**Contract:**
 
-- Modify: `.github/workflows/harness-release.yaml` — remove duplicated source parsing/prompt rendering and call the code-owned driver result.
-- Modify: `.github/workflows/harness-integrate.yaml` — invoke the driver inside the existing single job, preserve late credential minting, and keep the model credentialless with respect to push.
-- Retire: `packages/harness/prompt.txt` from the production integration path; delete or retain only as an explicitly non-authoritative migration artifact until the cutover review removes it.
-- Modify: `packages/harness/src/integrate.ts`, `packages/harness/src/integrate-command.ts`, and their tests for workflow-facing outputs.
-- Modify: `scripts/fro-bot-workflow.test.ts` and/or add `packages/harness/src/integration-shadow.test.ts` for static workflow/security invariants and shadow-result shape.
-- Read: `docs/solutions/workflow-issues/integrate-push-strips-workflow-files-2026-08-07.md`.
+- The existing authoritative `Run Fro Bot` path remains first and remains the release authority.
+- A trailing in-job dry-run uses the resolved dispatch/tag `base_version`, a short-lived broker model credential, and no push credential or App-token output.
+- A separate record step always attempts to compare the shadow tree with the anonymous `fro-bot/agent` `refs/harness-integrate/<base-version>` ref while preserving `anomalyco/opencode` as the upstream evidence repository.
+- Missing, malformed, failed, or divergent shadow outcomes produce inconclusive/mismatch evidence and never block the release.
+- Only the JSON record is uploaded for 90 days, then copied into `docs/evidence/harness-shadow/<base-version>.json` by the existing human-gated version-sync PR when refs exist.
+- The static one-job/OIDC/disabled-sudo-and-containers invariant remains unchanged.
 
-**Approach:**
-
-- Select shadow inputs only from the last 3–4 published harness releases/base bumps for which repository history records the exact `base_version`, ordered integration refs/SHAs, and a published integration commit/tree or retained workflow artifact. Build the candidate list from committed `packages/harness/harness.config.json` history plus corresponding release refs/artifacts; never substitute a nearby tag or ref.
-- Precheck every selected case: exact refs/SHAs must remain anonymously fetchable and the expected final tree must be identifiable. If provenance is missing, a ref was deleted/force-pushed/private, an artifact is missing, or the integration commit is ambiguous, mark the case `untestable`; never claim equivalence for it and never substitute another case.
-- Run the driver in dry-run/shadow mode for every provenance-complete selected case, using the exact source set applicable to that historical run. Cutover requires at least three provenance-complete reproducible cases, including at least one actual conflict if any selected historical case contains one. If fewer than three exist, collect forward shadow runs rather than weakening the gate.
-- Compare final tree identity/content modulo only the explicitly documented `.github/workflows` strip and nondeterministic generated metadata. Compare meaningful content and provenance, not commit IDs or incidental metadata outside that documented allowance.
-- Instrument and review conflict size, resolver attempts, and out-of-scope context requests. A clean historical run should show no model turn; a conflict run should show a bounded, explainable resolver turn.
-- Using existing release/job results and operator notes rather than promising new telemetry, record whether each shadow/cutover run completed, failed, elapsed time, and required manual intervention. Compare those observations with the current prompt-driven path when comparable records exist.
-- One unexplained final-tree divergence stops cutover and requires source-level investigation. Do not normalize a difference by expanding the allowlist or changing the comparator without recording why.
-- Only after all shadow stop conditions pass, retire the live bash/English duplication and make the code driver production-authoritative.
-- Preserve the one-job/OIDC security invariant, late scoped credential mint, no `secrets: inherit`, workflow strip, and build/release all-or-nothing gates.
-- Rollback is a revert to the previous workflow/driver version. Do not keep an untested runtime fallback that recreates the old three-way drift.
-
-**Patterns:** historical artifact comparison; non-tautological workflow tests; the one-job security comments and static workflow tests; release workflow's existing integration-commit handoff to build.
+**Historical path closed:** The historical audit found zero provenance-complete cases. Historical resolved SHAs, expected trees, and retained workflow artifacts are unavailable or expired, so historical replay is not a truthful route to cutover and must not be substituted with nearby refs or inferred trees. Forward evidence is the sole route.
 
 **Test scenarios:**
 
-- Happy: an exact-provenance historical case with anonymously fetchable refs produces an equivalent final tree modulo the documented workflow strip/generated metadata and an equivalent verified version/provenance result.
-- Edge: deleted, force-pushed, or private refs, missing artifacts, incomplete provenance, and ambiguous integration commits are each marked `untestable`, do not count toward cutover, and are never replaced by nearby refs.
-- Integration: the precheck identifies the exact base version, ordered refs/SHAs, expected integration commit/tree, and whether the case contains an actual conflict.
-- Stop: one unexplained file/content difference prevents cutover and names the historical base, path, and comparison category.
-- Security: workflow still has exactly one integration job, only the intended job has `id-token: write`, and push credential acquisition occurs after model work.
-- Security: model process cannot access the late push credential; workflow source access remains anonymous.
-- Error: dry-run or shadow failure blocks production cutover without modifying the live workflow path.
-- Integration: build jobs consume the same verified integration commit handoff and release binaries remain all-or-nothing.
-- Operational: the cutover record includes completion/failure, elapsed time, and manual-intervention observations for each comparable run; insufficient comparable history is reported as advisory rather than treated as a gate.
+- Happy: exact shadow and authoritative tree OIDs match and produce a strict `match` record with conflict metrics and run identity.
+- Error: missing/invalid/failed shadow outcomes produce an `inconclusive` record; the release and existing build gates remain unchanged.
+- Security: the single integrate job, late scoped mint, blank GitHub tokens, no App-token reference, no `secrets: inherit`, and public anonymous comparison remain statically enforced.
+- Retention: the current run's JSON record is fail-soft downloaded and copied into the normal version-sync PR only when present and valid.
 
-**Expected verification outcomes:** Historical shadow evidence records both reproducible and `untestable` cases; at least three provenance-complete cases pass, including a historical conflict when one exists; no unexplained divergence remains; production has one authoritative integration driver and no live dependency on prompt-improvised deterministic steps.
+**Expected verification outcomes:** Forward records are machine-readable, non-secret, atomically written, durably retained, and sufficient for the cutover gate once the required evidence exists.
 
-**Test-first note:** Characterization-first for historical tree comparison. Cutover is a release change, not a local refactor; the static workflow/security tests must pass before changing production authority.
+**Test-first note:** Workflow wiring and comparator repository identity are covered by RED/GREEN static and focused tests. This unit does not retire prompt rendering or alter production release authority.
+
+### U7b — Production cutover (blocked)
+
+**Goal:** Make the code-owned integration driver authoritative only after forward-shadow evidence proves equivalence.
+
+**Status:** Blocked — **0/3** distinct provenance-complete forward matches. The gate remains at least three distinct matching base versions with conflict evidence, or an explicit reviewed no-conflict waiver. U7b is not complete and U7 is not complete.
+
+**Required evidence before cutover:**
+
+- At least three strict `match` records for distinct base versions.
+- Valid 40-hex shadow and authoritative tree OIDs with exact ref/SHAs.
+- Conflict evidence in the records unless the explicit waiver is reviewed.
+- No unexplained mismatch, inconclusive record, or missing provenance for a counted case.
+
+**Cutover constraints:** Retire prompt-driven deterministic duplication only after the gate passes; preserve one-job/OIDC, late credential minting, trusted push re-materialization, build integration-commit handoff, and all-or-nothing release gating. Do not add a hidden runtime fallback.
+
+**Rollback:** Revert the workflow/driver authority change without granting new credentials or restoring model-owned push.
 
 ### U8 — Output-mode migration phase 2 in the next minor release
 

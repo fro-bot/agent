@@ -212,6 +212,7 @@ jobs:
     with:
       model: ${{ vars.HARNESS_MODEL }}
       prompt: ${{ needs.prepare-integrate.outputs.rendered_prompt }}
+      base-version: ${{ needs.prepare-integrate.outputs.base_version }}
 
   # ---------------------------------------------------------------------------
   # Per-platform build matrix
@@ -1161,6 +1162,45 @@ jobs:
         with:
           install-dependencies: 'true'
 
+      - name: Download forward shadow evidence
+        id: download-shadow-evidence
+        if: ${{ always() && needs.prepare-integrate.outputs.has_refs == 'true' }}
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: harness-shadow-${{ needs.prepare-integrate.outputs.base_version }}
+          path: ${{ runner.temp }}/harness-shadow
+
+      - name: Retain forward shadow evidence
+        id: retain-shadow-evidence
+        if: ${{ always() && needs.prepare-integrate.outputs.has_refs == 'true' }}
+        continue-on-error: true
+        env:
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
+          RUNNER_TEMP: ${{ runner.temp }}
+          SOURCE: ${{ runner.temp }}/harness-shadow/harness-shadow-${{ needs.prepare-integrate.outputs.base_version }}.json
+        run: |
+          set -euo pipefail
+          SOURCE="${RUNNER_TEMP}/harness-shadow/harness-shadow-${BASE_VERSION}.json"
+          if [ ! -f "${SOURCE}" ]; then
+            echo "pr-line=" >> "$GITHUB_OUTPUT"
+            echo "Forward shadow evidence artifact was unavailable; continuing without evidence."
+            exit 0
+          fi
+          bun -e "
+            import fs from 'node:fs';
+            import {validateForwardShadowRecord} from './packages/harness/src/forward-shadow.ts';
+            const value = JSON.parse(fs.readFileSync(process.env.SOURCE, 'utf8'));
+            const validation = validateForwardShadowRecord(value);
+            if (validation.ok !== true || validation.value?.baseVersion !== process.env.BASE_VERSION) {
+              throw new Error('forward shadow record failed strict retention validation');
+            }
+          "
+          DEST="docs/evidence/harness-shadow/${BASE_VERSION}.json"
+          mkdir -p "$(dirname "${DEST}")"
+          cp "${SOURCE}" "${DEST}"
+          echo "pr-line=- Retains forward-shadow evidence in docs/evidence/harness-shadow/${BASE_VERSION}.json." >> "$GITHUB_OUTPUT"
+
       - name: Compute NEW_VERSION and check idempotency
         id: version
         env:
@@ -1301,6 +1341,8 @@ jobs:
             tracking (which cannot order `+harness.<sha>` build-metadata tags).
             Merging this PR is the gate; not merging holds both surfaces at the
             prior build.
+
+            ${{ steps.retain-shadow-evidence.outputs.pr-line }}
           base: main
           author: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
           committer: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>

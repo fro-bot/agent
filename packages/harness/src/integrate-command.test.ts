@@ -17,6 +17,7 @@ import {existsSync} from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import process from 'node:process'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {cmdIntegrate, packageArtifact} from './integrate-command.js'
@@ -128,6 +129,40 @@ describe('cmdIntegrate — happy path', () => {
     expect(calledConfig.promptPath).toBe(promptPath)
   })
 
+  it('uses an explicit semver-ish base-version override instead of config', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.16.0', integrationRefs: [], integrationCommit: 'abc1234', buildSha: 'dev'},
+    })
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+
+    // #when
+    const code = await cmdIntegrate(
+      ['--base-version', '1.16.0-rc.1', '--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath],
+      configPath,
+      stubPackage,
+    )
+
+    // #then
+    expect(code).toBe(0)
+    const [calledConfig] = vi.mocked(runIntegration).mock.calls[0] as [IntegrationConfig, unknown]
+    expect(calledConfig.baseVersion).toBe('1.16.0-rc.1')
+  })
+
+  it('rejects an invalid base-version override before running integration', async () => {
+    // #when
+    const code = await cmdIntegrate(
+      ['--base-version', 'not a version', '--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath],
+      configPath,
+      vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    )
+
+    // #then
+    expect(code).toBe(1)
+    expect(runIntegration).not.toHaveBeenCalled()
+  })
+
   it('calls packageArtifact with workDir, integrationCommit, and outPath on {ok:true}', async () => {
     // #given
     const integrationCommit = 'deadbeef1234'
@@ -166,6 +201,98 @@ describe('cmdIntegrate — happy path', () => {
     expect(makeRealAdapters).toHaveBeenCalledOnce()
     const [, calledAdapters] = vi.mocked(runIntegration).mock.calls[0] as [IntegrationConfig, unknown]
     expect(calledAdapters).toBe(fakeAdapters)
+  })
+
+  it('reads broker auth once, removes it from the process environment, and passes it only in config', async () => {
+    // #given
+    const brokerAuthJson = '{"provider":"short-lived-model-credential"}'
+    const previousBrokerAuthJson = process.env.HARNESS_BROKER_AUTH_JSON
+    process.env.HARNESS_BROKER_AUTH_JSON = brokerAuthJson
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+    vi.mocked(runIntegration).mockImplementation(async config => {
+      expect(process.env.HARNESS_BROKER_AUTH_JSON).toBeUndefined()
+      expect(config.brokerAuthJson).toBe(brokerAuthJson)
+      return {
+        ok: true,
+        manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'abc1234', buildSha: 'dev'},
+      }
+    })
+
+    try {
+      // #when
+      const code = await cmdIntegrate(
+        ['--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath],
+        configPath,
+        stubPackage,
+      )
+
+      // #then
+      expect(code).toBe(0)
+      expect(process.env.HARNESS_BROKER_AUTH_JSON).toBeUndefined()
+    } finally {
+      if (previousBrokerAuthJson === undefined) delete process.env.HARNESS_BROKER_AUTH_JSON
+      else process.env.HARNESS_BROKER_AUTH_JSON = previousBrokerAuthJson
+    }
+  })
+
+  it('writes a machine-readable result file without broker auth or logs', async () => {
+    // #given
+    const brokerAuthJson = '{"provider":"secret-model-credential"}'
+    const previousBrokerAuthJson = process.env.HARNESS_BROKER_AUTH_JSON
+    process.env.HARNESS_BROKER_AUTH_JSON = brokerAuthJson
+    const resultPath = path.join(tmpDir, 'integration-result.json')
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {
+        baseVersion: '1.15.13',
+        integrationRefs: [{ref: 'refs/pull/30182/head', resolvedSha: 'a'.repeat(40)}],
+        integrationCommit: 'b'.repeat(40),
+        buildSha: 'dev',
+      },
+    })
+
+    try {
+      // #when
+      const code = await cmdIntegrate(
+        ['--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath, '--result-out', resultPath],
+        configPath,
+        stubPackage,
+      )
+      const resultContent = await fs.readFile(resultPath, 'utf8')
+
+      // #then
+      expect(code).toBe(0)
+      expect(resultContent).toContain('"schemaVersion": 1')
+      expect(resultContent).toContain(`"integrationCommit": "${'b'.repeat(40)}"`)
+      expect(resultContent).not.toContain(brokerAuthJson)
+      expect(resultContent).not.toMatch(/prompt|narration|token|password|log/i)
+    } finally {
+      if (previousBrokerAuthJson === undefined) delete process.env.HARNESS_BROKER_AUTH_JSON
+      else process.env.HARNESS_BROKER_AUTH_JSON = previousBrokerAuthJson
+    }
+  })
+
+  it('fails honestly when --result-out names a directory instead of a file', async () => {
+    // #given
+    vi.mocked(runIntegration).mockResolvedValue({
+      ok: true,
+      manifest: {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: 'abc1234', buildSha: 'dev'},
+    })
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+
+    // #when
+    const code = await cmdIntegrate(
+      ['--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath, '--result-out', tmpDir],
+      configPath,
+      stubPackage,
+    )
+
+    // #then
+    expect(code).toBe(1)
+    expect(errorSpy.mock.calls.flat().join('\n')).toContain('result file')
+    errorSpy.mockRestore()
   })
 })
 
@@ -244,6 +371,41 @@ describe('cmdIntegrate — error path', () => {
     expect(errorLine).not.toMatch(/at \w+ \(/)
 
     errorSpy.mockRestore()
+  })
+
+  it('removes broker auth before a failed pipeline and never leaks it in failure output', async () => {
+    // #given
+    const brokerAuthJson = '{"provider":"failure-secret"}'
+    const previousBrokerAuthJson = process.env.HARNESS_BROKER_AUTH_JSON
+    process.env.HARNESS_BROKER_AUTH_JSON = brokerAuthJson
+    const resultPath = path.join(tmpDir, 'failure-result.json')
+    vi.mocked(runIntegration).mockImplementation(async config => {
+      expect(process.env.HARNESS_BROKER_AUTH_JSON).toBeUndefined()
+      expect(config.brokerAuthJson).toBe(brokerAuthJson)
+      return {ok: false, stage: 'merge', error: 'merge failed'}
+    })
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const stubPackage = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+
+    try {
+      // #when
+      const code = await cmdIntegrate(
+        ['--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath, '--result-out', resultPath],
+        configPath,
+        stubPackage,
+      )
+      const resultContent = await fs.readFile(resultPath, 'utf8')
+
+      // #then
+      expect(code).toBe(1)
+      expect(process.env.HARNESS_BROKER_AUTH_JSON).toBeUndefined()
+      expect(errorSpy.mock.calls.flat().join('\n')).not.toContain(brokerAuthJson)
+      expect(resultContent).not.toContain(brokerAuthJson)
+    } finally {
+      errorSpy.mockRestore()
+      if (previousBrokerAuthJson === undefined) delete process.env.HARNESS_BROKER_AUTH_JSON
+      else process.env.HARNESS_BROKER_AUTH_JSON = previousBrokerAuthJson
+    }
   })
 
   it('returns 1 and leaves no artifact when packageArtifact throws', async () => {

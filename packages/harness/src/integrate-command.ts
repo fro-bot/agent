@@ -27,8 +27,10 @@ import {execFileSync, execSync} from 'node:child_process'
 import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {formatPipelineError} from './format-error.js'
+import {buildIntegrationOutcomeFile, writeIntegrationOutcomeFile} from './forward-shadow.js'
 import {makeRealAdapters, runIntegration} from './integrate.js'
 
 // ---------------------------------------------------------------------------
@@ -71,18 +73,26 @@ export const DEFAULT_CONFIG_PATH = path.join(packageRoot, 'harness.config.json')
 // ---------------------------------------------------------------------------
 
 interface ParsedFlags {
+  readonly baseVersion: string | undefined
   readonly workDir: string | undefined
   readonly promptPath: string | undefined
   readonly out: string | undefined
+  readonly resultOut: string | undefined
   readonly dryRun: boolean | undefined
   readonly pushRepo: string | undefined
   readonly pushRef: string | undefined
 }
 
+export function isValidBaseVersion(value: string): boolean {
+  return /^\d+\.\d+\.\d+(?:[.-][\w.-]+)?$/.test(value)
+}
+
 function parseFlags(argv: readonly string[]): ParsedFlags | null {
+  let baseVersion: string | undefined
   let workDir: string | undefined
   let promptPath: string | undefined
   let out: string | undefined
+  let resultOut: string | undefined
   let dryRun: boolean | undefined
   let pushRepo: string | undefined
   let pushRef: string | undefined
@@ -95,8 +105,10 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
     }
     if (
       arg === '--work-dir' ||
+      arg === '--base-version' ||
       arg === '--prompt-path' ||
       arg === '--out' ||
+      arg === '--result-out' ||
       arg === '--push-repo' ||
       arg === '--push-ref'
     ) {
@@ -105,7 +117,9 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
         console.error(`[integrate] ${arg} requires a value`)
         return null
       }
-      if (arg === '--work-dir') {
+      if (arg === '--base-version') {
+        baseVersion = next
+      } else if (arg === '--work-dir') {
         workDir = next
       } else if (arg === '--prompt-path') {
         promptPath = next
@@ -113,6 +127,8 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
         pushRepo = next
       } else if (arg === '--push-ref') {
         pushRef = next
+      } else if (arg === '--result-out') {
+        resultOut = next
       } else {
         out = next
       }
@@ -120,7 +136,7 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
     }
   }
 
-  return {workDir, promptPath, out, dryRun, pushRepo, pushRef}
+  return {baseVersion, workDir, promptPath, out, resultOut, dryRun, pushRepo, pushRef}
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +349,10 @@ export async function cmdIntegrate(
   _packageArtifact: typeof packageArtifact = packageArtifact,
   logger: IntegrateLogger = silentIntegrateLogger,
 ): Promise<number> {
+  const startedAt = new Date().toISOString()
+  const brokerAuthJson = process.env.HARNESS_BROKER_AUTH_JSON
+  delete process.env.HARNESS_BROKER_AUTH_JSON
+
   // Parse flags.
   const flags = parseFlags(argv)
   if (flags === null) return 1
@@ -340,6 +360,10 @@ export async function cmdIntegrate(
   // Validate required flags.
   if (flags.workDir === undefined) {
     console.error('[integrate] Missing required flag: --work-dir <dir>')
+    return 1
+  }
+  if (flags.baseVersion !== undefined && isValidBaseVersion(flags.baseVersion) === false) {
+    console.error(`[integrate] Invalid --base-version: ${flags.baseVersion}`)
     return 1
   }
   if (flags.out === undefined) {
@@ -375,17 +399,35 @@ export async function cmdIntegrate(
   }
 
   const config: IntegrationConfig = {
-    baseVersion: rawConfig.base_version,
+    baseVersion: flags.baseVersion ?? rawConfig.base_version,
     releaseRepo: rawConfig.release_repo,
     sourceRepo: rawConfig.source_repo,
     integrationRefs: rawConfig.integrationRefs,
     agent: rawConfig.agent,
     model: rawConfig.model,
     opencodeBin: rawConfig.opencode_bin ?? 'opencode',
+    brokerAuthJson,
     workDir,
     promptPath: flags.promptPath,
     dryRun: flags.dryRun,
     pushTarget,
+  }
+
+  const writeOutcome = async (
+    result: IntegrationResult,
+    failure?: {readonly stage: string; readonly error: string},
+  ): Promise<boolean> => {
+    if (flags.resultOut === undefined) return true
+    try {
+      await writeIntegrationOutcomeFile(
+        flags.resultOut,
+        buildIntegrationOutcomeFile(result, startedAt, new Date().toISOString(), failure),
+      )
+      return true
+    } catch (error) {
+      console.error(`[integrate] Failed to write result file: ${formatPipelineError(error)}`)
+      return false
+    }
   }
 
   // Run the integration and package the artifact.
@@ -393,15 +435,34 @@ export async function cmdIntegrate(
     const adapters = makeRealAdapters()
     const result = await runIntegration(config, adapters)
     if (result.ok === true) {
-      await _packageArtifact(workDir, result.manifest.integrationCommit, outPath)
+      try {
+        await _packageArtifact(workDir, result.manifest.integrationCommit, outPath)
+      } catch (error) {
+        const packaged = await writeOutcome(result, {stage: 'artifact', error: formatPipelineError(error)})
+        if (packaged === false) return 1
+        console.error(`[integrate] ${formatPipelineError(error)}`)
+        return 1
+      }
       const finalized = await finalizeLocalIntegration(config, adapters, result, artifactCompletion, logger)
-      if (finalized.ok === true) return 0
+      if (finalized.ok === true) {
+        const written = await writeOutcome(finalized)
+        return written ? 0 : 1
+      }
+      const written = await writeOutcome(result, {
+        stage: finalized.stage ?? 'finalize',
+        error: finalized.error,
+      })
+      if (written === false) return 1
       console.error(`[integrate] ${finalized.error}`)
       return 1
     }
+    const written = await writeOutcome(result)
+    if (written === false) return 1
     console.error(`[integrate] ${result.error}`)
     return 1
   } catch (error) {
+    const failed: IntegrationResult = {ok: false, stage: 'provenance', error: formatPipelineError(error)}
+    await writeOutcome(failed, {stage: 'command', error: formatPipelineError(error)})
     console.error(`[integrate] ${formatPipelineError(error)}`)
     return 1
   }
