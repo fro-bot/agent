@@ -74,7 +74,7 @@
     "@bfra.me/es": "0.1.0",
     "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.2.0",
-    "@opencode-ai/sdk": "1.18.14"
+    "@opencode-ai/sdk": "1.18.16"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.51.1",
@@ -84,7 +84,7 @@
     "@semantic-release/exec": "7.1.0",
     "@semantic-release/git": "10.0.1",
     "@types/node": "24.13.3",
-    "@vitest/eslint-plugin": "1.6.26",
+    "@vitest/eslint-plugin": "1.6.27",
     "conventional-changelog-conventionalcommits": "9.3.1",
     "eslint": "10.8.1",
     "eslint-config-prettier": "10.1.8",

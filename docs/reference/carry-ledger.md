@@ -22,7 +22,7 @@ No carry has an in-repo record of the upstream version that would contain it, so
 
 - **Capability:** Populates `session.summary.diffs` at the session level. Stock builds compute per-message summaries but never fold them into the session-level row.
 - **Surface:** Both, and load-bearing for headed/local consumers.
-- **Upstream status:** Open. Verified absent from stock through 1.18.14.
+- **Upstream status:** Open. Verified absent from stock through 1.18.18.
 - **Evidence it is still needed:** A downstream consumer (Space Bus) reads the aggregate summary as its preferred tier. Without this carry it falls back to fetching every message and aggregating per-turn diffs client-side.
 - **Removal condition:** Stock exposes the aggregate fold — not merely a `summary.diffs` field in the schema, which stock already has while leaving it unpopulated. Verify the value is written, not just typed.
 
