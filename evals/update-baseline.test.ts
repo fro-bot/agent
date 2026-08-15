@@ -52,9 +52,18 @@ function createReport(overrides: Partial<SyntheticReport> = {}): SyntheticReport
     output: 'raw response body with auth sk-secret-value',
     canary: 'raw canary',
     gates: [
-      {id: 'response-file-parses', status: 'passed'},
-      {id: 'verdict-matches', status: 'passed'},
+      {id: 'response-file-parses', kind: 'quality', status: 'passed'},
+      {id: 'verdict-matches', kind: 'quality', status: 'passed'},
     ],
+    outcome: {
+      scenarioId: scenario.id,
+      state: 'passed',
+      verdict: scenario.expect.verdict,
+      gates: [
+        {id: 'response-file-parses', kind: 'quality', status: 'passed'},
+        {id: 'verdict-matches', kind: 'quality', status: 'passed'},
+      ],
+    },
   }))
 
   return {
@@ -72,6 +81,22 @@ function createReport(overrides: Partial<SyntheticReport> = {}): SyntheticReport
 }
 
 describe('buildBaselineFromReport', {timeout: 60_000}, () => {
+  it('rejects a completed report that lacks the stable outcome projection', () => {
+    // #given a completed report from before the stable outcome projection was recorded
+    const reports = createReport().reports.map((report, index) => {
+      if (index !== 0) {
+        return report
+      }
+      const reportWithoutOutcome = {...report}
+      Reflect.deleteProperty(reportWithoutOutcome, 'outcome')
+      return reportWithoutOutcome
+    })
+
+    // #when strict baseline promotion validates the report
+    // #then missing observed outcome evidence is rejected instead of inferred from expectations
+    expect(() => buildBaselineFromReport(createReport({reports}))).toThrow('reports[0].outcome')
+  })
+
   it('rejects a report with missing pluginVersions provenance', () => {
     // #given a report whose first scenario omits plugin provenance entirely
     const reports = createReport().reports.map((report, index) => {
@@ -198,9 +223,16 @@ describe('buildBaselineFromReport', {timeout: 60_000}, () => {
       const raw = readFileSync(outputPath, 'utf8')
       const baseline = JSON.parse(raw) as unknown
       const expectedBaseline = buildBaselineFromReport(report)
+      const projectConfig = await prettier.resolveConfig(path.join(process.cwd(), 'evals', 'baselines', 'u1.json'))
 
       expect(baseline).toEqual(expectedBaseline)
-      expect(raw).toBe(await prettier.format(raw, {filepath: outputPath, parser: 'json'}))
+      expect(raw).toBe(
+        await prettier.format(raw, {
+          ...(projectConfig ?? {}),
+          filepath: outputPath,
+          parser: 'json',
+        }),
+      )
       expect(raw).not.toContain('raw response')
       expect(raw).not.toContain('sk-secret-value')
     } finally {

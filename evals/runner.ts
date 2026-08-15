@@ -29,7 +29,7 @@ import {
   readCapturedDiagnostics,
 } from './diagnostics.js'
 import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
-import {evaluateRun} from './gates.js'
+import {evaluateRun, projectStableOutcome} from './gates.js'
 
 const DEFAULT_EVAL_MODEL = 'opencode/big-pickle'
 export const EVAL_RESPONSE_PATH_SENTINEL = '/__fro-bot_eval__/response.md'
@@ -824,6 +824,12 @@ export async function runScenario(
       forbiddenMutations: detectForbiddenMutations(fixtureRepo.path, fixtureRepo.headSha),
     }
     const evaluation = evaluateRun(completeArtifacts)
+    const outcome = projectStableOutcome(
+      scenario.id,
+      evaluation.state,
+      completeArtifacts.parsedResponse?.verdict ?? null,
+      evaluation.gates,
+    )
     const deterministicProvenance = buildDeterministicScenarioProvenance(scenario, logger)
     const redactedAgentError = redactSensitiveText(agentResult.error ?? '', environment.authSecretValues)
     const redactedExecutionFailureReason = redactSensitiveText(
@@ -860,6 +866,7 @@ export async function runScenario(
         diagnosticsPath,
         cleanupError: null,
       },
+      outcome,
       gates: evaluation.gates,
       agentResult: {
         success: agentResult.success,
@@ -897,6 +904,7 @@ export async function runScenario(
       ...report,
       state: 'failed',
       stateReason: `Cleanup failed after completed execution: ${cleanupError}`,
+      outcome: {...report.outcome, state: 'failed'},
       execution: {...report.execution, cleanupError},
     }
   }

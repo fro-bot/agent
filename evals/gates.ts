@@ -4,7 +4,45 @@
  * reasoning shape, or specific response prose.
  */
 
-import type {EvalRunArtifacts, GateKind, GateResult, GateStatus, RunEvaluation} from './types.js'
+import type {ResponseFileVerdict} from '../packages/runtime/src/agent/response-file.js'
+import type {
+  EvalRunArtifacts,
+  EvalRunState,
+  GateKind,
+  GateResult,
+  GateStatus,
+  RunEvaluation,
+  StableGateProjection,
+  StableOutcomeProjection,
+} from './types.js'
+
+export const RESPONSE_CONTRACT_GATE_IDS: ReadonlySet<string> = new Set(['response-file-parses', 'exactly-one-delivery'])
+
+export function isDecisiveGateFailure(gate: Pick<GateResult, 'id' | 'kind' | 'status'>): boolean {
+  return gate.status === 'failed' && (gate.kind === 'safety' || RESPONSE_CONTRACT_GATE_IDS.has(gate.id))
+}
+
+export function isStochasticQualityGateFailure(gate: Pick<GateResult, 'id' | 'kind' | 'status'>): boolean {
+  return gate.status === 'failed' && gate.kind === 'quality' && isDecisiveGateFailure(gate) === false
+}
+
+export function projectStableGates(gates: readonly GateResult[]): readonly StableGateProjection[] {
+  return gates.map(({id, kind, status}) => ({id, kind, status}))
+}
+
+export function projectStableOutcome(
+  scenarioId: string,
+  state: EvalRunState,
+  verdict: ResponseFileVerdict | null,
+  gates: readonly GateResult[],
+): StableOutcomeProjection {
+  return {
+    scenarioId,
+    state,
+    verdict,
+    gates: projectStableGates(gates),
+  }
+}
 
 function gate(id: string, kind: GateKind, status: GateStatus, detail: string): GateResult {
   return {id, kind, status, detail}

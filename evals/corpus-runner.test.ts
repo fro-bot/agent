@@ -25,6 +25,12 @@ function createReport(scenarioId: string, cleanupError: string | null): EvalRunR
       diagnosticsPath: null,
       cleanupError,
     },
+    outcome: {
+      scenarioId,
+      state: cleanupError == null ? 'passed' : 'failed',
+      verdict: null,
+      gates: [],
+    },
     gates: [],
     agentResult: {success: true, exitCode: 0, error: null, tokenUsage: null},
   }
