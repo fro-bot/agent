@@ -28,6 +28,24 @@ The original `clean-pr` / `planted-defect` pair is a deliberately differential P
 
 The irrelevant-prior-work continuation scenario is a non-degradation check: unrelated supplied context must not prevent the agent from finding the current repository evidence. It is not contamination coverage and must not ban the unrelated marker from the response.
 
+## Candidate comparison
+
+`evals/compare.ts` provides a read-only candidate-vs-reviewed-baseline projection. It compares only `scenarioId`, the observed structured `verdict`, scenario `state`, and gate IDs with their `passed`/`failed`/`not-evaluated` semantics. Gate details and response prose are diagnostics, not quality equality.
+
+Model/runtime/plugin versions, prompt and fixture hashes, duration, cost, and token usage remain provenance or advisory differences. Tool calls, call counts, reasoning order, and step counts are never quality fields. A clean comparison reports only **no large observed regression across the six covered scenarios**; it does not claim improvement or production-surface quality.
+
+Safety and response-contract failures are decisive and block without stochastic retries. An inconclusive infrastructure outcome is neither pass nor fail and requests a rerun. A stochastic quality failure requests lazy repeats only for that scenario, with a maximum of four candidate and four reviewed-baseline samples including the initial observations. Mixed samples, or two modes that both pass without discrimination, remain inconclusive and never auto-promote a candidate baseline.
+
+The committed `u1.json` artifact predates the stable outcome projection. Until a newly reviewed baseline includes those observations, comparison returns explicit missing-evidence rather than copying candidate values into the baseline or inferring an observed verdict from expected metadata.
+
+### Bounded session-presearch experiment
+
+U4 is an eval-only differential seam, not a public feature. `runSessionPrep` keeps the current eager behavior when its strategy is omitted. The runner may inject the treatment strategy for only the existing `continuation-relevant` and `continuation-irrelevant-non-degradation` scenarios; the treatment removes eager recent/prior-work context while preserving the logical key, continuation identity, and native `session_*` capability.
+
+The treatment is selected by dependency injection through the runner path. There is no Action input, general feature flag, environment switch, or global state. Reports may include advisory `sessionPresearch` accounting for strategy, logical/continuation identity, context result counts, and injected-context bytes. That provenance is never a quality gate and contains no tool-call, call-count, ordering, or reasoning claim.
+
+The comparison reuses the stable outcome projection and the existing lazy four-vs-four repeat bound. A clean result means only that no large regression was observed on these two covered scenarios. If both modes pass, the corpus cannot attribute causal improvement; deleting eager presearch would be a documented simplicity/cost judgment rather than evidence that the model reasoned better.
+
 ## Run it
 
 Normal test runs do not start OpenCode and do not cost anything:

@@ -23,6 +23,10 @@ interface Workflow {
 interface RoutingScenario {
   readonly eventName: string
   readonly releaseTag: string
+  readonly correlationId: string
+  readonly prompt: string
+  readonly useWikiPrompt: boolean
+  readonly schedule: string
   readonly workflowRef: string
   readonly repository: string
   readonly ref: string
@@ -37,6 +41,7 @@ interface RoutingResult {
 type ExpressionValue = boolean | string
 
 const WORKFLOW_PATH = process.env.FRO_BOT_WORKFLOW_TEST_PATH ?? '.github/workflows/fro-bot.yaml'
+const HARNESS_INTEGRATE_WORKFLOW_PATH = '.github/workflows/harness-integrate.yaml'
 const REPOSITORY = 'fro-bot/agent'
 const DIRECT_REF = 'refs/heads/main'
 const DIRECT_WORKFLOW_REF = `${REPOSITORY}/.github/workflows/fro-bot.yaml@${DIRECT_REF}`
@@ -45,9 +50,36 @@ const GITHUB_TOKEN = 'github-token'
 const MINTED_TOKEN = 'minted-token'
 const PAT = 'pat-token'
 
-function loadWorkflow(): Workflow {
-  const parsed = parse(readFileSync(WORKFLOW_PATH, 'utf8')) as Record<string, unknown>
+function loadWorkflow(path = WORKFLOW_PATH): Workflow {
+  const parsed = parse(readFileSync(path, 'utf8')) as Record<string, unknown>
   return {jobs: parsed.jobs as Record<string, WorkflowJob>}
+}
+
+function loadRawWorkflow(path: string): Record<string, unknown> {
+  return parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+}
+
+function rawJob(path: string, name: string): Record<string, unknown> {
+  const workflow = loadRawWorkflow(path)
+  const jobs = workflow.jobs
+  if (jobs === null || typeof jobs !== 'object' || Array.isArray(jobs)) throw new TypeError(`${path} jobs are missing`)
+  const job = (jobs as Record<string, unknown>)[name]
+  if (job === null || typeof job !== 'object' || Array.isArray(job)) {
+    throw new TypeError(`${path} job ${name} is missing`)
+  }
+  return job as Record<string, unknown>
+}
+
+function stepsFor(path: string, jobName: string): Record<string, unknown>[] {
+  const job = rawJob(path, jobName)
+  if (!Array.isArray(job.steps)) throw new TypeError(`${path} job ${jobName} steps are missing`)
+  return job.steps.filter((step): step is Record<string, unknown> => step !== null && typeof step === 'object')
+}
+
+function stepById(steps: readonly Record<string, unknown>[], id: string): Record<string, unknown> {
+  const step = steps.find(value => value.id === id)
+  if (step === undefined) throw new TypeError(`step ${id} is missing`)
+  return step
 }
 
 function loadFroBotJob(): WorkflowJob {
@@ -166,6 +198,18 @@ function evaluateAtom(atom: string, scenario: RoutingScenario, mintOutput: strin
   if (atom === "github.event.inputs.release-tag == ''") {
     return scenario.releaseTag === ''
   }
+  if (atom === "github.event.inputs.correlation-id != ''") {
+    return scenario.correlationId !== ''
+  }
+  if (atom === "inputs.prompt != ''") {
+    return scenario.prompt !== ''
+  }
+  if (atom === "github.event.inputs.use-wiki-prompt == 'true'") {
+    return scenario.useWikiPrompt
+  }
+  if (atom === "github.event.schedule == '0 20 * * 0'") {
+    return scenario.schedule === '0 20 * * 0'
+  }
   if (atom === 'github.token') {
     return GITHUB_TOKEN
   }
@@ -174,6 +218,11 @@ function evaluateAtom(atom: string, scenario: RoutingScenario, mintOutput: strin
   }
   if (atom === 'secrets.FRO_BOT_PAT') {
     return PAT
+  }
+
+  const stringLiteralMatch = /^'([^']*)'$/.exec(atom)
+  if (stringLiteralMatch !== null) {
+    return stringLiteralMatch[1] ?? ''
   }
 
   const eventNameMatch = /^github\.event_name == '([^']*)'$/.exec(atom)
@@ -243,10 +292,20 @@ function resolveRouting(job: WorkflowJob, scenario: RoutingScenario): RoutingRes
   }
 }
 
+function resolveOutputModeCaller(job: WorkflowJob, routingScenario: RoutingScenario): string {
+  const runFroBot = findStep(job, step => step.uses === './')
+  const outputModeExpression = expressionFrom(runFroBot.with?.['output-mode'], 'output-mode')
+  return String(evaluateExpression(outputModeExpression, routingScenario, ''))
+}
+
 function scenario(overrides: Partial<RoutingScenario>): RoutingScenario {
   return {
     eventName: 'issue_comment',
     releaseTag: '',
+    correlationId: '',
+    prompt: '',
+    useWikiPrompt: false,
+    schedule: '',
     workflowRef: DIRECT_WORKFLOW_REF,
     repository: REPOSITORY,
     ref: DIRECT_REF,
@@ -398,5 +457,228 @@ describe('fro-bot workflow — owner-wide App token routing', () => {
     // #then only the trusted apply command receives FRO_BOT_PAT in its job
     expect(applyPatSteps).toHaveLength(1)
     expect(applyPatSteps[0]?.env?.GH_TOKEN).toBe(`\${{ secrets.FRO_BOT_PAT }}`)
+  })
+
+  it('keeps confirmed manual output-mode callers explicit in the checked-in expression', () => {
+    // #given the actual Fro Bot action call and representative manual trigger contexts
+    const job = loadFroBotJob()
+
+    // #when the workflow expression is evaluated for each confirmed caller path
+    const wikiDispatch = resolveOutputModeCaller(job, scenario({eventName: 'workflow_dispatch', useWikiPrompt: true}))
+    const wikiSchedule = resolveOutputModeCaller(job, scenario({eventName: 'schedule', schedule: '0 20 * * 0'}))
+    const correlationDispatch = resolveOutputModeCaller(
+      job,
+      scenario({eventName: 'workflow_dispatch', correlationId: 'release-123'}),
+    )
+    const customPromptDispatch = resolveOutputModeCaller(
+      job,
+      scenario({eventName: 'workflow_dispatch', prompt: 'write a release summary'}),
+    )
+    const ordinaryManualDispatch = resolveOutputModeCaller(job, scenario({eventName: 'workflow_dispatch'}))
+
+    // #then wiki paths request branch-pr, controlled local paths request working-dir, and fallback stays auto
+    expect(wikiDispatch).toBe('branch-pr')
+    expect(wikiSchedule).toBe('branch-pr')
+    expect(correlationDispatch).toBe('working-dir')
+    expect(customPromptDispatch).toBe('working-dir')
+    expect(ordinaryManualDispatch).toBe('auto')
+  })
+
+  it('keeps harness integration on explicit working-dir output mode', () => {
+    // #given the checked-in harness integration workflow
+    const workflow = loadWorkflow(HARNESS_INTEGRATE_WORKFLOW_PATH)
+    const job = workflow.jobs.integrate
+    if (job === undefined) {
+      throw new TypeError('integrate job is missing')
+    }
+    const runFroBot = findStep(job, step => step.uses === './')
+
+    // #then the integration caller cannot fall back to prompt-sensitive inference
+    expect(runFroBot.with?.['output-mode']).toBe('working-dir')
+  })
+})
+
+describe('harness forward-shadow workflow wiring', () => {
+  const integratePath = '.github/workflows/harness-integrate.yaml'
+  const releasePath = '.github/workflows/harness-release.yaml'
+
+  it('keeps harness-integrate to one job with unchanged permissions and no secret inheritance', () => {
+    // #given
+    const workflow = loadRawWorkflow(integratePath)
+    const jobs = workflow.jobs
+    if (jobs === null || typeof jobs !== 'object' || Array.isArray(jobs)) throw new TypeError('jobs are missing')
+    const jobNames = Object.keys(jobs)
+    const job = rawJob(integratePath, 'integrate')
+    const workflowCall = workflow.on as Record<string, unknown>
+    const call = workflowCall.workflow_call as Record<string, unknown>
+    const inputs = call.inputs as Record<string, unknown>
+    const secrets = call.secrets as Record<string, unknown>
+
+    // #then
+    expect(jobNames).toEqual(['integrate'])
+    expect(job.permissions).toEqual({'id-token': 'write', contents: 'read'})
+    expect((inputs['base-version'] as Record<string, unknown>).required).toBe(true)
+    expect(Object.keys(secrets).sort()).toEqual([
+      'APPLICATION_ID',
+      'APPLICATION_PRIVATE_KEY',
+      'OMO_PROVIDERS',
+      'OPENCODE_CONFIG',
+    ])
+    expect(JSON.stringify(workflow)).not.toContain('secrets: inherit')
+  })
+
+  it('orders authoritative Run Fro Bot before shadow driver, record, and upload', () => {
+    // #given
+    const steps = stepsFor(integratePath, 'integrate')
+    const mint = steps.findIndex(step => step.id === 'mint')
+    const appMint = steps.findIndex(step => step.id === 'mint-app-token')
+    const authoritative = steps.findIndex(step => step.name === 'Run Fro Bot')
+    const shadow = steps.findIndex(step => step.id === 'shadow-integrate')
+    const record = steps.findIndex(step => step.id === 'shadow-record')
+    const upload = steps.findIndex(step => step.id === 'upload-shadow-record')
+
+    // #then
+    expect(mint).toBeGreaterThanOrEqual(0)
+    expect(appMint).toBeGreaterThan(mint)
+    expect(authoritative).toBeGreaterThan(appMint)
+    expect(shadow).toBeGreaterThan(authoritative)
+    expect(record).toBeGreaterThan(shadow)
+    expect(upload).toBeGreaterThan(record)
+  })
+
+  it('keeps every shadow step credentialless and invokes dry-run without push flags', () => {
+    // #given
+    const steps = stepsFor(integratePath, 'integrate')
+    const shadowSteps = steps.filter(
+      step => step.id === 'shadow-integrate' || step.id === 'shadow-record' || step.id === 'upload-shadow-record',
+    )
+    const shadow = stepById(steps, 'shadow-integrate')
+    const run = String(shadow.run ?? '')
+
+    // #then
+    expect(shadowSteps).toHaveLength(3)
+    for (const step of shadowSteps) {
+      const env = step.env as Record<string, unknown> | undefined
+      expect(env?.GH_TOKEN).toBe('')
+      expect(env?.GITHUB_TOKEN).toBe('')
+      expect(JSON.stringify(step)).not.toContain('mint-app-token')
+    }
+    expect(shadow['continue-on-error']).toBe(true)
+    expect(String(shadow.if)).toContain('always()')
+    expect(run).toContain('--dry-run')
+    expect(run).toContain('--base-version')
+    expect(run).toContain('--result-out')
+    expect(run).not.toMatch(/--push-(repo|ref)/)
+  })
+
+  it('always records and uploads only a 90-day JSON evidence artifact', () => {
+    // #given
+    const steps = stepsFor(integratePath, 'integrate')
+    const record = stepById(steps, 'shadow-record')
+    const upload = stepById(steps, 'upload-shadow-record')
+    const uploadWith = upload.with as Record<string, unknown>
+
+    // #then
+    expect(String(record.if)).toContain('always()')
+    expect(String(upload.if)).toContain('always()')
+    expect(uploadWith['retention-days']).toBe(90)
+    expect(uploadWith['if-no-files-found']).toBe('warn')
+    expect(String(uploadWith.path)).toMatch(/\.json/)
+  })
+
+  it('passes the resolved base version to the reusable integrate workflow and preserves the build handoff', () => {
+    // #given
+    const integrate = rawJob(releasePath, 'integrate')
+    const build = rawJob(releasePath, 'build')
+    const integrateWith = integrate.with as Record<string, unknown>
+    const buildSteps = stepsFor(releasePath, 'build')
+    const fetch = stepById(buildSteps, 'fetch-integrate')
+
+    // #then
+    expect(integrateWith['base-version']).toBe('${{' + ' needs.prepare-integrate.outputs.base_version }}')
+    expect(build.needs).toEqual(['prepare-integrate', 'integrate'])
+    expect(String(build.if)).toContain('needs.integrate.result')
+    expect(String(fetch.run)).toContain('refs/harness-integrate/${' + 'BASE_VERSION}')
+    expect(String(fetch.run)).toContain('integration_commit=${' + 'INTEGRATION_COMMIT}')
+  })
+
+  it('downloads and retains the current run shadow record without changing sync permissions', () => {
+    // #given
+    const sync = rawJob(releasePath, 'sync-default-version')
+    const permissions = sync.permissions
+    const steps = stepsFor(releasePath, 'sync-default-version')
+    const download = stepById(steps, 'download-shadow-evidence')
+    const retain = stepById(steps, 'retain-shadow-evidence')
+    const pullRequest = steps.findIndex(step => step.name === 'Open PR via peter-evans/create-pull-request')
+    const retainIndex = steps.indexOf(retain)
+    const downloadWith = download.with as Record<string, unknown>
+
+    // #then
+    expect(permissions).toEqual({contents: 'write', 'pull-requests': 'write'})
+    expect(String(download.if)).toContain('always()')
+    expect(String(download.if)).toContain("has_refs == 'true'")
+    expect(download['continue-on-error']).toBe(true)
+    expect(String(downloadWith.name)).toContain('base_version')
+    expect(String(retain.run)).toContain('docs/evidence/harness-shadow')
+    expect(String(retain.run)).toContain('forwardShadowEvidencePath')
+    expect(String(retain.run)).toContain('non-matches')
+    expect(String(retain.run)).toContain('validateForwardShadowRecord')
+    expect(String(retain.run)).toContain('if [ ! -f')
+    expect(String(retain.run)).toContain('::warning')
+    expect(String(retain.run)).toContain('GITHUB_STEP_SUMMARY')
+    expect(String(retain.if)).toContain('always()')
+    expect(retain['continue-on-error']).toBe(true)
+    expect(retainIndex).toBeLessThan(pullRequest)
+  })
+
+  it('reports the strict forward-shadow gate without blocking the sync PR', () => {
+    // #given the sync job's retained countable evidence and the gate step
+    const steps = stepsFor(releasePath, 'sync-default-version')
+    const retain = stepById(steps, 'retain-shadow-evidence')
+    const gate = stepById(steps, 'forward-shadow-gate')
+    const retainIndex = steps.indexOf(retain)
+    const gateIndex = steps.indexOf(gate)
+    const pullRequest = steps.findIndex(step => step.name === 'Open PR via peter-evans/create-pull-request')
+
+    // #then the gate runs after retention, reports to the summary, and never enables the waiver or blocks the PR
+    expect(gateIndex).toBeGreaterThan(retainIndex)
+    expect(gateIndex).toBeLessThan(pullRequest)
+    expect(String(gate.if)).toContain('always()')
+    expect(gate['continue-on-error']).toBe(true)
+    expect(String(gate.run)).toContain('forward-shadow-gate.ts')
+    expect(String(gate.run)).toContain('RECORDS_DIR="docs/evidence/harness-shadow"')
+    expect(String(gate.run)).toContain(['--records-dir "', '$', '{RECORDS_DIR}"'].join(''))
+    expect(String(gate.run)).toContain('GITHUB_STEP_SUMMARY')
+    expect(String(gate.run)).toContain('const status = result.status')
+    expect(String(gate.run)).not.toContain("result.ok === true ? 'ready' : result.status")
+    expect(String(gate.run)).toContain('slice(0, 512)')
+    expect(String(gate.run)).not.toContain('--ack-no-conflict-evidence')
+    expect(String(gate.run)).toContain('exit 0')
+  })
+
+  it('announces rather than hides an idempotent run that cannot advance the evidence counter', () => {
+    // #given the retained evidence step, version guard, PR step, and non-advance report
+    const steps = stepsFor(releasePath, 'sync-default-version')
+    const retain = stepById(steps, 'retain-shadow-evidence')
+    const version = stepById(steps, 'version')
+    const pullRequest = stepById(steps, 'open-sync-pr')
+    const outcomeReport = stepById(steps, 'report-retained-shadow')
+
+    // #then retention reports whether a record was written
+    expect(String(retain.run)).toContain('retained=false')
+    expect(String(retain.run)).toContain('retained=true')
+    expect(String(version.run)).toContain('skip=true')
+
+    // #then the sync PR stays bound to a real version bump. NEW_VERSION embeds
+    // BASE_VERSION, so an idempotent run has no distinct base version to contribute
+    // and opening a PR for it would rewrite an existing evidence path.
+    expect(String(pullRequest.if)).toContain("steps.version.outputs.skip != 'true'")
+    expect(String(pullRequest.if)).not.toContain("steps.version.outputs.skip == 'true'")
+
+    // #then the non-advance is surfaced instead of passing silently
+    expect(String(outcomeReport.if)).toContain("steps.retain-shadow-evidence.outputs.retained == 'true'")
+    expect(String(outcomeReport.if)).toContain("steps.version.outputs.skip == 'true'")
+    expect(String(outcomeReport.run)).toContain('::warning')
+    expect(String(outcomeReport.run)).toContain('GITHUB_STEP_SUMMARY')
   })
 })

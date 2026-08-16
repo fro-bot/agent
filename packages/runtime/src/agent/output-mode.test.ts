@@ -141,7 +141,7 @@ describe('resolveOutputMode', () => {
     expect(branchPrResult).toBe('branch-pr')
   })
 
-  it('auto heuristic against each phrase in BRANCH_PR_PHRASES', () => {
+  it('auto resolves to working-dir regardless of legacy branch/PR phrases', () => {
     // #given
     const phrases = [
       'pull request',
@@ -155,6 +155,7 @@ describe('resolveOutputMode', () => {
       'create branch',
       'update branch',
       'branch workflow',
+      'pull the request',
     ] as const
 
     // #when
@@ -163,10 +164,10 @@ describe('resolveOutputMode', () => {
     )
 
     // #then
-    expect(results).toEqual(Array.from({length: phrases.length}, () => 'branch-pr'))
+    expect(results).toEqual(Array.from({length: phrases.length}, () => 'working-dir'))
   })
 
-  it('resolves auto to branch-pr for WIKI_PROMPT verbatim', () => {
+  it('keeps the wiki prompt on working-dir under auto', () => {
     // #given
     const prompt = WIKI_PROMPT
 
@@ -174,10 +175,10 @@ describe('resolveOutputMode', () => {
     const result = resolveOutputMode('workflow_dispatch', prompt, 'auto')
 
     // #then
-    expect(result).toBe('branch-pr')
+    expect(result).toBe('working-dir')
   })
 
-  it('resolves auto to working-dir for SCHEDULE_PROMPT verbatim', () => {
+  it('keeps the schedule prompt on working-dir under auto', () => {
     // #given
     const prompt = SCHEDULE_PROMPT
 
@@ -188,9 +189,38 @@ describe('resolveOutputMode', () => {
     expect(result).toBe('working-dir')
   })
 
-  it('resolves auto to working-dir for plain file-edit prompt', () => {
+  it('preserves explicit modes even when prompt wording matches the legacy phrases', () => {
     // #given
-    const prompt = ISSUE_511_PROMPT
+    const prompt = 'please create a pr after editing'
+
+    // #when
+    const workingDir = resolveOutputMode('workflow_dispatch', prompt, 'working-dir')
+    const branchPr = resolveOutputMode('schedule', prompt, 'branch-pr')
+
+    // #then
+    expect(workingDir).toBe('working-dir')
+    expect(branchPr).toBe('branch-pr')
+  })
+
+  it('auto resolves to working-dir for empty, null, and ordinary prompts', () => {
+    // #given
+    const emptyPrompt = '   '
+    const ordinaryPrompt = ISSUE_511_PROMPT
+
+    // #when
+    const emptyResult = resolveOutputMode('workflow_dispatch', emptyPrompt, 'auto')
+    const nullResult = resolveOutputMode('schedule', null, 'auto')
+    const ordinaryResult = resolveOutputMode('workflow_dispatch', ordinaryPrompt, 'auto')
+
+    // #then
+    expect(emptyResult).toBe('working-dir')
+    expect(nullResult).toBe('working-dir')
+    expect(ordinaryResult).toBe('working-dir')
+  })
+
+  it('keeps case-insensitive legacy wording on working-dir under auto', () => {
+    // #given
+    const prompt = 'PULL REQUEST'
 
     // #when
     const result = resolveOutputMode('workflow_dispatch', prompt, 'auto')
@@ -199,31 +229,7 @@ describe('resolveOutputMode', () => {
     expect(result).toBe('working-dir')
   })
 
-  it('empty/null prompt → working-dir', () => {
-    // #given
-    const emptyPrompt = '   '
-
-    // #when
-    const emptyResult = resolveOutputMode('workflow_dispatch', emptyPrompt, 'auto')
-    const nullResult = resolveOutputMode('schedule', null, 'auto')
-
-    // #then
-    expect(emptyResult).toBe('working-dir')
-    expect(nullResult).toBe('working-dir')
-  })
-
-  it('case-insensitive: PULL REQUEST → branch-pr', () => {
-    // #given
-    const prompt = 'PULL REQUEST'
-
-    // #when
-    const result = resolveOutputMode('workflow_dispatch', prompt, 'auto')
-
-    // #then
-    expect(result).toBe('branch-pr')
-  })
-
-  it('documented false positive: "pull the request body into the summary" → branch-pr', () => {
+  it('keeps the documented pull-the-request false positive on working-dir under auto', () => {
     // #given
     const prompt = 'pull the request body into the summary'
 
@@ -231,18 +237,25 @@ describe('resolveOutputMode', () => {
     const result = resolveOutputMode('workflow_dispatch', prompt, 'auto')
 
     // #then
-    expect(result).toBe('branch-pr')
+    expect(result).toBe('working-dir')
   })
 
-  it('resolves auto to branch-pr for prompt containing "pull request"', () => {
+  it('returns null for all non-manual and unsupported event types', () => {
     // #given
-    const prompt = 'Please open a pull request once the changes are ready.'
+    const eventTypes: readonly EventType[] = [
+      'discussion_comment',
+      'issue_comment',
+      'issues',
+      'pull_request',
+      'pull_request_review_comment',
+      'unsupported',
+    ]
 
     // #when
-    const result = resolveOutputMode('workflow_dispatch', prompt, 'auto')
+    const results = eventTypes.map(eventType => resolveOutputMode(eventType, WIKI_PROMPT, 'auto'))
 
     // #then
-    expect(result).toBe('branch-pr')
+    expect(results).toEqual(eventTypes.map(() => null))
   })
 
   it('documents the compile-time exhaustive switch guard', () => {

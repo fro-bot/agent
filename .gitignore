@@ -132,3 +132,4 @@ deploy/compose.override.yaml
 
 # Agent outcome eval reports
 /evals/output/
+.worktrees

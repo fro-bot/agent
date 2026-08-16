@@ -129,6 +129,7 @@ export async function runFinalize(
   setActionOutputs({
     sessionId: execution.sessionId,
     resolvedOutputMode: execution.resolvedOutputMode,
+    outputModeMigration: execution.outputModeMigration,
     cacheStatus: cacheRestore.cacheStatus,
     duration,
   })

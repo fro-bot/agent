@@ -1,4 +1,4 @@
-import type {ObjectStoreConfig} from '@fro-bot/runtime'
+import type {ObjectStoreConfig, OutputModeMigrationState, OutputModeRequestState} from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
 import type {AttachmentResult} from '../features/attachments/index.js'
@@ -15,7 +15,7 @@ import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
-import {runExecute} from './phases/execute.js'
+import {resolveRequestedOutputModeState, runExecute} from './phases/execute.js'
 import {runFinalize} from './phases/finalize.js'
 import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
@@ -37,11 +37,29 @@ export async function run(): Promise<number> {
   let repo = ''
   let runId = ''
   let lockEtag: string | null = null
+  let requestedOutputModeState: OutputModeRequestState = 'omitted'
+  let finalizationStarted = false
   let storeConfig: ObjectStoreConfig = {
     enabled: false,
     bucket: '',
     region: '',
     prefix: '',
+  }
+
+  const createUnavailableOutputModeMigration = (): OutputModeMigrationState => ({
+    requested: requestedOutputModeState,
+    resolved: null,
+    legacyWouldSelectBranchPr: false,
+  })
+
+  const setUnavailableActionOutputs = (duration: number): void => {
+    setActionOutputs({
+      sessionId: null,
+      resolvedOutputMode: null,
+      outputModeMigration: createUnavailableOutputModeMigration(),
+      cacheStatus: 'miss',
+      duration,
+    })
   }
 
   core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
@@ -50,27 +68,29 @@ export async function run(): Promise<number> {
   try {
     bootstrapLogger.info('Starting Fro Bot Agent')
 
+    requestedOutputModeState = resolveRequestedOutputModeState()
     const bootstrap = await runBootstrap(bootstrapLogger)
     if (bootstrap == null) {
-      setActionOutputs({
-        sessionId: null,
-        resolvedOutputMode: null,
-        cacheStatus: 'miss',
-        duration: Date.now() - startTime,
-      })
+      setUnavailableActionOutputs(Date.now() - startTime)
       return 1
     }
     detectedOpencodeVersion = bootstrap.opencodeResult.version
     storeConfig = bootstrap.inputs.storeConfig
 
     const routing = await runRouting(bootstrap, startTime)
-    if (routing == null) return 0
+    if (routing == null) {
+      setUnavailableActionOutputs(Date.now() - startTime)
+      return 0
+    }
     githubClient = routing.githubClient
 
     repo = `${routing.triggerResult.context.repo.owner}/${routing.triggerResult.context.repo.repo}`
     runId = routing.agentContext.runId
     const dedup = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
-    if (!dedup.shouldProceed) return 0
+    if (!dedup.shouldProceed) {
+      setUnavailableActionOutputs(Date.now() - startTime)
+      return 0
+    }
 
     const lockResult = await runAcquireLock({
       storeConfig,
@@ -87,6 +107,7 @@ export async function run(): Promise<number> {
           heldBy: lockResult.holder?.holder_id ?? null,
           surface: lockResult.holder?.surface ?? null,
         })
+        setUnavailableActionOutputs(Date.now() - startTime)
         return 0
       case 's3-disabled':
       case 'error':
@@ -105,7 +126,10 @@ export async function run(): Promise<number> {
     reactionCtx = await runAcknowledge(routing, bootstrap.logger)
 
     const cacheRestore = await runCacheRestore(bootstrap, metrics)
-    if (cacheRestore == null) return 1
+    if (cacheRestore == null) {
+      setUnavailableActionOutputs(Date.now() - startTime)
+      return 1
+    }
     serverHandle = cacheRestore.serverHandle
 
     const sessionPrep = await runSessionPrep(bootstrap, routing, cacheRestore, metrics)
@@ -139,6 +163,7 @@ export async function run(): Promise<number> {
     )
 
     metrics.end()
+    finalizationStarted = true
     exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, startTime, bootstrap.logger)
 
     // Dedup marker is saved only after a confirmed successful outcome (which,
@@ -157,12 +182,9 @@ export async function run(): Promise<number> {
     metrics.recordError(errorName, errorMessage, false)
     metrics.end()
 
-    setActionOutputs({
-      sessionId: null,
-      resolvedOutputMode: null,
-      cacheStatus: 'miss',
-      duration,
-    })
+    if (finalizationStarted === false) {
+      setUnavailableActionOutputs(duration)
+    }
 
     if (error instanceof Error) {
       bootstrapLogger.error('Agent failed', {error: error.message})

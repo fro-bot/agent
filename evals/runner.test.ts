@@ -17,10 +17,12 @@ import {
   buildPromptOptions,
   hashEvalPrompt,
   parseModel,
+  productionSessionPrepStrategy,
   resolveEvalTimeoutMs,
   resolveHarnessBinary,
   resolveModel,
   runScenario,
+  treatmentSessionPrepStrategy,
 } from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
 import {continuationIrrelevantNonDegradationScenario} from './scenarios/continuation-irrelevant-non-degradation.js'
@@ -254,6 +256,34 @@ describe('runScenario orchestration', () => {
     },
   )
 
+  it.each([continuationRelevantScenario, continuationIrrelevantNonDegradationScenario])(
+    'keeps continuation identity while the eval treatment removes injected context for %s',
+    scenario => {
+      // #given the same continuation scenario is projected through production and treatment strategies
+      const production = buildPromptOptions(
+        scenario,
+        CHARACTERIZATION_HEAD_SHA,
+        CHARACTERIZATION_RESPONSE_PATH,
+        productionSessionPrepStrategy,
+      )
+      const treatment = buildPromptOptions(
+        scenario,
+        CHARACTERIZATION_HEAD_SHA,
+        CHARACTERIZATION_RESPONSE_PATH,
+        treatmentSessionPrepStrategy,
+      )
+
+      // #when the two prompt projections are compared
+      // #then only eager injected context changes; continuation identity stays stable
+      expect(production.isContinuation).toBe(true)
+      expect(treatment.isContinuation).toBe(true)
+      expect(production.currentThreadSessionId).toBe('continuation-session-42')
+      expect(treatment.currentThreadSessionId).toBe(production.currentThreadSessionId)
+      expect(production.sessionContext).toBe(scenario.priorWork?.sessionContext)
+      expect(treatment.sessionContext).toEqual({recentSessions: [], priorWorkContext: []})
+    },
+  )
+
   it('restores cwd and env and removes the fixture when injected execution throws', async () => {
     // #given an injected execution that observes the fixture and then throws
     await withTestEnvironment(async setup => {
@@ -428,6 +458,43 @@ describe('runScenario orchestration', () => {
 
       // #then the full observable outcome passes and process state is restored
       expect(report.state).toBe('passed')
+      expect(report.outcome).toEqual({
+        scenarioId: cleanPrScenario.id,
+        state: 'passed',
+        verdict: 'approve',
+        gates: report.gates.map(({id, kind, status}) => ({id, kind, status})),
+      })
+      expect(report.outcome.gates.every(gate => 'detail' in gate === false)).toBe(true)
+      expectProcessRestored(setup)
+    })
+  }, 30_000)
+
+  it('records treatment context accounting without turning it into an outcome gate', async () => {
+    // #given a continuation scenario and an injected execution that returns its required observable signal
+    await withTestEnvironment(async setup => {
+      const execution = async (promptOptions: PromptOptions, _logger: Logger, _config?: ExecutionConfig) => {
+        const responseFilePath = promptOptions.responseFilePath
+        if (responseFilePath == null) {
+          throw new Error('Injected execution did not receive a response file path')
+        }
+        fs.writeFileSync(responseFilePath, '---\nschemaVersion: 1\n---\nseq ORBIT-217\n', 'utf8')
+        return createAgentResult()
+      }
+
+      // #when the runner selects the eval-only treatment strategy
+      const report = await runScenario(continuationRelevantScenario, logger, execution, treatmentSessionPrepStrategy)
+
+      // #then advisory accounting records the identity-preserving context reduction separately from gates
+      expect(report.state).toBe('passed')
+      expect(report.sessionPresearch).toEqual({
+        strategy: 'treatment',
+        logicalKey: 'issue-1',
+        continuationSessionId: 'continuation-session-42',
+        recentSessionCount: 0,
+        priorWorkResultCount: 0,
+        injectedContextBytes: 0,
+      })
+      expect(report.gates.every(gate => gate.status === 'passed')).toBe(true)
       expectProcessRestored(setup)
     })
   }, 30_000)

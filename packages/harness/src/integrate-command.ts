@@ -2,8 +2,9 @@
  * integrate-command.ts — `harness integrate` subcommand implementation.
  *
  * Reads harness.config.json for: baseVersion, releaseRepo, integrationRefs,
- * agent, model, opencodeBin. Parses --work-dir, --prompt-path, --out from argv.
- * Assembles IntegrationConfig and calls runIntegration(config, makeRealAdapters()).
+ * agent, model, opencodeBin. Parses deterministic driver flags from argv.
+ * Assembles IntegrationConfig, runs the local integration, packages the artifact,
+ * then calls the explicit finalize/push boundary.
  *
  * On {ok:true}: packages a clean merged source snapshot (via git archive) plus
  * provenance.json into a single artifact at --out using atomic staging.
@@ -14,13 +15,22 @@
  * No classes; functions only; explicit boolean checks; no as-any.
  */
 
-import type {IntegrationConfig} from './integrate.js'
+import type {
+  FinalTreeExpectation,
+  IntegrationAdapters,
+  IntegrationConfig,
+  IntegrationResult,
+  IntegrationStage,
+  TrustedPushRepository,
+} from './integrate.js'
 import {execFileSync, execSync} from 'node:child_process'
 import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {formatPipelineError} from './format-error.js'
+import {buildIntegrationOutcomeFile, writeIntegrationOutcomeFile} from './forward-shadow.js'
 import {makeRealAdapters, runIntegration} from './integrate.js'
 
 // ---------------------------------------------------------------------------
@@ -29,10 +39,11 @@ import {makeRealAdapters, runIntegration} from './integrate.js'
 
 interface HarnessConfig {
   readonly release_repo: string
+  readonly source_repo?: string
   readonly base_version: string
   readonly integrationRefs: readonly string[]
-  readonly agent: string
-  readonly model: string
+  readonly agent?: string
+  readonly model?: string
   readonly opencode_bin?: string
 }
 
@@ -40,11 +51,12 @@ function isValidHarnessConfig(value: unknown): value is HarnessConfig {
   if (value === null || typeof value !== 'object') return false
   const v = value as Record<string, unknown>
   if (typeof v.release_repo !== 'string' || v.release_repo.length === 0) return false
+  if (v.source_repo !== undefined && (typeof v.source_repo !== 'string' || v.source_repo.length === 0)) return false
   if (typeof v.base_version !== 'string' || v.base_version.length === 0) return false
   if (!Array.isArray(v.integrationRefs)) return false
   if (!v.integrationRefs.every((el: unknown) => typeof el === 'string' && el.length > 0)) return false
-  if (typeof v.agent !== 'string' || v.agent.length === 0) return false
-  if (typeof v.model !== 'string' || v.model.length === 0) return false
+  if (v.agent !== undefined && (typeof v.agent !== 'string' || v.agent.length === 0)) return false
+  if (v.model !== undefined && (typeof v.model !== 'string' || v.model.length === 0)) return false
   if (v.opencode_bin !== undefined && typeof v.opencode_bin !== 'string') return false
   return true
 }
@@ -61,28 +73,62 @@ export const DEFAULT_CONFIG_PATH = path.join(packageRoot, 'harness.config.json')
 // ---------------------------------------------------------------------------
 
 interface ParsedFlags {
+  readonly baseVersion: string | undefined
   readonly workDir: string | undefined
   readonly promptPath: string | undefined
   readonly out: string | undefined
+  readonly resultOut: string | undefined
+  readonly dryRun: boolean | undefined
+  readonly pushRepo: string | undefined
+  readonly pushRef: string | undefined
+}
+
+export function isValidBaseVersion(value: string): boolean {
+  return /^\d+\.\d+\.\d+(?:[.-][\w.-]+)?$/.test(value)
 }
 
 function parseFlags(argv: readonly string[]): ParsedFlags | null {
+  let baseVersion: string | undefined
   let workDir: string | undefined
   let promptPath: string | undefined
   let out: string | undefined
+  let resultOut: string | undefined
+  let dryRun: boolean | undefined
+  let pushRepo: string | undefined
+  let pushRef: string | undefined
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
-    if (arg === '--work-dir' || arg === '--prompt-path' || arg === '--out') {
+    if (arg === '--dry-run') {
+      dryRun = true
+      continue
+    }
+    if (
+      arg === '--work-dir' ||
+      arg === '--base-version' ||
+      arg === '--prompt-path' ||
+      arg === '--out' ||
+      arg === '--result-out' ||
+      arg === '--push-repo' ||
+      arg === '--push-ref'
+    ) {
       const next = argv[i + 1]
       if (next === undefined || next.startsWith('--')) {
         console.error(`[integrate] ${arg} requires a value`)
         return null
       }
-      if (arg === '--work-dir') {
+      if (arg === '--base-version') {
+        baseVersion = next
+      } else if (arg === '--work-dir') {
         workDir = next
       } else if (arg === '--prompt-path') {
         promptPath = next
+      } else if (arg === '--push-repo') {
+        pushRepo = next
+      } else if (arg === '--push-ref') {
+        pushRef = next
+      } else if (arg === '--result-out') {
+        resultOut = next
       } else {
         out = next
       }
@@ -90,7 +136,7 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
     }
   }
 
-  return {workDir, promptPath, out}
+  return {baseVersion, workDir, promptPath, out, resultOut, dryRun, pushRepo, pushRef}
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +215,121 @@ export async function packageArtifact(workDir: string, integrationCommit: string
   }
 }
 
+const artifactCompletion = Symbol('artifact-completion')
+type ArtifactCompletion = typeof artifactCompletion
+
+export interface IntegrateLogger {
+  readonly warning: (message: string, context?: Readonly<Record<string, unknown>>) => void
+}
+
+const silentIntegrateLogger: IntegrateLogger = {
+  warning: () => {},
+}
+
+function integrationFailure(stage: IntegrationStage, error: unknown): IntegrationResult {
+  return {ok: false, kind: 'failure', stage, error: formatPipelineError(error)}
+}
+
+function treeExpectationFor(config: IntegrationConfig, integrationCommit: string): FinalTreeExpectation {
+  const squashed = config.integrationRefs.length > 0
+  return {
+    baseTag: `v${config.baseVersion}`,
+    integrationCommit,
+    squashed,
+    workflowsStripped: squashed,
+  }
+}
+
+function assertPushTarget(
+  target: IntegrationConfig['pushTarget'],
+): asserts target is NonNullable<IntegrationConfig['pushTarget']> {
+  if (target === undefined) throw new Error('push target is required for a non-dry-run integration')
+  if (target.repository.trim().length === 0) throw new Error('push target repository is empty')
+  if (target.ref.trim().length === 0) throw new Error('push target ref is empty')
+  const url = new URL(target.repository)
+  if (url.protocol !== 'https:') throw new Error('push target must use anonymous-source-compatible HTTPS')
+  if (url.username.length > 0 || url.password.length > 0) {
+    throw new Error('push target must not contain URL credentials')
+  }
+}
+
+async function finalizeLocalIntegration(
+  config: IntegrationConfig,
+  adapters: IntegrationAdapters,
+  result: IntegrationResult,
+  completion: ArtifactCompletion,
+  logger: IntegrateLogger,
+): Promise<IntegrationResult> {
+  if (completion !== artifactCompletion) return integrationFailure('provenance', 'artifact completion proof is invalid')
+  if (result.ok !== true) return result
+
+  const {manifest} = result
+  const integrationCommit = manifest.integrationCommit
+  const expectation = treeExpectationFor(config, integrationCommit)
+  const dryRun = config.dryRun === true || (config.dryRun === undefined && config.pushTarget === undefined)
+
+  if (dryRun) return {ok: true, manifest, dryRun: true, pushed: false}
+
+  try {
+    const currentCommit = await adapters.getCommitSha(config.workDir)
+    if (currentCommit !== integrationCommit) {
+      throw new Error(`integration HEAD drifted: expected frozen commit ${integrationCommit}, found ${currentCommit}`)
+    }
+    await adapters.validateFinalTree(config.workDir, expectation)
+    const finalCommit = await adapters.getCommitSha(config.workDir)
+    if (finalCommit !== integrationCommit) {
+      throw new Error(`integration HEAD drifted: expected frozen commit ${integrationCommit}, found ${finalCommit}`)
+    }
+  } catch (error) {
+    return integrationFailure('tree', error)
+  }
+
+  let target: NonNullable<IntegrationConfig['pushTarget']>
+  try {
+    assertPushTarget(config.pushTarget)
+    target = config.pushTarget
+  } catch (error) {
+    return integrationFailure('push', error)
+  }
+
+  let trustedRepository: TrustedPushRepository
+  try {
+    trustedRepository = await adapters.prepareTrustedPushRepository(
+      config.workDir,
+      integrationCommit,
+      manifest,
+      expectation,
+    )
+  } catch (error) {
+    return integrationFailure('tree', error)
+  }
+
+  let primaryResult: IntegrationResult
+  try {
+    const credential = await adapters.acquirePushCredential()
+    if (credential.token.length === 0) {
+      primaryResult = integrationFailure('push', 'push credential is empty')
+    } else {
+      await adapters.pushIntegration(trustedRepository, integrationCommit, target, credential)
+      primaryResult = {ok: true, manifest, dryRun: false, pushed: true}
+    }
+  } catch (error) {
+    primaryResult = integrationFailure('push', error)
+  }
+
+  try {
+    await trustedRepository.cleanup()
+  } catch (error) {
+    try {
+      logger.warning('trusted push repository cleanup failed after finalization', {error: formatPipelineError(error)})
+    } catch {
+      // Logger failures must not change the push or credential outcome.
+    }
+  }
+
+  return primaryResult
+}
+
 // ---------------------------------------------------------------------------
 // Main command
 // ---------------------------------------------------------------------------
@@ -179,13 +340,19 @@ export async function packageArtifact(workDir: string, integrationCommit: string
  * @param argv              - CLI arguments (everything after "integrate").
  * @param configPath        - Path to harness.config.json (defaults to package root; injectable for tests).
  * @param _packageArtifact  - Injectable override for packageArtifact (for unit tests; defaults to the real impl).
+ * @param logger             - Injectable warning logger for post-push cleanup failures.
  * @returns Exit code: 0 on success, 1 on failure.
  */
 export async function cmdIntegrate(
   argv: readonly string[],
   configPath: string = DEFAULT_CONFIG_PATH,
   _packageArtifact: typeof packageArtifact = packageArtifact,
+  logger: IntegrateLogger = silentIntegrateLogger,
 ): Promise<number> {
+  const startedAt = new Date().toISOString()
+  const brokerAuthJson = process.env.HARNESS_BROKER_AUTH_JSON
+  delete process.env.HARNESS_BROKER_AUTH_JSON
+
   // Parse flags.
   const flags = parseFlags(argv)
   if (flags === null) return 1
@@ -195,17 +362,25 @@ export async function cmdIntegrate(
     console.error('[integrate] Missing required flag: --work-dir <dir>')
     return 1
   }
-  if (flags.promptPath === undefined) {
-    console.error('[integrate] Missing required flag: --prompt-path <path>')
+  if (flags.baseVersion !== undefined && isValidBaseVersion(flags.baseVersion) === false) {
+    console.error(`[integrate] Invalid --base-version: ${flags.baseVersion}`)
     return 1
   }
   if (flags.out === undefined) {
     console.error('[integrate] Missing required flag: --out <path>')
     return 1
   }
+  if ((flags.pushRepo === undefined) !== (flags.pushRef === undefined)) {
+    console.error('[integrate] --push-repo and --push-ref must be provided together')
+    return 1
+  }
 
   const workDir = flags.workDir
   const outPath = flags.out
+  const pushTarget =
+    flags.pushRepo !== undefined && flags.pushRef !== undefined
+      ? {repository: flags.pushRepo, ref: flags.pushRef}
+      : undefined
 
   // Read harness.config.json.
   let rawConfig: unknown
@@ -224,26 +399,70 @@ export async function cmdIntegrate(
   }
 
   const config: IntegrationConfig = {
-    baseVersion: rawConfig.base_version,
+    baseVersion: flags.baseVersion ?? rawConfig.base_version,
     releaseRepo: rawConfig.release_repo,
+    sourceRepo: rawConfig.source_repo,
     integrationRefs: rawConfig.integrationRefs,
     agent: rawConfig.agent,
     model: rawConfig.model,
     opencodeBin: rawConfig.opencode_bin ?? 'opencode',
+    brokerAuthJson,
     workDir,
     promptPath: flags.promptPath,
+    dryRun: flags.dryRun,
+    pushTarget,
+  }
+
+  const writeOutcome = async (
+    result: IntegrationResult,
+    failure?: {readonly stage: string; readonly error: string},
+  ): Promise<boolean> => {
+    if (flags.resultOut === undefined) return true
+    try {
+      await writeIntegrationOutcomeFile(
+        flags.resultOut,
+        buildIntegrationOutcomeFile(result, startedAt, new Date().toISOString(), failure),
+      )
+      return true
+    } catch (error) {
+      console.error(`[integrate] Failed to write result file: ${formatPipelineError(error)}`)
+      return false
+    }
   }
 
   // Run the integration and package the artifact.
   try {
-    const result = await runIntegration(config, makeRealAdapters())
+    const adapters = makeRealAdapters()
+    const result = await runIntegration(config, adapters)
     if (result.ok === true) {
-      await _packageArtifact(workDir, result.manifest.integrationCommit, outPath)
-      return 0
+      try {
+        await _packageArtifact(workDir, result.manifest.integrationCommit, outPath)
+      } catch (error) {
+        const packaged = await writeOutcome(result, {stage: 'artifact', error: formatPipelineError(error)})
+        if (packaged === false) return 1
+        console.error(`[integrate] ${formatPipelineError(error)}`)
+        return 1
+      }
+      const finalized = await finalizeLocalIntegration(config, adapters, result, artifactCompletion, logger)
+      if (finalized.ok === true) {
+        const written = await writeOutcome(finalized)
+        return written ? 0 : 1
+      }
+      const written = await writeOutcome(result, {
+        stage: finalized.stage ?? 'finalize',
+        error: finalized.error,
+      })
+      if (written === false) return 1
+      console.error(`[integrate] ${finalized.error}`)
+      return 1
     }
+    const written = await writeOutcome(result)
+    if (written === false) return 1
     console.error(`[integrate] ${result.error}`)
     return 1
   } catch (error) {
+    const failed: IntegrationResult = {ok: false, stage: 'provenance', error: formatPipelineError(error)}
+    await writeOutcome(failed, {stage: 'command', error: formatPipelineError(error)})
     console.error(`[integrate] ${formatPipelineError(error)}`)
     return 1
   }

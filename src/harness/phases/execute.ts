@@ -1,8 +1,15 @@
-import type {ClassificationPath, ErrorInfo, SessionSearchResult} from '@fro-bot/runtime'
+import type {
+  ClassificationPath,
+  ErrorInfo,
+  EventType,
+  OutputModeMigrationState,
+  OutputModeRequestState,
+  SessionSearchResult,
+} from '@fro-bot/runtime'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {Logger} from '../../shared/logger.js'
-import type {ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
+import type {OutputMode, ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
@@ -37,10 +44,69 @@ export interface ExecutePhaseResult {
   readonly llmError: ErrorInfo | null
   readonly classificationPath?: ClassificationPath
   readonly resolvedOutputMode: ResolvedOutputMode | null
+  readonly outputModeMigration: OutputModeMigrationState
   readonly overflowRecovery?: {
     readonly recovered: boolean
     readonly archivedSessionId: string
     readonly archiveSucceeded: boolean
+  }
+}
+
+const LEGACY_BRANCH_PR_PHRASES = [
+  'pull request',
+  'open a pr',
+  'create a pr',
+  'create pr',
+  'gh pr ',
+  'push to origin',
+  'git push',
+  'auto-merge',
+  'create branch',
+  'update branch',
+  'branch workflow',
+] as const
+
+function legacyWouldSelectBranchPr(prompt: string | null): boolean {
+  const normalizedPrompt = prompt?.toLowerCase().trim() ?? ''
+  if (normalizedPrompt.length === 0) {
+    return false
+  }
+
+  return (
+    LEGACY_BRANCH_PR_PHRASES.some(phrase => normalizedPrompt.includes(phrase)) ||
+    normalizedPrompt.includes('pull the request')
+  )
+}
+
+export function resolveRequestedOutputModeState(): OutputModeRequestState {
+  const rawOutputMode = core.getInput('output-mode').trim().toLowerCase()
+
+  if (rawOutputMode.length === 0) {
+    return 'omitted'
+  }
+
+  if (rawOutputMode === 'auto') {
+    return 'auto'
+  }
+
+  // Inputs are validated before this phase, so any non-empty non-auto value is
+  // one of the explicit modes.
+  return 'explicit'
+}
+
+function resolveOutputModeMigration(
+  eventType: EventType,
+  prompt: string | null,
+  configuredMode: OutputMode,
+  requested: OutputModeRequestState,
+): OutputModeMigrationState {
+  const resolved = resolveOutputMode(eventType, prompt, configuredMode)
+  const isManualTrigger = eventType === 'schedule' || eventType === 'workflow_dispatch'
+
+  return {
+    requested,
+    resolved,
+    legacyWouldSelectBranchPr: isManualTrigger && legacyWouldSelectBranchPr(prompt),
   }
 }
 
@@ -156,6 +222,7 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     ...recoveryExecResult,
     sessionId: recoverySessionId,
     resolvedOutputMode: overflowedResult.resolvedOutputMode,
+    outputModeMigration: overflowedResult.outputModeMigration,
     overflowRecovery: {
       recovered: recoveryExecResult.success,
       archivedSessionId: overflowedSessionId,
@@ -172,11 +239,25 @@ export async function runExecute(
   metrics: MetricsCollector,
   startTime: number,
 ): Promise<ExecutePhaseResult> {
-  const resolvedOutputMode = resolveOutputMode(
+  const outputModeMigration = resolveOutputModeMigration(
     routing.triggerResult.context.eventType,
     bootstrap.inputs.prompt,
     bootstrap.inputs.outputMode,
+    resolveRequestedOutputModeState(),
   )
+  const resolvedOutputMode = outputModeMigration.resolved
+
+  if (outputModeMigration.legacyWouldSelectBranchPr && bootstrap.inputs.outputMode === 'auto') {
+    core.warning(
+      JSON.stringify({
+        type: 'output-mode-migration',
+        requested: outputModeMigration.requested,
+        resolved: outputModeMigration.resolved,
+        legacyWouldSelectBranchPr: outputModeMigration.legacyWouldSelectBranchPr,
+        message: 'Legacy output-mode inference would have selected branch-pr; set output-mode to branch-pr explicitly.',
+      }),
+    )
+  }
 
   const promptOptions: PromptOptions = {
     context: routing.agentContext,
@@ -216,6 +297,7 @@ export async function runExecute(
       commentsPosted: 0,
       llmError: null,
       resolvedOutputMode,
+      outputModeMigration,
     }
   } else {
     const execLogger = createLogger({phase: 'execution'})
@@ -263,6 +345,7 @@ export async function runExecute(
       ...execResult,
       sessionId,
       resolvedOutputMode,
+      outputModeMigration,
     }
 
     const credentialProvisioned = executionConfig.credentialProvisioned === true

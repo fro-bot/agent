@@ -66,6 +66,14 @@ export interface ModelConfig {
 
 export type OutputMode = 'auto' | 'working-dir' | 'branch-pr'
 export type ResolvedOutputMode = 'working-dir' | 'branch-pr'
+export type OutputModeRequestState = 'omitted' | 'auto' | 'explicit'
+
+export interface OutputModeMigrationState {
+  readonly requested: OutputModeRequestState
+  readonly resolved: ResolvedOutputMode | null
+  readonly legacyWouldSelectBranchPr: boolean
+}
+
 export type ResponseMode = 'github' | 'none'
 
 // Action inputs (parsed and validated) - per RFC-001, RFC-013
@@ -127,6 +135,7 @@ export interface OmoProviders {
 export interface ActionOutputs {
   readonly sessionId: string | null
   readonly resolvedOutputMode: ResolvedOutputMode | null
+  readonly outputModeMigration?: OutputModeMigrationState | null
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly duration: number
 }
