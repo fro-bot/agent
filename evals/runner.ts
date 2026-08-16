@@ -1,6 +1,7 @@
 import type {DiffFileSummary} from '../packages/runtime/src/agent/index.js'
 import type {ParsedResponse, ResponseSurface} from '../packages/runtime/src/agent/response-file.js'
 import type {SessionContext, TriggerContext} from '../packages/runtime/src/agent/types.js'
+import type {SessionClient} from '../packages/runtime/src/session/backend.js'
 import type {LogicalSessionKey} from '../packages/runtime/src/session/logical-key.js'
 import type {OmoProviders} from '../packages/runtime/src/shared/types.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
@@ -23,14 +24,15 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
 import {pathToFileURL} from 'node:url'
+import {createOpencode} from '@opencode-ai/sdk'
 import {redactSecrets} from '../packages/harness/src/format-error.js'
 import {
   buildResponseFilePath,
   parseResponseFile,
   RESPONSE_FILE_DIR_SEGMENT,
 } from '../packages/runtime/src/agent/response-file.js'
+import {withScrubbedEnv} from '../packages/runtime/src/agent/with-scrubbed-env.js'
 import {buildLogicalKey, buildSessionTitle} from '../packages/runtime/src/session/logical-key.js'
-import {getOpenCodeStoragePath} from '../packages/runtime/src/shared/env.js'
 import {buildAgentPrompt, executeOpenCode} from '../src/features/agent/index.js'
 import {resolveResponseSurface} from '../src/features/agent/response-file.js'
 import {buildTriggerContext} from '../src/features/triggers/context-builders.js'
@@ -819,76 +821,69 @@ export function createFixtureFiles(scenario: Scenario, canary: string): Readonly
   return files
 }
 
-function writeEvalJson(filePath: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(filePath), {recursive: true})
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8')
-}
-
-function seedPriorWorkSession(
+export async function seedPriorWorkSession(
+  client: SessionClient,
   repoPath: string,
   scenario: Scenario,
-  headSha: string,
   logicalKey: LogicalSessionKey | null,
-): void {
-  if (scenario.priorWork == null || logicalKey == null) return
+  logger: Logger,
+): Promise<string | null> {
+  if (scenario.priorWork == null) return null
+  if (logicalKey == null) throw new Error(`Scenario ${scenario.id} requires a logical key for prior-work seeding`)
 
-  const storagePath = getOpenCodeStoragePath()
   const sessionID = scenario.priorWork.currentThreadSessionId
   const priorMatches = scenario.priorWork.sessionContext.priorWorkContext
     .filter(result => result.sessionId === sessionID)
     .flatMap(result => result.matches)
-  if (priorMatches.length === 0) return
-  const timestamp = Date.now()
-  const project = {
-    id: headSha,
-    worktree: repoPath,
-    vcs: 'git',
-    time: {created: timestamp, updated: timestamp},
+  if (priorMatches.length === 0) throw new Error(`Scenario ${scenario.id} has no prior-work matches to seed`)
+
+  const sessionResponse = await client.session.create({
+    query: {directory: repoPath},
+    body: {title: buildSessionTitle(logicalKey)},
+  })
+  if (sessionResponse.error != null || sessionResponse.data == null) {
+    throw new Error(`Failed to seed prior-work session: ${String(sessionResponse.error ?? 'No session returned')}`)
   }
-  const session = {
-    id: sessionID,
-    version: '1.18.18',
-    projectID: headSha,
+  const seededSessionID = sessionResponse.data.id
+
+  for (const match of priorMatches) {
+    const promptResponse = await client.session.prompt({
+      path: {id: seededSessionID},
+      query: {directory: repoPath},
+      body: {
+        noReply: true,
+        parts: [{type: 'text', text: match.excerpt}],
+      },
+    })
+    if (promptResponse.error != null) {
+      throw new Error(`Failed to seed prior-work message: ${String(promptResponse.error)}`)
+    }
+  }
+  logger.info('Seeded eval prior-work session through OpenCode SDK', {
+    sessionID: seededSessionID,
     directory: repoPath,
     title: buildSessionTitle(logicalKey),
-    time: {created: timestamp, updated: timestamp},
-  }
-  fs.mkdirSync(storagePath, {recursive: true})
-  fs.writeFileSync(path.join(storagePath, '.version'), '1', 'utf8')
-  writeEvalJson(path.join(storagePath, 'project', `${headSha}.json`), project)
-  writeEvalJson(path.join(storagePath, 'session', headSha, `${sessionID}.json`), session)
-  for (const [index, match] of priorMatches.entries()) {
-    const message = {
-      id: match.messageId,
-      sessionID,
-      role: match.role,
-      time: {created: timestamp + index, ...(match.role === 'assistant' ? {completed: timestamp + index} : {})},
-      ...(match.role === 'assistant'
-        ? {
-            parentID: `message-parent-${index}`,
-            modelID: 'eval-model',
-            providerID: 'opencode',
-            mode: 'build',
-            agent: match.agent ?? 'build',
-            path: {cwd: repoPath, root: repoPath},
-            cost: 0,
-            tokens: {input: 0, output: 0, reasoning: 0, cache: {read: 0, write: 0}},
-            finish: 'end_turn',
-          }
-        : {
-            agent: match.agent ?? 'build',
-            model: {providerID: 'opencode', modelID: 'eval-model'},
-          }),
-    }
-    const part = {
-      id: match.partId,
-      sessionID,
-      messageID: match.messageId,
-      type: 'text',
-      text: match.excerpt,
-    }
-    writeEvalJson(path.join(storagePath, 'message', sessionID, `${match.messageId}.json`), message)
-    writeEvalJson(path.join(storagePath, 'part', match.messageId, `${match.partId}.json`), part)
+    matchCount: priorMatches.length,
+  })
+  return seededSessionID
+}
+
+export type EvalSessionSeeder = (
+  repoPath: string,
+  scenario: Scenario,
+  logicalKey: LogicalSessionKey | null,
+  logger: Logger,
+) => Promise<string | null>
+
+const seedPriorWorkInOpenCode: EvalSessionSeeder = async (repoPath, scenario, logicalKey, logger) => {
+  const opencode = await withScrubbedEnv(
+    async (): Promise<Awaited<ReturnType<typeof createOpencode>>> => createOpencode({port: 0}),
+    logger,
+  )
+  try {
+    return await seedPriorWorkSession(opencode.client, repoPath, scenario, logicalKey, logger)
+  } finally {
+    opencode.server.close()
   }
 }
 
@@ -961,6 +956,7 @@ export async function runScenario(
   logger: Logger,
   execution: EvalExecution = executeOpenCode,
   sessionPrepStrategy: EvalSessionPrepStrategy = productionSessionPrepStrategy,
+  sessionSeeder?: EvalSessionSeeder,
 ): Promise<EvalRunReport> {
   const startedAt = Date.now()
   const originalCwd = process.cwd()
@@ -978,7 +974,17 @@ export async function runScenario(
     const environment = await createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model, logger)
     isolatedEnv = environment
     const preparedScenario = prepareScenarioPrompt(scenario, fixtureRepo.headSha, sessionPrepStrategy)
-    seedPriorWorkSession(fixtureRepo.path, scenario, fixtureRepo.headSha, preparedScenario.sessionPrep.logicalKey)
+    const resolvedSessionSeeder = sessionSeeder ?? (execution === executeOpenCode ? seedPriorWorkInOpenCode : null)
+    let continuationSessionId: string | null = null
+    if (preparedScenario.sessionPrep.currentThreadSessionId != null) {
+      continuationSessionId =
+        resolvedSessionSeeder == null
+          ? preparedScenario.sessionPrep.currentThreadSessionId
+          : await resolvedSessionSeeder(fixtureRepo.path, scenario, preparedScenario.sessionPrep.logicalKey, logger)
+      if (continuationSessionId == null) {
+        throw new Error(`Scenario ${scenario.id} declared continuation but seeding returned no session ID`)
+      }
+    }
     const promptOptions = buildPromptOptionsFromPrepared(scenario, environment.responseFilePath, preparedScenario)
     const responseSurface = resolveResponseSurface(promptOptions.context, promptOptions.triggerContext)
     const timeoutMs = resolveEvalTimeoutMs()
@@ -987,9 +993,7 @@ export async function runScenario(
       model: modelConfig,
       timeoutMs,
       omoProviders: NO_OMO_PROVIDERS,
-      ...(preparedScenario.sessionPrep.currentThreadSessionId == null
-        ? {}
-        : {continueSessionId: preparedScenario.sessionPrep.currentThreadSessionId}),
+      ...(continuationSessionId == null ? {} : {continueSessionId: continuationSessionId}),
     }
     let agentResult: AgentResult
     const openCodeVersion = readOpenCodeVersion(environment.opencodeBin)
