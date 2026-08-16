@@ -76,7 +76,7 @@ FRO_BOT_EVAL=1 bunx vitest run evals/corpus.test.ts
 | `FRO_BOT_EVAL_MODEL` | `provider/model` to run. Defaults to the free, credentialless `opencode/big-pickle`. |
 | `FRO_BOT_EVAL_HARNESS_BIN` | Path to the harness platform binary. Auto-discovered from `harness` on `PATH`; set explicitly when a workspace shim shadows the real install. |
 | `FRO_BOT_EVAL_TIMEOUT_MS` | Per-scenario execution budget. Defaults to 300000. |
-| `FRO_BOT_EVAL_OUTPUT` | Report path. Defaults to the gitignored `evals/output/eval-report.json`. |
+| `FRO_BOT_EVAL_OUTPUT` | Report path. Defaults to the gitignored `evals/output/eval-report.json` for the corpus, and `evals/output/presearch-differential-report.json` for `evals:presearch`. |
 
 The corpus runs the patched **harness** build, never stock `opencode-ai` from npm. The harness carries this project's upstream patch set, so an eval driven by the stock package measures a different system than the one that ships.
 
