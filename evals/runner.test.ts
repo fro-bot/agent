@@ -284,6 +284,25 @@ describe('runScenario orchestration', () => {
     },
   )
 
+  it('uses distinct deterministic provenance for production and treatment prompt strategies', () => {
+    // #given one continuation scenario projected through the two supported strategies
+    // #when deterministic prompt provenance is computed for each strategy
+    const production = buildDeterministicScenarioProvenance(
+      continuationRelevantScenario,
+      logger,
+      productionSessionPrepStrategy,
+    )
+    const treatment = buildDeterministicScenarioProvenance(
+      continuationRelevantScenario,
+      logger,
+      treatmentSessionPrepStrategy,
+    )
+
+    // #then the prompt hash records the strategy actually used while the fixture commit remains stable
+    expect(treatment.promptHash).not.toBe(production.promptHash)
+    expect(treatment.scenarioCommitSha).toBe(production.scenarioCommitSha)
+  })
+
   it('restores cwd and env and removes the fixture when injected execution throws', async () => {
     // #given an injected execution that observes the fixture and then throws
     await withTestEnvironment(async setup => {
@@ -498,6 +517,78 @@ describe('runScenario orchestration', () => {
       expectProcessRestored(setup)
     })
   }, 30_000)
+
+  it.each([
+    ['production', productionSessionPrepStrategy],
+    ['treatment', treatmentSessionPrepStrategy],
+  ] as const)(
+    'provisions session tools, seeds prior work, and carries continuation for %s',
+    async (_mode, strategy) => {
+      // #given a continuation scenario and an injected execution seam
+      await withTestEnvironment(async setup => {
+        let observedConfig: ExecutionConfig | undefined
+        let observedStorageRoot: string | undefined
+        let observedSessionTitle: string | undefined
+        let observedMessage: string | undefined
+        let observedPart: string | undefined
+        const execution = async (_promptOptions: PromptOptions, _logger: Logger, config?: ExecutionConfig) => {
+          observedConfig = config
+          const configHome = process.env.XDG_CONFIG_HOME
+          const dataHome = process.env.XDG_DATA_HOME
+          if (configHome == null || dataHome == null) {
+            throw new Error('Injected execution could not locate isolated OpenCode directories')
+          }
+          observedStorageRoot = path.join(dataHome, 'opencode', 'storage')
+          const toolFile = path.join(configHome, 'opencode', 'tool', 'session.js')
+          const toolContents = fs.readFileSync(toolFile, 'utf8')
+          expect(toolContents).toContain('No matches found.')
+          const sessionPath = path.join(dataHome, 'opencode', 'storage', 'session')
+          expect(fs.existsSync(sessionPath)).toBe(true)
+          const projectDirectory = fs.readdirSync(sessionPath)[0]
+          if (projectDirectory == null) {
+            throw new Error('Seeded session project directory is missing')
+          }
+          const seededSessionPath = path.join(sessionPath, projectDirectory, 'continuation-session-42.json')
+          observedSessionTitle = (JSON.parse(fs.readFileSync(seededSessionPath, 'utf8')) as {readonly title?: string})
+            .title
+          observedMessage = fs.readFileSync(
+            path.join(dataHome, 'opencode', 'storage', 'message', 'continuation-session-42', 'message-orbit-217.json'),
+            'utf8',
+          )
+          observedPart = fs.readFileSync(
+            path.join(dataHome, 'opencode', 'storage', 'part', 'message-orbit-217', 'part-orbit-217.json'),
+            'utf8',
+          )
+          const responseFilePath = _promptOptions.responseFilePath
+          if (responseFilePath == null) {
+            throw new Error('Injected execution did not receive a response file path')
+          }
+          fs.writeFileSync(responseFilePath, '---\nschemaVersion: 1\n---\nseq ORBIT-217\n', 'utf8')
+          return createAgentResult()
+        }
+
+        // #when the selected mode runs through the isolated eval environment
+        const report = await runScenario(continuationRelevantScenario, logger, execution, strategy)
+
+        // #then both modes retain the real continuation identity and seed the same logical session
+        expect(report.state).toBe('passed')
+        expect(observedConfig?.continueSessionId).toBe('continuation-session-42')
+        if (
+          observedStorageRoot == null ||
+          observedSessionTitle == null ||
+          observedMessage == null ||
+          observedPart == null
+        ) {
+          throw new Error('Injected execution did not observe isolated session storage')
+        }
+        expect(observedSessionTitle).toBe('fro-bot: issue-1')
+        expect(observedMessage).toContain('message-orbit-217')
+        expect(observedPart).toContain('ORBIT-217')
+        expectProcessRestored(setup)
+      })
+    },
+    30_000,
+  )
 
   it('fails a valid response when a sibling markdown artifact is delivered', async () => {
     // #given successful injected execution that writes the valid response and a duplicate artifact

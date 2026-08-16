@@ -22,17 +22,20 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
+import {pathToFileURL} from 'node:url'
 import {redactSecrets} from '../packages/harness/src/format-error.js'
 import {
   buildResponseFilePath,
   parseResponseFile,
   RESPONSE_FILE_DIR_SEGMENT,
 } from '../packages/runtime/src/agent/response-file.js'
-import {buildLogicalKey} from '../packages/runtime/src/session/logical-key.js'
+import {buildLogicalKey, buildSessionTitle} from '../packages/runtime/src/session/logical-key.js'
+import {getOpenCodeStoragePath} from '../packages/runtime/src/shared/env.js'
 import {buildAgentPrompt, executeOpenCode} from '../src/features/agent/index.js'
 import {resolveResponseSurface} from '../src/features/agent/response-file.js'
 import {buildTriggerContext} from '../src/features/triggers/context-builders.js'
 import {normalizeEvent} from '../src/services/github/context.js'
+import {writeSessionToolsFile} from '../src/services/setup/session-tools-config.js'
 import {
   captureDiagnostics,
   clearScenarioDiagnostics,
@@ -232,7 +235,13 @@ function cleanupIsolatedEvalEnv(env: IsolatedEvalEnv): void {
   }
 }
 
-function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: string, model: string): IsolatedEvalEnv {
+async function createIsolatedEvalEnv(
+  repoPath: string,
+  scenario: Scenario,
+  headSha: string,
+  model: string,
+  logger: Logger,
+): Promise<IsolatedEvalEnv> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), `fro-bot-eval-${scenario.id}-`))
   const runnerTemp = fs.mkdtempSync(path.join(os.tmpdir(), `fro-bot-eval-temp-${scenario.id}-`))
   const runId = String(Date.now())
@@ -284,6 +293,8 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${resolveHarnessBinary()}" "$@"\n`, {mode: 0o755})
     const pluginVersions = resolveConfiguredPluginVersions(model)
     const authPlugin = pluginVersions[0]
+    const sessionToolsAsset = path.resolve(import.meta.dirname, '..', 'dist', 'session-tools.js')
+    await writeSessionToolsFile(configDir, logger, () => pathToFileURL(sessionToolsAsset))
     fs.writeFileSync(
       path.join(configDir, 'opencode.json'),
       JSON.stringify(
@@ -684,20 +695,27 @@ export function hashEvalPrompt(promptOptions: PromptOptions, logger: Logger): st
 export function buildDeterministicScenarioProvenance(
   scenario: Scenario,
   logger: Logger,
+  sessionPrepStrategy: EvalSessionPrepStrategy = productionSessionPrepStrategy,
 ): {readonly promptHash: string; readonly scenarioCommitSha: string} {
-  const cached = deterministicProvenanceCache.get(scenario.id)
+  const cacheKey = `${scenario.id}:${sessionPrepStrategy === productionSessionPrepStrategy ? 'production' : 'treatment'}`
+  const cached = deterministicProvenanceCache.get(cacheKey)
   if (cached != null) {
     return cached
   }
 
   const fixtureRepo = createFixtureRepo(createFixtureFiles(scenario, EVAL_PROVENANCE_CANARY))
   try {
-    const promptOptions = buildPromptOptions(scenario, fixtureRepo.headSha, EVAL_RESPONSE_PATH_SENTINEL)
+    const promptOptions = buildPromptOptions(
+      scenario,
+      fixtureRepo.headSha,
+      EVAL_RESPONSE_PATH_SENTINEL,
+      sessionPrepStrategy,
+    )
     const provenance = {
       promptHash: hashEvalPrompt(promptOptions, logger),
       scenarioCommitSha: fixtureRepo.headSha,
     }
-    deterministicProvenanceCache.set(scenario.id, provenance)
+    deterministicProvenanceCache.set(cacheKey, provenance)
     return provenance
   } finally {
     cleanupFixtureRepo(fixtureRepo)
@@ -801,6 +819,79 @@ export function createFixtureFiles(scenario: Scenario, canary: string): Readonly
   return files
 }
 
+function writeEvalJson(filePath: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), {recursive: true})
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8')
+}
+
+function seedPriorWorkSession(
+  repoPath: string,
+  scenario: Scenario,
+  headSha: string,
+  logicalKey: LogicalSessionKey | null,
+): void {
+  if (scenario.priorWork == null || logicalKey == null) return
+
+  const storagePath = getOpenCodeStoragePath()
+  const sessionID = scenario.priorWork.currentThreadSessionId
+  const priorMatches = scenario.priorWork.sessionContext.priorWorkContext
+    .filter(result => result.sessionId === sessionID)
+    .flatMap(result => result.matches)
+  if (priorMatches.length === 0) return
+  const timestamp = Date.now()
+  const project = {
+    id: headSha,
+    worktree: repoPath,
+    vcs: 'git',
+    time: {created: timestamp, updated: timestamp},
+  }
+  const session = {
+    id: sessionID,
+    version: '1.18.18',
+    projectID: headSha,
+    directory: repoPath,
+    title: buildSessionTitle(logicalKey),
+    time: {created: timestamp, updated: timestamp},
+  }
+  fs.mkdirSync(storagePath, {recursive: true})
+  fs.writeFileSync(path.join(storagePath, '.version'), '1', 'utf8')
+  writeEvalJson(path.join(storagePath, 'project', `${headSha}.json`), project)
+  writeEvalJson(path.join(storagePath, 'session', headSha, `${sessionID}.json`), session)
+  for (const [index, match] of priorMatches.entries()) {
+    const message = {
+      id: match.messageId,
+      sessionID,
+      role: match.role,
+      time: {created: timestamp + index, ...(match.role === 'assistant' ? {completed: timestamp + index} : {})},
+      ...(match.role === 'assistant'
+        ? {
+            parentID: `message-parent-${index}`,
+            modelID: 'eval-model',
+            providerID: 'opencode',
+            mode: 'build',
+            agent: match.agent ?? 'build',
+            path: {cwd: repoPath, root: repoPath},
+            cost: 0,
+            tokens: {input: 0, output: 0, reasoning: 0, cache: {read: 0, write: 0}},
+            finish: 'end_turn',
+          }
+        : {
+            agent: match.agent ?? 'build',
+            model: {providerID: 'opencode', modelID: 'eval-model'},
+          }),
+    }
+    const part = {
+      id: match.partId,
+      sessionID,
+      messageID: match.messageId,
+      type: 'text',
+      text: match.excerpt,
+    }
+    writeEvalJson(path.join(storagePath, 'message', sessionID, `${match.messageId}.json`), message)
+    writeEvalJson(path.join(storagePath, 'part', match.messageId, `${match.partId}.json`), part)
+  }
+}
+
 interface CollectedResponseArtifacts {
   readonly artifacts: ResponseArtifacts
   readonly rawResponse: string | null
@@ -884,9 +975,10 @@ export async function runScenario(
   let cleanupError: string | null = null
 
   try {
-    const environment = createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model)
+    const environment = await createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model, logger)
     isolatedEnv = environment
     const preparedScenario = prepareScenarioPrompt(scenario, fixtureRepo.headSha, sessionPrepStrategy)
+    seedPriorWorkSession(fixtureRepo.path, scenario, fixtureRepo.headSha, preparedScenario.sessionPrep.logicalKey)
     const promptOptions = buildPromptOptionsFromPrepared(scenario, environment.responseFilePath, preparedScenario)
     const responseSurface = resolveResponseSurface(promptOptions.context, promptOptions.triggerContext)
     const timeoutMs = resolveEvalTimeoutMs()
@@ -895,6 +987,9 @@ export async function runScenario(
       model: modelConfig,
       timeoutMs,
       omoProviders: NO_OMO_PROVIDERS,
+      ...(preparedScenario.sessionPrep.currentThreadSessionId == null
+        ? {}
+        : {continueSessionId: preparedScenario.sessionPrep.currentThreadSessionId}),
     }
     let agentResult: AgentResult
     const openCodeVersion = readOpenCodeVersion(environment.opencodeBin)
@@ -936,7 +1031,7 @@ export async function runScenario(
       completeArtifacts.parsedResponse?.verdict ?? null,
       evaluation.gates,
     )
-    const deterministicProvenance = buildDeterministicScenarioProvenance(scenario, logger)
+    const deterministicProvenance = buildDeterministicScenarioProvenance(scenario, logger, sessionPrepStrategy)
     const redactedAgentError = redactSensitiveText(agentResult.error ?? '', environment.authSecretValues)
     const redactedExecutionFailureReason = redactSensitiveText(
       completeArtifacts.executionFailureReason ?? '',
