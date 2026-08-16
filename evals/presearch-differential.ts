@@ -15,7 +15,7 @@ import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {executeOpenCode} from '../src/features/agent/index.js'
 import {createLogger} from '../src/shared/logger.js'
-import {compareCandidateToBaseline, type ComparisonReport} from './compare.js'
+import {compareCandidateToBaseline, MAX_COMPARISON_SAMPLES, type ComparisonReport} from './compare.js'
 import {runScenarioSequence} from './corpus-runner.js'
 import {
   productionSessionPrepStrategy,
@@ -32,6 +32,7 @@ const BASELINE_COMPLETION_MARKER = 'fro-bot-eval-report-complete-v1'
 const REPORT_COMPLETION_MARKER = 'fro-bot-presearch-differential-report-complete-v1'
 const REPORT_SCHEMA_VERSION = 1 as const
 const EXPERIMENT_ID = 'bounded-session-presearch-v1' as const
+export const MAX_INFRASTRUCTURE_RETRIES = 2
 
 export const DEFAULT_PRESEARCH_OUTPUT_PATH = path.join(
   process.cwd(),
@@ -50,6 +51,14 @@ export interface DifferentialModeReport {
   readonly strategy: SessionPresearchStrategy
   readonly reports: readonly EvalRunReport[]
   readonly outcomes: readonly StableOutcomeProjection[]
+}
+
+export interface InfrastructureAttempt {
+  readonly mode: 'production' | 'treatment'
+  readonly scenarioId: string
+  readonly retryNumber: number
+  readonly retriesSpent: number
+  readonly reason: string
 }
 
 export interface DifferentialExperimentReport {
@@ -75,6 +84,7 @@ export interface DifferentialExperimentReport {
     readonly production: DifferentialModeReport
     readonly treatment: DifferentialModeReport
   }
+  readonly infrastructureAttempts: readonly InfrastructureAttempt[]
   readonly comparison: ComparisonReport
 }
 
@@ -315,30 +325,150 @@ async function driveBoundedRepeats(
   treatmentReports: EvalRunReport[],
   productionReports: EvalRunReport[],
   samples: Record<string, MutableComparisonSamples>,
+  infrastructureAttempts: InfrastructureAttempt[],
 ): Promise<ComparisonReport> {
-  let comparison = compareModes(treatmentInitialReports, productionInitialReports, reviewedBaseline, samples)
+  const infrastructureRetryCounts = new Map<string, number>()
+  const pendingInfrastructureModes = new Map<string, 'production' | 'treatment'>()
+  const lastAttemptModes = new Map<string, 'production' | 'treatment'>()
+  const initialInfrastructureKeys = new Set<string>()
+  const comparisonTreatmentReports = [...treatmentInitialReports]
+  const comparisonProductionReports = [...productionInitialReports]
 
-  while (comparison.repeatRequests.length > 0) {
+  const recordAttempt = (mode: 'production' | 'treatment', report: EvalRunReport, initial = false): void => {
+    lastAttemptModes.set(report.scenarioId, mode)
+    if (report.outcome.state !== 'inconclusive') {
+      if (pendingInfrastructureModes.get(report.scenarioId) === mode) {
+        pendingInfrastructureModes.delete(report.scenarioId)
+      }
+      return
+    }
+
+    const key = `${mode}:${report.scenarioId}`
+    if (initial) {
+      initialInfrastructureKeys.add(key)
+    }
+    const previousAttempts = infrastructureRetryCounts.get(key) ?? 0
+    infrastructureAttempts.push({
+      mode,
+      scenarioId: report.scenarioId,
+      retryNumber: previousAttempts + 1,
+      retriesSpent: previousAttempts,
+      reason: report.execution.reason ?? report.agentResult.error ?? report.stateReason,
+    })
+    infrastructureRetryCounts.set(key, previousAttempts + 1)
+    pendingInfrastructureModes.set(report.scenarioId, mode)
+  }
+
+  for (const report of productionReports) {
+    recordAttempt('production', report, true)
+  }
+  for (const report of treatmentReports) {
+    recordAttempt('treatment', report, true)
+  }
+
+  const appendSample = (mode: 'production' | 'treatment', report: EvalRunReport): void => {
+    if (report.outcome.state === 'inconclusive') {
+      recordAttempt(mode, report)
+      return
+    }
+
+    const scenarioSamples = getSamples(samples, report.scenarioId)
+    if (mode === 'treatment') {
+      scenarioSamples.candidate.push(report.outcome)
+    } else {
+      scenarioSamples.baseline.push(report.outcome)
+    }
+    recordAttempt(mode, report)
+  }
+
+  const runRepeat = async (mode: 'production' | 'treatment', scenario: Scenario): Promise<void> => {
+    const report = await runScenario(
+      scenario,
+      logger,
+      execution,
+      mode === 'treatment' ? treatmentSessionPrepStrategy : productionSessionPrepStrategy,
+    )
+    if (mode === 'treatment') {
+      treatmentReports.push(report)
+    } else {
+      productionReports.push(report)
+    }
+
+    const key = `${mode}:${report.scenarioId}`
+    if (report.outcome.state !== 'inconclusive' && initialInfrastructureKeys.has(key)) {
+      const comparisonReports = mode === 'treatment' ? comparisonTreatmentReports : comparisonProductionReports
+      const initialIndex = comparisonReports.findIndex(candidate => candidate.scenarioId === report.scenarioId)
+      if (initialIndex === -1) {
+        throw new Error(`Cannot replace missing initial infrastructure report for ${report.scenarioId}`)
+      }
+      comparisonReports[initialIndex] = report
+      initialInfrastructureKeys.delete(key)
+      recordAttempt(mode, report)
+      return
+    }
+    appendSample(mode, report)
+  }
+
+  let comparison = compareModes(comparisonTreatmentReports, comparisonProductionReports, reviewedBaseline, samples)
+
+  while (
+    pendingInfrastructureModes.size > 0 ||
+    comparison.repeatRequests.length > 0 ||
+    comparison.rerunScenarioIds.length > 0
+  ) {
+    const pendingInfrastructure = [...pendingInfrastructureModes.entries()][0]
+    if (pendingInfrastructure !== undefined) {
+      const [scenarioId, mode] = pendingInfrastructure
+      const scenario = findScenario(scenarios, scenarioId)
+      const key = `${mode}:${scenarioId}`
+      const infrastructureAttemptsSpent = infrastructureRetryCounts.get(key) ?? 0
+      if (infrastructureAttemptsSpent > MAX_INFRASTRUCTURE_RETRIES) {
+        break
+      }
+
+      await runRepeat(mode, scenario)
+      comparison = compareModes(comparisonTreatmentReports, comparisonProductionReports, reviewedBaseline, samples)
+      continue
+    }
+
+    const rerunScenarioId = comparison.rerunScenarioIds[0]
+    if (rerunScenarioId !== undefined) {
+      const scenario = findScenario(scenarios, rerunScenarioId)
+      const mode =
+        pendingInfrastructureModes.get(rerunScenarioId) ?? lastAttemptModes.get(rerunScenarioId) ?? 'production'
+      const key = `${mode}:${rerunScenarioId}`
+      const infrastructureAttemptsSpent = infrastructureRetryCounts.get(key) ?? 0
+      const isInfrastructureRerun = pendingInfrastructureModes.has(rerunScenarioId)
+      const scenarioSamples = getSamples(samples, rerunScenarioId)
+      const sampleCount = mode === 'treatment' ? scenarioSamples.candidate.length : scenarioSamples.baseline.length
+
+      if (isInfrastructureRerun && infrastructureAttemptsSpent > MAX_INFRASTRUCTURE_RETRIES) {
+        break
+      }
+      if (isInfrastructureRerun === false && sampleCount >= MAX_COMPARISON_SAMPLES) {
+        break
+      }
+
+      await runRepeat(mode, scenario)
+      comparison = compareModes(comparisonTreatmentReports, comparisonProductionReports, reviewedBaseline, samples)
+      continue
+    }
+
     const request = comparison.repeatRequests[0]
     if (request === undefined) {
       break
     }
     const scenario = findScenario(scenarios, request.scenarioId)
-    const scenarioSamples = getSamples(samples, request.scenarioId)
 
     if (request.candidateRemaining > 0) {
-      const report = await runScenario(scenario, logger, execution, treatmentSessionPrepStrategy)
-      treatmentReports.push(report)
-      scenarioSamples.candidate.push(report.outcome)
+      await runRepeat('treatment', scenario)
     } else if (request.baselineRemaining > 0) {
-      const report = await runScenario(scenario, logger, execution, productionSessionPrepStrategy)
-      productionReports.push(report)
-      scenarioSamples.baseline.push(report.outcome)
+      await runRepeat('production', scenario)
     } else {
       throw new Error(`Comparison requested a repeat without remaining samples for ${request.scenarioId}`)
     }
 
-    comparison = compareModes(treatmentInitialReports, productionInitialReports, reviewedBaseline, samples)
+    comparison = compareModes(comparisonTreatmentReports, comparisonProductionReports, reviewedBaseline, samples)
   }
 
   return comparison
@@ -390,6 +520,7 @@ export async function runPresearchDifferentialExperiment(
   const productionReports = [...productionInitialReports]
   const treatmentReports = [...treatmentInitialReports]
   const samples: Record<string, MutableComparisonSamples> = {}
+  const infrastructureAttempts: InfrastructureAttempt[] = []
   const comparison = await driveBoundedRepeats(
     scenarios,
     logger,
@@ -400,6 +531,7 @@ export async function runPresearchDifferentialExperiment(
     treatmentReports,
     productionReports,
     samples,
+    infrastructureAttempts,
   )
 
   const report: DifferentialExperimentReport = {
@@ -425,6 +557,7 @@ export async function runPresearchDifferentialExperiment(
       production: buildModeReport('production-default', productionReports),
       treatment: buildModeReport('treatment', treatmentReports),
     },
+    infrastructureAttempts,
     comparison,
   }
   writeReportAtomically(outputPath, report)

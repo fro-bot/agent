@@ -269,8 +269,8 @@ describe('bounded session-presearch differential experiment', () => {
     }
   }, 30_000)
 
-  it('reports an inconclusive infrastructure outcome as a rerun request', async () => {
-    // #given an injected treatment transport failure with no assessable response
+  it('retries an inconclusive infrastructure outcome before finalizing the comparison', async () => {
+    // #given an injected treatment transport failure with no assessable response on the first attempt
     const environment = createTestEnvironment(true)
     let treatmentRuns = 0
     try {
@@ -285,16 +285,154 @@ describe('bounded session-presearch differential experiment', () => {
         return createAgentResult()
       })
 
-      // #when the infrastructure outcome is compared
+      // #when the infrastructure outcome is retried
       const {report} = result
 
-      // #then it requests a rerun without classifying the treatment as a regression
-      expect(report.comparison.status).toBe('inconclusive')
-      expect(report.comparison.rerunScenarioIds).toEqual(['continuation-relevant'])
+      // #then the successful retry resolves the comparison without classifying the treatment as a regression
+      expect(report.comparison.status).toBe('passed')
+      expect(report.comparison.rerunScenarioIds).toEqual([])
       expect(
         report.comparison.scenarios.find(scenario => scenario.scenarioId === 'continuation-relevant')?.status,
-      ).toBe('inconclusive')
+      ).toBe('passed')
       expect(report.comparison.statement).not.toContain('candidate regression')
+      expect(report.infrastructureAttempts).toHaveLength(1)
+      expect(report.infrastructureAttempts[0]?.mode).toBe('treatment')
+    } finally {
+      restoreTestEnvironment(environment)
+    }
+  }, 30_000)
+
+  it('retries a production infrastructure loss without poisoning the bounded quality comparison', async () => {
+    // #given every treatment observation loses the continuation-relevant quality comparison
+    const environment = createTestEnvironment(true)
+    let productionRelevantRuns = 0
+    try {
+      const result = await runEnabled(environment, async promptOptions => {
+        const relevant = promptOptions.context.repo.endsWith('/continuation-relevant')
+        if (relevant === false) {
+          writeIssueResponse(promptOptions, 'seq ORBIT-217\n')
+          return createAgentResult()
+        }
+
+        if (isTreatment(promptOptions)) {
+          writeIssueResponse(promptOptions, 'ORBIT-217\n')
+          return createAgentResult()
+        }
+
+        productionRelevantRuns += 1
+        if (productionRelevantRuns === 2) {
+          return createAgentResult({success: false, exitCode: 1, error: 'server startup failure'})
+        }
+        writeIssueResponse(promptOptions, 'seq ORBIT-217\n')
+        return createAgentResult()
+      })
+
+      // #when the first production repeat loses infrastructure and the next repeat succeeds
+      const {report} = result
+      const relevantScenario = report.comparison.scenarios.find(
+        scenario => scenario.scenarioId === 'continuation-relevant',
+      )
+
+      // #then the candidate loss is decisive after the full quality budget, with the infra attempt auditable
+      expect(report.comparison.status).toBe('failed')
+      expect(relevantScenario?.status).toBe('failed')
+      expect(relevantScenario?.reason).toContain('bounded stochastic quality loss')
+      expect(
+        report.modes.treatment.reports.filter(scenario => scenario.scenarioId === 'continuation-relevant'),
+      ).toHaveLength(4)
+      expect(
+        report.modes.production.reports.filter(scenario => scenario.scenarioId === 'continuation-relevant'),
+      ).toHaveLength(5)
+      expect(report.infrastructureAttempts).toHaveLength(1)
+      expect(report.infrastructureAttempts[0]).toMatchObject({
+        mode: 'production',
+        scenarioId: 'continuation-relevant',
+        retryNumber: 1,
+        retriesSpent: 0,
+        reason: 'server startup failure',
+      })
+    } finally {
+      restoreTestEnvironment(environment)
+    }
+  }, 30_000)
+
+  it('stops infrastructure retries at the explicit cap without consuming quality budget', async () => {
+    // #given every treatment quality sample fails and every production repeat loses infrastructure
+    const environment = createTestEnvironment(true)
+    let productionRelevantRuns = 0
+    try {
+      const result = await runEnabled(environment, async promptOptions => {
+        const relevant = promptOptions.context.repo.endsWith('/continuation-relevant')
+        if (relevant === false) {
+          writeIssueResponse(promptOptions, 'seq ORBIT-217\n')
+          return createAgentResult()
+        }
+
+        if (isTreatment(promptOptions)) {
+          writeIssueResponse(promptOptions, 'ORBIT-217\n')
+          return createAgentResult()
+        }
+
+        productionRelevantRuns += 1
+        if (productionRelevantRuns > 1) {
+          return createAgentResult({success: false, exitCode: 1, error: 'persistent server startup failure'})
+        }
+        writeIssueResponse(promptOptions, 'seq ORBIT-217\n')
+        return createAgentResult()
+      })
+
+      // #when the infrastructure retry cap is exhausted
+      const {report} = result
+
+      // #then the comparison remains fail-closed and every infrastructure loss is recorded
+      expect(report.comparison.status).toBe('inconclusive')
+      const repeatRequest = report.comparison.repeatRequests.find(
+        request => request.scenarioId === 'continuation-relevant',
+      )
+      expect(repeatRequest?.baselineRemaining).toBe(3)
+      expect(report.infrastructureAttempts).toHaveLength(3)
+      expect(report.infrastructureAttempts.map(attempt => attempt.retryNumber)).toEqual([1, 2, 3])
+      expect(report.infrastructureAttempts.map(attempt => attempt.retriesSpent)).toEqual([0, 1, 2])
+      expect(report.infrastructureAttempts.every(attempt => attempt.mode === 'production')).toBe(true)
+      expect(
+        report.modes.production.reports.filter(scenario => scenario.scenarioId === 'continuation-relevant'),
+      ).toHaveLength(4)
+    } finally {
+      restoreTestEnvironment(environment)
+    }
+  }, 30_000)
+
+  it('preserves the existing bounded quality flow when no infrastructure failures occur', async () => {
+    // #given one initial treatment quality failure and otherwise successful execution
+    const environment = createTestEnvironment(true)
+    let treatmentRelevantRuns = 0
+    try {
+      const result = await runEnabled(environment, async promptOptions => {
+        const relevant = promptOptions.context.repo.endsWith('/continuation-relevant')
+        if (relevant && isTreatment(promptOptions)) {
+          treatmentRelevantRuns += 1
+          if (treatmentRelevantRuns === 1) {
+            writeIssueResponse(promptOptions, 'ORBIT-217\n')
+            return createAgentResult()
+          }
+        }
+        writeIssueResponse(promptOptions, 'seq ORBIT-217\n')
+        return createAgentResult()
+      })
+
+      // #when the comparison drives only stochastic quality repeats
+      const {report} = result
+
+      // #then the pre-existing four-vs-four inconclusive result is unchanged and no infra record exists
+      expect(report.comparison.status).toBe('inconclusive')
+      expect(report.comparison.repeatRequests).toEqual([])
+      expect(report.infrastructureAttempts).toEqual([])
+      expect(
+        report.modes.production.reports.filter(scenario => scenario.scenarioId === 'continuation-relevant'),
+      ).toHaveLength(4)
+      expect(
+        report.modes.treatment.reports.filter(scenario => scenario.scenarioId === 'continuation-relevant'),
+      ).toHaveLength(4)
     } finally {
       restoreTestEnvironment(environment)
     }
