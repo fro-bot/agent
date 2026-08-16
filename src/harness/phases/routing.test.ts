@@ -103,13 +103,7 @@ describe('runRouting', () => {
     const result = await runRouting(bootstrap, 100)
 
     expect(result).toBeNull()
-    expect(vi.mocked(setActionOutputs)).toHaveBeenCalledWith({
-      sessionId: null,
-      resolvedOutputMode: null,
-      cacheStatus: 'miss',
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-      duration: expect.any(Number),
-    })
+    expect(vi.mocked(setActionOutputs)).not.toHaveBeenCalled()
     expect(vi.mocked(collectAgentContext)).not.toHaveBeenCalled()
     expect(vi.mocked(getRepositoryPermission)).not.toHaveBeenCalled()
   })

@@ -6,7 +6,6 @@ import * as core from '@actions/core'
 import {restoreDeduplicationMarker, saveDeduplicationMarker} from '../../services/cache/dedup.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
-import {setActionOutputs} from '../config/outputs.js'
 
 const DEDUP_EVENT_TYPES = new Set(['pull_request', 'issues'])
 
@@ -41,7 +40,7 @@ export async function runDedup(
   dedupWindow: number,
   triggerContext: TriggerContext,
   repo: string,
-  startTime: number,
+  _startTime: number,
   logger: Logger = createLogger({phase: 'dedup'}),
   cacheAdapter?: CacheAdapter,
 ): Promise<DedupCheckResult> {
@@ -101,13 +100,6 @@ export async function runDedup(
     dedupWindow,
     entityType: entity.entityType,
     entityNumber: entity.entityNumber,
-  })
-
-  setActionOutputs({
-    sessionId: null,
-    resolvedOutputMode: null,
-    cacheStatus: 'miss',
-    duration: Date.now() - startTime,
   })
 
   await writeDedupSkipSummary(triggerContext, entity, marker, effectiveAge, dedupWindow, logger)

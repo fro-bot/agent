@@ -1,3 +1,7 @@
+---
+verifiedAgainstBaseVersion: "1.18.18"
+---
+
 # Harness carry ledger
 
 The harness build merges a set of upstream OpenCode pull requests into a pinned base version. Those patches are listed in [`packages/harness/harness.config.json`](../../packages/harness/harness.config.json), which is the authoritative set — this document explains the entries, it does not define them.
@@ -120,8 +124,8 @@ No carry has an in-repo record of the upstream version that would contain it, so
 
 ## Scope and authority
 
-This ledger is documentation. It is **not** enforcement, and it is explicitly non-authoritative for authentication, delivery, and retry policy. An entry never justifies weakening a guard, and removing a carry still goes through the normal review path.
+This ledger is documentation. It is **not** enforcement, and it is explicitly non-authoritative for authentication, delivery, and retry policy. An entry never justifies weakening a guard, and removing a carry still goes through the normal review path. The colocated static test at `packages/harness/src/carry-ledger.test.ts` checks that carry identities match `integrationRefs` in `packages/harness/harness.config.json` in both directions, that `verifiedAgainstBaseVersion` matches `base_version`, and that every entry has non-empty evidence and removal-condition fields. It performs no network checks.
 
 It covers upstream carries only. Ordinary deadlines, safety gates, and race guards get no entry — they are not fork-delta and have no upstream exit path to track. Removal conditions for things like prose fallbacks live in comments beside the code that owns them, where they travel with the thing they describe.
 
-Nothing asserts the carry count or set programmatically; the manifest is the single source of truth, and this document tracks it by hand. If the two disagree, the manifest is right and this file is stale.
+The manifest remains the single source of truth for the carry set. If the static check finds a mismatch, the manifest is right and this file is stale until corrected.

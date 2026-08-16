@@ -1,11 +1,21 @@
 import type {DiffFileSummary} from '../packages/runtime/src/agent/index.js'
 import type {ParsedResponse, ResponseSurface} from '../packages/runtime/src/agent/response-file.js'
-import type {TriggerContext} from '../packages/runtime/src/agent/types.js'
+import type {SessionContext, TriggerContext} from '../packages/runtime/src/agent/types.js'
+import type {LogicalSessionKey} from '../packages/runtime/src/session/logical-key.js'
 import type {OmoProviders} from '../packages/runtime/src/shared/types.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
 import type {GitHubContext} from '../src/services/github/types.js'
 import type {Logger} from '../src/shared/logger.js'
-import type {EvalRunArtifacts, EvalRunReport, ResponseArtifacts, Scenario} from './types.js'
+import type {
+  EvalRunArtifacts,
+  EvalRunReport,
+  PriorWork,
+  ResponseArtifacts,
+  Scenario,
+  SessionPresearchAccounting,
+  SessionPresearchStrategy,
+} from './types.js'
+import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
@@ -18,6 +28,7 @@ import {
   parseResponseFile,
   RESPONSE_FILE_DIR_SEGMENT,
 } from '../packages/runtime/src/agent/response-file.js'
+import {buildLogicalKey} from '../packages/runtime/src/session/logical-key.js'
 import {buildAgentPrompt, executeOpenCode} from '../src/features/agent/index.js'
 import {resolveResponseSurface} from '../src/features/agent/response-file.js'
 import {buildTriggerContext} from '../src/features/triggers/context-builders.js'
@@ -29,7 +40,7 @@ import {
   readCapturedDiagnostics,
 } from './diagnostics.js'
 import {cleanupFixtureRepo, createFixtureRepo} from './fixture-repo.js'
-import {evaluateRun} from './gates.js'
+import {evaluateRun, projectStableOutcome} from './gates.js'
 
 const DEFAULT_EVAL_MODEL = 'opencode/big-pickle'
 export const EVAL_RESPONSE_PATH_SENTINEL = '/__fro-bot_eval__/response.md'
@@ -479,6 +490,64 @@ interface ScenarioInput {
   readonly hydratedContext: PromptOptions['context']['hydratedContext']
 }
 
+export interface EvalSessionPrepInput {
+  readonly priorWork: PriorWork | null
+  readonly logicalKey: LogicalSessionKey | null
+}
+
+export interface EvalSessionPrepSelection {
+  readonly sessionContext: SessionContext
+  readonly isContinuation: boolean
+  readonly currentThreadSessionId: string | null
+  readonly logicalKey: LogicalSessionKey | null
+  readonly accounting: SessionPresearchAccounting
+}
+
+export type EvalSessionPrepStrategy = (input: EvalSessionPrepInput) => EvalSessionPrepSelection
+
+function buildSessionPresearchAccounting(
+  strategy: SessionPresearchStrategy,
+  logicalKey: LogicalSessionKey | null,
+  priorWork: PriorWork | null,
+  sessionContext: SessionContext,
+): SessionPresearchAccounting {
+  const hasInjectedContext = sessionContext.recentSessions.length > 0 || sessionContext.priorWorkContext.length > 0
+  return {
+    strategy,
+    logicalKey: logicalKey?.key ?? null,
+    continuationSessionId: priorWork?.currentThreadSessionId ?? null,
+    recentSessionCount: sessionContext.recentSessions.length,
+    priorWorkResultCount: sessionContext.priorWorkContext.length,
+    // JSON-size approximation for diagnosis only; it does not measure rendered prompt weight
+    // and must not become a quality gate.
+    injectedContextBytes: hasInjectedContext ? Buffer.byteLength(JSON.stringify(sessionContext), 'utf8') : 0,
+  }
+}
+
+function buildSessionPrepSelection(
+  strategy: SessionPresearchStrategy,
+  input: EvalSessionPrepInput,
+  sessionContext: SessionContext,
+): EvalSessionPrepSelection {
+  return {
+    sessionContext,
+    isContinuation: input.priorWork !== null,
+    currentThreadSessionId: input.priorWork?.currentThreadSessionId ?? null,
+    logicalKey: input.logicalKey,
+    accounting: buildSessionPresearchAccounting(strategy, input.logicalKey, input.priorWork, sessionContext),
+  }
+}
+
+export const productionSessionPrepStrategy: EvalSessionPrepStrategy = input =>
+  buildSessionPrepSelection(
+    'production-default',
+    input,
+    input.priorWork?.sessionContext ?? {recentSessions: [], priorWorkContext: []},
+  )
+
+export const treatmentSessionPrepStrategy: EvalSessionPrepStrategy = input =>
+  buildSessionPrepSelection('treatment', input, {recentSessions: [], priorWorkContext: []})
+
 function buildScenarioInput(scenario: Scenario): ScenarioInput {
   switch (scenario.surface.kind) {
     case 'pull_request':
@@ -520,18 +589,43 @@ function buildTriggerContextForScenario(
   return buildTriggerContext(githubContext, null, null)
 }
 
-export function buildPromptOptions(scenario: Scenario, headSha: string, responseFilePath: string): PromptOptions {
+interface PreparedScenarioPrompt {
+  readonly scenarioInput: ScenarioInput
+  readonly triggerContext: TriggerContext
+  readonly sessionPrep: EvalSessionPrepSelection
+}
+
+function prepareScenarioPrompt(
+  scenario: Scenario,
+  headSha: string,
+  sessionPrepStrategy: EvalSessionPrepStrategy,
+): PreparedScenarioPrompt {
   const scenarioInput = buildScenarioInput(scenario)
   const triggerContext = buildTriggerContextForScenario(scenario, headSha, scenarioInput)
+  const logicalKey = buildLogicalKey(triggerContext)
+
+  return {
+    scenarioInput,
+    triggerContext,
+    sessionPrep: sessionPrepStrategy({priorWork: scenario.priorWork, logicalKey}),
+  }
+}
+
+function buildPromptOptionsFromPrepared(
+  scenario: Scenario,
+  responseFilePath: string,
+  prepared: PreparedScenarioPrompt,
+): PromptOptions {
+  const {scenarioInput, triggerContext, sessionPrep} = prepared
   const target = triggerContext.target
   const author = triggerContext.author
   const priorWorkOptions =
-    scenario.priorWork == null
+    sessionPrep.isContinuation === false
       ? {}
       : {
-          sessionContext: scenario.priorWork.sessionContext,
+          sessionContext: sessionPrep.sessionContext,
           isContinuation: true,
-          currentThreadSessionId: scenario.priorWork.currentThreadSessionId,
+          currentThreadSessionId: sessionPrep.currentThreadSessionId,
         }
 
   return {
@@ -562,6 +656,16 @@ export function buildPromptOptions(scenario: Scenario, headSha: string, response
     responseFilePath,
     ...priorWorkOptions,
   }
+}
+
+export function buildPromptOptions(
+  scenario: Scenario,
+  headSha: string,
+  responseFilePath: string,
+  sessionPrepStrategy: EvalSessionPrepStrategy = productionSessionPrepStrategy,
+): PromptOptions {
+  const prepared = prepareScenarioPrompt(scenario, headSha, sessionPrepStrategy)
+  return buildPromptOptionsFromPrepared(scenario, responseFilePath, prepared)
 }
 
 function hashPrompt(prompt: string): string {
@@ -765,6 +869,7 @@ export async function runScenario(
   scenario: Scenario,
   logger: Logger,
   execution: EvalExecution = executeOpenCode,
+  sessionPrepStrategy: EvalSessionPrepStrategy = productionSessionPrepStrategy,
 ): Promise<EvalRunReport> {
   const startedAt = Date.now()
   const originalCwd = process.cwd()
@@ -781,7 +886,8 @@ export async function runScenario(
   try {
     const environment = createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model)
     isolatedEnv = environment
-    const promptOptions = buildPromptOptions(scenario, fixtureRepo.headSha, environment.responseFilePath)
+    const preparedScenario = prepareScenarioPrompt(scenario, fixtureRepo.headSha, sessionPrepStrategy)
+    const promptOptions = buildPromptOptionsFromPrepared(scenario, environment.responseFilePath, preparedScenario)
     const responseSurface = resolveResponseSurface(promptOptions.context, promptOptions.triggerContext)
     const timeoutMs = resolveEvalTimeoutMs()
     const executionConfig: ExecutionConfig = {
@@ -824,6 +930,12 @@ export async function runScenario(
       forbiddenMutations: detectForbiddenMutations(fixtureRepo.path, fixtureRepo.headSha),
     }
     const evaluation = evaluateRun(completeArtifacts)
+    const outcome = projectStableOutcome(
+      scenario.id,
+      evaluation.state,
+      completeArtifacts.parsedResponse?.verdict ?? null,
+      evaluation.gates,
+    )
     const deterministicProvenance = buildDeterministicScenarioProvenance(scenario, logger)
     const redactedAgentError = redactSensitiveText(agentResult.error ?? '', environment.authSecretValues)
     const redactedExecutionFailureReason = redactSensitiveText(
@@ -860,6 +972,7 @@ export async function runScenario(
         diagnosticsPath,
         cleanupError: null,
       },
+      outcome,
       gates: evaluation.gates,
       agentResult: {
         success: agentResult.success,
@@ -867,6 +980,7 @@ export async function runScenario(
         error: agentResult.error == null ? null : redactedAgentError,
         tokenUsage: agentResult.tokenUsage,
       },
+      sessionPresearch: preparedScenario.sessionPrep.accounting,
     }
   } catch (error) {
     primaryError = error
@@ -897,6 +1011,7 @@ export async function runScenario(
       ...report,
       state: 'failed',
       stateReason: `Cleanup failed after completed execution: ${cleanupError}`,
+      outcome: {...report.outcome, state: 'failed'},
       execution: {...report.execution, cleanupError},
     }
   }

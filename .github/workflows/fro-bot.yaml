@@ -300,7 +300,7 @@ jobs:
               || ''
             }}
         with:
-          auth-json: ${{ secrets.AUTH_JSON }}
+          auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           trusted-head-sha: ${{ steps.prehead.outputs.ref }}
           # Durable session state. The Actions cache alone is not sufficient: GitHub
           # issues read-only cache tokens for issue_comment and issues runs, so the
@@ -318,16 +318,12 @@ jobs:
           # release-tag narration uses github.token; all other paths retain the PAT.
           github-token: ${{ steps.mint-app-token.outputs.github-token || (github.event.inputs.release-tag != '' && github.token) || secrets.FRO_BOT_PAT }}
           model: ${{ inputs.model || vars.FRO_BOT_MODEL }}
-          # Release-notes narration (correlation-id-tagged) uses an explicit model
-          # override; oMo is skipped so its provider routing does not interfere with
-          # the narration model.
-          enable-omo: ${{ github.event.inputs.correlation-id != '' && 'false' || 'true' }}
-          omo-providers: ${{ github.event.inputs.correlation-id != '' && '' || secrets.OMO_PROVIDERS }}
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           # Wiki paths opt into branch-pr explicitly so delivery contract is
-          # self-documenting and decoupled from prompt-wording drift. All other
-          # manual paths use auto, which resolves to working-dir for prompts
-          # without explicit branch/PR language (e.g., the daily DMR run).
+          # self-documenting and decoupled from prompt-wording drift. Correlation
+          # and custom-prompt paths opt into working-dir explicitly. The remaining
+          # manual fallback uses public auto compatibility mode, which now always
+          # resolves to working-dir; prompt wording is warning-only diagnostics.
           # See docs/plans/2026-04-17-001-fix-manual-delivery-mode-plan.md.
           output-mode: >-
             ${{
@@ -395,7 +391,7 @@ jobs:
         # proceed to the apply script, whose readCandidate() treats a missing file
         # as fail-soft (warn + exit 0) rather than failing the step here.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-notes-candidate-${{ github.event.inputs.correlation-id }}
           path: .
