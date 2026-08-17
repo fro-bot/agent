@@ -42,7 +42,7 @@ One more instance came from reading an API response rather than a codebase. `gh 
 
 ## Guidance
 
-Before trusting a clean result, establish what the check was able to look at. That is a separate question from whether it passed, and it is almost never reported alongside the pass.
+Before trusting a clean result, establish what the check was able to look at and which interface the production consumer actually reads through. A check can pass on artifacts written by one interface while the real consumer reads through a different path, in which case the artifacts prove only that a write happened. That is a separate question from whether it passed, and it is almost never reported alongside the pass.
 
 **Compare the check's population against an independent count of the same population.** For dependency scanning the two numbers are one command apart:
 
