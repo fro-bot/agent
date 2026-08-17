@@ -33,6 +33,8 @@ const REPORT_COMPLETION_MARKER = 'fro-bot-presearch-differential-report-complete
 const REPORT_SCHEMA_VERSION = 1 as const
 const EXPERIMENT_ID = 'bounded-session-presearch-v1' as const
 export const MAX_INFRASTRUCTURE_RETRIES = 2
+export const MAX_DRIVER_ITERATIONS =
+  2 * PRESEARCH_EXPERIMENT_SCENARIO_IDS.length * (MAX_COMPARISON_SAMPLES + MAX_INFRASTRUCTURE_RETRIES + 1)
 
 export const DEFAULT_PRESEARCH_OUTPUT_PATH = path.join(
   process.cwd(),
@@ -90,6 +92,8 @@ export interface DifferentialExperimentReport {
 
 export interface DifferentialExperimentOptions {
   readonly execution?: EvalExecution
+  /** Test seam for forcing the defensive loop guard; production uses MAX_DRIVER_ITERATIONS. */
+  readonly maxIterations?: number
   readonly outputPath?: string
   readonly reviewedBaselinePath?: string
   readonly reviewedBaseline?: BaselineArtifact
@@ -315,6 +319,31 @@ function compareModes(
   })
 }
 
+const BASELINE_SAMPLE_RERUN_REASON = 'Reviewed baseline samples did not provide a stable passed comparison'
+
+export function resolveRerunMode(
+  scenarioId: string,
+  comparison: {
+    readonly scenarios: readonly {
+      readonly scenarioId: string
+      readonly reason: string
+    }[]
+  },
+  pendingInfrastructureMode: 'production' | 'treatment' | undefined,
+  lastAttemptMode: 'production' | 'treatment' | undefined,
+): 'production' | 'treatment' {
+  if (pendingInfrastructureMode !== undefined) {
+    return pendingInfrastructureMode
+  }
+
+  const scenarioComparison = comparison.scenarios.find(scenario => scenario.scenarioId === scenarioId)
+  if (scenarioComparison?.reason === BASELINE_SAMPLE_RERUN_REASON) {
+    return 'production'
+  }
+
+  return lastAttemptMode ?? 'production'
+}
+
 async function driveBoundedRepeats(
   scenarios: readonly Scenario[],
   logger: Logger,
@@ -326,6 +355,7 @@ async function driveBoundedRepeats(
   productionReports: EvalRunReport[],
   samples: Record<string, MutableComparisonSamples>,
   infrastructureAttempts: InfrastructureAttempt[],
+  maxIterations: number,
 ): Promise<ComparisonReport> {
   const infrastructureRetryCounts = new Map<string, number>()
   const pendingInfrastructureModes = new Map<string, 'production' | 'treatment'>()
@@ -410,12 +440,18 @@ async function driveBoundedRepeats(
   }
 
   let comparison = compareModes(comparisonTreatmentReports, comparisonProductionReports, reviewedBaseline, samples)
+  let iterations = 0
 
   while (
     pendingInfrastructureModes.size > 0 ||
     comparison.repeatRequests.length > 0 ||
     comparison.rerunScenarioIds.length > 0
   ) {
+    iterations += 1
+    if (iterations > maxIterations) {
+      throw new Error(`Presearch differential driver exceeded iteration cap of ${maxIterations}`)
+    }
+
     const pendingInfrastructure = [...pendingInfrastructureModes.entries()][0]
     if (pendingInfrastructure !== undefined) {
       const [scenarioId, mode] = pendingInfrastructure
@@ -434,18 +470,23 @@ async function driveBoundedRepeats(
     const rerunScenarioId = comparison.rerunScenarioIds[0]
     if (rerunScenarioId !== undefined) {
       const scenario = findScenario(scenarios, rerunScenarioId)
-      const mode =
-        pendingInfrastructureModes.get(rerunScenarioId) ?? lastAttemptModes.get(rerunScenarioId) ?? 'production'
+      const pendingInfrastructureMode = pendingInfrastructureModes.get(rerunScenarioId)
+      const mode = resolveRerunMode(
+        rerunScenarioId,
+        comparison,
+        pendingInfrastructureMode,
+        lastAttemptModes.get(rerunScenarioId),
+      )
       const key = `${mode}:${rerunScenarioId}`
       const infrastructureAttemptsSpent = infrastructureRetryCounts.get(key) ?? 0
-      const isInfrastructureRerun = pendingInfrastructureModes.has(rerunScenarioId)
+      const isInfrastructureRerun = pendingInfrastructureMode !== undefined
       const scenarioSamples = getSamples(samples, rerunScenarioId)
       const sampleCount = mode === 'treatment' ? scenarioSamples.candidate.length : scenarioSamples.baseline.length
 
       if (isInfrastructureRerun && infrastructureAttemptsSpent > MAX_INFRASTRUCTURE_RETRIES) {
         break
       }
-      if (isInfrastructureRerun === false && sampleCount >= MAX_COMPARISON_SAMPLES) {
+      if (isInfrastructureRerun === false && sampleCount >= MAX_COMPARISON_SAMPLES - 1) {
         break
       }
 
@@ -532,6 +573,7 @@ export async function runPresearchDifferentialExperiment(
     productionReports,
     samples,
     infrastructureAttempts,
+    options.maxIterations ?? MAX_DRIVER_ITERATIONS,
   )
 
   const report: DifferentialExperimentReport = {

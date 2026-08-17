@@ -6,8 +6,12 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {describe, expect, it} from 'vitest'
 import {createLogger} from '../src/shared/logger.js'
+import {MAX_COMPARISON_SAMPLES} from './compare.js'
 import {
+  MAX_DRIVER_ITERATIONS,
+  MAX_INFRASTRUCTURE_RETRIES,
   PRESEARCH_EXPERIMENT_SCENARIO_IDS,
+  resolveRerunMode,
   runPresearchDifferentialExperiment,
   type DifferentialExperimentResult,
 } from './presearch-differential.js'
@@ -433,6 +437,110 @@ describe('bounded session-presearch differential experiment', () => {
       expect(
         report.modes.treatment.reports.filter(scenario => scenario.scenarioId === 'continuation-relevant'),
       ).toHaveLength(4)
+    } finally {
+      restoreTestEnvironment(environment)
+    }
+  }, 30_000)
+
+  it('reruns the production side when a bounded baseline sample is non-passing', async () => {
+    // #given a candidate quality failure that fills its budget before a production sample fails
+    const environment = createTestEnvironment(true)
+    let productionRelevantRuns = 0
+    let treatmentRelevantRuns = 0
+    try {
+      const result = await runEnabled(environment, async promptOptions => {
+        const relevant = promptOptions.context.repo.endsWith('/continuation-relevant')
+        if (relevant === false) {
+          writeIssueResponse(promptOptions, 'seq ORBIT-217\n')
+          return createAgentResult()
+        }
+
+        if (isTreatment(promptOptions)) {
+          treatmentRelevantRuns += 1
+          if (treatmentRelevantRuns === 1) {
+            writeIssueResponse(promptOptions, 'ORBIT-217\n')
+            return createAgentResult()
+          }
+        } else {
+          productionRelevantRuns += 1
+          if (productionRelevantRuns === 2) {
+            writeIssueResponse(promptOptions, 'ORBIT-217\n')
+            return createAgentResult()
+          }
+        }
+
+        writeIssueResponse(promptOptions, 'seq ORBIT-217\n')
+        return createAgentResult()
+      })
+
+      // #when compare.ts requests a rerun because the production sample is not a stable passed comparison
+      const relevantScenario = result.report.comparison.scenarios.find(
+        scenario => scenario.scenarioId === 'continuation-relevant',
+      )
+      const productionRelevant = result.report.modes.production.reports.filter(
+        scenario => scenario.scenarioId === 'continuation-relevant',
+      )
+      const treatmentRelevant = result.report.modes.treatment.reports.filter(
+        scenario => scenario.scenarioId === 'continuation-relevant',
+      )
+
+      // #then reruns stay on production and the candidate budget is not consumed by the baseline failure
+      expect(relevantScenario?.reason).toContain('Reviewed baseline samples did not provide a stable passed comparison')
+      expect(productionRelevantRuns).toBe(4)
+      expect(treatmentRelevantRuns).toBe(4)
+      expect(productionRelevant).toHaveLength(4)
+      expect(treatmentRelevant).toHaveLength(4)
+    } finally {
+      restoreTestEnvironment(environment)
+    }
+  }, 30_000)
+
+  it('targets production for a rerun caused by a non-passing reviewed-baseline sample', () => {
+    // #given compare.ts reports the reviewed-baseline sample failure while the last attempt was treatment
+    const comparison = {
+      scenarios: [
+        {
+          scenarioId: 'continuation-relevant',
+          reason: 'Reviewed baseline samples did not provide a stable passed comparison',
+        },
+      ],
+    }
+
+    // #when the driver resolves the mode for the rerun
+    const mode = resolveRerunMode('continuation-relevant', comparison, undefined, 'treatment')
+
+    // #then it reruns the live baseline side instead of consuming candidate budget
+    expect(mode).toBe('production')
+  })
+
+  it('fails loudly when the absolute driver iteration cap is exceeded', async () => {
+    // #given an enabled experiment whose first treatment observation requests a quality repeat
+    const environment = createTestEnvironment(true)
+    let treatmentRuns = 0
+    try {
+      await expect(
+        runPresearchDifferentialExperiment(createLogger({component: 'presearch-test'}), {
+          execution: async promptOptions => {
+            if (isTreatment(promptOptions)) {
+              treatmentRuns += 1
+              if (treatmentRuns === 1) {
+                writeIssueResponse(promptOptions, 'ORBIT-217\n')
+                return createAgentResult()
+              }
+            }
+            writeIssueResponse(promptOptions, 'seq ORBIT-217\n')
+            return createAgentResult()
+          },
+          outputPath: outputPath(environment),
+          maxIterations: 0,
+        }),
+      ).rejects.toThrow('iteration cap of 0')
+
+      // #when the cap is configured from the normal bounded formula
+      // #then it remains proportional to scenarios, quality samples, and infrastructure retries
+      expect(MAX_DRIVER_ITERATIONS).toBe(
+        2 * PRESEARCH_EXPERIMENT_SCENARIO_IDS.length * (MAX_COMPARISON_SAMPLES + MAX_INFRASTRUCTURE_RETRIES + 1),
+      )
     } finally {
       restoreTestEnvironment(environment)
     }
