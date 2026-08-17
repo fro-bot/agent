@@ -125,7 +125,9 @@ With the seam corrected, both modes passed both scenarios with no stable differe
 
 `session_search` resolves sessions through the SDK, so only sessions that entered the store through that surface are visible. Files placed under `storage/` never become rows, are never indexed, and never appear in `session.list()` or `session.messages()`.
 
-Directory scope is equally load-bearing. `searchSessions` scopes to `process.cwd()`, and the SDK client sends that as the workspace scope on each request. A session that is correctly created but attached to a different directory is still invisible. Seeding therefore has to pass `query: {directory: repoPath}` for the same fixture repository the runner switches into.
+Scoping is partial, and knowing which half is scoped matters. Session *discovery* is directory-scoped: `listSessionsForProject` passes `query: {directory: workspacePath}` (`packages/runtime/src/session/storage.ts:12`) and `searchSessions` supplies `process.cwd()`, so a session created against a different directory is never discovered. Seeding therefore has to pass `query: {directory: repoPath}` for the same fixture repository the runner switches into.
+
+Message *retrieval* is not scoped. `getSessionMessages` calls `client.session.messages({path: {id: sessionID}})` with no directory at all (`packages/runtime/src/session/storage.ts:41`). Retrieval works here because the seeding server and the execution server share one isolated `XDG_DATA_HOME` and therefore address the same store. That shared-store dependency is load-bearing and undocumented at the seam: giving the execution server its own data home would silently break retrieval while every directory-scoping assertion continued to pass.
 
 Fail-loud behavior matters as much as the mechanism. Seeding now throws when a scenario declares continuation but yields no session, when a logical key is missing, and when the API returns an error. The original defect survived precisely because every one of those conditions was a silent no-op.
 
@@ -142,7 +144,7 @@ const listed = await client.session.list({query: {directory: repoPath}})
 expect(listed.data?.some(session => session.id === seededSessionID)).toBe(true)
 ```
 
-**Seed and verify in the same scope the capability is consumed in.** When retrieval is scoped by workspace, project, or tenant, a correctly created record in the wrong scope is indistinguishable from a missing one.
+**Seed and verify in the same scope the capability is consumed in, and establish exactly which operations are scoped.** When discovery is scoped by workspace, project, or tenant, a correctly created record in the wrong scope is indistinguishable from a missing one. When a neighbouring operation is *not* scoped, something else is quietly holding the setup together and it is worth naming: here discovery is directory-scoped while message retrieval is not, and the unstated dependency is that both servers share a single data home.
 
 **Suspect perfectly consistent failures.** A stochastic quality difference produces mixed samples. A 4/4 identical failure with a single mechanistic explanation usually means the scenario cannot succeed, not that the candidate is worse.
 
