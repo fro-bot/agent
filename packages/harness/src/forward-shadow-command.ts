@@ -8,7 +8,7 @@
  */
 
 import type {ForwardShadowComparisonInput, ForwardShadowConflictMetrics, ForwardShadowRecord} from './forward-shadow.js'
-import type {IntegrationResult, ProvenanceManifest} from './integrate.js'
+import type {IntegrationResult, IntegrationStage, ProvenanceManifest} from './integrate.js'
 import fs from 'node:fs/promises'
 import process from 'node:process'
 import {buildForwardShadowRecord, compareForwardShadow, writeForwardShadowRecord} from './forward-shadow.js'
@@ -50,6 +50,23 @@ const DEFAULT_DEPENDENCIES: ForwardShadowCommandDependencies = {
 
 const OID_PATTERN = /^[0-9a-f]{40}$/i
 const MAX_RUN_IDENTITY_LENGTH = 512
+const INTEGRATION_STAGES = [
+  'sources',
+  'clone',
+  'fetch-tags',
+  'branch',
+  'fetch',
+  'merge',
+  'squash',
+  'workflow-strip',
+  'commit',
+  'build',
+  'version',
+  'tree',
+  'provenance',
+  'cleanup',
+  'push',
+] as const satisfies readonly IntegrationStage[]
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && Array.isArray(value) === false
@@ -65,6 +82,14 @@ function isDateString(value: unknown): value is string {
 
 function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0
+}
+
+function parseFailure(value: unknown): {readonly stage: IntegrationStage; readonly error: string} | undefined {
+  if (isRecord(value) === false || isString(value.stage) === false || isString(value.error) === false) return undefined
+  for (const stage of INTEGRATION_STAGES) {
+    if (stage === value.stage) return {stage, error: value.error}
+  }
+  return undefined
 }
 
 function emptyMetrics(): ForwardShadowConflictMetrics {
@@ -156,8 +181,12 @@ async function readOutcome(
   if (conflictMetrics === undefined)
     return invalidOutcome(dependencies.now(), 'shadow outcome conflict metrics are invalid')
   if (parsed.ok === false) {
+    const failure = parseFailure(parsed.failure)
     return {
-      result: {ok: false, kind: 'failure', error: 'shadow integration outcome reported failure'},
+      result:
+        failure === undefined
+          ? {ok: false, kind: 'failure', error: 'shadow integration outcome reported failure'}
+          : {ok: false, kind: 'failure', stage: failure.stage, error: failure.error},
       conflictMetrics,
       startedAt,
       endedAt,
