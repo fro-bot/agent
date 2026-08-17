@@ -657,8 +657,7 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
     cloneRepo: async (repoUrl, workDir, tag) => {
       await fs.rm(workDir, {recursive: true, force: true})
       await fs.mkdir(path.dirname(workDir), {recursive: true})
-      const cloneArgs =
-        tag === undefined ? ['clone', repoUrl, workDir] : ['clone', '--depth', '1', '--branch', tag, repoUrl, workDir]
+      const cloneArgs = tag === undefined ? ['clone', repoUrl, workDir] : ['clone', '--branch', tag, repoUrl, workDir]
       await git.exec(cloneArgs, undefined, publicGitEnv())
     },
 

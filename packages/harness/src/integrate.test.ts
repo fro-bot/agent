@@ -1147,6 +1147,51 @@ describe('U5 code-owned integration driver', () => {
     }
   })
 
+  it('real adapters surface a conflict when the merge base lies beyond a shallow clone boundary', async () => {
+    // #given
+    const repositoryDir = await makeTmpDir()
+    const workDir = path.join(await makeTmpDir(), 'worktree')
+    const adapters = makeRealAdapters()
+    try {
+      runGit(repositoryDir, ['init', '--quiet'])
+      runGit(repositoryDir, ['config', 'user.name', 'harness-test'])
+      runGit(repositoryDir, ['config', 'user.email', 'harness-test@example.invalid'])
+      await fs.writeFile(path.join(repositoryDir, 'conflict.txt'), 'root\n', 'utf8')
+      runGit(repositoryDir, ['add', 'conflict.txt'])
+      runGit(repositoryDir, ['commit', '--quiet', '-m', 'root'])
+      const mergeBase = runGit(repositoryDir, ['rev-parse', 'HEAD'])
+
+      await fs.writeFile(path.join(repositoryDir, 'conflict.txt'), 'integration\n', 'utf8')
+      runGit(repositoryDir, ['add', 'conflict.txt'])
+      runGit(repositoryDir, ['commit', '--quiet', '-m', 'release'])
+      runGit(repositoryDir, ['tag', 'v1.15.13'])
+
+      runGit(repositoryDir, ['checkout', '--quiet', '-b', 'source', mergeBase])
+      await fs.writeFile(path.join(repositoryDir, 'conflict.txt'), 'source\n', 'utf8')
+      runGit(repositoryDir, ['commit', '--quiet', '-am', 'source'])
+
+      const repositoryUrl = `file://${repositoryDir}`
+      const sourceRef = 'refs/remotes/watch/local/source'
+      await adapters.cloneRepo(repositoryUrl, workDir, 'v1.15.13')
+
+      // #when
+      await adapters.fetchRef(workDir, repositoryUrl, 'refs/heads/source', sourceRef)
+      const actualMergeBase = runGit(workDir, ['merge-base', 'HEAD', sourceRef])
+      const outcome = await adapters.mergeRef(workDir, sourceRef)
+
+      // #then
+      expect(runGit(workDir, ['rev-parse', '--is-shallow-repository'])).toBe('false')
+      expect(actualMergeBase).toBe(mergeBase)
+      expect(outcome.kind).toBe('conflict')
+      if (outcome.kind !== 'conflict') throw new Error('expected real adapter to return a typed conflict')
+      expect(outcome.conflictPaths).toEqual(['conflict.txt'])
+    } finally {
+      await adapters.dispose?.()
+      await fs.rm(repositoryDir, {recursive: true, force: true})
+      await fs.rm(path.dirname(workDir), {recursive: true, force: true})
+    }
+  })
+
   it('rejects clean-filter transformed staged bytes despite ambient GIT_CONFIG injection', async () => {
     // #given
     const dir = await makeTmpDir()

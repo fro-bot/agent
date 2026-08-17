@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {runForwardShadowCommand} from './forward-shadow-command.js'
-import {buildForwardShadowRecord} from './forward-shadow.js'
+import {buildForwardShadowRecord, compareForwardShadow} from './forward-shadow.js'
 
 const OID_A = 'a'.repeat(40)
 const OID_B = 'b'.repeat(40)
@@ -275,6 +275,129 @@ describe('forward shadow command', () => {
     // #then
     expect(code).toBe(0)
     expect(receivedRecord?.verdict).toBe('inconclusive')
+    await fs.rm(directory, {recursive: true, force: true})
+  })
+
+  it('preserves a failed integration stage and bounds its error in the record', async () => {
+    // #given
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-command-test-'))
+    const resultPath = path.join(directory, 'result.json')
+    const recordPath = path.join(directory, 'record.json')
+    const failureError = `merge ref source failed: ${'x'.repeat(600)}`
+    await fs.writeFile(
+      resultPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        ok: false,
+        startedAt: '2026-08-14T00:00:00.000Z',
+        endedAt: '2026-08-14T00:00:01.000Z',
+        elapsedMs: 1000,
+        conflictMetrics: {
+          hadConflict: false,
+          conflictPathCount: 0,
+          conflictSizeBytes: 0,
+          resolverAttempts: 0,
+          contextRequestCount: 0,
+        },
+        failure: {stage: 'merge', error: failureError},
+      }),
+      'utf8',
+    )
+
+    // #when
+    let receivedRecord: ForwardShadowRecord | undefined
+    const code = await runForwardShadowCommand(
+      [
+        '--result-out',
+        resultPath,
+        '--record-out',
+        recordPath,
+        '--base-version',
+        '1.15.13',
+        '--shadow-work-dir',
+        directory,
+        '--release-repo',
+        'anomalyco/opencode',
+        '--authoritative-repository',
+        'fro-bot/agent',
+        '--authoritative-ref',
+        'refs/harness-integrate/1.15.13',
+        '--run-identity',
+        'run-1',
+      ],
+      {
+        readFile: async file => fs.readFile(file, 'utf8'),
+        compare: async input => compareForwardShadow(input),
+        writeRecord: async (_file, record) => {
+          receivedRecord = record
+        },
+        now: () => new Date('2026-08-14T00:00:02.000Z'),
+      },
+    )
+
+    // #then
+    expect(code).toBe(0)
+    expect(receivedRecord?.verdict).toBe('inconclusive')
+    expect(receivedRecord?.failureStage).toBe('merge')
+    expect(receivedRecord?.failureError).toBe(failureError.slice(0, 512))
+    expect(receivedRecord?.failureError?.length).toBeLessThanOrEqual(512)
+    await fs.rm(directory, {recursive: true, force: true})
+  })
+
+  it('falls back to the generic failure when the outcome stage is outside the integration union', async () => {
+    // #given
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-command-test-'))
+    const resultPath = path.join(directory, 'result.json')
+    const bogusStage = 'not-a-real-integration-stage'
+    await fs.writeFile(
+      resultPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        ok: false,
+        startedAt: '2026-08-14T00:00:00.000Z',
+        endedAt: '2026-08-14T00:00:01.000Z',
+        elapsedMs: 1000,
+        failure: {stage: bogusStage, error: 'bogus failure details'},
+      }),
+      'utf8',
+    )
+
+    // #when
+    let receivedRecord: ForwardShadowRecord | undefined
+    const code = await runForwardShadowCommand(
+      [
+        '--result-out',
+        resultPath,
+        '--record-out',
+        path.join(directory, 'record.json'),
+        '--base-version',
+        '1.15.13',
+        '--shadow-work-dir',
+        directory,
+        '--release-repo',
+        'anomalyco/opencode',
+        '--authoritative-repository',
+        'fro-bot/agent',
+        '--authoritative-ref',
+        'refs/harness-integrate/1.15.13',
+        '--run-identity',
+        'run-1',
+      ],
+      {
+        readFile: async file => fs.readFile(file, 'utf8'),
+        compare: async input => compareForwardShadow(input),
+        writeRecord: async (_file, record) => {
+          receivedRecord = record
+        },
+        now: () => new Date('2026-08-14T00:00:02.000Z'),
+      },
+    )
+
+    // #then
+    expect(code).toBe(0)
+    expect(receivedRecord?.failureStage).toBe('integration')
+    expect(receivedRecord?.failureStage).not.toBe(bogusStage)
+    expect(receivedRecord?.failureError).toBe('shadow integration outcome reported failure')
     await fs.rm(directory, {recursive: true, force: true})
   })
 })
