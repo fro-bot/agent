@@ -626,6 +626,7 @@ describe('runScenario orchestration', () => {
         // #then both modes retain the real continuation identity and seed the same logical session
         expect(report.state).toBe('passed')
         expect(observedConfig?.continueSessionId).toBe('seeded-session-42')
+        expect(report.sessionPresearch?.executedSessionId).toBe('seeded-session-42')
         expectProcessRestored(setup)
       })
     },

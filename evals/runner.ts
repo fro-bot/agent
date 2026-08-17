@@ -876,6 +876,7 @@ export type EvalSessionSeeder = (
 ) => Promise<string | null>
 
 const seedPriorWorkInOpenCode: EvalSessionSeeder = async (repoPath, scenario, logicalKey, logger) => {
+  // Seed and execution servers must share this isolated data home: discovery is directory-scoped, but message retrieval by ID is not.
   const opencode = await withScrubbedEnv(
     async (): Promise<Awaited<ReturnType<typeof createOpencode>>> => createOpencode({port: 0}),
     logger,
@@ -1036,6 +1037,10 @@ export async function runScenario(
       evaluation.gates,
     )
     const deterministicProvenance = buildDeterministicScenarioProvenance(scenario, logger, sessionPrepStrategy)
+    const sessionPresearch =
+      resolvedSessionSeeder == null || continuationSessionId == null
+        ? preparedScenario.sessionPrep.accounting
+        : {...preparedScenario.sessionPrep.accounting, executedSessionId: continuationSessionId}
     const redactedAgentError = redactSensitiveText(agentResult.error ?? '', environment.authSecretValues)
     const redactedExecutionFailureReason = redactSensitiveText(
       completeArtifacts.executionFailureReason ?? '',
@@ -1079,7 +1084,7 @@ export async function runScenario(
         error: agentResult.error == null ? null : redactedAgentError,
         tokenUsage: agentResult.tokenUsage,
       },
-      sessionPresearch: preparedScenario.sessionPrep.accounting,
+      sessionPresearch,
     }
   } catch (error) {
     primaryError = error
