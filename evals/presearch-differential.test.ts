@@ -6,11 +6,12 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {describe, expect, it} from 'vitest'
 import {createLogger} from '../src/shared/logger.js'
-import {MAX_COMPARISON_SAMPLES} from './compare.js'
+import {compareCandidateToBaseline, MAX_COMPARISON_SAMPLES} from './compare.js'
 import {
   MAX_DRIVER_ITERATIONS,
   MAX_INFRASTRUCTURE_RETRIES,
   PRESEARCH_EXPERIMENT_SCENARIO_IDS,
+  readReviewedBaseline,
   resolveRerunMode,
   runPresearchDifferentialExperiment,
   type DifferentialExperimentResult,
@@ -485,11 +486,43 @@ describe('bounded session-presearch differential experiment', () => {
       )
 
       // #then reruns stay on production and the candidate budget is not consumed by the baseline failure
-      expect(relevantScenario?.reason).toContain('Reviewed baseline samples did not provide a stable passed comparison')
-      expect(productionRelevantRuns).toBe(4)
+      expect(relevantScenario?.reason).toContain('exceeds the 4-vs-4 comparison budget')
+      expect(productionRelevantRuns).toBe(5)
       expect(treatmentRelevantRuns).toBe(4)
-      expect(productionRelevant).toHaveLength(4)
+      expect(productionRelevant).toHaveLength(5)
       expect(treatmentRelevant).toHaveLength(4)
+
+      // #then compare.ts accepts the baseline side at exactly four total samples without a budget error
+      const productionInitialReports = PRESEARCH_EXPERIMENT_SCENARIO_IDS.map(scenarioId => {
+        const report = result.report.modes.production.reports.find(candidate => candidate.scenarioId === scenarioId)
+        if (report === undefined) {
+          throw new Error(`Missing production report for ${scenarioId}`)
+        }
+        return report
+      })
+      const treatmentInitialReports = PRESEARCH_EXPERIMENT_SCENARIO_IDS.map(scenarioId => {
+        const report = result.report.modes.treatment.reports.find(candidate => candidate.scenarioId === scenarioId)
+        if (report === undefined) {
+          throw new Error(`Missing treatment report for ${scenarioId}`)
+        }
+        return report
+      })
+      const boundedComparison = compareCandidateToBaseline({
+        candidateReports: treatmentInitialReports,
+        reviewedBaseline: readReviewedBaseline(),
+        reviewedBaselineReports: productionInitialReports,
+        samples: {
+          'continuation-relevant': {
+            candidate: treatmentRelevant.slice(1, MAX_COMPARISON_SAMPLES).map(report => report.outcome),
+            baseline: productionRelevant.slice(1, MAX_COMPARISON_SAMPLES).map(report => report.outcome),
+          },
+        },
+        scenarioIds: PRESEARCH_EXPERIMENT_SCENARIO_IDS,
+      })
+      expect(boundedComparison.reason).not.toContain('exceeds the 4-vs-4 comparison budget')
+      expect(
+        boundedComparison.scenarios.find(scenario => scenario.scenarioId === 'continuation-relevant')?.reason,
+      ).toContain('Reviewed baseline samples did not provide a stable passed comparison')
     } finally {
       restoreTestEnvironment(environment)
     }

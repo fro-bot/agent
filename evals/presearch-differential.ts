@@ -486,7 +486,7 @@ async function driveBoundedRepeats(
       if (isInfrastructureRerun && infrastructureAttemptsSpent > MAX_INFRASTRUCTURE_RETRIES) {
         break
       }
-      if (isInfrastructureRerun === false && sampleCount >= MAX_COMPARISON_SAMPLES - 1) {
+      if (isInfrastructureRerun === false && sampleCount >= MAX_COMPARISON_SAMPLES) {
         break
       }
 
