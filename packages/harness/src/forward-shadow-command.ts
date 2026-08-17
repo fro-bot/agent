@@ -50,23 +50,24 @@ const DEFAULT_DEPENDENCIES: ForwardShadowCommandDependencies = {
 
 const OID_PATTERN = /^[0-9a-f]{40}$/i
 const MAX_RUN_IDENTITY_LENGTH = 512
-const INTEGRATION_STAGES = [
-  'sources',
-  'clone',
-  'fetch-tags',
-  'branch',
-  'fetch',
-  'merge',
-  'squash',
-  'workflow-strip',
-  'commit',
-  'build',
-  'version',
-  'tree',
-  'provenance',
-  'cleanup',
-  'push',
-] as const satisfies readonly IntegrationStage[]
+// The Record keys are exhaustive: adding an IntegrationStage requires updating this map.
+const INTEGRATION_STAGES: Readonly<Record<IntegrationStage, true>> = {
+  sources: true,
+  clone: true,
+  'fetch-tags': true,
+  branch: true,
+  fetch: true,
+  merge: true,
+  squash: true,
+  'workflow-strip': true,
+  commit: true,
+  build: true,
+  version: true,
+  tree: true,
+  provenance: true,
+  cleanup: true,
+  push: true,
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && Array.isArray(value) === false
@@ -84,12 +85,14 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0
 }
 
+function isIntegrationStage(value: unknown): value is IntegrationStage {
+  return typeof value === 'string' && Object.hasOwn(INTEGRATION_STAGES, value)
+}
+
 function parseFailure(value: unknown): {readonly stage: IntegrationStage; readonly error: string} | undefined {
-  if (isRecord(value) === false || isString(value.stage) === false || isString(value.error) === false) return undefined
-  for (const stage of INTEGRATION_STAGES) {
-    if (stage === value.stage) return {stage, error: value.error}
-  }
-  return undefined
+  if (isRecord(value) === false || isIntegrationStage(value.stage) === false || isString(value.error) === false)
+    return undefined
+  return {stage: value.stage, error: value.error}
 }
 
 function emptyMetrics(): ForwardShadowConflictMetrics {
