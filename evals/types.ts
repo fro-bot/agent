@@ -40,6 +40,7 @@ export interface SessionPresearchAccounting {
   readonly strategy: SessionPresearchStrategy
   readonly logicalKey: string | null
   readonly continuationSessionId: string | null
+  readonly executedSessionId?: string
   readonly recentSessionCount: number
   readonly priorWorkResultCount: number
   readonly injectedContextBytes: number

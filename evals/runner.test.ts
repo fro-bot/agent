@@ -1,3 +1,4 @@
+import type {SessionClient} from '../packages/runtime/src/session/backend.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
 import type {Logger} from '../src/shared/logger.js'
 import type {Scenario} from './types.js'
@@ -9,6 +10,7 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {describe, expect, it, vi} from 'vitest'
 import {RESPONSE_FILE_DIR_SEGMENT} from '../packages/runtime/src/agent/response-file.js'
+import {searchSessions} from '../packages/runtime/src/session/search.js'
 import {buildAgentPrompt} from '../src/features/agent/index.js'
 import {createIssueCommentCreatedEvent} from '../src/features/triggers/__fixtures__/payloads.js'
 import {createLogger} from '../src/shared/logger.js'
@@ -22,6 +24,7 @@ import {
   resolveHarnessBinary,
   resolveModel,
   runScenario,
+  seedPriorWorkSession,
   treatmentSessionPrepStrategy,
 } from './runner.js'
 import {cleanPrScenario} from './scenarios/clean-pr.js'
@@ -284,6 +287,25 @@ describe('runScenario orchestration', () => {
     },
   )
 
+  it('uses distinct deterministic provenance for production and treatment prompt strategies', () => {
+    // #given one continuation scenario projected through the two supported strategies
+    // #when deterministic prompt provenance is computed for each strategy
+    const production = buildDeterministicScenarioProvenance(
+      continuationRelevantScenario,
+      logger,
+      productionSessionPrepStrategy,
+    )
+    const treatment = buildDeterministicScenarioProvenance(
+      continuationRelevantScenario,
+      logger,
+      treatmentSessionPrepStrategy,
+    )
+
+    // #then the prompt hash records the strategy actually used while the fixture commit remains stable
+    expect(treatment.promptHash).not.toBe(production.promptHash)
+    expect(treatment.scenarioCommitSha).toBe(production.scenarioCommitSha)
+  })
+
   it('restores cwd and env and removes the fixture when injected execution throws', async () => {
     // #given an injected execution that observes the fixture and then throws
     await withTestEnvironment(async setup => {
@@ -498,6 +520,118 @@ describe('runScenario orchestration', () => {
       expectProcessRestored(setup)
     })
   }, 30_000)
+
+  it('seeds prior work through the SDK path consumed by session_search', async () => {
+    // #given a fake SDK client that persists created sessions and prompted messages in memory
+    const workspacePath = '/fixture/continuation-relevant'
+    const createdSession = {
+      id: 'seeded-session-42',
+      version: '1.18.18',
+      projectID: 'fixture-project',
+      directory: workspacePath,
+      title: 'fro-bot: issue-1',
+      time: {created: 1, updated: 1},
+    }
+    const persistedMessages: {readonly info: unknown; readonly parts: readonly {readonly text: string}[]}[] = []
+    const createSpy = vi.fn().mockResolvedValue({data: createdSession})
+    const promptSpy = vi.fn(
+      async (request: {readonly query?: {readonly directory?: string}; readonly body?: unknown}) => {
+        const body = request.body as {
+          readonly parts?: readonly [{readonly type: 'text'; readonly text: string}]
+        }
+        const text = body.parts?.[0]?.text ?? ''
+        persistedMessages.push({
+          info: {
+            id: `message-${persistedMessages.length + 1}`,
+            sessionID: createdSession.id,
+            role: 'user',
+            time: {created: persistedMessages.length + 1},
+            agent: 'build',
+            model: {providerID: 'opencode', modelID: 'eval-model'},
+          },
+          parts: [{text}],
+        })
+        return {data: {id: `message-${persistedMessages.length}`}}
+      },
+    )
+    const listSpy = vi.fn().mockResolvedValue({data: [createdSession]})
+    const messagesSpy = vi.fn().mockImplementation(async () => ({data: persistedMessages}))
+    const client = {
+      session: {
+        create: createSpy,
+        prompt: promptSpy,
+        list: listSpy,
+        messages: messagesSpy,
+      },
+    } as unknown as SessionClient
+
+    // #when prior work is seeded and searched through the runtime SDK primitives
+    const seededSessionId = await seedPriorWorkSession(
+      client,
+      workspacePath,
+      continuationRelevantScenario,
+      {key: 'issue-1', entityType: 'issue', entityId: '1'},
+      logger,
+    )
+    const results = await searchSessions('ORBIT-217', client, workspacePath, {limit: 5}, logger)
+
+    // #then creation, message persistence, directory scoping, and retrieval all use the public SDK path
+    expect(seededSessionId).toBe('seeded-session-42')
+    expect(createSpy).toHaveBeenCalledWith({
+      query: {directory: workspacePath},
+      body: {title: 'fro-bot: issue-1'},
+    })
+    expect(promptSpy).toHaveBeenCalledWith(expect.objectContaining({query: {directory: workspacePath}}))
+    expect(persistedMessages[0]?.parts[0]?.text).toContain('ORBIT-217')
+    expect(results).toHaveLength(1)
+    expect(results[0]?.sessionId).toBe('seeded-session-42')
+    expect(results[0]?.matches[0]?.excerpt).toContain('ORBIT-217')
+  })
+
+  it.each([
+    ['production', productionSessionPrepStrategy],
+    ['treatment', treatmentSessionPrepStrategy],
+  ] as const)(
+    'provisions session tools, seeds prior work, and carries continuation for %s',
+    async (_mode, strategy) => {
+      // #given a continuation scenario and an injected execution seam
+      await withTestEnvironment(async setup => {
+        let observedConfig: ExecutionConfig | undefined
+        const execution = async (_promptOptions: PromptOptions, _logger: Logger, config?: ExecutionConfig) => {
+          observedConfig = config
+          const configHome = process.env.XDG_CONFIG_HOME
+          if (configHome == null) {
+            throw new Error('Injected execution could not locate isolated OpenCode config')
+          }
+          const toolFile = path.join(configHome, 'opencode', 'tool', 'session.js')
+          const toolContents = fs.readFileSync(toolFile, 'utf8')
+          expect(toolContents).toContain('No matches found.')
+          const responseFilePath = _promptOptions.responseFilePath
+          if (responseFilePath == null) {
+            throw new Error('Injected execution did not receive a response file path')
+          }
+          fs.writeFileSync(responseFilePath, '---\nschemaVersion: 1\n---\nseq ORBIT-217\n', 'utf8')
+          return createAgentResult()
+        }
+
+        // #when the selected mode runs through the isolated eval environment
+        const report = await runScenario(
+          continuationRelevantScenario,
+          logger,
+          execution,
+          strategy,
+          async () => 'seeded-session-42',
+        )
+
+        // #then both modes retain the real continuation identity and seed the same logical session
+        expect(report.state).toBe('passed')
+        expect(observedConfig?.continueSessionId).toBe('seeded-session-42')
+        expect(report.sessionPresearch?.executedSessionId).toBe('seeded-session-42')
+        expectProcessRestored(setup)
+      })
+    },
+    30_000,
+  )
 
   it('fails a valid response when a sibling markdown artifact is delivered', async () => {
     // #given successful injected execution that writes the valid response and a duplicate artifact

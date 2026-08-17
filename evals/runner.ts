@@ -1,6 +1,7 @@
 import type {DiffFileSummary} from '../packages/runtime/src/agent/index.js'
 import type {ParsedResponse, ResponseSurface} from '../packages/runtime/src/agent/response-file.js'
 import type {SessionContext, TriggerContext} from '../packages/runtime/src/agent/types.js'
+import type {SessionClient} from '../packages/runtime/src/session/backend.js'
 import type {LogicalSessionKey} from '../packages/runtime/src/session/logical-key.js'
 import type {OmoProviders} from '../packages/runtime/src/shared/types.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
@@ -22,17 +23,21 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
+import {pathToFileURL} from 'node:url'
+import {createOpencode} from '@opencode-ai/sdk'
 import {redactSecrets} from '../packages/harness/src/format-error.js'
 import {
   buildResponseFilePath,
   parseResponseFile,
   RESPONSE_FILE_DIR_SEGMENT,
 } from '../packages/runtime/src/agent/response-file.js'
-import {buildLogicalKey} from '../packages/runtime/src/session/logical-key.js'
+import {withScrubbedEnv} from '../packages/runtime/src/agent/with-scrubbed-env.js'
+import {buildLogicalKey, buildSessionTitle} from '../packages/runtime/src/session/logical-key.js'
 import {buildAgentPrompt, executeOpenCode} from '../src/features/agent/index.js'
 import {resolveResponseSurface} from '../src/features/agent/response-file.js'
 import {buildTriggerContext} from '../src/features/triggers/context-builders.js'
 import {normalizeEvent} from '../src/services/github/context.js'
+import {writeSessionToolsFile} from '../src/services/setup/session-tools-config.js'
 import {
   captureDiagnostics,
   clearScenarioDiagnostics,
@@ -232,7 +237,13 @@ function cleanupIsolatedEvalEnv(env: IsolatedEvalEnv): void {
   }
 }
 
-function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: string, model: string): IsolatedEvalEnv {
+async function createIsolatedEvalEnv(
+  repoPath: string,
+  scenario: Scenario,
+  headSha: string,
+  model: string,
+  logger: Logger,
+): Promise<IsolatedEvalEnv> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), `fro-bot-eval-${scenario.id}-`))
   const runnerTemp = fs.mkdtempSync(path.join(os.tmpdir(), `fro-bot-eval-temp-${scenario.id}-`))
   const runId = String(Date.now())
@@ -284,6 +295,8 @@ function createIsolatedEvalEnv(repoPath: string, scenario: Scenario, headSha: st
     fs.writeFileSync(opencodeBin, `#!/bin/sh\nexec "${resolveHarnessBinary()}" "$@"\n`, {mode: 0o755})
     const pluginVersions = resolveConfiguredPluginVersions(model)
     const authPlugin = pluginVersions[0]
+    const sessionToolsAsset = path.resolve(import.meta.dirname, '..', 'dist', 'session-tools.js')
+    await writeSessionToolsFile(configDir, logger, () => pathToFileURL(sessionToolsAsset))
     fs.writeFileSync(
       path.join(configDir, 'opencode.json'),
       JSON.stringify(
@@ -684,20 +697,27 @@ export function hashEvalPrompt(promptOptions: PromptOptions, logger: Logger): st
 export function buildDeterministicScenarioProvenance(
   scenario: Scenario,
   logger: Logger,
+  sessionPrepStrategy: EvalSessionPrepStrategy = productionSessionPrepStrategy,
 ): {readonly promptHash: string; readonly scenarioCommitSha: string} {
-  const cached = deterministicProvenanceCache.get(scenario.id)
+  const cacheKey = `${scenario.id}:${sessionPrepStrategy === productionSessionPrepStrategy ? 'production' : 'treatment'}`
+  const cached = deterministicProvenanceCache.get(cacheKey)
   if (cached != null) {
     return cached
   }
 
   const fixtureRepo = createFixtureRepo(createFixtureFiles(scenario, EVAL_PROVENANCE_CANARY))
   try {
-    const promptOptions = buildPromptOptions(scenario, fixtureRepo.headSha, EVAL_RESPONSE_PATH_SENTINEL)
+    const promptOptions = buildPromptOptions(
+      scenario,
+      fixtureRepo.headSha,
+      EVAL_RESPONSE_PATH_SENTINEL,
+      sessionPrepStrategy,
+    )
     const provenance = {
       promptHash: hashEvalPrompt(promptOptions, logger),
       scenarioCommitSha: fixtureRepo.headSha,
     }
-    deterministicProvenanceCache.set(scenario.id, provenance)
+    deterministicProvenanceCache.set(cacheKey, provenance)
     return provenance
   } finally {
     cleanupFixtureRepo(fixtureRepo)
@@ -801,6 +821,73 @@ export function createFixtureFiles(scenario: Scenario, canary: string): Readonly
   return files
 }
 
+export async function seedPriorWorkSession(
+  client: SessionClient,
+  repoPath: string,
+  scenario: Scenario,
+  logicalKey: LogicalSessionKey | null,
+  logger: Logger,
+): Promise<string | null> {
+  if (scenario.priorWork == null) return null
+  if (logicalKey == null) throw new Error(`Scenario ${scenario.id} requires a logical key for prior-work seeding`)
+
+  const sessionID = scenario.priorWork.currentThreadSessionId
+  const priorMatches = scenario.priorWork.sessionContext.priorWorkContext
+    .filter(result => result.sessionId === sessionID)
+    .flatMap(result => result.matches)
+  if (priorMatches.length === 0) throw new Error(`Scenario ${scenario.id} has no prior-work matches to seed`)
+
+  const sessionResponse = await client.session.create({
+    query: {directory: repoPath},
+    body: {title: buildSessionTitle(logicalKey)},
+  })
+  if (sessionResponse.error != null || sessionResponse.data == null) {
+    throw new Error(`Failed to seed prior-work session: ${String(sessionResponse.error ?? 'No session returned')}`)
+  }
+  const seededSessionID = sessionResponse.data.id
+
+  for (const match of priorMatches) {
+    const promptResponse = await client.session.prompt({
+      path: {id: seededSessionID},
+      query: {directory: repoPath},
+      body: {
+        noReply: true,
+        parts: [{type: 'text', text: match.excerpt}],
+      },
+    })
+    if (promptResponse.error != null) {
+      throw new Error(`Failed to seed prior-work message: ${String(promptResponse.error)}`)
+    }
+  }
+  logger.info('Seeded eval prior-work session through OpenCode SDK', {
+    sessionID: seededSessionID,
+    directory: repoPath,
+    title: buildSessionTitle(logicalKey),
+    matchCount: priorMatches.length,
+  })
+  return seededSessionID
+}
+
+export type EvalSessionSeeder = (
+  repoPath: string,
+  scenario: Scenario,
+  logicalKey: LogicalSessionKey | null,
+  logger: Logger,
+) => Promise<string | null>
+
+const seedPriorWorkInOpenCode: EvalSessionSeeder = async (repoPath, scenario, logicalKey, logger) => {
+  // Seed and execution servers must share this isolated data home: discovery is directory-scoped, but message retrieval by ID is not.
+  const opencode = await withScrubbedEnv(
+    async (): Promise<Awaited<ReturnType<typeof createOpencode>>> => createOpencode({port: 0}),
+    logger,
+  )
+  try {
+    return await seedPriorWorkSession(opencode.client, repoPath, scenario, logicalKey, logger)
+  } finally {
+    opencode.server.close()
+  }
+}
+
 interface CollectedResponseArtifacts {
   readonly artifacts: ResponseArtifacts
   readonly rawResponse: string | null
@@ -870,6 +957,7 @@ export async function runScenario(
   logger: Logger,
   execution: EvalExecution = executeOpenCode,
   sessionPrepStrategy: EvalSessionPrepStrategy = productionSessionPrepStrategy,
+  sessionSeeder?: EvalSessionSeeder,
 ): Promise<EvalRunReport> {
   const startedAt = Date.now()
   const originalCwd = process.cwd()
@@ -884,9 +972,20 @@ export async function runScenario(
   let cleanupError: string | null = null
 
   try {
-    const environment = createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model)
+    const environment = await createIsolatedEvalEnv(fixtureRepo.path, scenario, fixtureRepo.headSha, model, logger)
     isolatedEnv = environment
     const preparedScenario = prepareScenarioPrompt(scenario, fixtureRepo.headSha, sessionPrepStrategy)
+    const resolvedSessionSeeder = sessionSeeder ?? (execution === executeOpenCode ? seedPriorWorkInOpenCode : null)
+    let continuationSessionId: string | null = null
+    if (preparedScenario.sessionPrep.currentThreadSessionId != null) {
+      continuationSessionId =
+        resolvedSessionSeeder == null
+          ? preparedScenario.sessionPrep.currentThreadSessionId
+          : await resolvedSessionSeeder(fixtureRepo.path, scenario, preparedScenario.sessionPrep.logicalKey, logger)
+      if (continuationSessionId == null) {
+        throw new Error(`Scenario ${scenario.id} declared continuation but seeding returned no session ID`)
+      }
+    }
     const promptOptions = buildPromptOptionsFromPrepared(scenario, environment.responseFilePath, preparedScenario)
     const responseSurface = resolveResponseSurface(promptOptions.context, promptOptions.triggerContext)
     const timeoutMs = resolveEvalTimeoutMs()
@@ -895,6 +994,7 @@ export async function runScenario(
       model: modelConfig,
       timeoutMs,
       omoProviders: NO_OMO_PROVIDERS,
+      ...(continuationSessionId == null ? {} : {continueSessionId: continuationSessionId}),
     }
     let agentResult: AgentResult
     const openCodeVersion = readOpenCodeVersion(environment.opencodeBin)
@@ -936,7 +1036,11 @@ export async function runScenario(
       completeArtifacts.parsedResponse?.verdict ?? null,
       evaluation.gates,
     )
-    const deterministicProvenance = buildDeterministicScenarioProvenance(scenario, logger)
+    const deterministicProvenance = buildDeterministicScenarioProvenance(scenario, logger, sessionPrepStrategy)
+    const sessionPresearch =
+      resolvedSessionSeeder == null || continuationSessionId == null
+        ? preparedScenario.sessionPrep.accounting
+        : {...preparedScenario.sessionPrep.accounting, executedSessionId: continuationSessionId}
     const redactedAgentError = redactSensitiveText(agentResult.error ?? '', environment.authSecretValues)
     const redactedExecutionFailureReason = redactSensitiveText(
       completeArtifacts.executionFailureReason ?? '',
@@ -980,7 +1084,7 @@ export async function runScenario(
         error: agentResult.error == null ? null : redactedAgentError,
         tokenUsage: agentResult.tokenUsage,
       },
-      sessionPresearch: preparedScenario.sessionPrep.accounting,
+      sessionPresearch,
     }
   } catch (error) {
     primaryError = error
