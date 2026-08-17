@@ -390,6 +390,16 @@ U1 is independent. U2 and U3 may proceed independently. U4 waits for U2 and runs
 
 **Goal:** Determine whether eager recent-session listing and prior-work search still improve covered outcomes enough to justify two SDK calls and injected context.
 
+**Status:** Complete. The bounded differential ran over the two covered scenarios and produced an auditable report.
+
+**Outcome:** Both modes passed both scenarios with no stable differences, so the corpus cannot attribute causal improvement in either direction. The result supports non-regression on the covered slice only.
+
+The operational delta does not favor deletion. Eager presearch costs two SDK calls and roughly 300 bytes of injected context per run, both deterministic. Disabling it did not remove that cost so much as relocate it. Wall-clock time rose in both scenarios, by 17% and 60%. Token accounting is mixed and favors neither mode: the candidate spent substantially more output and reasoning tokens on `continuation-relevant` (116 and 129 against 10 and 44) while spending fewer reasoning tokens on `continuation-irrelevant-non-degradation` (14 against 57), and total input tokens fell under the candidate, as expected once injected context is removed. Combined across both scenarios the input, output, and reasoning delta is roughly 5%. Durations and token counts are advisory and were observed at one sample per cell on a single small model, so this is directional evidence rather than a measurement.
+
+**Decision:** Retain eager presearch. This rests on non-regression plus an operational delta that does not favor removal. It is not a claim that eager presearch improves model reasoning, and it does not preclude a later deletion decision on different evidence.
+
+**Prerequisite defect:** The first execution of this experiment was invalid and its result must not be cited. The isolated eval never provisioned the native `session_*` tools, never persisted scenario prior work as a retrievable session, and never applied `continueSessionId`. The treatment strategy therefore removed the only reachable copy of the prior decision instead of isolating eager injection, and failed every sample for want of data rather than for want of retrieval capability. Corrected before the reported run.
+
 **Requirements:** R9, R10, R11, R13, R14
 
 **Dependencies:** U2 and U3. The comparison machinery must exist, and output-mode migration should be stable so measurement is not confounded by delivery routing.
