@@ -52,17 +52,18 @@ describe('prompt.txt bash snippet syntax', () => {
     expect(bashBlocks.length).toBeGreaterThan(0)
   })
 
-  it('push block contains required markers', () => {
+  it('does not grant the model push capability', () => {
     // #given
     const allBlocks = bashBlocks.join('\n')
 
     // #then
-    expect(allBlocks).toContain('GIT_ASKPASS')
-    expect(allBlocks).toContain('git push')
-    expect(allBlocks).toContain('refs/harness-integrate')
+    expect(allBlocks).not.toContain('git push')
+    expect(allBlocks).not.toContain('GIT_ASKPASS')
+    expect(allBlocks).not.toContain('GH_TOKEN')
+    expect(allBlocks).not.toContain('GITHUB_TOKEN')
   })
 
-  it('strips .github/workflows from the integration commit before pushing', () => {
+  it('strips .github/workflows from the integration commit before the trusted handoff', () => {
     // #given
     // The integration push authenticates as a GitHub App, and GitHub rejects any
     // App push that creates or updates a workflow file without the `workflows`
@@ -76,15 +77,17 @@ describe('prompt.txt bash snippet syntax', () => {
     expect(allBlocks).toMatch(/git rm -r --cached [^\n]*--ignore-unmatch [^\n]*\.github\/workflows/)
   })
 
-  it('removes workflows from the index only, before the integration commit', () => {
+  it('cleans the workflow files after removing them from the index, before the trusted handoff', () => {
     // #given
     const allBlocks = bashBlocks.join('\n')
     const stripIndex = allBlocks.indexOf('.github/workflows')
     const commitIndex = allBlocks.indexOf('git commit -m "harness: integrate OpenCode')
 
     // #then
-    // `--cached` keeps the files on disk so the build step is unaffected.
+    // The trusted builder uses a fresh materialized commit, so the candidate
+    // must not leave the index-only workflow files dirty at freeze time.
     expect(allBlocks).toContain('--cached')
+    expect(allBlocks).toContain('find .github/workflows -type f -delete')
     // The strip must precede the single integration commit, or the commit still
     // carries the workflow files and the push is rejected.
     expect(stripIndex).toBeGreaterThan(-1)

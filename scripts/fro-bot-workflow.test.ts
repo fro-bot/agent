@@ -527,23 +527,49 @@ describe('harness forward-shadow workflow wiring', () => {
     expect(JSON.stringify(workflow)).not.toContain('secrets: inherit')
   })
 
-  it('orders authoritative Run Fro Bot before shadow driver, record, and upload', () => {
+  it('orders authoritative Run Fro Bot, trusted freeze, then shadow evidence', () => {
     // #given
     const steps = stepsFor(integratePath, 'integrate')
     const mint = steps.findIndex(step => step.id === 'mint')
     const appMint = steps.findIndex(step => step.id === 'mint-app-token')
     const authoritative = steps.findIndex(step => step.name === 'Run Fro Bot')
+    const trustedFreeze = steps.findIndex(step => step.id === 'trusted-integrate')
     const shadow = steps.findIndex(step => step.id === 'shadow-integrate')
     const record = steps.findIndex(step => step.id === 'shadow-record')
     const upload = steps.findIndex(step => step.id === 'upload-shadow-record')
 
     // #then
     expect(mint).toBeGreaterThanOrEqual(0)
-    expect(appMint).toBeGreaterThan(mint)
-    expect(authoritative).toBeGreaterThan(appMint)
-    expect(shadow).toBeGreaterThan(authoritative)
+    expect(authoritative).toBeGreaterThan(mint)
+    expect(appMint).toBeGreaterThan(authoritative)
+    expect(trustedFreeze).toBeGreaterThan(appMint)
+    expect(shadow).toBeGreaterThan(trustedFreeze)
     expect(record).toBeGreaterThan(shadow)
     expect(upload).toBeGreaterThan(record)
+  })
+
+  it('gives the model only the read-only workflow token and reserves the App token for trusted push', () => {
+    // #given
+    const steps = stepsFor(integratePath, 'integrate')
+    const runFroBot = steps.find(step => step.name === 'Run Fro Bot')
+    const trusted = stepById(steps, 'trusted-integrate')
+    if (runFroBot === undefined) throw new TypeError('Run Fro Bot step is missing')
+    const runWith = runFroBot.with as Record<string, unknown>
+    const runEnv = runFroBot.env as Record<string, unknown>
+    const trustedEnv = trusted.env as Record<string, unknown>
+    const trustedRun = String(trusted.run ?? '')
+
+    // #then
+    const githubTokenExpression = '${' + '{ github.token }}'
+    const appTokenExpression = '${' + '{ steps.mint-app-token.outputs.github-token }}'
+    expect(runWith['github-token']).toBe(githubTokenExpression)
+    expect(runEnv.GH_TOKEN).toBe('')
+    expect(runEnv.GITHUB_TOKEN).toBe('')
+    expect(trustedEnv.GH_TOKEN).toBe(appTokenExpression)
+    expect(trustedEnv.GITHUB_TOKEN).toBe('')
+    expect(trustedRun).toContain('--candidate')
+    expect(trustedRun).toContain('--push-repo')
+    expect(trustedRun).toContain('--push-ref')
   })
 
   it('keeps every shadow step credentialless and invokes dry-run without push flags', () => {
