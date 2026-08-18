@@ -174,10 +174,14 @@ export interface IntegrationAdapters {
   readonly commitIntegration: (workDir: string, message: string) => Promise<void>
   /** Build the native CLI in the integrated work repo. */
   readonly buildCli: (workDir: string, version: string, channel: string) => Promise<void>
+  /** Install the frozen checkout's locked dependencies before building it. */
+  readonly installDependencies?: (workDir: string) => Promise<void>
   /** Verify the built CLI --version matches the expected base version exactly. */
   readonly verifyVersion: (workDir: string, expectedVersion: string) => Promise<void>
   /** Get the current HEAD commit SHA of the work repo. */
   readonly getCommitSha: (workDir: string) => Promise<string>
+  /** Resolve a local candidate ref to its commit SHA. */
+  readonly getRefSha?: (workDir: string, ref: string) => Promise<string>
   /** Validate the final commit/tree before and immediately before push. */
   readonly validateFinalTree: (workDir: string, expectation: FinalTreeExpectation) => Promise<void>
   /** Materialize and revalidate the frozen commit in a fresh trusted repository. */
@@ -618,6 +622,8 @@ async function prepareTrustedPushRepositoryReal(
     await git.exec(['update-ref', `refs/tags/${expectation.baseTag}`, baseCommit], trustedWorkDir, trustedGitEnv())
     await git.exec(['update-ref', 'refs/harness/frozen', integrationCommit], trustedWorkDir, trustedGitEnv())
     await git.exec(['symbolic-ref', 'HEAD', 'refs/harness/frozen'], trustedWorkDir, trustedGitEnv())
+    await git.exec(['checkout', '--quiet', '--detach', 'refs/harness/frozen'], trustedWorkDir, trustedGitEnv())
+    await fs.mkdir(path.join(trustedWorkDir, '.github', 'workflows'), {recursive: true})
 
     const actualCommit = await git.exec(['rev-parse', 'refs/harness/frozen^{commit}'], trustedWorkDir, trustedGitEnv())
     if (actualCommit !== integrationCommit) {
@@ -743,6 +749,15 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
       })
     },
 
+    installDependencies: async workDir => {
+      await execFileAsync('bun', ['install', '--frozen-lockfile'], {
+        cwd: workDir,
+        encoding: 'utf8',
+        env: publicGitEnv(),
+        timeout: 20 * 60 * 1000,
+      })
+    },
+
     verifyVersion: async (workDir, expectedVersion) => {
       const cliPath = resolveCliPath(workDir)
       const {stdout} = await execFileAsync(cliPath, ['--version'], {
@@ -757,6 +772,8 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
     },
 
     getCommitSha: async workDir => git.exec(['rev-parse', 'HEAD'], workDir, publicGitEnv()),
+
+    getRefSha: async (workDir, ref) => git.exec(['rev-parse', `${ref}^{commit}`], workDir, publicGitEnv()),
 
     validateFinalTree: async (workDir, expectation) => validateFinalTreeReal(git, workDir, expectation),
 
