@@ -81,6 +81,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
+function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
+  const resolvedFile = path.resolve(filePath)
+  const resolvedDirectory = path.resolve(directoryPath)
+  return resolvedFile.startsWith(`${resolvedDirectory}${path.sep}`)
+}
+
 /**
  * Scope the build agent's `external_directory` permission so the harness's
  * own response-file delivery (see `packages/runtime/src/agent/response-file.ts`
@@ -120,6 +126,7 @@ function scopeExternalDirectoryPermission(
   config: Record<string, unknown>,
   runnerTemp: string | undefined,
   integrationWorkDir: string | undefined,
+  logger: Logger,
 ): void {
   const agent = isRecord(config.agent) ? config.agent : {}
   const build = isRecord(agent.build) ? agent.build : {}
@@ -128,16 +135,26 @@ function scopeExternalDirectoryPermission(
   // Fail safe: if RUNNER_TEMP isn't set (e.g. local/non-Actions runs), we
   // can't know where the response-file dir will be, so keep the flat deny
   // rather than guessing a broad allow pattern.
-  const externalDirectory: Record<string, 'allow' | 'deny'> | 'deny' =
-    runnerTemp != null && runnerTemp.trim().length > 0
-      ? {
-          '*': 'deny',
-          [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',
-          ...(integrationWorkDir != null && integrationWorkDir.trim().length > 0
-            ? {[path.join(integrationWorkDir, '*')]: 'allow'}
-            : {}),
-        }
-      : 'deny'
+  let externalDirectory: Record<string, 'allow' | 'deny'> | 'deny' = 'deny'
+  if (runnerTemp != null && runnerTemp.trim().length > 0) {
+    externalDirectory = {
+      '*': 'deny',
+      [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',
+    }
+
+    if (integrationWorkDir != null && integrationWorkDir.trim().length > 0) {
+      const trimmedRunnerTemp = runnerTemp.trim()
+      const trimmedIntegrationWorkDir = integrationWorkDir.trim()
+      if (isPathInsideDirectory(trimmedIntegrationWorkDir, trimmedRunnerTemp)) {
+        externalDirectory[path.join(trimmedIntegrationWorkDir, '*')] = 'allow'
+      } else {
+        logger.warning('Ignoring integration workdir outside RUNNER_TEMP', {
+          integrationWorkDir: trimmedIntegrationWorkDir,
+          runnerTemp: trimmedRunnerTemp,
+        })
+      }
+    }
+  }
 
   config.agent = {
     ...agent,
@@ -254,7 +271,7 @@ export function buildCIConfig(
     // Pin default_agent to "build" — overrides any user-provided value
     const userAgent: unknown = ciConfig.default_agent
     ciConfig.default_agent = 'build'
-    scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, inputs.integrationWorkDir)
+    scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, inputs.integrationWorkDir, logger)
     if (userAgent != null && userAgent !== 'build') {
       rewrittenFields.push('default_agent')
     }
