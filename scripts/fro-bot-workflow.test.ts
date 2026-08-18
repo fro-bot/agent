@@ -538,6 +538,38 @@ describe('harness forward-shadow workflow wiring', () => {
     expect(JSON.stringify(workflow)).not.toContain('secrets: inherit')
   })
 
+  it('allows only the pinned OpenCode preview dependency host in the blocked egress list', () => {
+    // #given the checked-in runner hardening step
+    const job = rawJob(integratePath, 'integrate')
+    const harden = stepsFor(integratePath, 'integrate').find(step => step.name === 'Harden runner egress')
+    if (harden === undefined) throw new TypeError('Harden runner egress step is missing')
+    const hardenWith = harden.with as Record<string, unknown>
+
+    // #then the policy remains blocked and the allowlist changes only by adding pkg.pr.new
+    expect(hardenWith['egress-policy']).toBe('block')
+    expect(hardenWith['allowed-endpoints']).toBe(
+      [
+        'api.github.com:443',
+        'broker.fro.bot:443',
+        'bun.sh:443',
+        'codeload.github.com:443',
+        'cliproxy.fro.bot:443',
+        'github.com:443',
+        'models.dev:443',
+        'nodejs.org:443',
+        'pkg.pr.new:443',
+        'registry.npmjs.org:443',
+        '*.actions.githubusercontent.com:443',
+        '*.githubusercontent.com:443',
+      ].join(' '),
+    )
+
+    const raw = readFileSync(integratePath, 'utf8')
+    expect(raw).toContain('# Upstream OpenCode pins @solidjs/start to a pkg.pr.new preview build in its root')
+    expect(raw).toContain('# package.json, so bun install --frozen-lockfile cannot complete without it.')
+    expect(job.permissions).toEqual({'id-token': 'write', contents: 'read'})
+  })
+
   it('orders authoritative Run Fro Bot, trusted freeze, then shadow evidence', () => {
     // #given
     const steps = stepsFor(integratePath, 'integrate')
