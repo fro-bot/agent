@@ -502,6 +502,17 @@ describe('harness forward-shadow workflow wiring', () => {
   const integratePath = '.github/workflows/harness-integrate.yaml'
   const releasePath = '.github/workflows/harness-release.yaml'
 
+  it('bounds the integrate job and forward-shadow step independently', () => {
+    // #given the checked-in reusable integration workflow
+    const job = rawJob(integratePath, 'integrate')
+    const steps = stepsFor(integratePath, 'integrate')
+    const shadow = stepById(steps, 'shadow-integrate')
+
+    // #then the job backstop leaves room for the fail-soft shadow step to report evidence
+    expect(job['timeout-minutes']).toBe(120)
+    expect(shadow['timeout-minutes']).toBe(90)
+  })
+
   it('keeps harness-integrate to one job with unchanged permissions and no secret inheritance', () => {
     // #given
     const workflow = loadRawWorkflow(integratePath)

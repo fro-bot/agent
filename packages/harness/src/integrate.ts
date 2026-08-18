@@ -29,6 +29,11 @@ import {
   sourcesFromCarryManifest,
 } from './sources.js'
 
+/** Driver deadline: leaves the workflow backstop time to record a named failure and upload evidence. */
+export const DEFAULT_INTEGRATION_PIPELINE_TIMEOUT_MS = 75 * 60 * 1000
+/** Git command deadline: generous for a large hosted-runner clone/fetch, short enough to fail a wedged process. */
+export const GIT_SUBPROCESS_TIMEOUT_MS = 10 * 60 * 1000
+
 // Re-export so callers that previously imported from integrate.ts still work.
 export type {IntegrationRefRecord} from './provenance.js'
 
@@ -74,6 +79,8 @@ export interface IntegrationConfig {
   readonly brokerAuthJson?: string
   readonly runnerTempDir?: string
   readonly promptPath?: string
+  /** Overall driver deadline; callers may shorten it for fail-soft shadow evidence. */
+  readonly pipelineTimeoutMs?: number
 }
 
 export type MergeOutcome =
@@ -122,6 +129,7 @@ export type IntegrationStage =
   | 'provenance'
   | 'cleanup'
   | 'push'
+  | 'deadline'
 
 export type IntegrationResult =
   | {
@@ -349,6 +357,12 @@ function trustedGitEnv(): NodeJS.ProcessEnv {
 
 export interface RealAdapterOptions {
   readonly hooksRoot?: string
+  /** Test seam for exercising subprocess timeout handling without network access. */
+  readonly gitBin?: string
+  /** Test seam; production uses GIT_SUBPROCESS_TIMEOUT_MS. */
+  readonly gitTimeoutMs?: number
+  /** Shadow callers may shorten model attempts without changing authoritative integration. */
+  readonly conflictModelTimeoutMs?: number
 }
 
 interface GitSubprocess {
@@ -358,7 +372,20 @@ interface GitSubprocess {
   readonly dispose: () => Promise<void>
 }
 
-function makeGitSubprocess(hooksRoot: string): GitSubprocess {
+function isGitSubprocessTimeout(error: unknown): boolean {
+  if (error === null || typeof error !== 'object') return false
+  const record = error as Record<string, unknown>
+  return record.code === 'ETIMEDOUT' || (record.killed === true && record.signal === 'SIGTERM')
+}
+
+function gitSubprocessError(error: unknown, args: readonly string[], timeoutMs: number): unknown {
+  if (isGitSubprocessTimeout(error) === false) return error
+  const timeoutError = new Error(`git subprocess timed out after ${timeoutMs}ms: git ${args.join(' ')}`)
+  timeoutError.name = 'GitSubprocessTimeoutError'
+  return timeoutError
+}
+
+function makeGitSubprocess(hooksRoot: string, gitBin = 'git', timeoutMs = GIT_SUBPROCESS_TIMEOUT_MS): GitSubprocess {
   let hooksPathPromise: Promise<string> | undefined
   let disposePromise: Promise<void> | undefined
   let disposeRequested = false
@@ -389,21 +416,25 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
     begin()
     try {
       const disabledHooksPath = await hooksPath()
-      const result = await execFileAsync(
-        'git',
-        [
-          '-c',
-          'credential.helper=',
-          '-c',
-          'core.askPass=',
-          ...HARNESS_GIT_IDENTITY,
-          '-c',
-          `core.hooksPath=${disabledHooksPath}`,
-          ...args,
-        ],
-        {cwd, encoding: 'utf8', env},
-      )
-      return result.stdout.trim()
+      try {
+        const result = await execFileAsync(
+          gitBin,
+          [
+            '-c',
+            'credential.helper=',
+            '-c',
+            'core.askPass=',
+            ...HARNESS_GIT_IDENTITY,
+            '-c',
+            `core.hooksPath=${disabledHooksPath}`,
+            ...args,
+          ],
+          {cwd, encoding: 'utf8', env, timeout: timeoutMs},
+        )
+        return result.stdout.trim()
+      } catch (error) {
+        throw gitSubprocessError(error, args, timeoutMs)
+      }
     } finally {
       end()
     }
@@ -413,21 +444,25 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
     begin()
     try {
       const disabledHooksPath = await hooksPath()
-      const result = await execFileAsync(
-        'git',
-        [
-          '-c',
-          'credential.helper=',
-          '-c',
-          'core.askPass=',
-          ...HARNESS_GIT_IDENTITY,
-          '-c',
-          `core.hooksPath=${disabledHooksPath}`,
-          ...args,
-        ],
-        {cwd, encoding: 'buffer', env},
-      )
-      return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout)
+      try {
+        const result = await execFileAsync(
+          gitBin,
+          [
+            '-c',
+            'credential.helper=',
+            '-c',
+            'core.askPass=',
+            ...HARNESS_GIT_IDENTITY,
+            '-c',
+            `core.hooksPath=${disabledHooksPath}`,
+            ...args,
+          ],
+          {cwd, encoding: 'buffer', env, timeout: timeoutMs},
+        )
+        return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout)
+      } catch (error) {
+        throw gitSubprocessError(error, args, timeoutMs)
+      }
     } finally {
       end()
     }
@@ -437,12 +472,16 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
     begin()
     try {
       const disabledHooksPath = await hooksPath()
-      const result = await execFileAsync(
-        'git',
-        ['-c', 'credential.helper=', ...HARNESS_GIT_IDENTITY, '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
-        {cwd, encoding: 'utf8', env},
-      )
-      return result.stdout.trim()
+      try {
+        const result = await execFileAsync(
+          gitBin,
+          ['-c', 'credential.helper=', ...HARNESS_GIT_IDENTITY, '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
+          {cwd, encoding: 'utf8', env, timeout: timeoutMs},
+        )
+        return result.stdout.trim()
+      } catch (error) {
+        throw gitSubprocessError(error, args, timeoutMs)
+      }
     } finally {
       end()
     }
@@ -676,7 +715,7 @@ async function prepareTrustedPushRepositoryReal(
 }
 
 export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationAdapters {
-  const git = makeGitSubprocess(options.hooksRoot ?? os.tmpdir())
+  const git = makeGitSubprocess(options.hooksRoot ?? os.tmpdir(), options.gitBin, options.gitTimeoutMs)
   return {
     cloneRepo: async (repoUrl, workDir, tag) => {
       await fs.rm(workDir, {recursive: true, force: true})
@@ -743,7 +782,11 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
       }
     },
 
-    resolveConflict: async request => resolveConflictAttempt(request),
+    resolveConflict: async request =>
+      resolveConflictAttempt(
+        request,
+        options.conflictModelTimeoutMs === undefined ? {} : {modelTimeoutMs: options.conflictModelTimeoutMs},
+      ),
 
     stagePaths: async (workDir, paths) => {
       if (paths.length === 0) throw new Error('cannot stage an empty conflict path set')
@@ -873,6 +916,39 @@ function failure(stage: IntegrationStage, error: unknown): IntegrationResult {
   return {ok: false, kind: 'failure', stage, error: formatPipelineError(error)}
 }
 
+interface IntegrationDeadlineError extends Error {
+  readonly integrationStage: IntegrationStage
+  readonly timeoutMs: number
+}
+
+function integrationDeadlineError(stage: IntegrationStage, timeoutMs: number): IntegrationDeadlineError {
+  const error = new Error(`integration pipeline deadline exceeded during ${stage} after ${timeoutMs}ms`)
+  error.name = 'IntegrationDeadlineError'
+  Object.defineProperty(error, 'integrationStage', {value: stage})
+  Object.defineProperty(error, 'timeoutMs', {value: timeoutMs})
+  return error as IntegrationDeadlineError
+}
+
+function isIntegrationDeadlineError(error: unknown): error is IntegrationDeadlineError {
+  return error instanceof Error && error.name === 'IntegrationDeadlineError'
+}
+
+async function withIntegrationDeadline<T>(
+  operation: Promise<T>,
+  stage: () => IntegrationStage,
+  timeoutMs: number,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(integrationDeadlineError(stage(), timeoutMs)), timeoutMs)
+  })
+  try {
+    return await Promise.race([operation, deadline])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 function treeExpectationFor(config: IntegrationConfig, integrationCommit: string): FinalTreeExpectation {
   return {
     baseTag: `v${config.baseVersion}`,
@@ -978,6 +1054,7 @@ function validateManifest(
 async function runIntegrationPipeline(
   config: IntegrationConfig,
   adapters: IntegrationAdapters,
+  setStage: (stage: IntegrationStage) => void,
 ): Promise<IntegrationResult> {
   const {baseVersion, releaseRepo, integrationRefs, workDir} = config
   // Callers on the pre-U5 API did not have a push target. Preserve their local
@@ -992,6 +1069,7 @@ async function runIntegrationPipeline(
   let releaseRepoUrl: string
   let sourceRepoUrl: string
   try {
+    setStage('sources')
     releaseRepoUrl = resolveReleaseRepoUrl(releaseRepo)
     sourceRepoUrl = config.sourceRepo === undefined ? releaseRepoUrl : resolveReleaseRepoUrl(config.sourceRepo)
   } catch (error) {
@@ -1001,6 +1079,7 @@ async function runIntegrationPipeline(
   let sources: ResolvedIntegrationSource[]
   let carryManifest: CarryManifest
   try {
+    setStage('sources')
     if (config.carryManifest === undefined) {
       if (integrationRefs.length > 0 && adapters.resolveRefSha === undefined) {
         throw new Error('immutable carry manifest resolution is unavailable')
@@ -1020,18 +1099,21 @@ async function runIntegrationPipeline(
   }
 
   try {
+    setStage('clone')
     await adapters.cloneRepo(releaseRepoUrl, workDir, tag)
   } catch (error) {
     return failure('clone', error)
   }
 
   try {
+    setStage('fetch-tags')
     await adapters.fetchTags(workDir)
   } catch (error) {
     return failure('fetch-tags', error)
   }
 
   try {
+    setStage('branch')
     await adapters.createBranch(workDir, branch, tag)
   } catch (error) {
     return failure('branch', error)
@@ -1041,6 +1123,7 @@ async function runIntegrationPipeline(
   const conflictDiagnostics: ConflictResolverResult[] = []
   for (const source of sources) {
     try {
+      setStage('fetch')
       await adapters.fetchRef(workDir, source.repo, source.fetchRef, source.fetch, source.resolvedSha)
     } catch (error) {
       return failure('fetch', `fetch ref ${source.label} failed: ${formatPipelineError(error)}`)
@@ -1048,6 +1131,7 @@ async function runIntegrationPipeline(
 
     let resolvedSha: string | null
     try {
+      setStage('provenance')
       resolvedSha = await adapters.captureRefSha(workDir)
     } catch (error) {
       return failure('provenance', `capture SHA for ${source.label} failed: ${formatPipelineError(error)}`)
@@ -1061,6 +1145,7 @@ async function runIntegrationPipeline(
 
     let preMergeCommit: string
     try {
+      setStage('merge')
       preMergeCommit = await adapters.getCommitSha(workDir)
     } catch (error) {
       return failure('merge', `capture pre-merge commit for ${source.label} failed: ${formatPipelineError(error)}`)
@@ -1068,6 +1153,7 @@ async function runIntegrationPipeline(
 
     let mergeOutcome: MergeOutcome
     try {
+      setStage('merge')
       mergeOutcome = await adapters.mergeRef(workDir, source.merge)
     } catch (error) {
       return failure('merge', `merge ref ${source.label} failed: ${formatPipelineError(error)}`)
@@ -1096,6 +1182,7 @@ async function runIntegrationPipeline(
 
       let resolution: ConflictResolverResult
       try {
+        setStage('merge')
         resolution = await adapters.resolveConflict({
           integrationWorkDir: workDir,
           preConflictCommit: preMergeCommit,
@@ -1145,6 +1232,7 @@ async function runIntegrationPipeline(
       }
 
       try {
+        setStage('merge')
         await adapters.stagePaths(workDir, resolution.resolvedPaths)
         await adapters.verifyStagedPaths(workDir, resolution.resolvedDigests)
         await adapters.assertNoUnmerged(workDir)
@@ -1164,18 +1252,21 @@ async function runIntegrationPipeline(
   const squashed = sources.length > 0
   if (squashed) {
     try {
+      setStage('squash')
       await adapters.resetToBase(workDir, tag)
     } catch (error) {
       return failure('squash', error)
     }
 
     try {
+      setStage('workflow-strip')
       await adapters.stripWorkflowFiles(workDir)
     } catch (error) {
       return failure('workflow-strip', error)
     }
 
     try {
+      setStage('commit')
       await adapters.commitIntegration(
         workDir,
         `harness: integrate OpenCode ${baseVersion} carrying ${sources.map(s => s.label).join(', ')}`,
@@ -1187,6 +1278,7 @@ async function runIntegrationPipeline(
 
   let integrationCommit: string
   try {
+    setStage('commit')
     integrationCommit = await adapters.getCommitSha(workDir)
   } catch (error) {
     return failure('commit', error)
@@ -1195,18 +1287,21 @@ async function runIntegrationPipeline(
   const treeExpectation = treeExpectationFor(config, integrationCommit)
 
   try {
+    setStage('tree')
     await adapters.validateFinalTree(workDir, treeExpectation)
   } catch (error) {
     return failure('tree', error)
   }
 
   try {
+    setStage('build')
     await adapters.buildCli(workDir, baseVersion, channel)
   } catch (error) {
     return failure('build', error)
   }
 
   try {
+    setStage('version')
     await adapters.verifyVersion(workDir, baseVersion)
   } catch (error) {
     return failure('version', error)
@@ -1215,6 +1310,7 @@ async function runIntegrationPipeline(
   // Recheck the frozen commit/tree after build and version verification. This is
   // the first point at which a build hook could have moved HEAD.
   try {
+    setStage('tree')
     await assertFrozenIntegrationHead(adapters, workDir, integrationCommit)
     await adapters.validateFinalTree(workDir, treeExpectation)
     await assertFrozenIntegrationHead(adapters, workDir, integrationCommit)
@@ -1237,6 +1333,7 @@ async function runIntegrationPipeline(
   if (manifestError !== null) return failure('provenance', manifestError)
 
   try {
+    setStage('provenance')
     await writeProvenanceManifest(workDir, manifest)
   } catch (error) {
     return failure('provenance', error)
@@ -1259,20 +1356,40 @@ export async function runIntegration(
   let pipelineThrew = false
   let disposeError: unknown
   let disposeThrew = false
-
+  let deadlineExceeded = false
   try {
     try {
-      pipelineResult = await runIntegrationPipeline(config, adapters)
+      let activeStage: IntegrationStage = 'sources'
+      const timeoutMs = config.pipelineTimeoutMs ?? DEFAULT_INTEGRATION_PIPELINE_TIMEOUT_MS
+      pipelineResult = await withIntegrationDeadline(
+        runIntegrationPipeline(config, adapters, stage => {
+          activeStage = stage
+        }),
+        () => activeStage,
+        timeoutMs,
+      )
     } catch (error) {
-      pipelineThrew = true
-      pipelineError = error
+      if (isIntegrationDeadlineError(error)) {
+        deadlineExceeded = true
+        pipelineResult = failure('deadline', error)
+      } else {
+        pipelineThrew = true
+        pipelineError = error
+      }
     }
   } finally {
-    try {
-      await adapters.dispose?.()
-    } catch (error) {
-      disposeThrew = true
-      disposeError = error
+    if (deadlineExceeded) {
+      // Do not let cleanup of an already-bounded subprocess hide the deadline
+      // record; the adapter owns its own subprocess timeout and best-effort cleanup.
+      const dispose = adapters.dispose
+      if (dispose !== undefined) dispose().catch(() => undefined)
+    } else {
+      try {
+        await adapters.dispose?.()
+      } catch (error) {
+        disposeThrew = true
+        disposeError = error
+      }
     }
   }
 
