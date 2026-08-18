@@ -458,6 +458,67 @@ describe('runIntegration', () => {
     }
   })
 
+  it('returns a named deadline failure when the integration pipeline exceeds its configured bound', async () => {
+    // #given a local integration run whose clone stage never completes
+    const dir = await makeTmpDir()
+    try {
+      const resultPromise = runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: [],
+          workDir: dir,
+          pipelineTimeoutMs: 20,
+        },
+        makeAdapters({
+          cloneRepo: async () => new Promise<void>(() => {}),
+          dispose: async () => new Promise<void>(() => {}),
+        }),
+      )
+
+      // #when the driver deadline expires during clone
+      const result = await resultPromise
+
+      // #then the failure names both the deadline and the active stage
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected deadline failure')
+      expect(result.stage).toBe('deadline')
+      expect(result.error).toMatch(/integration pipeline deadline exceeded during clone/)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('reports a named timeout when a git subprocess exceeds its bound', async () => {
+    // #given a local repository and a local git shim that deliberately stalls
+    const dir = await makeTmpDir()
+    const sourceRepo = path.join(dir, 'source.git')
+    const gitShim = path.join(dir, 'git-stall.sh')
+    try {
+      execFileSync('git', ['init', '--bare', sourceRepo], {encoding: 'utf8'})
+      await fs.writeFile(gitShim, '#!/bin/sh\nsleep 1\n', {encoding: 'utf8', mode: 0o700})
+      const adapters = makeRealAdapters({hooksRoot: dir, gitBin: gitShim, gitTimeoutMs: 20})
+
+      // #when a local clone invokes the stalled git subprocess
+      const clone = adapters.cloneRepo(`file://${sourceRepo}`, path.join(dir, 'clone'))
+
+      // #then the timeout is attributable to the git subprocess rather than generic
+      let caughtError: unknown
+      try {
+        await clone
+      } catch (error) {
+        caughtError = error
+      }
+      expect(caughtError).toBeInstanceOf(Error)
+      if (!(caughtError instanceof Error)) throw new Error('expected git timeout error')
+      expect(caughtError.name).toBe('GitSubprocessTimeoutError')
+      expect(caughtError.message).toMatch(/git subprocess timed out after 20ms/)
+      await adapters.dispose?.()
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
   // ---------------------------------------------------------------------------
   // Happy path: successful integration with refs
   // ---------------------------------------------------------------------------

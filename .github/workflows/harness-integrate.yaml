@@ -63,6 +63,9 @@ jobs:
   integrate:
     name: integrate
     runs-on: ubuntu-latest
+    # INTEGRATION_JOB_TIMEOUT_MINUTES = 120. Leaves room for evidence recording
+    # while preventing the reusable job from inheriting GitHub's 360-minute default.
+    timeout-minutes: 120
 
     permissions:
       id-token: write
@@ -159,6 +162,9 @@ jobs:
         id: shadow-integrate
         if: ${{ always() }}
         continue-on-error: true
+        # FORWARD_SHADOW_STEP_TIMEOUT_MINUTES = 90. Healthy shadow runs need
+        # clone/fetch/merge/model/build headroom, but must stop before the job backstop.
+        timeout-minutes: 90
         env:
           BASE_VERSION: ${{ inputs.base-version }}
           SHADOW_WORK_DIR: ${{ runner.temp }}/harness-shadow-work

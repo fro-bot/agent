@@ -68,6 +68,7 @@ const INTEGRATION_STAGES: Readonly<Record<IntegrationStage, true>> = {
   provenance: true,
   cleanup: true,
   push: true,
+  deadline: true,
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
