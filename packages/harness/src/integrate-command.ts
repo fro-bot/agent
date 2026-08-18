@@ -282,12 +282,15 @@ async function finalizeLocalIntegration(
   }
 
   try {
-    const currentCommit = await adapters.getCommitSha(config.workDir)
+    // Candidate finalization has already materialized the frozen authority; the
+    // code-owned path still validates its original integration checkout here.
+    const validationWorkDir = preparedTrustedRepository?.workDir ?? config.workDir
+    const currentCommit = await adapters.getCommitSha(validationWorkDir)
     if (currentCommit !== integrationCommit) {
       throw new Error(`integration HEAD drifted: expected frozen commit ${integrationCommit}, found ${currentCommit}`)
     }
-    await adapters.validateFinalTree(config.workDir, expectation)
-    const finalCommit = await adapters.getCommitSha(config.workDir)
+    await adapters.validateFinalTree(validationWorkDir, expectation)
+    const finalCommit = await adapters.getCommitSha(validationWorkDir)
     if (finalCommit !== integrationCommit) {
       throw new Error(`integration HEAD drifted: expected frozen commit ${integrationCommit}, found ${finalCommit}`)
     }
@@ -344,6 +347,21 @@ function candidateDirtyPaths(workDir: string): string[] {
     .split('\n')
     .map(line => line.trimEnd())
     .filter(line => line.length > 0)
+}
+
+async function withBlankedPushTokens<T>(operation: () => Promise<T>): Promise<T> {
+  const savedGhToken = process.env.GH_TOKEN
+  const savedGithubToken = process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+  delete process.env.GITHUB_TOKEN
+  try {
+    return await operation()
+  } finally {
+    if (savedGhToken === undefined) delete process.env.GH_TOKEN
+    else process.env.GH_TOKEN = savedGhToken
+    if (savedGithubToken === undefined) delete process.env.GITHUB_TOKEN
+    else process.env.GITHUB_TOKEN = savedGithubToken
+  }
 }
 
 /**
@@ -431,16 +449,13 @@ export async function finalizeCandidateIntegration(
 
   let handedOff = false
   try {
-    if (adapters.installDependencies === undefined) {
+    const installDependencies = adapters.installDependencies
+    if (installDependencies === undefined) {
       throw new Error('trusted frozen checkout dependency installation is unavailable')
     }
 
-    const savedGhToken = process.env.GH_TOKEN
-    const savedGithubToken = process.env.GITHUB_TOKEN
-    delete process.env.GH_TOKEN
-    delete process.env.GITHUB_TOKEN
-    try {
-      await adapters.installDependencies(trustedRepository.workDir)
+    await withBlankedPushTokens(async () => {
+      await installDependencies(trustedRepository.workDir)
       await adapters.buildCli(trustedRepository.workDir, config.baseVersion, 'latest')
       await adapters.verifyVersion(trustedRepository.workDir, config.baseVersion)
       const trustedCommit = await adapters.getCommitSha(trustedRepository.workDir)
@@ -451,12 +466,7 @@ export async function finalizeCandidateIntegration(
       }
       await adapters.validateFinalTree(trustedRepository.workDir, expectation)
       await _packageArtifact(trustedRepository.workDir, integrationCommit, outPath)
-    } finally {
-      if (savedGhToken === undefined) delete process.env.GH_TOKEN
-      else process.env.GH_TOKEN = savedGhToken
-      if (savedGithubToken === undefined) delete process.env.GITHUB_TOKEN
-      else process.env.GITHUB_TOKEN = savedGithubToken
-    }
+    })
 
     const finalized = await finalizeLocalIntegration(
       config,

@@ -3,7 +3,7 @@ import {execFileSync} from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {finalizeCandidateIntegration} from './integrate-command.js'
 import {makeRealAdapters} from './integrate.js'
 
@@ -84,12 +84,20 @@ describe('finalizeCandidateIntegration', () => {
       process.env.GH_TOKEN = 'trusted-push-token'
       const originalPrepare = real.prepareTrustedPushRepository
       let pushedRepository: TrustedPushRepository | null = null
+      let candidateMutated = false
       const adapters: IntegrationAdapters = {
         ...real,
+        validateFinalTree: async (validationWorkDir, expectation) => {
+          if (validationWorkDir === workDir && candidateMutated) {
+            throw new Error('mutable candidate directory must not be authoritative after freeze')
+          }
+          await real.validateFinalTree(validationWorkDir, expectation)
+        },
         prepareTrustedPushRepository: async (...args) => {
           const trusted = await originalPrepare(...args)
           // Simulate the mutable working directory changing after freeze.
           await fs.writeFile(path.join(workDir, 'README.md'), 'mutated after freeze\n', 'utf8')
+          candidateMutated = true
           return trusted
         },
         buildCli: async trustedWorkDir => {
@@ -102,7 +110,10 @@ describe('finalizeCandidateIntegration', () => {
         },
         installDependencies: async () => {},
         verifyVersion: async () => {},
-        acquirePushCredential: async () => ({token: 'trusted-push-token'}),
+        acquirePushCredential: async () => {
+          expect(process.env.GH_TOKEN).toBe('trusted-push-token')
+          return {token: 'trusted-push-token'}
+        },
         pushIntegration: async trusted => {
           pushedRepository = trusted
         },
@@ -119,6 +130,50 @@ describe('finalizeCandidateIntegration', () => {
     } finally {
       if (previousGhToken === undefined) delete process.env.GH_TOKEN
       else process.env.GH_TOKEN = previousGhToken
+      await fs.rm(root, {recursive: true, force: true})
+    }
+  })
+
+  it('fails closed when no push credential is available at push time', async () => {
+    // #given
+    const root = await makeTmpDir()
+    const previousGhToken = process.env.GH_TOKEN
+    const previousGithubToken = process.env.GITHUB_TOKEN
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    try {
+      const {workDir} = await makeCandidateRepository(root)
+      const real = makeRealAdapters()
+      const pushCalled = vi.fn()
+      const adapters: IntegrationAdapters = {
+        ...real,
+        installDependencies: async () => {},
+        buildCli: async () => {},
+        verifyVersion: async () => {},
+        pushIntegration: async () => {
+          pushCalled()
+        },
+      }
+
+      // #when
+      const result = await finalizeCandidateIntegration(
+        candidateConfig(workDir),
+        path.join(root, 'artifact.tar'),
+        adapters,
+        async () => {},
+      )
+
+      // #then
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected missing push credential failure')
+      expect(result.stage).toBe('push')
+      expect(result.error).toContain('GH_TOKEN or GITHUB_TOKEN is required')
+      expect(pushCalled).not.toHaveBeenCalled()
+    } finally {
+      if (previousGhToken === undefined) delete process.env.GH_TOKEN
+      else process.env.GH_TOKEN = previousGhToken
+      if (previousGithubToken === undefined) delete process.env.GITHUB_TOKEN
+      else process.env.GITHUB_TOKEN = previousGithubToken
       await fs.rm(root, {recursive: true, force: true})
     }
   })
