@@ -78,6 +78,8 @@ jobs:
           egress-policy: block
           disable-telemetry: true
           disable-sudo-and-containers: true
+          # Upstream OpenCode pins @solidjs/start to a pkg.pr.new preview build in its root
+          # package.json, so bun install --frozen-lockfile cannot complete without it.
           allowed-endpoints: >-
             api.github.com:443
             broker.fro.bot:443
@@ -87,6 +89,7 @@ jobs:
             github.com:443
             models.dev:443
             nodejs.org:443
+            pkg.pr.new:443
             registry.npmjs.org:443
             *.actions.githubusercontent.com:443
             *.githubusercontent.com:443
