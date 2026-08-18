@@ -86,8 +86,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * own response-file delivery (see `packages/runtime/src/agent/response-file.ts`
  * `buildResponseFileDir` — a run-scoped dir under `RUNNER_TEMP`, deliberately
  * OUTSIDE the checkout so a compromised checkout can never plant/tamper with
- * the file the harness reads back) is allowed, while every other external
- * directory stays denied fail-closed.
+ * the file the harness reads back) and any explicitly designated integration
+ * workdir are allowed, while every other external directory stays denied
+ * fail-closed.
  *
  * Without this, OpenCode's shell-command scanner and the write/edit tools'
  * external-file check both raise an `external_directory` "ask" for any
@@ -106,7 +107,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * `<parentDir>/*` glob (`external-directory.ts:29-33`, parentDir = the same
  * run-scoped subdir) — no separate nested-level pattern is needed. This
  * mirrors the vendored native-agent defaults' own whitelisted-dir shape
- * (`agent/agent.ts:108-117`, `path.join(dir, "*")` keys).
+ * (`agent/agent.ts:108-117`, `path.join(dir, "*")` keys). The same shape is
+ * used for the explicitly supplied integration workdir.
  *
  * Rule-evaluation order matters: `Permission.evaluate` (`permission/index.ts:29-39`)
  * does `rulesets.flat().findLast(...)` — the LAST matching entry wins. Since
@@ -114,7 +116,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * first in the object and the specific allow entry MUST come after it, or
  * the deny would shadow the allow.
  */
-function scopeExternalDirectoryPermission(config: Record<string, unknown>, runnerTemp: string | undefined): void {
+function scopeExternalDirectoryPermission(
+  config: Record<string, unknown>,
+  runnerTemp: string | undefined,
+  integrationWorkDir: string | undefined,
+): void {
   const agent = isRecord(config.agent) ? config.agent : {}
   const build = isRecord(agent.build) ? agent.build : {}
   const permission = isRecord(build.permission) ? build.permission : {}
@@ -123,10 +129,13 @@ function scopeExternalDirectoryPermission(config: Record<string, unknown>, runne
   // can't know where the response-file dir will be, so keep the flat deny
   // rather than guessing a broad allow pattern.
   const externalDirectory: Record<string, 'allow' | 'deny'> | 'deny' =
-    runnerTemp != null && runnerTemp.length > 0
+    runnerTemp != null && runnerTemp.trim().length > 0
       ? {
           '*': 'deny',
           [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',
+          ...(integrationWorkDir != null && integrationWorkDir.trim().length > 0
+            ? {[path.join(integrationWorkDir, '*')]: 'allow'}
+            : {}),
         }
       : 'deny'
 
@@ -150,6 +159,7 @@ export function buildCIConfig(
     enableOmoSlim?: boolean
     omoSlimVersion?: string
     omoSlimPreset?: OmoSlimPreset
+    integrationWorkDir?: string
   },
   logger: Logger,
 ): CIConfigResult {
@@ -244,7 +254,7 @@ export function buildCIConfig(
     // Pin default_agent to "build" — overrides any user-provided value
     const userAgent: unknown = ciConfig.default_agent
     ciConfig.default_agent = 'build'
-    scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP)
+    scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, inputs.integrationWorkDir)
     if (userAgent != null && userAgent !== 'build') {
       rewrittenFields.push('default_agent')
     }
