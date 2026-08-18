@@ -144,7 +144,7 @@ describe('emitProvenanceManifest', () => {
     mockedReadFileSync.mockReturnValue(JSON.stringify(existing))
 
     // #when
-    emitProvenanceManifest('/tmp/harness', '1.15.13', 'commit-a', 'build-b')
+    emitProvenanceManifest('/harness-package', '1.15.13', 'commit-a', 'build-b')
 
     // #then
     expect(writtenManifest()).toEqual({
@@ -161,7 +161,7 @@ describe('emitProvenanceManifest', () => {
     })
 
     // #when
-    emitProvenanceManifest('/tmp/harness', '1.15.13', 'commit-a', 'build-a')
+    emitProvenanceManifest('/harness-package', '1.15.13', 'commit-a', 'build-a')
 
     // #then
     expect(writtenManifest()).toEqual({
@@ -177,7 +177,7 @@ describe('emitProvenanceManifest', () => {
     mockedReadFileSync.mockReturnValue('{not-json')
 
     // #when
-    emitProvenanceManifest('/tmp/harness', '1.15.13', 'commit-a', 'build-a')
+    emitProvenanceManifest('/harness-package', '1.15.13', 'commit-a', 'build-a')
 
     // #then
     expect(writtenManifest()).toEqual({
@@ -199,7 +199,7 @@ describe('emitProvenanceManifest', () => {
     )
 
     // #when
-    emitProvenanceManifest('/tmp/harness', '1.15.13', 'commit-new', 'build-a')
+    emitProvenanceManifest('/harness-package', '1.15.13', 'commit-new', 'build-a')
 
     // #then
     expect(writtenManifest()).toEqual({

@@ -23,6 +23,7 @@ import type {
   IntegrationStage,
   TrustedPushRepository,
 } from './integrate.js'
+import type {CarryManifest} from './sources.js'
 import {execFileSync, execSync} from 'node:child_process'
 import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync} from 'node:fs'
 import os from 'node:os'
@@ -426,6 +427,13 @@ export async function finalizeCandidateIntegration(
 
   const manifest = {
     baseVersion: config.baseVersion,
+    carryManifest: {
+      base: `v${config.baseVersion}`,
+      carries: sources.map((source, index) => ({
+        ref: config.integrationRefs[index] ?? source.label,
+        resolvedSha: resolvedShas[index] ?? '',
+      })),
+    } satisfies CarryManifest,
     integrationRefs: sources.map((source, index) => ({
       ref: config.integrationRefs[index] ?? source.label,
       resolvedSha: resolvedShas[index] ?? '',
