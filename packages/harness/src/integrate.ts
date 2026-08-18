@@ -10,7 +10,7 @@
 
 import type {ConflictResolutionRequest, ConflictResolverResult} from './conflict-resolver.js'
 import type {IntegrationRefRecord} from './provenance.js'
-import type {IntegrationSource} from './sources.js'
+import type {CarryManifest, IntegrationSource, ResolvedIntegrationSource} from './sources.js'
 import {Buffer} from 'node:buffer'
 import {execFile} from 'node:child_process'
 import crypto from 'node:crypto'
@@ -21,7 +21,13 @@ import process from 'node:process'
 import {promisify} from 'node:util'
 import {HARNESS_GIT_IDENTITY, resolveConflict as resolveConflictAttempt} from './conflict-resolver.js'
 import {formatPipelineError} from './format-error.js'
-import {resolveSources} from './sources.js'
+import {
+  carrySourceChangedError,
+  carrySourceFetchError,
+  isValidCarryManifest,
+  resolveCarryManifest,
+  sourcesFromCarryManifest,
+} from './sources.js'
 
 // Re-export so callers that previously imported from integrate.ts still work.
 export type {IntegrationRefRecord} from './provenance.js'
@@ -32,6 +38,8 @@ export type {IntegrationRefRecord} from './provenance.js'
 
 export interface ProvenanceManifest {
   readonly baseVersion: string
+  /** Required on manifests emitted by the current integration pipeline; optional for legacy test/build scaffolds. */
+  readonly carryManifest?: CarryManifest
   readonly integrationRefs: readonly IntegrationRefRecord[]
   readonly integrationCommit: string
   readonly buildSha: string
@@ -55,6 +63,7 @@ export interface IntegrationConfig {
   readonly releaseRepo: string
   readonly sourceRepo?: string
   readonly integrationRefs: readonly string[]
+  readonly carryManifest?: CarryManifest
   readonly workDir: string
   readonly dryRun?: boolean
   readonly pushTarget?: IntegrationPushTarget
@@ -140,8 +149,16 @@ export interface IntegrationAdapters {
   readonly cloneRepo: (repoUrl: string, workDir: string, tag?: string) => Promise<void>
   /** Fetch tags from the anonymous origin. */
   readonly fetchTags: (workDir: string) => Promise<void>
-  /** Fetch one public integration ref into a local tracking ref. */
-  readonly fetchRef: (workDir: string, remoteUrl: string, fetchRef: string, localRef: string) => Promise<void>
+  /** Fetch one public integration ref into a local tracking ref and verify its frozen SHA. */
+  readonly fetchRef: (
+    workDir: string,
+    remoteUrl: string,
+    fetchRef: string,
+    localRef: string,
+    expectedSha?: string,
+  ) => Promise<void>
+  /** Resolve one public integration ref to its current SHA before any carry fetches. */
+  readonly resolveRefSha?: (remoteUrl: string, fetchRef: string) => Promise<string>
   /** Capture the resolved upstream SHA immediately after fetchRef. */
   readonly captureRefSha: (workDir: string) => Promise<string | null>
   /** Create/reset the integration branch to the release tag. */
@@ -233,6 +250,7 @@ function isValidIntegrationRefRecord(value: unknown): value is IntegrationRefRec
 export function isValidProvenanceManifest(value: unknown): value is ProvenanceManifest {
   if (!isRecord(value)) return false
   if (typeof value.baseVersion !== 'string' || value.baseVersion.length === 0) return false
+  if (isValidCarryManifest(value.carryManifest) === false) return false
   if (!Array.isArray(value.integrationRefs)) return false
   if (!value.integrationRefs.every(isValidIntegrationRefRecord)) return false
   if (typeof value.integrationCommit !== 'string' || value.integrationCommit.length === 0) return false
@@ -671,8 +689,31 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
       await git.exec(['fetch', 'origin', '--tags'], workDir, publicGitEnv())
     },
 
-    fetchRef: async (workDir, remoteUrl, fetchRef, localRef) => {
-      await git.exec(['fetch', '--no-tags', remoteUrl, `${fetchRef}:${localRef}`], workDir, publicGitEnv())
+    fetchRef: async (workDir, remoteUrl, fetchRef, localRef, expectedSha) => {
+      try {
+        await git.exec(['fetch', '--no-tags', remoteUrl, `${fetchRef}:${localRef}`], workDir, publicGitEnv())
+      } catch (error) {
+        if (expectedSha !== undefined) throw carrySourceFetchError({label: fetchRef}, error)
+        throw error
+      }
+      if (expectedSha !== undefined) {
+        const actualSha = await git.exec(['rev-parse', `${localRef}^{commit}`], workDir, publicGitEnv())
+        if (actualSha !== expectedSha) {
+          throw carrySourceChangedError({label: fetchRef}, expectedSha, actualSha)
+        }
+      }
+    },
+
+    resolveRefSha: async (remoteUrl, fetchRef) => {
+      const output = await git.exec(['ls-remote', remoteUrl, fetchRef], undefined, publicGitEnv())
+      const firstLine = splitLines(output)[0]
+      const resolvedSha = firstLine?.split(/\s+/)[0]
+      if (resolvedSha === undefined || /^[0-9a-f]{40}$/i.test(resolvedSha) === false) {
+        const error = new Error(`remote ref ${fetchRef} did not resolve to a commit SHA`)
+        error.name = 'CarrySourceResolutionError'
+        throw error
+      }
+      return resolvedSha.toLowerCase()
     },
 
     captureRefSha: async workDir => {
@@ -856,6 +897,24 @@ function sourceRefForManifest(source: IntegrationSource, configuredRef: string |
   return configuredRef === undefined ? source.label : configuredRef
 }
 
+function validateCarryManifestInput(
+  manifest: CarryManifest,
+  expectedBase: string,
+  configuredRefs: readonly string[],
+): string | null {
+  if (isValidCarryManifest(manifest) === false) return 'immutable carry manifest shape is invalid'
+  if (manifest.base !== expectedBase) return 'immutable carry manifest base does not match configuration'
+  if (manifest.carries.length !== configuredRefs.length)
+    return 'immutable carry manifest ref count does not match configuration'
+  for (const [index, carry] of manifest.carries.entries()) {
+    const configuredRef = configuredRefs[index]
+    if (configuredRef === undefined || carry.ref !== configuredRef) {
+      return `immutable carry manifest ref ${index} identity does not match configuration`
+    }
+  }
+  return null
+}
+
 function resolveReleaseRepoUrl(releaseRepo: string): string {
   const candidate = releaseRepo.startsWith('https://')
     ? releaseRepo.endsWith('.git')
@@ -879,6 +938,13 @@ function validateManifest(
 ): string | null {
   if (!isValidProvenanceManifest(manifest)) return 'provenance manifest shape is invalid'
   if (manifest.baseVersion !== config.baseVersion) return 'provenance base version does not match configuration'
+  if (manifest.carryManifest === undefined) return 'provenance immutable carry manifest is missing'
+  const carryManifestError = validateCarryManifestInput(
+    manifest.carryManifest,
+    `v${config.baseVersion}`,
+    config.integrationRefs,
+  )
+  if (carryManifestError !== null) return carryManifestError
   if (manifest.integrationCommit !== integrationCommit) return 'provenance integration commit does not match HEAD'
   if (manifest.integrationRefs.length !== sources.length) {
     return 'provenance ref count does not match configured sources'
@@ -893,6 +959,10 @@ function validateManifest(
     const expectedRef = sourceRefForManifest(source, config.integrationRefs[index])
     if (record.ref !== expectedRef) return `provenance ref ${index} identity does not match configuration`
     if (record.resolvedSha !== expectedSha) return `provenance ref ${index} SHA does not match the fetched source`
+    const carry = manifest.carryManifest.carries[index]
+    if (carry === undefined || carry.ref !== record.ref || carry.resolvedSha !== record.resolvedSha) {
+      return `provenance carry ${index} does not match the immutable carry manifest`
+    }
   }
 
   return null
@@ -928,9 +998,23 @@ async function runIntegrationPipeline(
     return failure('sources', error)
   }
 
-  let sources: IntegrationSource[]
+  let sources: ResolvedIntegrationSource[]
+  let carryManifest: CarryManifest
   try {
-    sources = resolveSources(integrationRefs, sourceRepoUrl)
+    if (config.carryManifest === undefined) {
+      if (integrationRefs.length > 0 && adapters.resolveRefSha === undefined) {
+        throw new Error('immutable carry manifest resolution is unavailable')
+      }
+      carryManifest = await resolveCarryManifest(tag, integrationRefs, sourceRepoUrl, async source => {
+        if (adapters.resolveRefSha === undefined) throw new Error('immutable carry manifest resolution is unavailable')
+        return adapters.resolveRefSha(source.repo, source.fetchRef)
+      })
+    } else {
+      const manifestError = validateCarryManifestInput(config.carryManifest, tag, integrationRefs)
+      if (manifestError !== null) throw new Error(manifestError)
+      carryManifest = config.carryManifest
+    }
+    sources = sourcesFromCarryManifest(carryManifest, sourceRepoUrl)
   } catch (error) {
     return failure('sources', error)
   }
@@ -953,11 +1037,11 @@ async function runIntegrationPipeline(
     return failure('branch', error)
   }
 
-  const resolvedShas: string[] = []
+  const resolvedShas = carryManifest.carries.map(carry => carry.resolvedSha)
   const conflictDiagnostics: ConflictResolverResult[] = []
   for (const source of sources) {
     try {
-      await adapters.fetchRef(workDir, source.repo, source.fetchRef, source.fetch)
+      await adapters.fetchRef(workDir, source.repo, source.fetchRef, source.fetch, source.resolvedSha)
     } catch (error) {
       return failure('fetch', `fetch ref ${source.label} failed: ${formatPipelineError(error)}`)
     }
@@ -971,7 +1055,9 @@ async function runIntegrationPipeline(
     if (resolvedSha === null || resolvedSha.length === 0) {
       return failure('provenance', `capture SHA for ${source.label} returned no resolved source SHA`)
     }
-    resolvedShas.push(resolvedSha)
+    if (resolvedSha.toLowerCase() !== source.resolvedSha) {
+      return failure('fetch', carrySourceChangedError(source, source.resolvedSha, resolvedSha).message)
+    }
 
     let preMergeCommit: string
     try {
@@ -1138,6 +1224,7 @@ async function runIntegrationPipeline(
 
   const manifest: ProvenanceManifest = {
     baseVersion,
+    carryManifest,
     integrationRefs: sources.map((source, index) => ({
       ref: sourceRefForManifest(source, integrationRefs[index]),
       resolvedSha: resolvedShas[index] ?? '',

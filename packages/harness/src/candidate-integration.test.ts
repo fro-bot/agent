@@ -1,4 +1,4 @@
-import type {IntegrationAdapters, IntegrationConfig, TrustedPushRepository} from './integrate.js'
+import type {IntegrationAdapters, IntegrationConfig, ProvenanceManifest, TrustedPushRepository} from './integrate.js'
 import {execFileSync} from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -78,12 +78,13 @@ describe('finalizeCandidateIntegration', () => {
     const root = await makeTmpDir()
     const previousGhToken = process.env.GH_TOKEN
     try {
-      const {workDir} = await makeCandidateRepository(root)
+      const {workDir, commit} = await makeCandidateRepository(root)
       const outPath = path.join(root, 'artifact.tar')
       const real = makeRealAdapters()
       process.env.GH_TOKEN = 'trusted-push-token'
       const originalPrepare = real.prepareTrustedPushRepository
       let pushedRepository: TrustedPushRepository | null = null
+      const preparedManifest: {value: ProvenanceManifest | null} = {value: null}
       let candidateMutated = false
       const adapters: IntegrationAdapters = {
         ...real,
@@ -93,8 +94,9 @@ describe('finalizeCandidateIntegration', () => {
           }
           await real.validateFinalTree(validationWorkDir, expectation)
         },
-        prepareTrustedPushRepository: async (...args) => {
-          const trusted = await originalPrepare(...args)
+        prepareTrustedPushRepository: async (sourceWorkDir, integrationCommit, manifest, expectation) => {
+          preparedManifest.value = manifest
+          const trusted = await originalPrepare(sourceWorkDir, integrationCommit, manifest, expectation)
           // Simulate the mutable working directory changing after freeze.
           await fs.writeFile(path.join(workDir, 'README.md'), 'mutated after freeze\n', 'utf8')
           candidateMutated = true
@@ -124,6 +126,11 @@ describe('finalizeCandidateIntegration', () => {
 
       // #then
       expect(result.ok).toBe(true)
+      if (preparedManifest.value === null) throw new Error('expected prepared provenance manifest')
+      expect(preparedManifest.value.carryManifest).toEqual({
+        base: 'v1.0.0',
+        carries: [{ref: 'candidate-ref', resolvedSha: commit}],
+      })
       expect(pushedRepository).not.toBeNull()
       expect(outPath).toBeTruthy()
       await expect(fs.stat(outPath)).resolves.toBeTruthy()

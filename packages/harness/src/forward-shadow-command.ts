@@ -13,6 +13,7 @@ import fs from 'node:fs/promises'
 import process from 'node:process'
 import {buildForwardShadowRecord, compareForwardShadow, writeForwardShadowRecord} from './forward-shadow.js'
 import {isValidBaseVersion} from './integrate-command.js'
+import {isValidCarryManifest} from './sources.js'
 
 interface ParsedFlags {
   readonly resultOut: string
@@ -124,16 +125,25 @@ function parseManifest(value: unknown, baseVersion: string): ProvenanceManifest 
   if (isRecord(value) === false || value.baseVersion !== baseVersion || isString(value.buildSha) === false) {
     return undefined
   }
-  if (OID_PATTERN.test(String(value.integrationCommit)) === false || Array.isArray(value.integrationRefs) === false) {
+  if (
+    typeof value.integrationCommit !== 'string' ||
+    OID_PATTERN.test(value.integrationCommit) === false ||
+    isValidCarryManifest(value.carryManifest) === false ||
+    value.carryManifest.base !== `v${baseVersion}` ||
+    Array.isArray(value.integrationRefs) === false ||
+    value.carryManifest.carries.length !== value.integrationRefs.length
+  ) {
     return undefined
   }
   const integrationRefs: {readonly ref: string; readonly resolvedSha: string}[] = []
-  for (const entry of value.integrationRefs) {
+  for (const [index, entry] of value.integrationRefs.entries()) {
     if (
       isRecord(entry) === false ||
       isString(entry.ref) === false ||
       typeof entry.resolvedSha !== 'string' ||
-      OID_PATTERN.test(entry.resolvedSha) === false
+      OID_PATTERN.test(entry.resolvedSha) === false ||
+      value.carryManifest.carries[index]?.ref !== entry.ref ||
+      value.carryManifest.carries[index]?.resolvedSha.toLowerCase() !== entry.resolvedSha.toLowerCase()
     ) {
       return undefined
     }
@@ -141,8 +151,15 @@ function parseManifest(value: unknown, baseVersion: string): ProvenanceManifest 
   }
   return {
     baseVersion,
+    carryManifest: {
+      base: value.carryManifest.base,
+      carries: value.carryManifest.carries.map(carry => ({
+        ref: carry.ref,
+        resolvedSha: carry.resolvedSha.toLowerCase(),
+      })),
+    },
     integrationRefs,
-    integrationCommit: String(value.integrationCommit).toLowerCase(),
+    integrationCommit: value.integrationCommit.toLowerCase(),
     buildSha: value.buildSha,
   }
 }
@@ -197,13 +214,15 @@ async function readOutcome(
     }
   }
   const manifest = parseManifest(parsed.manifest, baseVersion)
-  if (manifest === undefined) return invalidOutcome(dependencies.now(), 'shadow outcome manifest is invalid')
+  if (manifest === undefined || manifest.carryManifest === undefined) {
+    return invalidOutcome(dependencies.now(), 'shadow outcome manifest is invalid')
+  }
   return {
     result: {ok: true, manifest, conflictDiagnostics: []},
     conflictMetrics,
     startedAt,
     endedAt,
-    integrationRefs: manifest.integrationRefs,
+    integrationRefs: manifest.carryManifest.carries,
   }
 }
 

@@ -98,6 +98,69 @@ describe('forward shadow command', () => {
     await fs.rm(directory, {recursive: true, force: true})
   })
 
+  it('passes the immutable carry manifest entries unchanged to the shadow consumer', async () => {
+    // #given
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-command-test-'))
+    const resultPath = path.join(directory, 'result.json')
+    const recordPath = path.join(directory, 'record.json')
+    const carry = {ref: 'https://github.com/anomalyco/opencode/pull/30182', resolvedSha: 'c'.repeat(40)}
+    let receivedRefs: readonly {readonly ref: string; readonly resolvedSha: string}[] = []
+    await fs.writeFile(
+      resultPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        ok: true,
+        startedAt: '2026-08-14T00:00:00.000Z',
+        endedAt: '2026-08-14T00:00:01.000Z',
+        elapsedMs: 1000,
+        manifest: {
+          baseVersion: '1.15.13',
+          carryManifest: {base: 'v1.15.13', carries: [carry]},
+          integrationRefs: [carry],
+          integrationCommit: OID_A,
+          buildSha: 'build',
+        },
+      }),
+      'utf8',
+    )
+
+    // #when
+    const code = await runForwardShadowCommand(
+      [
+        '--result-out',
+        resultPath,
+        '--record-out',
+        recordPath,
+        '--base-version',
+        '1.15.13',
+        '--shadow-work-dir',
+        directory,
+        '--release-repo',
+        'anomalyco/opencode',
+        '--authoritative-repository',
+        'fro-bot/agent',
+        '--authoritative-ref',
+        'refs/harness-integrate/1.15.13',
+        '--run-identity',
+        'run-1',
+      ],
+      {
+        readFile: async file => fs.readFile(file, 'utf8'),
+        compare: async input => {
+          receivedRefs = input.integrationRefs
+          return matchRecord()
+        },
+        writeRecord: async (file, record) => fs.writeFile(file, JSON.stringify(record), 'utf8'),
+        now: () => new Date('2026-08-14T00:00:02.000Z'),
+      },
+    )
+
+    // #then
+    expect(code).toBe(0)
+    expect(receivedRefs).toEqual([carry])
+    await fs.rm(directory, {recursive: true, force: true})
+  })
+
   it('writes inconclusive evidence when the outcome is missing and never leaks its path or contents', async () => {
     // #given
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'forward-shadow-command-test-'))

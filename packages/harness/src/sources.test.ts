@@ -1,7 +1,8 @@
 import {describe, expect, it} from 'vitest'
-import {parseSource, resolveSources} from './sources.js'
+import {parseSource, resolveCarryManifest, resolveSources, sourcesFromCarryManifest} from './sources.js'
 
 const SOURCE_REPO = 'https://github.com/anomalyco/opencode.git'
+const SOURCE_SHA = 'a'.repeat(40)
 
 // ---------------------------------------------------------------------------
 // parseSource — PR URL
@@ -146,5 +147,31 @@ describe('resolveSources', () => {
 
     // #then
     expect(sources.length).toBe(0)
+  })
+})
+
+describe('resolveCarryManifest', () => {
+  it('resolves each carry once and maps the immutable manifest back to sources', async () => {
+    // #given
+    const refs = ['https://github.com/anomalyco/opencode/pull/30182']
+    const resolved = [] as string[]
+
+    // #when
+    const manifest = await resolveCarryManifest('v1.18.18', refs, SOURCE_REPO, async source => {
+      resolved.push(source.fetchRef)
+      return SOURCE_SHA
+    })
+    const sources = sourcesFromCarryManifest(manifest, SOURCE_REPO)
+
+    // #then
+    expect(manifest).toEqual({
+      base: 'v1.18.18',
+      carries: [{ref: refs[0], resolvedSha: SOURCE_SHA}],
+    })
+    expect(resolved).toEqual(['refs/pull/30182/head'])
+    expect(sources[0]?.resolvedSha).toBe(SOURCE_SHA)
+    expect(sources[0]?.fetchRef).toBe('refs/pull/30182/head')
+    expect(Object.isFrozen(manifest)).toBe(true)
+    expect(Object.isFrozen(manifest.carries)).toBe(true)
   })
 })
