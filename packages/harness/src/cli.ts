@@ -29,6 +29,7 @@ Usage:
   harness integrate            Run the deterministic integration pipeline
                                    --base-version <ver> Override harness.config.json base version
                                   --dry-run             Validate/build without acquiring push credentials
+                                  --candidate            Freeze/build/push a model-produced local candidate
                                   --push-repo <url>     Push target repository (non-dry-run)
                                   --push-ref <ref>      Push target ref (non-dry-run)
                                  --work-dir <dir>     (required) Working directory for the clone
