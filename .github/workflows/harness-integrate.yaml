@@ -114,6 +114,10 @@ jobs:
         env:
           GH_TOKEN: ''
           GITHUB_TOKEN: ''
+          # Keep the model's designated integration workdir in step with the
+          # trusted finalization step below. The action passes this run-specific
+          # path to its generic CI config writer via FRO_BOT_INTEGRATION_WORK_DIR.
+          FRO_BOT_INTEGRATION_WORK_DIR: ${{ runner.temp }}/harness-integrate-work
           # Keep provider-level failures diagnosable; trusted finalization owns the pushed ref.
           OPENCODE_PROMPT_ARTIFACT: 'true'
         with:

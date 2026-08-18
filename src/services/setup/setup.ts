@@ -207,6 +207,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         enableOmoSlim: inputs.enableOmoSlim,
         omoSlimVersion: inputs.omoSlimVersion,
         omoSlimPreset: inputs.omoSlimPreset,
+        integrationWorkDir: process.env.FRO_BOT_INTEGRATION_WORK_DIR,
       },
       logger,
     )
