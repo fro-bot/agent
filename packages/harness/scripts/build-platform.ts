@@ -661,7 +661,7 @@ function emitBinary(
  * The manifest records the integration commit, base version, and build SHA
  * so the runtime getProvenance() function can serve it to `harness info`.
  */
-function emitProvenanceManifest(
+export function emitProvenanceManifest(
   harnessPackageDir: string,
   baseVersion: string,
   integrationCommit: string,
@@ -672,9 +672,12 @@ function emitProvenanceManifest(
   try {
     const existing: unknown = JSON.parse(readFileSync(path.join(harnessPackageDir, 'provenance.json'), 'utf8'))
     if (typeof existing === 'object' && existing !== null) {
-      if ('carryManifest' in existing) carryManifest = existing.carryManifest
-      if ('integrationRefs' in existing && Array.isArray(existing.integrationRefs))
-        integrationRefs = existing.integrationRefs
+      const existingIntegrationCommit = 'integrationCommit' in existing ? existing.integrationCommit : undefined
+      if (existingIntegrationCommit === integrationCommit) {
+        if ('carryManifest' in existing) carryManifest = existing.carryManifest
+        if ('integrationRefs' in existing && Array.isArray(existing.integrationRefs))
+          integrationRefs = existing.integrationRefs
+      }
     }
   } catch {
     // Build-only invocations may not have an integration manifest to preserve.

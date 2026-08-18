@@ -30,6 +30,7 @@ import {
   assertMuslBinary,
   assertPatchLanded,
   cloneAndCheckout,
+  emitProvenanceManifest,
   enforceBunVersion,
   main,
   parseArgs,
@@ -111,6 +112,103 @@ vi.mock('node:fs', async importOriginal => {
     readFileSync: vi.fn(),
     writeFileSync: vi.fn(),
   }
+})
+
+describe('emitProvenanceManifest', () => {
+  const mockedReadFileSync = vi.mocked(readFileSync)
+  const mockedWriteFileSync = vi.mocked(writeFileSync)
+
+  function writtenManifest(): Record<string, unknown> {
+    const call = mockedWriteFileSync.mock.calls.at(-1)
+    if (call === undefined || typeof call[1] !== 'string') throw new Error('expected provenance write')
+    const parsed: unknown = JSON.parse(call[1])
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+      throw new Error('invalid written manifest')
+    return parsed as Record<string, unknown>
+  }
+
+  beforeEach(() => {
+    mockedReadFileSync.mockReset()
+    mockedWriteFileSync.mockReset()
+  })
+
+  it('preserves carry data from an existing manifest with the same integration commit', () => {
+    // #given
+    const existing = {
+      baseVersion: 'old-base',
+      carryManifest: {base: 'v1.15.13', carries: [{ref: 'carry', resolvedSha: 'a'.repeat(40)}]},
+      integrationRefs: [{ref: 'carry', resolvedSha: 'a'.repeat(40)}],
+      integrationCommit: 'commit-a',
+      buildSha: 'old-build',
+    }
+    mockedReadFileSync.mockReturnValue(JSON.stringify(existing))
+
+    // #when
+    emitProvenanceManifest('/tmp/harness', '1.15.13', 'commit-a', 'build-b')
+
+    // #then
+    expect(writtenManifest()).toEqual({
+      ...existing,
+      baseVersion: '1.15.13',
+      buildSha: 'build-b',
+    })
+  })
+
+  it('writes an empty carry set when no existing manifest is available', () => {
+    // #given
+    mockedReadFileSync.mockImplementation(() => {
+      throw new Error('missing')
+    })
+
+    // #when
+    emitProvenanceManifest('/tmp/harness', '1.15.13', 'commit-a', 'build-a')
+
+    // #then
+    expect(writtenManifest()).toEqual({
+      baseVersion: '1.15.13',
+      integrationRefs: [],
+      integrationCommit: 'commit-a',
+      buildSha: 'build-a',
+    })
+  })
+
+  it('writes an empty carry set when the existing manifest is malformed', () => {
+    // #given
+    mockedReadFileSync.mockReturnValue('{not-json')
+
+    // #when
+    emitProvenanceManifest('/tmp/harness', '1.15.13', 'commit-a', 'build-a')
+
+    // #then
+    expect(writtenManifest()).toEqual({
+      baseVersion: '1.15.13',
+      integrationRefs: [],
+      integrationCommit: 'commit-a',
+      buildSha: 'build-a',
+    })
+  })
+
+  it('clears preserved carry data when the existing integration commit is stale', () => {
+    // #given
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        carryManifest: {base: 'v1.15.13', carries: [{ref: 'stale', resolvedSha: 'b'.repeat(40)}]},
+        integrationRefs: [{ref: 'stale', resolvedSha: 'b'.repeat(40)}],
+        integrationCommit: 'commit-old',
+      }),
+    )
+
+    // #when
+    emitProvenanceManifest('/tmp/harness', '1.15.13', 'commit-new', 'build-a')
+
+    // #then
+    expect(writtenManifest()).toEqual({
+      baseVersion: '1.15.13',
+      integrationRefs: [],
+      integrationCommit: 'commit-new',
+      buildSha: 'build-a',
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------

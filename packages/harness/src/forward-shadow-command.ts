@@ -126,7 +126,8 @@ function parseManifest(value: unknown, baseVersion: string): ProvenanceManifest 
     return undefined
   }
   if (
-    OID_PATTERN.test(String(value.integrationCommit)) === false ||
+    typeof value.integrationCommit !== 'string' ||
+    OID_PATTERN.test(value.integrationCommit) === false ||
     isValidCarryManifest(value.carryManifest) === false ||
     value.carryManifest.base !== `v${baseVersion}` ||
     Array.isArray(value.integrationRefs) === false ||
@@ -158,7 +159,7 @@ function parseManifest(value: unknown, baseVersion: string): ProvenanceManifest 
       })),
     },
     integrationRefs,
-    integrationCommit: String(value.integrationCommit).toLowerCase(),
+    integrationCommit: value.integrationCommit.toLowerCase(),
     buildSha: value.buildSha,
   }
 }
