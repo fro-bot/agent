@@ -605,6 +605,8 @@ The operational delta does not favor deletion. Eager presearch costs two SDK cal
 
 **Goal:** Make the code-owned integration driver authoritative after forward-shadow evidence demonstrates structural and outcome equivalence.
 
+**Prerequisite:** U7c is defined above and precedes this unit because trusted push separation is required before production cutover.
+
 **Status:** Blocked — the outcome-based gate is not yet satisfied. The former three-distinct-base tree-equality requirement is deleted because it measures stochastic conflict bytes rather than release readiness. U7b is not complete and U7 is not complete.
 
 **Decision:** Replace the three strict tree-OID `match` records across distinct base versions with structural-plus-outcome equivalence. Base and ordered carries are resolved to immutable SHAs once in trusted code; both paths receive the same immutable manifest; the shadow is judged on deterministic structure and release outcomes, not on reproducing one model invocation's conflict bytes. Three distinct base versions add calendar delay, not confidence, because the authoritative process is not self-reproducible.
