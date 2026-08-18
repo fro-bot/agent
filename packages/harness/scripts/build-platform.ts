@@ -667,9 +667,22 @@ function emitProvenanceManifest(
   integrationCommit: string,
   buildSha: string,
 ): void {
+  let carryManifest: unknown
+  let integrationRefs: readonly unknown[] = []
+  try {
+    const existing: unknown = JSON.parse(readFileSync(path.join(harnessPackageDir, 'provenance.json'), 'utf8'))
+    if (typeof existing === 'object' && existing !== null) {
+      if ('carryManifest' in existing) carryManifest = existing.carryManifest
+      if ('integrationRefs' in existing && Array.isArray(existing.integrationRefs))
+        integrationRefs = existing.integrationRefs
+    }
+  } catch {
+    // Build-only invocations may not have an integration manifest to preserve.
+  }
   const manifest = {
     baseVersion,
-    integrationRefs: [], // populated by the integration engine; preserved here as empty for build-only runs
+    ...(carryManifest === undefined ? {} : {carryManifest}),
+    integrationRefs,
     integrationCommit,
     buildSha,
   }

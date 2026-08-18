@@ -18,11 +18,13 @@ async function makeTmpDir(): Promise<string> {
 }
 
 function makeAdapters(overrides: Partial<IntegrationAdapters> = {}): IntegrationAdapters {
+  const sourceSha = 'a'.repeat(40)
   return {
     cloneRepo: async () => {},
     fetchTags: async () => {},
     fetchRef: async () => {},
-    captureRefSha: async () => 'resolved-source-sha',
+    resolveRefSha: async () => sourceSha,
+    captureRefSha: async () => sourceSha,
     createBranch: async () => {},
     mergeRef: async () => ({kind: 'clean'}),
     runMerge: async () => {},
@@ -79,6 +81,15 @@ describe('writeProvenanceManifest / readProvenanceManifest', () => {
     try {
       const manifest: ProvenanceManifest = {
         baseVersion: '1.15.13',
+        carryManifest: {
+          base: 'v1.15.13',
+          carries: [
+            {
+              ref: 'https://github.com/anomalyco/opencode/pull/30182',
+              resolvedSha: 'd'.repeat(40),
+            },
+          ],
+        },
         integrationRefs: [
           {
             ref: 'https://github.com/anomalyco/opencode/pull/30182',
@@ -156,6 +167,115 @@ describe('runIntegration', () => {
       expect(result.manifest.baseVersion).toBe('1.15.13')
       expect(result.manifest.integrationRefs.length).toBe(0)
       expect(typeof result.manifest.integrationCommit).toBe('string')
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('records the carry SHA rather than the final integration commit', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    const carrySha = 'b'.repeat(40)
+    const integrationCommit = 'c'.repeat(40)
+    try {
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: ['https://github.com/anomalyco/opencode/pull/30182'],
+          workDir: dir,
+        },
+        makeAdapters({
+          resolveRefSha: async () => carrySha,
+          captureRefSha: async () => carrySha,
+          getCommitSha: async () => integrationCommit,
+        }),
+      )
+
+      // #when
+      // The pipeline has already completed with the resolved carry.
+
+      // #then
+      expect(result.ok).toBe(true)
+      if (result.ok === false) throw new Error(result.error)
+      if (result.manifest.carryManifest === undefined) throw new Error('expected carry manifest')
+      expect(result.manifest.carryManifest.carries[0]?.resolvedSha).toBe(carrySha)
+      expect(result.manifest.integrationRefs[0]?.resolvedSha).toBe(carrySha)
+      expect(result.manifest.integrationRefs[0]?.resolvedSha).not.toBe(integrationCommit)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('fails closed with CarrySourceChangedError when the moving head changes before fetch completes', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    const resolvedSha = 'd'.repeat(40)
+    const movedSha = 'e'.repeat(40)
+    try {
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: ['https://github.com/anomalyco/opencode/pull/30182'],
+          workDir: dir,
+        },
+        makeAdapters({
+          resolveRefSha: async () => resolvedSha,
+          captureRefSha: async () => movedSha,
+        }),
+      )
+
+      // #when
+      // The fetched source resolves to a different SHA than the frozen manifest.
+
+      // #then
+      expect(result.ok).toBe(false)
+      if (result.ok === true) throw new Error('expected source drift failure')
+      expect(result.error).toMatch(/CarrySourceChangedError/)
+      expect(await readProvenanceManifest(dir)).toBeNull()
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('passes one supplied carry manifest unchanged to the integration consumer', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    const carrySha = 'f'.repeat(40)
+    const carryManifest = {
+      base: 'v1.15.13',
+      carries: [{ref: 'https://github.com/anomalyco/opencode/pull/30182', resolvedSha: carrySha}],
+    } as const
+    const fetched: string[] = []
+    try {
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: [carryManifest.carries[0].ref],
+          carryManifest,
+          workDir: dir,
+        },
+        makeAdapters({
+          resolveRefSha: async () => {
+            throw new Error('supplied manifest must be consumed without re-resolution')
+          },
+          fetchRef: async (_workDir, _remoteUrl, _fetchRef, _localRef, expectedSha) => {
+            fetched.push(expectedSha ?? '')
+          },
+          captureRefSha: async () => carrySha,
+        }),
+      )
+
+      // #when
+      // The same manifest is supplied to the trusted integration consumer.
+
+      // #then
+      expect(result.ok).toBe(true)
+      if (result.ok === false) throw new Error(result.error)
+      expect(result.manifest.carryManifest).toEqual(carryManifest)
+      expect(fetched).toEqual([carrySha])
     } finally {
       await fs.rm(dir, {recursive: true, force: true})
     }
@@ -538,6 +658,15 @@ describe('runIntegration', () => {
     try {
       const manifest: ProvenanceManifest = {
         baseVersion: '1.15.13',
+        carryManifest: {
+          base: 'v1.15.13',
+          carries: [
+            {
+              ref: 'https://github.com/anomalyco/opencode/pull/30182',
+              resolvedSha: 'd'.repeat(40),
+            },
+          ],
+        },
         integrationRefs: [
           {
             ref: 'https://github.com/anomalyco/opencode/pull/30182',
@@ -584,9 +713,15 @@ describe('runIntegration', () => {
         'dummy {{tag}} {{branch}} {{merges}} {{sources}} {{repo}} {{version}} {{channel}} {{base}} {{release_repo}} {{release_url}} {{branches}}',
       )
       // Each ref gets a distinct SHA from captureRefSha
-      const refShas = ['aaa1111100000000', 'bbb2222200000000', 'ccc3333300000000']
+      const refShas = ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40)]
+      let resolveCallCount = 0
       let captureCallCount = 0
       const adapters = makeAdapters({
+        resolveRefSha: async () => {
+          const sha = refShas[resolveCallCount] ?? ''
+          resolveCallCount++
+          return sha
+        },
         captureRefSha: async () => {
           const sha = refShas[captureCallCount] ?? null
           captureCallCount++
@@ -622,9 +757,9 @@ describe('runIntegration', () => {
       // All 3 are distinct
       expect(new Set(shas).size).toBe(3)
       // Each matches the captured SHA, not the integration commit
-      expect(shas[0]).toBe('aaa1111100000000')
-      expect(shas[1]).toBe('bbb2222200000000')
-      expect(shas[2]).toBe('ccc3333300000000')
+      expect(shas[0]).toBe('a'.repeat(40))
+      expect(shas[1]).toBe('b'.repeat(40))
+      expect(shas[2]).toBe('c'.repeat(40))
     } finally {
       await fs.rm(dir, {recursive: true, force: true})
     }
@@ -756,6 +891,38 @@ describe('clean-snapshot guarantees', () => {
   })
 })
 
+describe('frozen carry fetches', () => {
+  it('detects a local branch move between SHA resolution and fetch without network access', async () => {
+    // #given
+    const sourceDir = await makeTmpDir()
+    const workDir = await makeTmpDir()
+    const adapters = integrateModule.makeRealAdapters()
+    try {
+      runGit(sourceDir, ['init', '--quiet'])
+      runGit(sourceDir, ['config', 'user.name', 'harness-test'])
+      runGit(sourceDir, ['config', 'user.email', 'harness-test@example.invalid'])
+      await fs.writeFile(path.join(sourceDir, 'carry.txt'), 'first\n', 'utf8')
+      runGit(sourceDir, ['add', 'carry.txt'])
+      runGit(sourceDir, ['commit', '--quiet', '-m', 'carry'])
+      const resolvedSha = runGit(sourceDir, ['rev-parse', 'HEAD'])
+
+      runGit(sourceDir, ['checkout', '--quiet', '-b', 'carry'])
+      await fs.writeFile(path.join(sourceDir, 'carry.txt'), 'moved\n', 'utf8')
+      runGit(sourceDir, ['commit', '--quiet', '-am', 'move carry'])
+      runGit(workDir, ['init', '--quiet'])
+
+      // #when / #then
+      await expect(
+        adapters.fetchRef(workDir, sourceDir, 'refs/heads/carry', 'refs/remotes/watch/local/carry', resolvedSha),
+      ).rejects.toMatchObject({name: 'CarrySourceChangedError'})
+    } finally {
+      await adapters.dispose?.()
+      await fs.rm(sourceDir, {recursive: true, force: true})
+      await fs.rm(workDir, {recursive: true, force: true})
+    }
+  })
+})
+
 // ---------------------------------------------------------------------------
 // U5: code-owned deterministic integration driver
 // ---------------------------------------------------------------------------
@@ -776,6 +943,7 @@ describe('U5 code-owned integration driver', () => {
       runGit(sourceDir, ['tag', 'v1.15.13'])
       const manifest: ProvenanceManifest = {
         baseVersion: '1.15.13',
+        carryManifest: {base: 'v1.15.13', carries: []},
         integrationRefs: [],
         integrationCommit,
         buildSha: 'dev',
