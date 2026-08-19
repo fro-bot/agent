@@ -26,7 +26,7 @@ OpenCode SDK execution with GitHub context injection, multi-section prompt const
 - `buildAgentPrompt(options, logger)`: Compiles multi-section prompt
 - `buildTaskSection(context, promptInput, resolvedMode)`: Task directive with append-mode and Delivery Mode preamble
 - `getTriggerDirective(context, promptInput)`: Per-event directive selection
-- `resolveOutputMode(eventType, prompt, configuredMode)`: Resolves the operator-level Delivery Mode contract for manual triggers (returns `null` for non-manual)
+- `resolveOutputMode(eventType, configuredMode)`: Resolves the operator-level Delivery Mode contract for manual triggers (returns `null` for non-manual)
 - `buildResponseProtocolSection(...)`: CI output rules (single comment, Run Summary)
 - `buildOutputContractSection(context)`: PR review action guidance
 - Diff summary is merged inline into `buildHydratedContextSection()` PR metadata
