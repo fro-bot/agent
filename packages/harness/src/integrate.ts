@@ -656,6 +656,9 @@ function errorText(error: unknown): string {
   return String(error)
 }
 
+// `stale info` is git's authoritative marker for a rejected `--force-with-lease`. The second
+// pattern is a defensive fallback only: it would not survive git abbreviating the expected SHA
+// or localizing the message, so it must never be relied on as the primary signal.
 function isTrustedPushLeaseRejection(error: unknown): boolean {
   const text = errorText(error)
   return /stale info/i.test(text) || /cannot lock ref .*expected [0-9a-f]{40}/i.test(text)
@@ -669,6 +672,10 @@ function trustedPushLeaseRejectedError(targetRef: string, cause: unknown): Error
   return error
 }
 
+// The expected value is captured out-of-band because the trusted repository is materialized fresh
+// and has no local tracking ref for the target, so git has nothing to lease against implicitly.
+// A ref that moves between this lookup and the push is not a race: the lease rejects that push,
+// which is precisely the protection being bought here.
 async function resolvePushLeaseExpectation(
   git: GitSubprocess,
   target: IntegrationPushTarget,

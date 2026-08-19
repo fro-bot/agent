@@ -6,7 +6,13 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import {describe, expect, it} from 'vitest'
-import {makeRealAdapters, readProvenanceManifest, runIntegration, writeProvenanceManifest} from './integrate.js'
+import {
+  makeRealAdapters,
+  readProvenanceManifest,
+  runIntegration,
+  TRUSTED_PUSH_LEASE_REJECTED_ERROR_NAME,
+  writeProvenanceManifest,
+} from './integrate.js'
 import * as integrateModule from './integrate.js'
 
 // ---------------------------------------------------------------------------
@@ -1124,7 +1130,7 @@ describe('trusted integration push leases', () => {
       )
       expect(rejection).toBeInstanceOf(Error)
       if (!(rejection instanceof Error)) throw new Error('expected trusted push to reject')
-      expect(rejection.name).toBe('TrustedPushLeaseRejectedError')
+      expect(rejection.name).toBe(TRUSTED_PUSH_LEASE_REJECTED_ERROR_NAME)
       expect(rejection.message).toMatch(/moved underneath/)
       expect(runGit(remoteDir, [`rev-parse`, `${targetRef}^{commit}`])).toBe(movedSha)
     } finally {
