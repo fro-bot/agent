@@ -111,6 +111,13 @@ jobs:
         id: mint
         run: node --experimental-strip-types scripts/harness/mint-broker-credential.ts
 
+      # The external-directory allowlist grants the model `<workdir>/*`, which covers paths
+      # inside the workdir but not creation of the workdir itself. Without this, `git clone`
+      # cannot create its own target and the model clones into a subdirectory instead,
+      # leaving trusted finalization pointed at a path that is not a git repository.
+      - name: Create the integration workdir
+        run: mkdir -p "${{ runner.temp }}/harness-integrate-work"
+
       # SYNC: keep the shared merge inputs in step with fro-bot.yaml's Run Fro Bot step
       - name: Run Fro Bot
         uses: ./
