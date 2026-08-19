@@ -498,9 +498,33 @@ describe('fro-bot workflow — owner-wide App token routing', () => {
   })
 })
 
-describe('harness forward-shadow workflow wiring', () => {
+describe('harness integration workflow wiring', () => {
   const integratePath = '.github/workflows/harness-integrate.yaml'
   const releasePath = '.github/workflows/harness-release.yaml'
+
+  it('bounds the integrate job so a wedged run cannot consume the default six hours', () => {
+    // #given the checked-in reusable integration workflow
+    const job = rawJob(integratePath, 'integrate')
+
+    // #then
+    expect(job['timeout-minutes']).toBe(120)
+  })
+
+  it('creates the integration workdir before the model step that must clone into it', () => {
+    // #given
+    // The model is granted `<workdir>/*`, which covers paths inside the workdir but not
+    // creation of the workdir itself, so `git clone` cannot create its own target.
+    const job = rawJob(integratePath, 'integrate')
+    const steps = job.steps as {readonly name?: string; readonly run?: string}[]
+    const createIndex = steps.findIndex(step => step.name === 'Create the integration workdir')
+    const modelIndex = steps.findIndex(step => step.name === 'Run Fro Bot')
+
+    // #then
+    expect(createIndex).toBeGreaterThanOrEqual(0)
+    expect(modelIndex).toBeGreaterThanOrEqual(0)
+    expect(createIndex).toBeLessThan(modelIndex)
+    expect(String(steps[createIndex]?.run)).toContain('harness-integrate-work')
+  })
 
   it('keeps harness-integrate to one job with unchanged permissions and no secret inheritance', () => {
     // #given
@@ -527,63 +551,75 @@ describe('harness forward-shadow workflow wiring', () => {
     expect(JSON.stringify(workflow)).not.toContain('secrets: inherit')
   })
 
-  it('orders authoritative Run Fro Bot before shadow driver, record, and upload', () => {
+  it('allows only the pinned OpenCode preview dependency host in the blocked egress list', () => {
+    // #given the checked-in runner hardening step
+    const job = rawJob(integratePath, 'integrate')
+    const harden = stepsFor(integratePath, 'integrate').find(step => step.name === 'Harden runner egress')
+    if (harden === undefined) throw new TypeError('Harden runner egress step is missing')
+    const hardenWith = harden.with as Record<string, unknown>
+
+    // #then the policy remains blocked and the allowlist changes only by adding pkg.pr.new
+    expect(hardenWith['egress-policy']).toBe('block')
+    expect(hardenWith['allowed-endpoints']).toBe(
+      [
+        'api.github.com:443',
+        'broker.fro.bot:443',
+        'bun.sh:443',
+        'codeload.github.com:443',
+        'cliproxy.fro.bot:443',
+        'github.com:443',
+        'models.dev:443',
+        'nodejs.org:443',
+        'pkg.pr.new:443',
+        'registry.npmjs.org:443',
+        '*.actions.githubusercontent.com:443',
+        '*.githubusercontent.com:443',
+      ].join(' '),
+    )
+
+    const raw = readFileSync(integratePath, 'utf8')
+    expect(raw).toContain('# Upstream OpenCode pins @solidjs/start to a pkg.pr.new preview build in its root')
+    expect(raw).toContain('# package.json, so bun install --frozen-lockfile cannot complete without it.')
+    expect(job.permissions).toEqual({'id-token': 'write', contents: 'read'})
+  })
+
+  it('mints the write-capable token only after the model step and before trusted freeze', () => {
     // #given
     const steps = stepsFor(integratePath, 'integrate')
     const mint = steps.findIndex(step => step.id === 'mint')
     const appMint = steps.findIndex(step => step.id === 'mint-app-token')
     const authoritative = steps.findIndex(step => step.name === 'Run Fro Bot')
-    const shadow = steps.findIndex(step => step.id === 'shadow-integrate')
-    const record = steps.findIndex(step => step.id === 'shadow-record')
-    const upload = steps.findIndex(step => step.id === 'upload-shadow-record')
+    const trustedFreeze = steps.findIndex(step => step.id === 'trusted-integrate')
 
-    // #then
+    // #then the model runs before any write-capable credential exists
     expect(mint).toBeGreaterThanOrEqual(0)
-    expect(appMint).toBeGreaterThan(mint)
-    expect(authoritative).toBeGreaterThan(appMint)
-    expect(shadow).toBeGreaterThan(authoritative)
-    expect(record).toBeGreaterThan(shadow)
-    expect(upload).toBeGreaterThan(record)
+    expect(authoritative).toBeGreaterThan(mint)
+    expect(appMint).toBeGreaterThan(authoritative)
+    expect(trustedFreeze).toBeGreaterThan(appMint)
   })
 
-  it('keeps every shadow step credentialless and invokes dry-run without push flags', () => {
+  it('gives the model only the read-only workflow token and reserves the App token for trusted push', () => {
     // #given
     const steps = stepsFor(integratePath, 'integrate')
-    const shadowSteps = steps.filter(
-      step => step.id === 'shadow-integrate' || step.id === 'shadow-record' || step.id === 'upload-shadow-record',
-    )
-    const shadow = stepById(steps, 'shadow-integrate')
-    const run = String(shadow.run ?? '')
+    const runFroBot = steps.find(step => step.name === 'Run Fro Bot')
+    const trusted = stepById(steps, 'trusted-integrate')
+    if (runFroBot === undefined) throw new TypeError('Run Fro Bot step is missing')
+    const runWith = runFroBot.with as Record<string, unknown>
+    const runEnv = runFroBot.env as Record<string, unknown>
+    const trustedEnv = trusted.env as Record<string, unknown>
+    const trustedRun = String(trusted.run ?? '')
 
     // #then
-    expect(shadowSteps).toHaveLength(3)
-    for (const step of shadowSteps) {
-      const env = step.env as Record<string, unknown> | undefined
-      expect(env?.GH_TOKEN).toBe('')
-      expect(env?.GITHUB_TOKEN).toBe('')
-      expect(JSON.stringify(step)).not.toContain('mint-app-token')
-    }
-    expect(shadow['continue-on-error']).toBe(true)
-    expect(String(shadow.if)).toContain('always()')
-    expect(run).toContain('--dry-run')
-    expect(run).toContain('--base-version')
-    expect(run).toContain('--result-out')
-    expect(run).not.toMatch(/--push-(repo|ref)/)
-  })
-
-  it('always records and uploads only a 90-day JSON evidence artifact', () => {
-    // #given
-    const steps = stepsFor(integratePath, 'integrate')
-    const record = stepById(steps, 'shadow-record')
-    const upload = stepById(steps, 'upload-shadow-record')
-    const uploadWith = upload.with as Record<string, unknown>
-
-    // #then
-    expect(String(record.if)).toContain('always()')
-    expect(String(upload.if)).toContain('always()')
-    expect(uploadWith['retention-days']).toBe(90)
-    expect(uploadWith['if-no-files-found']).toBe('warn')
-    expect(String(uploadWith.path)).toMatch(/\.json/)
+    const githubTokenExpression = '${' + '{ github.token }}'
+    const appTokenExpression = '${' + '{ steps.mint-app-token.outputs.github-token }}'
+    expect(runWith['github-token']).toBe(githubTokenExpression)
+    expect(runEnv.GH_TOKEN).toBe('')
+    expect(runEnv.GITHUB_TOKEN).toBe('')
+    expect(trustedEnv.GH_TOKEN).toBe(appTokenExpression)
+    expect(trustedEnv.GITHUB_TOKEN).toBe('')
+    expect(trustedRun).toContain('--candidate')
+    expect(trustedRun).toContain('--push-repo')
+    expect(trustedRun).toContain('--push-ref')
   })
 
   it('passes the resolved base version to the reusable integrate workflow and preserves the build handoff', () => {
@@ -600,85 +636,5 @@ describe('harness forward-shadow workflow wiring', () => {
     expect(String(build.if)).toContain('needs.integrate.result')
     expect(String(fetch.run)).toContain('refs/harness-integrate/${' + 'BASE_VERSION}')
     expect(String(fetch.run)).toContain('integration_commit=${' + 'INTEGRATION_COMMIT}')
-  })
-
-  it('downloads and retains the current run shadow record without changing sync permissions', () => {
-    // #given
-    const sync = rawJob(releasePath, 'sync-default-version')
-    const permissions = sync.permissions
-    const steps = stepsFor(releasePath, 'sync-default-version')
-    const download = stepById(steps, 'download-shadow-evidence')
-    const retain = stepById(steps, 'retain-shadow-evidence')
-    const pullRequest = steps.findIndex(step => step.name === 'Open PR via peter-evans/create-pull-request')
-    const retainIndex = steps.indexOf(retain)
-    const downloadWith = download.with as Record<string, unknown>
-
-    // #then
-    expect(permissions).toEqual({contents: 'write', 'pull-requests': 'write'})
-    expect(String(download.if)).toContain('always()')
-    expect(String(download.if)).toContain("has_refs == 'true'")
-    expect(download['continue-on-error']).toBe(true)
-    expect(String(downloadWith.name)).toContain('base_version')
-    expect(String(retain.run)).toContain('docs/evidence/harness-shadow')
-    expect(String(retain.run)).toContain('forwardShadowEvidencePath')
-    expect(String(retain.run)).toContain('non-matches')
-    expect(String(retain.run)).toContain('validateForwardShadowRecord')
-    expect(String(retain.run)).toContain('if [ ! -f')
-    expect(String(retain.run)).toContain('::warning')
-    expect(String(retain.run)).toContain('GITHUB_STEP_SUMMARY')
-    expect(String(retain.if)).toContain('always()')
-    expect(retain['continue-on-error']).toBe(true)
-    expect(retainIndex).toBeLessThan(pullRequest)
-  })
-
-  it('reports the strict forward-shadow gate without blocking the sync PR', () => {
-    // #given the sync job's retained countable evidence and the gate step
-    const steps = stepsFor(releasePath, 'sync-default-version')
-    const retain = stepById(steps, 'retain-shadow-evidence')
-    const gate = stepById(steps, 'forward-shadow-gate')
-    const retainIndex = steps.indexOf(retain)
-    const gateIndex = steps.indexOf(gate)
-    const pullRequest = steps.findIndex(step => step.name === 'Open PR via peter-evans/create-pull-request')
-
-    // #then the gate runs after retention, reports to the summary, and never enables the waiver or blocks the PR
-    expect(gateIndex).toBeGreaterThan(retainIndex)
-    expect(gateIndex).toBeLessThan(pullRequest)
-    expect(String(gate.if)).toContain('always()')
-    expect(gate['continue-on-error']).toBe(true)
-    expect(String(gate.run)).toContain('forward-shadow-gate.ts')
-    expect(String(gate.run)).toContain('RECORDS_DIR="docs/evidence/harness-shadow"')
-    expect(String(gate.run)).toContain(['--records-dir "', '$', '{RECORDS_DIR}"'].join(''))
-    expect(String(gate.run)).toContain('GITHUB_STEP_SUMMARY')
-    expect(String(gate.run)).toContain('const status = result.status')
-    expect(String(gate.run)).not.toContain("result.ok === true ? 'ready' : result.status")
-    expect(String(gate.run)).toContain('slice(0, 512)')
-    expect(String(gate.run)).not.toContain('--ack-no-conflict-evidence')
-    expect(String(gate.run)).toContain('exit 0')
-  })
-
-  it('announces rather than hides an idempotent run that cannot advance the evidence counter', () => {
-    // #given the retained evidence step, version guard, PR step, and non-advance report
-    const steps = stepsFor(releasePath, 'sync-default-version')
-    const retain = stepById(steps, 'retain-shadow-evidence')
-    const version = stepById(steps, 'version')
-    const pullRequest = stepById(steps, 'open-sync-pr')
-    const outcomeReport = stepById(steps, 'report-retained-shadow')
-
-    // #then retention reports whether a record was written
-    expect(String(retain.run)).toContain('retained=false')
-    expect(String(retain.run)).toContain('retained=true')
-    expect(String(version.run)).toContain('skip=true')
-
-    // #then the sync PR stays bound to a real version bump. NEW_VERSION embeds
-    // BASE_VERSION, so an idempotent run has no distinct base version to contribute
-    // and opening a PR for it would rewrite an existing evidence path.
-    expect(String(pullRequest.if)).toContain("steps.version.outputs.skip != 'true'")
-    expect(String(pullRequest.if)).not.toContain("steps.version.outputs.skip == 'true'")
-
-    // #then the non-advance is surfaced instead of passing silently
-    expect(String(outcomeReport.if)).toContain("steps.retain-shadow-evidence.outputs.retained == 'true'")
-    expect(String(outcomeReport.if)).toContain("steps.version.outputs.skip == 'true'")
-    expect(String(outcomeReport.run)).toContain('::warning')
-    expect(String(outcomeReport.run)).toContain('GITHUB_STEP_SUMMARY')
   })
 })

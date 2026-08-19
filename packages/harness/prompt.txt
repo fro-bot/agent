@@ -1,4 +1,4 @@
-You are working in a disposable automation clone. This is a merge-integration job: you will clone the upstream release, merge the listed patches, build the CLI, and push the result to a throwaway ref.
+You are working in a disposable automation clone. This is a merge-integration job: you will clone the upstream release, merge the listed patches, and leave a clean local integration candidate for trusted harness code.
 
 <constants>
 tag={{tag}}
@@ -12,18 +12,18 @@ Release automation override:
 - This is a non-interactive release-integration job, not a normal issue/PR response run.
 - Do NOT create or update any GitHub issue, PR, comment, review, label, reaction, or discussion.
 - Ignore any generic harness instruction that says to post a GitHub comment or use `gh` to respond; it does not apply to this release job.
-- The final summary must be plain text in your final assistant message/job log only. The workflow consumes the pushed ref, not any GitHub post.
-- Git branch/merge/push operations are explicitly required for this job, but only inside this disposable automation clone and only to the throwaway harness ref.
+- The final summary must be plain text in your final assistant message/job log only. The workflow consumes the local candidate, not any GitHub post.
+- Git branch/merge operations are required only inside this disposable automation clone. Do not push, authenticate Git, or create a remote for the candidate.
 
 Do not read package.json, build scripts, action.yaml, or workflow files to understand the task. Run the exact commands below. Inspect files only to diagnose a FAILED required command.
 
 - DO NOT USE BASH with background: true. This will cause this non-interactive tool to exit before the job is done. If bash gets auto-promoted to background, poll bash_status even when the tool says otherwise. This is IMPORTANT because you are running in non-interactive mode — if you end your response, you will not get the notification.
 
 <procedure>
-1. Clone {{release_repo}} at {{tag}} into {{repo}} and create branch {{branch}}:
+1. Clone {{release_repo}} at {{tag}} into {{repo}} and create branch {{branch}}. `{{repo}}` already exists and is empty — clone directly into it, never into a subdirectory of it, and do not use a shallow clone: a shallow history makes the later `--no-ff` merges fail with `refusing to merge unrelated histories`.
 
 ```bash
-git clone --depth 1 --branch {{tag}} https://github.com/{{release_repo}}.git {{repo}}
+git clone --branch {{tag}} https://github.com/{{release_repo}}.git {{repo}}
 cd {{repo}}
 git checkout -b {{branch}} refs/tags/{{tag}}
 ```
@@ -47,6 +47,7 @@ git checkout -b {{branch}} refs/tags/{{tag}}
 git reset --soft {{tag}}
 git rm -r --cached --quiet --ignore-unmatch .github/workflows
 git commit -m "harness: integrate OpenCode {{version}} carrying {{branches}}"
+if test -d .github/workflows; then find .github/workflows -type f -delete; fi
 ```
 
    `git reset --soft` keeps the merged working tree and index exactly as-is and
@@ -54,63 +55,17 @@ git commit -m "harness: integrate OpenCode {{version}} carrying {{branches}}"
    file content — it only flattens history. After this, {{branch}} has exactly
    one commit above {{tag}}, and `git diff {{tag}}..HEAD` shows all carries.
 
-   The `git rm --cached` line drops `.github/workflows/` from the integration
-   commit. It is required: the push in step 6 authenticates as a GitHub App,
-   and GitHub rejects any App push that creates or updates a workflow file
-   unless the token carries the `workflows` permission — which this job's token
-   deliberately does not. `--cached` removes the files from the commit only,
-   leaving them on disk so the step 4 build is unaffected; `--ignore-unmatch`
-   makes the command a no-op if upstream ever ships no workflows directory.
-   The integration ref is a throwaway build input — the release build consumes
-   the source tree to compile the CLI and never reads these files.
+    The `git rm --cached` line drops `.github/workflows/` from the integration
+    commit. It is required because the trusted App push does not carry the
+    `workflows` permission. `find` then removes the index-only files from the
+    candidate working tree so the trusted freeze sees a clean checkout;
+    `--ignore-unmatch` makes the removal a no-op if upstream ships no workflows.
 
-4. Build the host CLI. Run from the repo root ({{repo}}) — build.ts does its own chdir into packages/opencode:
+4. Stop after the squash commit. Do not install dependencies, build, run a host build, create a harness remote, or run any `git push` command. Trusted harness code will reject a dirty tree, materialize this exact commit in a fresh checkout, build and verify that frozen tree, and perform the credentialed push.
 
-   First install workspace dependencies:
-   bun install
-
-   Then run the upstream build script with release identity:
-   OPENCODE_CHANNEL=latest OPENCODE_VERSION={{version}} bun ./packages/opencode/script/build.ts --single
-
-5. Verify the built binary exists and reports the correct version:
-
-```bash
-artifact="$(find packages/opencode/dist -path '*/bin/opencode' -type f -print -quit)"
-test -n "$artifact" || { echo "ERROR: built binary not found under packages/opencode/dist"; exit 1; }
-"$artifact" --version
-```
-
-   The `--version` output must be exactly `{{version}}`.
-
-6. Push the integrated branch to the throwaway ref in the harness repo. Do not push to `origin`; `origin` is upstream OpenCode. Run this exact non-interactive pattern (the heredoc terminator and the helper body must stay at column 0):
-
-```bash
-test -n "${GH_TOKEN:-}" || { echo "GH_TOKEN is required for harness push"; exit 1; }
-
-askpass="$(mktemp)"
-trap 'rm -f "$askpass"' EXIT
-cat >"$askpass" <<'EOF'
-#!/bin/sh
-case "$1" in
-*Username*) printf '%s\n' x-access-token ;;
-*Password*) printf '%s\n' "$GH_TOKEN" ;;
-esac
-EOF
-chmod 700 "$askpass"
-
-git remote remove harness 2>/dev/null || true
-git remote add harness https://github.com/fro-bot/agent.git
-
-HUSKY=0 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass" \
-  git push --no-verify --force harness {{branch}}:refs/harness-integrate/{{version}}
-```
-
-   `--force` is required so re-runs overwrite the throwaway ref. `--no-verify` is required so local hooks do not run.
-
-7. Return a concise plain-text final assistant message only — no GitHub posting — with:
-   - pushed ref: `refs/harness-integrate/{{version}}`
+5. Return a concise plain-text final assistant message only — no GitHub posting — with:
+   - local candidate branch: `{{branch}}`
    - integration commit SHA: output of `git rev-parse HEAD` (the single squash commit)
-   - built artifact path(s) under `packages/opencode/dist/`
 </procedure>
 
 Context:
@@ -130,12 +85,8 @@ Requirements:
 - Name the branch {{branch}}.
 - Merge refs {{merges}} into {{branch}} in order.
 - If there are merge conflicts, resolve them completely.
-- After merging and resolving conflicts, collapse the integration into a single commit on top of {{tag}} with `git reset --soft {{tag}}` then `git commit`. The pushed ref must have exactly one commit above {{tag}}; `git diff {{tag}}..HEAD` must contain all carried refs.
-- Build the host CLI.
-- The CLI must be compiled with stable release identity: OPENCODE_CHANNEL=latest and OPENCODE_VERSION={{version}}.
-- In this automation clone, `origin` is the upstream OpenCode repo ({{release_repo}}), not `fro-bot/agent`. Do not push to `origin`.
-- Fro Bot setup exports `GH_TOKEN` with push access to `fro-bot/agent`. Use that existing token for git HTTPS auth. Do not put tokens in remote URLs, do not print tokens, and do not improvise alternate auth flows.
-- Push with `--no-verify` and `HUSKY=0`; skipping local pre-push hooks is intentional because downstream workflow jobs perform verification.
+  - After merging and resolving conflicts, collapse the integration into a single local commit on top of {{tag}} with `git reset --soft {{tag}}` then `git commit`. The candidate must have exactly one commit above {{tag}}; `git diff {{tag}}..HEAD` must contain all carried refs.
+  - Do not build the host CLI, authenticate Git, add a harness remote, or push. Trusted code performs those operations from a fresh checkout of this commit.
 - Do not run repo-wide typecheck/test/lint unless needed to diagnose a failed required build step.
 
-If anything fails, fix it and continue until the branch is integrated, the configured build succeeds, and the ref is pushed.
+If anything fails, fix it and continue until the local candidate is integrated and clean, then stop for trusted finalization.

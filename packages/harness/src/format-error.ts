@@ -13,7 +13,7 @@
  */
 
 /** Maximum length of the formatted error message (characters). */
-export const FORMAT_ERROR_MAX_LENGTH = 300
+export const FORMAT_ERROR_MAX_LENGTH = 2000
 
 /** Placeholder substituted for each redacted secret. */
 const REDACTED = '[REDACTED]'

@@ -23,15 +23,17 @@ import type {
   IntegrationStage,
   TrustedPushRepository,
 } from './integrate.js'
+import type {CarryManifest} from './sources.js'
 import {execFileSync, execSync} from 'node:child_process'
 import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
+import {DEFAULT_SHADOW_CONFLICT_MODEL_TIMEOUT_MS} from './conflict-resolver.js'
 import {formatPipelineError} from './format-error.js'
-import {buildIntegrationOutcomeFile, writeIntegrationOutcomeFile} from './forward-shadow.js'
-import {makeRealAdapters, runIntegration} from './integrate.js'
+import {makeRealAdapters, runIntegration, writeProvenanceManifest} from './integrate.js'
+import {resolveSources} from './sources.js'
 
 // ---------------------------------------------------------------------------
 // Config file shape
@@ -77,8 +79,8 @@ interface ParsedFlags {
   readonly workDir: string | undefined
   readonly promptPath: string | undefined
   readonly out: string | undefined
-  readonly resultOut: string | undefined
   readonly dryRun: boolean | undefined
+  readonly candidate: boolean
   readonly pushRepo: string | undefined
   readonly pushRef: string | undefined
 }
@@ -92,8 +94,8 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
   let workDir: string | undefined
   let promptPath: string | undefined
   let out: string | undefined
-  let resultOut: string | undefined
   let dryRun: boolean | undefined
+  let candidate = false
   let pushRepo: string | undefined
   let pushRef: string | undefined
 
@@ -103,12 +105,15 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
       dryRun = true
       continue
     }
+    if (arg === '--candidate') {
+      candidate = true
+      continue
+    }
     if (
       arg === '--work-dir' ||
       arg === '--base-version' ||
       arg === '--prompt-path' ||
       arg === '--out' ||
-      arg === '--result-out' ||
       arg === '--push-repo' ||
       arg === '--push-ref'
     ) {
@@ -127,8 +132,6 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
         pushRepo = next
       } else if (arg === '--push-ref') {
         pushRef = next
-      } else if (arg === '--result-out') {
-        resultOut = next
       } else {
         out = next
       }
@@ -136,7 +139,7 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
     }
   }
 
-  return {baseVersion, workDir, promptPath, out, resultOut, dryRun, pushRepo, pushRef}
+  return {baseVersion, workDir, promptPath, out, dryRun, candidate, pushRepo, pushRef}
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +262,7 @@ async function finalizeLocalIntegration(
   result: IntegrationResult,
   completion: ArtifactCompletion,
   logger: IntegrateLogger,
+  preparedTrustedRepository?: TrustedPushRepository,
 ): Promise<IntegrationResult> {
   if (completion !== artifactCompletion) return integrationFailure('provenance', 'artifact completion proof is invalid')
   if (result.ok !== true) return result
@@ -268,15 +272,21 @@ async function finalizeLocalIntegration(
   const expectation = treeExpectationFor(config, integrationCommit)
   const dryRun = config.dryRun === true || (config.dryRun === undefined && config.pushTarget === undefined)
 
-  if (dryRun) return {ok: true, manifest, dryRun: true, pushed: false}
+  if (dryRun) {
+    if (preparedTrustedRepository !== undefined) await preparedTrustedRepository.cleanup()
+    return {ok: true, manifest, dryRun: true, pushed: false}
+  }
 
   try {
-    const currentCommit = await adapters.getCommitSha(config.workDir)
+    // Candidate finalization has already materialized the frozen authority; the
+    // code-owned path still validates its original integration checkout here.
+    const validationWorkDir = preparedTrustedRepository?.workDir ?? config.workDir
+    const currentCommit = await adapters.getCommitSha(validationWorkDir)
     if (currentCommit !== integrationCommit) {
       throw new Error(`integration HEAD drifted: expected frozen commit ${integrationCommit}, found ${currentCommit}`)
     }
-    await adapters.validateFinalTree(config.workDir, expectation)
-    const finalCommit = await adapters.getCommitSha(config.workDir)
+    await adapters.validateFinalTree(validationWorkDir, expectation)
+    const finalCommit = await adapters.getCommitSha(validationWorkDir)
     if (finalCommit !== integrationCommit) {
       throw new Error(`integration HEAD drifted: expected frozen commit ${integrationCommit}, found ${finalCommit}`)
     }
@@ -294,12 +304,9 @@ async function finalizeLocalIntegration(
 
   let trustedRepository: TrustedPushRepository
   try {
-    trustedRepository = await adapters.prepareTrustedPushRepository(
-      config.workDir,
-      integrationCommit,
-      manifest,
-      expectation,
-    )
+    trustedRepository =
+      preparedTrustedRepository ??
+      (await adapters.prepareTrustedPushRepository(config.workDir, integrationCommit, manifest, expectation))
   } catch (error) {
     return integrationFailure('tree', error)
   }
@@ -330,6 +337,169 @@ async function finalizeLocalIntegration(
   return primaryResult
 }
 
+function candidateDirtyPaths(workDir: string): string[] {
+  const statusOutput = execSync('git status --porcelain=v1 --untracked-files=all', {cwd: workDir, encoding: 'utf8'})
+  return statusOutput
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(line => line.length > 0)
+}
+
+async function withBlankedPushTokens<T>(operation: () => Promise<T>): Promise<T> {
+  const savedGhToken = process.env.GH_TOKEN
+  const savedGithubToken = process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+  delete process.env.GITHUB_TOKEN
+  try {
+    return await operation()
+  } finally {
+    if (savedGhToken === undefined) delete process.env.GH_TOKEN
+    else process.env.GH_TOKEN = savedGhToken
+    if (savedGithubToken === undefined) delete process.env.GITHUB_TOKEN
+    else process.env.GITHUB_TOKEN = savedGithubToken
+  }
+}
+
+/**
+ * Freezes a model-produced local candidate, then delegates build, packaging,
+ * validation, and push to the existing trusted repository machinery.
+ */
+export async function finalizeCandidateIntegration(
+  config: IntegrationConfig,
+  outPath: string,
+  adapters: IntegrationAdapters,
+  _packageArtifact: typeof packageArtifact = packageArtifact,
+  logger: IntegrateLogger = silentIntegrateLogger,
+): Promise<IntegrationResult> {
+  let dirtyPaths: string[]
+  try {
+    dirtyPaths = candidateDirtyPaths(config.workDir)
+  } catch (error) {
+    return integrationFailure('tree', error)
+  }
+  if (dirtyPaths.length > 0) {
+    return integrationFailure(
+      'tree',
+      `candidate working tree is dirty at freeze time; refusing to freeze:\n${dirtyPaths.join('\n')}`,
+    )
+  }
+
+  let integrationCommit: string
+  try {
+    integrationCommit = await adapters.getCommitSha(config.workDir)
+  } catch (error) {
+    return integrationFailure('commit', error)
+  }
+  const expectation = treeExpectationFor(config, integrationCommit)
+
+  try {
+    await adapters.validateFinalTree(config.workDir, expectation)
+  } catch (error) {
+    return integrationFailure('tree', error)
+  }
+
+  const sourceRepo = config.sourceRepo ?? `https://github.com/${config.releaseRepo}.git`
+  let sources: ReturnType<typeof resolveSources>
+  try {
+    sources = resolveSources(config.integrationRefs, sourceRepo)
+  } catch (error) {
+    return integrationFailure('sources', error)
+  }
+  const resolvedShas: string[] = []
+  for (const source of sources) {
+    if (adapters.getRefSha === undefined) {
+      return integrationFailure('provenance', 'candidate ref resolution is unavailable')
+    }
+    try {
+      resolvedShas.push(await adapters.getRefSha(config.workDir, source.merge))
+    } catch (error) {
+      return integrationFailure(
+        'provenance',
+        `candidate source ${source.label} SHA resolution failed: ${formatPipelineError(error)}`,
+      )
+    }
+  }
+
+  const manifest = {
+    baseVersion: config.baseVersion,
+    carryManifest: {
+      base: `v${config.baseVersion}`,
+      carries: sources.map((source, index) => ({
+        ref: config.integrationRefs[index] ?? source.label,
+        resolvedSha: resolvedShas[index] ?? '',
+      })),
+    } satisfies CarryManifest,
+    integrationRefs: sources.map((source, index) => ({
+      ref: config.integrationRefs[index] ?? source.label,
+      resolvedSha: resolvedShas[index] ?? '',
+    })),
+    integrationCommit,
+    buildSha: 'dev',
+  }
+
+  let trustedRepository: TrustedPushRepository
+  try {
+    await writeProvenanceManifest(config.workDir, manifest)
+    trustedRepository = await adapters.prepareTrustedPushRepository(
+      config.workDir,
+      integrationCommit,
+      manifest,
+      expectation,
+    )
+  } catch (error) {
+    return integrationFailure('provenance', error)
+  }
+
+  let handedOff = false
+  try {
+    const installDependencies = adapters.installDependencies
+    if (installDependencies === undefined) {
+      throw new Error('trusted frozen checkout dependency installation is unavailable')
+    }
+
+    await withBlankedPushTokens(async () => {
+      await installDependencies(trustedRepository.workDir)
+      await adapters.buildCli(trustedRepository.workDir, config.baseVersion, 'latest')
+      await adapters.verifyVersion(trustedRepository.workDir, config.baseVersion)
+      const trustedCommit = await adapters.getCommitSha(trustedRepository.workDir)
+      if (trustedCommit !== integrationCommit) {
+        throw new Error(
+          `trusted build HEAD drifted: expected frozen commit ${integrationCommit}, found ${trustedCommit}`,
+        )
+      }
+      await adapters.validateFinalTree(trustedRepository.workDir, expectation)
+      await _packageArtifact(trustedRepository.workDir, integrationCommit, outPath)
+    })
+
+    const finalized = await finalizeLocalIntegration(
+      config,
+      adapters,
+      {ok: true, manifest, dryRun: false, pushed: false},
+      artifactCompletion,
+      logger,
+      trustedRepository,
+    )
+    handedOff = true
+    return finalized
+  } catch (error) {
+    return integrationFailure('build', error)
+  } finally {
+    if (handedOff === false) {
+      try {
+        await trustedRepository.cleanup()
+      } catch (error) {
+        try {
+          logger.warning('trusted candidate repository cleanup failed after candidate failure', {
+            error: formatPipelineError(error),
+          })
+        } catch {
+          // Cleanup diagnostics must not mask the candidate failure.
+        }
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main command
 // ---------------------------------------------------------------------------
@@ -349,7 +519,6 @@ export async function cmdIntegrate(
   _packageArtifact: typeof packageArtifact = packageArtifact,
   logger: IntegrateLogger = silentIntegrateLogger,
 ): Promise<number> {
-  const startedAt = new Date().toISOString()
   const brokerAuthJson = process.env.HARNESS_BROKER_AUTH_JSON
   delete process.env.HARNESS_BROKER_AUTH_JSON
 
@@ -413,56 +582,34 @@ export async function cmdIntegrate(
     pushTarget,
   }
 
-  const writeOutcome = async (
-    result: IntegrationResult,
-    failure?: {readonly stage: string; readonly error: string},
-  ): Promise<boolean> => {
-    if (flags.resultOut === undefined) return true
-    try {
-      await writeIntegrationOutcomeFile(
-        flags.resultOut,
-        buildIntegrationOutcomeFile(result, startedAt, new Date().toISOString(), failure),
-      )
-      return true
-    } catch (error) {
-      console.error(`[integrate] Failed to write result file: ${formatPipelineError(error)}`)
-      return false
-    }
-  }
-
   // Run the integration and package the artifact.
   try {
-    const adapters = makeRealAdapters()
+    const adapters = makeRealAdapters({
+      conflictModelTimeoutMs: config.dryRun === true ? DEFAULT_SHADOW_CONFLICT_MODEL_TIMEOUT_MS : undefined,
+    })
+    if (flags.candidate) {
+      const result = await finalizeCandidateIntegration(config, outPath, adapters, _packageArtifact, logger)
+      if (result.ok === true) return 0
+      console.error(`[integrate] ${result.error}`)
+      return 1
+    }
+
     const result = await runIntegration(config, adapters)
     if (result.ok === true) {
       try {
         await _packageArtifact(workDir, result.manifest.integrationCommit, outPath)
       } catch (error) {
-        const packaged = await writeOutcome(result, {stage: 'artifact', error: formatPipelineError(error)})
-        if (packaged === false) return 1
         console.error(`[integrate] ${formatPipelineError(error)}`)
         return 1
       }
       const finalized = await finalizeLocalIntegration(config, adapters, result, artifactCompletion, logger)
-      if (finalized.ok === true) {
-        const written = await writeOutcome(finalized)
-        return written ? 0 : 1
-      }
-      const written = await writeOutcome(result, {
-        stage: finalized.stage ?? 'finalize',
-        error: finalized.error,
-      })
-      if (written === false) return 1
+      if (finalized.ok === true) return 0
       console.error(`[integrate] ${finalized.error}`)
       return 1
     }
-    const written = await writeOutcome(result)
-    if (written === false) return 1
     console.error(`[integrate] ${result.error}`)
     return 1
   } catch (error) {
-    const failed: IntegrationResult = {ok: false, stage: 'provenance', error: formatPipelineError(error)}
-    await writeOutcome(failed, {stage: 'command', error: formatPipelineError(error)})
     console.error(`[integrate] ${formatPipelineError(error)}`)
     return 1
   }

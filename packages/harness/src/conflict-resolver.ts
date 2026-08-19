@@ -36,6 +36,8 @@ export const MAX_CONFLICT_CONTEXT_BYTES = 48 * 1024
 export const MAX_CONFLICT_CONTEXT_FILES = 8
 export const MAX_CONFLICT_CONTEXT_REQUESTS = 8
 export const DEFAULT_CONFLICT_MODEL_TIMEOUT_MS = 30 * 60 * 1000
+/** Shadow evidence model deadline: enough for a repair attempt, bounded below the authoritative 30-minute budget. */
+export const DEFAULT_SHADOW_CONFLICT_MODEL_TIMEOUT_MS = 5 * 60 * 1000
 const MODEL_OUTPUT_MAX_BUFFER = 8 * 1024 * 1024
 
 const RUNTIME_ENV_KEYS = [

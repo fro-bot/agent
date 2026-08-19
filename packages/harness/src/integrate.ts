@@ -10,7 +10,7 @@
 
 import type {ConflictResolutionRequest, ConflictResolverResult} from './conflict-resolver.js'
 import type {IntegrationRefRecord} from './provenance.js'
-import type {IntegrationSource} from './sources.js'
+import type {CarryManifest, IntegrationSource, ResolvedIntegrationSource} from './sources.js'
 import {Buffer} from 'node:buffer'
 import {execFile} from 'node:child_process'
 import crypto from 'node:crypto'
@@ -21,7 +21,20 @@ import process from 'node:process'
 import {promisify} from 'node:util'
 import {HARNESS_GIT_IDENTITY, resolveConflict as resolveConflictAttempt} from './conflict-resolver.js'
 import {formatPipelineError} from './format-error.js'
-import {resolveSources} from './sources.js'
+import {
+  carrySourceChangedError,
+  carrySourceFetchError,
+  isValidCarryManifest,
+  resolveCarryManifest,
+  sourcesFromCarryManifest,
+} from './sources.js'
+
+/** Driver deadline: leaves the workflow backstop time to record a named failure and upload evidence. */
+export const DEFAULT_INTEGRATION_PIPELINE_TIMEOUT_MS = 75 * 60 * 1000
+/** Git command deadline: generous for a large hosted-runner clone/fetch, short enough to fail a wedged process. */
+export const GIT_SUBPROCESS_TIMEOUT_MS = 10 * 60 * 1000
+/** Error name used when the trusted integration ref changed after lease capture. */
+export const TRUSTED_PUSH_LEASE_REJECTED_ERROR_NAME = 'TrustedPushLeaseRejectedError'
 
 // Re-export so callers that previously imported from integrate.ts still work.
 export type {IntegrationRefRecord} from './provenance.js'
@@ -32,6 +45,8 @@ export type {IntegrationRefRecord} from './provenance.js'
 
 export interface ProvenanceManifest {
   readonly baseVersion: string
+  /** Required on manifests emitted by the current integration pipeline; optional for legacy test/build scaffolds. */
+  readonly carryManifest?: CarryManifest
   readonly integrationRefs: readonly IntegrationRefRecord[]
   readonly integrationCommit: string
   readonly buildSha: string
@@ -55,6 +70,7 @@ export interface IntegrationConfig {
   readonly releaseRepo: string
   readonly sourceRepo?: string
   readonly integrationRefs: readonly string[]
+  readonly carryManifest?: CarryManifest
   readonly workDir: string
   readonly dryRun?: boolean
   readonly pushTarget?: IntegrationPushTarget
@@ -65,6 +81,8 @@ export interface IntegrationConfig {
   readonly brokerAuthJson?: string
   readonly runnerTempDir?: string
   readonly promptPath?: string
+  /** Overall driver deadline; callers may shorten it for fail-soft shadow evidence. */
+  readonly pipelineTimeoutMs?: number
 }
 
 export type MergeOutcome =
@@ -113,6 +131,7 @@ export type IntegrationStage =
   | 'provenance'
   | 'cleanup'
   | 'push'
+  | 'deadline'
 
 export type IntegrationResult =
   | {
@@ -140,8 +159,16 @@ export interface IntegrationAdapters {
   readonly cloneRepo: (repoUrl: string, workDir: string, tag?: string) => Promise<void>
   /** Fetch tags from the anonymous origin. */
   readonly fetchTags: (workDir: string) => Promise<void>
-  /** Fetch one public integration ref into a local tracking ref. */
-  readonly fetchRef: (workDir: string, remoteUrl: string, fetchRef: string, localRef: string) => Promise<void>
+  /** Fetch one public integration ref into a local tracking ref and verify its frozen SHA. */
+  readonly fetchRef: (
+    workDir: string,
+    remoteUrl: string,
+    fetchRef: string,
+    localRef: string,
+    expectedSha?: string,
+  ) => Promise<void>
+  /** Resolve one public integration ref to its current SHA before any carry fetches. */
+  readonly resolveRefSha?: (remoteUrl: string, fetchRef: string) => Promise<string>
   /** Capture the resolved upstream SHA immediately after fetchRef. */
   readonly captureRefSha: (workDir: string) => Promise<string | null>
   /** Create/reset the integration branch to the release tag. */
@@ -174,10 +201,14 @@ export interface IntegrationAdapters {
   readonly commitIntegration: (workDir: string, message: string) => Promise<void>
   /** Build the native CLI in the integrated work repo. */
   readonly buildCli: (workDir: string, version: string, channel: string) => Promise<void>
+  /** Install the frozen checkout's locked dependencies before building it. */
+  readonly installDependencies?: (workDir: string) => Promise<void>
   /** Verify the built CLI --version matches the expected base version exactly. */
   readonly verifyVersion: (workDir: string, expectedVersion: string) => Promise<void>
   /** Get the current HEAD commit SHA of the work repo. */
   readonly getCommitSha: (workDir: string) => Promise<string>
+  /** Resolve a local candidate ref to its commit SHA. */
+  readonly getRefSha?: (workDir: string, ref: string) => Promise<string>
   /** Validate the final commit/tree before and immediately before push. */
   readonly validateFinalTree: (workDir: string, expectation: FinalTreeExpectation) => Promise<void>
   /** Materialize and revalidate the frozen commit in a fresh trusted repository. */
@@ -229,6 +260,7 @@ function isValidIntegrationRefRecord(value: unknown): value is IntegrationRefRec
 export function isValidProvenanceManifest(value: unknown): value is ProvenanceManifest {
   if (!isRecord(value)) return false
   if (typeof value.baseVersion !== 'string' || value.baseVersion.length === 0) return false
+  if (isValidCarryManifest(value.carryManifest) === false) return false
   if (!Array.isArray(value.integrationRefs)) return false
   if (!value.integrationRefs.every(isValidIntegrationRefRecord)) return false
   if (typeof value.integrationCommit !== 'string' || value.integrationCommit.length === 0) return false
@@ -327,6 +359,12 @@ function trustedGitEnv(): NodeJS.ProcessEnv {
 
 export interface RealAdapterOptions {
   readonly hooksRoot?: string
+  /** Test seam for exercising subprocess timeout handling without network access. */
+  readonly gitBin?: string
+  /** Test seam; production uses GIT_SUBPROCESS_TIMEOUT_MS. */
+  readonly gitTimeoutMs?: number
+  /** Shadow callers may shorten model attempts without changing authoritative integration. */
+  readonly conflictModelTimeoutMs?: number
 }
 
 interface GitSubprocess {
@@ -336,7 +374,20 @@ interface GitSubprocess {
   readonly dispose: () => Promise<void>
 }
 
-function makeGitSubprocess(hooksRoot: string): GitSubprocess {
+function isGitSubprocessTimeout(error: unknown): boolean {
+  if (error === null || typeof error !== 'object') return false
+  const record = error as Record<string, unknown>
+  return record.code === 'ETIMEDOUT' || (record.killed === true && record.signal === 'SIGTERM')
+}
+
+function gitSubprocessError(error: unknown, args: readonly string[], timeoutMs: number): unknown {
+  if (isGitSubprocessTimeout(error) === false) return error
+  const timeoutError = new Error(`git subprocess timed out after ${timeoutMs}ms: git ${args.join(' ')}`)
+  timeoutError.name = 'GitSubprocessTimeoutError'
+  return timeoutError
+}
+
+function makeGitSubprocess(hooksRoot: string, gitBin = 'git', timeoutMs = GIT_SUBPROCESS_TIMEOUT_MS): GitSubprocess {
   let hooksPathPromise: Promise<string> | undefined
   let disposePromise: Promise<void> | undefined
   let disposeRequested = false
@@ -367,21 +418,25 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
     begin()
     try {
       const disabledHooksPath = await hooksPath()
-      const result = await execFileAsync(
-        'git',
-        [
-          '-c',
-          'credential.helper=',
-          '-c',
-          'core.askPass=',
-          ...HARNESS_GIT_IDENTITY,
-          '-c',
-          `core.hooksPath=${disabledHooksPath}`,
-          ...args,
-        ],
-        {cwd, encoding: 'utf8', env},
-      )
-      return result.stdout.trim()
+      try {
+        const result = await execFileAsync(
+          gitBin,
+          [
+            '-c',
+            'credential.helper=',
+            '-c',
+            'core.askPass=',
+            ...HARNESS_GIT_IDENTITY,
+            '-c',
+            `core.hooksPath=${disabledHooksPath}`,
+            ...args,
+          ],
+          {cwd, encoding: 'utf8', env, timeout: timeoutMs},
+        )
+        return result.stdout.trim()
+      } catch (error) {
+        throw gitSubprocessError(error, args, timeoutMs)
+      }
     } finally {
       end()
     }
@@ -391,21 +446,25 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
     begin()
     try {
       const disabledHooksPath = await hooksPath()
-      const result = await execFileAsync(
-        'git',
-        [
-          '-c',
-          'credential.helper=',
-          '-c',
-          'core.askPass=',
-          ...HARNESS_GIT_IDENTITY,
-          '-c',
-          `core.hooksPath=${disabledHooksPath}`,
-          ...args,
-        ],
-        {cwd, encoding: 'buffer', env},
-      )
-      return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout)
+      try {
+        const result = await execFileAsync(
+          gitBin,
+          [
+            '-c',
+            'credential.helper=',
+            '-c',
+            'core.askPass=',
+            ...HARNESS_GIT_IDENTITY,
+            '-c',
+            `core.hooksPath=${disabledHooksPath}`,
+            ...args,
+          ],
+          {cwd, encoding: 'buffer', env, timeout: timeoutMs},
+        )
+        return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout)
+      } catch (error) {
+        throw gitSubprocessError(error, args, timeoutMs)
+      }
     } finally {
       end()
     }
@@ -415,12 +474,16 @@ function makeGitSubprocess(hooksRoot: string): GitSubprocess {
     begin()
     try {
       const disabledHooksPath = await hooksPath()
-      const result = await execFileAsync(
-        'git',
-        ['-c', 'credential.helper=', ...HARNESS_GIT_IDENTITY, '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
-        {cwd, encoding: 'utf8', env},
-      )
-      return result.stdout.trim()
+      try {
+        const result = await execFileAsync(
+          gitBin,
+          ['-c', 'credential.helper=', ...HARNESS_GIT_IDENTITY, '-c', `core.hooksPath=${disabledHooksPath}`, ...args],
+          {cwd, encoding: 'utf8', env, timeout: timeoutMs},
+        )
+        return result.stdout.trim()
+      } catch (error) {
+        throw gitSubprocessError(error, args, timeoutMs)
+      }
     } finally {
       end()
     }
@@ -584,6 +647,51 @@ function assertPushTarget(target: IntegrationPushTarget): void {
   }
 }
 
+function errorText(error: unknown): string {
+  if (error instanceof Error) {
+    const record = error as Error & {readonly stderr?: unknown}
+    const stderr = typeof record.stderr === 'string' ? record.stderr : ''
+    return `${error.message}\n${stderr}`
+  }
+  return String(error)
+}
+
+// `stale info` is git's authoritative marker for a rejected `--force-with-lease`. The second
+// pattern is a defensive fallback only: it would not survive git abbreviating the expected SHA
+// or localizing the message, so it must never be relied on as the primary signal.
+function isTrustedPushLeaseRejection(error: unknown): boolean {
+  const text = errorText(error)
+  return /stale info/i.test(text) || /cannot lock ref .*expected [0-9a-f]{40}/i.test(text)
+}
+
+function trustedPushLeaseRejectedError(targetRef: string, cause: unknown): Error {
+  const error = new Error(
+    `trusted integration ref moved underneath this run: ${targetRef}; ${formatPipelineError(cause)}`,
+  )
+  error.name = TRUSTED_PUSH_LEASE_REJECTED_ERROR_NAME
+  return error
+}
+
+// The expected value is captured out-of-band because the trusted repository is materialized fresh
+// and has no local tracking ref for the target, so git has nothing to lease against implicitly.
+// A ref that moves between this lookup and the push is not a race: the lease rejects that push,
+// which is precisely the protection being bought here.
+async function resolvePushLeaseExpectation(
+  git: GitSubprocess,
+  target: IntegrationPushTarget,
+  workDir: string,
+  env: NodeJS.ProcessEnv,
+): Promise<string> {
+  const output = await git.authExec(['ls-remote', '--refs', target.repository, target.ref], workDir, env)
+  const firstLine = splitLines(output)[0]
+  if (firstLine === undefined || firstLine.length === 0) return ''
+  const [sha, ref] = firstLine.split(/\s+/)
+  if (sha === undefined || ref !== target.ref || /^[0-9a-f]{40}$/i.test(sha) === false) {
+    throw new Error(`push target ref ${target.ref} did not resolve to a commit SHA`)
+  }
+  return sha.toLowerCase()
+}
+
 function assertCommitSha(commit: string): void {
   if (!/^[0-9a-f]{40}$/i.test(commit)) throw new Error('integration commit must be a full hexadecimal SHA')
 }
@@ -618,6 +726,8 @@ async function prepareTrustedPushRepositoryReal(
     await git.exec(['update-ref', `refs/tags/${expectation.baseTag}`, baseCommit], trustedWorkDir, trustedGitEnv())
     await git.exec(['update-ref', 'refs/harness/frozen', integrationCommit], trustedWorkDir, trustedGitEnv())
     await git.exec(['symbolic-ref', 'HEAD', 'refs/harness/frozen'], trustedWorkDir, trustedGitEnv())
+    await git.exec(['checkout', '--quiet', '--detach', 'refs/harness/frozen'], trustedWorkDir, trustedGitEnv())
+    await fs.mkdir(path.join(trustedWorkDir, '.github', 'workflows'), {recursive: true})
 
     const actualCommit = await git.exec(['rev-parse', 'refs/harness/frozen^{commit}'], trustedWorkDir, trustedGitEnv())
     if (actualCommit !== integrationCommit) {
@@ -652,13 +762,12 @@ async function prepareTrustedPushRepositoryReal(
 }
 
 export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationAdapters {
-  const git = makeGitSubprocess(options.hooksRoot ?? os.tmpdir())
+  const git = makeGitSubprocess(options.hooksRoot ?? os.tmpdir(), options.gitBin, options.gitTimeoutMs)
   return {
     cloneRepo: async (repoUrl, workDir, tag) => {
       await fs.rm(workDir, {recursive: true, force: true})
       await fs.mkdir(path.dirname(workDir), {recursive: true})
-      const cloneArgs =
-        tag === undefined ? ['clone', repoUrl, workDir] : ['clone', '--depth', '1', '--branch', tag, repoUrl, workDir]
+      const cloneArgs = tag === undefined ? ['clone', repoUrl, workDir] : ['clone', '--branch', tag, repoUrl, workDir]
       await git.exec(cloneArgs, undefined, publicGitEnv())
     },
 
@@ -666,8 +775,31 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
       await git.exec(['fetch', 'origin', '--tags'], workDir, publicGitEnv())
     },
 
-    fetchRef: async (workDir, remoteUrl, fetchRef, localRef) => {
-      await git.exec(['fetch', '--no-tags', remoteUrl, `${fetchRef}:${localRef}`], workDir, publicGitEnv())
+    fetchRef: async (workDir, remoteUrl, fetchRef, localRef, expectedSha) => {
+      try {
+        await git.exec(['fetch', '--no-tags', remoteUrl, `${fetchRef}:${localRef}`], workDir, publicGitEnv())
+      } catch (error) {
+        if (expectedSha !== undefined) throw carrySourceFetchError({label: fetchRef}, error)
+        throw error
+      }
+      if (expectedSha !== undefined) {
+        const actualSha = await git.exec(['rev-parse', `${localRef}^{commit}`], workDir, publicGitEnv())
+        if (actualSha !== expectedSha) {
+          throw carrySourceChangedError({label: fetchRef}, expectedSha, actualSha)
+        }
+      }
+    },
+
+    resolveRefSha: async (remoteUrl, fetchRef) => {
+      const output = await git.exec(['ls-remote', remoteUrl, fetchRef], undefined, publicGitEnv())
+      const firstLine = splitLines(output)[0]
+      const resolvedSha = firstLine?.split(/\s+/)[0]
+      if (resolvedSha === undefined || /^[0-9a-f]{40}$/i.test(resolvedSha) === false) {
+        const error = new Error(`remote ref ${fetchRef} did not resolve to a commit SHA`)
+        error.name = 'CarrySourceResolutionError'
+        throw error
+      }
+      return resolvedSha.toLowerCase()
     },
 
     captureRefSha: async workDir => {
@@ -697,7 +829,11 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
       }
     },
 
-    resolveConflict: async request => resolveConflictAttempt(request),
+    resolveConflict: async request =>
+      resolveConflictAttempt(
+        request,
+        options.conflictModelTimeoutMs === undefined ? {} : {modelTimeoutMs: options.conflictModelTimeoutMs},
+      ),
 
     stagePaths: async (workDir, paths) => {
       if (paths.length === 0) throw new Error('cannot stage an empty conflict path set')
@@ -744,6 +880,15 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
       })
     },
 
+    installDependencies: async workDir => {
+      await execFileAsync('bun', ['install', '--frozen-lockfile'], {
+        cwd: workDir,
+        encoding: 'utf8',
+        env: publicGitEnv(),
+        timeout: 20 * 60 * 1000,
+      })
+    },
+
     verifyVersion: async (workDir, expectedVersion) => {
       const cliPath = resolveCliPath(workDir)
       const {stdout} = await execFileAsync(cliPath, ['--version'], {
@@ -758,6 +903,8 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
     },
 
     getCommitSha: async workDir => git.exec(['rev-parse', 'HEAD'], workDir, publicGitEnv()),
+
+    getRefSha: async (workDir, ref) => git.exec(['rev-parse', `${ref}^{commit}`], workDir, publicGitEnv()),
 
     validateFinalTree: async (workDir, expectation) => validateFinalTreeReal(git, workDir, expectation),
 
@@ -794,11 +941,20 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
         env.HARNESS_PUSH_TOKEN = credential.token
         env.GIT_ASKPASS = askpass
         env.GIT_TERMINAL_PROMPT = '0'
-        await git.authExec(
-          ['push', '--no-verify', target.repository, `${sourceRef}:${target.ref}`],
-          trustedRepository.workDir,
-          env,
-        )
+        const expectedOldValue = await resolvePushLeaseExpectation(git, target, trustedRepository.workDir, env)
+        const pushArgs = [
+          'push',
+          '--no-verify',
+          `--force-with-lease=${target.ref}:${expectedOldValue}`,
+          target.repository,
+          `${sourceRef}:${target.ref}`,
+        ] as const
+        try {
+          await git.authExec(pushArgs, trustedRepository.workDir, env)
+        } catch (error) {
+          if (isTrustedPushLeaseRejection(error)) throw trustedPushLeaseRejectedError(target.ref, error)
+          throw error
+        }
       } finally {
         await fs.rm(tempDir, {recursive: true, force: true})
       }
@@ -814,6 +970,39 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
 
 function failure(stage: IntegrationStage, error: unknown): IntegrationResult {
   return {ok: false, kind: 'failure', stage, error: formatPipelineError(error)}
+}
+
+interface IntegrationDeadlineError extends Error {
+  readonly integrationStage: IntegrationStage
+  readonly timeoutMs: number
+}
+
+function integrationDeadlineError(stage: IntegrationStage, timeoutMs: number): IntegrationDeadlineError {
+  const error = new Error(`integration pipeline deadline exceeded during ${stage} after ${timeoutMs}ms`)
+  error.name = 'IntegrationDeadlineError'
+  Object.defineProperty(error, 'integrationStage', {value: stage})
+  Object.defineProperty(error, 'timeoutMs', {value: timeoutMs})
+  return error as IntegrationDeadlineError
+}
+
+function isIntegrationDeadlineError(error: unknown): error is IntegrationDeadlineError {
+  return error instanceof Error && error.name === 'IntegrationDeadlineError'
+}
+
+async function withIntegrationDeadline<T>(
+  operation: Promise<T>,
+  stage: () => IntegrationStage,
+  timeoutMs: number,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(integrationDeadlineError(stage(), timeoutMs)), timeoutMs)
+  })
+  try {
+    return await Promise.race([operation, deadline])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }
 
 function treeExpectationFor(config: IntegrationConfig, integrationCommit: string): FinalTreeExpectation {
@@ -840,6 +1029,24 @@ function sourceRefForManifest(source: IntegrationSource, configuredRef: string |
   return configuredRef === undefined ? source.label : configuredRef
 }
 
+function validateCarryManifestInput(
+  manifest: CarryManifest,
+  expectedBase: string,
+  configuredRefs: readonly string[],
+): string | null {
+  if (isValidCarryManifest(manifest) === false) return 'immutable carry manifest shape is invalid'
+  if (manifest.base !== expectedBase) return 'immutable carry manifest base does not match configuration'
+  if (manifest.carries.length !== configuredRefs.length)
+    return 'immutable carry manifest ref count does not match configuration'
+  for (const [index, carry] of manifest.carries.entries()) {
+    const configuredRef = configuredRefs[index]
+    if (configuredRef === undefined || carry.ref !== configuredRef) {
+      return `immutable carry manifest ref ${index} identity does not match configuration`
+    }
+  }
+  return null
+}
+
 function resolveReleaseRepoUrl(releaseRepo: string): string {
   const candidate = releaseRepo.startsWith('https://')
     ? releaseRepo.endsWith('.git')
@@ -863,6 +1070,13 @@ function validateManifest(
 ): string | null {
   if (!isValidProvenanceManifest(manifest)) return 'provenance manifest shape is invalid'
   if (manifest.baseVersion !== config.baseVersion) return 'provenance base version does not match configuration'
+  if (manifest.carryManifest === undefined) return 'provenance immutable carry manifest is missing'
+  const carryManifestError = validateCarryManifestInput(
+    manifest.carryManifest,
+    `v${config.baseVersion}`,
+    config.integrationRefs,
+  )
+  if (carryManifestError !== null) return carryManifestError
   if (manifest.integrationCommit !== integrationCommit) return 'provenance integration commit does not match HEAD'
   if (manifest.integrationRefs.length !== sources.length) {
     return 'provenance ref count does not match configured sources'
@@ -877,6 +1091,10 @@ function validateManifest(
     const expectedRef = sourceRefForManifest(source, config.integrationRefs[index])
     if (record.ref !== expectedRef) return `provenance ref ${index} identity does not match configuration`
     if (record.resolvedSha !== expectedSha) return `provenance ref ${index} SHA does not match the fetched source`
+    const carry = manifest.carryManifest.carries[index]
+    if (carry === undefined || carry.ref !== record.ref || carry.resolvedSha !== record.resolvedSha) {
+      return `provenance carry ${index} does not match the immutable carry manifest`
+    }
   }
 
   return null
@@ -892,6 +1110,7 @@ function validateManifest(
 async function runIntegrationPipeline(
   config: IntegrationConfig,
   adapters: IntegrationAdapters,
+  setStage: (stage: IntegrationStage) => void,
 ): Promise<IntegrationResult> {
   const {baseVersion, releaseRepo, integrationRefs, workDir} = config
   // Callers on the pre-U5 API did not have a push target. Preserve their local
@@ -906,48 +1125,69 @@ async function runIntegrationPipeline(
   let releaseRepoUrl: string
   let sourceRepoUrl: string
   try {
+    setStage('sources')
     releaseRepoUrl = resolveReleaseRepoUrl(releaseRepo)
     sourceRepoUrl = config.sourceRepo === undefined ? releaseRepoUrl : resolveReleaseRepoUrl(config.sourceRepo)
   } catch (error) {
     return failure('sources', error)
   }
 
-  let sources: IntegrationSource[]
+  let sources: ResolvedIntegrationSource[]
+  let carryManifest: CarryManifest
   try {
-    sources = resolveSources(integrationRefs, sourceRepoUrl)
+    setStage('sources')
+    if (config.carryManifest === undefined) {
+      if (integrationRefs.length > 0 && adapters.resolveRefSha === undefined) {
+        throw new Error('immutable carry manifest resolution is unavailable')
+      }
+      carryManifest = await resolveCarryManifest(tag, integrationRefs, sourceRepoUrl, async source => {
+        if (adapters.resolveRefSha === undefined) throw new Error('immutable carry manifest resolution is unavailable')
+        return adapters.resolveRefSha(source.repo, source.fetchRef)
+      })
+    } else {
+      const manifestError = validateCarryManifestInput(config.carryManifest, tag, integrationRefs)
+      if (manifestError !== null) throw new Error(manifestError)
+      carryManifest = config.carryManifest
+    }
+    sources = sourcesFromCarryManifest(carryManifest, sourceRepoUrl)
   } catch (error) {
     return failure('sources', error)
   }
 
   try {
+    setStage('clone')
     await adapters.cloneRepo(releaseRepoUrl, workDir, tag)
   } catch (error) {
     return failure('clone', error)
   }
 
   try {
+    setStage('fetch-tags')
     await adapters.fetchTags(workDir)
   } catch (error) {
     return failure('fetch-tags', error)
   }
 
   try {
+    setStage('branch')
     await adapters.createBranch(workDir, branch, tag)
   } catch (error) {
     return failure('branch', error)
   }
 
-  const resolvedShas: string[] = []
+  const resolvedShas = carryManifest.carries.map(carry => carry.resolvedSha)
   const conflictDiagnostics: ConflictResolverResult[] = []
   for (const source of sources) {
     try {
-      await adapters.fetchRef(workDir, source.repo, source.fetchRef, source.fetch)
+      setStage('fetch')
+      await adapters.fetchRef(workDir, source.repo, source.fetchRef, source.fetch, source.resolvedSha)
     } catch (error) {
       return failure('fetch', `fetch ref ${source.label} failed: ${formatPipelineError(error)}`)
     }
 
     let resolvedSha: string | null
     try {
+      setStage('provenance')
       resolvedSha = await adapters.captureRefSha(workDir)
     } catch (error) {
       return failure('provenance', `capture SHA for ${source.label} failed: ${formatPipelineError(error)}`)
@@ -955,10 +1195,13 @@ async function runIntegrationPipeline(
     if (resolvedSha === null || resolvedSha.length === 0) {
       return failure('provenance', `capture SHA for ${source.label} returned no resolved source SHA`)
     }
-    resolvedShas.push(resolvedSha)
+    if (resolvedSha.toLowerCase() !== source.resolvedSha) {
+      return failure('fetch', carrySourceChangedError(source, source.resolvedSha, resolvedSha).message)
+    }
 
     let preMergeCommit: string
     try {
+      setStage('merge')
       preMergeCommit = await adapters.getCommitSha(workDir)
     } catch (error) {
       return failure('merge', `capture pre-merge commit for ${source.label} failed: ${formatPipelineError(error)}`)
@@ -966,6 +1209,7 @@ async function runIntegrationPipeline(
 
     let mergeOutcome: MergeOutcome
     try {
+      setStage('merge')
       mergeOutcome = await adapters.mergeRef(workDir, source.merge)
     } catch (error) {
       return failure('merge', `merge ref ${source.label} failed: ${formatPipelineError(error)}`)
@@ -994,6 +1238,7 @@ async function runIntegrationPipeline(
 
       let resolution: ConflictResolverResult
       try {
+        setStage('merge')
         resolution = await adapters.resolveConflict({
           integrationWorkDir: workDir,
           preConflictCommit: preMergeCommit,
@@ -1043,6 +1288,7 @@ async function runIntegrationPipeline(
       }
 
       try {
+        setStage('merge')
         await adapters.stagePaths(workDir, resolution.resolvedPaths)
         await adapters.verifyStagedPaths(workDir, resolution.resolvedDigests)
         await adapters.assertNoUnmerged(workDir)
@@ -1062,18 +1308,21 @@ async function runIntegrationPipeline(
   const squashed = sources.length > 0
   if (squashed) {
     try {
+      setStage('squash')
       await adapters.resetToBase(workDir, tag)
     } catch (error) {
       return failure('squash', error)
     }
 
     try {
+      setStage('workflow-strip')
       await adapters.stripWorkflowFiles(workDir)
     } catch (error) {
       return failure('workflow-strip', error)
     }
 
     try {
+      setStage('commit')
       await adapters.commitIntegration(
         workDir,
         `harness: integrate OpenCode ${baseVersion} carrying ${sources.map(s => s.label).join(', ')}`,
@@ -1085,6 +1334,7 @@ async function runIntegrationPipeline(
 
   let integrationCommit: string
   try {
+    setStage('commit')
     integrationCommit = await adapters.getCommitSha(workDir)
   } catch (error) {
     return failure('commit', error)
@@ -1093,18 +1343,21 @@ async function runIntegrationPipeline(
   const treeExpectation = treeExpectationFor(config, integrationCommit)
 
   try {
+    setStage('tree')
     await adapters.validateFinalTree(workDir, treeExpectation)
   } catch (error) {
     return failure('tree', error)
   }
 
   try {
+    setStage('build')
     await adapters.buildCli(workDir, baseVersion, channel)
   } catch (error) {
     return failure('build', error)
   }
 
   try {
+    setStage('version')
     await adapters.verifyVersion(workDir, baseVersion)
   } catch (error) {
     return failure('version', error)
@@ -1113,6 +1366,7 @@ async function runIntegrationPipeline(
   // Recheck the frozen commit/tree after build and version verification. This is
   // the first point at which a build hook could have moved HEAD.
   try {
+    setStage('tree')
     await assertFrozenIntegrationHead(adapters, workDir, integrationCommit)
     await adapters.validateFinalTree(workDir, treeExpectation)
     await assertFrozenIntegrationHead(adapters, workDir, integrationCommit)
@@ -1122,6 +1376,7 @@ async function runIntegrationPipeline(
 
   const manifest: ProvenanceManifest = {
     baseVersion,
+    carryManifest,
     integrationRefs: sources.map((source, index) => ({
       ref: sourceRefForManifest(source, integrationRefs[index]),
       resolvedSha: resolvedShas[index] ?? '',
@@ -1134,6 +1389,7 @@ async function runIntegrationPipeline(
   if (manifestError !== null) return failure('provenance', manifestError)
 
   try {
+    setStage('provenance')
     await writeProvenanceManifest(workDir, manifest)
   } catch (error) {
     return failure('provenance', error)
@@ -1156,20 +1412,40 @@ export async function runIntegration(
   let pipelineThrew = false
   let disposeError: unknown
   let disposeThrew = false
-
+  let deadlineExceeded = false
   try {
     try {
-      pipelineResult = await runIntegrationPipeline(config, adapters)
+      let activeStage: IntegrationStage = 'sources'
+      const timeoutMs = config.pipelineTimeoutMs ?? DEFAULT_INTEGRATION_PIPELINE_TIMEOUT_MS
+      pipelineResult = await withIntegrationDeadline(
+        runIntegrationPipeline(config, adapters, stage => {
+          activeStage = stage
+        }),
+        () => activeStage,
+        timeoutMs,
+      )
     } catch (error) {
-      pipelineThrew = true
-      pipelineError = error
+      if (isIntegrationDeadlineError(error)) {
+        deadlineExceeded = true
+        pipelineResult = failure('deadline', error)
+      } else {
+        pipelineThrew = true
+        pipelineError = error
+      }
     }
   } finally {
-    try {
-      await adapters.dispose?.()
-    } catch (error) {
-      disposeThrew = true
-      disposeError = error
+    if (deadlineExceeded) {
+      // Do not let cleanup of an already-bounded subprocess hide the deadline
+      // record; the adapter owns its own subprocess timeout and best-effort cleanup.
+      const dispose = adapters.dispose
+      if (dispose !== undefined) dispose().catch(() => undefined)
+    } else {
+      try {
+        await adapters.dispose?.()
+      } catch (error) {
+        disposeThrew = true
+        disposeError = error
+      }
     }
   }
 
