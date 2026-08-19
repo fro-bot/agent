@@ -5,6 +5,7 @@ import { Session } from "./session"
 import { SessionID, MessageID, PartID } from "./schema"
 import { Provider } from "@/provider/provider"
 import { MessageV2 } from "./message-v2"
+import { LLM } from "./llm"
 import { Token } from "@/util/token"
 import { SessionProcessor } from "./processor"
 import { Agent } from "@/agent/agent"
@@ -12,7 +13,7 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context } from "effect"
+import { Cause, Effect, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -22,6 +23,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { SessionStatus } from "./status"
 
 export const Event = SessionCompactionEvent
 
@@ -46,42 +48,6 @@ type CompletedCompaction = {
   userIndex: number
   assistantIndex: number
   summary: string | undefined
-}
-
-const truncate = (value: string) =>
-  value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
-
-const serialize = (message: SessionV1.WithParts) => {
-  if (message.info.role === "user") {
-    const text = message.parts
-      .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.ignored)
-      .map((part) => part.text)
-      .filter(Boolean)
-      .join("\n")
-    const files = message.parts.flatMap((part) =>
-      part.type === "file" ? [`[Attached ${part.mime}: ${part.filename ?? "file"}]`] : [],
-    )
-    return [...(text ? [`[User]: ${text}`] : []), ...files].join("\n")
-  }
-  return message.parts
-    .flatMap((part) => {
-      if (part.type === "text") return part.text ? [`[Assistant]: ${part.text}`] : []
-      if (part.type === "reasoning") return part.text ? [`[Assistant reasoning]: ${part.text}`] : []
-      if (part.type !== "tool") return []
-      const call = `[Assistant tool call]: ${part.tool}(${JSON.stringify(part.state.input)})`
-      if (part.state.status === "completed") {
-        const attachments = (part.state.attachments ?? []).map(
-          (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
-        )
-        const output = part.state.time.compacted
-          ? "[Old tool result content cleared]"
-          : truncate([part.state.output, ...attachments].join("\n"))
-        return [call, `[Tool result]: ${output}`]
-      }
-      if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
-      return [call]
-    })
-    .join("\n")
 }
 
 function summaryText(message: SessionV1.WithParts) {
@@ -199,6 +165,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const status = yield* SessionStatus.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -369,26 +336,7 @@ const layer = Layer.effect(
         cfg,
         model,
       })
-      // Allow plugins to inject context or replace compaction prompt.
-      const compacting = yield* plugin.trigger(
-        "experimental.session.compacting",
-        { sessionID: input.sessionID },
-        { context: [], prompt: undefined },
-      )
       const msgs = structuredClone(selected.head)
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
-      const nextPrompt =
-        compacting.prompt ??
-        [
-          buildPrompt({
-            previousSummary,
-            context: [conversation],
-          }),
-          ...compacting.context,
-        ]
-          .filter(Boolean)
-          .join("\n\n")
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
@@ -417,31 +365,78 @@ const layer = Layer.effect(
         },
       }
       yield* session.updateMessage(msg)
-      const processor = yield* processors.create({
-        assistantMessage: msg,
-        sessionID: input.sessionID,
-        model,
+      const system = LLM.buildSystem({ agent, model, parts: [], user: userMessage })
+      const removeInterruptedSummary = Effect.gen(function* () {
+        yield* session.removeMessage({ sessionID: input.sessionID, messageID: msg.id }).pipe(Effect.ignore)
+        yield* status.set(input.sessionID, { type: "idle" })
       })
+      const finalizeFailedSummary = (error: unknown) =>
+        Effect.gen(function* () {
+          msg.error = MessageV2.fromError(error, { providerID: model.providerID })
+          msg.finish = "error"
+          msg.time.completed = Date.now()
+          yield* session.updateMessage(msg)
+          yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: msg.error })
+          yield* status.set(input.sessionID, { type: "idle" })
+        })
+      const prepared = yield* Effect.gen(function* () {
+        // Allow plugins to inject context or replace compaction prompt.
+        const compacting = yield* plugin.trigger(
+          "experimental.session.compacting",
+          { sessionID: input.sessionID },
+          { context: [], prompt: undefined },
+        )
+        const systemHeader = system[0]
+        yield* plugin.trigger(
+          "experimental.chat.system.transform",
+          { sessionID: input.sessionID, model },
+          { system },
+        )
+        LLM.rejoinSystemForCaching(system, systemHeader)
+        yield* plugin.trigger(
+          "experimental.chat.messages.transform",
+          { sessionID: input.sessionID, model: { providerID: model.providerID, modelID: model.id } },
+          { messages: msgs },
+        )
+        const messages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
+          stripMedia: true,
+          toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+        })
+        return {
+          messages,
+          nextPrompt: compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context }),
+        }
+      }).pipe(
+        Effect.catchCauseIf((cause) => !Cause.hasInterruptsOnly(cause), (cause) =>
+          finalizeFailedSummary(Cause.squash(cause)).pipe(Effect.as(undefined)),
+        ),
+        Effect.onInterrupt(() => removeInterruptedSummary),
+      )
+      if (!prepared) return "stop"
+      const processor = yield* processors
+        .create({
+          assistantMessage: msg,
+          sessionID: input.sessionID,
+          model,
+        })
+        .pipe(
+          Effect.catchCauseIf((cause) => !Cause.hasInterruptsOnly(cause), (cause) =>
+            finalizeFailedSummary(Cause.squash(cause)).pipe(Effect.as(undefined)),
+          ),
+          Effect.onInterrupt(() => removeInterruptedSummary),
+        )
+      if (!processor) return "stop"
       const result = yield* processor.process({
         user: userMessage,
         agent,
         sessionID: input.sessionID,
         tools: {},
-        system: [],
+        system,
         messages: [
+          ...prepared.messages,
           {
             role: "user",
-            content: [
-              {
-                type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n"),
-              },
-            ],
+            content: [{ type: "text", text: prepared.nextPrompt }],
           },
         ],
         model,
@@ -602,6 +597,7 @@ export const node = LayerNode.make({
     Provider.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
+    SessionStatus.node,
   ],
 })
 
