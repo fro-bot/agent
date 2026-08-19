@@ -49,7 +49,6 @@ export async function run(): Promise<number> {
   const createUnavailableOutputModeMigration = (): OutputModeMigrationState => ({
     requested: requestedOutputModeState,
     resolved: null,
-    legacyWouldSelectBranchPr: false,
   })
 
   const setUnavailableActionOutputs = (duration: number): void => {

@@ -17,7 +17,7 @@ OpenCode SDK execution with GitHub context injection, multi-section prompt const
 | **Prompt**    | `prompt.ts`        | Multi-section prompt with response protocol and output contract (420 L) |
 | **Budgeting** | `diff-context.ts`  | Context limits (50 files in context, 20 in prompt) (75 L)               |
 | **Types**     | `types.ts`         | `AgentContext`, `AgentResult`, `PromptOptions`, `DiffContext` (138 L)   |
-| **OutputMode** | `output-mode.ts`  | `resolveOutputMode()` for manual triggers; frozen phrase heuristic (72 L) |
+| **OutputMode** | `output-mode.ts`  | `resolveOutputMode()` for manual triggers; `auto` safely aliases `working-dir` |
 
 ## KEY EXPORTS
 

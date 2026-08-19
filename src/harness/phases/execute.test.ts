@@ -232,8 +232,8 @@ describe('runExecute overflow recovery', () => {
     mocks.searchSessions.mockResolvedValue([])
   })
 
-  it('warns on legacy branch/PR language while resolving auto safely and emitting migration state', async () => {
-    // #given a manual auto request whose prompt would have selected branch-pr under the legacy matcher
+  it('does not warn on legacy branch/PR language while resolving auto safely', async () => {
+    // #given a manual auto request whose prompt contains former legacy delivery language
     vi.stubEnv('SKIP_AGENT_EXECUTION', 'true')
     mocks.getInput.mockReturnValue('auto')
     mocks.resolveOutputMode.mockReturnValue('working-dir')
@@ -254,21 +254,10 @@ describe('runExecute overflow recovery', () => {
     // #when the execute phase resolves the delivery contract
     const result = await runExecute(bootstrap, routing, createCacheRestore(), createSessionPrep(), createMetrics(), 0)
 
-    // #then legacy inference is observable but cannot select branch-pr
+    // #then prompt wording has no effect and does not emit a migration warning
     expect(result.resolvedOutputMode).toBe('working-dir')
-    expect(mocks.warning).toHaveBeenCalledOnce()
-    const warning = JSON.parse(String(mocks.warning.mock.calls[0]?.[0])) as Record<string, unknown>
-    expect(warning).toMatchObject({
-      type: 'output-mode-migration',
-      requested: 'auto',
-      resolved: 'working-dir',
-      legacyWouldSelectBranchPr: true,
-    })
-    expect(result.outputModeMigration).toEqual({
-      requested: 'auto',
-      resolved: 'working-dir',
-      legacyWouldSelectBranchPr: true,
-    })
+    expect(mocks.warning).not.toHaveBeenCalled()
+    expect(result.outputModeMigration).toEqual({requested: 'auto', resolved: 'working-dir'})
     expect(mocks.setOutput).not.toHaveBeenCalled()
   })
 
@@ -306,7 +295,7 @@ describe('runExecute overflow recovery', () => {
 
       // #then the scalar result and structured output preserve the requested state
       expect(result.resolvedOutputMode).toBe(resolved)
-      expect(result.outputModeMigration).toEqual({requested, resolved, legacyWouldSelectBranchPr: false})
+      expect(result.outputModeMigration).toEqual({requested, resolved})
       expect(mocks.setOutput).not.toHaveBeenCalled()
     },
   )
