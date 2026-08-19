@@ -70,6 +70,60 @@ async function withEnvironment<T>(
   }
 }
 
+async function makeGitUrlWrapper(targetUrl: string, remoteDir: string): Promise<string> {
+  const wrapperPath = path.join(await makeTmpDir(), 'git-wrapper.mjs')
+  await fs.writeFile(
+    wrapperPath,
+    String.raw`#!/usr/bin/env node
+import {appendFileSync} from 'node:fs'
+import {spawnSync} from 'node:child_process'
+
+const args = process.argv.slice(2)
+const logPath = process.env.TEST_GIT_LOG
+if (logPath !== undefined) appendFileSync(logPath, JSON.stringify(args) + '\n')
+
+if (args.includes('push') && process.env.TEST_MOVE_SHA !== undefined) {
+  const update = spawnSync('git', ['--git-dir', ${JSON.stringify(remoteDir)}, 'update-ref', process.env.TEST_MOVE_REF ?? '', process.env.TEST_MOVE_SHA], {
+    encoding: 'utf8',
+  })
+  if (update.status !== 0) {
+    process.stderr.write(update.stderr ?? '')
+    process.exit(update.status ?? 1)
+  }
+}
+
+const rewritten = args.map(arg => (arg === ${JSON.stringify(targetUrl)} ? ${JSON.stringify(remoteDir)} : arg))
+const result = spawnSync('git', rewritten, {stdio: 'inherit'})
+if (result.error !== undefined) {
+  process.stderr.write(String(result.error))
+  process.exit(1)
+}
+process.exit(result.status ?? 1)
+`,
+    {encoding: 'utf8', mode: 0o700},
+  )
+  return wrapperPath
+}
+
+async function makeGitSourceRepository(): Promise<{
+  readonly dir: string
+  readonly firstSha: string
+  readonly headSha: string
+}> {
+  const dir = await makeTmpDir()
+  runGit(dir, ['init', '--quiet'])
+  runGit(dir, ['config', 'user.name', 'harness-test'])
+  runGit(dir, ['config', 'user.email', 'harness-test@example.invalid'])
+  await fs.writeFile(path.join(dir, 'file.txt'), 'first\n', 'utf8')
+  runGit(dir, ['add', 'file.txt'])
+  runGit(dir, ['commit', '--quiet', '-m', 'first'])
+  const firstSha = runGit(dir, ['rev-parse', 'HEAD'])
+  await fs.writeFile(path.join(dir, 'file.txt'), 'second\n', 'utf8')
+  runGit(dir, ['commit', '--quiet', '-am', 'second'])
+  const headSha = runGit(dir, ['rev-parse', 'HEAD'])
+  return {dir, firstSha, headSha}
+}
+
 // ---------------------------------------------------------------------------
 // Provenance round-trip
 // ---------------------------------------------------------------------------
@@ -980,6 +1034,150 @@ describe('frozen carry fetches', () => {
       await adapters.dispose?.()
       await fs.rm(sourceDir, {recursive: true, force: true})
       await fs.rm(workDir, {recursive: true, force: true})
+    }
+  })
+})
+
+describe('trusted integration push leases', () => {
+  it('pushes when the remote ref matches the lease expectation', async () => {
+    // #given
+    const source = await makeGitSourceRepository()
+    const remoteDir = await makeTmpDir()
+    const logPath = path.join(await makeTmpDir(), 'git-args.log')
+    const targetUrl = 'https://local.test/fro-bot/agent.git'
+    const targetRef = 'refs/harness-integrate/test'
+    runGit(remoteDir, ['init', '--bare', '--quiet'])
+    runGit(source.dir, ['push', '--quiet', remoteDir, `${source.firstSha}:${targetRef}`])
+    runGit(source.dir, ['push', '--quiet', remoteDir, `${source.headSha}:refs/hidden/source`])
+    const gitBin = await makeGitUrlWrapper(targetUrl, remoteDir)
+    const adapters = makeRealAdapters({gitBin})
+
+    try {
+      // #when
+      await withEnvironment({TEST_GIT_LOG: logPath}, async () => {
+        await adapters.pushIntegration(
+          {workDir: source.dir, integrationCommit: source.headSha, cleanup: async () => {}},
+          source.headSha,
+          {repository: targetUrl, ref: targetRef},
+          {token: 'test-token'},
+        )
+      })
+
+      // #then
+      expect(runGit(remoteDir, [`rev-parse`, `${targetRef}^{commit}`])).toBe(source.headSha)
+      const loggedArgs = (await fs.readFile(logPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map(line => JSON.parse(line) as string[])
+        .find(args => args.includes('push'))
+      if (loggedArgs === undefined) throw new Error('expected wrapper to log a push')
+      const pushIndex = loggedArgs.indexOf('push')
+      expect(loggedArgs.slice(pushIndex)).toEqual([
+        'push',
+        '--no-verify',
+        `--force-with-lease=${targetRef}:${source.firstSha}`,
+        targetUrl,
+        `${source.headSha}:${targetRef}`,
+      ])
+    } finally {
+      await adapters.dispose?.()
+      await fs.rm(source.dir, {recursive: true, force: true})
+      await fs.rm(remoteDir, {recursive: true, force: true})
+      await fs.rm(path.dirname(gitBin), {recursive: true, force: true})
+      await fs.rm(path.dirname(logPath), {recursive: true, force: true})
+    }
+  })
+
+  it('rejects a ref that moved underneath the run with a named lease error', async () => {
+    // #given
+    const source = await makeGitSourceRepository()
+    const remoteDir = await makeTmpDir()
+    const logPath = path.join(await makeTmpDir(), 'git-args.log')
+    const targetUrl = 'https://local.test/fro-bot/agent.git'
+    const targetRef = 'refs/harness-integrate/test'
+    runGit(remoteDir, ['init', '--bare', '--quiet'])
+    runGit(source.dir, ['push', '--quiet', remoteDir, `${source.firstSha}:${targetRef}`])
+    await fs.writeFile(path.join(source.dir, 'file.txt'), 'moved\n', 'utf8')
+    runGit(source.dir, ['commit', '--quiet', '-am', 'moved'])
+    const movedSha = runGit(source.dir, ['rev-parse', 'HEAD'])
+    runGit(source.dir, ['push', '--quiet', remoteDir, `${movedSha}:refs/hidden/moved`])
+    const gitBin = await makeGitUrlWrapper(targetUrl, remoteDir)
+    const adapters = makeRealAdapters({gitBin})
+
+    try {
+      // #when / #then
+      const rejection: unknown = await withEnvironment<unknown>(
+        {TEST_GIT_LOG: logPath, TEST_MOVE_REF: targetRef, TEST_MOVE_SHA: movedSha},
+        async (): Promise<unknown> => {
+          try {
+            await adapters.pushIntegration(
+              {workDir: source.dir, integrationCommit: source.headSha, cleanup: async () => {}},
+              source.headSha,
+              {repository: targetUrl, ref: targetRef},
+              {token: 'test-token'},
+            )
+            return undefined
+          } catch (error) {
+            return error
+          }
+        },
+      )
+      expect(rejection).toBeInstanceOf(Error)
+      if (!(rejection instanceof Error)) throw new Error('expected trusted push to reject')
+      expect(rejection.name).toBe('TrustedPushLeaseRejectedError')
+      expect(rejection.message).toMatch(/moved underneath/)
+      expect(runGit(remoteDir, [`rev-parse`, `${targetRef}^{commit}`])).toBe(movedSha)
+    } finally {
+      await adapters.dispose?.()
+      await fs.rm(source.dir, {recursive: true, force: true})
+      await fs.rm(remoteDir, {recursive: true, force: true})
+      await fs.rm(path.dirname(gitBin), {recursive: true, force: true})
+      await fs.rm(path.dirname(logPath), {recursive: true, force: true})
+    }
+  })
+
+  it('pushes the first release when the target ref does not exist', async () => {
+    // #given
+    const source = await makeGitSourceRepository()
+    const remoteDir = await makeTmpDir()
+    const logPath = path.join(await makeTmpDir(), 'git-args.log')
+    const targetUrl = 'https://local.test/fro-bot/agent.git'
+    const targetRef = 'refs/harness-integrate/first-release'
+    runGit(remoteDir, ['init', '--bare', '--quiet'])
+    const gitBin = await makeGitUrlWrapper(targetUrl, remoteDir)
+    const adapters = makeRealAdapters({gitBin})
+
+    try {
+      // #when
+      await withEnvironment({TEST_GIT_LOG: logPath}, async () => {
+        await adapters.pushIntegration(
+          {workDir: source.dir, integrationCommit: source.headSha, cleanup: async () => {}},
+          source.headSha,
+          {repository: targetUrl, ref: targetRef},
+          {token: 'test-token'},
+        )
+      })
+
+      // #then
+      expect(runGit(remoteDir, [`rev-parse`, `${targetRef}^{commit}`])).toBe(source.headSha)
+      const loggedArgs = (await fs.readFile(logPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map(line => JSON.parse(line) as string[])
+        .find(args => args.includes('push'))
+      if (loggedArgs === undefined) throw new Error('expected wrapper to log a push')
+      const pushIndex = loggedArgs.indexOf('push')
+      expect(loggedArgs.slice(pushIndex, pushIndex + 3)).toEqual([
+        'push',
+        '--no-verify',
+        `--force-with-lease=${targetRef}:`,
+      ])
+    } finally {
+      await adapters.dispose?.()
+      await fs.rm(source.dir, {recursive: true, force: true})
+      await fs.rm(remoteDir, {recursive: true, force: true})
+      await fs.rm(path.dirname(gitBin), {recursive: true, force: true})
+      await fs.rm(path.dirname(logPath), {recursive: true, force: true})
     }
   })
 })

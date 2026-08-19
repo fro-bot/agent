@@ -33,6 +33,8 @@ import {
 export const DEFAULT_INTEGRATION_PIPELINE_TIMEOUT_MS = 75 * 60 * 1000
 /** Git command deadline: generous for a large hosted-runner clone/fetch, short enough to fail a wedged process. */
 export const GIT_SUBPROCESS_TIMEOUT_MS = 10 * 60 * 1000
+/** Error name used when the trusted integration ref changed after lease capture. */
+export const TRUSTED_PUSH_LEASE_REJECTED_ERROR_NAME = 'TrustedPushLeaseRejectedError'
 
 // Re-export so callers that previously imported from integrate.ts still work.
 export type {IntegrationRefRecord} from './provenance.js'
@@ -645,6 +647,44 @@ function assertPushTarget(target: IntegrationPushTarget): void {
   }
 }
 
+function errorText(error: unknown): string {
+  if (error instanceof Error) {
+    const record = error as Error & {readonly stderr?: unknown}
+    const stderr = typeof record.stderr === 'string' ? record.stderr : ''
+    return `${error.message}\n${stderr}`
+  }
+  return String(error)
+}
+
+function isTrustedPushLeaseRejection(error: unknown): boolean {
+  const text = errorText(error)
+  return /stale info/i.test(text) || /cannot lock ref .*expected [0-9a-f]{40}/i.test(text)
+}
+
+function trustedPushLeaseRejectedError(targetRef: string, cause: unknown): Error {
+  const error = new Error(
+    `trusted integration ref moved underneath this run: ${targetRef}; ${formatPipelineError(cause)}`,
+  )
+  error.name = TRUSTED_PUSH_LEASE_REJECTED_ERROR_NAME
+  return error
+}
+
+async function resolvePushLeaseExpectation(
+  git: GitSubprocess,
+  target: IntegrationPushTarget,
+  workDir: string,
+  env: NodeJS.ProcessEnv,
+): Promise<string> {
+  const output = await git.authExec(['ls-remote', '--refs', target.repository, target.ref], workDir, env)
+  const firstLine = splitLines(output)[0]
+  if (firstLine === undefined || firstLine.length === 0) return ''
+  const [sha, ref] = firstLine.split(/\s+/)
+  if (sha === undefined || ref !== target.ref || /^[0-9a-f]{40}$/i.test(sha) === false) {
+    throw new Error(`push target ref ${target.ref} did not resolve to a commit SHA`)
+  }
+  return sha.toLowerCase()
+}
+
 function assertCommitSha(commit: string): void {
   if (!/^[0-9a-f]{40}$/i.test(commit)) throw new Error('integration commit must be a full hexadecimal SHA')
 }
@@ -894,11 +934,20 @@ export function makeRealAdapters(options: RealAdapterOptions = {}): IntegrationA
         env.HARNESS_PUSH_TOKEN = credential.token
         env.GIT_ASKPASS = askpass
         env.GIT_TERMINAL_PROMPT = '0'
-        await git.authExec(
-          ['push', '--no-verify', target.repository, `${sourceRef}:${target.ref}`],
-          trustedRepository.workDir,
-          env,
-        )
+        const expectedOldValue = await resolvePushLeaseExpectation(git, target, trustedRepository.workDir, env)
+        const pushArgs = [
+          'push',
+          '--no-verify',
+          `--force-with-lease=${target.ref}:${expectedOldValue}`,
+          target.repository,
+          `${sourceRef}:${target.ref}`,
+        ] as const
+        try {
+          await git.authExec(pushArgs, trustedRepository.workDir, env)
+        } catch (error) {
+          if (isTrustedPushLeaseRejection(error)) throw trustedPushLeaseRejectedError(target.ref, error)
+          throw error
+        }
       } finally {
         await fs.rm(tempDir, {recursive: true, force: true})
       }

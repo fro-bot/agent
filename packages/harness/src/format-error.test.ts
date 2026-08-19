@@ -221,6 +221,28 @@ describe('formatPipelineError', () => {
     expect(result).toBe('short error')
   })
 
+  it('keeps useful multi-line git rejection details visible', () => {
+    // #given
+    const err = new Error(
+      [
+        'Command failed: git push --no-verify https://github.com/fro-bot/agent.git',
+        '! [rejected] c9fda554:refs/harness-integrate/1.18.18 (stale info)',
+        'error: failed to push some refs to https://github.com/fro-bot/agent.git',
+        'hint: Updates were rejected because the remote ref moved underneath this run.',
+        'hint: Verify the integration ref before retrying the release.',
+      ].join('\n'),
+    )
+
+    // #when
+    const result = formatPipelineError(err)
+
+    // #then
+    expect(result).toContain('stale info')
+    expect(result).toContain('remote ref moved underneath this run')
+    expect(result.length).toBeGreaterThan(300)
+    expect(result.endsWith('...')).toBe(false)
+  })
+
   it('handles null safely', () => {
     // #given / #when
     const result = formatPipelineError(null)
