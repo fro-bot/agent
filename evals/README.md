@@ -46,6 +46,14 @@ The treatment is selected by dependency injection through the runner path. There
 
 The comparison reuses the stable outcome projection and the existing lazy four-vs-four repeat bound. A clean result means only that no large regression was observed on these two covered scenarios. If both modes pass, the corpus cannot attribute causal improvement; deleting eager presearch would be a documented simplicity/cost judgment rather than evidence that the model reasoned better.
 
+Run the differential experiment explicitly; it is skipped without the same `FRO_BOT_EVAL=1` gate as the corpus:
+
+```bash
+FRO_BOT_EVAL=1 bun run evals:presearch
+```
+
+The driver compares treatment reports with live production-mode reports and uses `evals/baselines/u1.json` for reviewed registry/provenance validation. The default artifact is `evals/output/presearch-differential-report.json`; `FRO_BOT_EVAL_OUTPUT` overrides that path. A missing stable outcome in `u1.json` is filled only by independently validated live production reports; no treatment value is copied into the reviewed baseline. Infrastructure-inconclusive scenarios remain rerun requests, not regressions.
+
 ## Run it
 
 Normal test runs do not start OpenCode and do not cost anything:
@@ -68,7 +76,7 @@ FRO_BOT_EVAL=1 bunx vitest run evals/corpus.test.ts
 | `FRO_BOT_EVAL_MODEL` | `provider/model` to run. Defaults to the free, credentialless `opencode/big-pickle`. |
 | `FRO_BOT_EVAL_HARNESS_BIN` | Path to the harness platform binary. Auto-discovered from `harness` on `PATH`; set explicitly when a workspace shim shadows the real install. |
 | `FRO_BOT_EVAL_TIMEOUT_MS` | Per-scenario execution budget. Defaults to 300000. |
-| `FRO_BOT_EVAL_OUTPUT` | Report path. Defaults to the gitignored `evals/output/eval-report.json`. |
+| `FRO_BOT_EVAL_OUTPUT` | Report path. Defaults to the gitignored `evals/output/eval-report.json` for the corpus, and `evals/output/presearch-differential-report.json` for `evals:presearch`. |
 
 The corpus runs the patched **harness** build, never stock `opencode-ai` from npm. The harness carries this project's upstream patch set, so an eval driven by the stock package measures a different system than the one that ships.
 

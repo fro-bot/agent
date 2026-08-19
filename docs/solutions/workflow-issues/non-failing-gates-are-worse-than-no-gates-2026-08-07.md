@@ -107,6 +107,6 @@ A gate is only evidence if some reachable input makes it red. Until you have exe
 - **Write the failing case first.** If you cannot construct an input that fails the gate, the gate is not measuring what you think.
 - **Trace the canary's path to the system under test.** For anything planted in the environment, confirm no scrubbing, filtering, or sandboxing sits between the plant and the observer. Security controls are the most likely thing to silently neutralise a canary.
 - **Do not let one function assemble both observations and expectations.** Split the types so placeholder values cannot occupy fields that must be measured.
-- **Be suspicious of a gate that is green on its first run.** A gate written against a real hazard usually fails once before it passes.
+- **Be suspicious of a gate that is green on its first run.** A gate written against a real hazard usually fails once before it passes. A green result can also mean the harness never exposed the capability under test, leaving the gate nothing to evaluate.
 
 Related: [an env-var scrub can silently no-op when the key name does not match](../logic-errors/actions-core-input-env-hyphen-mapping-2026-07-01.md) is the same class of self-consistent-but-wrong wiring, and [credential isolation via an OIDC broker](isolate-ci-credential-via-oidc-broker-2026-07-01.md) documents the scrubbing behaviour that made this canary unobservable.

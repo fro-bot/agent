@@ -53,6 +53,7 @@ jobs:
             src-changed: &src-changed
               - apps/**
               - assets/**
+              - evals/**
               - packages/**
               - src/**
               - action.yaml

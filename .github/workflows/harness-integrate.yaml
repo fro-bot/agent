@@ -34,12 +34,12 @@ on:
         type: string
         required: false
       base-version:
-        description: Resolved base release version used by authoritative and shadow integration paths.
+        description: Resolved base release version used by the authoritative integration path.
         type: string
         required: true
     secrets:
       APPLICATION_ID:
-        description: GitHub App id used to mint the scoped installation token for the merge push. Required.
+        description: GitHub App id used to mint the scoped installation token for trusted finalization. Required.
         required: true
       APPLICATION_PRIVATE_KEY:
         description: GitHub App private key (PEM). Mapped only to the mint step's env; never job-level. Required.
@@ -63,6 +63,9 @@ jobs:
   integrate:
     name: integrate
     runs-on: ubuntu-latest
+    # INTEGRATION_JOB_TIMEOUT_MINUTES = 120. Leaves room for evidence recording
+    # while preventing the reusable job from inheriting GitHub's 360-minute default.
+    timeout-minutes: 120
 
     permissions:
       id-token: write
@@ -75,6 +78,8 @@ jobs:
           egress-policy: block
           disable-telemetry: true
           disable-sudo-and-containers: true
+          # Upstream OpenCode pins @solidjs/start to a pkg.pr.new preview build in its root
+          # package.json, so bun install --frozen-lockfile cannot complete without it.
           allowed-endpoints: >-
             api.github.com:443
             broker.fro.bot:443
@@ -84,6 +89,7 @@ jobs:
             github.com:443
             models.dev:443
             nodejs.org:443
+            pkg.pr.new:443
             registry.npmjs.org:443
             *.actions.githubusercontent.com:443
             *.githubusercontent.com:443
@@ -105,28 +111,28 @@ jobs:
         id: mint
         run: node --experimental-strip-types scripts/harness/mint-broker-credential.ts
 
-      # Trusted inline no-post mint. MUST stay a plain run: step invoking the
-      # checked-in script — never a marketplace action with a post: hook (the
-      # runner re-supplies INPUT_* — including the private key — during the
-      # post phase, and a prompt-injected earlier step can tamper the on-disk
-      # post script; see docs/plans/2026-07-11-002-feat-inline-app-token-mint-integrate-plan.md).
-      # The App secrets are mapped to THIS step's env only — never job-level.
-      - name: Mint scoped App token
-        id: mint-app-token
-        run: node --experimental-strip-types scripts/harness/mint-app-token.ts
-        env:
-          APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
-          APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+      # The external-directory allowlist grants the model `<workdir>/*`, which covers paths
+      # inside the workdir but not creation of the workdir itself. Without this, `git clone`
+      # cannot create its own target and the model clones into a subdirectory instead,
+      # leaving trusted finalization pointed at a path that is not a git repository.
+      - name: Create the integration workdir
+        run: mkdir -p "${{ runner.temp }}/harness-integrate-work"
 
       # SYNC: keep the shared merge inputs in step with fro-bot.yaml's Run Fro Bot step
       - name: Run Fro Bot
         uses: ./
         env:
-          # Keep provider-level failures diagnosable; the pushed ref is this job's only other output.
+          GH_TOKEN: ''
+          GITHUB_TOKEN: ''
+          # Keep the model's designated integration workdir in step with the
+          # trusted finalization step below. The action passes this run-specific
+          # path to its generic CI config writer via FRO_BOT_INTEGRATION_WORK_DIR.
+          FRO_BOT_INTEGRATION_WORK_DIR: ${{ runner.temp }}/harness-integrate-work
+          # Keep provider-level failures diagnosable; trusted finalization owns the pushed ref.
           OPENCODE_PROMPT_ARTIFACT: 'true'
         with:
           auth-json: ${{ steps.mint.outputs.auth-json }}
-          github-token: ${{ steps.mint-app-token.outputs.github-token }}
+          github-token: ${{ github.token }}
           model: ${{ inputs.model || vars.HARNESS_MODEL }}
           prompt: ${{ inputs.prompt }}
           response-mode: none
@@ -136,60 +142,32 @@ jobs:
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           timeout: '0'
 
-      - name: Run forward shadow integration
-        id: shadow-integrate
-        if: ${{ always() }}
-        continue-on-error: true
+      # Trusted inline no-post mint. MUST stay a plain run: step invoking the
+      # checked-in script — never a marketplace action with a post: hook (the
+      # runner re-supplies INPUT_* — including the private key — during the
+      # post phase, and a prompt-injected earlier step can tamper the on-disk
+      # post script; see docs/plans/2026-07-11-002-feat-inline-app-token-mint-integrate-plan.md).
+      # The App secrets are mapped to THIS step's env only — never job-level.
+      - name: Mint scoped App token for trusted finalization
+        id: mint-app-token
+        run: node --experimental-strip-types scripts/harness/mint-app-token.ts
+        env:
+          APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
+          APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+
+      - name: Freeze, build, validate, and push candidate
+        id: trusted-integrate
         env:
           BASE_VERSION: ${{ inputs.base-version }}
-          SHADOW_WORK_DIR: ${{ runner.temp }}/harness-shadow-work
-          SHADOW_ARTIFACT: ${{ runner.temp }}/harness-shadow-artifact.tar
-          SHADOW_RESULT: ${{ runner.temp }}/harness-shadow-result.json
-          HARNESS_BROKER_AUTH_JSON: ${{ steps.mint.outputs.auth-json }}
-          GH_TOKEN: ''
+          WORK_DIR: ${{ runner.temp }}/harness-integrate-work
+          ARTIFACT: ${{ runner.temp }}/harness-authoritative-artifact.tar
+          GH_TOKEN: ${{ steps.mint-app-token.outputs.github-token }}
           GITHUB_TOKEN: ''
         run: >-
           bun run packages/harness/src/cli.ts integrate
-          --dry-run
+          --candidate
           --base-version "$BASE_VERSION"
-          --work-dir "$SHADOW_WORK_DIR"
-          --out "$SHADOW_ARTIFACT"
-          --result-out "$SHADOW_RESULT"
-
-      - name: Record forward shadow evidence
-        id: shadow-record
-        if: ${{ always() }}
-        continue-on-error: true
-        env:
-          BASE_VERSION: ${{ inputs.base-version }}
-          SHADOW_WORK_DIR: ${{ runner.temp }}/harness-shadow-work
-          SHADOW_RESULT: ${{ runner.temp }}/harness-shadow-result.json
-          SHADOW_RECORD: ${{ runner.temp }}/harness-shadow-${{ inputs.base-version }}.json
-          GH_TOKEN: ''
-          GITHUB_TOKEN: ''
-          RELEASE_REPO: anomalyco/opencode
-          AUTHORITATIVE_REPOSITORY: fro-bot/agent
-          RUN_IDENTITY: ${{ github.run_id }}/${{ github.run_attempt }}/${{ github.workflow_ref }}/${{ github.server_url }}/${{ github.repository }}
-        run: >-
-          bun run packages/harness/src/forward-shadow-command.ts
-          --result-out "$SHADOW_RESULT"
-          --record-out "$SHADOW_RECORD"
-          --base-version "$BASE_VERSION"
-          --shadow-work-dir "$SHADOW_WORK_DIR"
-          --release-repo "$RELEASE_REPO"
-          --authoritative-repository "$AUTHORITATIVE_REPOSITORY"
-          --authoritative-ref "refs/harness-integrate/$BASE_VERSION"
-          --run-identity "$RUN_IDENTITY"
-
-      - name: Upload forward shadow evidence
-        id: upload-shadow-record
-        if: ${{ always() }}
-        env:
-          GH_TOKEN: ''
-          GITHUB_TOKEN: ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: harness-shadow-${{ inputs.base-version }}
-          path: ${{ runner.temp }}/harness-shadow-${{ inputs.base-version }}.json
-          if-no-files-found: warn
-          retention-days: 90
+          --work-dir "$WORK_DIR"
+          --out "$ARTIFACT"
+          --push-repo "https://github.com/fro-bot/agent.git"
+          --push-ref "refs/harness-integrate/$BASE_VERSION"

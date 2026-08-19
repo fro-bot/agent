@@ -398,6 +398,154 @@ describe('buildCIConfig', () => {
       })
     })
 
+    it('allows the explicitly designated integration workdir after the response-file dir', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          integrationWorkDir: '/home/runner/work/_temp/harness-integrate-work',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      const config = result.config as {agent: {build: {permission: {external_directory: Record<string, unknown>}}}}
+      const externalDirectory = config.agent.build.permission.external_directory
+      expect(externalDirectory).toEqual({
+        '*': 'deny',
+        '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+        '/home/runner/work/_temp/harness-integrate-work/*': 'allow',
+      })
+      expect(Object.keys(externalDirectory)).toEqual([
+        '*',
+        '/home/runner/work/_temp/fro-bot-response/*',
+        '/home/runner/work/_temp/harness-integrate-work/*',
+      ])
+    })
+
+    it('keeps the response-file allowlist when the integration workdir is unknown', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+
+      // #then - generic runs retain response delivery without guessing an integration path
+      expect(result.error).toBeNull()
+      expect(result.config).toMatchObject({
+        agent: {
+          build: {
+            permission: {
+              external_directory: {
+                '*': 'deny',
+                '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+              },
+            },
+          },
+        },
+      })
+    })
+
+    it('omits an integration workdir outside RUNNER_TEMP while preserving the deny and response allow', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          integrationWorkDir: '/home/runner/work/other/harness-integrate-work',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config).toMatchObject({
+        agent: {
+          build: {
+            permission: {
+              external_directory: {
+                '*': 'deny',
+                '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+              },
+            },
+          },
+        },
+      })
+      expect(logger.warning).toHaveBeenCalledWith('Ignoring integration workdir outside RUNNER_TEMP', {
+        integrationWorkDir: '/home/runner/work/other/harness-integrate-work',
+        runnerTemp: '/home/runner/work/_temp',
+      })
+    })
+
+    it('omits an integration workdir whose traversal escapes RUNNER_TEMP', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          integrationWorkDir: '/home/runner/work/_temp/../../etc',
+        },
+        logger,
+      )
+
+      // #then
+      const config = result.config as {agent: {build: {permission: {external_directory: Record<string, unknown>}}}}
+      expect(config.agent.build.permission.external_directory).toEqual({
+        '*': 'deny',
+        '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+      })
+      expect(logger.warning).toHaveBeenCalledWith('Ignoring integration workdir outside RUNNER_TEMP', {
+        integrationWorkDir: '/home/runner/work/_temp/../../etc',
+        runnerTemp: '/home/runner/work/_temp',
+      })
+    })
+
+    it('omits a sibling-prefix integration workdir', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          integrationWorkDir: '/home/runner/work/_tempevil/harness-integrate-work',
+        },
+        logger,
+      )
+
+      // #then
+      const config = result.config as {agent: {build: {permission: {external_directory: Record<string, unknown>}}}}
+      expect(config.agent.build.permission.external_directory).toEqual({
+        '*': 'deny',
+        '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+      })
+      expect(logger.warning).toHaveBeenCalledWith('Ignoring integration workdir outside RUNNER_TEMP', {
+        integrationWorkDir: '/home/runner/work/_tempevil/harness-integrate-work',
+        runnerTemp: '/home/runner/work/_temp',
+      })
+    })
+
     it('falls back to a flat deny when RUNNER_TEMP is unset (fail safe, never guesses a broad allow)', () => {
       // #given
       const logger = createLogger()
