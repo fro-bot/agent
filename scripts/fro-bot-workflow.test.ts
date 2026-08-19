@@ -513,6 +513,22 @@ describe('harness forward-shadow workflow wiring', () => {
     expect(shadow['timeout-minutes']).toBe(90)
   })
 
+  it('creates the integration workdir before the model step that must clone into it', () => {
+    // #given
+    // The model is granted `<workdir>/*`, which covers paths inside the workdir but not
+    // creation of the workdir itself, so `git clone` cannot create its own target.
+    const job = rawJob(integratePath, 'integrate')
+    const steps = job.steps as {readonly name?: string; readonly run?: string}[]
+    const createIndex = steps.findIndex(step => step.name === 'Create the integration workdir')
+    const modelIndex = steps.findIndex(step => step.name === 'Run Fro Bot')
+
+    // #then
+    expect(createIndex).toBeGreaterThanOrEqual(0)
+    expect(modelIndex).toBeGreaterThanOrEqual(0)
+    expect(createIndex).toBeLessThan(modelIndex)
+    expect(String(steps[createIndex]?.run)).toContain('harness-integrate-work')
+  })
+
   it('keeps harness-integrate to one job with unchanged permissions and no secret inheritance', () => {
     // #given
     const workflow = loadRawWorkflow(integratePath)

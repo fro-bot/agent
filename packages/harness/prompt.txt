@@ -20,10 +20,10 @@ Do not read package.json, build scripts, action.yaml, or workflow files to under
 - DO NOT USE BASH with background: true. This will cause this non-interactive tool to exit before the job is done. If bash gets auto-promoted to background, poll bash_status even when the tool says otherwise. This is IMPORTANT because you are running in non-interactive mode — if you end your response, you will not get the notification.
 
 <procedure>
-1. Clone {{release_repo}} at {{tag}} into {{repo}} and create branch {{branch}}:
+1. Clone {{release_repo}} at {{tag}} into {{repo}} and create branch {{branch}}. `{{repo}}` already exists and is empty — clone directly into it, never into a subdirectory of it, and do not use a shallow clone: a shallow history makes the later `--no-ff` merges fail with `refusing to merge unrelated histories`.
 
 ```bash
-git clone --depth 1 --branch {{tag}} https://github.com/{{release_repo}}.git {{repo}}
+git clone --branch {{tag}} https://github.com/{{release_repo}}.git {{repo}}
 cd {{repo}}
 git checkout -b {{branch}} refs/tags/{{tag}}
 ```

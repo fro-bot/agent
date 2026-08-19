@@ -63,6 +63,29 @@ describe('prompt.txt bash snippet syntax', () => {
     expect(allBlocks).not.toContain('GITHUB_TOKEN')
   })
 
+  it('clones the full history so the ordered --no-ff merges can find a merge base', () => {
+    // #given
+    // A shallow clone makes `git merge --no-ff` fail with `refusing to merge unrelated
+    // histories` before producing any unmerged index entries. The code-owned driver hit
+    // the same defect; see the tagged clone path in integrate.ts.
+    const allBlocks = bashBlocks.join('\n')
+
+    // #then
+    expect(allBlocks).toContain('git clone --branch')
+    expect(allBlocks).not.toContain('--depth')
+  })
+
+  it('directs the clone at the pre-created workdir rather than a subdirectory', () => {
+    // #given
+    // The model is granted `<workdir>/*`, which does not cover creating the workdir
+    // itself, so the workflow pre-creates it. Cloning one level deeper leaves trusted
+    // finalization pointed at a path that is not a git repository.
+
+    // #then
+    expect(promptContent).toContain('already exists and is empty')
+    expect(promptContent).toContain('never into a subdirectory of it')
+  })
+
   it('strips .github/workflows from the integration commit before the trusted handoff', () => {
     // #given
     // The integration push authenticates as a GitHub App, and GitHub rejects any
