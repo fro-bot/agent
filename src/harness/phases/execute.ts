@@ -52,32 +52,6 @@ export interface ExecutePhaseResult {
   }
 }
 
-const LEGACY_BRANCH_PR_PHRASES = [
-  'pull request',
-  'open a pr',
-  'create a pr',
-  'create pr',
-  'gh pr ',
-  'push to origin',
-  'git push',
-  'auto-merge',
-  'create branch',
-  'update branch',
-  'branch workflow',
-] as const
-
-function legacyWouldSelectBranchPr(prompt: string | null): boolean {
-  const normalizedPrompt = prompt?.toLowerCase().trim() ?? ''
-  if (normalizedPrompt.length === 0) {
-    return false
-  }
-
-  return (
-    LEGACY_BRANCH_PR_PHRASES.some(phrase => normalizedPrompt.includes(phrase)) ||
-    normalizedPrompt.includes('pull the request')
-  )
-}
-
 export function resolveRequestedOutputModeState(): OutputModeRequestState {
   const rawOutputMode = core.getInput('output-mode').trim().toLowerCase()
 
@@ -96,17 +70,14 @@ export function resolveRequestedOutputModeState(): OutputModeRequestState {
 
 function resolveOutputModeMigration(
   eventType: EventType,
-  prompt: string | null,
   configuredMode: OutputMode,
   requested: OutputModeRequestState,
 ): OutputModeMigrationState {
-  const resolved = resolveOutputMode(eventType, prompt, configuredMode)
-  const isManualTrigger = eventType === 'schedule' || eventType === 'workflow_dispatch'
+  const resolved = resolveOutputMode(eventType, configuredMode)
 
   return {
     requested,
     resolved,
-    legacyWouldSelectBranchPr: isManualTrigger && legacyWouldSelectBranchPr(prompt),
   }
 }
 
@@ -241,23 +212,10 @@ export async function runExecute(
 ): Promise<ExecutePhaseResult> {
   const outputModeMigration = resolveOutputModeMigration(
     routing.triggerResult.context.eventType,
-    bootstrap.inputs.prompt,
     bootstrap.inputs.outputMode,
     resolveRequestedOutputModeState(),
   )
   const resolvedOutputMode = outputModeMigration.resolved
-
-  if (outputModeMigration.legacyWouldSelectBranchPr && bootstrap.inputs.outputMode === 'auto') {
-    core.warning(
-      JSON.stringify({
-        type: 'output-mode-migration',
-        requested: outputModeMigration.requested,
-        resolved: outputModeMigration.resolved,
-        legacyWouldSelectBranchPr: outputModeMigration.legacyWouldSelectBranchPr,
-        message: 'Legacy output-mode inference would have selected branch-pr; set output-mode to branch-pr explicitly.',
-      }),
-    )
-  }
 
   const promptOptions: PromptOptions = {
     context: routing.agentContext,
