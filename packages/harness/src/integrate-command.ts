@@ -32,7 +32,6 @@ import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {DEFAULT_SHADOW_CONFLICT_MODEL_TIMEOUT_MS} from './conflict-resolver.js'
 import {formatPipelineError} from './format-error.js'
-import {buildIntegrationOutcomeFile, writeIntegrationOutcomeFile} from './forward-shadow.js'
 import {makeRealAdapters, runIntegration, writeProvenanceManifest} from './integrate.js'
 import {resolveSources} from './sources.js'
 
@@ -80,7 +79,6 @@ interface ParsedFlags {
   readonly workDir: string | undefined
   readonly promptPath: string | undefined
   readonly out: string | undefined
-  readonly resultOut: string | undefined
   readonly dryRun: boolean | undefined
   readonly candidate: boolean
   readonly pushRepo: string | undefined
@@ -96,7 +94,6 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
   let workDir: string | undefined
   let promptPath: string | undefined
   let out: string | undefined
-  let resultOut: string | undefined
   let dryRun: boolean | undefined
   let candidate = false
   let pushRepo: string | undefined
@@ -117,7 +114,6 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
       arg === '--base-version' ||
       arg === '--prompt-path' ||
       arg === '--out' ||
-      arg === '--result-out' ||
       arg === '--push-repo' ||
       arg === '--push-ref'
     ) {
@@ -136,8 +132,6 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
         pushRepo = next
       } else if (arg === '--push-ref') {
         pushRef = next
-      } else if (arg === '--result-out') {
-        resultOut = next
       } else {
         out = next
       }
@@ -145,7 +139,7 @@ function parseFlags(argv: readonly string[]): ParsedFlags | null {
     }
   }
 
-  return {baseVersion, workDir, promptPath, out, resultOut, dryRun, candidate, pushRepo, pushRef}
+  return {baseVersion, workDir, promptPath, out, dryRun, candidate, pushRepo, pushRef}
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +519,6 @@ export async function cmdIntegrate(
   _packageArtifact: typeof packageArtifact = packageArtifact,
   logger: IntegrateLogger = silentIntegrateLogger,
 ): Promise<number> {
-  const startedAt = new Date().toISOString()
   const brokerAuthJson = process.env.HARNESS_BROKER_AUTH_JSON
   delete process.env.HARNESS_BROKER_AUTH_JSON
 
@@ -589,23 +582,6 @@ export async function cmdIntegrate(
     pushTarget,
   }
 
-  const writeOutcome = async (
-    result: IntegrationResult,
-    failure?: {readonly stage: string; readonly error: string},
-  ): Promise<boolean> => {
-    if (flags.resultOut === undefined) return true
-    try {
-      await writeIntegrationOutcomeFile(
-        flags.resultOut,
-        buildIntegrationOutcomeFile(result, startedAt, new Date().toISOString(), failure),
-      )
-      return true
-    } catch (error) {
-      console.error(`[integrate] Failed to write result file: ${formatPipelineError(error)}`)
-      return false
-    }
-  }
-
   // Run the integration and package the artifact.
   try {
     const adapters = makeRealAdapters({
@@ -613,12 +589,7 @@ export async function cmdIntegrate(
     })
     if (flags.candidate) {
       const result = await finalizeCandidateIntegration(config, outPath, adapters, _packageArtifact, logger)
-      if (result.ok === true) {
-        const written = await writeOutcome(result)
-        return written ? 0 : 1
-      }
-      const written = await writeOutcome(result)
-      if (written === false) return 1
+      if (result.ok === true) return 0
       console.error(`[integrate] ${result.error}`)
       return 1
     }
@@ -628,31 +599,17 @@ export async function cmdIntegrate(
       try {
         await _packageArtifact(workDir, result.manifest.integrationCommit, outPath)
       } catch (error) {
-        const packaged = await writeOutcome(result, {stage: 'artifact', error: formatPipelineError(error)})
-        if (packaged === false) return 1
         console.error(`[integrate] ${formatPipelineError(error)}`)
         return 1
       }
       const finalized = await finalizeLocalIntegration(config, adapters, result, artifactCompletion, logger)
-      if (finalized.ok === true) {
-        const written = await writeOutcome(finalized)
-        return written ? 0 : 1
-      }
-      const written = await writeOutcome(result, {
-        stage: finalized.stage ?? 'finalize',
-        error: finalized.error,
-      })
-      if (written === false) return 1
+      if (finalized.ok === true) return 0
       console.error(`[integrate] ${finalized.error}`)
       return 1
     }
-    const written = await writeOutcome(result)
-    if (written === false) return 1
     console.error(`[integrate] ${result.error}`)
     return 1
   } catch (error) {
-    const failed: IntegrationResult = {ok: false, stage: 'provenance', error: formatPipelineError(error)}
-    await writeOutcome(failed, {stage: 'command', error: formatPipelineError(error)})
     console.error(`[integrate] ${formatPipelineError(error)}`)
     return 1
   }

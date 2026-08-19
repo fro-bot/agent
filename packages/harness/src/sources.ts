@@ -31,7 +31,7 @@ export interface CarryManifestEntry {
 }
 
 /**
- * The immutable carry input shared by the authoritative and forward-shadow paths.
+ * The immutable carry input for the authoritative integration path.
  * GitHub does not reliably serve arbitrary reachable commits by SHA, so consumers
  * fetch the configured ref and assert that it still resolves to this SHA.
  */
