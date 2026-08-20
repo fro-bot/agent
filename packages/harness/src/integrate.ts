@@ -77,11 +77,11 @@ export interface IntegrationConfig {
   readonly agent?: string
   readonly model?: string
   readonly opencodeBin?: string
-  /** Short-lived broker-minted model auth JSON; U7 wires the production input. */
+  /** Short-lived broker-minted model auth JSON, supplied via HARNESS_BROKER_AUTH_JSON when set. */
   readonly brokerAuthJson?: string
   readonly runnerTempDir?: string
   readonly promptPath?: string
-  /** Overall driver deadline; callers may shorten it for fail-soft shadow evidence. */
+  /** Overall driver deadline; callers may shorten it. */
   readonly pipelineTimeoutMs?: number
 }
 
