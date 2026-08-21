@@ -106,6 +106,7 @@ describe('runBootstrap response-delivery wiring', () => {
   it('resolves file-convention delivery with a non-null response file path under RUNNER_TEMP for an affected trigger with responseMode github', async () => {
     // #given an issues trigger with responseMode github (an affected, posting trigger)
     mocks.githubContext.eventName = 'issues'
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
     const trustedHeadSha = 'a'.repeat(40)
     mocks.parseActionInputs.mockReturnValue({
       success: true,
@@ -131,6 +132,36 @@ describe('runBootstrap response-delivery wiring', () => {
     }
     const dirStats = await fs.stat(path.dirname(responseFilePath))
     expect(dirStats.isDirectory()).toBe(true)
+    expect(result?.responseFilePathCandidates).toEqual([
+      responseFilePath,
+      path.join(runnerTempDir, 'repo', 'fro-bot-response', '555-2', path.basename(responseFilePath)),
+    ])
+  })
+
+  it('logs only the response directory and never the generated nonce', async () => {
+    // #given a file-convention run with a workspace configured
+    mocks.githubContext.eventName = 'issues'
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-workspace-'))
+    vi.stubEnv('GITHUB_WORKSPACE', workspaceDir)
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap resolves the response artifact
+    const result = await runBootstrap(createMockLogger())
+
+    // #then the debug payload contains the directory but not the nonce filename
+    const responseFilePath = result?.responseFilePath
+    expect(responseFilePath).not.toBeNull()
+    const logger = result?.logger
+    expect(logger).toBeDefined()
+    if (logger === undefined) {
+      throw new Error('expected bootstrap logger')
+    }
+    expect(vi.mocked(logger.debug)).toHaveBeenCalledWith('Resolved response file path', {
+      directory: path.dirname(responseFilePath as string),
+    })
+    expect(JSON.stringify(vi.mocked(logger.debug).mock.calls)).not.toContain(path.basename(responseFilePath as string))
+    await fs.rm(workspaceDir, {recursive: true, force: true})
   })
 
   it('resolves model-gh delivery with a null response file path for workflow_dispatch', async () => {

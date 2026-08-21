@@ -70,6 +70,7 @@ function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): Bootstr
     opencodeResult: {didSetup: false, version: '1.0.0'} as BootstrapPhaseResult['opencodeResult'],
     delivery: 'file-convention',
     responseFilePath: '/tmp/fro-bot-response.md',
+    responseFilePathCandidates: null,
     trustedHeadSha: '',
     ...overrides,
   }
@@ -279,7 +280,7 @@ describe('runFinalize file-convention delivery', () => {
 
     // #then the existing fail-closed delivery path remains exclusive
     expect(mocks.postComment).not.toHaveBeenCalled()
-    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining(bootstrap.responseFilePath as string))
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/tmp'))
   })
 
   it('posts one trusted comment and preserves the primary execution failure when the failed agent wrote no artifact', async () => {
@@ -446,7 +447,7 @@ describe('runFinalize file-convention delivery', () => {
 
       // #then non-file-read failures remain fail-closed without a fallback post
       expect(mocks.postComment).not.toHaveBeenCalled()
-      expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining(bootstrap.responseFilePath as string))
+      expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/tmp'))
     }
   })
 

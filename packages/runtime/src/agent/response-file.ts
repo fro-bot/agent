@@ -96,6 +96,39 @@ export function buildResponseFilePath(parts: {
   return path.join(buildResponseFileDir(parts), `${parts.nonce}.md`)
 }
 
+/**
+ * Build the expected response-file path and the one known path produced when
+ * OpenCode resolves the model's relative write against the checkout.
+ *
+ * The fallback is only returned when it remains strictly inside the workspace;
+ * a malformed runner-temp path must never turn this helper into a traversal
+ * primitive.
+ */
+export function buildResponseFilePathCandidates(parts: {
+  readonly runnerTemp: string
+  readonly runId: string | number
+  readonly runAttempt: string | number
+  readonly nonce: string
+  readonly workspaceDir: string | undefined
+}): readonly string[] {
+  const expectedPath = path.resolve(buildResponseFilePath(parts))
+  const workspaceDir = parts.workspaceDir
+  if (workspaceDir == null || workspaceDir.trim().length === 0) {
+    return [expectedPath]
+  }
+
+  const resolvedWorkspaceDir = path.resolve(workspaceDir)
+  const relativeExpectedPath = path.relative(path.resolve(parts.runnerTemp), expectedPath)
+  const fallbackPath = path.resolve(path.join(resolvedWorkspaceDir, relativeExpectedPath))
+  const isInsideWorkspace = fallbackPath.startsWith(`${resolvedWorkspaceDir}${path.sep}`)
+
+  if (isInsideWorkspace === false || fallbackPath === expectedPath) {
+    return [expectedPath]
+  }
+
+  return [expectedPath, fallbackPath]
+}
+
 interface Frontmatter {
   readonly verdict?: string
   readonly schemaVersion?: string

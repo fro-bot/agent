@@ -7,6 +7,7 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
+import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {createErrorInfo, createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
@@ -214,6 +215,7 @@ export async function runFinalize(
       agentContext: routing.agentContext,
       triggerResult: routing.triggerResult,
       responseFilePath: bootstrap.responseFilePath,
+      responseFilePathCandidates: bootstrap.responseFilePathCandidates ?? undefined,
       executionSucceeded: execution.success,
     }
     const responsePrecheck = await readAndParseResponseFile(responseFileParams, responsePostLogger)
@@ -309,6 +311,7 @@ export async function runFinalize(
         triggerResult: routing.triggerResult,
         botLogin: routing.botLogin,
         responseFilePath: bootstrap.responseFilePath,
+        responseFilePathCandidates: bootstrap.responseFilePathCandidates ?? undefined,
         ...(deliveryFooter == null ? {} : {deliveryFooter}),
       }
 
@@ -335,7 +338,7 @@ export async function runFinalize(
       }
 
       core.setFailed(
-        `Failed to deliver the agent's response from ${bootstrap.responseFilePath}: ${result.reason} — ${result.detail}`,
+        `Failed to deliver the agent's response from ${path.dirname(bootstrap.responseFilePath)}: ${result.reason} — ${result.detail}`,
       )
       return 1
     }

@@ -1,5 +1,11 @@
 import {describe, expect, it} from 'vitest'
-import {buildResponseFileDir, buildResponseFilePath, MAX_BODY_BYTES, parseResponseFile} from './response-file.js'
+import {
+  buildResponseFileDir,
+  buildResponseFilePath,
+  buildResponseFilePathCandidates,
+  MAX_BODY_BYTES,
+  parseResponseFile,
+} from './response-file.js'
 
 describe('buildResponseFileDir', () => {
   it('joins runnerTemp with a run+attempt scoped directory', () => {
@@ -24,6 +30,65 @@ describe('buildResponseFilePath', () => {
 
     // #then
     expect(filePath).toBe('/tmp/runner/fro-bot-response/123-1/abc123.md')
+  })
+})
+
+describe('buildResponseFilePathCandidates', () => {
+  it('returns the expected path before the known workspace misresolution', () => {
+    // #given a runner temp path, workspace, and stable response-file parts
+    const parts = {
+      runnerTemp: '/tmp/runner/_temp',
+      runId: '123',
+      runAttempt: '1',
+      nonce: 'abc123',
+      workspaceDir: '/tmp/runner/repo',
+    }
+
+    // #when building candidate paths
+    const candidates = buildResponseFilePathCandidates(parts)
+
+    // #then the expected path is first and the workspace-relative path is second
+    expect(candidates).toEqual([
+      '/tmp/runner/_temp/fro-bot-response/123-1/abc123.md',
+      '/tmp/runner/repo/fro-bot-response/123-1/abc123.md',
+    ])
+  })
+
+  it.each([{workspaceDir: undefined}, {workspaceDir: '   '}, {workspaceDir: '/tmp/runner'}])(
+    'returns only the expected path when the fallback is unavailable or unsafe',
+    ({workspaceDir}) => {
+      // #given response-file parts and a workspace configuration
+      const parts = {
+        runnerTemp: '/tmp/runner',
+        runId: '123',
+        runAttempt: '1',
+        nonce: 'abc123',
+        workspaceDir,
+      }
+
+      // #when building candidate paths
+      const candidates = buildResponseFilePathCandidates(parts)
+
+      // #then no unsafe or duplicate fallback is returned
+      expect(candidates).toEqual(['/tmp/runner/fro-bot-response/123-1/abc123.md'])
+    },
+  )
+
+  it('returns only the expected path when the fallback would escape the workspace', () => {
+    // #given a runner temp path whose relative form would traverse out of the workspace
+    const parts = {
+      runnerTemp: '/tmp/runner',
+      runId: '../../outside',
+      runAttempt: '1',
+      nonce: 'abc123',
+      workspaceDir: '/tmp/runner/repo',
+    }
+
+    // #when building candidate paths
+    const candidates = buildResponseFilePathCandidates(parts)
+
+    // #then only the expected path is retained
+    expect(candidates).toEqual(['/tmp/outside-1/abc123.md'])
   })
 })
 

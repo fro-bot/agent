@@ -14,6 +14,7 @@
 import type {AgentContext, ParsedResponse, ResponseSurface} from '@fro-bot/runtime'
 import type {TriggerResultProcess} from '../../features/triggers/types.js'
 import type {Logger} from '../../shared/logger.js'
+import type {ReviewEvent} from '../reviews/types.js'
 
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -68,6 +69,7 @@ export interface RunResponsePostParams {
   readonly triggerResult: TriggerResultProcess
   readonly botLogin: string | null
   readonly responseFilePath: string
+  readonly responseFilePathCandidates?: readonly string[]
   /** Action-generated delivery text appended only to plain comment responses. */
   readonly deliveryFooter?: string
 }
@@ -76,16 +78,64 @@ export interface ReadAndParseResponseFileParams {
   readonly agentContext: AgentContext
   readonly triggerResult: TriggerResultProcess
   readonly responseFilePath: string
+  readonly responseFilePathCandidates?: readonly string[]
   /** Only false downgrades missing-file errors to debug; omission keeps the error log for success/unknown runs. */
   readonly executionSucceeded?: boolean
 }
 
 export type ReadAndParseResponseFileResult =
-  | {readonly success: true; readonly data: {readonly parsed: ParsedResponse; readonly surface: ResponseSurface}}
+  | {
+      readonly success: true
+      readonly data: {
+        readonly parsed: ParsedResponse
+        readonly surface: ResponseSurface
+        readonly recoveredFromFallback: boolean
+      }
+    }
   | ResponsePostFailure
 
 function failure(reason: ResponsePostFailureReason, detail: string): ResponsePostFailure {
   return {delivered: false, reason, detail}
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (error instanceof Error && 'code' in error && typeof error.code === 'string') {
+    return error.code
+  }
+  return undefined
+}
+
+function responsePathForLog(filePath: string): string {
+  return path.join(path.dirname(filePath), '<filename-redacted>')
+}
+
+function readErrorDetail(error: unknown, responseFilePathCandidates: readonly string[]): string {
+  const detail = error instanceof Error ? error.message : String(error)
+  return responseFilePathCandidates.reduce(
+    (sanitized, candidate) => sanitized.replaceAll(candidate, responsePathForLog(candidate)),
+    detail,
+  )
+}
+
+async function inspectDirectory(directoryPath: string): Promise<ResponseDirectoryDiagnostic> {
+  try {
+    const directoryEntries = await fs.readdir(directoryPath)
+    return {
+      directoryStatus: directoryEntries.length === 0 ? ('empty' as const) : ('present' as const),
+      directoryEntryCount: directoryEntries.length,
+      directoryEntries: directoryEntries.slice(0, RESPONSE_DIRECTORY_ENTRY_LIMIT),
+    }
+  } catch (error) {
+    const inspectionDetail = error instanceof Error ? error.message : String(error)
+    return errorCode(error) === 'ENOENT'
+      ? {directoryStatus: 'missing', directoryEntryCount: null, directoryEntries: []}
+      : {
+          directoryStatus: 'inspection-failed',
+          directoryEntryCount: null,
+          directoryEntries: [],
+          directoryInspectionError: inspectionDetail,
+        }
+  }
 }
 
 /** Read and validate a response artifact without performing any GitHub mutation. */
@@ -94,66 +144,83 @@ export async function readAndParseResponseFile(
   logger: Logger,
 ): Promise<ReadAndParseResponseFileResult> {
   const {responseFilePath, agentContext, triggerResult, executionSucceeded} = params
-  let raw: string
+  const responseFilePathCandidates = [
+    responseFilePath,
+    ...(params.responseFilePathCandidates ?? []).filter(candidate => candidate !== responseFilePath),
+  ]
+  let raw: string | undefined
+  let actualResponseFilePath = responseFilePath
+  let readError: unknown
   try {
     raw = await fs.readFile(responseFilePath, 'utf8')
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-    const expectedFilename = path.basename(responseFilePath)
-    let directoryDiagnostic: ResponseDirectoryDiagnostic
-
-    try {
-      const directoryEntries = await fs.readdir(path.dirname(responseFilePath))
-      directoryDiagnostic = {
-        directoryStatus: directoryEntries.length === 0 ? 'empty' : 'present',
-        directoryEntryCount: directoryEntries.length,
-        directoryEntries: directoryEntries.slice(0, RESPONSE_DIRECTORY_ENTRY_LIMIT),
+    readError = error
+    if (errorCode(error) === 'ENOENT') {
+      for (const candidate of responseFilePathCandidates.slice(1)) {
+        try {
+          raw = await fs.readFile(candidate, 'utf8')
+          actualResponseFilePath = candidate
+          break
+        } catch (candidateError) {
+          readError = candidateError
+          if (errorCode(candidateError) !== 'ENOENT') {
+            break
+          }
+        }
       }
-    } catch (inspectionError) {
-      const inspectionDetail = inspectionError instanceof Error ? inspectionError.message : String(inspectionError)
-      const inspectionCode =
-        inspectionError instanceof Error && 'code' in inspectionError && typeof inspectionError.code === 'string'
-          ? inspectionError.code
-          : undefined
-
-      directoryDiagnostic =
-        inspectionCode === 'ENOENT'
-          ? {directoryStatus: 'missing', directoryEntryCount: null, directoryEntries: []}
-          : {
-              directoryStatus: 'inspection-failed',
-              directoryEntryCount: null,
-              directoryEntries: [],
-              directoryInspectionError: inspectionDetail,
-            }
     }
 
-    const logPayload = {
-      responseFilePath,
-      expectedFilename,
-      error: detail,
-      ...directoryDiagnostic,
+    if (raw === undefined) {
+      const detail = readErrorDetail(readError, responseFilePathCandidates)
+      const directoryDiagnostics: Record<string, ResponseDirectoryDiagnostic> = {}
+      for (const candidate of responseFilePathCandidates) {
+        const directory = path.dirname(candidate)
+        if (directoryDiagnostics[directory] === undefined) {
+          directoryDiagnostics[directory] = await inspectDirectory(directory)
+        }
+      }
+
+      const primaryDirectoryDiagnostic = directoryDiagnostics[path.dirname(responseFilePath)]
+      const logPayload = {
+        responseFileDirectory: path.dirname(responseFilePath),
+        error: detail,
+        ...(primaryDirectoryDiagnostic ?? {
+          directoryStatus: 'inspection-failed' as const,
+          directoryEntryCount: null,
+          directoryEntries: [],
+        }),
+        directoryDiagnostics,
+      }
+      if (executionSucceeded === false) {
+        logger.debug('Response-post: no response file after failed execution (expected)', logPayload)
+      } else {
+        logger.error('Response-post: failed to read response file', logPayload)
+      }
+      return failure('file-read-failed', detail)
     }
-    if (executionSucceeded === false) {
-      logger.debug('Response-post: no response file after failed execution (expected)', {
-        ...logPayload,
-      })
-    } else {
-      logger.error('Response-post: failed to read response file', logPayload)
-    }
-    return failure('file-read-failed', detail)
   }
 
   const surface = resolveResponseSurface(agentContext, triggerResult.context)
   const parsed = parseResponseFile(raw, {surface})
   if (parsed.success === false) {
     logger.error('Response-post: response file failed validation', {
-      responseFilePath,
+      responseFileDirectory: path.dirname(actualResponseFilePath),
       reason: parsed.error.reason,
     })
     return failure('parse-failed', parsed.error.message)
   }
 
-  return {success: true, data: {parsed: parsed.data, surface}}
+  const recoveredFromFallback = actualResponseFilePath !== responseFilePath
+  if (recoveredFromFallback) {
+    logger.warning('Response-post: recovered response file from fallback location', {
+      expectedResponsePath: responsePathForLog(responseFilePath),
+      actualResponsePath: responsePathForLog(actualResponseFilePath),
+      expectedResponseDirectory: path.dirname(responseFilePath),
+      actualResponseDirectory: path.dirname(actualResponseFilePath),
+    })
+  }
+
+  return {success: true, data: {parsed: parsed.data, surface, recoveredFromFallback}}
 }
 
 function withMarker(body: string): string {
@@ -269,14 +336,18 @@ async function postCommentWithRetry(
  * writer outage.
  */
 export async function runResponsePost(params: RunResponsePostParams, logger: Logger): Promise<ResponsePostResult> {
-  const {octokit, agentContext, triggerResult, botLogin, responseFilePath, deliveryFooter} = params
+  const {octokit, agentContext, triggerResult, botLogin, responseFilePath, responseFilePathCandidates, deliveryFooter} =
+    params
 
-  const prepared = await readAndParseResponseFile({agentContext, triggerResult, responseFilePath}, logger)
+  const prepared = await readAndParseResponseFile(
+    {agentContext, triggerResult, responseFilePath, responseFilePathCandidates},
+    logger,
+  )
   if ('success' in prepared === false) {
     return prepared
   }
 
-  const {surface, parsed} = prepared.data
+  const {surface, parsed, recoveredFromFallback} = prepared.data
   const {target} = deriveSurfaceAndTarget(agentContext, triggerResult)
 
   if (target == null) {
@@ -292,7 +363,9 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     // silently downgrade a required review into a comment and still report
     // delivered:true. Fail closed instead; nothing is posted.
     if (surface === 'pr-review') {
-      logger.error('Response-post: pr-review surface has no verdict frontmatter', {responseFilePath})
+      logger.error('Response-post: pr-review surface has no verdict frontmatter', {
+        responseFileDirectory: path.dirname(responseFilePath),
+      })
       return failure('missing-verdict', 'pull_request responses must carry a verdict frontmatter')
     }
 
@@ -309,7 +382,18 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return failure('missing-target-context', 'Cannot submit a review: bot login is unavailable')
   }
 
-  const reviewEvent = parsed.verdict === 'approve' ? 'APPROVE' : 'REQUEST_CHANGES'
+  const reviewEvent: ReviewEvent =
+    parsed.verdict === 'approve' ? (recoveredFromFallback ? 'COMMENT' : 'APPROVE') : 'REQUEST_CHANGES'
+
+  if (recoveredFromFallback && parsed.verdict === 'approve') {
+    const actualResponseFilePath = responseFilePathCandidates?.find(candidate => candidate !== responseFilePath)
+    logger.warning('Response-post: withholding approving verdict from fallback response artifact', {
+      expectedResponsePath: responsePathForLog(responseFilePath),
+      actualResponsePath: responsePathForLog(actualResponseFilePath ?? responseFilePath),
+      expectedResponseDirectory: path.dirname(responseFilePath),
+      actualResponseDirectory: path.dirname(actualResponseFilePath ?? responseFilePath),
+    })
+  }
 
   const guard = await checkForkOrSelfGuard(
     {octokit, owner: target.owner, repo: target.repo, prNumber: target.number, botLogin, event: reviewEvent},

@@ -31,6 +31,7 @@ export type {CredentialDisposition, ResponseDelivery, ResponseDeliveryDecision} 
 export {
   buildResponseFileDir,
   buildResponseFilePath,
+  buildResponseFilePathCandidates,
   createResponseFileError,
   MAX_BODY_BYTES,
   parseResponseFile,
