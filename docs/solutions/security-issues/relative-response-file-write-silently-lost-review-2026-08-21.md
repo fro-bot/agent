@@ -79,23 +79,29 @@ Both theories explained a missing file. Neither explained a successful write wit
 
 ## Solution
 
-PR #1450 made the handoff explicit and fail safer in five parts.
+PR #1450 made the handoff explicit and fail safer. PR #1454 corrected it after the first attempt shipped a defect described below.
 
-1. `packages/runtime/src/agent/response-file.ts` builds the expected path and the one known workspace-relative misresolution. It returns the fallback only when the candidate remains strictly inside `GITHUB_WORKSPACE`; it cannot become a traversal primitive.
-2. `src/features/agent/response-post.ts` probes the fallback only after the expected read fails with `ENOENT`. Permission errors, I/O failures, and every other read error retain the previous failure behavior.
-3. A response recovered from the fallback can never approve a pull request. An `approve` verdict is downgraded to a non-approving comment because checkout space is contributor-writable on `pull_request` events. Recovering the review body is useful; satisfying a required check from untrusted space is not.
-4. `src/services/setup/ci-config.ts` adds an `edit` deny rule for the worktree-relative response directory. A future relative write fails during the run instead of succeeding silently.
-5. `src/harness/phases/bootstrap.ts` checks both candidate paths before execution, creates the trusted directory, and logs only its directory. The nonce is no longer logged: it is the only value preventing a planted response file, and job logs are readable by anyone with repository read access, including the pull-request author.
+1. `packages/runtime/src/agent/response-file.ts` exports `buildResponseFileFallbackRoots(runnerTemp)`, the single definition of where a misresolved write can land: `[basename(runnerTemp), '']`, ordered observed-first. It builds the expected path plus one candidate per root, returning a candidate only when it remains strictly inside `GITHUB_WORKSPACE`; it cannot become a traversal primitive.
+2. `src/features/agent/response-post.ts` probes the candidates in order and advances only after a read fails with `ENOENT`. Permission errors, I/O failures, and every other read error retain the previous failure behavior.
+3. A response recovered from any fallback can never approve a pull request. An `approve` verdict is downgraded to a non-approving comment because checkout space is contributor-writable on `pull_request` events. Recovering the review body is useful; satisfying a required check from untrusted space is not.
+4. `src/services/setup/ci-config.ts` derives its `edit` deny patterns from the same helper, so the guarded paths and the recovered paths cannot disagree. A future relative write fails during the run instead of succeeding silently.
+5. `src/harness/phases/bootstrap.ts` checks every candidate before execution, creates the trusted directory, and logs only its directory. The nonce is no longer logged: it is the only value preventing a planted response file, and job logs are readable by anyone with repository read access, including the pull-request author.
 
-The merged implementation's candidate builder derives the fallback by relocating the response path relative to `RUNNER_TEMP` under the workspace. Its tests name that path `${GITHUB_WORKSPACE}/fro-bot-response/...`; the incident was observed at `${GITHUB_WORKSPACE}/_temp/fro-bot-response/...`. Keep those path forms distinct when diagnosing a deployment: the source and tests are authoritative for the current recovery candidate.
+### The first fix was inert
+
+#1450 derived the fallback with `path.relative(RUNNER_TEMP, expectedPath)`. On a hosted runner `RUNNER_TEMP` is `/home/runner/work/_temp`, so that strips `_temp` and probed `${GITHUB_WORKSPACE}/fro-bot-response/...`. The model kept `_temp`; the file was at `${GITHUB_WORKSPACE}/_temp/fro-bot-response/...`. The recovery would not have fired on the incident that motivated it.
+
+The deny rule in the same PR guarded the correct path. So the two halves of one defense were built on opposite assumptions about which prefix the model drops, in two files, each internally consistent. Reviewing either file in isolation showed nothing wrong. #1454 replaced both derivations with the shared helper, which is why the correction is a shared definition rather than a corrected string.
 
 ## Why This Works
 
 The primary path remains the only trusted delivery path. The fallback is bounded, read only after an `ENOENT`, and explicitly marked as lower trust. Its content can still recover a useful review comment, but it cannot gain the authority to approve a pull request.
 
-The deny rule addresses the original defect at its source. If OpenCode resolves the model's relative path into the plausible wrong checkout directory, the Write tool is rejected instead of creating directories and reporting success. Recovery is retained for already-produced artifacts and for versions of the path behavior that reach the reader before the deny rule does.
+The deny rules address the original defect at its source. If OpenCode resolves the model's relative path into a plausible wrong checkout directory, the Write tool is rejected instead of creating directories and reporting success. Recovery is retained for already-produced artifacts and for versions of the path behavior that reach the reader before the deny rules do.
 
 The general lesson is broader than response files: when a tool silently creates parent directories and reports unconditional success, a misdirected write is indistinguishable from a correct one. Any handoff that depends on a model reproducing an absolute path needs either a verification read or a deny rule on the plausible-wrong location.
+
+The second lesson came from the failed correction. When one defense is split across a guard and a recovery, both must derive from a single definition of the thing being guarded. Two independent derivations of the same path will eventually disagree, and the disagreement is invisible in any single-file review: each half reads as correct on its own, and only comparing them across files exposes the contradiction.
 
 ## Prevention
 
@@ -105,3 +111,5 @@ The general lesson is broader than response files: when a tool silently creates 
 - Preserve the distinction between `ENOENT` and other read failures. Missing-file recovery is not permission-error recovery.
 - Never log the nonce or the response filename. Diagnostics need directory-level evidence; the nonce is the anti-preseed secret.
 - When an intermittent missing artifact contains the expected nonce and run identity, compare absolute prefixes before investigating provider, permission, or concurrency flakes.
+- Derive a guard and its matching recovery from one shared definition. If a deny rule and a fallback probe are written independently, review them against each other, not just against their own tests.
+- Redact filenames in directory diagnostics, not only in path fields. Listing a directory re-leaks the filename that the surrounding redaction removed.
