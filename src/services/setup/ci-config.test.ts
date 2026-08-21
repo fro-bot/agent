@@ -157,7 +157,7 @@ describe('buildCIConfig', () => {
         agent: {
           build: {
             permission: {
-              edit: {'_temp/fro-bot-response/*': 'deny'},
+              edit: {},
               external_directory: 'deny',
             },
           },
@@ -412,7 +412,10 @@ describe('buildCIConfig', () => {
         agent: {
           build: {
             permission: {
-              edit: {'_temp/fro-bot-response/*': 'deny'},
+              edit: {
+                '_temp/fro-bot-response/*': 'deny',
+                'fro-bot-response/*': 'deny',
+              },
             },
           },
         },
@@ -425,6 +428,7 @@ describe('buildCIConfig', () => {
     it('preserves an existing scalar edit policy while adding the scoped deny', () => {
       // #given an explicit scalar edit policy
       const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
       const result = buildCIConfig(
         {
           opencodeConfig: JSON.stringify({agent: {build: {permission: {edit: 'deny'}}}}),
@@ -439,12 +443,14 @@ describe('buildCIConfig', () => {
       const edit = ((permission.permission as Record<string, unknown>).edit ?? {}) as Record<string, unknown>
       expect(edit['*']).toBe('deny')
       expect(edit['_temp/fro-bot-response/*']).toBe('deny')
-      expect(Object.keys(edit)).toEqual(['*', '_temp/fro-bot-response/*'])
+      expect(edit['fro-bot-response/*']).toBe('deny')
+      expect(Object.keys(edit)).toEqual(['*', '_temp/fro-bot-response/*', 'fro-bot-response/*'])
     })
 
     it('preserves existing edit object entries in order and appends the scoped deny', () => {
       // #given an explicit object edit policy without the response-file deny
       const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
       const result = buildCIConfig(
         {
           opencodeConfig: JSON.stringify({
@@ -459,19 +465,31 @@ describe('buildCIConfig', () => {
       // #then original entries are preserved and the deny is appended last
       const permission = (result.config.agent as Record<string, unknown>).build as Record<string, unknown>
       const edit = ((permission.permission as Record<string, unknown>).edit ?? {}) as Record<string, unknown>
-      expect(edit).toEqual({src: 'ask', docs: 'deny', '_temp/fro-bot-response/*': 'deny'})
-      expect(Object.keys(edit)).toEqual(['src', 'docs', '_temp/fro-bot-response/*'])
+      expect(edit).toEqual({
+        src: 'ask',
+        docs: 'deny',
+        '_temp/fro-bot-response/*': 'deny',
+        'fro-bot-response/*': 'deny',
+      })
+      expect(Object.keys(edit)).toEqual(['src', 'docs', '_temp/fro-bot-response/*', 'fro-bot-response/*'])
     })
 
     it('moves an existing response-file deny to the end of the edit policy', () => {
       // #given an existing deny followed by a broad allow
       const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
       const result = buildCIConfig(
         {
           opencodeConfig: JSON.stringify({
             agent: {
               build: {
-                permission: {edit: {'_temp/fro-bot-response/*': 'allow', '*': 'allow'}},
+                permission: {
+                  edit: {
+                    '_temp/fro-bot-response/*': 'allow',
+                    'fro-bot-response/*': 'allow',
+                    '*': 'allow',
+                  },
+                },
               },
             },
           }),
@@ -484,8 +502,12 @@ describe('buildCIConfig', () => {
       // #then delete-then-re-add ordering makes the scoped deny last
       const permission = (result.config.agent as Record<string, unknown>).build as Record<string, unknown>
       const edit = ((permission.permission as Record<string, unknown>).edit ?? {}) as Record<string, unknown>
-      expect(edit).toEqual({'*': 'allow', '_temp/fro-bot-response/*': 'deny'})
-      expect(Object.keys(edit)).toEqual(['*', '_temp/fro-bot-response/*'])
+      expect(edit).toEqual({
+        '*': 'allow',
+        '_temp/fro-bot-response/*': 'deny',
+        'fro-bot-response/*': 'deny',
+      })
+      expect(Object.keys(edit)).toEqual(['*', '_temp/fro-bot-response/*', 'fro-bot-response/*'])
     })
 
     it('allows the explicitly designated integration workdir after the response-file dir', () => {
