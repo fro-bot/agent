@@ -157,7 +157,7 @@ describe('resolveCarryManifest', () => {
     const resolved = [] as string[]
 
     // #when
-    const manifest = await resolveCarryManifest('v1.18.18', refs, SOURCE_REPO, async source => {
+    const manifest = await resolveCarryManifest('v1.18.21', refs, SOURCE_REPO, async source => {
       resolved.push(source.fetchRef)
       return SOURCE_SHA
     })
@@ -165,7 +165,7 @@ describe('resolveCarryManifest', () => {
 
     // #then
     expect(manifest).toEqual({
-      base: 'v1.18.18',
+      base: 'v1.18.21',
       carries: [{ref: refs[0], resolvedSha: SOURCE_SHA}],
     })
     expect(resolved).toEqual(['refs/pull/30182/head'])
