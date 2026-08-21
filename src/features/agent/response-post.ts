@@ -11,7 +11,7 @@
  * the caller (finalize) is responsible for turning that into a failed run.
  */
 
-import type {AgentContext, ParsedResponse, ResponseSurface} from '@fro-bot/runtime'
+import type {AgentContext, ParsedResponse, ResponseFilePathCandidates, ResponseSurface} from '@fro-bot/runtime'
 import type {TriggerResultProcess} from '../../features/triggers/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ReviewEvent} from '../reviews/types.js'
@@ -37,7 +37,8 @@ const RESPONSE_DIRECTORY_ENTRY_LIMIT = 20
 
 interface ResponseDirectoryDiagnostic {
   readonly directoryStatus: 'missing' | 'empty' | 'present' | 'inspection-failed'
-  readonly directoryEntryCount: number | null
+  readonly directoryEntriesObserved: number | null
+  readonly directoryEntriesTruncated: boolean
   readonly directoryEntries: readonly string[]
   readonly directoryInspectionError?: string
 }
@@ -69,7 +70,7 @@ export interface RunResponsePostParams {
   readonly triggerResult: TriggerResultProcess
   readonly botLogin: string | null
   readonly responseFilePath: string
-  readonly responseFilePathCandidates?: readonly string[]
+  readonly responseFilePathCandidates?: ResponseFilePathCandidates
   /** Action-generated delivery text appended only to plain comment responses. */
   readonly deliveryFooter?: string
 }
@@ -78,7 +79,7 @@ export interface ReadAndParseResponseFileParams {
   readonly agentContext: AgentContext
   readonly triggerResult: TriggerResultProcess
   readonly responseFilePath: string
-  readonly responseFilePathCandidates?: readonly string[]
+  readonly responseFilePathCandidates?: ResponseFilePathCandidates
   /** Only false downgrades missing-file errors to debug; omission keeps the error log for success/unknown runs. */
   readonly executionSucceeded?: boolean
 }
@@ -120,19 +121,39 @@ function readErrorDetail(error: unknown, responseFilePathCandidates: readonly st
 
 async function inspectDirectory(directoryPath: string): Promise<ResponseDirectoryDiagnostic> {
   try {
-    const directoryEntries = await fs.readdir(directoryPath)
+    const directoryHandle = await fs.opendir(directoryPath)
+    const directoryEntries: string[] = []
+    for await (const entry of directoryHandle) {
+      directoryEntries.push(entry.name)
+      if (directoryEntries.length >= RESPONSE_DIRECTORY_ENTRY_LIMIT) {
+        return {
+          directoryStatus: 'present',
+          directoryEntriesObserved: directoryEntries.length,
+          directoryEntriesTruncated: true,
+          directoryEntries,
+        }
+      }
+    }
+
     return {
       directoryStatus: directoryEntries.length === 0 ? ('empty' as const) : ('present' as const),
-      directoryEntryCount: directoryEntries.length,
-      directoryEntries: directoryEntries.slice(0, RESPONSE_DIRECTORY_ENTRY_LIMIT),
+      directoryEntriesObserved: directoryEntries.length,
+      directoryEntriesTruncated: false,
+      directoryEntries,
     }
   } catch (error) {
     const inspectionDetail = error instanceof Error ? error.message : String(error)
     return errorCode(error) === 'ENOENT'
-      ? {directoryStatus: 'missing', directoryEntryCount: null, directoryEntries: []}
+      ? {
+          directoryStatus: 'missing',
+          directoryEntriesObserved: null,
+          directoryEntriesTruncated: false,
+          directoryEntries: [],
+        }
       : {
           directoryStatus: 'inspection-failed',
-          directoryEntryCount: null,
+          directoryEntriesObserved: null,
+          directoryEntriesTruncated: false,
           directoryEntries: [],
           directoryInspectionError: inspectionDetail,
         }
@@ -145,9 +166,10 @@ export async function readAndParseResponseFile(
   logger: Logger,
 ): Promise<ReadAndParseResponseFileResult> {
   const {responseFilePath, agentContext, triggerResult, executionSucceeded} = params
+  const fallbackPath = params.responseFilePathCandidates?.fallbackPath
   const responseFilePathCandidates = [
     responseFilePath,
-    ...(params.responseFilePathCandidates ?? []).filter(candidate => candidate !== responseFilePath),
+    ...(fallbackPath === null || fallbackPath === undefined || fallbackPath === responseFilePath ? [] : [fallbackPath]),
   ]
   let raw: string | undefined
   let actualResponseFilePath = responseFilePath
@@ -187,7 +209,8 @@ export async function readAndParseResponseFile(
         error: detail,
         ...(primaryDirectoryDiagnostic ?? {
           directoryStatus: 'inspection-failed' as const,
-          directoryEntryCount: null,
+          directoryEntriesObserved: null,
+          directoryEntriesTruncated: false,
           directoryEntries: [],
         }),
         directoryDiagnostics,

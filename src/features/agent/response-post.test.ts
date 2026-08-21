@@ -126,6 +126,7 @@ describe('readAndParseResponseFile read failures', () => {
     logger = createMockLogger()
     tempFiles = []
     fsMocks.readFile.mockReset().mockRejectedValue(new Error('read failed'))
+    fsMocks.readdir.mockClear()
   })
 
   afterEach(async () => {
@@ -156,12 +157,14 @@ describe('readAndParseResponseFile read failures', () => {
       responseFileDirectory: path.dirname(responseFilePath),
       error: 'read failed',
       directoryStatus: 'missing',
-      directoryEntryCount: null,
+      directoryEntriesObserved: null,
+      directoryEntriesTruncated: false,
       directoryEntries: [],
       directoryDiagnostics: {
         [path.dirname(responseFilePath)]: {
           directoryStatus: 'missing',
-          directoryEntryCount: null,
+          directoryEntriesObserved: null,
+          directoryEntriesTruncated: false,
           directoryEntries: [],
         },
       },
@@ -193,12 +196,14 @@ describe('readAndParseResponseFile read failures', () => {
         responseFileDirectory: path.dirname(responseFilePath),
         error: 'read failed',
         directoryStatus: 'empty',
-        directoryEntryCount: 0,
+        directoryEntriesObserved: 0,
+        directoryEntriesTruncated: false,
         directoryEntries: [],
         directoryDiagnostics: {
           [path.dirname(responseFilePath)]: {
             directoryStatus: 'empty',
-            directoryEntryCount: 0,
+            directoryEntriesObserved: 0,
+            directoryEntriesTruncated: false,
             directoryEntries: [],
           },
         },
@@ -207,7 +212,7 @@ describe('readAndParseResponseFile read failures', () => {
     expect(vi.mocked(logger.error)).not.toHaveBeenCalled()
   })
 
-  it('logs bounded entry names and the total count without reading their contents', async () => {
+  it('logs capped entry names and signals truncation without materializing the full listing', async () => {
     // #given a run-scoped directory containing more entries than the diagnostic cap
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-entries-'))
     const responseFilePath = path.join(dir, 'expected-response.md')
@@ -231,25 +236,23 @@ describe('readAndParseResponseFile read failures', () => {
     // #then only names are logged, the listing is capped, and no entry contents are read
     expect(result).toEqual({delivered: false, reason: 'file-read-failed', detail: 'read failed'})
     expect(fsMocks.readFile).toHaveBeenCalledExactlyOnceWith(responseFilePath, 'utf8')
-    expect(vi.mocked(logger.error)).toHaveBeenCalledWith('Response-post: failed to read response file', {
-      responseFileDirectory: path.dirname(responseFilePath),
-      error: 'read failed',
-      directoryStatus: 'present',
-      directoryEntryCount: 25,
-      directoryEntries: entryNames.slice(0, 20),
-      directoryDiagnostics: {
-        [path.dirname(responseFilePath)]: {
-          directoryStatus: 'present',
-          directoryEntryCount: 25,
-          directoryEntries: entryNames.slice(0, 20),
-        },
-      },
-    })
+    expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
+      'Response-post: failed to read response file',
+      expect.objectContaining({
+        responseFileDirectory: path.dirname(responseFilePath),
+        error: 'read failed',
+        directoryStatus: 'present',
+        directoryEntriesObserved: 20,
+        directoryEntriesTruncated: true,
+      }),
+    )
     const [, payload] = vi.mocked(logger.error).mock.calls[0] as [
       string,
       {readonly directoryEntries: readonly string[]},
     ]
     expect(payload.directoryEntries).toHaveLength(20)
+    expect(payload.directoryEntries.every(entry => entryNames.includes(entry))).toBe(true)
+    expect(fsMocks.readdir).not.toHaveBeenCalled()
     expect(JSON.stringify(payload)).not.toContain('secret content')
   })
 
@@ -270,7 +273,7 @@ describe('readAndParseResponseFile read failures', () => {
         agentContext: makeAgentContext(),
         triggerResult: makeTriggerResult('issue_comment'),
         responseFilePath,
-        responseFilePathCandidates: [responseFilePath, fallbackPath],
+        responseFilePathCandidates: {expectedPath: responseFilePath, fallbackPath},
         executionSucceeded: true,
       },
       logger,
@@ -284,12 +287,14 @@ describe('readAndParseResponseFile read failures', () => {
       directoryDiagnostics: {
         [primaryDir]: {
           directoryStatus: 'empty',
-          directoryEntryCount: 0,
+          directoryEntriesObserved: 0,
+          directoryEntriesTruncated: false,
           directoryEntries: [],
         },
         [fallbackDir]: {
           directoryStatus: 'present',
-          directoryEntryCount: 1,
+          directoryEntriesObserved: 1,
+          directoryEntriesTruncated: false,
           directoryEntries: ['near-miss.md'],
         },
       },
@@ -319,7 +324,7 @@ describe('readAndParseResponseFile read failures', () => {
         agentContext: makeAgentContext(),
         triggerResult: makeTriggerResult('issue_comment'),
         responseFilePath,
-        responseFilePathCandidates: [responseFilePath, fallbackPath],
+        responseFilePathCandidates: {expectedPath: responseFilePath, fallbackPath},
       },
       logger,
     )
@@ -354,7 +359,7 @@ describe('readAndParseResponseFile read failures', () => {
         agentContext: makeAgentContext(),
         triggerResult: makeTriggerResult('issue_comment'),
         responseFilePath,
-        responseFilePathCandidates: [responseFilePath, fallbackPath],
+        responseFilePathCandidates: {expectedPath: responseFilePath, fallbackPath},
       },
       logger,
     )
@@ -470,11 +475,10 @@ describe('runResponsePost', () => {
   })
 
   it('submits a fallback-sourced approving verdict as a non-approving COMMENT review', async () => {
-    // #given an approving response recovered from the second fallback candidate
+    // #given an approving response recovered from the fallback candidate
     const primaryPath = await createMissingResponsePath()
-    const firstFallbackPath = await createMissingResponsePath()
-    const secondFallbackPath = await writeFixture('---\nverdict: approve\n---\n\nRecovered approval.')
-    tempFiles.push(primaryPath, firstFallbackPath, secondFallbackPath)
+    const fallbackPath = await writeFixture('---\nverdict: approve\n---\n\nRecovered approval.')
+    tempFiles.push(primaryPath, fallbackPath)
     const octokit = makeOctokit()
 
     // #when posting with the fallback candidate
@@ -485,7 +489,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: primaryPath,
-        responseFilePathCandidates: [primaryPath, firstFallbackPath, secondFallbackPath],
+        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPath},
       },
       logger,
     )
@@ -499,11 +503,10 @@ describe('runResponsePost', () => {
       'Response-post: withholding approving verdict from fallback response artifact',
       expect.objectContaining({
         expectedResponseDirectory: path.dirname(primaryPath),
-        actualResponsePath: path.join(path.dirname(secondFallbackPath), '<filename-redacted>'),
-        actualResponseDirectory: path.dirname(secondFallbackPath),
+        actualResponsePath: path.join(path.dirname(fallbackPath), '<filename-redacted>'),
+        actualResponseDirectory: path.dirname(fallbackPath),
       }),
     )
-    expect(JSON.stringify(vi.mocked(logger.warning).mock.calls)).not.toContain(path.dirname(firstFallbackPath))
   })
 
   it('keeps a primary-sourced approving verdict as an APPROVE review', async () => {
@@ -520,7 +523,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
-        responseFilePathCandidates: [filePath, '/tmp/unused-fallback.md'],
+        responseFilePathCandidates: {expectedPath: filePath, fallbackPath: '/tmp/unused-fallback.md'},
       },
       logger,
     )
@@ -549,7 +552,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: primaryPath,
-        responseFilePathCandidates: [primaryPath, fallbackPath],
+        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPath},
       },
       logger,
     )
@@ -559,6 +562,36 @@ describe('runResponsePost', () => {
     expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({event: 'REQUEST_CHANGES', pull_number: 7, commit_id: 'head-sha'}),
     )
+  })
+
+  it('fails closed for a fallback-sourced pr-review artifact with no verdict frontmatter', async () => {
+    // #given a response recovered from the fallback path without review verdict frontmatter
+    const primaryPath = await createMissingResponsePath()
+    const fallbackPath = await writeFixture('Recovered review body without a verdict.')
+    tempFiles.push(primaryPath, fallbackPath)
+    const octokit = makeOctokit()
+
+    // #when posting the fallback response for a pull_request trigger
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: primaryPath,
+        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPath},
+      },
+      logger,
+    )
+
+    // #then no review or comment is submitted
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'missing-verdict',
+      detail: 'pull_request responses must carry a verdict frontmatter',
+    })
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
   })
 
   it('targets the routing-derived issue number even when the file embeds a different number', async () => {

@@ -1,4 +1,4 @@
-import type {ResponseDelivery} from '@fro-bot/runtime'
+import type {ResponseDelivery, ResponseFilePathCandidates} from '@fro-bot/runtime'
 import type {EnsureOpenCodeResult} from '../../features/agent/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ActionInputs} from '../../shared/types.js'
@@ -8,12 +8,7 @@ import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
-import {
-  buildResponseFileDir,
-  buildResponseFilePath,
-  buildResponseFilePathCandidates,
-  resolveResponseDelivery,
-} from '@fro-bot/runtime'
+import {buildResponseFileDir, buildResponseFilePathCandidates, resolveResponseDelivery} from '@fro-bot/runtime'
 import {ensureOpenCodeAvailable} from '../../features/agent/index.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {assertNoPersistedGitCredentials} from '../../services/setup/git-credential-check.js'
@@ -45,7 +40,7 @@ export interface BootstrapPhaseResult {
    * runs, closing the workspace-preseed and stale-file-replay attacks.
    */
   readonly responseFilePath: string | null
-  readonly responseFilePathCandidates: readonly string[] | null
+  readonly responseFilePathCandidates: ResponseFilePathCandidates | null
   /** Trusted PR head SHA captured by workflow setup; empty when brokered push is unavailable. */
   readonly trustedHeadSha: string
 }
@@ -149,7 +144,10 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
 async function resolveResponseFilePath(
   delivery: ResponseDelivery,
   logger: Logger,
-): Promise<{readonly responseFilePath: string; readonly responseFilePathCandidates: readonly string[]} | null> {
+): Promise<{
+  readonly responseFilePath: string
+  readonly responseFilePathCandidates: ResponseFilePathCandidates
+} | null> {
   if (delivery !== 'file-convention') {
     return null
   }
@@ -165,7 +163,6 @@ async function resolveResponseFilePath(
   const workspaceDir = process.env.GITHUB_WORKSPACE
 
   const dir = buildResponseFileDir({runnerTemp, runId, runAttempt})
-  const filePath = buildResponseFilePath({runnerTemp, runId, runAttempt, nonce})
   const responseFilePathCandidates = buildResponseFilePathCandidates({
     runnerTemp,
     runId,
@@ -173,17 +170,24 @@ async function resolveResponseFilePath(
     nonce,
     workspaceDir,
   })
+  const filePath = responseFilePathCandidates.expectedPath
 
   await fs.mkdir(dir, {recursive: true})
 
-  const alreadyExists = await fs
-    .access(filePath)
-    .then(() => true)
-    .catch(() => false)
-  if (alreadyExists) {
-    throw new Error(
-      `Response file already exists before execution (preseed guard tripped) in directory: ${path.dirname(filePath)}`,
-    )
+  const candidatePaths = [
+    responseFilePathCandidates.expectedPath,
+    ...(responseFilePathCandidates.fallbackPath === null ? [] : [responseFilePathCandidates.fallbackPath]),
+  ]
+  for (const candidatePath of candidatePaths) {
+    const alreadyExists = await fs
+      .stat(candidatePath)
+      .then(stats => stats.isFile())
+      .catch(() => false)
+    if (alreadyExists) {
+      throw new Error(
+        `Response file already exists before execution (preseed guard tripped) in directory: ${path.dirname(candidatePath)}`,
+      )
+    }
   }
 
   logger.debug('Resolved response file path', {directory: path.dirname(filePath)})

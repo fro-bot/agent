@@ -104,17 +104,22 @@ export function buildResponseFilePath(parts: {
  * a malformed runner-temp path must never turn this helper into a traversal
  * primitive.
  */
+export interface ResponseFilePathCandidates {
+  readonly expectedPath: string
+  readonly fallbackPath: string | null
+}
+
 export function buildResponseFilePathCandidates(parts: {
   readonly runnerTemp: string
   readonly runId: string | number
   readonly runAttempt: string | number
   readonly nonce: string
   readonly workspaceDir: string | undefined
-}): readonly string[] {
+}): ResponseFilePathCandidates {
   const expectedPath = path.resolve(buildResponseFilePath(parts))
   const workspaceDir = parts.workspaceDir
   if (workspaceDir == null || workspaceDir.trim().length === 0) {
-    return [expectedPath]
+    return {expectedPath, fallbackPath: null}
   }
 
   const resolvedWorkspaceDir = path.resolve(workspaceDir)
@@ -123,10 +128,10 @@ export function buildResponseFilePathCandidates(parts: {
   const isInsideWorkspace = fallbackPath.startsWith(`${resolvedWorkspaceDir}${path.sep}`)
 
   if (isInsideWorkspace === false || fallbackPath === expectedPath) {
-    return [expectedPath]
+    return {expectedPath, fallbackPath: null}
   }
 
-  return [expectedPath, fallbackPath]
+  return {expectedPath, fallbackPath}
 }
 
 interface Frontmatter {

@@ -48,10 +48,10 @@ describe('buildResponseFilePathCandidates', () => {
     const candidates = buildResponseFilePathCandidates(parts)
 
     // #then the expected path is first and the workspace-relative path is second
-    expect(candidates).toEqual([
-      '/tmp/runner/_temp/fro-bot-response/123-1/abc123.md',
-      '/tmp/runner/repo/fro-bot-response/123-1/abc123.md',
-    ])
+    expect(candidates).toEqual({
+      expectedPath: '/tmp/runner/_temp/fro-bot-response/123-1/abc123.md',
+      fallbackPath: '/tmp/runner/repo/fro-bot-response/123-1/abc123.md',
+    })
   })
 
   it.each([{workspaceDir: undefined}, {workspaceDir: '   '}, {workspaceDir: '/tmp/runner'}])(
@@ -70,7 +70,10 @@ describe('buildResponseFilePathCandidates', () => {
       const candidates = buildResponseFilePathCandidates(parts)
 
       // #then no unsafe or duplicate fallback is returned
-      expect(candidates).toEqual(['/tmp/runner/fro-bot-response/123-1/abc123.md'])
+      expect(candidates).toEqual({
+        expectedPath: '/tmp/runner/fro-bot-response/123-1/abc123.md',
+        fallbackPath: null,
+      })
     },
   )
 
@@ -88,7 +91,7 @@ describe('buildResponseFilePathCandidates', () => {
     const candidates = buildResponseFilePathCandidates(parts)
 
     // #then only the expected path is retained
-    expect(candidates).toEqual(['/tmp/outside-1/abc123.md'])
+    expect(candidates).toEqual({expectedPath: '/tmp/outside-1/abc123.md', fallbackPath: null})
   })
 })
 

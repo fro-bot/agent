@@ -37,7 +37,13 @@ export {
   parseResponseFile,
   RESPONSE_FILE_DIR_SEGMENT,
 } from './response-file.js'
-export type {ParsedResponse, ResponseFileError, ResponseFileErrorReason, ResponseSurface} from './response-file.js'
+export type {
+  ParsedResponse,
+  ResponseFileError,
+  ResponseFileErrorReason,
+  ResponseFilePathCandidates,
+  ResponseSurface,
+} from './response-file.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
 export type {OpenCodeServerHandle} from './server.js'
 export {createSessionTools, info, list, read, search} from './session-tools.js'
