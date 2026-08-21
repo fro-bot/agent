@@ -97,6 +97,16 @@ export function buildResponseFilePath(parts: {
 }
 
 /**
+ * The path the harness tells the model to write, plus the single location the
+ * write lands in when OpenCode resolves a relative path against the checkout.
+ * `fallbackPath` is null whenever no distinct in-workspace path applies.
+ */
+export interface ResponseFilePathCandidates {
+  readonly expectedPath: string
+  readonly fallbackPath: string | null
+}
+
+/**
  * Build the expected response-file path and the one known path produced when
  * OpenCode resolves the model's relative write against the checkout.
  *
@@ -104,11 +114,6 @@ export function buildResponseFilePath(parts: {
  * a malformed runner-temp path must never turn this helper into a traversal
  * primitive.
  */
-export interface ResponseFilePathCandidates {
-  readonly expectedPath: string
-  readonly fallbackPath: string | null
-}
-
 export function buildResponseFilePathCandidates(parts: {
   readonly runnerTemp: string
   readonly runId: string | number
