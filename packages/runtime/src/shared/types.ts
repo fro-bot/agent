@@ -71,7 +71,6 @@ export type OutputModeRequestState = 'omitted' | 'auto' | 'explicit'
 export interface OutputModeMigrationState {
   readonly requested: OutputModeRequestState
   readonly resolved: ResolvedOutputMode | null
-  readonly legacyWouldSelectBranchPr: boolean
 }
 
 export type ResponseMode = 'github' | 'none'

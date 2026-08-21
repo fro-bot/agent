@@ -114,7 +114,6 @@ describe('setActionOutputs', () => {
     const outputModeMigration = {
       requested: 'auto' as const,
       resolved: 'working-dir' as const,
-      legacyWouldSelectBranchPr: true,
     }
     const outputs: ActionOutputs = {
       sessionId: 'ses_output_mode_migration',
@@ -134,7 +133,6 @@ describe('setActionOutputs', () => {
     const outputModeMigration = {
       requested: 'omitted' as const,
       resolved: null,
-      legacyWouldSelectBranchPr: false,
     }
     const outputs: ActionOutputs = {
       sessionId: null,

@@ -180,7 +180,6 @@ describe('run', () => {
   const unavailableOutputModeMigration = {
     requested: 'omitted' as const,
     resolved: null,
-    legacyWouldSelectBranchPr: false,
   }
 
   function expectUnavailableOutputs(): void {
@@ -228,7 +227,7 @@ describe('run', () => {
     expect(exitCode).toBe(1)
     expect(vi.mocked(setActionOutputs)).toHaveBeenCalledWith(
       expect.objectContaining({
-        outputModeMigration: {requested: 'explicit', resolved: null, legacyWouldSelectBranchPr: false},
+        outputModeMigration: {requested: 'explicit', resolved: null},
       }),
     )
   })

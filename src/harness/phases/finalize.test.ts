@@ -142,7 +142,6 @@ function createExecution(overrides: Partial<ExecutePhaseResult> = {}): ExecutePh
     outputModeMigration: {
       requested: 'explicit',
       resolved: 'branch-pr',
-      legacyWouldSelectBranchPr: false,
     },
     ...overrides,
   }
@@ -217,7 +216,6 @@ describe('runFinalize file-convention delivery', () => {
       outputModeMigration: {
         requested: 'auto' as const,
         resolved: 'branch-pr' as const,
-        legacyWouldSelectBranchPr: true,
       },
     } as ExecutePhaseResult
     const metrics = createMetrics()
@@ -230,7 +228,7 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.setOutput).toHaveBeenCalledWith('resolved-output-mode', 'branch-pr')
     expect(mocks.setOutput).toHaveBeenCalledWith(
       'output-mode-migration',
-      JSON.stringify({requested: 'auto', resolved: 'branch-pr', legacyWouldSelectBranchPr: true}),
+      JSON.stringify({requested: 'auto', resolved: 'branch-pr'}),
     )
     expect(mocks.setOutput.mock.calls.filter(([name]) => name === 'resolved-output-mode')).toHaveLength(1)
     expect(mocks.setOutput.mock.calls.filter(([name]) => name === 'output-mode-migration')).toHaveLength(1)

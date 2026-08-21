@@ -1,7 +1,7 @@
 ---
 title: "refactor: Audit and upgrade Bitter Lesson delta flexibility"
 type: refactor
-status: active
+status: done
 date: 2026-08-13
 ---
 
@@ -13,9 +13,9 @@ This plan is a fresh, source-grounded audit of the remaining Bitter Lesson risk 
 
 The August 7 U1-U6 units shipped and remain valid. U7's carry ledger shipped. Its proposed liveness rewrite was correctly abandoned: the shipped OpenCode surface has no truthful per-session progress signal that can replace the current initial-activity semantics. This plan does not reopen that decision.
 
-The current harness is substantially Bitter-Lesson-aligned. The largest remaining capability ceiling is not a broad prompt problem. It is the release integration path, where the same deterministic procedure exists in TypeScript, bash/YAML, and an English model prompt and has drifted. A smaller contract defect remains in phrase-inferred output mode. The existing outcome corpus is useful but needs one bounded comparative projection so agent-facing changes can be judged without becoming a benchmark platform. The carry ledger needs machine-enforced referential integrity, and one carefully bounded experiment should test whether eager session presearch still earns its cost.
+The current harness is substantially Bitter-Lesson-aligned. The largest remaining capability ceiling is not a broad prompt problem. It is the release integration merge phase, where the same procedure remains represented in TypeScript, bash/YAML, and an English model prompt and has drifted. Push, build, and validation duplication is gone. The existing outcome corpus is useful but needs one bounded comparative projection so agent-facing changes can be judged without becoming a benchmark platform. The carry ledger needs machine-enforced referential integrity, and one carefully bounded experiment should test whether eager session presearch still earns its cost.
 
-The units are phased rather than one all-at-once landing: U1-U7 form the active completion path, while U8 is deliberately delayed until the next minor-release migration window.
+The units landed in phases rather than one all-at-once change. U7b was abandoned after its evidence dependency failed the plan's first stop condition. U7c and U8 are complete; the remaining integration debt is the merge-phase authority boundary.
 
 The governing direction is simple:
 
@@ -46,8 +46,8 @@ Search, decomposition, routing, and orchestration are not automatically Bitter-L
 ### Audit conclusions
 
 1. **Do not prescribe a broad prompt diet.** The August 7 prompt audit found a disciplined prompt whose durable sections state authority, environment, safety, and delivery contracts. The one redundant session ritual was removed. Remaining prompt changes should be contract-preserving and outcome-measured, not a generalized deletion campaign.
-2. **Collapse the release integration implementations.** `packages/harness/src/integrate.ts` and its CLI already contain useful deterministic primitives, but production still runs the workflow's bash/YAML rendering plus `packages/harness/prompt.txt`. The three representations have different semantics: the TypeScript path does not yet own squash, workflow stripping, or push, while the production prompt does.
-3. **Make delivery mode explicit.** `resolveAutoMode` is brittle code guessing a side-effect routing decision from English. This is not chiefly a model-capability violation; it is a trusted configuration decision placed in the wrong layer. Keep compatibility briefly, make `auto` safe and deterministic, warn on legacy matches, and remove the detector after migration.
+2. **Collapse the release integration merge implementations.** `packages/harness/src/integrate.ts` and its CLI now own squash, workflow stripping, build, validation, provenance, and push through the trusted frozen-commit boundary. Production still runs workflow bash/YAML source parsing and the English prompt for the merge phase, so that phase remains triplicated and is not yet code-authoritative.
+3. **Make delivery mode explicit.** Phrase inference was a brittle way to guess a side-effect routing decision from English. U8 removed it: `auto` is a safe deterministic alias for `working-dir`, and `branch-pr` requires explicit configuration. This is not chiefly a model-capability violation; it is a trusted configuration decision that belonged in the wrong layer.
 4. **Use the existing eval corpus as a verifier, not a platform.** The six-scenario corpus and reviewed baseline remain authoritative and capped at eight scenarios. Add only a stable candidate-vs-baseline comparison and lazy, bounded repeats for a stochastic quality failure.
 5. **Machine-check the carry ledger's integrity.** The ledger documents upstream carry rationale; it must not become an external-truth oracle. Static checks can prevent drift between the manifest and documentation without making network claims about upstream PR state.
 6. **Test eager session presearch once.** The current action phase eagerly lists recent sessions and searches prior work, while native `session_*` tools remain available. The question is whether the injected context still pays for itself. The experiment must preserve logical-key session continuity and must not assert tool usage or a prescribed model method.
@@ -60,7 +60,7 @@ Search, decomposition, routing, and orchestration are not automatically Bitter-L
 - **R4 — Conflict-scoped artifact validation:** Each model-resolution attempt runs in a disposable isolated checkout rooted under the runner's temporary scratch area. The checkout is recreated from the exact pre-conflict commit before every attempt, then the same merge is reapplied to regenerate the conflict set; `git reset --hard` alone is insufficient because it does not remove ignored or untracked state. The resolver does not claim to prevent or reliably detect arbitrary external filesystem writes from a model running inside the runner trust boundary. Instead, attempt filesystem state is never artifact authority: code extracts bytes only from the exact allowed conflict paths, rejects symlink components and non-regular files, applies strict encoding/marker/size checks, and copies accepted blobs into an independently reconstructed integration merge state. Code stages only explicit validated paths, never `git add -A`, requires an empty unmerged index, and preserves the late deterministic validation/push boundary. Broader read-only context may be allowed after trusted reassessment, but write scope never widens implicitly. Any invalid extracted result destroys the attempt and fails it.
 - **R5 — Bounded conflict recovery:** Each integration ref receives at most two conflict-resolution attempts. Exhausting the bound fails the release integration hard.
 - **R6 — Release preservation:** The one-job/OIDC security invariant, workflow-file strip, all-or-nothing build/publish dependency, provenance, and rollback behavior remain intact.
-- **R7 — Explicit output contract:** Public `auto` remains temporarily for compatibility but deterministically resolves to `working-dir`. The old matcher may warn during one minor-release window but never chooses `branch-pr`. Keep the existing scalar `resolved-output-mode` output backward-compatible and add a dedicated `output-mode-migration` machine-readable output that lets external callers detect requested/omitted `auto`, final `working-dir`, and whether legacy inference would have selected `branch-pr`.
+- **R7 — Explicit output contract:** Public `auto` remains for compatibility and deterministically resolves to `working-dir`; phrase inference never selects `branch-pr`. Keep the existing scalar `resolved-output-mode` output backward-compatible and retain the dedicated `output-mode-migration` machine-readable output for requested/omitted mode and final resolution. The legacy-inference field was removed with U8.
 - **R8 — Credential override remains absolute:** `pull_request`, `issue_comment`, and `issues` events continue to withhold GitHub credentials even if any caller requests a non-posting or alternate output mode.
 - **R9 — Stable comparative evaluation:** Candidate comparison uses only scenario state, structured verdict, and gate IDs/semantics. Prompt hashes, runtime/plugin versions, duration, cost, and tokens remain provenance or advisory data, never quality-equality gates.
 - **R10 — Conservative eval verdicts:** Safety or contract-gate failure blocks without retries. Inconclusive infrastructure outcomes are neither pass nor fail and require rerun. Stochastic quality repeats are lazy and bounded to at most 4-vs-4 samples per affected scenario, including the initial run.
@@ -107,6 +107,7 @@ No hand-authored `dist/` change is an implementation unit. Generated distributio
 - **Generic plugin/config abstraction or richer model-parameter framework:** deferred.
 - **External upstream truth checks for carries:** rejected from normal tests. Upstream status and removal satisfaction remain human/advisory research.
 - **Registry for every workaround:** rejected. Carries belong in the carry ledger; code-owned accommodations belong beside the code that owns them.
+- **Forward-shadow evidence collection:** abandoned and deleted in PR #1439 (`2432df80b`). The authoritative prompt-driven path is not self-reproducible under stochastic conflict resolution, so it could not provide a truthful structural or outcome signal; no shadow evidence was collected.
 - **Judge model, significance tests, score aggregation, flake database, dashboard, parallel eval runner, and benchmark platform:** rejected.
 
 ## Current-State Audit Verdict
@@ -115,10 +116,10 @@ No hand-authored `dist/` change is an implementation unit. Generated distributio
 | --- | --- | --- |
 | Prompts, context, and session tools | **Partial** | XML authority, safety/output contracts, context caps, and the August 7 prompt correction are aligned. Eager `listSessions`/`searchSessions` plus injected `priorWorkContext` remains a measurable capability/cost question, not grounds for a broad prompt diet. Native `session_*` tools remain available. |
 | Execution and recovery | **Aligned** | August 7 execution/recovery and structured classification work shipped. Unknown and side-effect-sensitive paths remain conservative. Fixed retry/backoff/poll/deadline values are reliability controls; the liveness rewrite is correctly absent. |
-| Routing and delivery | **Partial** | Trusted event routing, response-file delivery, and credential withholding are durable and aligned. Manual `auto` still infers a branch/PR side effect from phrases, including the one-off “pull the request” workaround; the scalar output does not yet expose enough migration state to external callers. |
+| Routing and delivery | **Aligned** | Trusted event routing, response-file delivery, and credential withholding are durable and aligned. Manual `auto` deterministically resolves to `working-dir`; `branch-pr` requires explicit configuration. The scalar and structured outputs expose the requested and final mode. |
 | Config, plugins, and model pins | **Aligned** | Exact OpenCode/Systematic/oMo pins and checksum verification are dependency management, not a model ceiling. Carry documentation exists; referential integrity is not yet machine-enforced. |
 | Evals | **Partial** | The six-scenario outcome corpus, tri-state results, diagnostics, and reviewed baseline are useful verifier infrastructure. Candidate comparison on stable outcomes and explicit corpus law are still missing; the cap remains eight and no platform expansion is justified. |
-| Harness integration | **Misaligned** | Deterministic integration is represented in TypeScript, bash/YAML, and English prompt instructions. Production behavior depends on model compliance and historical improvisation for workflow stripping, while the code-owned path is incomplete and unused. This is the primary active delta. |
+| Harness integration | **Partial** | U5/U6 completed the code-owned integration path, and U7c made trusted frozen-commit build, validation, and push authoritative for candidate finalization. The merge procedure remains represented in TypeScript, bash/YAML, and English prompt instructions, with production still using the prompt-driven merge. Workflow stripping is no longer model improvisation: `finalizeCandidateIntegration` calls `validateFinalTree`. The merge-phase authority boundary is the remaining debt. |
 | Release narration | **Aligned** | The generate model writes a bounded narrative candidate; trusted code validates, assembles, applies, and enforces idempotency and auth separation. Prompt coaching is not a current investment. |
 | Gateway and workspace | **Aligned** | Gateway mention execution and Action execution are distinct surface adapters with separate lifecycle/transport/security concerns. No unification is planned. Workspace egress and operator redaction boundaries remain durable. |
 | Security and persistence | **Aligned** | Credential withholding, response-file trust, locks, cleanup, S3/cache persistence, and fail-closed delivery are the right durable constraints. The session experiment may remove eager context, never logical-key continuity or persistence itself. |
@@ -166,14 +167,14 @@ The completed August 7 plan is treated as a completed baseline and decision reco
 - **KTD3 — Treat each model attempt as disposable and its output as untrusted data.** Every attempt starts from the exact pre-conflict commit in a recreated temporary checkout and reapplies the merge. The runner trust boundary is explicit: in-process permissions and validation reduce blast radius but do not claim kernel containment. The resolver may produce bytes only for regular files in the allowed conflict set; code owns extraction, encoding/marker checks, independent application, staging, merge completion, verification, credentials, cleanup, and push.
 - **KTD4 — Scope the broker credential, not a raw provider-env channel.** The resolver receives only the short-lived broker-minted model credential through `auth.json`; it is model-scoped, push-incapable, and cannot perform authenticated GitHub operations. It receives no GitHub/App/AWS/cloud/browser/session/askpass secrets. Runner and broker workflow controls remain the authority for egress and trust-boundary containment; public sources fail closed on auth requirements.
 - **KTD5 — Preserve the known artifact shape.** Workflow files are stripped from the pushed integration commit before push, while remaining on disk for build. The App token is not widened with `workflows` permission.
-- **KTD6 — `auto` becomes a safe alias with visible migration state.** A phrase matcher is not an authority for side-effect routing. Explicit callers are migrated first; the compatibility warning observes old behavior without reproducing it, and the dedicated machine-readable migration output makes requested/omitted mode, final mode, and legacy-match state visible to external callers.
+- **KTD6 — `auto` is a safe alias with visible migration state.** A phrase matcher is not an authority for side-effect routing. Explicit callers are migrated, `auto` deterministically resolves to `working-dir`, and the dedicated machine-readable migration output makes requested/omitted mode and final mode visible to external callers.
 - **KTD7 — Compare outcomes, not methods.** The eval layer may record tool/cost/token provenance for diagnosis, but it must not make tool calls, call counts, ordering, or prompt hashes into quality equality.
 - **KTD8 — Safety failures dominate quality evidence.** A secret leak, forbidden mutation, delivery-contract failure, or invalid response blocks immediately. Infrastructure inconclusive is not a model regression and must be rerun.
 - **KTD9 — Lazy repeats only.** A clean initial candidate corpus is enough to say no large regression was observed on the covered slice. Repeats are added only when a stochastic quality gate fails, and only for the affected scenario.
 - **KTD10 — Documentation can be structurally checked without becoming truth.** The carry ledger records evidence and removal conditions, but static tests enforce only internal consistency; upstream state remains advisory research.
 - **KTD11 — Experiment the presearch, not continuity.** A narrow injected strategy at the `runSessionPrep` boundary removes only eager recent/search injection for eval scenarios. Logical-key resolution, continuation identity, and native `session_*` tools remain production invariants; a corpus pass cannot claim better model reasoning.
 - **KTD12 — Roll back by version, not by hidden branch.** If the integrated driver fails after cutover, revert the workflow/driver release. Do not ship a second runtime path whose existence itself becomes another drift source.
-- **KTD13 — Gate cutover on structural and outcome equivalence.** The code-owned path must repeatedly produce a releasable artifact from the same immutable manifest while enforcing R3/R4. It must not be required to reproduce conflict bytes from one stochastic model invocation; tree diffs are retained for diagnosis only.
+- **KTD13 — Gate any future cutover on structural and outcome evidence.** The forward-shadow gate mechanism was deleted and U7b was abandoned because stochastic conflict resolution made both tree equality and the structural-plus-outcome equivalence gate unmeasurable. The underlying principle remains valid for any future attempt: the code-owned path must repeatedly produce a releasable artifact from the same immutable manifest while enforcing R3/R4, without requiring reproduction of conflict bytes from one stochastic model invocation.
 
 ### Alternatives rejected
 
@@ -195,7 +196,7 @@ The completed August 7 plan is treated as a completed baseline and decision reco
 - **AE6 — Workflow strip remains deterministic.** The final integration tree matches the merged source modulo the unconditional `.github/workflows` strip, and the strip is reverified immediately before push.
 - **AE7 — Dry-run is a real pipeline.** A dry-run performs build, version verification, provenance checks, and final-tree validation but never acquires push credentials or performs a push.
 - **AE8 — Public-source auth failure is visible.** An anonymous fetch that receives an auth-required response fails the integration rather than granting the model a token or switching source authority.
-- **AE9 — `auto` is safe and externally observable.** A prompt containing every legacy branch/PR phrase resolves to `working-dir`; the compatibility detector may warn but cannot return `branch-pr`. An external/manual caller that does not surface warnings can read the dedicated migration output and see requested/omitted `auto`, final `working-dir`, and legacy branch/PR inference state.
+- **AE9 — `auto` is safe and externally observable.** A prompt containing former legacy branch/PR phrases resolves to `working-dir`; phrases cannot return `branch-pr`. An external/manual caller can read the dedicated migration output and see requested/omitted `auto` and final `working-dir`; no legacy-inference field is required.
 - **AE10 — Affected-event credentials remain withheld.** `pull_request`, `issue_comment`, and `issues` keep `credential: withhold` regardless of response mode or output-mode input.
 - **AE11 — Comparative eval does not overclaim.** A clean candidate corpus report produces “no large observed regression across six scenarios,” not “improvement,” and does not compare prompt hashes, duration, cost, or token usage as quality.
 - **AE12 — Safety failure blocks without retries.** A candidate that leaks the eval canary or mutates a read-only fixture is rejected even if its verdict and evidence gates pass.
@@ -203,7 +204,7 @@ The completed August 7 plan is treated as a completed baseline and decision reco
 - **AE14 — Carry documentation cannot drift silently.** Removing one manifest ref, adding one undocumented ledger heading, changing the base version, or omitting an evidence/removal field fails the static test without network access.
 - **AE15 — Presearch experiment preserves continuity.** The production default and eval treatment are selected through an injected `runSessionPrep` strategy supplied only by the eval runner/scenario path; the treatment keeps the same logical-key session selection and native `session_*` tools while varying only injected recent/search context.
 - **AE16 — Presearch deletion is a judgment.** If both modes pass outcome gates, the corpus says it cannot attribute causal improvement. Removing eager presearch may be a consciously documented simplicity/cost decision, but it is not evidence that the model reasoned better and is not inferred from a green boolean.
-- **AE17 — Forward-shadow authority is structural and outcome-based.** A selected case freezes the base and ordered carry SHAs once, gives both paths the same immutable manifest, requires non-conflict paths to equal the deterministic merge projection, limits differences to the recorded conflict-path union, builds the frozen shadow commit through the six-platform matrix, and passes the version, provenance, workflow-strip, clean-tree, and security invariants. Tree differences remain diagnostic evidence and do not independently count toward cutover.
+- **AE17 — Forward-shadow authority is structural and outcome-based (abandoned).** This acceptance example is abandoned with U7b. The deleted apparatus could not measure the proposed gate against a stochastic prompt-driven path; see the U7b decision record.
 
 ## High-Level Technical Design
 
@@ -243,18 +244,21 @@ flowchart TB
   U4[U4 session-presearch experiment]
   U5[U5 code-owned integration semantics]
   U6[U6 conflict boundary and validation]
-  U7[U7 forward shadow, trusted push, and cutover]
+  U7a["U7a forward shadow (deleted)"]
+  U7b["U7b production cutover (abandoned)"]
+  U7c["U7c trusted push separation (complete)"]
   U8[U8 output-mode migration phase 2]
 
   U2 --> U4
   U3 --> U4
   U5 --> U6
-  U6 --> U7
+  U6 --> U7c
   U3 --> U8
-  U7 -. migration evidence and release hygiene .-> U8
+  U7a -. former evidence gate .-> U7b
+  U7c -. former prerequisite .-> U7b
 ```
 
-U1 is independent. U2 and U3 may proceed independently. U4 waits for U2 and runs after U3 for measurement hygiene. U5-U7 are an independent deterministic integration chain. U7c is a prerequisite to U7b but is independently valuable: trusted freezing and fresh-checkout build validation improve the release boundary whether or not the conflict-only driver is cut over. U7 remains in this plan because the integration objective is incomplete if a correct code-owned driver exists while production still runs the prompt/YAML duplicate; verified cutover must activate the single owner. U8 is deliberately delayed until the next minor-release migration window has produced caller/output evidence. It remains visible so the compatibility detector cannot become permanent architecture, but it is not on the critical path for U1-U7 completion and the eight units do not land together.
+U1 is independent. U2 and U3 may proceed independently. U4 waits for U2 and runs after U3 for measurement hygiene. U5-U6 are the code-owned integration chain. U7 completes at U7c, which independently delivered trusted frozen-commit build, validation, and push separation. U7a was deleted and U7b was abandoned when the repository could not provide a truthful forward-shadow signal. U8 depends only on U3; it carries no dependency on U7.
 
 ## Implementation Units
 
@@ -534,43 +538,23 @@ The operational delta does not favor deletion. Eager presearch costs two SDK cal
 
 **Test-first note:** Test-first. The dangerous contract is the post-model boundary, not the prompt wording. Write failing tests for unmerged paths, marker remnants, out-of-scope edits, credential absence, and two-attempt exhaustion before wiring the resolver into the driver.
 
-### U7a — Forward-shadow evidence collection (implemented)
+### U7a — Forward-shadow evidence collection (deleted)
 
 **Goal:** Collect durable, credentialless forward-shadow records beside the existing authoritative prompt-driven release path without changing production authority.
 
-**Status:** Implemented in the code-owned comparator, strict record/gate core, integrate result seam, reusable-workflow wiring, and 90-day artifact/version-sync retention path.
+**Status:** Deleted in PR #1439 (`2432df80b`). The authoritative prompt-driven path is not self-reproducible: stochastic conflict resolution means the same immutable inputs can produce different trees. The forward-shadow apparatus, its tests, workflow steps, and retention path were removed because it could not provide a truthful cutover signal. No shadow evidence was ever collected; `docs/evidence/harness-shadow/` does not exist.
 
 **Requirements:** R1, R2, R3, R4, R5, R6, R15, R16
 
 **Dependencies:** U5 and U6.
 
-**Contract:**
-
-- The existing authoritative `Run Fro Bot` path remains first and remains the release authority.
-- A trailing in-job dry-run uses the resolved dispatch/tag `base_version`, a short-lived broker model credential, and no push credential or App-token output.
-- A separate record step always attempts to compare the shadow tree with the anonymous `fro-bot/agent` `refs/harness-integrate/<base-version>` ref while preserving `anomalyco/opencode` as the upstream evidence repository.
-- Missing, malformed, failed, or divergent shadow outcomes produce inconclusive/mismatch evidence and never block the release.
-- Only the JSON record is uploaded for 90 days, then copied into `docs/evidence/harness-shadow/<base-version>.json` by the existing human-gated version-sync PR when refs exist.
-- The static one-job/OIDC/disabled-sudo-and-containers invariant remains unchanged.
-
-**Historical path closed:** The historical audit found zero provenance-complete cases. Historical resolved SHAs, expected trees, and retained workflow artifacts are unavailable or expired, so historical replay is not a truthful route to cutover and must not be substituted with nearby refs or inferred trees. Forward evidence is the sole route.
-
-**Test scenarios:**
-
-- Happy: shadow and authoritative tree OIDs, conflict metrics, and run identity are recorded; tree equality is retained as diagnostic evidence and does not decide cutover.
-- Error: missing/invalid/failed shadow outcomes produce an `inconclusive` record; the release and existing build gates remain unchanged.
-- Security: the single integrate job, late scoped mint, blank GitHub tokens, no App-token reference, no `secrets: inherit`, and public anonymous comparison remain statically enforced.
-- Retention: the current run's JSON record is fail-soft downloaded and copied into the normal version-sync PR only when present and valid.
-
-**Expected verification outcomes:** Forward records are machine-readable, non-secret, atomically written, durably retained, and provide the immutable inputs, structural comparison, conflict-path diagnostics, and release outcomes required by the cutover gate.
-
-**Test-first note:** Workflow wiring and comparator repository identity are covered by RED/GREEN static and focused tests. This unit does not retire prompt rendering or alter production release authority.
+**Decision record:** The historical path had zero provenance-complete cases, and no forward run produced a record. Do not substitute nearby refs, inferred trees, or a new shadow implementation for the missing signal. Any future cutover needs an evidence strategy that does not depend on reproducing stochastic conflict bytes.
 
 ### U7c — Trusted push separation
 
 **Goal:** Keep the model on a local integration candidate boundary while trusted code freezes, builds, validates, and pushes the resulting commit.
 
-**Status:** Planned. This unit is a prerequisite for production cutover and is independently valuable because it removes model-owned push and mutable-working-tree build risk without depending on shadow machinery.
+**Status:** Complete. Shipped in PR #1431 (`7316582e3`) and production-verified in release run `32298059735`, integration commit `39b7b193125e13b50e3e3631b632171692e03518`, published as `@fro.bot/harness@1.18.18-harness.39b7b193`. It removes model-owned push and mutable-working-tree build risk without depending on shadow machinery.
 
 **Requirements:** R1, R3, R5, R6
 
@@ -601,59 +585,44 @@ The operational delta does not favor deletion. Eager presearch costs two SDK cal
 
 **Test-first note:** Test the frozen-commit and dirty-tree boundaries before changing prompt or workflow wiring. The security benefit must be observable without shadow evidence.
 
-### U7b — Production cutover (blocked)
+### U7b — Production cutover (abandoned)
 
 **Goal:** Make the code-owned integration driver authoritative after forward-shadow evidence demonstrates structural and outcome equivalence.
 
-**Prerequisite:** U7c is defined above and precedes this unit because trusted push separation is required before production cutover.
+**Status:** Abandoned. The forward-shadow apparatus was deleted in PR #1439 (`2432df80b`) because the authoritative prompt-driven path is not self-reproducible: stochastic conflict resolution means the same immutable inputs yield different trees. Both tree equality and the #1433 structural-plus-outcome equivalence gate were therefore unmeasurable.
 
-**Status:** Blocked — the outcome-based gate is not yet satisfied. The former three-distinct-base tree-equality requirement is deleted because it measures stochastic conflict bytes rather than release readiness. U7b is not complete and U7 is not complete.
+**Decision record:** The R3 security benefit was delivered in full by U7c, independently of the shadow. The R1 objective of a single code-owned driver remains unsatisfied for the merge phase and is known debt. The merge procedure still exists in three representations:
 
-**Decision:** Replace the three strict tree-OID `match` records across distinct base versions with structural-plus-outcome equivalence. Base and ordered carries are resolved to immutable SHAs once in trusted code; both paths receive the same immutable manifest; the shadow is judged on deterministic structure and release outcomes, not on reproducing one model invocation's conflict bytes. Three distinct base versions add calendar delay, not confidence, because the authoritative process is not self-reproducible.
+- `packages/harness/prompt.txt` — English model instructions;
+- `.github/workflows/harness-release.yaml` lines ~62-189 — a bash/Node reimplementation of `resolveSources()` from `packages/harness/src/sources.ts`; and
+- `packages/harness/src/integrate.ts`'s `runIntegration()` — tested TypeScript, reachable only via `cli.ts integrate` without `--candidate`; production always passes `--candidate`.
 
-**Gate before cutover:**
+A future cutover needs a new evidence strategy that does not depend on reproducing stochastic conflict bytes. The plan's first Stop Condition — the dependency or repository cannot provide a truthful signal for a proposed branch — triggered. Do not restore the deleted apparatus or add a hidden runtime fallback.
 
-1. Base and ordered carries resolve to immutable SHAs once, in trusted code.
-2. Both paths receive the same immutable manifest.
-3. The shadow's non-conflict paths equal the deterministic merge projection.
-4. Differences are permitted only within the recorded conflict-path union.
-5. A fresh checkout of the frozen shadow commit builds through the same six-platform matrix.
-6. Version, provenance, workflow-strip, clean-tree, and security invariants hold.
-7. The authoritative tree diff is retained as diagnostic evidence only, not as a verdict.
-
-The cutover property is that the code-owned path can repeatedly produce a releasable artifact from immutable real inputs while enforcing R3/R4. It is not that the code-owned path guessed the same conflict bytes as one LLM invocation.
-
-**Operational finding:** `.github/workflows/harness-integrate.yaml` has no `timeout-minutes`, and the shadow step has `continue-on-error: true`. A wedged resolver can therefore consume GitHub's six-hour default job timeout while the job still reports green. The resolver budget of two attempts at 30 minutes across 12 refs exceeds that job timeout, and no overall integration deadline exists.
-
-**Cutover constraints:** Retire prompt-driven deterministic duplication only after the gate passes; preserve one-job/OIDC, late credential minting, trusted push re-materialization, build integration-commit handoff, and all-or-nothing release gating. Do not add a hidden runtime fallback.
-
-**Rollback:** Revert the workflow/driver authority change without granting new credentials or restoring model-owned push.
-
-### U8 — Output-mode migration phase 2 in the next minor release
+### U8 — Output-mode migration phase 2 (complete)
 
 **Goal:** Remove the legacy phrase detector and warning after the bounded compatibility window.
 
+**Status:** Complete. Shipped in PR #1443 (`ed4b882be`). `auto` still resolves deterministically to `working-dir`.
+
 **Requirements:** R7, R8, R15
 
-**Dependencies:** U3; caller migration and warning review must be complete. U7 may provide release hygiene evidence but is not a semantic dependency.
-
-U8 is an explicitly delayed, trigger-bound unit for the next minor release. It remains visible so the one-minor compatibility detector cannot become permanent architecture, but it is not on the critical path for U1-U7 completion and should not be presented as landing with the integration cutover.
+**Dependencies:** U3; caller migration and warning review are complete. U7 is not a dependency.
 
 **Repo-relative files:**
 
-- Modify: `packages/runtime/src/agent/output-mode.ts` — remove phrase-list and one-off detector; keep `auto` as the safe compatibility alias unless a separately approved breaking-input policy removes it.
-- Modify: `packages/runtime/src/agent/output-mode.test.ts` — delete phrase-selection expectations and assert deterministic safe `auto` behavior.
-- Modify: `action.yaml` and relevant workflow/docs text — remove migration-warning language while preserving explicit-mode documentation and the dedicated `output-mode-migration` contract.
-- Modify: `src/harness/phases/execute.ts` and tests — remove warning-only plumbing.
+- Shipped: `packages/runtime/src/agent/output-mode.ts` and tests — removed phrase inference while retaining deterministic `auto` behavior.
+- Shipped: `src/harness/phases/execute.ts` and tests — removed `LEGACY_BRANCH_PR_PHRASES` and `legacyWouldSelectBranchPr`, and dropped the unused `prompt` parameter from `resolveOutputMode`.
+- Shipped: Action/workflow output wiring — dropped the `legacyWouldSelectBranchPr` field from the `output-mode-migration` output while preserving the requested/resolved state.
 
 **Approach:**
 
 - Do not introduce another resolver or config layer. `auto` remains deterministic `working-dir` for compatibility, and explicit `branch-pr` remains the only branch/PR selection.
-- Remove the frozen phrase list and warning path only after the minor-release migration window has been observed and known in-repo callers are explicit.
-- Retain the dedicated `output-mode-migration` output for external compatibility; after detector removal it reports the explicit/safe resolution and no legacy branch/PR inference rather than disappearing with the warning.
+- The frozen phrase list, one-off detector, and warning path are gone.
+- Retain the dedicated `output-mode-migration` output for external compatibility; it reports the requested and final resolution without a legacy-inference field.
 - Reassert affected-event credential withholding and trusted delivery routing unchanged.
 
-**Patterns:** phase-1 warning tests and explicit caller inventory; no model-selected delivery semantics.
+**Patterns:** phase-1 explicit caller inventory and safe-resolution tests; no model-selected delivery semantics.
 
 **Test scenarios:**
 
@@ -665,7 +634,7 @@ U8 is an explicitly delayed, trigger-bound unit for the next minor release. It r
 
 **Expected verification outcomes:** The compatibility detector is gone, safe `auto` behavior is stable, and all branch/PR delivery is attributable to explicit trusted configuration.
 
-**Test-first note:** This is a delayed cleanup unit. Do not remove the warning before the migration window and caller evidence exist.
+**Test-first note:** The cleanup shipped after the migration window and caller evidence existed. Tests assert that phrase content cannot select `branch-pr` and that `auto` resolves to `working-dir`.
 
 ## System-Wide Impact
 
@@ -694,7 +663,7 @@ U8 is an explicitly delayed, trigger-bound unit for the next minor release. It r
 | Removing eager presearch degrades continuation quality | Medium | Medium | Existing continuation scenarios, outcome-only comparison, candidate loses → keep presearch; both pass → explicit uncertainty/simplicity judgment. |
 | Session experiment accidentally breaks continuity | Low | High | Preserve logical key/current session ID in both modes; dedicated phase tests and logical-key characterization. |
 | Carry ledger gives false confidence about upstream state | Low | Medium | Static test enforces only internal referential integrity; upstream status/removal remains advisory research. |
-| Forward-shadow evidence is incomplete or non-reproducible | Medium | Critical | Freeze the base, ordered carries, and shared manifest once; require structural comparison, conflict-path diagnostics, fresh-checkout matrix builds, invariant checks, and release outcomes. Missing immutable inputs or failed outcome checks do not count. |
+| Forward-shadow evidence is incomplete or non-reproducible | Medium | Critical | Materialized. The apparatus was deleted in PR #1439 because stochastic conflict resolution made tree equality and the structural-plus-outcome gate unmeasurable; the planned mitigation was insufficient. U7b is abandoned. A future cutover needs a new evidence strategy that does not depend on reproducing stochastic conflict bytes. |
 | Operational comparisons are overinterpreted as capability gains | Medium | Medium | Record completion/failure, elapsed time, and manual intervention as advisory operator evidence only; use as hard gates only with enough comparable releases. |
 | Cutover failure requires emergency rollback | Low | Critical | Versioned revert to prior workflow/driver; no invented runtime fallback. |
 
@@ -720,26 +689,26 @@ Stop implementation or cutover rather than widening scope when any of these occu
 
 1. Land the carry-ledger integrity test and metadata correction; keep the ledger's authority and non-network scope explicit.
 2. Land the comparative projection/report and corpus-law documentation without changing production execution.
-3. Migrate known output-mode callers, ship safe `auto`, and observe warning/output behavior plus the primary `output-mode-migration` contract for one minor-release window.
+3. Migrate known output-mode callers and ship safe `auto`; U8 later removed the warning/detector while preserving the requested/final `output-mode-migration` contract.
 4. Run the session-presearch differential experiment; record the outcome and the judgment separately from the measured fields. Do not activate a deletion follow-on automatically.
 5. Characterize and complete the code-owned integration driver, then add the credentialless conflict boundary.
-6. Run outcome-based forward dry-run/shadow verification with the base, ordered carries, and shared manifest frozen to immutable SHAs. Attach deterministic projection comparison, conflict-path union, tree-diff, conflict-size, attempt, out-of-scope-context, fresh-checkout matrix-build, completion/failure, elapsed-time, and manual-intervention evidence to the cutover review. Treat tree-diff as diagnostic evidence, not as the verdict.
-7. Cut production over by removing live bash/English duplication only after all stop conditions pass. Preserve one-job/OIDC and release all-or-nothing behavior.
-8. In the next minor release, remove the phrase detector/warning and leave explicit `branch-pr` as the only branch/PR selection.
+6. The forward-shadow apparatus was deleted in PR #1439 after its evidence dependency failed the first stop condition. No shadow evidence was collected.
+7. Do not cut production over. U7b is abandoned; the merge-phase single-driver objective remains known debt and needs a new evidence strategy that does not depend on reproducing stochastic conflict bytes.
+8. U8 shipped in PR #1443 (`ed4b882be`): the phrase detector/warning is gone and explicit `branch-pr` is the only branch/PR selection.
 9. Update the relevant architecture/operational references when the driver becomes authoritative; do not add a new broad workaround registry.
 
 Rollback is a normal revert to the previous workflow/driver version. A rollback must not grant new credentials or restore a model-owned push path.
 
 ## Success Metrics
 
-- **Integration determinism:** one authoritative code driver; conflict-free integrations invoke the model zero times; conflicted integrations require model turns only for actual conflict sets; no manual workflow-strip or push improvisation remains; every accepted conflict turn is within the two-attempt bound; no unexplained historical final-tree divergence.
-- **Operator value:** compare manual operator interventions across shadow/cutover releases with the current prompt-driven path; lower or zero intervention is the desired direction. Record release completion/failure and elapsed time before and after as operational evidence, without treating them as hard acceptance gates unless enough comparable releases exist.
-- **Security boundary:** no increase in credential exposure; zero accepted resolver turns with push credentials; denied secret keys remain absent and the model turn cannot push or perform authenticated GitHub operations; anonymous source fetch remains the only normal source path; workflow-strip and one-job/OIDC tests remain green.
-- **Delivery explicitness:** every source-confirmed in-repo caller is explicit before phase 2; no legacy warning remains after the next minor release; the scalar `resolved-output-mode` and dedicated `output-mode-migration` output keep the decision observable.
+- **Integration determinism:** Not achieved as a whole. The one-authoritative-driver objective remains debt for the merge phase because production still uses the prompt/YAML merge procedure alongside the tested TypeScript path. Conflict-free model avoidance, bounded conflict turns, workflow stripping, build, validation, provenance, and trusted push are code-owned and verified; no cutover occurred.
+- **Operator value:** Not measurable. No shadow or cutover release occurred, so there is no comparable before/after evidence for manual interventions, completion/failure, or elapsed time.
+- **Security boundary:** Satisfied. U7c's trusted frozen-commit boundary delivered the R3 benefit: zero accepted resolver turns with push credentials, denied secret keys remain absent, the model turn cannot push or perform authenticated GitHub operations, anonymous source fetch remains the normal source path, and workflow-strip/one-job/OIDC tests remain green.
+- **Delivery explicitness:** Satisfied by U8. Every source-confirmed in-repo caller is explicit, the legacy phrase detector and warning are gone, `auto` resolves to `working-dir`, and the scalar `resolved-output-mode` plus `output-mode-migration` output keep the requested/final decision observable.
 - **Eval usefulness:** candidate reports compare only stable outcome fields; safety/contract failures block; inconclusive outcomes are visible and rerunnable; existing verifier/scope metrics remain guardrails rather than claims of capability gain; no method assertion or benchmark-platform surface is added.
 - **Carry integrity:** manifest and ledger sets remain equal in both directions and the base-version metadata remains synchronized without network access.
 - **Session decision quality:** the experiment records outcome gates and advisory cost/token/context deltas; any deletion decision states whether evidence was discriminating or merely a simplicity judgment; logical-key continuity remains intact.
-- **Tree/release safety:** no unexplained final-tree divergence is accepted, and release completion/failure, elapsed time, and manual-intervention observations are retained as operator evidence where comparable.
+- **Tree/release safety:** Not measurable as a shadow/cutover metric. No shadow or cutover release occurred, so no comparative final-tree or release-safety evidence exists; the trusted U7c validation boundary remains in place.
 - **Scope discipline:** no gateway unification, broad prompt diet, retry/liveness rewrite, trigger/dedup redesign, generic config abstraction, model framework, or unreviewed dist/infrastructure expansion enters the implementation.
 
 ## Sources and References
