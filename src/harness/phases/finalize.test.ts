@@ -254,9 +254,11 @@ describe('runFinalize file-convention delivery', () => {
       createMockLogger(),
     )
 
-    // #then the run is failed closed, naming the response file
+    // #then the run is failed closed with a trusted artifact-missing message
     expect(exitCode).not.toBe(0)
-    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining(bootstrap.responseFilePath as string))
+    expect(mocks.setFailed).toHaveBeenCalledWith(
+      'The agent execution completed, but the response artifact was not found at the expected path, so no response was delivered.',
+    )
   })
 
   it('does not post a fallback when a response was already posted', async () => {
@@ -312,8 +314,39 @@ describe('runFinalize file-convention delivery', () => {
     )
     const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
     expect(target).toEqual({type: 'issue', number: 1, owner: 'owner', repo: 'repo'})
-    expect(options.body).toContain('response artifact')
+    expect(options.body).toBe(
+      'The agent execution failed before it could write a response artifact, so no response was delivered.',
+    )
     expect(options.body).not.toContain('ENOENT')
+  })
+
+  it('surfaces a diagnostic message when execution succeeded but the response artifact was not found', async () => {
+    // #given a successful execution whose response artifact cannot be read
+    const bootstrap = createBootstrap()
+    const routing = createRouting()
+    const execution = createExecution({success: true})
+    const metrics = createMetrics()
+    const result: ResponsePostResult = {delivered: false, reason: 'file-read-failed', detail: 'ENOENT'}
+    mocks.runResponsePost.mockResolvedValue(result)
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the failure says execution completed but the expected artifact was absent
+    expect(exitCode).toBe(1)
+    expect(mocks.postComment).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledWith(
+      'The agent execution completed, but the response artifact was not found at the expected path, so no response was delivered.',
+    )
   })
 
   it('marks a recovered overflow run in the job summary and keeps one response delivery', async () => {
@@ -699,7 +732,7 @@ describe('runFinalize file-convention delivery', () => {
     expect(exitCode).toBe(1)
     expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
     expect(mocks.runResponsePost).not.toHaveBeenCalled()
-    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining(bootstrap.responseFilePath as string))
+    expect(mocks.setFailed).toHaveBeenCalled()
   })
 
   it('posts exactly one normal response for a nothing-to-deliver brokered outcome', async () => {

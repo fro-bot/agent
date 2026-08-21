@@ -16,6 +16,7 @@ import type {TriggerResultProcess} from '../../features/triggers/types.js'
 import type {Logger} from '../../shared/logger.js'
 
 import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 import process from 'node:process'
 import {parseResponseFile} from '@fro-bot/runtime'
 import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../services/github/types.js'
@@ -31,6 +32,14 @@ import {resolveResponseSurface} from './response-file.js'
  * client.
  */
 const TRANSIENT_RETRY_ATTEMPTS = 3
+const RESPONSE_DIRECTORY_ENTRY_LIMIT = 20
+
+interface ResponseDirectoryDiagnostic {
+  readonly directoryStatus: 'missing' | 'empty' | 'present' | 'inspection-failed'
+  readonly directoryEntryCount: number | null
+  readonly directoryEntries: readonly string[]
+  readonly directoryInspectionError?: string
+}
 
 export type ResponsePostFailureReason =
   | 'file-read-failed'
@@ -90,13 +99,46 @@ export async function readAndParseResponseFile(
     raw = await fs.readFile(responseFilePath, 'utf8')
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
+    const expectedFilename = path.basename(responseFilePath)
+    let directoryDiagnostic: ResponseDirectoryDiagnostic
+
+    try {
+      const directoryEntries = await fs.readdir(path.dirname(responseFilePath))
+      directoryDiagnostic = {
+        directoryStatus: directoryEntries.length === 0 ? 'empty' : 'present',
+        directoryEntryCount: directoryEntries.length,
+        directoryEntries: directoryEntries.slice(0, RESPONSE_DIRECTORY_ENTRY_LIMIT),
+      }
+    } catch (inspectionError) {
+      const inspectionDetail = inspectionError instanceof Error ? inspectionError.message : String(inspectionError)
+      const inspectionCode =
+        inspectionError instanceof Error && 'code' in inspectionError && typeof inspectionError.code === 'string'
+          ? inspectionError.code
+          : undefined
+
+      directoryDiagnostic =
+        inspectionCode === 'ENOENT'
+          ? {directoryStatus: 'missing', directoryEntryCount: null, directoryEntries: []}
+          : {
+              directoryStatus: 'inspection-failed',
+              directoryEntryCount: null,
+              directoryEntries: [],
+              directoryInspectionError: inspectionDetail,
+            }
+    }
+
+    const logPayload = {
+      responseFilePath,
+      expectedFilename,
+      error: detail,
+      ...directoryDiagnostic,
+    }
     if (executionSucceeded === false) {
       logger.debug('Response-post: no response file after failed execution (expected)', {
-        responseFilePath,
-        error: detail,
+        ...logPayload,
       })
     } else {
-      logger.error('Response-post: failed to read response file', {responseFilePath, error: detail})
+      logger.error('Response-post: failed to read response file', logPayload)
     }
     return failure('file-read-failed', detail)
   }

@@ -9,6 +9,20 @@ import {BOT_COMMENT_MARKER, type Octokit} from '../../services/github/types.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {readAndParseResponseFile, runResponsePost} from './response-post.js'
 
+const fsMocks = vi.hoisted(() => ({
+  readFile: vi.fn(),
+  readdir: vi.fn(),
+  actualReadFile: undefined as typeof import('node:fs/promises').readFile | undefined,
+}))
+
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+  fsMocks.actualReadFile = actual.readFile
+  fsMocks.readFile.mockImplementation(actual.readFile)
+  fsMocks.readdir.mockImplementation(actual.readdir)
+  return {...actual, readFile: fsMocks.readFile, readdir: fsMocks.readdir}
+})
+
 function makeAgentContext(overrides?: Partial<AgentContext>): AgentContext {
   return {
     eventName: 'issue_comment',
@@ -98,6 +112,130 @@ async function writeFixture(content: string): Promise<string> {
   return filePath
 }
 
+async function createMissingResponsePath(): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-missing-'))
+  await fs.rm(dir, {recursive: true, force: true})
+  return path.join(dir, 'expected-response.md')
+}
+
+describe('readAndParseResponseFile read failures', () => {
+  let logger: Logger
+  let tempFiles: string[] = []
+
+  beforeEach(() => {
+    logger = createMockLogger()
+    tempFiles = []
+    fsMocks.readFile.mockReset().mockRejectedValue(new Error('read failed'))
+  })
+
+  afterEach(async () => {
+    for (const filePath of tempFiles) {
+      await fs.rm(path.dirname(filePath), {recursive: true, force: true})
+    }
+  })
+
+  it('logs a missing directory without changing the read failure result', async () => {
+    // #given a response path whose run-scoped directory is missing
+    const responseFilePath = await createMissingResponsePath()
+    tempFiles.push(responseFilePath)
+
+    // #when reading the response file after a successful execution
+    const result = await readAndParseResponseFile(
+      {
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        responseFilePath,
+        executionSucceeded: true,
+      },
+      logger,
+    )
+
+    // #then the missing-directory state, expected filename, and original failure are logged
+    expect(result).toEqual({delivered: false, reason: 'file-read-failed', detail: 'read failed'})
+    expect(vi.mocked(logger.error)).toHaveBeenCalledWith('Response-post: failed to read response file', {
+      responseFilePath,
+      expectedFilename: 'expected-response.md',
+      error: 'read failed',
+      directoryStatus: 'missing',
+      directoryEntryCount: null,
+      directoryEntries: [],
+    })
+  })
+
+  it('logs an empty present directory and keeps failed-execution read failures at debug', async () => {
+    // #given a present but empty run-scoped directory
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-empty-'))
+    const responseFilePath = path.join(dir, 'expected-response.md')
+    tempFiles.push(responseFilePath)
+
+    // #when reading the response file after a failed execution
+    const result = await readAndParseResponseFile(
+      {
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        responseFilePath,
+        executionSucceeded: false,
+      },
+      logger,
+    )
+
+    // #then the empty-directory state is logged at debug and the failure contract is unchanged
+    expect(result).toEqual({delivered: false, reason: 'file-read-failed', detail: 'read failed'})
+    expect(vi.mocked(logger.debug)).toHaveBeenCalledWith(
+      'Response-post: no response file after failed execution (expected)',
+      {
+        responseFilePath,
+        expectedFilename: 'expected-response.md',
+        error: 'read failed',
+        directoryStatus: 'empty',
+        directoryEntryCount: 0,
+        directoryEntries: [],
+      },
+    )
+    expect(vi.mocked(logger.error)).not.toHaveBeenCalled()
+  })
+
+  it('logs bounded entry names and the total count without reading their contents', async () => {
+    // #given a run-scoped directory containing more entries than the diagnostic cap
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-entries-'))
+    const responseFilePath = path.join(dir, 'expected-response.md')
+    tempFiles.push(responseFilePath)
+    const entryNames = Array.from({length: 25}, (_, index) => `near-miss-${String(index).padStart(2, '0')}.md`)
+    for (const entryName of entryNames) {
+      await fs.writeFile(path.join(dir, entryName), `secret content for ${entryName}`, 'utf8')
+    }
+
+    // #when reading the response file after a successful execution
+    const result = await readAndParseResponseFile(
+      {
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        responseFilePath,
+        executionSucceeded: true,
+      },
+      logger,
+    )
+
+    // #then only names are logged, the listing is capped, and no entry contents are read
+    expect(result).toEqual({delivered: false, reason: 'file-read-failed', detail: 'read failed'})
+    expect(fsMocks.readFile).toHaveBeenCalledExactlyOnceWith(responseFilePath, 'utf8')
+    expect(vi.mocked(logger.error)).toHaveBeenCalledWith('Response-post: failed to read response file', {
+      responseFilePath,
+      expectedFilename: 'expected-response.md',
+      error: 'read failed',
+      directoryStatus: 'present',
+      directoryEntryCount: 25,
+      directoryEntries: entryNames.slice(0, 20),
+    })
+    const [, payload] = vi.mocked(logger.error).mock.calls[0] as [
+      string,
+      {readonly directoryEntries: readonly string[]},
+    ]
+    expect(payload.directoryEntries).toHaveLength(20)
+    expect(JSON.stringify(payload)).not.toContain('secret content')
+  })
+})
+
 describe('runResponsePost', () => {
   let logger: Logger
   let tempFiles: string[] = []
@@ -105,6 +243,9 @@ describe('runResponsePost', () => {
   beforeEach(() => {
     logger = createMockLogger()
     tempFiles = []
+    if (fsMocks.actualReadFile !== undefined) {
+      fsMocks.readFile.mockReset().mockImplementation(fsMocks.actualReadFile)
+    }
   })
 
   afterEach(async () => {
