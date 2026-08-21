@@ -90,6 +90,7 @@ export type ReadAndParseResponseFileResult =
         readonly parsed: ParsedResponse
         readonly surface: ResponseSurface
         readonly recoveredFromFallback: boolean
+        readonly actualResponseFilePath: string
       }
     }
   | ResponsePostFailure
@@ -220,7 +221,7 @@ export async function readAndParseResponseFile(
     })
   }
 
-  return {success: true, data: {parsed: parsed.data, surface, recoveredFromFallback}}
+  return {success: true, data: {parsed: parsed.data, surface, recoveredFromFallback, actualResponseFilePath}}
 }
 
 function withMarker(body: string): string {
@@ -347,7 +348,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return prepared
   }
 
-  const {surface, parsed, recoveredFromFallback} = prepared.data
+  const {surface, parsed, recoveredFromFallback, actualResponseFilePath} = prepared.data
   const {target} = deriveSurfaceAndTarget(agentContext, triggerResult)
 
   if (target == null) {
@@ -386,12 +387,11 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     parsed.verdict === 'approve' ? (recoveredFromFallback ? 'COMMENT' : 'APPROVE') : 'REQUEST_CHANGES'
 
   if (recoveredFromFallback && parsed.verdict === 'approve') {
-    const actualResponseFilePath = responseFilePathCandidates?.find(candidate => candidate !== responseFilePath)
     logger.warning('Response-post: withholding approving verdict from fallback response artifact', {
       expectedResponsePath: responsePathForLog(responseFilePath),
-      actualResponsePath: responsePathForLog(actualResponseFilePath ?? responseFilePath),
+      actualResponsePath: responsePathForLog(actualResponseFilePath),
       expectedResponseDirectory: path.dirname(responseFilePath),
-      actualResponseDirectory: path.dirname(actualResponseFilePath ?? responseFilePath),
+      actualResponseDirectory: path.dirname(actualResponseFilePath),
     })
   }
 

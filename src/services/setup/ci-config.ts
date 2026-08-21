@@ -120,7 +120,9 @@ function isPathInsideDirectory(filePath: string, directoryPath: string): boolean
  * does `rulesets.flat().findLast(...)` — the LAST matching entry wins. Since
  * `'*'` matches every pattern (including our specific one), `'*'` MUST come
  * first in the object and the specific allow entry MUST come after it, or
- * the deny would shadow the allow.
+ * the deny would shadow the allow. The edit deny is deleted and re-added
+ * below so an existing key is moved to the end rather than retaining its
+ * original insertion position.
  */
 function scopeExternalDirectoryPermission(
   config: Record<string, unknown>,
@@ -136,12 +138,15 @@ function scopeExternalDirectoryPermission(
   // can't know where the response-file dir will be, so keep the flat deny
   // rather than guessing a broad allow pattern.
   let externalDirectory: Record<string, 'allow' | 'deny'> | 'deny' = 'deny'
+  const deniedEditPattern = path.join('_temp', RESPONSE_FILE_DIR_SEGMENT, '*')
   const editPermission: Record<string, unknown> = isRecord(permission.edit)
     ? {...permission.edit}
     : typeof permission.edit === 'string'
       ? {'*': permission.edit}
-      : {'*': 'allow'}
-  editPermission[path.join('_temp', RESPONSE_FILE_DIR_SEGMENT, '*')] = 'deny'
+      : {}
+
+  delete editPermission[deniedEditPattern]
+  editPermission[deniedEditPattern] = 'deny'
 
   if (runnerTemp != null && runnerTemp.trim().length > 0) {
     externalDirectory = {

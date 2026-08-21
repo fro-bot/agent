@@ -331,6 +331,7 @@ describe('readAndParseResponseFile read failures', () => {
         parsed: {body: 'Recovered body'},
         surface: 'issue-comment',
         recoveredFromFallback: true,
+        actualResponseFilePath: fallbackPath,
       },
     })
     expect(logger.warning).toHaveBeenCalledWith(
@@ -469,10 +470,11 @@ describe('runResponsePost', () => {
   })
 
   it('submits a fallback-sourced approving verdict as a non-approving COMMENT review', async () => {
-    // #given an approving response recovered from inside the workspace
+    // #given an approving response recovered from the second fallback candidate
     const primaryPath = await createMissingResponsePath()
-    const fallbackPath = await writeFixture('---\nverdict: approve\n---\n\nRecovered approval.')
-    tempFiles.push(primaryPath, fallbackPath)
+    const firstFallbackPath = await createMissingResponsePath()
+    const secondFallbackPath = await writeFixture('---\nverdict: approve\n---\n\nRecovered approval.')
+    tempFiles.push(primaryPath, firstFallbackPath, secondFallbackPath)
     const octokit = makeOctokit()
 
     // #when posting with the fallback candidate
@@ -483,7 +485,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: primaryPath,
-        responseFilePathCandidates: [primaryPath, fallbackPath],
+        responseFilePathCandidates: [primaryPath, firstFallbackPath, secondFallbackPath],
       },
       logger,
     )
@@ -497,9 +499,11 @@ describe('runResponsePost', () => {
       'Response-post: withholding approving verdict from fallback response artifact',
       expect.objectContaining({
         expectedResponseDirectory: path.dirname(primaryPath),
-        actualResponseDirectory: path.dirname(fallbackPath),
+        actualResponsePath: path.join(path.dirname(secondFallbackPath), '<filename-redacted>'),
+        actualResponseDirectory: path.dirname(secondFallbackPath),
       }),
     )
+    expect(JSON.stringify(vi.mocked(logger.warning).mock.calls)).not.toContain(path.dirname(firstFallbackPath))
   })
 
   it('keeps a primary-sourced approving verdict as an APPROVE review', async () => {

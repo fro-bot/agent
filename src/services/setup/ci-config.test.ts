@@ -157,10 +157,7 @@ describe('buildCIConfig', () => {
         agent: {
           build: {
             permission: {
-              edit: {
-                '*': 'allow',
-                '_temp/fro-bot-response/*': 'deny',
-              },
+              edit: {'_temp/fro-bot-response/*': 'deny'},
               external_directory: 'deny',
             },
           },
@@ -415,10 +412,7 @@ describe('buildCIConfig', () => {
         agent: {
           build: {
             permission: {
-              edit: {
-                '*': 'allow',
-                '_temp/fro-bot-response/*': 'deny',
-              },
+              edit: {'_temp/fro-bot-response/*': 'deny'},
             },
           },
         },
@@ -445,6 +439,53 @@ describe('buildCIConfig', () => {
       const edit = ((permission.permission as Record<string, unknown>).edit ?? {}) as Record<string, unknown>
       expect(edit['*']).toBe('deny')
       expect(edit['_temp/fro-bot-response/*']).toBe('deny')
+      expect(Object.keys(edit)).toEqual(['*', '_temp/fro-bot-response/*'])
+    })
+
+    it('preserves existing edit object entries in order and appends the scoped deny', () => {
+      // #given an explicit object edit policy without the response-file deny
+      const logger = createLogger()
+      const result = buildCIConfig(
+        {
+          opencodeConfig: JSON.stringify({
+            agent: {build: {permission: {edit: {src: 'ask', docs: 'deny'}}}},
+          }),
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+        },
+        logger,
+      )
+
+      // #then original entries are preserved and the deny is appended last
+      const permission = (result.config.agent as Record<string, unknown>).build as Record<string, unknown>
+      const edit = ((permission.permission as Record<string, unknown>).edit ?? {}) as Record<string, unknown>
+      expect(edit).toEqual({src: 'ask', docs: 'deny', '_temp/fro-bot-response/*': 'deny'})
+      expect(Object.keys(edit)).toEqual(['src', 'docs', '_temp/fro-bot-response/*'])
+    })
+
+    it('moves an existing response-file deny to the end of the edit policy', () => {
+      // #given an existing deny followed by a broad allow
+      const logger = createLogger()
+      const result = buildCIConfig(
+        {
+          opencodeConfig: JSON.stringify({
+            agent: {
+              build: {
+                permission: {edit: {'_temp/fro-bot-response/*': 'allow', '*': 'allow'}},
+              },
+            },
+          }),
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+        },
+        logger,
+      )
+
+      // #then delete-then-re-add ordering makes the scoped deny last
+      const permission = (result.config.agent as Record<string, unknown>).build as Record<string, unknown>
+      const edit = ((permission.permission as Record<string, unknown>).edit ?? {}) as Record<string, unknown>
+      expect(edit).toEqual({'*': 'allow', '_temp/fro-bot-response/*': 'deny'})
+      expect(Object.keys(edit)).toEqual(['*', '_temp/fro-bot-response/*'])
     })
 
     it('allows the explicitly designated integration workdir after the response-file dir', () => {
