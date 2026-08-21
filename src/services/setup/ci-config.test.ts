@@ -157,6 +157,10 @@ describe('buildCIConfig', () => {
         agent: {
           build: {
             permission: {
+              edit: {
+                '*': 'allow',
+                '_temp/fro-bot-response/*': 'deny',
+              },
               external_directory: 'deny',
             },
           },
@@ -396,6 +400,51 @@ describe('buildCIConfig', () => {
           },
         },
       })
+    })
+
+    it('denies the in-workspace response directory without denying unrelated checkout paths', () => {
+      // #given a runner temp directory and a normal checkout
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when building disabled-mode config
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+
+      // #then only the response directory is denied for edit permission
+      expect(result.config).toMatchObject({
+        agent: {
+          build: {
+            permission: {
+              edit: {
+                '*': 'allow',
+                '_temp/fro-bot-response/*': 'deny',
+              },
+            },
+          },
+        },
+      })
+      const build = (result.config.agent as Record<string, unknown>).build as Record<string, unknown>
+      const edit = ((build.permission as Record<string, unknown>).edit ?? {}) as Record<string, unknown>
+      expect(edit['src/other-file.ts']).toBeUndefined()
+    })
+
+    it('preserves an existing scalar edit policy while adding the scoped deny', () => {
+      // #given an explicit scalar edit policy
+      const logger = createLogger()
+      const result = buildCIConfig(
+        {
+          opencodeConfig: JSON.stringify({agent: {build: {permission: {edit: 'deny'}}}}),
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+        },
+        logger,
+      )
+
+      // #then the scalar policy remains the default for unrelated paths
+      const permission = (result.config.agent as Record<string, unknown>).build as Record<string, unknown>
+      const edit = ((permission.permission as Record<string, unknown>).edit ?? {}) as Record<string, unknown>
+      expect(edit['*']).toBe('deny')
+      expect(edit['_temp/fro-bot-response/*']).toBe('deny')
     })
 
     it('allows the explicitly designated integration workdir after the response-file dir', () => {

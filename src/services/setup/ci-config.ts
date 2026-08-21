@@ -136,6 +136,13 @@ function scopeExternalDirectoryPermission(
   // can't know where the response-file dir will be, so keep the flat deny
   // rather than guessing a broad allow pattern.
   let externalDirectory: Record<string, 'allow' | 'deny'> | 'deny' = 'deny'
+  const editPermission: Record<string, unknown> = isRecord(permission.edit)
+    ? {...permission.edit}
+    : typeof permission.edit === 'string'
+      ? {'*': permission.edit}
+      : {'*': 'allow'}
+  editPermission[path.join('_temp', RESPONSE_FILE_DIR_SEGMENT, '*')] = 'deny'
+
   if (runnerTemp != null && runnerTemp.trim().length > 0) {
     externalDirectory = {
       '*': 'deny',
@@ -162,6 +169,7 @@ function scopeExternalDirectoryPermission(
       ...build,
       permission: {
         ...permission,
+        edit: editPermission,
         external_directory: externalDirectory,
       },
     },
