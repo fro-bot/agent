@@ -141,7 +141,17 @@ describe('runBootstrap response-delivery wiring', () => {
     expect(dirStats.isDirectory()).toBe(true)
     expect(result?.responseFilePathCandidates).toEqual({
       expectedPath: responseFilePath,
-      fallbackPath: path.join(runnerTempDir, 'repo', 'fro-bot-response', '555-2', path.basename(responseFilePath)),
+      fallbackPaths: [
+        path.join(
+          runnerTempDir,
+          'repo',
+          path.basename(runnerTempDir),
+          'fro-bot-response',
+          '555-2',
+          path.basename(responseFilePath),
+        ),
+        path.join(runnerTempDir, 'repo', 'fro-bot-response', '555-2', path.basename(responseFilePath)),
+      ],
     })
   })
 
@@ -238,7 +248,13 @@ describe('runBootstrap response-delivery wiring', () => {
     vi.stubEnv('GITHUB_WORKSPACE', workspaceDir)
     mocks.randomUUID.mockReturnValue('fallback-preseed-nonce')
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
-    const fallbackPath = path.join(workspaceDir, 'fro-bot-response', '555-2', 'fallback-preseed-nonce.md')
+    const fallbackPath = path.join(
+      workspaceDir,
+      path.basename(runnerTempDir),
+      'fro-bot-response',
+      '555-2',
+      'fallback-preseed-nonce.md',
+    )
     await fs.mkdir(path.dirname(fallbackPath), {recursive: true})
     await fs.writeFile(fallbackPath, 'untrusted response', 'utf8')
     const {runBootstrap} = await import('./bootstrap.js')
@@ -259,6 +275,61 @@ describe('runBootstrap response-delivery wiring', () => {
     await fs.rm(workspaceDir, {recursive: true, force: true})
   })
 
+  it('fails loudly when the second fallback candidate is pre-seeded', async () => {
+    // #given a preexisting file at the workspace-relative fallback candidate
+    mocks.githubContext.eventName = 'issues'
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-workspace-'))
+    vi.stubEnv('GITHUB_WORKSPACE', workspaceDir)
+    mocks.randomUUID.mockReturnValue('second-fallback-preseed-nonce')
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+    const fallbackPath = path.join(workspaceDir, 'fro-bot-response', '555-2', 'second-fallback-preseed-nonce.md')
+    await fs.mkdir(path.dirname(fallbackPath), {recursive: true})
+    await fs.writeFile(fallbackPath, 'untrusted response', 'utf8')
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap checks response candidates
+    let caughtError: unknown
+    try {
+      await runBootstrap(createMockLogger())
+    } catch (error) {
+      caughtError = error
+    }
+
+    // #then the second fallback trips the same file-only guard
+    expect(caughtError).toBeInstanceOf(Error)
+    const detail = caughtError instanceof Error ? caughtError.message : String(caughtError)
+    expect(detail).toBe(
+      `Response file already exists before execution (preseed guard tripped) in directory: ${path.dirname(fallbackPath)}`,
+    )
+    expect(detail).not.toContain('second-fallback-preseed-nonce.md')
+    await fs.rm(workspaceDir, {recursive: true, force: true})
+  })
+
+  it('does not trip the preseed guard for a fallback directory', async () => {
+    // #given a directory at the first fallback candidate instead of a file
+    mocks.githubContext.eventName = 'issues'
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-workspace-'))
+    vi.stubEnv('GITHUB_WORKSPACE', workspaceDir)
+    mocks.randomUUID.mockReturnValue('fallback-directory-nonce')
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+    const fallbackPath = path.join(
+      workspaceDir,
+      path.basename(runnerTempDir),
+      'fro-bot-response',
+      '555-2',
+      'fallback-directory-nonce.md',
+    )
+    await fs.mkdir(fallbackPath, {recursive: true})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap checks response candidates
+    const result = await runBootstrap(createMockLogger())
+
+    // #then a directory does not trip the file-only guard
+    expect(result?.responseFilePathCandidates?.fallbackPaths).toContain(fallbackPath)
+    await fs.rm(workspaceDir, {recursive: true, force: true})
+  })
+
   it('proceeds when neither response candidate exists', async () => {
     // #given a controlled nonce with no preexisting primary or fallback file
     mocks.githubContext.eventName = 'issues'
@@ -273,7 +344,10 @@ describe('runBootstrap response-delivery wiring', () => {
     // #then the response path is resolved normally
     expect(result?.responseFilePathCandidates).toEqual({
       expectedPath: result?.responseFilePath,
-      fallbackPath: path.join(runnerTempDir, 'repo', 'fro-bot-response', '555-2', 'fresh-nonce.md'),
+      fallbackPaths: [
+        path.join(runnerTempDir, 'repo', path.basename(runnerTempDir), 'fro-bot-response', '555-2', 'fresh-nonce.md'),
+        path.join(runnerTempDir, 'repo', 'fro-bot-response', '555-2', 'fresh-nonce.md'),
+      ],
     })
   })
 
@@ -290,9 +364,10 @@ describe('runBootstrap response-delivery wiring', () => {
     const result = await runBootstrap(createMockLogger())
 
     // #then only the primary response directory is created and bootstrap proceeds
-    expect(result?.responseFilePathCandidates?.fallbackPath).toBe(
+    expect(result?.responseFilePathCandidates?.fallbackPaths).toEqual([
+      path.join(workspaceDir, path.basename(runnerTempDir), 'fro-bot-response', '555-2', 'absent-parent-nonce.md'),
       path.join(workspaceDir, 'fro-bot-response', '555-2', 'absent-parent-nonce.md'),
-    )
+    ])
     await expect(fs.stat(workspaceDir)).rejects.toMatchObject({code: 'ENOENT'})
   })
 })

@@ -30,6 +30,7 @@ export {resolveResponseDelivery} from './response-delivery.js'
 export type {CredentialDisposition, ResponseDelivery, ResponseDeliveryDecision} from './response-delivery.js'
 export {
   buildResponseFileDir,
+  buildResponseFileFallbackRoots,
   buildResponseFilePath,
   buildResponseFilePathCandidates,
   createResponseFileError,

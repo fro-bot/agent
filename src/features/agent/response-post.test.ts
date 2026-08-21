@@ -256,30 +256,66 @@ describe('readAndParseResponseFile read failures', () => {
     expect(JSON.stringify(payload)).not.toContain('secret content')
   })
 
-  it('inspects every candidate parent directory when the primary read fails', async () => {
-    // #given a missing primary path and a distinct fallback directory containing a near miss
-    const primaryDir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-primary-'))
-    const fallbackDir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-fallback-'))
-    const responseFilePath = path.join(primaryDir, 'expected-response.md')
-    const fallbackPath = path.join(fallbackDir, 'fallback-response.md')
-    tempFiles.push(responseFilePath, fallbackPath)
-    await fs.writeFile(path.join(fallbackDir, 'near-miss.md'), 'untrusted content', 'utf8')
+  it('redacts a candidate filename when its directory is listable', async () => {
+    // #given a listable response directory containing the nonce-named response file
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-listable-'))
+    const responseFilePath = path.join(dir, 'secret-nonce-response.md')
+    tempFiles.push(responseFilePath)
+    await fs.writeFile(responseFilePath, 'response content', 'utf8')
     const error = Object.assign(new Error('missing'), {code: 'ENOENT'})
     fsMocks.readFile.mockReset().mockRejectedValue(error)
 
-    // #when reading the response file with a fallback candidate
+    // #when reading the response file while the directory diagnostic runs
     const result = await readAndParseResponseFile(
       {
         agentContext: makeAgentContext(),
         triggerResult: makeTriggerResult('issue_comment'),
         responseFilePath,
-        responseFilePathCandidates: {expectedPath: responseFilePath, fallbackPath},
         executionSucceeded: true,
       },
       logger,
     )
 
-    // #then diagnostics include both parent directories without exposing file contents
+    // #then the nonce is absent from every log payload and the listing remains bounded
+    expect(result).toEqual({delivered: false, reason: 'file-read-failed', detail: 'missing'})
+    const [, payload] = vi.mocked(logger.error).mock.calls[0] as [
+      string,
+      {readonly directoryEntries: readonly string[]},
+    ]
+    expect(payload.directoryEntries).toEqual(['<filename-redacted>'])
+    expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain('secret-nonce-response')
+  })
+
+  it('inspects every candidate parent directory when the primary read fails', async () => {
+    // #given a missing primary path and two distinct fallback directories containing near misses
+    const primaryDir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-primary-'))
+    const firstFallbackDir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-first-fallback-'))
+    const secondFallbackDir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-second-fallback-'))
+    const responseFilePath = path.join(primaryDir, 'expected-response.md')
+    const firstFallbackPath = path.join(firstFallbackDir, 'first-fallback-response.md')
+    const secondFallbackPath = path.join(secondFallbackDir, 'second-fallback-response.md')
+    tempFiles.push(responseFilePath, firstFallbackPath, secondFallbackPath)
+    await fs.writeFile(path.join(firstFallbackDir, 'near-miss-first.md'), 'untrusted content', 'utf8')
+    await fs.writeFile(path.join(secondFallbackDir, 'near-miss-second.md'), 'untrusted content', 'utf8')
+    const error = Object.assign(new Error('missing'), {code: 'ENOENT'})
+    fsMocks.readFile.mockReset().mockRejectedValue(error)
+
+    // #when reading the response file with two fallback candidates
+    const result = await readAndParseResponseFile(
+      {
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        responseFilePath,
+        responseFilePathCandidates: {
+          expectedPath: responseFilePath,
+          fallbackPaths: [firstFallbackPath, secondFallbackPath],
+        },
+        executionSucceeded: true,
+      },
+      logger,
+    )
+
+    // #then diagnostics include all three parent directories without exposing file contents
     expect(result).toEqual({delivered: false, reason: 'file-read-failed', detail: 'missing'})
     const [, payload] = vi.mocked(logger.error).mock.calls[0] as [string, Record<string, unknown>]
     expect(payload).toMatchObject({
@@ -291,11 +327,17 @@ describe('readAndParseResponseFile read failures', () => {
           directoryEntriesTruncated: false,
           directoryEntries: [],
         },
-        [fallbackDir]: {
+        [firstFallbackDir]: {
           directoryStatus: 'present',
           directoryEntriesObserved: 1,
           directoryEntriesTruncated: false,
-          directoryEntries: ['near-miss.md'],
+          directoryEntries: ['near-miss-first.md'],
+        },
+        [secondFallbackDir]: {
+          directoryStatus: 'present',
+          directoryEntriesObserved: 1,
+          directoryEntriesTruncated: false,
+          directoryEntries: ['near-miss-second.md'],
         },
       },
     })
@@ -324,7 +366,7 @@ describe('readAndParseResponseFile read failures', () => {
         agentContext: makeAgentContext(),
         triggerResult: makeTriggerResult('issue_comment'),
         responseFilePath,
-        responseFilePathCandidates: {expectedPath: responseFilePath, fallbackPath},
+        responseFilePathCandidates: {expectedPath: responseFilePath, fallbackPaths: [fallbackPath]},
       },
       logger,
     )
@@ -346,6 +388,53 @@ describe('readAndParseResponseFile read failures', () => {
     expect(JSON.stringify(vi.mocked(logger.warning).mock.calls)).not.toContain('expected-secret-nonce')
   })
 
+  it('continues after an ENOENT first fallback and recovers from the second fallback', async () => {
+    // #given a missing primary artifact, missing first fallback, and valid second fallback
+    const primaryDir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-primary-'))
+    const firstFallbackDir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-first-fallback-'))
+    const secondFallbackDir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-second-fallback-'))
+    const responseFilePath = path.join(primaryDir, 'response.md')
+    const firstFallbackPath = path.join(firstFallbackDir, 'response.md')
+    const secondFallbackPath = path.join(secondFallbackDir, 'response.md')
+    tempFiles.push(responseFilePath, firstFallbackPath, secondFallbackPath)
+    await fs.writeFile(secondFallbackPath, 'Recovered from second fallback', 'utf8')
+    const missing = Object.assign(new Error('missing'), {code: 'ENOENT'})
+    fsMocks.readFile.mockReset().mockImplementation(async (filePath: string) => {
+      if (filePath === responseFilePath || filePath === firstFallbackPath) {
+        throw missing
+      }
+      return fsMocks.actualReadFile?.(filePath, 'utf8')
+    })
+
+    // #when reading with both ordered fallback candidates
+    const result = await readAndParseResponseFile(
+      {
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        responseFilePath,
+        responseFilePathCandidates: {
+          expectedPath: responseFilePath,
+          fallbackPaths: [firstFallbackPath, secondFallbackPath],
+        },
+      },
+      logger,
+    )
+
+    // #then the second fallback is recovered and the actual path is returned
+    expect(result).toEqual({
+      success: true,
+      data: {
+        parsed: {body: 'Recovered from second fallback'},
+        surface: 'issue-comment',
+        recoveredFromFallback: true,
+        actualResponseFilePath: secondFallbackPath,
+      },
+    })
+    expect(fsMocks.readFile).toHaveBeenNthCalledWith(1, responseFilePath, 'utf8')
+    expect(fsMocks.readFile).toHaveBeenNthCalledWith(2, firstFallbackPath, 'utf8')
+    expect(fsMocks.readFile).toHaveBeenNthCalledWith(3, secondFallbackPath, 'utf8')
+  })
+
   it('does not probe fallback candidates for a non-ENOENT primary read error', async () => {
     // #given a primary read failure that is not a missing-file error
     const responseFilePath = '/tmp/primary/response.md'
@@ -359,7 +448,7 @@ describe('readAndParseResponseFile read failures', () => {
         agentContext: makeAgentContext(),
         triggerResult: makeTriggerResult('issue_comment'),
         responseFilePath,
-        responseFilePathCandidates: {expectedPath: responseFilePath, fallbackPath},
+        responseFilePathCandidates: {expectedPath: responseFilePath, fallbackPaths: [fallbackPath]},
       },
       logger,
     )
@@ -367,6 +456,41 @@ describe('readAndParseResponseFile read failures', () => {
     // #then only the primary path was probed and the original failure is returned
     expect(result).toEqual({delivered: false, reason: 'file-read-failed', detail: 'permission denied'})
     expect(fsMocks.readFile).toHaveBeenCalledExactlyOnceWith(responseFilePath, 'utf8')
+  })
+
+  it('stops probing after a non-ENOENT first fallback read error', async () => {
+    // #given a missing primary artifact and a denied first fallback
+    const responseFilePath = '/tmp/primary/response.md'
+    const firstFallbackPath = '/tmp/first-fallback/response.md'
+    const secondFallbackPath = '/tmp/second-fallback/response.md'
+    const missing = Object.assign(new Error('missing'), {code: 'ENOENT'})
+    const denied = Object.assign(new Error('permission denied'), {code: 'EACCES'})
+    fsMocks.readFile.mockReset().mockImplementation(async (filePath: string) => {
+      if (filePath === responseFilePath) {
+        throw missing
+      }
+      throw denied
+    })
+
+    // #when reading with two fallback candidates
+    const result = await readAndParseResponseFile(
+      {
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        responseFilePath,
+        responseFilePathCandidates: {
+          expectedPath: responseFilePath,
+          fallbackPaths: [firstFallbackPath, secondFallbackPath],
+        },
+      },
+      logger,
+    )
+
+    // #then the non-ENOENT error stops probing and is returned
+    expect(result).toEqual({delivered: false, reason: 'file-read-failed', detail: 'permission denied'})
+    expect(fsMocks.readFile).toHaveBeenCalledTimes(2)
+    expect(fsMocks.readFile).toHaveBeenNthCalledWith(1, responseFilePath, 'utf8')
+    expect(fsMocks.readFile).toHaveBeenNthCalledWith(2, firstFallbackPath, 'utf8')
   })
 })
 
@@ -489,7 +613,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: primaryPath,
-        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPath},
+        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPaths: [fallbackPath]},
       },
       logger,
     )
@@ -509,6 +633,34 @@ describe('runResponsePost', () => {
     )
   })
 
+  it('downgrades an approving verdict recovered from the second fallback', async () => {
+    // #given an approving response recovered from the second fallback candidate
+    const primaryPath = await createMissingResponsePath()
+    const firstFallbackPath = await createMissingResponsePath()
+    const secondFallbackPath = await writeFixture('---\nverdict: approve\n---\n\nRecovered approval.')
+    tempFiles.push(primaryPath, firstFallbackPath, secondFallbackPath)
+    const octokit = makeOctokit()
+
+    // #when posting with both ordered fallback candidates
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: primaryPath,
+        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPaths: [firstFallbackPath, secondFallbackPath]},
+      },
+      logger,
+    )
+
+    // #then the second fallback is delivered without an approving review event
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'COMMENT', pull_number: 7, commit_id: 'head-sha'}),
+    )
+  })
+
   it('keeps a primary-sourced approving verdict as an APPROVE review', async () => {
     // #given an approving response at the expected path
     const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
@@ -523,7 +675,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
-        responseFilePathCandidates: {expectedPath: filePath, fallbackPath: '/tmp/unused-fallback.md'},
+        responseFilePathCandidates: {expectedPath: filePath, fallbackPaths: ['/tmp/unused-fallback.md']},
       },
       logger,
     )
@@ -552,7 +704,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: primaryPath,
-        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPath},
+        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPaths: [fallbackPath]},
       },
       logger,
     )
@@ -579,7 +731,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: primaryPath,
-        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPath},
+        responseFilePathCandidates: {expectedPath: primaryPath, fallbackPaths: [fallbackPath]},
       },
       logger,
     )

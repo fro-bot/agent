@@ -2,7 +2,7 @@ import type {OmoSlimPreset} from '../../shared/types.js'
 import type {Logger} from './types.js'
 import * as path from 'node:path'
 import process from 'node:process'
-import {RESPONSE_FILE_DIR_SEGMENT} from '@fro-bot/runtime'
+import {buildResponseFileFallbackRoots, RESPONSE_FILE_DIR_SEGMENT} from '@fro-bot/runtime'
 import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 
 export interface CIConfigResult {
@@ -138,17 +138,23 @@ function scopeExternalDirectoryPermission(
   // can't know where the response-file dir will be, so keep the flat deny
   // rather than guessing a broad allow pattern.
   let externalDirectory: Record<string, 'allow' | 'deny'> | 'deny' = 'deny'
-  const deniedEditPattern = path.join('_temp', RESPONSE_FILE_DIR_SEGMENT, '*')
   const editPermission: Record<string, unknown> = isRecord(permission.edit)
     ? {...permission.edit}
     : typeof permission.edit === 'string'
       ? {'*': permission.edit}
       : {}
 
-  delete editPermission[deniedEditPattern]
-  editPermission[deniedEditPattern] = 'deny'
-
   if (runnerTemp != null && runnerTemp.trim().length > 0) {
+    const deniedEditPatterns = buildResponseFileFallbackRoots(runnerTemp.trim()).map(root =>
+      path.join(root, RESPONSE_FILE_DIR_SEGMENT, '*'),
+    )
+    for (const deniedEditPattern of deniedEditPatterns) {
+      delete editPermission[deniedEditPattern]
+    }
+    for (const deniedEditPattern of deniedEditPatterns) {
+      editPermission[deniedEditPattern] = 'deny'
+    }
+
     externalDirectory = {
       '*': 'deny',
       [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',

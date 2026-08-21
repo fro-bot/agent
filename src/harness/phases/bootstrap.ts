@@ -174,10 +174,7 @@ async function resolveResponseFilePath(
 
   await fs.mkdir(dir, {recursive: true})
 
-  const candidatePaths = [
-    responseFilePathCandidates.expectedPath,
-    ...(responseFilePathCandidates.fallbackPath === null ? [] : [responseFilePathCandidates.fallbackPath]),
-  ]
+  const candidatePaths = [responseFilePathCandidates.expectedPath, ...responseFilePathCandidates.fallbackPaths]
   for (const candidatePath of candidatePaths) {
     const alreadyExists = await fs
       .stat(candidatePath)
