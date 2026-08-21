@@ -122,6 +122,7 @@ function createBootstrap(): BootstrapPhaseResult {
     opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},
     delivery: 'model-gh',
     responseFilePath: null,
+    responseFilePathCandidates: null,
     trustedHeadSha: '',
   }
 }
