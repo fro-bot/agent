@@ -3,11 +3,7 @@ import type {EventType} from './types.js'
 
 export type {OutputMode, ResolvedOutputMode} from '../shared/types.js'
 
-export function resolveOutputMode(
-  eventType: EventType,
-  _prompt: string | null,
-  configuredMode: OutputMode,
-): ResolvedOutputMode | null {
+export function resolveOutputMode(eventType: EventType, configuredMode: OutputMode): ResolvedOutputMode | null {
   switch (eventType) {
     case 'discussion_comment':
     case 'issue_comment':

@@ -21,8 +21,8 @@ inputs:
     description: >-
       Requested delivery mode for schedule/workflow_dispatch runs only. Values:
       auto, working-dir, branch-pr. When omitted, the public auto compatibility
-      mode is used. Manual auto requests always resolve to working-dir; legacy
-      branch/PR phrase matches are warning-only migration diagnostics.
+      mode is used. Manual auto requests always resolve to working-dir; use
+      branch-pr explicitly when branch/PR delivery is required.
     required: false
   session-retention:
     description: Number of sessions to retain (default 50)
@@ -142,9 +142,8 @@ outputs:
   output-mode-migration:
     description: >-
       JSON migration record with requested state (omitted, auto, or explicit),
-      resolved mode, and whether legacy prompt inference would have selected branch-pr.
-      Pre-execute skips and thrown errors use resolved: null in this record and an
-      empty string for resolved-output-mode.
+      and resolved mode. Pre-execute skips and thrown errors use resolved: null in
+      this record and an empty string for resolved-output-mode.
   cache-status:
     description: Cache restore status (hit/miss/corrupted)
   duration:

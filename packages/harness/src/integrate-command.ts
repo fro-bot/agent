@@ -30,7 +30,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
-import {DEFAULT_SHADOW_CONFLICT_MODEL_TIMEOUT_MS} from './conflict-resolver.js'
+import {DEFAULT_DRY_RUN_CONFLICT_MODEL_TIMEOUT_MS} from './conflict-resolver.js'
 import {formatPipelineError} from './format-error.js'
 import {makeRealAdapters, runIntegration, writeProvenanceManifest} from './integrate.js'
 import {resolveSources} from './sources.js'
@@ -585,7 +585,7 @@ export async function cmdIntegrate(
   // Run the integration and package the artifact.
   try {
     const adapters = makeRealAdapters({
-      conflictModelTimeoutMs: config.dryRun === true ? DEFAULT_SHADOW_CONFLICT_MODEL_TIMEOUT_MS : undefined,
+      conflictModelTimeoutMs: config.dryRun === true ? DEFAULT_DRY_RUN_CONFLICT_MODEL_TIMEOUT_MS : undefined,
     })
     if (flags.candidate) {
       const result = await finalizeCandidateIntegration(config, outPath, adapters, _packageArtifact, logger)
