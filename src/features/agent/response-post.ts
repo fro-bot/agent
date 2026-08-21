@@ -119,12 +119,15 @@ function readErrorDetail(error: unknown, responseFilePathCandidates: readonly st
   )
 }
 
-async function inspectDirectory(directoryPath: string): Promise<ResponseDirectoryDiagnostic> {
+async function inspectDirectory(
+  directoryPath: string,
+  redactedEntryNames: ReadonlySet<string>,
+): Promise<ResponseDirectoryDiagnostic> {
   try {
     const directoryHandle = await fs.opendir(directoryPath)
     const directoryEntries: string[] = []
     for await (const entry of directoryHandle) {
-      directoryEntries.push(entry.name)
+      directoryEntries.push(redactedEntryNames.has(entry.name) ? '<filename-redacted>' : entry.name)
       if (directoryEntries.length >= RESPONSE_DIRECTORY_ENTRY_LIMIT) {
         return {
           directoryStatus: 'present',
@@ -166,11 +169,11 @@ export async function readAndParseResponseFile(
   logger: Logger,
 ): Promise<ReadAndParseResponseFileResult> {
   const {responseFilePath, agentContext, triggerResult, executionSucceeded} = params
-  const fallbackPath = params.responseFilePathCandidates?.fallbackPath
   const responseFilePathCandidates = [
     responseFilePath,
-    ...(fallbackPath === null || fallbackPath === undefined || fallbackPath === responseFilePath ? [] : [fallbackPath]),
+    ...(params.responseFilePathCandidates?.fallbackPaths ?? []).filter(candidate => candidate !== responseFilePath),
   ]
+  const candidateBasenames = new Set(responseFilePathCandidates.map(candidate => path.basename(candidate)))
   let raw: string | undefined
   let actualResponseFilePath = responseFilePath
   let readError: unknown
@@ -199,7 +202,7 @@ export async function readAndParseResponseFile(
       for (const candidate of responseFilePathCandidates) {
         const directory = path.dirname(candidate)
         if (directoryDiagnostics[directory] === undefined) {
-          directoryDiagnostics[directory] = await inspectDirectory(directory)
+          directoryDiagnostics[directory] = await inspectDirectory(directory, candidateBasenames)
         }
       }
 
