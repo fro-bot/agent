@@ -17,7 +17,7 @@
     "@octokit/core": "7.0.6",
     "discord.js": "14.27.0",
     "effect": "3.22.1",
-    "hono": "4.13.2",
+    "hono": "4.13.3",
     "web-push": "3.6.7",
     "yaml": "2.9.0"
   },
