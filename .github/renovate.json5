@@ -225,6 +225,8 @@
         'eslint-plugin-prettier',
         '@vitest/eslint-plugin',
       ],
+      // This object replaces the top-level postUpgradeTasks rather than merging
+      // with it, so the full command list is repeated here on purpose.
       postUpgradeTasks: {
         commands: ['bun install --ignore-scripts', 'bun run fix', 'bun run build'],
         executionMode: 'branch',
