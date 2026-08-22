@@ -1,6 +1,12 @@
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: ['github>fro-bot/.github'],
+  // Commit through the GitHub Contents API instead of the git CLI. The CLI path
+  // runs local hooks, and `postinstall: simple-git-hooks` installs a pre-push
+  // hook that re-runs `lint && build` — repeating work postUpgradeTasks already
+  // did, at roughly two minutes per branch. The API path cannot run hooks at
+  // all, and attributes commits to the App rather than a synthesized author.
+  platformCommit: 'enabled',
   // dist/ is bundled vendor code (committed for the GitHub Action runtime).
   // ignorePaths excludes it from dependency extraction only — it does NOT
   // suppress the hidden-Unicode safety scan, which runs on these files
@@ -221,7 +227,10 @@
   postUpgradeTasks: {
     // `build` escapes dist hidden Unicode as its final step, so a rebuilt dist on
     // update branches stays free of characters Renovate would otherwise flag.
-    commands: ['bun install', 'bun run fix', 'bun run build'],
+    // --ignore-scripts keeps `postinstall: simple-git-hooks` from installing the
+    // pre-push hook into the runner. Lockfile resolution does not depend on
+    // lifecycle scripts, and neither `fix` nor `build` needs one to have run.
+    commands: ['bun install --ignore-scripts', 'bun run fix', 'bun run build'],
     executionMode: 'branch',
   },
   vulnerabilityAlerts: {
