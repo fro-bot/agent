@@ -53,7 +53,7 @@
       "name": "@fro-bot/workspace-agent",
       "version": "0.0.0-development",
       "dependencies": {
-        "@hono/node-server": "2.1.0",
+        "@hono/node-server": "2.1.1",
         "hono": "4.13.2",
       },
       "devDependencies": {
@@ -65,7 +65,7 @@
       "version": "0.0.0-development",
       "dependencies": {
         "@fro-bot/runtime": "workspace:*",
-        "@hono/node-server": "2.1.0",
+        "@hono/node-server": "2.1.1",
         "@octokit/core": "7.0.6",
         "discord.js": "14.27.0",
         "effect": "3.22.1",
@@ -271,7 +271,7 @@
 
     "@fro.bot/harness": ["@fro.bot/harness@workspace:packages/harness"],
 
-    "@hono/node-server": ["@hono/node-server@2.1.0", "", { "peerDependencies": { "hono": "^4" } }, "sha512-XovyyCCnBzW+zKu+z/zq8hwNs4KOR5rEMAOxo2f40Q5xoOI37IMm6MIg2COOUtUApo0i6850MTBKH2u4QLGIqg=="],
+    "@hono/node-server": ["@hono/node-server@2.1.1", "", { "peerDependencies": { "hono": "^4" } }, "sha512-ELuehkj5VCBdgEw9zs+ivkKwyzzUCSQuE96YmiPvn1ECBoZCczbFXJLeEGMTYjphP6gydh4pHMqEYPVMYUVgQg=="],
 
     "@humanfs/core": ["@humanfs/core@0.19.2", "", { "dependencies": { "@humanfs/types": "^0.15.0" } }, "sha512-UhXNm+CFMWcbChXywFwkmhqjs3PRCmcSa/hfBgLIb7oQ5HNb1wS0icWsGtSAUNgefHeI+eBrA8I1fxmbHsGdvA=="],
 
