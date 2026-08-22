@@ -526,7 +526,7 @@ describe('runScenario orchestration', () => {
     const workspacePath = '/fixture/continuation-relevant'
     const createdSession = {
       id: 'seeded-session-42',
-      version: '1.18.18',
+      version: '1.18.21',
       projectID: 'fixture-project',
       directory: workspacePath,
       title: 'fro-bot: issue-1',

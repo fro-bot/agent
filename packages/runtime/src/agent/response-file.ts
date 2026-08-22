@@ -96,6 +96,78 @@ export function buildResponseFilePath(parts: {
   return path.join(buildResponseFileDir(parts), `${parts.nonce}.md`)
 }
 
+/**
+ * The path the harness tells the model to write, plus the ordered locations the
+ * write may land in when OpenCode resolves a relative path against the checkout.
+ */
+export interface ResponseFilePathCandidates {
+  readonly expectedPath: string
+  readonly fallbackPaths: readonly string[]
+}
+
+/**
+ * Relative workspace roots for response-file recovery, ordered from the
+ * observed hosted-runner layout to the existing workspace-relative layout.
+ */
+export function buildResponseFileFallbackRoots(runnerTemp: string): readonly string[] {
+  const runnerTempBasename = path.basename(runnerTemp)
+  return [runnerTempBasename, '']
+}
+
+/**
+ * Build the expected response-file path and the known paths produced when
+ * OpenCode resolves the model's relative write against the checkout.
+ *
+ * Fallbacks are only returned when they remain strictly inside the workspace;
+ * malformed runner-temp or workspace paths must never turn this helper into a
+ * traversal primitive.
+ */
+export function buildResponseFilePathCandidates(parts: {
+  readonly runnerTemp: string
+  readonly runId: string | number
+  readonly runAttempt: string | number
+  readonly nonce: string
+  readonly workspaceDir: string | undefined
+}): ResponseFilePathCandidates {
+  const expectedPath = path.resolve(buildResponseFilePath(parts))
+  const workspaceDir = parts.workspaceDir
+  if (workspaceDir == null || workspaceDir.trim().length === 0) {
+    return {expectedPath, fallbackPaths: []}
+  }
+
+  const resolvedRunnerTemp = path.resolve(parts.runnerTemp)
+  const resolvedWorkspaceDir = path.resolve(workspaceDir)
+  const relativeExpectedPath = path.relative(resolvedRunnerTemp, expectedPath)
+  const expectedPathIsStrictlyUnderRunnerTemp =
+    relativeExpectedPath.length > 0 &&
+    path.isAbsolute(relativeExpectedPath) === false &&
+    relativeExpectedPath !== '..' &&
+    relativeExpectedPath.startsWith(`..${path.sep}`) === false
+
+  if (expectedPathIsStrictlyUnderRunnerTemp === false) {
+    return {expectedPath, fallbackPaths: []}
+  }
+
+  const fallbackPaths: string[] = []
+  const seenPaths = new Set<string>()
+  for (const fallbackRoot of buildResponseFileFallbackRoots(parts.runnerTemp)) {
+    const fallbackPath = path.resolve(resolvedWorkspaceDir, fallbackRoot, relativeExpectedPath)
+    const relativeFallbackPath = path.relative(resolvedWorkspaceDir, fallbackPath)
+    const isStrictlyInsideWorkspace =
+      relativeFallbackPath.length > 0 &&
+      path.isAbsolute(relativeFallbackPath) === false &&
+      relativeFallbackPath !== '..' &&
+      relativeFallbackPath.startsWith(`..${path.sep}`) === false
+
+    if (isStrictlyInsideWorkspace && fallbackPath !== expectedPath && seenPaths.has(fallbackPath) === false) {
+      seenPaths.add(fallbackPath)
+      fallbackPaths.push(fallbackPath)
+    }
+  }
+
+  return {expectedPath, fallbackPaths}
+}
+
 interface Frontmatter {
   readonly verdict?: string
   readonly schemaVersion?: string

@@ -1,5 +1,12 @@
 import {describe, expect, it} from 'vitest'
-import {buildResponseFileDir, buildResponseFilePath, MAX_BODY_BYTES, parseResponseFile} from './response-file.js'
+import {
+  buildResponseFileDir,
+  buildResponseFileFallbackRoots,
+  buildResponseFilePath,
+  buildResponseFilePathCandidates,
+  MAX_BODY_BYTES,
+  parseResponseFile,
+} from './response-file.js'
 
 describe('buildResponseFileDir', () => {
   it('joins runnerTemp with a run+attempt scoped directory', () => {
@@ -24,6 +31,119 @@ describe('buildResponseFilePath', () => {
 
     // #then
     expect(filePath).toBe('/tmp/runner/fro-bot-response/123-1/abc123.md')
+  })
+})
+
+describe('buildResponseFilePathCandidates', () => {
+  it('derives the first fallback root from the runner temp basename', () => {
+    // #given a non-hosted runner temp layout
+    // #when building relative fallback roots
+    const roots = buildResponseFileFallbackRoots('/var/tmp/custom-runner-temp')
+
+    // #then the runner-specific root comes first and the workspace-relative root remains second
+    expect(roots).toEqual(['custom-runner-temp', ''])
+  })
+
+  it('returns the observed _temp fallback before the workspace-relative fallback', () => {
+    // #given the hosted runner layout, workspace, and stable response-file parts
+    const parts = {
+      runnerTemp: '/tmp/runner/_temp',
+      runId: '123',
+      runAttempt: '1',
+      nonce: 'abc123',
+      workspaceDir: '/tmp/runner/repo',
+    }
+
+    // #when building candidate paths
+    const candidates = buildResponseFilePathCandidates(parts)
+
+    // #then the observed _temp path is first and the current workspace-relative path is second
+    expect(candidates).toEqual({
+      expectedPath: '/tmp/runner/_temp/fro-bot-response/123-1/abc123.md',
+      fallbackPaths: [
+        '/tmp/runner/repo/_temp/fro-bot-response/123-1/abc123.md',
+        '/tmp/runner/repo/fro-bot-response/123-1/abc123.md',
+      ],
+    })
+  })
+
+  it.each([{workspaceDir: undefined}, {workspaceDir: '   '}])(
+    'returns no fallbacks when the workspace is unavailable or the expected path is not strictly beneath runnerTemp',
+    ({workspaceDir}) => {
+      // #given response-file parts and a workspace configuration
+      const parts = {
+        runnerTemp: '/tmp/runner',
+        runId: '123',
+        runAttempt: '1',
+        nonce: 'abc123',
+        workspaceDir,
+      }
+
+      // #when building candidate paths
+      const candidates = buildResponseFilePathCandidates(parts)
+
+      // #then no unsafe or duplicate fallback is returned
+      expect(candidates).toEqual({
+        expectedPath: '/tmp/runner/fro-bot-response/123-1/abc123.md',
+        fallbackPaths: [],
+      })
+    },
+  )
+
+  it('returns no fallbacks when the expected path is not beneath runnerTemp', () => {
+    // #given a runner temp path whose relative form would traverse out of the workspace
+    const parts = {
+      runnerTemp: '/tmp/runner',
+      runId: '../../outside',
+      runAttempt: '1',
+      nonce: 'abc123',
+      workspaceDir: '/tmp/runner/repo',
+    }
+
+    // #when building candidate paths
+    const candidates = buildResponseFilePathCandidates(parts)
+
+    // #then no fallback can be derived from an out-of-tree expected path
+    expect(candidates).toEqual({expectedPath: '/tmp/outside-1/abc123.md', fallbackPaths: []})
+  })
+
+  it('returns no fallbacks when parent segments escape runnerTemp', () => {
+    // #given a nonce whose parent segments move the expected path outside runnerTemp
+    const parts = {
+      runnerTemp: '/tmp/runner',
+      runId: '123',
+      runAttempt: '1',
+      nonce: '../../../abc123',
+      workspaceDir: '/tmp/runner/repo',
+    }
+
+    // #when building candidate paths
+    const candidates = buildResponseFilePathCandidates(parts)
+
+    // #then no fallback is derived from an escaped expected path
+    expect(candidates).toEqual({expectedPath: '/tmp/abc123.md', fallbackPaths: []})
+  })
+
+  it('drops duplicate fallbacks and any fallback equal to the expected path', () => {
+    // #given a root whose basename produces duplicate relative fallback roots
+    const duplicateCandidates = buildResponseFilePathCandidates({
+      runnerTemp: '/',
+      runId: '123',
+      runAttempt: '1',
+      nonce: 'abc123',
+      workspaceDir: '/tmp/workspace',
+    })
+    const equalCandidate = buildResponseFilePathCandidates({
+      runnerTemp: '/tmp/runner',
+      runId: '123',
+      runAttempt: '1',
+      nonce: 'abc123',
+      workspaceDir: '/tmp/runner',
+    })
+
+    // #then duplicate and primary-equal paths are excluded
+    expect(duplicateCandidates.fallbackPaths).toEqual(['/tmp/workspace/fro-bot-response/123-1/abc123.md'])
+    expect(equalCandidate.fallbackPaths).toEqual(['/tmp/runner/runner/fro-bot-response/123-1/abc123.md'])
   })
 })
 
