@@ -28,6 +28,7 @@ afterAll(() => {
 
 const projectRoot = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '..')
 const distMainPath = path.join(projectRoot, 'dist', 'main.js')
+const MAIN_CHILD_TIMEOUT_MS = 10_000
 
 function assertDistBundle(): void {
   if (existsSync(distMainPath)) return
@@ -35,22 +36,23 @@ function assertDistBundle(): void {
 }
 
 /**
- * Spawn node and import the main module, returning stdout/stderr.
+ * Spawn node with the given arguments, returning stdout/stderr.
  * Uses spawn instead of exec to avoid shell escaping issues with
  * environment variable names containing hyphens.
  *
  * Sets XDG_DATA_HOME to an isolated temp directory to prevent tests
  * from accessing or modifying local development OpenCode data.
  */
-async function runMain(env: Record<string, string>): Promise<{stdout: string; stderr: string; code: number | null}> {
-  assertDistBundle()
-
-  const importTarget = pathToFileURL(distMainPath).href
+async function runNode(
+  args: readonly string[],
+  env: Record<string, string>,
+  timeoutMs = MAIN_CHILD_TIMEOUT_MS,
+): Promise<{stdout: string; stderr: string; code: number | null}> {
   return new Promise((resolve, reject) => {
     // Prepend mock bin dir to PATH so opencode is found
     const pathEnv = mockBinDir + path.delimiter + (process.env.PATH ?? '')
 
-    const child = spawn(process.execPath, ['--input-type=module', '-e', `import(${JSON.stringify(importTarget)});`], {
+    const child = spawn(process.execPath, args, {
       env: {...process.env, ...env, XDG_DATA_HOME: testDataDir, PATH: pathEnv},
       cwd: projectRoot,
       shell: false,
@@ -58,6 +60,15 @@ async function runMain(env: Record<string, string>): Promise<{stdout: string; st
 
     let stdout = ''
     let stderr = ''
+    let settled = false
+    let timeout: ReturnType<typeof setTimeout> | undefined
+
+    const settle = (callback: () => void): void => {
+      if (settled === true) return
+      settled = true
+      if (timeout !== undefined) clearTimeout(timeout)
+      callback()
+    }
 
     child.stdout.on('data', (data: Buffer) => {
       stdout += data.toString()
@@ -66,11 +77,35 @@ async function runMain(env: Record<string, string>): Promise<{stdout: string; st
       stderr += data.toString()
     })
 
-    child.on('error', reject)
+    child.on('error', error => settle(() => reject(error)))
     child.on('close', code => {
-      resolve({stdout, stderr, code})
+      settle(() => resolve({stdout, stderr, code}))
     })
+    timeout = setTimeout(() => {
+      if (settled === true) return
+      child.kill('SIGKILL')
+      settle(() => {
+        reject(new Error(`Child process timed out after ${timeoutMs}ms.\nstdout:\n${stdout}\nstderr:\n${stderr}`))
+      })
+    }, timeoutMs)
   })
+}
+
+async function runMain(
+  env: Record<string, string>,
+  timeoutMs = MAIN_CHILD_TIMEOUT_MS,
+): Promise<{stdout: string; stderr: string; code: number | null}> {
+  assertDistBundle()
+
+  const importTarget = pathToFileURL(distMainPath).href
+  return runNode(
+    ['--input-type=module', '-e', `import(${JSON.stringify(importTarget)});`],
+    {
+      ...env,
+      GITHUB_API_URL: 'http://127.0.0.1:1',
+    },
+    timeoutMs,
+  )
 }
 
 it('runs successfully with valid inputs', async () => {
@@ -133,4 +168,24 @@ it('fails when server bootstrap fails', {timeout: 15000}, async () => {
 
   expect(code).not.toBe(0)
   expect(stdout).toContain('bootstrap')
+})
+
+it('kills a child that exceeds its timeout and preserves partial output', async () => {
+  // #given a child that writes output and remains alive beyond the timeout
+  const child = runNode(
+    [
+      '--input-type=module',
+      '-e',
+      "process.stdout.write('partial stdout'); process.stderr.write('partial stderr'); setTimeout(() => {}, 1000)",
+    ],
+    {},
+    50,
+  )
+
+  // #when the child exceeds the per-call timeout
+  await expect(child).rejects.toThrow(/timed out/i)
+
+  // #then the rejection preserves the child's output for diagnostics
+  await expect(child).rejects.toThrow('partial stdout')
+  await expect(child).rejects.toThrow('partial stderr')
 })
