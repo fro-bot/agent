@@ -34,6 +34,7 @@ fro-bot/agent/
 │   ├── gateway/                # @fro-bot/gateway — Discord daemon + operator web surface
 │   │   └── src/
 │   │       ├── discord/        # Discord client, mentions, commands, streaming
+│   │       ├── github/         # GitHub App client, Actions workflow-dispatch adapter
 │   │       ├── execute/        # run-core, queue, concurrency, recovery
 │   │       ├── web/            # Operator HTTP routes, SSE, audit
 │   │       ├── workspace-api/  # Workspace API surface

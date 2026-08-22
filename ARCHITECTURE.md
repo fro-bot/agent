@@ -9,7 +9,7 @@ This document describes the system design, invariants, and data flows for the fr
 This monorepo ships three distinct deployable surfaces from one codebase:
 
 - **GitHub Action** — a CI harness that runs OpenCode agents in response to GitHub webhook events (issues, PRs, comments, reviews, scheduled runs, workflow dispatches). The Action entry points are `src/main.ts` and `src/post.ts`; the real logic lives in the 4-layer `src/` tree and `packages/runtime/`. Sessions persist across CI runs via GitHub Actions cache and an S3-compatible object store.
-- **`@fro-bot/gateway`** (`packages/gateway/`) — a Discord-first daemon that listens for `@fro-bot` mentions in bound guild channels and runs OpenCode inside a sandboxed workspace container. Includes an operator web surface (Hono, gateway-net only), an inbound announce webhook, and an S3-backed coordination layer.
+- **`@fro-bot/gateway`** (`packages/gateway/`) — a Discord-first daemon that listens for `@fro-bot` mentions in bound guild channels and runs OpenCode inside a sandboxed workspace container. Includes an operator web surface (Hono, gateway-net only), an inbound announce webhook, and an S3-backed coordination layer. The `/fro-bot dispatch` slash command is a separate, simpler path: it asks the bound repo's `fro-bot.yaml` workflow to run via the GitHub Actions API and returns the run URL — it never touches the gateway's queue, concurrency cap, or run-state.
 - **`@fro.bot/harness`** (`packages/harness/`) — a patched OpenCode binary built via an LLM-merge integration pipeline. Published to npm and GitHub Releases; consumed by the Action setup phase as the default OpenCode binary.
 
 Supporting packages: `@fro-bot/runtime` (`packages/runtime/`) owns shared runtime primitives and version-pin constants; `@fro-bot/action` (`apps/action/`) is a thin workspace wrapper whose build produces the committed root `dist/`; `@fro-bot/workspace-agent` (`apps/workspace-agent/`) is the Hono HTTP sidecar inside the workspace container.
@@ -56,17 +56,18 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
 | `bootstrapOpenCodeServer` | Function | `src/features/agent/server.ts` | Initialize SDK server lifecycle |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
-| `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.6.0`) |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness version (`1.18.14+harness.202732ae`) |
+| `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.12.4`) |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness version (`1.18.21+harness.22dee0ee`) |
 
 ### `packages/gateway/`
 
-| Symbol               | Type     | Location                                 | Role                             |
-| -------------------- | -------- | ---------------------------------------- | -------------------------------- |
-| `runMention`         | Function | `packages/gateway/src/execute/run.ts`    | Full mention execution lifecycle |
-| `launchWork`         | Function | `packages/gateway/src/execute/run.ts`    | Fire-and-return web launch path  |
-| `buildDiscordPrompt` | Function | `packages/gateway/src/execute/prompt.ts` | Discord-specific prompt builder  |
-| `buildOperatorApp`   | Function | `packages/gateway/src/web/server.ts`     | Operator Hono app factory        |
+| Symbol | Type | Location | Role |
+| --- | --- | --- | --- |
+| `runMention` | Function | `packages/gateway/src/execute/run.ts` | Full mention execution lifecycle |
+| `launchWork` | Function | `packages/gateway/src/execute/run.ts` | Fire-and-return web launch path |
+| `buildDiscordPrompt` | Function | `packages/gateway/src/execute/prompt.ts` | Discord-specific prompt builder |
+| `buildOperatorApp` | Function | `packages/gateway/src/web/server.ts` | Operator Hono app factory |
+| `createWorkflowDispatcher` | Function | `packages/gateway/src/github/dispatch.ts` | `/fro-bot dispatch` GitHub Actions workflow-dispatch adapter (fire-and-forget; no queue, concurrency, or local run-state) |
 
 ## Invariants
 
@@ -120,6 +121,9 @@ main.ts
         ├─→ execute phase
         │     executeOpenCode → bootstrapOpenCodeServer → sendPromptToSession
         │       → runPromptAttempt → processEventStream (SSE)
+        │     (onPermissionAsked auto-denies any permission.asked event immediately —
+        │      there is no interactive approval path in CI, so an unanswered ask must
+        │      never be left to block the run until the execution deadline)
         │
         ├─→ review-reconciliation phase
         │     reconcile formal review state after agent execution
