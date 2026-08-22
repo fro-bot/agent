@@ -14,6 +14,12 @@ Ship Unit 7A of the gateway roadmap: a Discord `/fro-bot dispatch task:<task>` s
 
 This plan supersedes Unit 7, “Cloud dispatch + summaries bridge,” in `docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md`. The implementation scope is deliberately limited to dispatch acceptance. Completion notification and the summaries bridge remain separate tasks.
 
+## Problem Frame
+
+Work that needs the Action's environment — matrix CI, secrets-heavy operations, long-running jobs — currently has no path from Discord. A user in a bound channel can mention the bot for local execution in the gateway's workspace, but cannot reach the Action at all without leaving Discord for the GitHub UI.
+
+The April plan specified this capability and it never shipped. Its design predates the operator web surface, the object-store key builder, run-state coordination, and the release-notes narration flow that gave `correlation-id` its current meaning, so the original unit is no longer implementable as written.
+
 ## Requirements Trace
 
 - **R3:** Reuse the channel binding as the authoritative repo context. The task is user-authored session content and must be treated as untrusted input by the Action. No cross-surface session resume is introduced.
@@ -96,7 +102,7 @@ The dispatch adapter exposes an exhaustive outcome set:
 
 The Discord mapping must use an exhaustive `switch` with a `const exhaustiveCheck: never` guard. Unexpected throws still fall through the shared `INTERNAL_ERROR_COPY` path.
 
-### Key Technical Decisions
+## Key Technical Decisions
 
 - **Use `/fro-bot dispatch`, not `/fro-bot cloud`:** explicit owner decision; the implementation and documentation use one name consistently.
 - **Never send `correlation-id`:** `.github/workflows/fro-bot.yaml` treats any non-empty value as release-notes mode, which changes output mode to `working-dir`, suppresses GitHub response delivery with `response-mode: none`, and applies a 600-second timeout. A dispatch command must not accidentally enter that mode.
@@ -106,9 +112,9 @@ The Discord mapping must use an exhaustive `switch` with a `const exhaustiveChec
 - **No local queue or slot participation:** dispatch consumes no local execution resources. The Action owns the authoritative per-repo lock; a successful API acceptance can still lead to a skipped run if another surface holds that lock.
 - **Say accepted, not succeeded:** the reply describes GitHub's acceptance of the dispatch and includes the run link. It does not imply the Action completed successfully.
 
-## Implementation Plan
+## Implementation Units
 
-### Unit 1 — Add scoped workflow-dispatch capability to the GitHub App client
+- [ ] **Unit 1: Add scoped workflow-dispatch capability to the GitHub App client**
 
 **Files:** modify `packages/gateway/src/github/app-client.ts`, `packages/gateway/src/github/app-client.test.ts`.
 
@@ -122,7 +128,7 @@ Extend the App client with a dispatch-specific authorization path. Keep ordinary
 - Token minting or discovery fails → returns a safe auth error without logging credentials.
 - Ordinary `authForRepo` with `contents: read` → remains successful without requiring Actions write.
 
-### Unit 2 — Implement the typed GitHub workflow-dispatch adapter
+- [ ] **Unit 2: Implement the typed GitHub workflow-dispatch adapter**
 
 **Files:** create `packages/gateway/src/github/dispatch.ts` and `packages/gateway/src/github/dispatch.test.ts`.
 
@@ -141,7 +147,7 @@ Create the gateway-level dispatch primitive. It resolves the binding's owner/rep
 - Successful request payload inspection → confirms the ref is the resolved default branch, inputs contain only `prompt`, and `correlation-id` is never sent.
 - `200` response with a malformed or missing nested `workflow_run` → returns `dispatch-rejected` rather than fabricating a run link.
 
-### Unit 3 — Wire `/fro-bot dispatch`, program injection, and deployment documentation
+- [ ] **Unit 3: Wire `/fro-bot dispatch`, program injection, and deployment documentation**
 
 **Files:** create `packages/gateway/src/discord/commands/dispatch.ts` and `packages/gateway/src/discord/commands/dispatch.test.ts`; modify `packages/gateway/src/discord/commands/fro-bot.ts`, `packages/gateway/src/discord/commands/fro-bot.test.ts`, `packages/gateway/src/discord/commands/index.test.ts`, `packages/gateway/src/program.ts`, `packages/gateway/src/program.test.ts`, and `deploy/README.md`.
 
