@@ -113,7 +113,7 @@ The types case was resolved by holding the update and capping it, alongside the 
 }
 ```
 
-Raise that only when every runtime surface has moved, not ahead of it.
+The cap tracks the runtime major rather than the version being rejected: `<25` keeps types on 24.x, where the runtime is. `<26` would admit v25 and reintroduce the same mismatch one major lower. Raise it only when every runtime surface has moved, not ahead of it.
 
 The probe pattern generalizes to any dependency whose behavior CI does not exercise. Drive the real plugins with the real configuration, once on the baseline and once on the candidate, and compare:
 
