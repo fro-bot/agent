@@ -47,6 +47,7 @@
   "prettier": "@bfra.me/prettier-config/120-proof",
   "overrides": {
     "brace-expansion": ">=5.0.9",
+    "conventional-changelog-writer": ">=9",
     "fast-uri": ">=4.1.2",
     "fast-xml-builder": ">=1.1.7",
     "fast-xml-parser": ">=5.10.1",
