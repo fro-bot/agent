@@ -2,7 +2,7 @@ import type {createOpencode, Event} from '@opencode-ai/sdk'
 import type {createOpencodeClient} from '@opencode-ai/sdk/v2'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptOutcome, AttemptResult} from './prompt-sender.js'
-import type {ActivityTracker, EventStreamResult} from './streaming.js'
+import type {ActivityTracker, EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {pollForSessionCompletion, waitForAbortableDelay, waitForEventProcessorShutdown} from './session-poll.js'
 import {detectArtifactsFromMessageParts, processEventStream} from './streaming.js'
@@ -359,6 +359,7 @@ export async function runPromptAttempt(
   startPrompt?: PromptStarter,
   deadline?: ExecutionDeadline,
   attemptAbortController?: AbortController,
+  onPermissionAsked?: PermissionAskedResponder,
 ): Promise<AttemptResult> {
   const attemptController = attemptAbortController ?? new AbortController()
   const eventAbortController = new AbortController()
@@ -393,7 +394,15 @@ export async function runPromptAttempt(
     llmError: null,
   }
 
-  const eventProcessor = processEventStream(events, sessionId, eventSignal, logger, activityTracker, deadline)
+  const eventProcessor = processEventStream(
+    events,
+    sessionId,
+    eventSignal,
+    logger,
+    activityTracker,
+    deadline,
+    onPermissionAsked,
+  )
     .then(result => {
       eventStreamResult = result
     })

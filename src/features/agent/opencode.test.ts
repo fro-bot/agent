@@ -369,6 +369,45 @@ describe('executeOpenCode', () => {
     expect(result.success).toBe(true)
   })
 
+  it('rejects permission asks through the v1 SDK route with the execution directory', async () => {
+    // #given — the real executeOpenCode responder is wired to a permission ask in the SDK event stream
+    const executionDirectory = envUtils.getGitHubWorkspace()
+    const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({data: true})
+    const mockClient = {
+      ...createMockClient({
+        promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+        events: [
+          createCurrentTurnActivityEvent(),
+          {
+            type: 'permission.asked',
+            properties: {
+              id: 'permission-123',
+              sessionID: 'ses_123',
+              permission: 'bash',
+              patterns: ['ls'],
+            },
+          } as unknown as Event,
+          {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+        ],
+      }),
+      postSessionIdPermissionsPermissionId,
+    }
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then — query.directory is load-bearing: without it, the v1 reply route returns 200 but silently no-ops.
+    expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledExactlyOnceWith({
+      path: {id: 'ses_123', permissionID: 'permission-123'},
+      body: {response: 'reject'},
+      query: {directory: executionDirectory},
+      signal: expect.any(AbortSignal) as AbortSignal,
+    })
+    expect(result.success).toBe(true)
+  })
+
   it('creates session and sends prompt', async () => {
     // #given
     const mockClient = createMockClient({
@@ -3261,6 +3300,164 @@ describe('waitForEventProcessorShutdown', () => {
 })
 
 describe('processEventStream', () => {
+  it('responds to a current-session permission ask using the properties request id', async () => {
+    // #given a permission ask whose envelope id differs from the request id
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      currentTurnArmed: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([
+      {
+        id: 'envelope-id',
+        type: 'permission.asked',
+        properties: {
+          id: 'request-id',
+          sessionID: 'ses_123',
+          permission: 'read',
+          patterns: ['*.env'],
+          metadata: {file: '.env.local'},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when the permission ask is processed
+    await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      responder,
+    )
+
+    // #then the responder receives properties.id, never the SSE envelope id
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: 'ses_123',
+      permission: 'read',
+      patterns: ['*.env'],
+    })
+    expect(responder).not.toHaveBeenCalledWith(expect.objectContaining({requestID: 'envelope-id'}))
+  })
+
+  it('ignores permission asks for other sessions', async () => {
+    // #given a permission ask for a different session
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const eventStream = createMockEventStream([
+      {
+        id: 'envelope-id',
+        type: 'permission.asked',
+        properties: {
+          id: 'request-id',
+          sessionID: 'ses_other',
+          permission: 'read',
+          patterns: ['*.env'],
+          metadata: {file: '.env.local'},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when the permission ask is processed
+    await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then the other session's ask is ignored
+    expect(responder).not.toHaveBeenCalled()
+  })
+
+  it('catches responder failures, logs a warning, and continues stream processing', async () => {
+    // #given a responder that rejects and a later terminal event
+    const logger = createMockLogger()
+    const responder = vi.fn().mockRejectedValue(new Error('reply failed'))
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([
+      {
+        id: 'envelope-id',
+        type: 'permission.asked',
+        properties: {
+          id: 'request-id',
+          sessionID: 'ses_123',
+          permission: 'doom_loop',
+          patterns: ['*'],
+          metadata: {command: 'sensitive'},
+        },
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ])
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      new AbortController().signal,
+      logger,
+      activityTracker,
+      undefined,
+      responder,
+    )
+
+    // #then the failure is non-fatal and the stream reaches its later event
+    expect(activityTracker.sessionIdle).toBe(true)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Failed to reject OpenCode permission request',
+      expect.objectContaining({permission: 'doom_loop', patterns: ['*']}),
+    )
+  })
+
+  it('logs an unanswerable permission ask and continues when no responder is supplied', async () => {
+    // #given a permission ask without a responder and a later terminal event
+    const logger = createMockLogger()
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([
+      {
+        id: 'envelope-id',
+        type: 'permission.asked',
+        properties: {
+          id: 'request-id',
+          sessionID: 'ses_123',
+          permission: 'read',
+          patterns: ['*.env'],
+          metadata: {contents: 'must not be logged'},
+        },
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ])
+
+    // #when the stream is processed
+    await processEventStream(eventStream.stream, 'ses_123', new AbortController().signal, logger, activityTracker)
+
+    // #then the missing responder is logged without interrupting the stream
+    expect(activityTracker.sessionIdle).toBe(true)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'OpenCode permission request observed but no responder is configured',
+      expect.objectContaining({permission: 'read', patterns: ['*.env']}),
+    )
+    expect(JSON.stringify((logger.warning as ReturnType<typeof vi.fn>).mock.calls)).not.toContain('metadata')
+    expect(JSON.stringify((logger.warning as ReturnType<typeof vi.fn>).mock.calls)).not.toContain('must not be logged')
+  })
+
   it('marks activity tracker when message part updates arrive', async () => {
     // #given
     const activityTracker = {
