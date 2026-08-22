@@ -171,7 +171,9 @@ it('fails when server bootstrap fails', {timeout: 15000}, async () => {
 })
 
 it('kills a child that exceeds its timeout and preserves partial output', async () => {
-  // #given a child that writes output and remains alive beyond the timeout
+  // #given a child that writes output and remains alive beyond the timeout.
+  // The budget must clear Node's cold start so the writes land before SIGKILL;
+  // the child stays alive 1000ms, so 500ms still exercises the kill path.
   const child = runNode(
     [
       '--input-type=module',
@@ -179,10 +181,12 @@ it('kills a child that exceeds its timeout and preserves partial output', async 
       "process.stdout.write('partial stdout'); process.stderr.write('partial stderr'); setTimeout(() => {}, 1000)",
     ],
     {},
-    50,
+    500,
   )
 
   // #when the child exceeds the per-call timeout
+  // The same rejected promise is awaited three times on purpose — a settled
+  // promise memoizes its result, so each assertion inspects the one rejection.
   await expect(child).rejects.toThrow(/timed out/i)
 
   // #then the rejection preserves the child's output for diagnostics
