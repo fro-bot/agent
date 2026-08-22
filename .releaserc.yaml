@@ -65,4 +65,4 @@ presetConfig:
     - type: chore
       section: Miscellaneous Chores
     - type: skip
-      hidden: true
+      effect: hidden
