@@ -157,6 +157,12 @@ describe('buildCIConfig', () => {
         agent: {
           build: {
             permission: {
+              doom_loop: 'deny',
+              read: {
+                '*.env': 'deny',
+                '*.env.*': 'deny',
+                '*.env.example': 'allow',
+              },
               edit: {},
               external_directory: 'deny',
             },
@@ -341,6 +347,52 @@ describe('buildCIConfig', () => {
         (call: unknown[]) => typeof call[0] === 'string' && call[0].includes('OpenCode config rewritten'),
       )
       expect(rewriteWarning).toBeUndefined()
+    })
+
+    it('denies reachable native asks while preserving user read rules and putting managed rules last', () => {
+      // #given user-supplied permission rules with a native wildcard and custom entries
+      const logger = createLogger()
+      const result = buildCIConfig(
+        {
+          opencodeConfig: JSON.stringify({
+            agent: {
+              build: {
+                permission: {
+                  doom_loop: 'ask',
+                  read: {'*': 'allow', '*.env.example': 'ask', custom: 'deny', '*.env': 'ask'},
+                  edit: {existing: 'ask'},
+                  external_directory: 'ask',
+                },
+              },
+            },
+          }),
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+        },
+        logger,
+      )
+
+      // #then the known asks are denied and read rule ordering remains load-bearing
+      expect(result.error).toBeNull()
+      const build = (result.config.agent as Record<string, unknown>).build as Record<string, unknown>
+      const permission = build.permission as Record<string, unknown>
+      expect(permission.doom_loop).toBe('deny')
+      expect(permission.read).toEqual({
+        '*': 'allow',
+        custom: 'deny',
+        '*.env': 'deny',
+        '*.env.*': 'deny',
+        '*.env.example': 'allow',
+      })
+      expect(Object.keys(permission.read as Record<string, unknown>)).toEqual([
+        '*',
+        'custom',
+        '*.env',
+        '*.env.*',
+        '*.env.example',
+      ])
+      expect(permission.edit).toEqual({existing: 'ask'})
+      expect(permission.external_directory).toBe('deny')
     })
 
     it('appends systematic plugin even when no user config', () => {

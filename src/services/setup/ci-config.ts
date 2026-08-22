@@ -143,6 +143,23 @@ function scopeExternalDirectoryPermission(
     : typeof permission.edit === 'string'
       ? {'*': permission.edit}
       : {}
+  const readPermission: Record<string, unknown> = isRecord(permission.read) ? {...permission.read} : {}
+  const deniedReadPatterns = {
+    '*.env': 'deny',
+    '*.env.*': 'deny',
+    '*.env.example': 'allow',
+  } as const
+
+  for (const [pattern, rule] of Object.entries(deniedReadPatterns)) {
+    delete readPermission[pattern]
+    readPermission[pattern] = rule
+  }
+
+  const buildPermission: Record<string, unknown> = {...permission}
+  delete buildPermission.doom_loop
+  buildPermission.doom_loop = 'deny'
+  delete buildPermission.read
+  buildPermission.read = readPermission
 
   if (runnerTemp != null && runnerTemp.trim().length > 0) {
     const deniedEditPatterns = buildResponseFileFallbackRoots(runnerTemp.trim()).map(root =>
@@ -179,7 +196,7 @@ function scopeExternalDirectoryPermission(
     build: {
       ...build,
       permission: {
-        ...permission,
+        ...buildPermission,
         edit: editPermission,
         external_directory: externalDirectory,
       },
