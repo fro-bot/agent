@@ -1,7 +1,7 @@
 import type {ErrorInfo} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {OpenCodeServerHandle} from './server.js'
-import type {EventStreamResult} from './streaming.js'
+import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
@@ -25,6 +25,23 @@ import {
 import {waitForAbortableDelay} from './session-poll.js'
 
 const SESSION_ABORT_TIMEOUT_MS = 2_000
+
+interface PermissionReplyClient {
+  readonly permission: {
+    readonly reply: (parameters: {
+      readonly requestID: string
+      readonly reply: 'reject'
+      readonly message: string
+    }) => Promise<unknown>
+  }
+}
+
+function hasPermissionReplyClient(client: unknown): client is PermissionReplyClient {
+  if (client == null || typeof client !== 'object') return false
+  const permission = (client as {readonly permission?: unknown}).permission
+  if (permission == null || typeof permission !== 'object') return false
+  return typeof (permission as {readonly reply?: unknown}).reply === 'function'
+}
 
 async function abortRemoteSession(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
@@ -166,6 +183,21 @@ export async function executeOpenCode(
       'reference file materialization',
     )
     const allFileParts = [...(promptOptions.fileParts ?? []), ...referenceFileParts]
+    const onPermissionAsked: PermissionAskedResponder = async request => {
+      if (hasPermissionReplyClient(sessionClient)) {
+        await sessionClient.permission.reply({
+          requestID: request.requestID,
+          reply: 'reject',
+          message: 'Permission requests are denied in CI.',
+        })
+        return
+      }
+
+      await sessionClient.postSessionIdPermissionsPermissionId({
+        path: {id: request.sessionID, permissionID: request.requestID},
+        body: {response: 'reject'},
+      })
+    }
 
     let lastError: string | null = null
     let promptAccepted = false
@@ -193,6 +225,7 @@ export async function executeOpenCode(
             logger,
             serverUrl,
             deadline,
+            onPermissionAsked,
           )
           shouldAbortRemoteOnTimeout = false
           return attemptResult

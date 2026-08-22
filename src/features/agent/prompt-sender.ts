@@ -1,6 +1,6 @@
 import type {createOpencode, Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
-import type {EventStreamResult} from './streaming.js'
+import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
@@ -50,6 +50,7 @@ export async function sendPromptToSession(
   logger: Logger,
   serverUrl?: string | null,
   deadline?: ExecutionDeadline,
+  onPermissionAsked?: PermissionAskedResponder,
 ): Promise<AttemptResult> {
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart, ...(fileParts ?? [])]
@@ -115,6 +116,7 @@ export async function sendPromptToSession(
         startPrompt,
         deadline,
         attemptAbortController,
+        onPermissionAsked,
       )
     return await runAttempt()
   } finally {

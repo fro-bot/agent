@@ -260,6 +260,15 @@ interface ToolCallInfo {
   readonly input: unknown
 }
 
+export interface PermissionAskedRequest {
+  readonly requestID: string
+  readonly sessionID: string
+  readonly permission: string
+  readonly patterns: readonly string[]
+}
+
+export type PermissionAskedResponder = (request: PermissionAskedRequest) => Promise<void>
+
 export async function processEventStream(
   stream: AsyncIterable<Event>,
   sessionId: string,
@@ -267,6 +276,7 @@ export async function processEventStream(
   logger: Logger,
   activityTracker?: ActivityTracker,
   deadline?: ExecutionDeadline,
+  onPermissionAsked?: PermissionAskedResponder,
 ): Promise<EventStreamResult> {
   let lastText = ''
   let tokens: TokenUsage | null = null
@@ -284,9 +294,49 @@ export async function processEventStream(
   for await (const event of stream) {
     if (signal.aborted) break
     logServerEvent(event, logger)
-    if (activityTracker?.currentTurnArmed === false) continue
     const eventType = getEventKind(event)
     const eventPayload = getEventPayload(event)
+
+    if (eventType === 'permission.asked') {
+      const eventSessionID = getEventSessionID(event)
+      if (eventSessionID !== sessionId) continue
+
+      const requestID = getStringProperty(eventPayload, 'id')
+      const permission = getStringProperty(eventPayload, 'permission') ?? 'unknown'
+      const rawPatterns = getObjectProperty(eventPayload, 'patterns')
+      const patterns: string[] = Array.isArray(rawPatterns)
+        ? rawPatterns.filter((pattern): pattern is string => typeof pattern === 'string')
+        : []
+      const context = {sessionId, permission, patterns}
+
+      if (requestID == null) {
+        logger.warning('OpenCode permission request missing request id', context)
+        continue
+      }
+
+      const request: PermissionAskedRequest = {
+        requestID,
+        sessionID: sessionId,
+        permission,
+        patterns,
+      }
+      if (onPermissionAsked === undefined) {
+        logger.warning('OpenCode permission request observed but no responder is configured', context)
+      } else {
+        logger.warning('Rejecting OpenCode permission request', context)
+        try {
+          await onPermissionAsked(request)
+        } catch (error) {
+          logger.warning('Failed to reject OpenCode permission request', {
+            ...context,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+      continue
+    }
+
+    if (activityTracker?.currentTurnArmed === false) continue
 
     if (activityTracker != null && isStreamActivityEvent(eventType)) {
       const eventSessionID = getEventSessionID(event)
