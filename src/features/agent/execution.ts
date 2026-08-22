@@ -1,7 +1,7 @@
 import type {ErrorInfo} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {OpenCodeServerHandle} from './server.js'
-import type {EventStreamResult} from './streaming.js'
+import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
@@ -166,6 +166,14 @@ export async function executeOpenCode(
       'reference file materialization',
     )
     const allFileParts = [...(promptOptions.fileParts ?? []), ...referenceFileParts]
+    const onPermissionAsked: PermissionAskedResponder = async request => {
+      await sessionClient.postSessionIdPermissionsPermissionId({
+        path: {id: request.sessionID, permissionID: request.requestID},
+        body: {response: 'reject'},
+        query: {directory},
+        signal: deadline.signal,
+      })
+    }
 
     let lastError: string | null = null
     let promptAccepted = false
@@ -193,6 +201,7 @@ export async function executeOpenCode(
             logger,
             serverUrl,
             deadline,
+            onPermissionAsked,
           )
           shouldAbortRemoteOnTimeout = false
           return attemptResult

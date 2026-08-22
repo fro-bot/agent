@@ -1,6 +1,12 @@
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: ['github>fro-bot/.github'],
+  // Commit through the GitHub Contents API instead of the git CLI. The CLI path
+  // runs local hooks, and `postinstall: simple-git-hooks` installs a pre-push
+  // hook that re-runs `lint && build` — repeating work postUpgradeTasks already
+  // did, at roughly two minutes per branch. The API path cannot run hooks at
+  // all, and attributes commits to the App rather than a synthesized author.
+  platformCommit: 'enabled',
   // dist/ is bundled vendor code (committed for the GitHub Action runtime).
   // ignorePaths excludes it from dependency extraction only — it does NOT
   // suppress the hidden-Unicode safety scan, which runs on these files
@@ -196,6 +202,37 @@
       allowedVersions: '<=1.3.14',
     },
     {
+      // Keep @types/node on the major the code actually runs on. Every runtime
+      // surface is Node 24 — `using: node24` in action.yaml, node:24 in both
+      // deploy Dockerfiles, and node-version 24 in harness-release. Newer types
+      // describe a stdlib none of them have, and type-checking against them
+      // succeeds by construction, so CI cannot catch the mismatch. Raise this
+      // together with the runtime, not ahead of it.
+      matchPackageNames: ['@types/node'],
+      allowedVersions: '<25',
+    },
+    {
+      // `fix` is autofix-only, and update branches touch manifests, lockfiles,
+      // and workflow YAML — none of which ESLint reads. Running it repo-wide on
+      // every branch costs ~95s to change nothing, so it runs only for the
+      // tooling that can actually move lint output.
+      matchPackageNames: [
+        'eslint',
+        'prettier',
+        '@bfra.me/eslint-config',
+        '@bfra.me/prettier-config',
+        'eslint-config-prettier',
+        'eslint-plugin-prettier',
+        '@vitest/eslint-plugin',
+      ],
+      // This object replaces the top-level postUpgradeTasks rather than merging
+      // with it, so the full command list is repeated here on purpose.
+      postUpgradeTasks: {
+        commands: ['bun install --ignore-scripts', 'bun run fix', 'bun run build'],
+        executionMode: 'branch',
+      },
+    },
+    {
       // Let release-pipeline packages settle before they reach the release job. A
       // broken same-day publish (e.g. semantic-release 25.0.4 shipped a missing
       // @semantic-release/core import) would otherwise break Perform Release before
@@ -221,7 +258,10 @@
   postUpgradeTasks: {
     // `build` escapes dist hidden Unicode as its final step, so a rebuilt dist on
     // update branches stays free of characters Renovate would otherwise flag.
-    commands: ['bun install', 'bun run fix', 'bun run build'],
+    // --ignore-scripts keeps `postinstall: simple-git-hooks` from installing the
+    // pre-push hook into the runner. Lockfile resolution does not depend on
+    // lifecycle scripts, and neither `fix` nor `build` needs one to have run.
+    commands: ['bun install --ignore-scripts', 'bun run build'],
     executionMode: 'branch',
   },
   vulnerabilityAlerts: {
