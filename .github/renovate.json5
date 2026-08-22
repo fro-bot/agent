@@ -212,6 +212,27 @@
       allowedVersions: '<25',
     },
     {
+      // `fix` is autofix-only, and update branches touch manifests, lockfiles,
+      // and workflow YAML — none of which ESLint reads. Running it repo-wide on
+      // every branch costs ~95s to change nothing, so it runs only for the
+      // tooling that can actually move lint output.
+      matchPackageNames: [
+        'eslint',
+        'prettier',
+        '@bfra.me/eslint-config',
+        '@bfra.me/prettier-config',
+        'eslint-config-prettier',
+        'eslint-plugin-prettier',
+        '@vitest/eslint-plugin',
+      ],
+      // This object replaces the top-level postUpgradeTasks rather than merging
+      // with it, so the full command list is repeated here on purpose.
+      postUpgradeTasks: {
+        commands: ['bun install --ignore-scripts', 'bun run fix', 'bun run build'],
+        executionMode: 'branch',
+      },
+    },
+    {
       // Let release-pipeline packages settle before they reach the release job. A
       // broken same-day publish (e.g. semantic-release 25.0.4 shipped a missing
       // @semantic-release/core import) would otherwise break Perform Release before
@@ -240,7 +261,7 @@
     // --ignore-scripts keeps `postinstall: simple-git-hooks` from installing the
     // pre-push hook into the runner. Lockfile resolution does not depend on
     // lifecycle scripts, and neither `fix` nor `build` needs one to have run.
-    commands: ['bun install --ignore-scripts', 'bun run fix', 'bun run build'],
+    commands: ['bun install --ignore-scripts', 'bun run build'],
     executionMode: 'branch',
   },
   vulnerabilityAlerts: {
