@@ -40,6 +40,7 @@ import {recoverStaleRuns} from './execute/recovery.js'
 import {createRunIndex} from './execute/run-index.js'
 import {getInFlightRuns} from './execute/run.js'
 import {createAppClient} from './github/app-client.js'
+import {createWorkflowDispatcher} from './github/dispatch.js'
 import {createRateLimiter} from './http/rate-limit.js'
 import {createDenylistCache} from './redaction/denylist.js'
 import {createAppClientMetadataReader} from './redaction/reader-app-client.js'
@@ -420,6 +421,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       installUrl: config.gatewayGitHubAppInstallUrl,
       logger: addProjectLogger,
     })
+    const dispatchWorkflow = createWorkflowDispatcher({appClient, logger})
     const workspaceClient = createWorkspaceClient({baseUrl: config.workspaceAgentUrl})
 
     const commandDeps = {
@@ -439,6 +441,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // forceReleaseStaleLockEffect so it reads run-state under the correct key segment.
       identity: config.identity,
       forceReleaseStaleLock: forceReleaseStaleLockEffect,
+      dispatchWorkflow,
     }
 
     const registry = getCommandRegistry(commandDeps)

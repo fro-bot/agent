@@ -29,6 +29,9 @@ import {isOctokitNotFound, safeErrorMessage} from './errors.js'
  */
 export const REPO_IDENTITY_REQUEST_TIMEOUT_MS = 10_000
 
+/** Maximum duration for each network operation in workflow-dispatch App auth. */
+export const WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS = 5_000
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -132,6 +135,18 @@ export interface AppClient {
   ) => Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>>
 
   /**
+   * Return an authenticated, repository-scoped Octokit instance for workflow dispatch.
+   *
+   * This capability separately requires Actions: write and mints a token with only
+   * `{actions: 'write'}`. It intentionally does not widen the ordinary authForRepo
+   * permission contract.
+   */
+  readonly authForWorkflowDispatch: (
+    owner: string,
+    repo: string,
+  ) => Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>>
+
+  /**
    * Fetch the repo's immutable numeric id and node_id via GET /repos/{owner}/{repo}.
    *
    * Uses the authenticated octokit from authForRepo — no extra auth round-trip.
@@ -187,87 +202,127 @@ export interface AppClientOptions {
 export function createAppClient(options: AppClientOptions): AppClient {
   const {appId, privateKey, installUrl = 'https://github.com/apps/fro-bot-agent/installations/new', logger} = options
 
-  // In-memory cache: "owner/repo" → installationId
-  const installationCache = new Map<string, number>()
+  interface InstallationData {
+    readonly id: number
+    readonly permissions: Record<string, string>
+  }
+
+  // In-memory cache: "owner/repo" → verified installation data
+  const installationCache = new Map<string, InstallationData>()
 
   const cacheKey = (owner: string, repo: string): string => `${owner}/${repo}`
+
+  async function discoverInstallation(
+    owner: string,
+    repo: string,
+    requestSignal?: AbortSignal,
+  ): Promise<Result<InstallationData, AppNotInstalledError | InsufficientPermissionsError | AuthError>> {
+    const key = cacheKey(owner, repo)
+    const cached = installationCache.get(key)
+    if (cached !== undefined) return ok(cached)
+
+    try {
+      // Mint a JWT-scoped auth (no installationId) to call the discovery endpoint.
+      const jwtAuth = createAppAuth({appId, privateKey})
+      const {token: jwtToken} = await jwtAuth({type: 'app'})
+      const discoveryOctokit = new Octokit({auth: jwtToken})
+
+      let installationData: InstallationData
+      try {
+        const requestOptions =
+          requestSignal === undefined ? {owner, repo} : {owner, repo, request: {signal: requestSignal}}
+        const response = await discoveryOctokit.request('GET /repos/{owner}/{repo}/installation', requestOptions)
+        installationData = {
+          id: response.data.id,
+          permissions: response.data.permissions ?? {},
+        }
+      } catch (discoveryError) {
+        if (isOctokitNotFound(discoveryError)) {
+          return err(new AppNotInstalledError(owner, repo, installUrl))
+        }
+        return err(new AuthError(safeErrorMessage(discoveryError)))
+      }
+
+      // The ordinary contents:read minimum remains a prerequisite for every cached installation.
+      const permissionResult = verifyPermissions(installationData.permissions, REQUIRED_PERMISSIONS, installUrl, logger)
+      if (permissionResult !== null) return err(permissionResult)
+
+      installationCache.set(key, installationData)
+      logger?.debug('Discovered GitHub App installation', {
+        owner,
+        repo,
+        installationId: installationData.id,
+      })
+      return ok(installationData)
+    } catch (error) {
+      return err(new AuthError(safeErrorMessage(error)))
+    }
+  }
+
+  async function mintToken(
+    owner: string,
+    repo: string,
+    installation: InstallationData,
+    permissions: Record<string, string>,
+    requestSignal?: AbortSignal,
+  ): Promise<Result<AppClientAuthResult, AuthError>> {
+    try {
+      const installAuth = createAppAuth({appId, privateKey, installationId: installation.id})
+      const requestOptions = requestSignal === undefined ? {} : {request: {signal: requestSignal}}
+      const {token} = await installAuth({
+        type: 'installation',
+        repositoryNames: [repo],
+        permissions,
+        ...requestOptions,
+      })
+      const octokit = new Octokit({auth: token})
+      return ok({octokit, installationId: installation.id, token})
+    } catch (mintError) {
+      // A mint failure means the cached installation may no longer be usable.
+      installationCache.delete(cacheKey(owner, repo))
+      return err(new AuthError(safeErrorMessage(mintError)))
+    }
+  }
 
   async function authForRepo(
     owner: string,
     repo: string,
   ): Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>> {
-    try {
-      // Stage 1: JWT-level auth — discover installation ID if not cached.
-      let installationId = installationCache.get(cacheKey(owner, repo))
+    const installationResult = await discoverInstallation(owner, repo)
+    if (installationResult.success === false) return installationResult
+    return mintToken(owner, repo, installationResult.data, {contents: 'read'})
+  }
 
-      if (installationId === undefined) {
-        // Note: the over-privileged WARN in verifyPermissions only fires during
-        // discovery (cache miss). Cache-hit calls skip this block entirely, so
-        // the WARN will not repeat on subsequent calls — this is intentional.
-        // Mint a JWT-scoped auth (no installationId) to call the discovery endpoint.
-        const jwtAuth = createAppAuth({appId, privateKey})
+  async function authForWorkflowDispatch(
+    owner: string,
+    repo: string,
+  ): Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>> {
+    const installationResult = await discoverInstallation(
+      owner,
+      repo,
+      AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS),
+    )
+    if (installationResult.success === false) return installationResult
 
-        // Get a JWT token for the App-level request.
-        const {token: jwtToken} = await jwtAuth({type: 'app'})
-
-        const discoveryOctokit = new Octokit({auth: jwtToken})
-
-        let installationData: {id: number; permissions: Record<string, string>}
-        try {
-          const response = await discoveryOctokit.request('GET /repos/{owner}/{repo}/installation', {owner, repo})
-          installationData = {
-            id: response.data.id,
-            permissions: response.data.permissions ?? {},
-          }
-        } catch (discoveryError) {
-          if (isOctokitNotFound(discoveryError)) {
-            return err(new AppNotInstalledError(owner, repo, installUrl))
-          }
-          return err(new AuthError(safeErrorMessage(discoveryError)))
-        }
-
-        // Verify permissions.
-        const permissionResult = verifyPermissions(installationData.permissions, installUrl, logger)
-        if (permissionResult !== null) {
-          return err(permissionResult)
-        }
-
-        installationId = installationData.id
-        installationCache.set(cacheKey(owner, repo), installationId)
-
-        logger?.debug('Discovered GitHub App installation', {
-          owner,
-          repo,
-          installationId,
-        })
-      }
-
-      // Stage 2: Mint a repository-scoped installation token.
-      // Narrow the token to the requested repository and the minimum required
-      // permissions (contents:read) so a compromised token cannot be used to
-      // access other repositories in the same installation.
-      const installAuth = createAppAuth({appId, privateKey, installationId})
-      let token: string
-      try {
-        ;({token} = await installAuth({
-          type: 'installation',
-          repositoryNames: [repo],
-          permissions: {contents: 'read'},
-        }))
-      } catch (mintError) {
-        // Stage-2 failure means the cached installationId is no longer usable
-        // (e.g. revoked installation, rotated key, transient API error).
-        // Evict it so the next call re-discovers rather than failing indefinitely.
-        installationCache.delete(cacheKey(owner, repo))
-        return err(new AuthError(safeErrorMessage(mintError)))
-      }
-
-      const octokit = new Octokit({auth: token})
-
-      return ok({octokit, installationId, token})
-    } catch (error) {
-      return err(new AuthError(safeErrorMessage(error)))
+    const permissionResult = verifyPermissions(
+      installationResult.data.permissions,
+      {actions: 'write'},
+      installUrl,
+      logger,
+    )
+    if (permissionResult !== null) {
+      // Do not retain an installation that cannot satisfy this dedicated capability.
+      installationCache.delete(cacheKey(owner, repo))
+      return err(permissionResult)
     }
+
+    return mintToken(
+      owner,
+      repo,
+      installationResult.data,
+      {actions: 'write'},
+      AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS),
+    )
   }
 
   async function getRepoIdentity(
@@ -317,7 +372,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
     installationCache.delete(cacheKey(owner, repo))
   }
 
-  return {authForRepo, getRepoIdentity, invalidateCache}
+  return {authForRepo, authForWorkflowDispatch, getRepoIdentity, invalidateCache}
 }
 
 // ---------------------------------------------------------------------------
@@ -331,13 +386,14 @@ export function createAppClient(options: AppClientOptions): AppClient {
  */
 function verifyPermissions(
   granted: Record<string, string>,
+  requiredPermissions: Record<string, string>,
   installUrl: string,
   logger?: AppClientOptions['logger'],
 ): InsufficientPermissionsError | null {
   const missing: string[] = []
   const overPrivileged: string[] = []
 
-  for (const [permission, requiredLevel] of Object.entries(REQUIRED_PERMISSIONS)) {
+  for (const [permission, requiredLevel] of Object.entries(requiredPermissions)) {
     const grantedLevel = granted[permission] ?? 'none'
     const grantedIdx = permissionLevel(grantedLevel)
     const requiredIdx = permissionLevel(requiredLevel)

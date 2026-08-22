@@ -14,6 +14,7 @@ import type {CoordinationConfig, ForceReleaseStaleLockResult} from '@fro-bot/run
 import type {ChatInputCommandInteraction, Guild} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RunTask} from '../../execute/run.js'
+import type {DispatchWorkflow} from '../../github/dispatch.js'
 import type {FroBotDeps} from './fro-bot.js'
 
 import {Effect} from 'effect'
@@ -74,6 +75,7 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
     },
     appClient: {
       authForRepo: vi.fn(),
+      authForWorkflowDispatch: vi.fn(),
       getRepoIdentity: vi.fn(),
       invalidateCache: vi.fn(),
     },
@@ -105,6 +107,7 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
     },
     identity: 'discord-gateway',
     forceReleaseStaleLock: defaultForceRelease,
+    dispatchWorkflow: vi.fn<DispatchWorkflow>(),
     ...overrides,
   }
 }
@@ -133,6 +136,7 @@ function makeInteraction(
     editReply,
     options: {
       getSubcommand: vi.fn().mockReturnValue(subcommand),
+      getString: vi.fn().mockReturnValue('run the checks'),
     },
   } as unknown as ChatInputCommandInteraction
   return {interaction, reply, deferReply, editReply}
@@ -155,6 +159,11 @@ describe('createFroBotCommand — builder registration', () => {
     expect(subNames).toContain('ping')
     expect(subNames).toContain('add-project')
     expect(subNames).toContain('clear-queue')
+    expect(subNames).toContain('dispatch')
+
+    const dispatch = (json.options ?? []).find((o: {name: string}) => o.name === 'dispatch') as
+      {options?: readonly {name: string; required?: boolean}[]} | undefined
+    expect(dispatch?.options).toEqual(expect.arrayContaining([expect.objectContaining({name: 'task', required: true})]))
   })
 })
 
@@ -189,6 +198,44 @@ describe('createFroBotCommand — dispatch', () => {
     expect(reply).toHaveBeenCalledWith(
       expect.objectContaining({content: 'pong', ephemeral: true, allowedMentions: {parse: []}}),
     )
+  })
+
+  it('routes dispatch to the injected workflow dispatcher', async () => {
+    // #given — a bound channel, authorized user, and accepted dispatch result
+    const dispatchWorkflow = vi.fn<DispatchWorkflow>().mockResolvedValue({
+      outcome: 'accepted',
+      owner: 'acme',
+      repo: 'widget',
+      runId: 1234,
+      runUrl: 'https://github.com/acme/widget/actions/runs/1234',
+    })
+    const bindingsStore = {
+      createBinding: vi.fn(),
+      getBindingByRepo: vi.fn(),
+      getBindingByChannelId: vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          owner: 'acme',
+          repo: 'widget',
+          channelId: 'ch-test-123',
+          channelName: 'widget',
+          workspacePath: '/workspace/repos/acme/widget',
+          createdAt: new Date().toISOString(),
+          createdByDiscordId: 'user-authorized-123',
+        },
+      }),
+      listBindings: vi.fn(),
+    }
+    const deps = makeDeps({bindingsStore, dispatchWorkflow})
+    const cmd = createFroBotCommand(deps)
+    const {interaction} = makeInteraction('dispatch')
+
+    // #when
+    const result = await Effect.runPromise(Effect.either(cmd.execute(interaction)))
+
+    // #then
+    expect(result._tag).toBe('Right')
+    expect(dispatchWorkflow).toHaveBeenCalledExactlyOnceWith('acme', 'widget', 'run the checks')
   })
 
   it('returns Effect.fail for an unknown subcommand', async () => {

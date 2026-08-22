@@ -47,6 +47,7 @@ function makeAppClient(
 ): AppClient {
   return {
     authForRepo: vi.fn().mockResolvedValue(authResult),
+    authForWorkflowDispatch: vi.fn(),
     getRepoIdentity: vi.fn().mockResolvedValue(ok({databaseId: 1, nodeId: 'node-1'})),
     invalidateCache: vi.fn(),
   }
@@ -394,6 +395,7 @@ describe('ensureWorkspaceClone', () => {
       const repo = 'testrepo'
       const appClient: AppClient = {
         authForRepo: vi.fn().mockRejectedValue(new Error('unexpected crash')),
+        authForWorkflowDispatch: vi.fn(),
         getRepoIdentity: vi.fn().mockResolvedValue(ok({databaseId: 1, nodeId: 'node-1'})),
         invalidateCache: vi.fn(),
       }
@@ -415,6 +417,7 @@ describe('ensureWorkspaceClone', () => {
       const repo = 'testrepo'
       const appClient: AppClient = {
         authForRepo: vi.fn().mockRejectedValue(new Error('sensitive internal detail')),
+        authForWorkflowDispatch: vi.fn(),
         getRepoIdentity: vi.fn().mockResolvedValue(ok({databaseId: 1, nodeId: 'node-1'})),
         invalidateCache: vi.fn(),
       }
@@ -443,6 +446,7 @@ describe('ensureWorkspaceClone', () => {
       const repo = 'testrepo'
       const appClient: AppClient = {
         authForRepo: vi.fn().mockReturnValue(new Promise<never>(() => {})), // never resolves
+        authForWorkflowDispatch: vi.fn(),
         getRepoIdentity: vi.fn().mockResolvedValue(ok({databaseId: 1, nodeId: 'node-1'})),
         invalidateCache: vi.fn(),
       }
