@@ -126,6 +126,7 @@ function createBootstrap(
     opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},
     delivery: overrides.delivery ?? 'model-gh',
     responseFilePath: overrides.responseFilePath ?? null,
+    responseFilePathCandidates: null,
     trustedHeadSha: '',
   }
 }

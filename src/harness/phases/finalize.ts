@@ -7,6 +7,7 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
+import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {createErrorInfo, createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
@@ -30,6 +31,8 @@ const PROVIDER_AUTH_SET_FAILED_MESSAGE =
 
 const FILE_READ_FAILURE_FALLBACK_ACTION =
   'The agent execution failed before it could write a response artifact, so no response was delivered.'
+const FILE_READ_FAILURE_AFTER_SUCCESS_ACTION =
+  'The agent execution completed, but the response artifact was not found at the expected path, so no response was delivered.'
 
 const BROKERED_PUSH_ERROR_MESSAGE = 'Brokered push delivery failed. The model response was not posted.'
 const BROKERED_PUSH_ERROR_ACTION = 'Review the workflow logs and retry the run.'
@@ -60,8 +63,8 @@ function isResolvedCommentTarget(target: CommentTarget): boolean {
   return target.number > 0 && target.owner.length > 0 && target.repo.length > 0
 }
 
-function formatFileReadFailureFallback(): string {
-  return FILE_READ_FAILURE_FALLBACK_ACTION
+function formatFileReadFailureFallback(executionSucceeded: boolean): string {
+  return executionSucceeded === true ? FILE_READ_FAILURE_AFTER_SUCCESS_ACTION : FILE_READ_FAILURE_FALLBACK_ACTION
 }
 
 function failWithPrimaryExecutionError(execution: ExecutePhaseResult): number {
@@ -212,6 +215,7 @@ export async function runFinalize(
       agentContext: routing.agentContext,
       triggerResult: routing.triggerResult,
       responseFilePath: bootstrap.responseFilePath,
+      responseFilePathCandidates: bootstrap.responseFilePathCandidates ?? undefined,
       executionSucceeded: execution.success,
     }
     const responsePrecheck = await readAndParseResponseFile(responseFileParams, responsePostLogger)
@@ -307,6 +311,7 @@ export async function runFinalize(
         triggerResult: routing.triggerResult,
         botLogin: routing.botLogin,
         responseFilePath: bootstrap.responseFilePath,
+        responseFilePathCandidates: bootstrap.responseFilePathCandidates ?? undefined,
         ...(deliveryFooter == null ? {} : {deliveryFooter}),
       }
 
@@ -314,19 +319,26 @@ export async function runFinalize(
     }
 
     if (result.delivered === false) {
-      if (result.reason === 'file-read-failed' && execution.success === false && execution.commentsPosted === 0) {
-        const commentTarget = resolveCommentTarget(routing)
-        if (isResolvedCommentTarget(commentTarget)) {
-          await postErrorComment(routing, commentTarget, formatFileReadFailureFallback(), metrics, logger)
-        } else {
-          logger.warning('Cannot post missing-response fallback comment: missing target context')
+      if (result.reason === 'file-read-failed') {
+        if (execution.success === false && execution.commentsPosted === 0) {
+          const commentTarget = resolveCommentTarget(routing)
+          if (isResolvedCommentTarget(commentTarget)) {
+            await postErrorComment(routing, commentTarget, formatFileReadFailureFallback(false), metrics, logger)
+          } else {
+            logger.warning('Cannot post missing-response fallback comment: missing target context')
+          }
+
+          return failWithPrimaryExecutionError(execution)
         }
 
-        return failWithPrimaryExecutionError(execution)
+        if (execution.success === true) {
+          core.setFailed(formatFileReadFailureFallback(true))
+          return 1
+        }
       }
 
       core.setFailed(
-        `Failed to deliver the agent's response from ${bootstrap.responseFilePath}: ${result.reason} — ${result.detail}`,
+        `Failed to deliver the agent's response from ${path.dirname(bootstrap.responseFilePath)}: ${result.reason} — ${result.detail}`,
       )
       return 1
     }
