@@ -202,6 +202,16 @@
       allowedVersions: '<=1.3.14',
     },
     {
+      // Keep @types/node on the major the code actually runs on. Every runtime
+      // surface is Node 24 — `using: node24` in action.yaml, node:24 in both
+      // deploy Dockerfiles, and node-version 24 in harness-release. Newer types
+      // describe a stdlib none of them have, and type-checking against them
+      // succeeds by construction, so CI cannot catch the mismatch. Raise this
+      // together with the runtime, not ahead of it.
+      matchPackageNames: ['@types/node'],
+      allowedVersions: '<25',
+    },
+    {
       // Let release-pipeline packages settle before they reach the release job. A
       // broken same-day publish (e.g. semantic-release 25.0.4 shipped a missing
       // @semantic-release/core import) would otherwise break Perform Release before
