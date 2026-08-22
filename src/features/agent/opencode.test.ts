@@ -369,6 +369,45 @@ describe('executeOpenCode', () => {
     expect(result.success).toBe(true)
   })
 
+  it('rejects permission asks through the v1 SDK route with the execution directory', async () => {
+    // #given — the real executeOpenCode responder is wired to a permission ask in the SDK event stream
+    const executionDirectory = envUtils.getGitHubWorkspace()
+    const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({data: true})
+    const mockClient = {
+      ...createMockClient({
+        promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+        events: [
+          createCurrentTurnActivityEvent(),
+          {
+            type: 'permission.asked',
+            properties: {
+              id: 'permission-123',
+              sessionID: 'ses_123',
+              permission: 'bash',
+              patterns: ['ls'],
+            },
+          } as unknown as Event,
+          {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+        ],
+      }),
+      postSessionIdPermissionsPermissionId,
+    }
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then — query.directory is load-bearing: without it, the v1 reply route returns 200 but silently no-ops.
+    expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledExactlyOnceWith({
+      path: {id: 'ses_123', permissionID: 'permission-123'},
+      body: {response: 'reject'},
+      query: {directory: executionDirectory},
+      signal: expect.any(AbortSignal) as AbortSignal,
+    })
+    expect(result.success).toBe(true)
+  })
+
   it('creates session and sends prompt', async () => {
     // #given
     const mockClient = createMockClient({

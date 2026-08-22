@@ -336,6 +336,7 @@ export async function processEventStream(
       continue
     }
 
+    // Permission handling must run before this guard; an ask on an unarmed turn would otherwise be skipped and hang.
     if (activityTracker?.currentTurnArmed === false) continue
 
     if (activityTracker != null && isStreamActivityEvent(eventType)) {
