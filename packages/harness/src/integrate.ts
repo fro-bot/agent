@@ -6,6 +6,9 @@
  * provenance, final-tree validation, and the late push boundary. A merge conflict
  * is returned as a typed boundary for the conflict-resolver unit; this module does
  * not invoke a model to perform deterministic work.
+ * Production release runs pass --candidate and bypass this pipeline; conflict
+ * repair there is prompt-driven. The resolver also fails closed without the
+ * workflow-unset HARNESS_BROKER_AUTH_JSON; see prompt.txt:38.
  */
 
 import type {ConflictResolutionRequest, ConflictResolverResult} from './conflict-resolver.js'
@@ -29,7 +32,7 @@ import {
   sourcesFromCarryManifest,
 } from './sources.js'
 
-/** Driver deadline: leaves the workflow backstop time to record a named failure and upload evidence. */
+/** Used only by runIntegration, which production --candidate runs bypass. */
 export const DEFAULT_INTEGRATION_PIPELINE_TIMEOUT_MS = 75 * 60 * 1000
 /** Git command deadline: generous for a large hosted-runner clone/fetch, short enough to fail a wedged process. */
 export const GIT_SUBPROCESS_TIMEOUT_MS = 10 * 60 * 1000
@@ -77,7 +80,7 @@ export interface IntegrationConfig {
   readonly agent?: string
   readonly model?: string
   readonly opencodeBin?: string
-  /** Short-lived broker-minted model auth JSON, supplied via HARNESS_BROKER_AUTH_JSON when set. */
+  /** Used only by the non-candidate conflict-resolver path; --candidate never consumes it. */
   readonly brokerAuthJson?: string
   readonly runnerTempDir?: string
   readonly promptPath?: string
@@ -175,7 +178,7 @@ export interface IntegrationAdapters {
   readonly createBranch: (workDir: string, branch: string, tag: string) => Promise<void>
   /** Run one deterministic no-ff merge. Conflicts are returned, not thrown. */
   readonly mergeRef: (workDir: string, mergeRef: string) => Promise<MergeOutcome>
-  /** Resolve one actual merge conflict in a disposable broker-scoped checkout. */
+  /** Resolve one actual merge conflict; only runIntegration's non-candidate path invokes this. */
   readonly resolveConflict?: (request: ConflictResolutionRequest) => Promise<ConflictResolverResult>
   /** Stage only the validated regular-file conflict paths. */
   readonly stagePaths?: (workDir: string, paths: readonly string[]) => Promise<void>
@@ -256,7 +259,7 @@ function isValidIntegrationRefRecord(value: unknown): value is IntegrationRefRec
   return true
 }
 
-/** Type guard for complete, non-partial integration provenance. */
+/** Type guard used by the non-candidate pipeline; candidate finalization does not validate manifests here. */
 export function isValidProvenanceManifest(value: unknown): value is ProvenanceManifest {
   if (!isRecord(value)) return false
   if (typeof value.baseVersion !== 'string' || value.baseVersion.length === 0) return false
@@ -268,7 +271,7 @@ export function isValidProvenanceManifest(value: unknown): value is ProvenanceMa
   return true
 }
 
-/** Reads a complete manifest, returning null for missing or malformed data. */
+/** Reads a complete manifest for the non-candidate pipeline; candidate finalization only writes it. */
 export async function readProvenanceManifest(dir: string): Promise<ProvenanceManifest | null> {
   const manifestPath = path.join(dir, MANIFEST_FILENAME)
   try {
@@ -1106,6 +1109,8 @@ function validateManifest(
  * A clean merge never crosses the model boundary. A conflict returns before
  * squash/build so U6 can own the bounded contextual repair contract. Artifact
  * packaging and the credentialed trusted push are owned by the command layer.
+ * Production --candidate runs bypass this pipeline; its conflict branch is
+ * test-covered but not production-reachable.
  */
 async function runIntegrationPipeline(
   config: IntegrationConfig,
@@ -1403,6 +1408,10 @@ async function runIntegrationPipeline(
   return {ok: true, manifest: persistedManifest, dryRun, pushed: false, conflictDiagnostics}
 }
 
+/**
+ * Not reached by production release runs: --candidate routes to
+ * finalizeCandidateIntegration before this path. Its conflict branch remains test-covered.
+ */
 export async function runIntegration(
   config: IntegrationConfig,
   adapters: IntegrationAdapters,
