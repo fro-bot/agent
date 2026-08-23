@@ -176,6 +176,8 @@ Release narratives are shallow reformats of commit subjects (e.g. v0.92.1) becau
 
 - [ ] **Unit 5: Docs + live verification**
 
+Open: verification evidence is a live release dry-run, so it leaves no tree artifact to confirm. The narration flow itself ships and is documented in `AGENTS.md`.
+
 **Goal:** Update operational docs and prove the pipeline on a real tag without mutating a real release incorrectly.
 
 **Requirements:** R4, R5, R8
