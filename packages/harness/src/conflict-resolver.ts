@@ -6,6 +6,10 @@
  * filesystem is never artifact authority: code extracts only validated bytes
  * from the declared conflict paths, then applies those bytes to the real
  * integration merge state.
+ *
+ * This resolver is not reached by production release runs: --candidate routes
+ * around runIntegration, HARNESS_BROKER_AUTH_JSON is unset by workflows, and
+ * production conflict repair is prompt-driven; see prompt.txt:38.
  */
 
 import {execFile} from 'node:child_process'
@@ -29,6 +33,7 @@ export const HARNESS_GIT_IDENTITY = [
   'user.email=fro-bot[bot]@users.noreply.github.com',
 ] as const
 
+// Resolver-only limits; production --candidate never invokes resolveConflict.
 export const MAX_CONFLICT_RESOLUTION_ATTEMPTS = 2
 export const MAX_CONFLICT_FILE_BYTES = 1_048_576
 export const MAX_CONFLICT_PAYLOAD_BYTES = 4 * 1_048_576
@@ -231,6 +236,7 @@ function permissionRules(workDir: string, allowedPaths: readonly string[]): Reco
 /**
  * Build the smallest OpenCode config used by the resolver.
  * Object insertion order is intentional: OpenCode resolves last-match-wins.
+ * Not reached in production: --candidate bypasses the pipeline that invokes this resolver config.
  */
 export function buildConflictResolverConfig(
   workDir: string,
@@ -280,7 +286,7 @@ interface BuildEnvironmentOptions {
   readonly sourceLabel: string
 }
 
-/** Build env without copying provider keys or the caller's OpenCode config. */
+/** Resolver-only environment assembly; production --candidate never invokes it. */
 export function buildConflictResolverEnv(options: BuildEnvironmentOptions): NodeJS.ProcessEnv {
   const result = buildRuntimeEnv(options.source)
   // Model turns use the private attempt sandbox as HOME.
@@ -699,7 +705,13 @@ function failure(
   return {ok: false, attempts, error, diagnostics}
 }
 
-/** Resolves one merge conflict with at most two fresh disposable attempts. */
+/**
+ * Resolves one merge conflict with at most two fresh disposable attempts.
+ *
+ * Not reached in production: --candidate bypasses runIntegration, and the
+ * workflow never supplies HARNESS_BROKER_AUTH_JSON, so this entrypoint fails
+ * closed without it. Production repair is prompt-driven; see prompt.txt:38.
+ */
 export async function resolveConflict(
   request: ConflictResolutionRequest,
   options: ConflictResolverOptions = {},
