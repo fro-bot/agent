@@ -1,9 +1,6 @@
 # Bun Migration — Spike Findings (Phase 1)
 
-**Date:** 2026-06-23
-**Branch:** `feat/pnpm-to-bun-migration`
-**Plan:** `docs/plans/2026-06-23-001-refactor-pnpm-to-bun-migration-plan.md`
-**Bun version:** 1.3.14
+**Date:** 2026-06-23 **Branch:** `feat/pnpm-to-bun-migration` **Plan:** `docs/plans/2026-06-23-001-refactor-pnpm-to-bun-migration-plan.md` **Bun version:** 1.3.14
 
 ## Decision: GO (with one new work item folded in)
 
@@ -12,6 +9,7 @@ The migration is viable. Every blocker has a confirmed path. One finding (notice
 ## Sub-spike: Bun-native notice collector — PROVEN
 
 A `bun.lock`-based collector was built and verified to reproduce the committed attribution. Independent verification (name-level set comparison against `dist/THIRD_PARTY_NOTICES.txt`):
+
 - **Zero committed package names missing** — all 214 committed packages present in the Bun-native output.
 - 6 genuinely-new names (`anynum`, `buffers`, `eastasianwidth`, `get-east-asian-width`, `is-unsafe` — transitive deps of version-bumped packages — plus `yaml`, the gateway phantom dep added this branch).
 - Version-level differences are pure drift (newer versions resolved in `bun.lock` vs the days-old committed pnpm file), not a collector defect.
@@ -23,7 +21,7 @@ The collector is the load-bearing cutover unit and is now de-risked.
 ## Blocker resolution (each yes/no with evidence)
 
 | Item | Result | Evidence |
-|------|--------|----------|
+| --- | --- | --- |
 | U1 `bun install` | ✅ GREEN | 1874 packages installed, exit 0; `bun.lock` (310 KB text, 1264 entries) created; `node_modules/@fro-bot/runtime` symlinks correctly to the workspace package. |
 | U1 config relocation | ✅ GREEN | `workspaces` + `trustedDependencies` + `overrides` in `package.json`, `bunfig.toml` for `minimumReleaseAge`, `pnpm-workspace.yaml` deleted — install clean. |
 | U1 `trustedDependencies` / simple-git-hooks | ✅ GREEN | `simple-git-hooks` postinstall fired (skipped via env in spike) with no isolated-layout ENOENT crash. |

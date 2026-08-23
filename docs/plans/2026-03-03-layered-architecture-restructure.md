@@ -1,6 +1,11 @@
-# Layered Architecture Restructure — Implementation Plan
+---
+title: "Layered Architecture Restructure — Implementation Plan"
+type: refactor
+status: done
+date: 2026-03-03
+---
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+# Layered Architecture Restructure — Implementation Plan
 
 **Goal:** Restructure the codebase from a flat `lib/` layout into a four-layer architecture (`shared/` → `services/` → `features/` → `harness/`) while deduplicating code and splitting all oversized files under 200 LOC.
 
@@ -8,7 +13,7 @@
 
 **Tech Stack:** TypeScript, ESM-only (.js extensions), Vitest, tsdown, pnpm
 
-**Design doc:** `docs/plans/2026-03-03-layered-architecture-restructure-design.md`
+**Design doc:** `docs/decisions/2026-03-03-layered-architecture-restructure-design.md`
 
 ---
 

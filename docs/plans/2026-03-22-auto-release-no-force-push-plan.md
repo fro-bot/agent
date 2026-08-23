@@ -1,6 +1,11 @@
-# Auto Release No-Force-Push Implementation Plan
+---
+title: "Auto Release No-Force-Push Implementation Plan"
+type: feat
+status: done
+date: 2026-03-22
+---
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+# Auto Release No-Force-Push Implementation Plan
 
 **Goal:** Eliminate force-pushes to the protected `release` branch by making `next` the only disposable synthetic branch and publishing only from a merged `next -> release` PR.
 
