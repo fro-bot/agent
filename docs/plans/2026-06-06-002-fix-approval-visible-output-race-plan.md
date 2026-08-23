@@ -1,7 +1,7 @@
 ---
 title: "fix: Resolve gateway approval/status visible-output race in timeout classification"
 type: fix
-status: completed
+status: done
 date: 2026-06-06
 completed: 2026-06-06
 ---

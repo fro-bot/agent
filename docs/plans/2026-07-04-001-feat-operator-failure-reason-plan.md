@@ -1,7 +1,7 @@
 ---
 title: 'feat: expose sanitized operator failure reason on the run status contract'
 type: feat
-status: active
+status: done
 date: 2026-07-04
 deepened: 2026-07-04
 ---
@@ -84,7 +84,7 @@ A dashboard-launched run can end `failed` while the gateway knows the sanitized 
 
 ## Implementation Units
 
-- [ ] **Unit 1: Contract type + allowlist mapping**
+- [x] **Unit 1: Contract type + allowlist mapping**
 
 **Goal:** Define `OperatorFailureKind` and the closed `RunCoreErrorKind → OperatorFailureKind` allowlist gate; export from the contract barrel. No projection changes yet.
 
@@ -112,7 +112,7 @@ A dashboard-launched run can end `failed` while the gateway knows the sanitized 
 
 **Verification:** the mapping is total over `RunCoreErrorKind`, falls back to `'unknown'` for everything else, and reads no other detail.
 
-- [ ] **Unit 2: Populate both projections + closed-DTO tests**
+- [x] **Unit 2: Populate both projections + closed-DTO tests**
 
 **Goal:** Add `failureKind?` to `OperatorRunStatus` and `RunSummary`, populate it (FAILED-only) in both projectors and the SSE copy-through, and update the closed-DTO guards.
 
@@ -144,7 +144,7 @@ A dashboard-launched run can end `failed` while the gateway knows the sanitized 
 
 > Write-path caveat (deepen/#1109): these tests use populated run-state fakes and prove only the *reader*. The write is proven in Unit 3's end-to-end scenario — do not treat a green Unit 2 as evidence production populates the field.
 
-- [ ] **Unit 3: Persist the failure kind on the in-flight FAILED transition**
+- [x] **Unit 3: Persist the failure kind on the in-flight FAILED transition**
 
 **Goal:** Classify the in-flight run failure and write it to run-state so the projections (Unit 2) can read it.
 
@@ -174,7 +174,7 @@ A dashboard-launched run can end `failed` while the gateway knows the sanitized 
 
 **Verification:** the FAILED transition persists the classified kind; a full inactivity-timeout path surfaces the sanitized reason on the operator contract with no raw detail leak.
 
-- [ ] **Unit 4: Pre-ACK workspace-unreachable coverage**
+- [x] **Unit 4: Pre-ACK workspace-unreachable coverage**
 
 **Goal:** Surface `workspace-unreachable` for pre-ACK workspace-startup failures; leave other pre-ACK failures without a `failureKind`.
 

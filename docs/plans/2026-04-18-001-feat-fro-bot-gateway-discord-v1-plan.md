@@ -9,6 +9,8 @@ revised: 2026-06-01 (Units 5-6 reconciled; remote-attach MVP) / 2026-05-20 (Unit
 review_coverage: full (coherence + feasibility + scope-guardian, 3 reviewers)
 ---
 
+Open: Unit 8 remains; `docs/SETUP.md`, `docs/KNOWN-LIMITS.md`, and `docs/OPERATIONS.md` are absent.
+
 # feat: Fro Bot Gateway — Discord-first action-taking agent (v1)
 
 ## Overview

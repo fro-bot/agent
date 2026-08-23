@@ -1,7 +1,7 @@
 ---
 title: "feat: Inert SSE run-observation core (Unit 4a)"
 type: feat
-status: completed
+status: done
 date: 2026-06-19
 deepened: 2026-06-19
 completed: 2026-06-19

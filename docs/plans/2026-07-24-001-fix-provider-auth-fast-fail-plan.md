@@ -1,7 +1,7 @@
 ---
 title: "fix: Fail fast on model-provider authentication failures"
 type: fix
-status: completed
+status: done
 date: 2026-07-24
 deepened: 2026-07-24
 ---

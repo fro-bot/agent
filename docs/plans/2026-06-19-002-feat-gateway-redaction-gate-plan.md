@@ -1,7 +1,7 @@
 ---
 title: "feat: Gateway metadata/repos.yaml redaction gate (denylist-before-query)"
 type: feat
-status: completed
+status: done
 date: 2026-06-19
 completed: 2026-06-19
 origin: https://github.com/fro-bot/agent/issues/950 (Fro Bot triage comment as requirements)

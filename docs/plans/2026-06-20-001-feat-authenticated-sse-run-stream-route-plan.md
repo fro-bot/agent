@@ -1,7 +1,7 @@
 ---
 title: "feat: Authenticated SSE run-stream route (Unit 4b)"
 type: feat
-status: completed
+status: done
 date: 2026-06-20
 deepened: 2026-06-20
 completed: 2026-06-20

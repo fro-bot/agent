@@ -8,6 +8,8 @@ origin: docs/brainstorms/2026-07-11-remove-agent-github-credential-requirements.
 issue: fro-bot/agent#1167
 ---
 
+Open: Unit 6 remains; `detectArtifacts` and `detectArtifactsFromMessageParts` still have six occurrences in `src/features/agent/streaming.ts`, although affected-flow delivery uses the response file.
+
 # fix: Remove the agent's GitHub credential for comment/review flows
 
 ## Overview

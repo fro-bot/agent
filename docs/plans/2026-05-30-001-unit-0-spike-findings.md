@@ -1,6 +1,6 @@
 ---
 title: Unit 0 spike findings — remote-attach streaming + bearer-token proxy
-status: complete
+status: done
 date: 2026-05-30
 plan: docs/plans/2026-05-30-001-feat-gateway-unit-6-mention-loop-plan.md
 verdict: GO

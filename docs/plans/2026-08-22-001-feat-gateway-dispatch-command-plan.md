@@ -1,7 +1,7 @@
 ---
 title: "feat: /fro-bot dispatch — trigger Action runs from Discord"
 type: feat
-status: active
+status: done
 date: 2026-08-22
 origin: docs/brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md
 ---
@@ -114,7 +114,7 @@ The Discord mapping must use an exhaustive `switch` with a `const exhaustiveChec
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add scoped workflow-dispatch capability to the GitHub App client**
+- [x] **Unit 1: Add scoped workflow-dispatch capability to the GitHub App client**
 
 **Files:** modify `packages/gateway/src/github/app-client.ts`, `packages/gateway/src/github/app-client.test.ts`.
 
@@ -128,7 +128,7 @@ Extend the App client with a dispatch-specific authorization path. Keep ordinary
 - Token minting or discovery fails → returns a safe auth error without logging credentials.
 - Ordinary `authForRepo` with `contents: read` → remains successful without requiring Actions write.
 
-- [ ] **Unit 2: Implement the typed GitHub workflow-dispatch adapter**
+- [x] **Unit 2: Implement the typed GitHub workflow-dispatch adapter**
 
 **Files:** create `packages/gateway/src/github/dispatch.ts` and `packages/gateway/src/github/dispatch.test.ts`.
 
@@ -147,7 +147,7 @@ Create the gateway-level dispatch primitive. It resolves the binding's owner/rep
 - Successful request payload inspection → confirms the ref is the resolved default branch, inputs contain only `prompt`, and `correlation-id` is never sent.
 - `200` response with a malformed or missing nested `workflow_run` → returns `dispatch-rejected` rather than fabricating a run link.
 
-- [ ] **Unit 3: Wire `/fro-bot dispatch`, program injection, and deployment documentation**
+- [x] **Unit 3: Wire `/fro-bot dispatch`, program injection, and deployment documentation**
 
 **Files:** create `packages/gateway/src/discord/commands/dispatch.ts` and `packages/gateway/src/discord/commands/dispatch.test.ts`; modify `packages/gateway/src/discord/commands/fro-bot.ts`, `packages/gateway/src/discord/commands/fro-bot.test.ts`, `packages/gateway/src/discord/commands/index.test.ts`, `packages/gateway/src/program.ts`, `packages/gateway/src/program.test.ts`, and `deploy/README.md`.
 

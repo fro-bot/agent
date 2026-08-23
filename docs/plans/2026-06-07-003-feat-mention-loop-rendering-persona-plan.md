@@ -1,7 +1,7 @@
 ---
 title: "feat: Mention-loop clean rendering + Discord persona (Phase 1)"
 type: feat
-status: completed
+status: done
 date: 2026-06-07
 origin: docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md
 deepened: 2026-06-07
