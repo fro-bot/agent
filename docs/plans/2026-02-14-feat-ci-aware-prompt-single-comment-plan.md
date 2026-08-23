@@ -1,12 +1,11 @@
 ---
 title: "feat: CI-Aware Agent Prompt with Single Comment Output"
 type: feat
+status: done
 date: 2026-02-14
 ---
 
 # CI-Aware Agent Prompt with Single Comment Output
-
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 ## Overview
 

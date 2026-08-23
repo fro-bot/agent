@@ -1,6 +1,11 @@
-# Prompt Builder Audit Implementation Plan
+---
+title: "Prompt Builder Audit Implementation Plan"
+type: feat
+status: done
+date: 2026-02-14
+---
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+# Prompt Builder Audit Implementation Plan
 
 **Goal:** Add context-aware, trigger-specific PR review directives and output contracts to the prompt builder, including new context flags for reviewer-requested and collaborator status.
 

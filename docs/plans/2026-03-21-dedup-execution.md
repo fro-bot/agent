@@ -1,6 +1,11 @@
-# Execution Deduplication Implementation Plan
+---
+title: "Execution Deduplication Implementation Plan"
+type: feat
+status: done
+date: 2026-03-21
+---
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+# Execution Deduplication Implementation Plan
 
 **Goal:** Prevent redundant agent invocations when multiple PR/issue events fire for the same entity within a short window (e.g., `synchronize` followed by `review_requested`).
 
