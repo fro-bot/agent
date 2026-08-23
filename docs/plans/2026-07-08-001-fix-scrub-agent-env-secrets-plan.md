@@ -1,7 +1,7 @@
 ---
 title: "fix: scrub raw secrets from the OpenCode agent environment"
 type: fix
-status: active
+status: done
 date: 2026-07-08
 ---
 
@@ -80,7 +80,7 @@ The leak vector is confirmed from a downstream consumer's run artifact (see #114
 
 ## Implementation Units
 
-- [ ] **Unit 1: Env allowlist filter helper**
+- [x] **Unit 1: Env allowlist filter helper**
 
 **Goal:** A pure, tested helper that takes an environment record and returns a filtered copy containing only allowlisted keys (deny-by-default), dropping all secret-shaped vars.
 
@@ -108,7 +108,7 @@ The leak vector is confirmed from a downstream consumer's run artifact (see #114
 
 **Verification:** Filter returns only allowlisted keys; every token/secret-shaped key (incl. any `GITHUB_*` secret) is absent; `OPENCODE_CONFIG_CONTENT` is retained.
 
-- [ ] **Unit 2: Scope the env scrub to the OpenCode spawn (snapshot → scrub → spawn → restore)**
+- [x] **Unit 2: Scope the env scrub to the OpenCode spawn (snapshot → scrub → spawn → restore)**
 
 **Goal:** At each `createOpencode` call, `process.env` is temporarily reduced to the allowlisted set so the synchronously-spawned child captures a clean env, then `process.env` is restored so the harness keeps its full env (S3 `AWS_*`, proxy vars, etc.). The model's bash never inherits `GH_TOKEN`/`GITHUB_TOKEN`; the harness's own later phases (cache save/restore) are unaffected.
 
@@ -141,7 +141,7 @@ The leak vector is confirmed from a downstream consumer's run artifact (see #114
 - Restore `process.env` in `afterEach` (snapshot in `beforeEach`) so tests don't leak.
 **Verification:** Inside `withScrubbedEnv`'s `fn`, `process.env` provably lacks `GH_TOKEN`/`GITHUB_TOKEN` (test fails otherwise) while `OPENCODE_CONFIG_CONTENT` is retained; after it resolves (or throws), `process.env` is fully restored including `AWS_*`; both `server.ts` and `execution.ts` seams wrap their `createOpencode` call.
 
-- [ ] **Unit 3: Off-environment `gh` authentication**
+- [x] **Unit 3: Off-environment `gh` authentication**
 
 **Goal:** `gh` is authenticated for the model's bash via a persisted config in a temp `GH_CONFIG_DIR`, not via `GH_TOKEN` in the child env — so delegated `gh` works with the raw token scrubbed.
 

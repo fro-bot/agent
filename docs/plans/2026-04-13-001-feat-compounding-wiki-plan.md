@@ -1,7 +1,7 @@
 ---
 title: "feat: Add compounding project wiki maintained by Fro Bot"
 type: feat
-status: completed
+status: done
 date: 2026-04-13
 origin: docs/brainstorms/2026-04-13-compounding-wiki-requirements.md
 deepened: 2026-04-13

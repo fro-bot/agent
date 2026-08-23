@@ -1,7 +1,7 @@
 ---
 title: "fix: recoverable ContextOverflowError for the PR review session"
 type: fix
-status: active
+status: done
 date: 2026-08-03
 origin: docs/brainstorms/2026-08-03-review-session-overflow-recovery-requirements.md
 deepened: 2026-08-03
@@ -101,7 +101,7 @@ Key research reframe (see origin R4): the overflow comes from the **continued se
 
 ## Implementation Units
 
-- [ ] **Unit 1: Classify `ContextOverflowError` distinctly**
+- [x] **Unit 1: Classify `ContextOverflowError` distinctly**
 
 **Goal:** Produce a distinct `context_overflow` `ErrorInfo` when the session emits `ContextOverflowError`, at the same streaming boundary that already classifies auth/quota.
 
@@ -134,7 +134,7 @@ Key research reframe (see origin R4): the overflow comes from the **continued se
 
 **Verification:** A `ContextOverflowError` session event yields a distinct `context_overflow` `ErrorInfo`; auth/quota/generic classification unchanged.
 
-- [ ] **Unit 2: Session primitives — archive, resolver eligibility fix, prior-work exclusion**
+- [x] **Unit 2: Session primitives — archive, resolver eligibility fix, prior-work exclusion**
 
 **Goal:** Provide the three session-layer mechanisms recovery needs: archive a session so it is never re-continued, make the resolver pick the eligible (non-archived) same-title session, and exclude a session from prior-work search.
 
@@ -170,7 +170,7 @@ Key research reframe (see origin R4): the overflow comes from the **continued se
 
 **Verification:** Archiving a session makes `resolveSessionForLogicalKey` skip it; a newer archived same-title session no longer masks an eligible fresh one; `searchSessions` can exclude a given session and is unchanged when the option is omitted.
 
-- [ ] **Unit 3: Phase-level recovery orchestration (bounded single restart)**
+- [x] **Unit 3: Phase-level recovery orchestration (bounded single restart)**
 
 **Goal:** On a classified overflow, archive the overflowed session and restart the review once — from a fresh, bounded session-prep — within the same run and the same execution budget; bound to exactly one restart.
 
@@ -209,7 +209,7 @@ Key research reframe (see origin R4): the overflow comes from the **continued se
 
 **Verification:** An overflowing review run recovers in-run without admin override; the second overflow fails cleanly; the second attempt shares the original budget; a delivered overflow attempt never double-posts; non-overflow errors are unaffected.
 
-- [ ] **Unit 4: Suppress ENOENT cascade + surface the recovery marker**
+- [x] **Unit 4: Suppress ENOENT cascade + surface the recovery marker**
 
 **Goal:** Stop the confusing `failed to read response file … ENOENT` secondary on session-error failures, and make overflow recovery visible in the run output, without regressing the #1252 fallback.
 

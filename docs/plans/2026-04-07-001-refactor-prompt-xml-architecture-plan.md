@@ -1,7 +1,7 @@
 ---
 title: "refactor: Migrate prompt structure to XML-tagged architecture"
 type: refactor
-status: completed
+status: done
 date: 2026-04-07
 origin: docs/brainstorms/2026-04-07-prompt-xml-architecture-requirements.md
 deepened: 2026-04-07

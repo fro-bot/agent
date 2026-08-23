@@ -1,7 +1,7 @@
 ---
 title: "feat: Durable S3-compatible object storage as canonical persistence backend"
 type: feat
-status: completed
+status: done
 date: 2026-04-15
 deepened: 2026-04-15
 origin: docs/brainstorms/2026-04-15-durable-object-storage-requirements.md

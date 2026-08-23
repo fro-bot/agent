@@ -1,7 +1,7 @@
 ---
 title: "feat: Brokered push for trusted same-repo mention runs"
 type: feat
-status: active
+status: done
 date: 2026-07-30
 deepened: 2026-07-30
 origin: docs/brainstorms/2026-07-30-brokered-push-trusted-mention-requirements.md
@@ -133,7 +133,7 @@ finalize: after outputs/summary
 
 ## Implementation Units
 
-- [ ] **Unit 1: Extend the delegated commit primitive for deletions and regular-file mode policy**
+- [x] **Unit 1: Extend the delegated commit primitive for deletions and regular-file mode policy**
 
 **Goal:** `createCommit` can remove files and enforces regular-file-only entries, so a reconstructed change set writes a correct, safe tree.
 
@@ -164,7 +164,7 @@ finalize: after outputs/summary
 
 **Verification:** deletions and modifications co-exist in one commit; non-regular entries rejected; existing add/modify tests still pass; `force:false` preserved.
 
-- [ ] **Unit 2: Change-reconstruction bridge (workspace → FileChange[])**
+- [x] **Unit 2: Change-reconstruction bridge (workspace → FileChange[])**
 
 **Goal:** Turn the net difference between the checked-out workspace and the trusted head SHA into a validated `FileChange[]` (adds, modifies, deletes), branch- and history-agnostic, trusting no local git metadata.
 
@@ -199,7 +199,7 @@ finalize: after outputs/summary
 
 **Verification:** correct `FileChange[]` for add/modify/delete regardless of the model's local git state; non-regular entries rejected; clean "nothing to deliver" on no difference; no reliance on local git config for target/base.
 
-- [ ] **Unit 3: Brokered-push allowlist validation**
+- [x] **Unit 3: Brokered-push allowlist validation**
 
 **Goal:** A brokered-push-specific validation that admits only allowlisted product/docs/test paths, on top of the existing size/sensitive rules — without touching global `validateFiles`.
 
@@ -231,7 +231,7 @@ finalize: after outputs/summary
 
 **Verification:** only allowlisted paths pass; global delegated-commit behavior unchanged.
 
-- [ ] **Unit 4: Brokered-push authorization + target derivation gate**
+- [x] **Unit 4: Brokered-push authorization + target derivation gate**
 
 **Goal:** A gate that decides, from trusted event context and live GitHub state only, whether a brokered push is allowed and what branch it targets — with an event-time early filter and a delivery-time live check.
 
@@ -263,7 +263,7 @@ finalize: after outputs/summary
 
 **Verification:** admits exactly the trusted same-repo PR case with live write permission and a matching live head; every other context bypasses or fails per policy, using only event-derived + live GitHub state.
 
-- [ ] **Unit 5a: Brokered-push finalize state machine**
+- [x] **Unit 5a: Brokered-push finalize state machine**
 
 **Goal:** finalize runs the brokered-push decision for the eligible surface and returns a typed outcome, with precise sequencing against existing branches and no response mutation yet.
 
@@ -298,7 +298,7 @@ finalize: after outputs/summary
 
 **Verification:** each state yields the correct typed outcome and the push is attempted only in the precise eligible+successful state.
 
-- [ ] **Unit 5b: Single-response composition**
+- [x] **Unit 5b: Single-response composition**
 
 **Goal:** Fold the push outcome into exactly one response — model reply plus push footer on success, one error comment on fail-loud — preserving one-response-per-run.
 
@@ -326,7 +326,7 @@ finalize: after outputs/summary
 
 **Verification:** one response in every outcome; success reports the branch and paths; failures never post the model's "fixed it" reply.
 
-- [ ] **Unit 6: Workflow + docs**
+- [x] **Unit 6: Workflow + docs**
 
 **Goal:** Supply the trusted head SHA to the action and document the trusted-push behavior.
 
