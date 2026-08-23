@@ -36,6 +36,9 @@ export function validatePlanFrontmatter(documents: readonly PlanFrontmatterDocum
       continue
     }
 
+    // Deliberately not a YAML parser: every required field is a simple scalar on its own line.
+    // A value containing a line-anchored `---`, or a folded/block scalar, would end the block
+    // early or be skipped — reported as a missing field rather than passing silently.
     const remainder = document.content.slice(opening[0].length)
     const closing = /\r?\n---(?:\r?\n|$)/.exec(remainder)
     if (closing == null) {
