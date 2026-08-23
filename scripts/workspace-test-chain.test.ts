@@ -44,6 +44,8 @@ function packageHasTestScript(packageJson: PackageJson): boolean {
   return typeof scripts.test === 'string'
 }
 
+// Assumes the chain's uniform `bun run --filter <name> test` shape. A variant such as
+// `--filter <name> run test`, or a flag between the name and `test`, reads as missing.
 function referencesPackageTest(rootTestScript: string, name: string): boolean {
   const tokens = rootTestScript.trim().split(/\s+/)
   for (let index = 0; index < tokens.length; index += 1) {
