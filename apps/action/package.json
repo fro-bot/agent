@@ -10,7 +10,7 @@
     "check-types": "bunx tsc --noEmit -p ../../tsconfig.json",
     "fix": "bunx eslint --fix ../../src ../../scripts ../../tsdown.config.ts ../../eslint.config.ts",
     "lint": "bunx eslint ../../src ../../scripts ../../evals ../../tsdown.config.ts ../../eslint.config.ts",
-    "test": "bunx vitest run --root ../.. src"
+    "test": "bunx vitest run --root ../.. --dir ../../src"
   },
   "dependencies": {
     "@fro-bot/runtime": "workspace:*"

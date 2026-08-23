@@ -519,6 +519,9 @@ export async function cmdIntegrate(
   _packageArtifact: typeof packageArtifact = packageArtifact,
   logger: IntegrateLogger = silentIntegrateLogger,
 ): Promise<number> {
+  // Legacy conflict-resolver input. Production always uses --candidate, so it
+  // is not consumed; workflows never set it, and the resolver fails closed
+  // without it. Production conflict repair is prompt-driven; see prompt.txt:38.
   const brokerAuthJson = process.env.HARNESS_BROKER_AUTH_JSON
   delete process.env.HARNESS_BROKER_AUTH_JSON
 
@@ -588,6 +591,8 @@ export async function cmdIntegrate(
       conflictModelTimeoutMs: config.dryRun === true ? DEFAULT_DRY_RUN_CONFLICT_MODEL_TIMEOUT_MS : undefined,
     })
     if (flags.candidate) {
+      // Production release path: --candidate bypasses runIntegration and its
+      // code-owned conflict resolver. Conflict repair happens in prompt.txt:38 and :87.
       const result = await finalizeCandidateIntegration(config, outPath, adapters, _packageArtifact, logger)
       if (result.ok === true) return 0
       console.error(`[integrate] ${result.error}`)
