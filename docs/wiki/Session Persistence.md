@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-08-09"
-updated-by: "c006768"
+last-updated: "2026-08-24"
+updated-by: "ses_fd0b1eaf4ffeTMI146lECk0yxc"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
@@ -57,6 +57,8 @@ On restore, the cache module performs several safety checks:
 
 Cache saves happen twice: once during the cleanup phase of the main step, and again in the post-action hook (`post.ts`). The post-action hook exists because GitHub Actions may kill the main step's `finally` block, and losing cache would mean losing all session history.
 
+A save that does not actually persist is now reported as a failure rather than a false success. `@actions/cache` swallows both write denials and reservation collisions internally, returning a `-1` sentinel instead of throwing, so an earlier `saveCache` would log "Cache saved" milliseconds after the platform refused the write and then set the state flag telling the post-action there was nothing left to do. The module now branches on that sentinel at every save site and returns a non-persisted result — the library cannot tell a policy denial from a benign key collision once it has hidden the error, so a collision is treated as a failure too rather than continuing to mask real ones. Reporting the denial honestly is what re-enables the post-action retry that the false success had been suppressing, and it is the session-side counterpart to the tools-cache write-failure handling described in [[Setup and Configuration]]. This matters most for read-only cache tokens: a run that cannot write the Actions cache relies on the object store for continuity, so its cache write must fail loudly rather than pretend to succeed.
+
 Before saving, `saveCache` in `src/services/cache/save.ts` checks whether there is anything worth caching — but this check is subtler than "is the storage directory non-empty." Recent OpenCode versions persist sessions in an `opencode.db` SQLite file in the _parent_ of the storage directory, not inside it, so a naive empty-directory check would skip the save on every real run. The guard therefore also treats any non-empty SQLite DB-family file (`opencode.db`, `opencode.db-wal`, `opencode.db-shm`) as evidence of cacheable content. The WAL file matters specifically: because server shutdown kills the process without awaiting a checkpoint, a valid session can leave `opencode.db` at zero bytes with all data still in the `-wal` file, so any one non-empty member of the family is sufficient to proceed with the save.
 
 ## Object Store (S3 Backup)
@@ -79,7 +81,7 @@ The implementation lives in `packages/runtime/src/object-store/` and consists of
 
 The object store hooks into the cache layer at two points:
 
-1. **On restore** — If the GitHub Actions cache misses or is corrupted, `restoreCache` in `src/services/cache/restore.ts` calls `syncSessionsFromStore` as a fallback. A successful S3 restore reports `source: 'storage'` in the `CacheResult` (vs. `source: 'cache'` for an Actions cache hit).
+1. **On restore** — When the object store is configured, `restoreCache` in `src/services/cache/restore.ts` consults it **before** the Actions cache, not merely as a miss-time fallback. This ordering exists because some runs — mention-triggered runs in particular — cannot write the Actions cache, so their own state only ever lands in the object store; their successful S3 upload was invisible to a restore that took any cache hit first, including a stale prefix-fallback hit from an unrelated earlier run, leaving them to start cold every time. Consulting durable storage first lets the most recent real session win. A store hit still requires the main session database — sidecar WAL/SHM files alone remain a miss, as with the cache path — and the downloaded storage is validated the same way a cache restore is. A store failure or a disabled store falls through to the cache path unchanged, so the behavior is inert until durable storage is configured. A successful S3 restore reports `source: 'storage'` in the `CacheResult` (vs. `source: 'cache'` for an Actions cache hit).
 
 2. **On save** — After the normal Actions cache save, `saveCache` in `src/services/cache/save.ts` calls `syncSessionsToStore` to write the session database to S3. This write-through approach means S3 always has a recent copy.
 
