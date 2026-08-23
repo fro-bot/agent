@@ -23,6 +23,7 @@ vi.mock('./discord/commands/index.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./discord/commands/index.js')>()
   return {
     ...actual,
+    getCommandRegistry: vi.fn(actual.getCommandRegistry),
     registerSlashCommands: vi.fn().mockResolvedValue(undefined),
   }
 })
@@ -117,7 +118,9 @@ vi.mock('./web/operator-push/subscription-store.js', async importOriginal => {
 
 const {makeDiscordClientFromConfig, makeGatewayProgram, makeLogger} = await import('./program.js')
 const {createDiscordClient} = await import('./discord/client.js')
+const {getCommandRegistry} = await import('./discord/commands/index.js')
 const createDiscordClientSpy = vi.mocked(createDiscordClient)
+const getCommandRegistrySpy = vi.mocked(getCommandRegistry)
 
 const stubLogger: GatewayLogger = {
   debug: vi.fn(),
@@ -550,6 +553,28 @@ describe('makeGatewayProgram', () => {
     expect(callOrder).toContain('runProviderSelfTest')
     expect(callOrder).toContain('login')
     expect(callOrder.indexOf('runProviderSelfTest')).toBeLessThan(callOrder.indexOf('login'))
+  })
+
+  it('constructs and injects the workflow dispatch primitive into the command registry', async () => {
+    // #given — a bootable gateway with no announce server required
+    const fakeConfig = makeFakeConfig({announce: undefined})
+    const fakeClient = makeFakeClient()
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: vi.fn(),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — program wiring passes a callable dispatcher without using module-global state
+    expect(getCommandRegistrySpy).toHaveBeenCalledOnce()
+    const commandDeps = getCommandRegistrySpy.mock.calls[0]?.[0] as {dispatchWorkflow?: unknown} | undefined
+    expect(typeof commandDeps?.dispatchWorkflow).toBe('function')
   })
 
   it('boot fails fast when provider self-test rejects', async () => {

@@ -9,12 +9,14 @@
  * - `add-project` — bind a GitHub repo to a Discord channel
  * - `clear-queue` — drop pending queued tasks for the invoking channel
  * - `force-release-lock` — dead-run-verified force-release of a stuck per-repo lock
+ * - `dispatch` — ask GitHub Actions to run the fixed repository workflow
  */
 
 import type {CoordinationConfig, ForceReleaseStaleLockResult} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RunTask} from '../../execute/run.js'
+import type {DispatchWorkflow} from '../../github/dispatch.js'
 import type {CoordinationLogger} from '../../runtime-effect.js'
 import type {GatewayLogger} from '../client.js'
 import type {AddProjectDeps} from './add-project.js'
@@ -26,6 +28,7 @@ import {Effect} from 'effect'
 import {editInteraction} from '../io.js'
 import {userIsAuthorized} from '../mentions.js'
 import {executeAddProject} from './add-project.js'
+import {buildDispatchSpec} from './dispatch.js'
 import {INTERNAL_ERROR_COPY, makeGuildCommand} from './guild-command.js'
 import {executePing} from './ping.js'
 
@@ -75,6 +78,8 @@ export interface FroBotDeps extends AddProjectDeps {
     identity: string,
     logger: CoordinationLogger,
   ) => Effect.Effect<ForceReleaseStaleLockResult, Error>
+  /** GitHub Actions dispatch primitive, constructed once in program.ts. */
+  readonly dispatchWorkflow: DispatchWorkflow
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +123,12 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
         .setDescription(
           'Force-release a stuck per-repo coordination lock (dead-run-verified; requires ManageChannels)',
         ),
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('dispatch')
+        .setDescription('Ask GitHub Actions to run the repository workflow')
+        .addStringOption(opt => opt.setName('task').setDescription('Task to send to the Action').setRequired(true)),
     ) as SlashCommandBuilder
 
   // Build pipeline executors once per factory call, closing over deps.
@@ -295,6 +306,16 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
     deps,
   )
 
+  const executeDispatchCommand = makeGuildCommand(
+    {
+      name: 'dispatch',
+      ...buildDispatchSpec(deps),
+      denialCopy: 'You are not authorized to dispatch tasks here.',
+      serverOnlyCopy: 'This command can only be used in a server.',
+    },
+    deps,
+  )
+
   const execute = (interaction: ChatInputCommandInteraction): Effect.Effect<void, Error> => {
     const subcommand = interaction.options.getSubcommand(true)
 
@@ -312,6 +333,10 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
 
     if (subcommand === 'force-release-lock') {
       return executeForceReleaseLock(interaction)
+    }
+
+    if (subcommand === 'dispatch') {
+      return executeDispatchCommand(interaction)
     }
 
     return Effect.fail(new Error(`Unknown subcommand: ${subcommand}`))

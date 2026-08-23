@@ -218,7 +218,7 @@ When a new optional secret is added to `compose.yaml` in the future, add a row h
 
 ## GitHub App
 
-The gateway uses a GitHub App to authenticate against repositories. This is required for the `/add-project` command and any feature that reads repository content.
+The gateway uses a GitHub App to authenticate against repositories. This is required for the `/add-project` command, `/fro-bot dispatch`, and any feature that reads repository content.
 
 ### Creating the App
 
@@ -226,6 +226,7 @@ The gateway uses a GitHub App to authenticate against repositories. This is requ
 2. Set the App name, homepage URL, and webhook URL (webhook is not used by the gateway — set it to any valid URL).
 3. Under **Permissions → Repository permissions**, grant:
    - **Contents**: Read-only (minimum required)
+   - **Actions**: Read and write (required for `/fro-bot dispatch`)
    - Grant only the minimum permissions needed. Over-privileged installations produce a `WARN` log entry at runtime but do not block operation. Under-privileged installations fail fast at `/add-project` time with a clear error message.
 4. Disable **Webhook** (the gateway does not receive webhooks from GitHub).
 5. Click **Create GitHub App**.
@@ -255,8 +256,18 @@ The gateway auto-discovers the installation ID at runtime — you do not need to
 
 ### Permission behaviour
 
-- **Under-privileged** (e.g. `contents: none`): the gateway returns an error at `/add-project` time with a message naming the missing permissions and a link to the installation settings page.
+- **Under-privileged** (e.g. `contents: none` or missing `actions: write`): the gateway returns an error with a link to the installation settings page. `/fro-bot dispatch` specifically requires `Actions: write`.
 - **Over-privileged** (e.g. `contents: write` when only `read` is required): the gateway logs a `WARN` entry listing the over-privileged scopes but does not block the request. Operators should review and reduce permissions to the minimum needed.
+
+### Dispatching an Action run
+
+In a channel bound with `/fro-bot add-project`, an authorized member can request an Action run with:
+
+```text
+/fro-bot dispatch task:<task>
+```
+
+The gateway dispatches the fixed `.github/workflows/fro-bot.yaml` workflow on the repository's default branch and replies with GitHub's accepted run link. Acceptance does not mean the run has completed successfully; GitHub Actions may still skip or fail it, including when another surface holds the repository lock.
 
 ## Operator OAuth (Web Surface)
 

@@ -51,6 +51,7 @@ function makeFakeAppClient(octokit: {request: ReturnType<typeof vi.fn>}): AppCli
   }
   return {
     authForRepo: vi.fn().mockResolvedValue({success: true, data: authResult}),
+    authForWorkflowDispatch: vi.fn(),
     getRepoIdentity: vi.fn().mockResolvedValue({success: false, error: new Error('not used')}),
     invalidateCache: vi.fn(),
   }
@@ -60,6 +61,7 @@ function makeFakeAppClient(octokit: {request: ReturnType<typeof vi.fn>}): AppCli
 function makeFakeFailingAppClient(error: Error): AppClient {
   return {
     authForRepo: vi.fn().mockResolvedValue({success: false, error}),
+    authForWorkflowDispatch: vi.fn(),
     getRepoIdentity: vi.fn().mockResolvedValue({success: false, error: new Error('not used')}),
     invalidateCache: vi.fn(),
   }

@@ -830,6 +830,8 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 - [ ] **Unit 7: Cloud dispatch + summaries bridge**
 
+**Superseded by [2026-08-22-001-feat-gateway-dispatch-command-plan.md](2026-08-22-001-feat-gateway-dispatch-command-plan.md).** The design below predates the operator web surface, the object-store key builder, run-state coordination, and the release-notes narration flow that gave `correlation-id` its current meaning; several of its file paths and premises are no longer accurate. The command is now `/fro-bot dispatch`. Dispatch acceptance is scoped as Unit 7A; completion notification and the summaries bridge are deferred there with reasons. The box stays unchecked because the work has not shipped — read the superseding plan, not the design below.
+
 **Goal:** Implement `/fro-bot cloud <task>` to dispatch the Action via `workflow_dispatch` with a typed schema. Write the summaries bridge: Action writes a condensed summary to `summaries/` prefix; gateway reads it when users ask about prior Action work.
 
 **Requirements:** R3 (summaries bridge), R4 (cloud dispatch), S4 + S7 (cross-surface context)
