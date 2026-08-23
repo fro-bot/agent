@@ -1,7 +1,7 @@
 ---
 title: 'feat: Skip PR reviews via opt-out label'
 type: feat
-status: active
+status: done
 date: 2026-07-16
 origin: docs/brainstorms/2026-07-15-skip-agent-review-label-requirements.md
 ---

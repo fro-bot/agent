@@ -1,7 +1,7 @@
 ---
 title: "fix: Reconcile PR review approval event when the agent delivers a verdict as a comment"
 type: fix
-status: completed
+status: done
 date: 2026-06-06
 completed: 2026-06-06
 ---

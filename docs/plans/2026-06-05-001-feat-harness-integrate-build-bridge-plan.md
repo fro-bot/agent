@@ -1,7 +1,7 @@
 ---
 title: "feat: Harness integrate→build bridge via CI artifact handoff"
 type: feat
-status: completed
+status: done
 date: 2026-06-05
 ---
 

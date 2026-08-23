@@ -1,7 +1,7 @@
 ---
 title: "refactor: Shared guild-command pipeline (makeGuildCommand)"
 type: refactor
-status: completed
+status: done
 date: 2026-06-10
 deepened: 2026-06-10
 completed: 2026-06-10

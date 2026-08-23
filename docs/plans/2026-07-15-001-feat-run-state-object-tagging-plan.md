@@ -1,7 +1,7 @@
 ---
 title: "feat: Tag run-state objects for S3 lifecycle retention"
 type: feat
-status: active
+status: done
 date: 2026-07-15
 issue: https://github.com/fro-bot/agent/issues/1192
 depth: standard

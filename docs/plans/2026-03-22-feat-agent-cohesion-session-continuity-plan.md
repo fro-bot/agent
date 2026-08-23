@@ -1,7 +1,7 @@
 ---
 title: "feat: Agent Cohesion via Deterministic Session Continuity"
 type: feat
-status: completed
+status: done
 date: 2026-03-22
 origin: docs/brainstorms/2026-03-22-agent-cohesion-session-context-brainstorm.md
 shipped: 2026-03-22 onward (buildLogicalKey + deterministic 'fro-bot: {key}' titles + session continuation are in packages/runtime/src/session/logical-key.ts and src/harness/phases/session-prep.ts)
