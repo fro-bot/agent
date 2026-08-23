@@ -1,7 +1,7 @@
 ---
 title: 'Native session tools: always-on session_list/read/search/info'
 status: done
-created: 2026-07-13
+date: 2026-07-13
 issue: https://github.com/fro-bot/agent/issues/1188
 requirements: none (issue #1188 + operator directive are the requirements)
 type: feat
