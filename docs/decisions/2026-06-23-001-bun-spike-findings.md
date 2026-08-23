@@ -1,6 +1,9 @@
 # Bun Migration — Spike Findings (Phase 1)
 
-**Date:** 2026-06-23 **Branch:** `feat/pnpm-to-bun-migration` **Plan:** `docs/plans/2026-06-23-001-refactor-pnpm-to-bun-migration-plan.md` **Bun version:** 1.3.14
+- **Date:** 2026-06-23
+- **Branch:** `feat/pnpm-to-bun-migration`
+- **Plan:** `docs/plans/2026-06-23-001-refactor-pnpm-to-bun-migration-plan.md`
+- **Bun version:** 1.3.14
 
 ## Decision: GO (with one new work item folded in)
 
