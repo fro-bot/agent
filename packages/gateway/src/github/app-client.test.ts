@@ -68,6 +68,14 @@ interface InstallationAuthCallArg {
   readonly type: string
   readonly repositoryNames?: string[]
   readonly permissions?: Record<string, string>
+  readonly request?: {readonly signal?: AbortSignal}
+}
+
+function makeAbortedTimeout(): {readonly signal: AbortSignal; readonly restore: () => void} {
+  const controller = new AbortController()
+  controller.abort(new Error('workflow dispatch timeout'))
+  const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(controller.signal)
+  return {signal: controller.signal, restore: () => timeoutSpy.mockRestore()}
 }
 
 function getInstallationCalls(): InstallationAuthCallArg[] {
@@ -120,6 +128,9 @@ describe('createAppClient', () => {
     expect(result.data.installationId).toBe(99)
     expect(result.data.token).toBe('installation-token-value')
     expect(result.data.octokit).toBeDefined()
+    const [installationCallArg] = getInstallationCalls()
+    expect(installationCallArg?.repositoryNames).toEqual(['repo'])
+    expect(installationCallArg?.permissions).toEqual({contents: 'read'})
   })
 
   it('happy path: second call for same (owner, repo) reuses cached installationId', async () => {
@@ -313,6 +324,142 @@ describe('createAppClient', () => {
       expect(arg.repositoryNames).toEqual(['myrepo'])
       expect(arg.permissions).toEqual({contents: 'read'})
     }
+  })
+
+  describe('authForWorkflowDispatch', () => {
+    it('bounds installation discovery with an abort signal', async () => {
+      // #given — the discovery request is aborted by the workflow-dispatch timeout
+      const timeout = makeAbortedTimeout()
+      let receivedSignal: AbortSignal | undefined
+      mockRequest.mockImplementation(async (_route: string, options: InstallationAuthCallArg) => {
+        receivedSignal = options.request?.signal
+        throw timeout.signal.reason
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+      // #when
+      const result = await client.authForWorkflowDispatch('myorg', 'myrepo')
+
+      // #then
+      expect(receivedSignal).toBe(timeout.signal)
+      expect(result.success).toBe(false)
+      if (result.success === true) return
+      expect(result.error).toBeInstanceOf(AuthError)
+      timeout.restore()
+    })
+
+    it('bounds installation token minting with an abort signal', async () => {
+      // #given — discovery succeeds but installation-token minting is aborted
+      const timeout = makeAbortedTimeout()
+      let receivedSignal: AbortSignal | undefined
+      mockRequest.mockResolvedValue({data: {id: 99, permissions: {contents: 'read', actions: 'write'}}})
+      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
+        if (options.type === 'app') return {token: 'jwt-token-value'}
+        receivedSignal = options.request?.signal
+        throw timeout.signal.reason
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+      // #when
+      const result = await client.authForWorkflowDispatch('myorg', 'myrepo')
+
+      // #then
+      expect(receivedSignal).toBe(timeout.signal)
+      expect(result.success).toBe(false)
+      if (result.success === true) return
+      expect(result.error).toBeInstanceOf(AuthError)
+      timeout.restore()
+    })
+
+    it('returns a repository-scoped dispatch client when Actions: write is granted', async () => {
+      // #given — the installation grants the ordinary contents permission and Actions: write
+      mockRequest.mockResolvedValue({data: {id: 99, permissions: {contents: 'read', actions: 'write'}}})
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+      // #when
+      const result = await client.authForWorkflowDispatch('myorg', 'myrepo')
+
+      // #then — dispatch auth succeeds and the token is scoped to this repository with only Actions: write
+      expect(result.success).toBe(true)
+      expect(getInstallationCalls()).toHaveLength(1)
+      const [installationCallArg] = getInstallationCalls()
+      expect(installationCallArg?.repositoryNames).toEqual(['myrepo'])
+      expect(installationCallArg?.permissions).toEqual({actions: 'write'})
+    })
+
+    it('returns InsufficientPermissionsError with the install URL when Actions: write is missing', async () => {
+      // #given — the installation has contents:read but no Actions:write
+      mockRequest
+        .mockResolvedValueOnce({data: {id: 99, permissions: {contents: 'read'}}})
+        .mockResolvedValueOnce({data: {id: 99, permissions: {contents: 'read', actions: 'write'}}})
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+      // #when
+      const result = await client.authForWorkflowDispatch('myorg', 'myrepo')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success === true) return
+      expect(result.error).toBeInstanceOf(InsufficientPermissionsError)
+      if (result.error instanceof InsufficientPermissionsError === false) return
+      expect(result.error.message).toContain('actions: write')
+      expect(result.error.installUrl).toBe(INSTALL_URL)
+      expect(getInstallationCalls()).toHaveLength(0)
+
+      // #when — the installation is fixed and the capability is requested again
+      const retry = await client.authForWorkflowDispatch('myorg', 'myrepo')
+
+      // #then — the unusable permission result was not cached
+      expect(retry.success).toBe(true)
+      expect(mockRequest).toHaveBeenCalledTimes(2)
+    })
+
+    it('returns AppNotInstalledError with the install URL when dispatch auth cannot find an installation', async () => {
+      // #given
+      mockRequest.mockRejectedValueOnce(Object.assign(new Error('Not Found'), {status: 404}))
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+      // #when
+      const result = await client.authForWorkflowDispatch('myorg', 'myrepo')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success === true) return
+      expect(result.error).toBeInstanceOf(AppNotInstalledError)
+      if (result.error instanceof AppNotInstalledError === false) return
+      expect(result.error.installUrl).toBe(INSTALL_URL)
+    })
+
+    it('returns a safe AuthError when dispatch token minting fails', async () => {
+      // #given
+      mockRequest.mockResolvedValue({data: {id: 99, permissions: {contents: 'read', actions: 'write'}}})
+      mockAuth.mockImplementation(async ({type}: {type: string}) => {
+        if (type === 'app') return {token: 'jwt-token-value'}
+        throw new Error('installation token mint failed')
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+      // #when
+      const result = await client.authForWorkflowDispatch('myorg', 'myrepo')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success === true) return
+      expect(result.error).toBeInstanceOf(AuthError)
+      expect(result.error.message).not.toContain('installation-token-value')
+    })
+
+    it('does not require Actions: write for ordinary repository auth', async () => {
+      // #given — the ordinary installation permission remains contents:read only
+      mockRequest.mockResolvedValue({data: {id: 99, permissions: {contents: 'read'}}})
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('myorg', 'myrepo')
+
+      // #then
+      expect(result.success).toBe(true)
+    })
   })
 
   it('security: repositoryNames uses the repo name, not the owner/repo path', async () => {

@@ -1,5 +1,6 @@
 import type {CoordinationConfig} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction} from 'discord.js'
+import type {DispatchWorkflow} from '../../github/dispatch.js'
 import type {FroBotDeps} from './fro-bot.js'
 
 import {Routes} from 'discord.js'
@@ -22,6 +23,7 @@ function makeMockDeps(): FroBotDeps {
     },
     appClient: {
       authForRepo: vi.fn(),
+      authForWorkflowDispatch: vi.fn(),
       getRepoIdentity: vi.fn(),
       invalidateCache: vi.fn(),
     },
@@ -62,6 +64,7 @@ function makeMockDeps(): FroBotDeps {
       success: true,
       data: {outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null},
     }),
+    dispatchWorkflow: vi.fn<DispatchWorkflow>(),
   }
 }
 
