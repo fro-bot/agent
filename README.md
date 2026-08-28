@@ -109,7 +109,7 @@ The agent supports seven event types:
 
 Comment and issue triggers are gated by author association — only `OWNER`, `MEMBER`, and `COLLABORATOR` are processed. Bot accounts are ignored to prevent loops, and fork pull requests are skipped. The full guard expressions, per-trigger behavior, and minimum permissions live in [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
 
-Trusted same-repository, non-fork PR mentions on `issue_comment` from `OWNER`, `MEMBER`, or `COLLABORATOR` can broker a fix commit directly to the PR head branch. Brokered pushes are limited to allowlisted product, docs, and test paths; config, scripts, and CI files are excluded. Keep checkout `persist-credentials: false` as shown in the example.
+Trusted same-repository, non-fork PR mentions on `issue_comment` from `OWNER`, `MEMBER`, or `COLLABORATOR` can broker a fix commit directly to the PR head branch. Brokered pushes are limited to allowlisted product, docs, and test paths; config, scripts, and CI files are excluded. Use `brokered-push-extra-paths` to opt into additional comma-separated relative path prefixes when a consumer repository keeps product code elsewhere. The default is empty. Protected surfaces remain hard-denied at parse and enforcement time; do not include secrets or execution surfaces such as CI, scripts, manifests, lockfiles, Dockerfiles, or `.git/`. Keep checkout `persist-credentials: false` as shown in the example.
 
 ### Comment examples
 
@@ -160,6 +160,7 @@ A few inputs most workflows touch:
 - **`timeout`** — OpenCode execution timeout in milliseconds; governs the Action's internal execution deadline only, not the whole GitHub Actions job. Default `1800000` (30 minutes); `0` disables the Action-internal execution deadline. Set the job's `timeout-minutes` as the whole-job/process backstop, with headroom beyond this value for setup, fallback response delivery, and cleanup.
 - **`response-mode`** — `github` (default) posts exactly one comment or review; `none` suppresses all GitHub writes and uses the run log as the response surface.
 - **`enable-omo`** / **`enable-omo-slim`** — opt into extended orchestration (mutually exclusive).
+- **`brokered-push-extra-paths`** — optional comma-separated relative path prefixes to add to the brokered-push allowlist; defaults to empty. Protected surfaces are hard-denied regardless of this opt-in. Do not stage secrets or execution surfaces.
 
 <details>
 <summary><strong>All inputs</strong></summary>
@@ -197,6 +198,7 @@ A few inputs most workflows touch:
 | `dedup-window` | No | `600000` | Skip a run if the agent already ran for the same PR/issue within this window (ms); `0` disables |
 | `response-mode` | No | `github` | `github` posts one comment/review; `none` suppresses all GitHub writes |
 | `review-skip-label` | No | `skip-agent-review` | PR label that suppresses automatic PR-event reviews (case-insensitive); authorized mentions and review requests naming the bot still run; empty disables |
+| `brokered-push-extra-paths` | No | Empty | Comma-separated relative path prefixes added to brokered pushes; protected surfaces remain hard-denied; do not include secrets or execution surfaces |
 
 **Outputs**
 

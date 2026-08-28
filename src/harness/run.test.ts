@@ -117,6 +117,7 @@ function createBootstrap(): BootstrapPhaseResult {
       dedupWindow: 0,
       responseMode: 'github',
       reviewSkipLabel: null,
+      brokeredPushExtraPaths: [],
     },
     logger: createLogger({phase: 'test'}),
     opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},

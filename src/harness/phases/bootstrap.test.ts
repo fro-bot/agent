@@ -75,6 +75,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     dedupWindow: 0,
     responseMode: 'github',
     reviewSkipLabel: null,
+    brokeredPushExtraPaths: [],
     storeConfig: {
       enabled: false,
       bucket: '',
