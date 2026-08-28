@@ -123,7 +123,7 @@ Issue #1489. Two defects in practice: a trusted maintainer's requested change si
 
 ## Implementation Units
 
-- [ ] **Unit 1: Input — parse, normalize, validate `brokered-push-extra-paths`**
+- [x] **Unit 1: Input — parse, normalize, validate `brokered-push-extra-paths`**
 
 **Goal:** A consumer can supply comma-separated path prefixes; malformed or overlap-denied values fail the run at parse time.
 
@@ -151,7 +151,7 @@ Issue #1489. Two defects in practice: a trusted maintainer's requested change si
 
 **Verification:** invalid input fails the run before any phase executes; `README.md` documents the input, its default, and the hard-deny guarantee.
 
-- [ ] **Unit 2: Structured failure taxonomy in the brokered-push outcome**
+- [x] **Unit 2: Structured failure taxonomy in the brokered-push outcome**
 
 **Goal:** Finalize can distinguish failure classes and access offending paths without parsing strings.
 
@@ -174,7 +174,7 @@ Issue #1489. Two defects in practice: a trusted maintainer's requested change si
 
 **Verification:** no call site inspects `reason` text to branch on failure kind.
 
-- [ ] **Unit 3: Merged allowlist enforcement**
+- [x] **Unit 3: Merged allowlist enforcement**
 
 **Goal:** Extra prefixes widen `validateBrokeredPushFiles()` at segment boundaries; the shared floor and default behavior are untouched.
 
@@ -200,7 +200,7 @@ Issue #1489. Two defects in practice: a trusted maintainer's requested change si
 
 **Verification:** existing brokered-push validation tests pass unmodified; widened delivery works end-to-end in the feature test.
 
-- [ ] **Unit 4: Failure comment specificity in finalize**
+- [x] **Unit 4: Failure comment specificity in finalize**
 
 **Goal:** The PR comment names the failure class; validation rejections name offending paths, truncated and scrubbed.
 
