@@ -1,7 +1,7 @@
 ---
 title: "feat: add Gateway-owned operator push notifications"
 type: feat
-status: active
+status: done
 date: 2026-07-08
 deepened: 2026-07-09
 origin: "fro-bot/dashboard:docs/brainstorms/2026-07-08-operator-push-notifications-requirements.md"

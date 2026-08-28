@@ -7,7 +7,7 @@ origin: docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md
 deepened: 2026-05-30
 ---
 
-> **Status: done.** All 6 units shipped: the Unit 0 remote-attach spike (verdict GO, `docs/plans/2026-05-30-001-unit-0-spike-findings.md`), the workspace-agent OpenCode SDK server lifecycle, the gateway remote-attach client + execution orchestrator, the Discord streaming sink, mention → execution wiring with run-state lifecycle + lock, and startup stale-run recovery — verified on `main` (`packages/gateway/src/execute/recovery.ts`, PR #705). The deferred UX/approval/queue layers (reactions, working-message heartbeat, approvals, per-thread queue, extra slash commands) shipped separately in the follow-up plans this reconciliation also marks done.
+> **Status: done.** All 6 units shipped: the Unit 0 remote-attach spike (verdict GO, `docs/decisions/2026-05-30-001-unit-0-spike-findings.md`), the workspace-agent OpenCode SDK server lifecycle, the gateway remote-attach client + execution orchestrator, the Discord streaming sink, mention → execution wiring with run-state lifecycle + lock, and startup stale-run recovery — verified on `main` (`packages/gateway/src/execute/recovery.ts`, PR #705). The deferred UX/approval/queue layers (reactions, working-message heartbeat, approvals, per-thread queue, extra slash commands) shipped separately in the follow-up plans this reconciliation also marks done.
 
 # Gateway Unit 6 MVP — `@fro-bot` Mention → OpenCode Interaction Loop
 
@@ -304,7 +304,7 @@ events arriving when `directory` is threaded through `event.subscribe`. This gat
 - Create (throwaway/spike, not shipped): a minimal harness script under `packages/gateway/` that boots
   an OpenCode server in one process (simulating the workspace), attaches from another via `baseURL`,
   sends a trivial prompt against a fixture directory, and logs every event kind received.
-- Produce a named go/no-go artifact: `docs/plans/2026-05-30-001-unit-0-spike-findings.md` (a short
+- Produce a named go/no-go artifact: `docs/decisions/2026-05-30-001-unit-0-spike-findings.md` (a short
   checklist: did text deltas arrive? did a `session.next.tool.*` event arrive? did `session.idle`
   arrive? can the client send a custom `Authorization` header on HTTP AND SSE? — each ✅/❌ with the
   observed event kinds + the header-injection mechanism). This artifact is the green-light contract

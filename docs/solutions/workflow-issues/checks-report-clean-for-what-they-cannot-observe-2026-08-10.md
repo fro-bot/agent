@@ -109,6 +109,7 @@ Total 9 packages affected by 24 known vulnerabilities (1 Critical, 13 High, 10 M
 ## Related
 
 - [A gate that cannot fail manufactures confidence](non-failing-gates-are-worse-than-no-gates-2026-08-07.md) — the adjacent failure mode. That doc covers gates where _no reachable input can turn them red_; this one covers gates that can fail but observe a narrower population than they appear to. A gate can be perfectly capable of failing and still be blind.
+- [A present signal is not evidence of the effect it implies](verify-behavior-not-signal-2026-08-23.md) — the mirror image. This doc covers checks that saw too little; that one covers cases where the thing was fully observed and the wrong property of it was read — a present request field, a correct path string, a symbol count — taken as proof of an effect none of them establish.
 - [Verify the signal before implementing the plan](evidence-first-scope-correction-under-incomplete-signals-2026-08-08.md) — verifying a premise before building on it.
 - [Trustworthy agent eval corpus design](../best-practices/deterministic-agent-outcome-eval-corpus-2026-08-09.md) — where the self-referential baseline was fixed.
 - [Machine-readable advisory data over prose](../best-practices/machine-checked-advisory-ranges-and-version-floors-2026-08-10.md) — the dependency triage that followed from this coverage gap.

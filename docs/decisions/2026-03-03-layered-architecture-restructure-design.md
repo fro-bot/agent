@@ -27,12 +27,12 @@ src/
 
 ### Layer Rules
 
-| Layer            | May Import From            | Must NOT Import From              |
-| ---------------- | -------------------------- | --------------------------------- |
-| `shared/`        | nothing                    | services, features, harness |
-| `services/`      | shared                     | features, harness           |
-| `features/`      | shared, services           | harness                     |
-| `harness/` | shared, services, features | —                                 |
+| Layer       | May Import From            | Must NOT Import From        |
+| ----------- | -------------------------- | --------------------------- |
+| `shared/`   | nothing                    | services, features, harness |
+| `services/` | shared                     | features, harness           |
+| `features/` | shared, services           | harness                     |
+| `harness/`  | shared, services, features | —                           |
 
 ### Concrete Structure
 
@@ -140,13 +140,13 @@ src/
 
 ## Deduplication Strategy
 
-| Current Duplication                                 | Resolution                                               |
-| --------------------------------------------------- | -------------------------------------------------------- |
+| Current Duplication                                 | Resolution                                         |
+| --------------------------------------------------- | -------------------------------------------------- |
 | `parseOmoProviders()` in `inputs.ts` and `setup.ts` | Single source in `harness/config/omo-providers.ts` |
-| `VALID_OMO_PROVIDERS` array in both files           | Same — canonical location in `omo-providers.ts`          |
-| `parseSetupInputs()` re-reading `core.getInput()`   | `setup.ts` receives `ActionInputs` parameter             |
-| `setup.ts` raw cache restore (lines 318-340)        | Remove entirely; use `services/cache/restore.ts`         |
-| Cache key component construction × 3                | Factory function in `services/cache/cache-key.ts`        |
+| `VALID_OMO_PROVIDERS` array in both files           | Same — canonical location in `omo-providers.ts`    |
+| `parseSetupInputs()` re-reading `core.getInput()`   | `setup.ts` receives `ActionInputs` parameter       |
+| `setup.ts` raw cache restore (lines 318-340)        | Remove entirely; use `services/cache/restore.ts`   |
+| Cache key component construction × 3                | Factory function in `services/cache/cache-key.ts`  |
 
 ## File Splits
 
