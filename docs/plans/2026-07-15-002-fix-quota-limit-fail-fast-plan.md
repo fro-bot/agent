@@ -1,7 +1,7 @@
 ---
 title: "fix: Fail fast on provider quota exhaustion"
 type: fix
-status: active
+status: done
 date: 2026-07-15
 issue: https://github.com/fro-bot/agent/issues/1206
 depth: deep
@@ -555,7 +555,7 @@ The diagram expresses intended boundaries, not exact method signatures.
   - **Verification:** Finalization tests assert response count, bound surface, failure status, and no duplicate
     delivery.
 
-- [ ] **Unit 7: Verify and release**
+- [x] **Unit 7: Verify and release**
   - **Goal:** Prove the exact production failure mode is fixed and ship through the normal Action release process.
   - **Requirements:** R1 through R11
   - **Dependencies:** Units 1 and 3 through 6. Unit 2 is skipped/no-op.

@@ -1,7 +1,7 @@
 ---
 title: "feat: Mention-loop operator commands — /fro-bot force-release-lock + run reactions"
 type: feat
-status: completed
+status: done
 date: 2026-06-09
 deepened: 2026-06-09
 completed: 2026-06-09

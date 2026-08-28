@@ -1,12 +1,14 @@
 ---
 title: "fix: Remove the agent's GitHub credential for comment/review flows"
 type: fix
-status: active
+status: done
 date: 2026-07-11
 deepened: 2026-07-11
 origin: docs/brainstorms/2026-07-11-remove-agent-github-credential-requirements.md
 issue: fro-bot/agent#1167
 ---
+
+Open: Unit 7's documentation landed, but its verification evidence is a live run against a real PR and issue, so it leaves no tree artifact to confirm.
 
 # fix: Remove the agent's GitHub credential for comment/review flows
 
@@ -113,7 +115,7 @@ bootstrap: resolveResponseDelivery(eventName, responseMode) -> { delivery, crede
 
 ## Implementation Units
 
-- [ ] **Unit 1: Two-axis delivery resolver (single source of truth, in runtime)**
+- [x] **Unit 1: Two-axis delivery resolver (single source of truth, in runtime)**
 
 **Goal:** `resolveResponseDelivery(eventName, responseMode) → {delivery, credential}` — one decision consumed by the credential gate, prompt builder, and finalize.
 
@@ -136,7 +138,7 @@ bootstrap: resolveResponseDelivery(eventName, responseMode) -> { delivery, crede
 - Edge case (the trap): `pull_request` + `responseMode:'none'` → `{delivery:'none', credential:'withhold'}` (credential still withheld).
 - Edge case: exhaustiveness guard trips for an unhandled event name (compile-time).
 
-- [ ] **Unit 2: Response-file — out-of-checkout path helper, strict schema, validating reader**
+- [x] **Unit 2: Response-file — out-of-checkout path helper, strict schema, validating reader**
 
 **Goal:** One module owning the run-scoped `$RUNNER_TEMP` path and a strict parse/validate returning `{body, verdict?}`.
 
@@ -159,7 +161,7 @@ bootstrap: resolveResponseDelivery(eventName, responseMode) -> { delivery, crede
 - Security (R3): file with `number: 999` / `repo: other/x` / `surface:` / any unknown key → hard error; result never carries a target field; a body containing "PASS"/"approved" prose with `verdict: request-changes` → parsed verdict is `request-changes` (body never consulted).
 - Error path: missing/empty → typed error; malformed frontmatter → error; verdict on a comment surface → error; unknown verdict value → error; oversize body → error.
 
-- [ ] **Unit 3: Credential suppression (BOTH token-write sites) — [ATOMIC CUTOVER with Units 4-5]**
+- [x] **Unit 3: Credential suppression (BOTH token-write sites) — [ATOMIC CUTOVER with Units 4-5]**
 
 **Goal:** For affected triggers, withhold the token everywhere the child can read it; unchanged for autonomous triggers.
 
@@ -183,7 +185,7 @@ bootstrap: resolveResponseDelivery(eventName, responseMode) -> { delivery, crede
 - Security: with `persist-credentials:false`, `.git/config` has no extraheader/embedded token for affected flows (assert); a fixture with an extraheader fails the preflight.
 - Regression (R6): #1147 env-scrub still holds.
 
-- [ ] **Unit 4: Response Protocol prompt rewrite (per-delivery) — [ATOMIC CUTOVER with Units 3, 5]**
+- [x] **Unit 4: Response Protocol prompt rewrite (per-delivery) — [ATOMIC CUTOVER with Units 3, 5]**
 
 **Goal:** For `file-convention` delivery, instruct the model to write the file **synchronously** at the exact path and state `gh` is unavailable; `model-gh` keeps current instructions; `none` renders neither.
 
@@ -204,7 +206,7 @@ bootstrap: resolveResponseDelivery(eventName, responseMode) -> { delivery, crede
 - Edge: `responseMode:none` → neither file nor `gh` posting instruction.
 - Regression: `<!-- fro-bot-agent -->` marker + Run Summary guidance survive.
 
-- [ ] **Unit 5: Finalize response-delivery — post, guard, assert, reconciliation skip — [ATOMIC CUTOVER with Units 3-4]**
+- [x] **Unit 5: Finalize response-delivery — post, guard, assert, reconciliation skip — [ATOMIC CUTOVER with Units 3-4]**
 
 **Goal:** Read/validate/post with trusted-context binding, apply review guards, fail-closed with a delivery assertion, and make reconciliation skip file-convention runs.
 
@@ -232,7 +234,9 @@ bootstrap: resolveResponseDelivery(eventName, responseMode) -> { delivery, crede
 - Edge: `responseMode:none` → no read, no post, assertion expects zero; dedup marker not saved when delivery fails.
 - Integration: real write-path (fixture file in a temp `$RUNNER_TEMP`, real finalize read → stubbed Octokit asserting body+target), not a pre-seeded parse result; re-review (second invocation, fresh nonce path) → one new review, reconciliation does not double-submit.
 
-- [ ] **Unit 6: Retire dead artifact-scraping for affected flows + metrics**
+- [x] **Unit 6: Retire dead artifact-scraping for affected flows + metrics**
+
+Done by re-sourcing, not deletion. `metrics.incrementComments()` fires at `src/harness/phases/finalize.ts:347` once the file-convention response is delivered, and `detectArtifacts`/`detectArtifactsFromMessageParts` stay in `src/features/agent/streaming.ts` for autonomous flows that self-post via `gh`. The two sources are mutually exclusive per run.
 
 **Goal:** Remove/neutralize the `gh`-output URL scraping that no longer fires for affected flows; re-source the posted-comment metric.
 

@@ -1,6 +1,7 @@
 ---
 title: "feat: Update session support for OpenCode ≥1.1.53 SQLite storage"
 type: feat
+status: done
 date: 2026-02-15
 ---
 

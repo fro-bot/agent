@@ -1,6 +1,7 @@
 ---
 title: "docs: Document Supported Event Triggers & Create Pristine Example Workflow"
 type: docs
+status: done
 date: 2026-02-16
 ---
 

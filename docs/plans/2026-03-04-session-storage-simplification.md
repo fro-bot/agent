@@ -1,6 +1,11 @@
-# Session Storage Simplification Plan
+---
+title: "Session Storage Simplification Plan"
+type: refactor
+status: done
+date: 2026-03-04
+---
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+# Session Storage Simplification Plan
 
 **Goal:** Consolidate the over-fragmented session storage layer from 10+ mapper/utility files down to ~3, eliminating redundant defensive parsing while preserving fields the SDK types omit.
 

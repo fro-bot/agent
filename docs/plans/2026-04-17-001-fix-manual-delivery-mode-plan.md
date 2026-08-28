@@ -1,7 +1,7 @@
 ---
 title: "fix: Add explicit delivery mode for manual file-edit runs"
 type: fix
-status: completed
+status: done
 date: 2026-04-17
 gap_review: 2026-04-17 (Metis — critical + important gaps closed)
 deepened: 2026-04-17 (research-grounded — repo verification, prompt-priority research, system-wide impact, pattern alignment)
