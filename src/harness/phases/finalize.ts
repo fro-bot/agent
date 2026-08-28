@@ -269,7 +269,7 @@ export async function runFinalize(
             new Promise<BrokeredPushOutcome>(resolve => {
               timeout = setTimeout(() => {
                 controller.abort()
-                resolve({kind: 'fail-loud', reason: BROKERED_PUSH_TIMEOUT_REASON})
+                resolve({kind: 'fail-loud', failureClass: 'timeout', reason: BROKERED_PUSH_TIMEOUT_REASON})
               }, BROKERED_PUSH_TIMEOUT_MS)
             }),
           ])

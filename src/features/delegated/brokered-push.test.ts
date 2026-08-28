@@ -147,6 +147,8 @@ describe('runBrokeredPush', () => {
     // #then the TOCTOU mismatch is fail-loud and no write-side API is called
     expect(outcome.kind).toBe('fail-loud')
     if (outcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(outcome.failureClass).toBe('moved-head')
+    expect(outcome.paths).toBeUndefined()
     expect(outcome.reason).toContain('Branch head changed before commit construction')
     expect(createBlob).not.toHaveBeenCalled()
     expect(createTree).not.toHaveBeenCalled()
@@ -184,15 +186,27 @@ describe('runBrokeredPush', () => {
 
   it('fails loud when reconstructed changes are rejected by the brokered allowlist', async () => {
     // #given reconstruction produced a change outside the brokered allowlist
-    const changes = [{path: '.github/workflows/ci.yml', content: 'unsafe'}]
+    const changes = [
+      {path: '.github/workflows/ci.yml', content: 'unsafe'},
+      {path: 'foo.md', content: 'also unsafe'},
+    ]
     allowGateSequence(changes)
-    mocks.validateFiles.mockReturnValue({valid: false, errors: ['path is not allowed']})
+    mocks.validateFiles.mockReturnValue({
+      valid: false,
+      errors: ['path is not allowed'],
+      paths: ['.github/workflows/ci.yml', 'foo.md'],
+    })
 
     // #when brokered push delivery runs
     const outcome = await run()
 
     // #then the model response must be suppressed by a typed failure
-    expect(outcome).toEqual({kind: 'fail-loud', reason: 'path is not allowed'})
+    expect(outcome).toEqual({
+      kind: 'fail-loud',
+      reason: 'path is not allowed',
+      failureClass: 'validation',
+      paths: ['.github/workflows/ci.yml', 'foo.md'],
+    })
     expect(mocks.checkPreWriteGate).not.toHaveBeenCalled()
   })
 
@@ -205,7 +219,7 @@ describe('runBrokeredPush', () => {
     const permissionOutcome = await run()
 
     // #then no workspace or write operation is attempted
-    expect(permissionOutcome).toEqual({kind: 'fail-loud', reason: 'permission removed'})
+    expect(permissionOutcome).toEqual({kind: 'fail-loud', reason: 'permission removed', failureClass: 'permission'})
     expect(mocks.reconstructChanges).not.toHaveBeenCalled()
 
     // #given reconstruction itself fails
@@ -218,7 +232,7 @@ describe('runBrokeredPush', () => {
     const reconstructionOutcome = await run()
 
     // #then reconstruction errors fail loud instead of becoming a bypass
-    expect(reconstructionOutcome).toEqual({kind: 'fail-loud', reason: 'head moved'})
+    expect(reconstructionOutcome).toEqual({kind: 'fail-loud', reason: 'head moved', failureClass: 'reconstruction'})
 
     // #given a live pre-write gate denial
     vi.clearAllMocks()
@@ -229,7 +243,24 @@ describe('runBrokeredPush', () => {
     const preWriteOutcome = await run()
 
     // #then no commit is reported or created
-    expect(preWriteOutcome).toEqual({kind: 'fail-loud', reason: 'head SHA changed'})
+    expect(preWriteOutcome).toEqual({kind: 'fail-loud', reason: 'head SHA changed', failureClass: 'identity'})
+  })
+
+  it.each([
+    'Unable to diff workspace against trusted head SHA: diff failed',
+    'Unable to enumerate untracked workspace files: ls-files failed',
+    'Reconstructed file validation failed: src/fix.ts: invalid content',
+  ])('classifies %s as reconstruction', async reason => {
+    // #given an eligible delivery whose reconstruction stage reports a failure
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockResolvedValue({decision: 'allowed', permission: 'write'})
+    mocks.reconstructChanges.mockResolvedValue({success: false, error: new Error(reason)})
+
+    // #when brokered push delivery runs
+    const outcome = await run()
+
+    // #then all reconstruction failure sites share the stable reconstruction class
+    expect(outcome).toEqual({kind: 'fail-loud', reason, failureClass: 'reconstruction'})
   })
 
   it('fails loud when the ref update rejects after commit creation', async () => {
@@ -251,7 +282,7 @@ describe('runBrokeredPush', () => {
     const outcome = await run({octokit})
 
     // #then the unreachable commit is never reported as delivered
-    expect(outcome).toEqual({kind: 'fail-loud', reason: 'reference update rejected'})
+    expect(outcome).toEqual({kind: 'fail-loud', reason: 'reference update rejected', failureClass: 'commit'})
   })
 
   it('maps an aborted octokit-backed path to the brokered push budget reason', async () => {
@@ -269,12 +300,24 @@ describe('runBrokeredPush', () => {
     const outcome = await run({signal: controller.signal})
 
     // #then the raw abort error is replaced with the clear fail-loud budget reason
-    expect(outcome).toEqual({kind: 'fail-loud', reason: 'brokered push exceeded time budget'})
+    expect(outcome).toEqual({kind: 'fail-loud', reason: 'brokered push exceeded time budget', failureClass: 'timeout'})
     expect(mocks.checkPermission).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
       expect.anything(),
       controller.signal,
     )
+  })
+
+  it('classifies unexpected thrown exceptions as unknown', async () => {
+    // #given an eligible event whose permission gate throws an unclassified exception
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockRejectedValue(new Error('unexpected gate failure'))
+
+    // #when brokered push delivery runs
+    const outcome = await run()
+
+    // #then the failure is machine-distinguishable without parsing its reason
+    expect(outcome).toEqual({kind: 'fail-loud', reason: 'unexpected gate failure', failureClass: 'unknown'})
   })
 })

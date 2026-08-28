@@ -769,7 +769,7 @@ describe('runFinalize file-convention delivery', () => {
     const routing = createEligibleRouting()
     const execution = createExecution({success: true, commentsPosted: 0})
     const metrics = createMetrics()
-    mocks.runBrokeredPush.mockResolvedValue({kind: 'fail-loud', reason: 'head SHA changed'})
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'fail-loud', failureClass: 'moved-head', reason: 'head SHA changed'})
     mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
 
     // #when finalize runs
@@ -901,7 +901,11 @@ describe('runFinalize file-convention delivery', () => {
     const execution = createExecution({success: true, commentsPosted: 0})
     const metrics = createMetrics()
     const logger = createMockLogger()
-    mocks.runBrokeredPush.mockResolvedValue({kind: 'fail-loud', reason: 'provider secret sentinel'})
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'fail-loud',
+      failureClass: 'unknown',
+      reason: 'provider secret sentinel',
+    })
 
     // #when finalize runs with the target removed
     const exitCode = await runFinalize(

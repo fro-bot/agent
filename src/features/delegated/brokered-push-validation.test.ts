@@ -62,6 +62,8 @@ describe('validateBrokeredPushFiles', () => {
     // #then
     expect(result.valid).toBe(false)
     expect(result.errors).toContain('package.json: path is not allowed for brokered push')
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.paths).toEqual(['package.json'])
   })
 
   it('accepts a deletion of an allowlisted path', () => {
@@ -85,6 +87,25 @@ describe('validateBrokeredPushFiles', () => {
     // #then
     expect(result.valid).toBe(false)
     expect(result.errors.length).toBeGreaterThan(0)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.paths).toContain(path)
+  })
+
+  it('returns every offending path with the validation messages', () => {
+    // #given several changes outside the brokered allowlist
+    const files = [
+      contentChange('.github/workflows/ci.yml'),
+      contentChange('scripts/release.sh'),
+      contentChange('foo.md'),
+    ]
+
+    // #when validating the complete change set
+    const result = validateBrokeredPushFiles(files)
+
+    // #then all rejected paths are available without parsing the error strings
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.paths).toEqual(['.github/workflows/ci.yml', 'scripts/release.sh', 'foo.md'])
   })
 
   it('accepts an empty file list as a no-op', () => {
