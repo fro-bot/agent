@@ -787,9 +787,114 @@ describe('runFinalize file-convention delivery', () => {
     expect(exitCode).toBe(1)
     expect(mocks.postComment).toHaveBeenCalledTimes(1)
     const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
-    expect(errorOptions.body).toContain('Brokered push delivery failed')
+    expect(errorOptions.body).toContain('Brokered push failure (moved-head)')
+    expect(errorOptions.body).not.toContain('Offending paths')
     expect(errorOptions.body).not.toContain('head SHA changed')
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('head SHA changed'))
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+  })
+
+  it('posts the validation failure class and offending paths without exposing the raw reason', async () => {
+    // #given a successful eligible execution whose brokered validation rejects a changed path
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    const rawReason = 'path rejected because an internal validator leaked this detail'
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'fail-loud',
+      failureClass: 'validation',
+      reason: rawReason,
+      paths: ['apps-legacy/x.ts'],
+    })
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the comment names the class and path, while setFailed retains the full reason
+    expect(exitCode).toBe(1)
+    const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
+    expect(errorOptions.body).toContain('Brokered push failure (validation)')
+    expect(errorOptions.body).toContain('apps-legacy/x.ts')
+    expect(errorOptions.body).not.toContain(rawReason)
+    expect(mocks.setFailed).toHaveBeenCalledWith(`Brokered push delivery failed: ${rawReason}`)
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+  })
+
+  it('truncates validation paths and renders hostile path text inside a fenced block', async () => {
+    // #given validation paths containing markdown syntax, a mention, a fence sequence, and an absolute workspace prefix
+    vi.stubEnv('GITHUB_WORKSPACE', '/workspace/repo')
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    const paths = [
+      '/workspace/repo/foo](https://evil.example)',
+      '@org/team',
+      'foo```bar',
+      ...Array.from({length: 22}, (_, index) => `apps-legacy/file-${index + 4}.ts`),
+    ]
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'fail-loud',
+      failureClass: 'validation',
+      reason: 'full validation reason',
+      paths,
+    })
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    try {
+      // #when finalize runs
+      await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), createMockLogger())
+
+      // #then only ten scrubbed paths are shown, and markdown control text stays inert in the code fence
+      const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
+      expect(errorOptions.body).toContain('Offending paths:\n```\nfoo](https://evil.example)\n@org/team\nfoobar')
+      expect(errorOptions.body).toContain('… and 15 more')
+      expect(errorOptions.body).not.toContain('foo```bar')
+      expect(errorOptions.body).not.toContain('/workspace/repo/')
+      expect(mocks.setFailed).toHaveBeenCalledWith('Brokered push delivery failed: full validation reason')
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('normalizes a thrown brokered-push error to an unknown failure and still posts one comment', async () => {
+    // #given a successful eligible execution whose brokered-push call rejects unexpectedly
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    const rawReason = 'unexpected brokered push exception'
+    mocks.runBrokeredPush.mockRejectedValue(new Error(rawReason))
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the unknown class is reported without raw internals and the run remains failed
+    expect(exitCode).toBe(1)
+    expect(mocks.postComment).toHaveBeenCalledTimes(1)
+    const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
+    expect(errorOptions.body).toContain('Brokered push failure (unknown)')
+    expect(errorOptions.body).not.toContain(rawReason)
+    expect(mocks.setFailed).toHaveBeenCalledWith(`Brokered push delivery failed: ${rawReason}`)
     expect(mocks.runResponsePost).not.toHaveBeenCalled()
   })
 
@@ -966,6 +1071,7 @@ describe('runFinalize file-convention delivery', () => {
 
     // #then the one-response gate also excludes brokered push
     expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
+    expect(mocks.postComment).not.toHaveBeenCalled()
   })
 })
 
