@@ -119,6 +119,78 @@ describe('validateBrokeredPushFiles', () => {
     expect(result).toEqual({valid: true, errors: []})
   })
 
+  it('accepts a consumer-layout path with an opted-in prefix', () => {
+    // #given a consumer application path outside the default allowlist
+    const files = [contentChange('apps/web/src/index.ts')]
+
+    // #when the consumer opts into the apps prefix
+    const result = validateBrokeredPushFiles(files, ['apps'])
+
+    // #then the segment-boundary prefix admits the change
+    expect(result).toEqual({valid: true, errors: []})
+  })
+
+  it('keeps the default allowlist unchanged when no extra prefixes are supplied', () => {
+    // #given a consumer-layout path and no opt-in
+    const files = [contentChange('apps/web/src/index.ts')]
+
+    // #when validating with the default configuration
+    const result = validateBrokeredPushFiles(files, [])
+
+    // #then the path remains denied
+    expect(result.valid).toBe(false)
+    expect(result.errors).toContain('apps/web/src/index.ts: path is not allowed for brokered push')
+  })
+
+  it('matches extra prefixes only at segment boundaries and treats overlaps as a union', () => {
+    // #given sibling and nested paths plus overlapping extra prefixes
+    const files = [
+      contentChange('apps/web/src/index.ts'),
+      contentChange('apps/web/tests/index.ts'),
+      contentChange('apps-legacy/x.ts'),
+      contentChange('src/extra.ts'),
+    ]
+
+    // #when validating with overlapping prefixes and a default prefix
+    const result = validateBrokeredPushFiles(files, ['apps', 'apps/web', 'src'])
+
+    // #then only the sibling directory remains outside the union
+    expect(result.valid).toBe(false)
+    expect(result.errors).toContain('apps-legacy/x.ts: path is not allowed for brokered push')
+    expect(result.errors).not.toContain('apps/web/src/index.ts: path is not allowed for brokered push')
+    expect(result.errors).not.toContain('apps/web/tests/index.ts: path is not allowed for brokered push')
+  })
+
+  it.each([
+    {path: 'apps/.env', content: 'secret'},
+    {path: 'apps/large.bin', content: 'x'.repeat(5 * 1024 * 1024 + 1)},
+    {path: 'apps/../.github/workflows/ci.yml', content: 'unsafe'},
+  ])('never bypasses shared validation for $path', file => {
+    // #given a file denied by the shared validation floor
+    const files = [file]
+
+    // #when the containing apps prefix is opted in
+    const result = validateBrokeredPushFiles(files, ['apps'])
+
+    // #then the shared floor still rejects the change
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.paths).toContain(file.path)
+  })
+
+  it('rechecks protected extra prefixes at enforcement time', () => {
+    // #given a caller that bypasses the parser with a protected surface prefix
+    const prefix = '.github'
+
+    // #when validating an otherwise empty change set
+    const result = validateBrokeredPushFiles([], [prefix])
+
+    // #then enforcement rejects the prefix and names it
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.errors).toContain(`${prefix}: path prefix overlaps protected brokered-push surface .github`)
+  })
+
   it('accepts the maximum brokered push file count', () => {
     // #given exactly the configured maximum number of allowlisted changes
     const files = Array.from({length: 100}, (_, index) => contentChange(`src/file-${index}.ts`))

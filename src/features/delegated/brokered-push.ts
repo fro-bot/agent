@@ -25,6 +25,7 @@ export interface BrokeredPushParams {
   readonly trustedHeadSha: string
   readonly expectedHeadBranch: string
   readonly repoRoot: string
+  readonly extraPathPrefixes: readonly string[]
   readonly signal?: AbortSignal
 }
 
@@ -88,7 +89,7 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
     }
 
     const changes: FileChange[] = reconstruction.data.changes
-    const validation = validateBrokeredPushFiles(changes)
+    const validation = validateBrokeredPushFiles(changes, params.extraPathPrefixes)
     if (validation.valid === false) {
       return failLoud(validation.errors.join('; '), 'validation', logger, validation.paths)
     }

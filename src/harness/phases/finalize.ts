@@ -260,6 +260,7 @@ export async function runFinalize(
               trustedHeadSha: bootstrap.trustedHeadSha,
               expectedHeadBranch,
               repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
+              extraPathPrefixes: bootstrap.inputs.brokeredPushExtraPaths,
               signal: controller.signal,
             }),
             // This branch only ever resolves (to fail-loud), never rejects — a

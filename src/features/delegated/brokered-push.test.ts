@@ -65,7 +65,12 @@ function allowGateSequence(changes: readonly object[]): void {
 }
 
 async function run(
-  options: {readonly octokit?: Octokit; readonly signal?: AbortSignal; readonly trustedHeadSha?: string} = {},
+  options: {
+    readonly octokit?: Octokit
+    readonly signal?: AbortSignal
+    readonly trustedHeadSha?: string
+    readonly extraPathPrefixes?: readonly string[]
+  } = {},
 ) {
   return runBrokeredPush({
     octokit: options.octokit ?? createMockOctokit(),
@@ -83,6 +88,7 @@ async function run(
     trustedHeadSha: options.trustedHeadSha ?? TRUSTED_HEAD_SHA,
     expectedHeadBranch: BRANCH,
     repoRoot: '/workspace',
+    extraPathPrefixes: options.extraPathPrefixes ?? [],
     signal: options.signal,
   })
 }
@@ -122,6 +128,34 @@ describe('runBrokeredPush', () => {
         message: 'fix',
       },
     })
+    expect(updateRef).toHaveBeenCalledWith(
+      expect.objectContaining({owner: OWNER, repo: REPO, ref: `heads/${BRANCH}`, sha: 'commit-sha', force: false}),
+    )
+  })
+
+  it('delivers a consumer-layout change set when an extra path prefix is opted in', async () => {
+    // #given an eligible PR mention whose reconstructed changes live under a consumer app
+    const changes = [{path: 'apps/web/src/index.ts', content: 'export const app = true'}]
+    allowGateSequence(changes)
+    const updateRef = vi.fn().mockResolvedValue({data: {}})
+    const octokit = createMockOctokit({
+      getRef: {object: {sha: TRUSTED_HEAD_SHA}},
+      getCommit: {tree: {sha: 'base-tree-sha'}},
+      createBlob: {sha: 'blob-sha'},
+      createTree: {sha: 'tree-sha'},
+      createCommit: vi.fn().mockResolvedValue({
+        data: {sha: 'commit-sha', html_url: 'https://github.com/owner/repo/commit/commit-sha', message: 'fix'},
+      }),
+      updateRef,
+    })
+
+    // #when brokered push delivery runs with the consumer path opt-in
+    const outcome = await run({octokit, extraPathPrefixes: ['apps']})
+
+    // #then the consumer-layout change is delivered and the opt-in reaches validation
+    expect(outcome.kind).toBe('pushed')
+    expect(outcome).toMatchObject({branch: BRANCH, paths: ['apps/web/src/index.ts']})
+    expect(mocks.validateFiles).toHaveBeenCalledWith(changes, ['apps'])
     expect(updateRef).toHaveBeenCalledWith(
       expect.objectContaining({owner: OWNER, repo: REPO, ref: `heads/${BRANCH}`, sha: 'commit-sha', force: false}),
     )
