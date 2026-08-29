@@ -294,6 +294,77 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     expect(dispatchWorkflow).toHaveBeenCalledOnce()
   })
 
+  it('rejects same key reused for a different repo without dispatching or auditing', async () => {
+    // #given
+    const dispatchWorkflow: DispatchWorkflow = vi.fn(async () => ({
+      outcome: 'accepted' as const,
+      owner: 'acme',
+      repo: 'widget',
+    }))
+    const auditLogger = makeAuditLogger()
+    const deps = makeDeps({dispatchWorkflow, auditLogger})
+    const app = buildApp(deps)
+
+    // #when
+    await postDispatch(app, {repo: 'acme/widget', task: 'do work', idempotencyKey: 'repo-key'})
+    const response = await postDispatch(app, {repo: 'acme/other', task: 'do work', idempotencyKey: 'repo-key'})
+
+    // #then — the stored outcome is never projected onto a different repo
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({error: 'idempotency key reuse with different request'})
+    expect(dispatchWorkflow).toHaveBeenCalledOnce()
+    expect(vi.mocked(auditLogger.info)).toHaveBeenCalledOnce()
+  })
+
+  it('rejects same key reused for a different task without dispatching', async () => {
+    // #given
+    const dispatchWorkflow: DispatchWorkflow = vi.fn(async () => ({
+      outcome: 'accepted' as const,
+      owner: 'acme',
+      repo: 'widget',
+    }))
+    const deps = makeDeps({dispatchWorkflow})
+    const app = buildApp(deps)
+
+    // #when
+    await postDispatch(app, {repo: 'acme/widget', task: 'first task', idempotencyKey: 'task-key'})
+    const response = await postDispatch(app, {repo: 'acme/widget', task: 'second task', idempotencyKey: 'task-key'})
+
+    // #then
+    expect(response.status).toBe(400)
+    expect(dispatchWorkflow).toHaveBeenCalledOnce()
+  })
+
+  it('rejects an in-flight replay with a different payload instead of awaiting it', async () => {
+    // #given — hold the first dispatch open after reservation
+    let releaseDispatch: ((outcome: DispatchOutcome) => void) | undefined
+    const dispatchWorkflow: DispatchWorkflow = vi.fn(
+      async () =>
+        new Promise<DispatchOutcome>(resolve => {
+          releaseDispatch = resolve
+        }),
+    )
+    const deps = makeDeps({dispatchWorkflow})
+    const app = buildApp(deps)
+    const firstResponse = postDispatch(app, {repo: 'acme/widget', task: 'first task', idempotencyKey: 'flight-key'})
+    await vi.waitFor(() => expect(dispatchWorkflow).toHaveBeenCalledOnce())
+
+    // #when — a different payload arrives while the first dispatch is in flight
+    const secondResponse = await postDispatch(app, {
+      repo: 'acme/widget',
+      task: 'different task',
+      idempotencyKey: 'flight-key',
+    })
+
+    // #then — mismatch is rejected immediately; it does not await or dispatch again
+    expect(secondResponse.status).toBe(400)
+    expect(await secondResponse.json()).toEqual({error: 'idempotency key reuse with different request'})
+    expect(dispatchWorkflow).toHaveBeenCalledOnce()
+
+    releaseDispatch?.({outcome: 'accepted', owner: 'acme', repo: 'widget'})
+    expect((await firstResponse).status).toBe(200)
+  })
+
   it('returns 404 when the session token is unavailable', async () => {
     // #given
     const sessionStore = makeSessionStore({getOperatorToken: vi.fn(() => undefined)})

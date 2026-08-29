@@ -139,7 +139,8 @@ export function isCanonicalBrokeredPushPath(path: string): boolean {
 /**
  * Parse and validate the comma-separated `brokered-push-extra-paths` input.
  * Empty entries are ignored; valid duplicate prefixes are deduplicated after
- * normalization. Errors identify the original offending entry.
+ * normalization, and the unique normalized prefix count is capped. Errors
+ * identify the original offending entry.
  */
 export function parseBrokeredPushExtraPaths(input: string): readonly string[] {
   const prefixes = new Set<string>()
@@ -147,12 +148,6 @@ export function parseBrokeredPushExtraPaths(input: string): readonly string[] {
     .split(',')
     .map(rawEntry => rawEntry.trim())
     .filter(entry => entry.length > 0)
-
-  if (entries.length > MAX_BROKERED_PUSH_EXTRA_PATHS) {
-    throw new Error(
-      `Invalid brokered-push-extra-paths: received ${entries.length} entries; maximum is ${MAX_BROKERED_PUSH_EXTRA_PATHS}`,
-    )
-  }
 
   for (const entry of entries) {
     try {
@@ -165,6 +160,12 @@ export function parseBrokeredPushExtraPaths(input: string): readonly string[] {
       const reason = error instanceof Error ? error.message : String(error)
       throw new Error(`Invalid brokered-push-extra-paths entry "${entry}": ${reason}`)
     }
+  }
+
+  if (prefixes.size > MAX_BROKERED_PUSH_EXTRA_PATHS) {
+    throw new Error(
+      `Invalid brokered-push-extra-paths: received ${prefixes.size} unique entries; maximum is ${MAX_BROKERED_PUSH_EXTRA_PATHS}`,
+    )
   }
 
   return [...prefixes]

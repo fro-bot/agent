@@ -32,7 +32,7 @@ import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {OperatorLogger} from '../server.js'
 import type {IdempotencyGuard} from './idempotency.js'
 import type {LaunchRouteBindingsLookup, LaunchRouteSessionStore} from './launch-route.js'
-import {randomUUID} from 'node:crypto'
+import {createHash, randomUUID} from 'node:crypto'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {bindingToRepoKey} from '../../redaction/surface-gate.js'
 import {emitAudit} from '../audit.js'
@@ -75,8 +75,20 @@ export interface DispatchRouteDeps {
 }
 
 interface CompletedDispatch {
+  readonly fingerprint: string
   readonly outcome: DispatchOutcome
   readonly expiresAt: number
+}
+
+interface InFlightDispatch {
+  readonly fingerprint: string
+  readonly promise: Promise<DispatchOutcome>
+}
+
+function fingerprintDispatchRequest(owner: string, repo: string, task: string): string {
+  return createHash('sha256')
+    .update(JSON.stringify([owner, repo, task]), 'utf8')
+    .digest('hex')
 }
 
 function parseRepo(repoField: string): {readonly owner: string; readonly repo: string} | undefined {
@@ -99,7 +111,7 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
     deps.perHrRateLimiter ??
     createRateLimiter({limit: DISPATCH_RATE_LIMIT_PER_HR, windowMs: DISPATCH_RATE_WINDOW_HR_MS, clock: deps.now})
   const completedDispatches = new Map<string, CompletedDispatch>()
-  const inFlightDispatches = new Map<string, Promise<DispatchOutcome>>()
+  const inFlightDispatches = new Map<string, InFlightDispatch>()
 
   registerOperatorRoute(app, 'POST', '/operator/dispatch', async c => {
     const nowMs = deps.now()
@@ -193,18 +205,25 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
 
     if (idempotencyKey !== undefined) {
       const idempotencyMapKey = `${githubUserId}:${idempotencyKey}`
+      const fingerprint = fingerprintDispatchRequest(owner, repo, taskField)
       const priorMarker = deps.idempotencyGuard.check(githubUserId, idempotencyKey)
       if (priorMarker !== undefined) {
         const completed = completedDispatches.get(idempotencyMapKey)
         if (completed !== undefined && deps.now() < completed.expiresAt) {
+          if (completed.fingerprint !== fingerprint) {
+            return c.json({error: 'idempotency key reuse with different request'}, 400)
+          }
           return c.json({outcome: completed.outcome}, 200)
         }
         if (completed !== undefined) completedDispatches.delete(idempotencyMapKey)
 
         const inFlight = inFlightDispatches.get(idempotencyMapKey)
         if (inFlight !== undefined) {
+          if (inFlight.fingerprint !== fingerprint) {
+            return c.json({error: 'idempotency key reuse with different request'}, 400)
+          }
           try {
-            return c.json({outcome: await inFlight}, 200)
+            return c.json({outcome: await inFlight.promise}, 200)
           } catch {
             return c.json({error: 'internal error'}, 500)
           }
@@ -220,11 +239,15 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
       let committed = false
       try {
         const dispatchPromise = deps.dispatchWorkflow(owner, repo, taskField)
-        inFlightDispatches.set(idempotencyMapKey, dispatchPromise)
+        inFlightDispatches.set(idempotencyMapKey, {fingerprint, promise: dispatchPromise})
         const outcome = await dispatchPromise
         deps.idempotencyGuard.commit(githubUserId, idempotencyKey)
         committed = true
-        completedDispatches.set(idempotencyMapKey, {outcome, expiresAt: deps.now() + DISPATCH_IDEMPOTENCY_TTL_MS})
+        completedDispatches.set(idempotencyMapKey, {
+          fingerprint,
+          outcome,
+          expiresAt: deps.now() + DISPATCH_IDEMPOTENCY_TTL_MS,
+        })
         pruneCompletedDispatches(completedDispatches, deps.now())
         emitDispatchAudit(deps.auditLogger, outcome, githubUserId, owner, repo)
         return c.json({outcome}, 200)
