@@ -95,7 +95,12 @@ function createBrokeredPushError(failureClass: BrokeredPushFailureClass) {
 }
 
 function toRepoRelativeBrokeredPushPath(value: string): string {
-  const normalizedValue = value.replaceAll('\\', '/').replaceAll('\n', ' ').replaceAll('\r', ' ')
+  const normalizedValue = value
+    .replaceAll('\\', '/')
+    .replaceAll('\n', ' ')
+    .replaceAll('\r', ' ')
+    .replaceAll('\u2028', ' ')
+    .replaceAll('\u2029', ' ')
   const workspace = (process.env.GITHUB_WORKSPACE ?? process.cwd()).replaceAll('\\', '/').replace(/\/+$/, '')
 
   if (normalizedValue === workspace) return '.'
@@ -110,15 +115,19 @@ function sanitizeBrokeredPushPath(value: string): string {
 
 function formatBrokeredPushError(outcome: Extract<BrokeredPushOutcome, {readonly kind: 'fail-loud'}>): string {
   const errorComment = formatErrorComment(createBrokeredPushError(outcome.failureClass))
-  if (outcome.failureClass !== 'validation' || outcome.paths == null || outcome.paths.length === 0) {
-    return errorComment
+  if (outcome.failureClass === 'validation') {
+    if (outcome.paths.length === 0) {
+      return errorComment
+    }
+
+    const visiblePaths = outcome.paths.slice(0, MAX_BROKERED_PUSH_ERROR_PATHS).map(sanitizeBrokeredPushPath)
+    const remainingPathCount = outcome.paths.length - visiblePaths.length
+    const pathSummary = remainingPathCount > 0 ? `\n… and ${remainingPathCount} more` : ''
+
+    return `${errorComment}\n\nOffending paths:\n\`\`\`\n${visiblePaths.join('\n')}\n\`\`\`${pathSummary}`
   }
 
-  const visiblePaths = outcome.paths.slice(0, MAX_BROKERED_PUSH_ERROR_PATHS).map(sanitizeBrokeredPushPath)
-  const remainingPathCount = outcome.paths.length - visiblePaths.length
-  const pathSummary = remainingPathCount > 0 ? `\n… and ${remainingPathCount} more` : ''
-
-  return `${errorComment}\n\nOffending paths:\n\`\`\`\n${visiblePaths.join('\n')}\n\`\`\`${pathSummary}`
+  return errorComment
 }
 
 function createUnknownBrokeredPushOutcome(error: unknown): Extract<BrokeredPushOutcome, {readonly kind: 'fail-loud'}> {
@@ -268,7 +277,7 @@ export async function runFinalize(
       result = responsePrecheck
     } else {
       let deliveryFooter: string | undefined
-      if (execution.success === true && execution.commentsPosted === 0) {
+      if (execution.success === true) {
         const triggerContext = routing.triggerResult.context
         const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
         const eventFacts = {

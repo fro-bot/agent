@@ -38,9 +38,14 @@ export type BrokeredPushOutcome =
   | {readonly kind: 'pushed'; readonly commit: CommitResult; readonly branch: string; readonly paths: readonly string[]}
   | {
       readonly kind: 'fail-loud'
+      readonly failureClass: 'validation'
       readonly reason: string
-      readonly failureClass: BrokeredPushFailureClass
-      readonly paths?: readonly string[]
+      readonly paths: readonly string[]
+    }
+  | {
+      readonly kind: 'fail-loud'
+      readonly failureClass: Exclude<BrokeredPushFailureClass, 'validation'>
+      readonly reason: string
     }
 
 /**
@@ -202,15 +207,32 @@ function observeBrokeredPushPreWriteLookup(octokit: Octokit, observation: {looku
 
 function failLoud(
   reason: string,
+  failureClass: 'validation',
+  logger: Logger,
+  paths: readonly string[],
+): Extract<BrokeredPushOutcome, {readonly kind: 'fail-loud'; readonly failureClass: 'validation'}>
+function failLoud(
+  reason: string,
+  failureClass: Exclude<BrokeredPushFailureClass, 'validation'>,
+  logger: Logger,
+): Extract<
+  BrokeredPushOutcome,
+  {readonly kind: 'fail-loud'; readonly failureClass: Exclude<BrokeredPushFailureClass, 'validation'>}
+>
+function failLoud(
+  reason: string,
   failureClass: BrokeredPushFailureClass,
   logger: Logger,
   paths?: readonly string[],
-): {
-  readonly kind: 'fail-loud'
-  readonly reason: string
-  readonly failureClass: BrokeredPushFailureClass
-  readonly paths?: readonly string[]
-} {
+): Extract<BrokeredPushOutcome, {readonly kind: 'fail-loud'}> {
   logger.warning('Brokered push delivery failed', {reason})
-  return paths == null ? {kind: 'fail-loud', reason, failureClass} : {kind: 'fail-loud', reason, failureClass, paths}
+  if (failureClass === 'validation') {
+    if (paths == null) {
+      throw new Error('Validation brokered-push failures require offending paths')
+    }
+
+    return {kind: 'fail-loud', reason, failureClass, paths}
+  }
+
+  return {kind: 'fail-loud', reason, failureClass}
 }

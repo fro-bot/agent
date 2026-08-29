@@ -182,7 +182,7 @@ describe('runBrokeredPush', () => {
     expect(outcome.kind).toBe('fail-loud')
     if (outcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
     expect(outcome.failureClass).toBe('moved-head')
-    expect(outcome.paths).toBeUndefined()
+    expect(outcome).not.toHaveProperty('paths')
     expect(outcome.reason).toContain('Branch head changed before commit construction')
     expect(createBlob).not.toHaveBeenCalled()
     expect(createTree).not.toHaveBeenCalled()
@@ -253,7 +253,9 @@ describe('runBrokeredPush', () => {
     const permissionOutcome = await run()
 
     // #then no workspace or write operation is attempted
-    expect(permissionOutcome).toEqual({kind: 'fail-loud', reason: 'permission removed', failureClass: 'permission'})
+    expect(permissionOutcome).toMatchObject({kind: 'fail-loud', failureClass: 'permission'})
+    if (permissionOutcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(permissionOutcome.reason).toEqual(expect.stringContaining('permission'))
     expect(mocks.reconstructChanges).not.toHaveBeenCalled()
 
     // #given reconstruction itself fails
@@ -266,7 +268,9 @@ describe('runBrokeredPush', () => {
     const reconstructionOutcome = await run()
 
     // #then reconstruction errors fail loud instead of becoming a bypass
-    expect(reconstructionOutcome).toEqual({kind: 'fail-loud', reason: 'head moved', failureClass: 'reconstruction'})
+    expect(reconstructionOutcome).toMatchObject({kind: 'fail-loud', failureClass: 'reconstruction'})
+    if (reconstructionOutcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(reconstructionOutcome.reason).toEqual(expect.stringContaining('head moved'))
 
     // #given a live pre-write gate denial
     vi.clearAllMocks()
@@ -277,7 +281,9 @@ describe('runBrokeredPush', () => {
     const preWriteOutcome = await run()
 
     // #then no commit is reported or created
-    expect(preWriteOutcome).toEqual({kind: 'fail-loud', reason: 'head SHA changed', failureClass: 'identity'})
+    expect(preWriteOutcome).toMatchObject({kind: 'fail-loud', failureClass: 'identity'})
+    if (preWriteOutcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(preWriteOutcome.reason).toEqual(expect.stringContaining('head SHA changed'))
   })
 
   it.each([

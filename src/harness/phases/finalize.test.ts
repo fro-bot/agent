@@ -830,6 +830,38 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.runResponsePost).not.toHaveBeenCalled()
   })
 
+  it('suppresses a validation failure comment when a response was already posted but preserves the full reason', async () => {
+    // #given a successful execution that already posted a response and a brokered validation failure
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 1})
+    const metrics = createMetrics()
+    const rawReason = 'path rejected with the complete validation details'
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'fail-loud',
+      failureClass: 'validation',
+      reason: rawReason,
+      paths: ['apps-legacy/x.ts'],
+    })
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the already-posted response suppresses another comment but does not hide the failure reason
+    expect(exitCode).toBe(1)
+    expect(mocks.postComment).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledWith(`Brokered push delivery failed: ${rawReason}`)
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+  })
+
   it('truncates validation paths and renders hostile path text inside a fenced block', async () => {
     // #given validation paths containing markdown syntax, a mention, a fence sequence, and an absolute workspace prefix
     vi.stubEnv('GITHUB_WORKSPACE', '/workspace/repo')
@@ -865,6 +897,79 @@ describe('runFinalize file-convention delivery', () => {
     } finally {
       vi.unstubAllEnvs()
     }
+  })
+
+  it('renders exactly ten validation paths without a truncation suffix', async () => {
+    // #given exactly the maximum number of validation paths
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    const paths = Array.from({length: 10}, (_, index) => `apps-legacy/file-${index}.ts`)
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'fail-loud',
+      failureClass: 'validation',
+      reason: 'validation failed',
+      paths,
+    })
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    // #when finalize runs
+    await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), createMockLogger())
+
+    // #then every path is listed and no truncation suffix is added
+    const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
+    for (const path of paths) expect(errorOptions.body).toContain(path)
+    expect(errorOptions.body).not.toContain('… and')
+  })
+
+  it('renders ten validation paths and a one-path truncation suffix at eleven paths', async () => {
+    // #given one more than the maximum number of validation paths
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    const paths = Array.from({length: 11}, (_, index) => `apps-legacy/file-${index}.ts`)
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'fail-loud',
+      failureClass: 'validation',
+      reason: 'validation failed',
+      paths,
+    })
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    // #when finalize runs
+    await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), createMockLogger())
+
+    // #then ten paths are listed and the remaining one is summarized
+    const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
+    for (const path of paths.slice(0, 10)) expect(errorOptions.body).toContain(path)
+    expect(errorOptions.body).not.toContain(paths[10] ?? '')
+    expect(errorOptions.body).toContain('… and 1 more')
+  })
+
+  it('flattens U+2028 in validation paths before rendering the error comment', async () => {
+    // #given a validation path containing a Unicode line separator
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    const pathWithLineSeparator = 'apps\u2028legacy/file.ts'
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'fail-loud',
+      failureClass: 'validation',
+      reason: 'validation failed',
+      paths: [pathWithLineSeparator],
+    })
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+
+    // #when finalize runs
+    await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), createMockLogger())
+
+    // #then the path is inert and remains on one rendered line
+    const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
+    expect(errorOptions.body).toContain('apps legacy/file.ts')
+    expect(errorOptions.body).not.toContain('\u2028')
   })
 
   it('normalizes a thrown brokered-push error to an unknown failure and still posts one comment', async () => {
@@ -1034,7 +1139,7 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.runResponsePost).not.toHaveBeenCalled()
   })
 
-  it('does not invoke brokered push for failed executions or already-posted responses', async () => {
+  it('does not invoke brokered push for failed executions but still checks already-posted responses', async () => {
     // #given a trusted PR mention whose execution failed
     const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
     const routing = createEligibleRouting()
@@ -1069,8 +1174,8 @@ describe('runFinalize file-convention delivery', () => {
       createMockLogger(),
     )
 
-    // #then the one-response gate also excludes brokered push
-    expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
+    // #then a prior response no longer suppresses the brokered delivery safety check
+    expect(mocks.runBrokeredPush).toHaveBeenCalledTimes(1)
     expect(mocks.postComment).not.toHaveBeenCalled()
   })
 })

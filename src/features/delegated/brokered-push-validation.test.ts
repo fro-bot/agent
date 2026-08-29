@@ -191,6 +191,25 @@ describe('validateBrokeredPushFiles', () => {
     expect(result.errors).toContain(`${prefix}: path prefix overlaps protected brokered-push surface .github`)
   })
 
+  it('rejects malformed extra prefixes and does not admit protected files through them', () => {
+    // #given a caller that bypasses the parser with a traversal-bearing protected prefix
+    const prefix = 'docs/../.github/'
+    const protectedFile = contentChange('.github/workflows/ci.yml')
+
+    // #when validating an empty change set and a protected file with that prefix
+    const emptyResult = validateBrokeredPushFiles([], [prefix])
+    const fileResult = validateBrokeredPushFiles([protectedFile], [prefix])
+
+    // #then the malformed entry is named and cannot widen the allowlist
+    expect(emptyResult.valid).toBe(false)
+    if (emptyResult.valid) throw new Error('Expected validation failure')
+    expect(emptyResult.errors.some(error => error.includes(prefix))).toBe(true)
+    expect(fileResult.valid).toBe(false)
+    if (fileResult.valid) throw new Error('Expected validation failure')
+    expect(fileResult.errors).toContain(`${protectedFile.path}: path is not allowed for brokered push`)
+    expect(fileResult.paths).toContain(protectedFile.path)
+  })
+
   it('accepts the maximum brokered push file count', () => {
     // #given exactly the configured maximum number of allowlisted changes
     const files = Array.from({length: 100}, (_, index) => contentChange(`src/file-${index}.ts`))
