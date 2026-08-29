@@ -37,7 +37,7 @@
   },
   "simple-git-hooks": {
     "pre-commit": "bunx lint-staged",
-    "pre-push": "bun run lint && bun run build"
+    "pre-push": "bun install --frozen-lockfile --ignore-scripts && bun run lint && bun run build && git diff --ignore-space-at-eol --stat --exit-code HEAD -- dist/"
   },
   "lint-staged": {
     "*.{ts,js,jsx,tsx,css,md,json,yaml,yml}": [
