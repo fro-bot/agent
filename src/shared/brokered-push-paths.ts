@@ -17,9 +17,14 @@ export const BROKERED_PUSH_PROTECTED_SURFACES: ReadonlySet<string> = new Set([
   'yarn.lock',
   'bun.lockb',
   'Dockerfile',
+  '.npmrc',
+  '.gitmodules',
+  'action.yml',
+  'action.yaml',
 ])
 
 function isDockerfileVariant(prefix: string): boolean {
+  // Case-sensitive prefix matching mirrors Docker's own default-filename case sensitivity; this is intentional.
   return prefix === 'Dockerfile' || prefix.startsWith('Dockerfile.')
 }
 
@@ -87,6 +92,41 @@ export function matchesBrokeredPushPrefix(path: string, prefix: string): boolean
 export function isBrokeredPushProtectedPrefix(prefix: string): boolean {
   const normalized = normalizeBrokeredPushPrefix(prefix)
   return isProtectedSurfaceOverlap(normalized)
+}
+
+/**
+ * Return true when a path contains a protected directory segment or names a
+ * protected manifest, lockfile, Dockerfile variant, or root execution surface.
+ * Malformed paths are treated as protected so enforcement callers fail closed.
+ */
+export function hasProtectedSegment(path: string): boolean {
+  let normalized: string
+  try {
+    normalized = normalizeBrokeredPushPrefix(path)
+  } catch {
+    return true
+  }
+
+  const segments = normalized.split('/')
+  const basename = segments.at(-1) ?? ''
+  return (
+    segments.some(segment => BROKERED_PUSH_PROTECTED_SURFACES.has(segment)) ||
+    BROKERED_PUSH_PROTECTED_SURFACES.has(basename) ||
+    isDockerfileVariant(basename)
+  )
+}
+
+/**
+ * Return true when a file path is already in the canonical form used for
+ * brokered-push delivery. Interior dot segments are not normalized away and
+ * therefore remain an explicit non-canonical spelling.
+ */
+export function isCanonicalBrokeredPushPath(path: string): boolean {
+  try {
+    return path === normalizeBrokeredPushPrefix(path) && /(?:^|\/)\.(?:\/|$)/.test(path) === false
+  } catch {
+    return false
+  }
 }
 
 /**

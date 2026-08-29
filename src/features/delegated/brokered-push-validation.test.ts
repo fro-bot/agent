@@ -130,6 +130,55 @@ describe('validateBrokeredPushFiles', () => {
     expect(result).toEqual({valid: true, errors: []})
   })
 
+  it.each([
+    'apps/web/package.json',
+    'apps/web/Dockerfile',
+    'apps/web/bun.lock',
+    'apps/deploy/scripts/release.ts',
+    'apps/web/.github/workflows/ci.yml',
+    'apps/web/.npmrc',
+    'apps/web/.gitmodules',
+  ])('rejects protected nested path %s under an opted-in prefix', path => {
+    // #given a protected file nested under a consumer prefix
+    const result = validateBrokeredPushFiles([contentChange(path)], ['apps'])
+
+    // #then the validation-class error names the offending file
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.errors.some(error => error.includes(path))).toBe(true)
+    expect(result.paths).toContain(path)
+  })
+
+  it('rejects the complete protected nested-path repro under an opted-in prefix', () => {
+    // #given the reviewer's five-file protected-surface repro
+    const files = [
+      contentChange('apps/web/package.json'),
+      contentChange('apps/web/.github/workflows/ci.yml'),
+      contentChange('apps/web/Dockerfile'),
+      contentChange('apps/web/bun.lock'),
+      contentChange('apps/deploy/scripts/release.ts'),
+    ]
+
+    // #when the apps prefix is opted in
+    const result = validateBrokeredPushFiles(files, ['apps'])
+
+    // #then no protected nested path is deliverable
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    for (const file of files) expect(result.errors.some(error => error.includes(file.path))).toBe(true)
+  })
+
+  it('admits non-protected paths nested under an opted-in prefix', () => {
+    // #given product source and a scripts-data directory, which is not scripts
+    const files = [contentChange('apps/web/src/index.ts'), contentChange('apps/web/scripts-data/x.ts')]
+
+    // #when the apps prefix is opted in
+    const result = validateBrokeredPushFiles(files, ['apps'])
+
+    // #then both files remain deliverable
+    expect(result).toEqual({valid: true, errors: []})
+  })
+
   it('keeps the default allowlist unchanged when no extra prefixes are supplied', () => {
     // #given a consumer-layout path and no opt-in
     const files = [contentChange('apps/web/src/index.ts')]
@@ -161,6 +210,17 @@ describe('validateBrokeredPushFiles', () => {
     expect(result.errors).not.toContain('apps/web/tests/index.ts: path is not allowed for brokered push')
   })
 
+  it.each(['./apps/x.ts', 'apps/./x.ts', 'apps//x.ts'])('rejects non-canonical extra-path file %s', path => {
+    // #given a file that matches the extra prefix only after normalization
+    const result = validateBrokeredPushFiles([contentChange(path)], ['apps'])
+
+    // #then validation rejects the non-canonical spelling and names it
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.errors).toContain(`${path}: path is not canonical for brokered push`)
+    expect(result.paths).toContain(path)
+  })
+
   it.each([
     {path: 'apps/.env', content: 'secret'},
     {path: 'apps/large.bin', content: 'x'.repeat(5 * 1024 * 1024 + 1)},
@@ -189,6 +249,16 @@ describe('validateBrokeredPushFiles', () => {
     expect(result.valid).toBe(false)
     if (result.valid) throw new Error('Expected validation failure')
     expect(result.errors).toContain(`${prefix}: path prefix overlaps protected brokered-push surface .github`)
+  })
+
+  it.each(['', '.'])('fails closed for a direct malformed prefix bypass: %j', prefix => {
+    // #given a caller bypassing parse-time prefix validation
+    const result = validateBrokeredPushFiles([], [prefix])
+
+    // #then enforcement rejects the malformed prefix
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.errors.some(error => error.includes(prefix))).toBe(true)
   })
 
   it('rejects malformed extra prefixes and does not admit protected files through them', () => {

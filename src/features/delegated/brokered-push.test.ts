@@ -286,6 +286,36 @@ describe('runBrokeredPush', () => {
     expect(preWriteOutcome.reason).toEqual(expect.stringContaining('head SHA changed'))
   })
 
+  it('classifies a 404 from the pre-write PR lookup as an identity failure', async () => {
+    // #given all prior gates pass and the PR disappears before the final identity check
+    const changes = [{path: 'src/fix.ts', content: 'fixed'}]
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockResolvedValue({decision: 'allowed', permission: 'write'})
+    mocks.reconstructChanges.mockResolvedValue({success: true, data: {kind: 'changes', changes}})
+    mocks.validateFiles.mockReturnValue({valid: true, errors: []})
+    mocks.checkPreWriteGate.mockImplementation(async (wrappedOctokit: Octokit) => {
+      try {
+        await wrappedOctokit.rest.pulls.get({owner: OWNER, repo: REPO, pull_number: 42})
+      } catch {
+        // The real gate converts the lookup failure into a denied outcome.
+      }
+      return {decision: 'denied', reason: 'Unable to re-resolve PR before write: Not Found'}
+    })
+    const octokit = createMockOctokit({
+      getPullRequest: vi.fn().mockRejectedValue(Object.assign(new Error('Not Found'), {status: 404})),
+    })
+
+    // #when brokered push delivery runs
+    const outcome = await run({octokit})
+
+    // #then deletion or transfer is reported as identity drift, not permission failure
+    expect(outcome).toEqual({
+      kind: 'fail-loud',
+      reason: 'Unable to re-resolve PR before write: Not Found',
+      failureClass: 'identity',
+    })
+  })
+
   it.each([
     'Unable to diff workspace against trusted head SHA: diff failed',
     'Unable to enumerate untracked workspace files: ls-files failed',

@@ -1,8 +1,9 @@
 import type {FileChange} from './types.js'
 
 import {
-  BROKERED_PUSH_PROTECTED_SURFACES,
+  hasProtectedSegment,
   isBrokeredPushProtectedPrefix,
+  isCanonicalBrokeredPushPath,
   matchesBrokeredPushPrefix,
 } from '../../shared/brokered-push-paths.js'
 import {validateFiles} from './commit.js'
@@ -17,14 +18,6 @@ export type BrokeredPushValidationResult =
 
 function protectedSurfaceForPrefix(prefix: string): string | null {
   try {
-    for (const surface of BROKERED_PUSH_PROTECTED_SURFACES) {
-      if (matchesBrokeredPushPrefix(prefix, surface) || matchesBrokeredPushPrefix(surface, prefix)) {
-        return surface
-      }
-    }
-
-    // The shared policy also covers Dockerfile variants, which are not a
-    // segment-boundary match of the bare Dockerfile surface.
     return isBrokeredPushProtectedPrefix(prefix) ? prefix : null
   } catch {
     // Enforcement is fail-closed for callers that bypass the input parser.
@@ -71,14 +64,23 @@ export function validateBrokeredPushFiles(
       paths.add(file.path)
     }
 
-    const allowed =
+    const allowedByDefault =
       BROKERED_PUSH_ALLOWED_ROOT_FILES.has(file.path) ||
-      BROKERED_PUSH_ALLOWED_PATHS.some(pattern => pattern.test(file.path)) ||
-      extraPrefixes.some(prefix => matchesExtraPrefix(file.path, prefix))
+      BROKERED_PUSH_ALLOWED_PATHS.some(pattern => pattern.test(file.path))
+    const allowedByExtra = extraPrefixes.some(prefix => matchesExtraPrefix(file.path, prefix))
+    const allowed = allowedByDefault || allowedByExtra
 
     if (allowed === false) {
       errors.push(`${file.path}: path is not allowed for brokered push`)
       paths.add(file.path)
+    } else if (allowedByDefault === false && allowedByExtra) {
+      if (isCanonicalBrokeredPushPath(file.path) === false) {
+        errors.push(`${file.path}: path is not canonical for brokered push`)
+        paths.add(file.path)
+      } else if (hasProtectedSegment(file.path)) {
+        errors.push(`${file.path}: path is within a protected brokered-push surface`)
+        paths.add(file.path)
+      }
     }
   }
 

@@ -3,6 +3,7 @@ import type {ExecAdapter} from '../../services/setup/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CommitResult, FileChange} from './types.js'
 
+import {isNotFoundError} from '../../services/github/utils.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {
   checkBrokeredPushPermission,
@@ -99,7 +100,7 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
       return failLoud(validation.errors.join('; '), 'validation', logger, validation.paths)
     }
 
-    const preWriteObservation = {lookupFailed: false}
+    const preWriteObservation = {lookupFailed: false, lookupNotFound: false}
     const preWriteGate = await checkBrokeredPushPreWriteGate(
       observeBrokeredPushPreWriteLookup(octokit, preWriteObservation),
       {eligible: earlyGate, expectedHeadBranch},
@@ -107,7 +108,8 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
       signal,
     )
     if (preWriteGate.decision === 'denied') {
-      const failureClass = preWriteObservation.lookupFailed ? 'permission' : 'identity'
+      const failureClass =
+        preWriteObservation.lookupNotFound || preWriteObservation.lookupFailed === false ? 'identity' : 'permission'
       return failLoud(
         signal?.aborted === true ? BROKERED_PUSH_TIMEOUT_REASON : preWriteGate.reason,
         signal?.aborted === true ? 'timeout' : failureClass,
@@ -182,13 +184,17 @@ function observeBrokeredPushHead(octokit: Octokit, expectedHeadSha: string, obse
   }
 }
 
-function observeBrokeredPushPreWriteLookup(octokit: Octokit, observation: {lookupFailed: boolean}): Octokit {
+function observeBrokeredPushPreWriteLookup(
+  octokit: Octokit,
+  observation: {lookupFailed: boolean; lookupNotFound: boolean},
+): Octokit {
   const originalGetPull = octokit.rest.pulls.get
   const observedGetPull = Object.assign(async (...args: Parameters<typeof originalGetPull>) => {
     try {
       return await originalGetPull(...args)
     } catch (error) {
       observation.lookupFailed = true
+      observation.lookupNotFound = isNotFoundError(error)
       throw error
     }
   }, originalGetPull)

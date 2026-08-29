@@ -2,6 +2,8 @@ import {describe, expect, it} from 'vitest'
 
 import {
   BROKERED_PUSH_PROTECTED_SURFACES,
+  hasProtectedSegment,
+  isCanonicalBrokeredPushPath,
   matchesBrokeredPushPrefix,
   normalizeBrokeredPushPrefix,
   parseBrokeredPushExtraPaths,
@@ -56,13 +58,16 @@ describe('brokered-push path primitives', () => {
     expect(() => parseBrokeredPushExtraPaths(entry)).toThrow('malformed')
   })
 
-  it.each(['.github/', 'scripts/', 'package.json'])('rejects protected entry %s', entry => {
-    // #given a prefix overlapping a protected surface
-    // #when parsing it
-    // #then parsing fails and identifies the entry
-    expect(() => parseBrokeredPushExtraPaths(entry)).toThrow(entry)
-    expect(() => parseBrokeredPushExtraPaths(entry)).toThrow('protected')
-  })
+  it.each(['.github/', 'scripts/', 'package.json', '.npmrc', '.gitmodules', 'action.yml', 'action.yaml'])(
+    'rejects protected entry %s',
+    entry => {
+      // #given a prefix overlapping a protected surface
+      // #when parsing it
+      // #then parsing fails and identifies the entry
+      expect(() => parseBrokeredPushExtraPaths(entry)).toThrow(entry)
+      expect(() => parseBrokeredPushExtraPaths(entry)).toThrow('protected')
+    },
+  )
 
   it('exports the canonical protected surface set', () => {
     // #given the shared protected-surface definition
@@ -81,6 +86,10 @@ describe('brokered-push path primitives', () => {
         'yarn.lock',
         'bun.lockb',
         'Dockerfile',
+        '.npmrc',
+        '.gitmodules',
+        'action.yml',
+        'action.yaml',
       ]),
     )
   })
@@ -93,4 +102,24 @@ describe('brokered-push path primitives', () => {
     expect(matchesBrokeredPushPrefix('apps/web/src/index.ts', 'apps')).toBe(true)
     expect(matchesBrokeredPushPrefix('apps-legacy/x.ts', 'apps')).toBe(false)
   })
+
+  it.each([
+    'apps/web/package.json',
+    'apps/web/.github/workflows/ci.yml',
+    'apps/web/Dockerfile.dev',
+    'apps/web/src/index.ts',
+  ])('checks protected segments and basenames for %s', path => {
+    // #when checking the path against the shared protected-surface policy
+    const protectedPath = hasProtectedSegment(path)
+
+    // #then only the protected examples are denied
+    expect(protectedPath).toBe(path !== 'apps/web/src/index.ts')
+  })
+
+  it.each(['apps/x.ts', './apps/x.ts', 'apps/./x.ts', 'apps//x.ts', 'apps/x.ts/'])(
+    'identifies non-canonical brokered paths: %s',
+    path => {
+      expect(isCanonicalBrokeredPushPath(path)).toBe(path === 'apps/x.ts')
+    },
+  )
 })
