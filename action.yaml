@@ -133,6 +133,10 @@ inputs:
       (case-insensitive). Set empty to disable.
     required: false
     default: skip-agent-review
+  brokered-push-extra-paths:
+    description: Comma-separated path prefixes for brokered pushes; protected surfaces remain denied
+    required: false
+    default: ''
 
 outputs:
   session-id:
@@ -144,10 +148,15 @@ outputs:
       JSON migration record with requested state (omitted, auto, or explicit),
       and resolved mode. Pre-execute skips and thrown errors use resolved: null in
       this record and an empty string for resolved-output-mode.
+  brokered-push-allowlist:
+    description: >-
+      JSON effective brokered-push allowlist (defaultPaths, rootFiles, extraPrefixes);
+      empty string when the run exits before finalize. defaultPaths retain trailing slashes and may contain *;
+      extraPrefixes are normalized without trailing slashes and never contain globs
   cache-status:
     description: Cache restore status (hit/miss/corrupted)
   duration:
-    description: Run duration in seconds
+    description: Run duration in milliseconds
 
 runs:
   using: node24

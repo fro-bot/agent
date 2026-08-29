@@ -37,7 +37,7 @@
   },
   "simple-git-hooks": {
     "pre-commit": "bunx lint-staged",
-    "pre-push": "bun run lint && bun run build"
+    "pre-push": "bun install --frozen-lockfile --ignore-scripts && bun run lint && bun run build && git diff --ignore-space-at-eol --stat --exit-code HEAD -- dist/"
   },
   "lint-staged": {
     "*.{ts,js,jsx,tsx,css,md,json,yaml,yml}": [
@@ -88,7 +88,7 @@
     "@types/node": "24.13.3",
     "@vitest/eslint-plugin": "1.6.27",
     "conventional-changelog-conventionalcommits": "10.4.0",
-    "eslint": "10.8.1",
+    "eslint": "10.9.1",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.6",
     "jiti": "2.7.0",

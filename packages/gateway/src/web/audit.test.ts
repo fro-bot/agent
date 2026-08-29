@@ -474,6 +474,51 @@ describe('emitAudit — launch.accepted', () => {
 })
 
 // ---------------------------------------------------------------------------
+// dispatch.completed
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — dispatch.completed', () => {
+  it('logs accepted dispatches at info level', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'dispatch.completed',
+      correlationId: 'corr-dispatch-accepted',
+      githubUserId: 42,
+      repoFullName: 'org/repo',
+      outcome: 'accepted',
+      runId: 123,
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+  })
+
+  it('logs non-accepted dispatch outcomes at warn level', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'dispatch.completed',
+      correlationId: 'corr-dispatch-failed',
+      githubUserId: 42,
+      repoFullName: 'org/repo',
+      outcome: 'github-unavailable',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // launch.rejected
 // ---------------------------------------------------------------------------
 

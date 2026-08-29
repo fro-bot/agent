@@ -520,17 +520,28 @@ describe('buildOperatorApp — health route is explicitly public', () => {
   })
 
   it('assertAllPrivilegedRoutesWrapped passes for the real buildOperatorApp', async () => {
-    // #given
+    // #given — include the dispatch route's optional dependencies so the real
+    // production registration path mounts it before the wrapping assertion.
     const {buildOperatorApp} = await import('./server.js')
+    const sessionStore = (await import('./auth/session.js')).createInMemorySessionStore()
+    const logger = {debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined}
     const app = buildOperatorApp(
       {
-        logger: {debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined},
+        logger,
         isShuttingDown: () => false,
+        sessionStore,
+        allowlist: {isAuthorized: () => true, size: 1},
+        csrfSecret: 'stub-csrf-secret-base64url-32bytes-ok',
+        auditLogger: {info: () => undefined, warn: () => undefined},
+        denylistCache: {getDenylistState: async () => undefined, isRepoDenied: () => false},
+        getBindingByRepo: async () => ({success: true as const, data: null}),
+        dispatchWorkflow: async (owner: string, repo: string) => ({outcome: 'accepted' as const, owner, repo}),
       },
       {bindHost: '127.0.0.1', bindPort: 0, publicOrigin: 'https://operator.example.com'},
     )
 
     // #when / #then — all operator routes are wrapped or explicitly public
     expect(() => assertAllPrivilegedRoutesWrapped(app)).not.toThrow()
+    expect(isPrivilegedRoute(app, 'POST', '/operator/dispatch')).toBe(true)
   })
 })

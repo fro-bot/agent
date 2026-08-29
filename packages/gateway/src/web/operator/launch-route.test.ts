@@ -24,7 +24,7 @@ import {Hono} from 'hono'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {launchWork} from '../../execute/run.js'
 import {setOperatorRouteGuard} from '../operator-route.js'
-import {createIdempotencyGuard} from './idempotency.js'
+import {createIdempotencyGuard, IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
 import {buildLaunchRoute} from './launch-route.js'
 
 // vi.mock is hoisted by Vitest before imports — mock launchWork so route tests
@@ -714,6 +714,28 @@ describe('POST /operator/runs — bad request bodies', () => {
 
     // #then
     expect(response.status).toBe(400)
+  })
+
+  it('accepts the shared idempotency-key length boundary and rejects one character over', async () => {
+    // #given
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when
+    const boundaryResponse = await postRuns(app, {
+      repo: 'acme/widget',
+      prompt: 'do something',
+      idempotencyKey: 'k'.repeat(IDEMPOTENCY_KEY_MAX_LENGTH),
+    })
+    const overLimitResponse = await postRuns(app, {
+      repo: 'acme/widget',
+      prompt: 'do something',
+      idempotencyKey: 'k'.repeat(IDEMPOTENCY_KEY_MAX_LENGTH + 1),
+    })
+
+    // #then
+    expect(boundaryResponse.status).toBe(202)
+    expect(overLimitResponse.status).toBe(400)
   })
 })
 
