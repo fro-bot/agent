@@ -1,11 +1,95 @@
+import type {BrokeredPushAllowlist} from '@fro-bot/runtime'
 import type {FileChange} from './types.js'
 
 import {describe, expect, it} from 'vitest'
-import {validateBrokeredPushFiles} from './brokered-push-validation.js'
+import {
+  createBrokeredPushAllowlist,
+  serializeBrokeredPushAllowlist,
+  validateBrokeredPushFiles,
+} from './brokered-push-validation.js'
 
 function contentChange(path: string): FileChange {
   return {path, content: 'content'}
 }
+
+function probePath(defaultPath: string): string {
+  return `${defaultPath.replaceAll('*', 'runtime')}probe.ts`
+}
+
+function mutatedSiblingPath(defaultPath: string): string {
+  return `${defaultPath.replaceAll('*', 'runtime').replace(/\/$/, '')}2/probe.ts`
+}
+
+function extraStarSegmentPath(defaultPath: string): string {
+  return `${defaultPath.replaceAll('*', 'a/b')}probe.ts`
+}
+
+describe('brokered-push allowlist serialization', () => {
+  it('serializes the enforcement defaults, root files, and configured extras', () => {
+    // #given configured extra prefixes
+    const allowlist = createBrokeredPushAllowlist(['apps', 'tools/cli'])
+
+    // #when serializing the effective allowlist
+    const serialized = serializeBrokeredPushAllowlist(allowlist)
+
+    // #then the output is a stable machine-readable record
+    expect(JSON.parse(serialized)).toEqual({
+      defaultPaths: ['src/', 'packages/*/src/', 'docs/'],
+      rootFiles: ['README.md', 'ARCHITECTURE.md', 'STRUCTURE.md'],
+      extraPrefixes: ['apps', 'tools/cli'],
+    })
+  })
+
+  it('serializes defaults without extras when no prefixes are configured', () => {
+    // #when serializing the default effective allowlist
+    const serialized = serializeBrokeredPushAllowlist(createBrokeredPushAllowlist())
+
+    // #then only the default definitions are present
+    expect(JSON.parse(serialized)).toEqual({
+      defaultPaths: ['src/', 'packages/*/src/', 'docs/'],
+      rootFiles: ['README.md', 'ARCHITECTURE.md', 'STRUCTURE.md'],
+      extraPrefixes: [],
+    })
+  })
+
+  it('pins every serialized default path to enforcement', () => {
+    // #given paths from the serialized effective allowlist
+    const {defaultPaths} = JSON.parse(
+      serializeBrokeredPushAllowlist(createBrokeredPushAllowlist()),
+    ) as BrokeredPushAllowlist
+
+    for (const defaultPath of defaultPaths) {
+      // #when validating a probe and a mutated sibling derived from that serialized pattern
+      const admittedResult = validateBrokeredPushFiles([contentChange(probePath(defaultPath))])
+      const deniedResult = validateBrokeredPushFiles([contentChange(mutatedSiblingPath(defaultPath))])
+
+      // #then the serialized pattern predicts the validator's admission boundary
+      expect(admittedResult).toEqual({valid: true, errors: []})
+      expect(deniedResult.valid).toBe(false)
+    }
+
+    for (const defaultPath of defaultPaths.filter(path => path.includes('*'))) {
+      // #then a wildcard widened to multiple path segments would be rejected
+      const extraSegmentResult = validateBrokeredPushFiles([contentChange(extraStarSegmentPath(defaultPath))])
+      expect(extraSegmentResult.valid).toBe(false)
+    }
+  })
+
+  it('pins every serialized root file to enforcement', () => {
+    // #given root files from the serialized effective allowlist
+    const {rootFiles} = JSON.parse(
+      serializeBrokeredPushAllowlist(createBrokeredPushAllowlist()),
+    ) as BrokeredPushAllowlist
+
+    for (const path of rootFiles) {
+      // #when validating the serialized root file verbatim
+      const result = validateBrokeredPushFiles([contentChange(path)])
+
+      // #then the root file remains admitted by default enforcement
+      expect(result).toEqual({valid: true, errors: []})
+    }
+  })
+})
 
 describe('validateBrokeredPushFiles', () => {
   it('accepts allowlisted product, package, documentation, and top-level documentation paths', () => {

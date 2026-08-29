@@ -5,6 +5,7 @@ import {
   hasProtectedSegment,
   isCanonicalBrokeredPushPath,
   matchesBrokeredPushPrefix,
+  MAX_BROKERED_PUSH_EXTRA_PATHS,
   normalizeBrokeredPushPrefix,
   parseBrokeredPushExtraPaths,
 } from './brokered-push-paths.js'
@@ -37,6 +38,39 @@ describe('brokered-push path primitives', () => {
 
     // #then the normalized prefix appears once
     expect(result).toEqual(['apps'])
+  })
+
+  it('accepts the maximum number of extra prefixes', () => {
+    // #given exactly the configured extra-prefix limit
+    const input = Array.from({length: MAX_BROKERED_PUSH_EXTRA_PATHS}, (_, index) => `apps/${index}`).join(',')
+
+    // #when parsing the extra path list
+    const result = parseBrokeredPushExtraPaths(input)
+
+    // #then all entries are accepted
+    expect(result).toHaveLength(MAX_BROKERED_PUSH_EXTRA_PATHS)
+  })
+
+  it('accepts duplicate raw entries when the unique prefix count is within the limit', () => {
+    // #given more raw entries than the limit that normalize to one prefix
+    const input = Array.from({length: MAX_BROKERED_PUSH_EXTRA_PATHS + 1}, () => 'apps').join(',')
+
+    // #when parsing the extra path list
+    const result = parseBrokeredPushExtraPaths(input)
+
+    // #then the effective configuration contains the one unique prefix
+    expect(result).toEqual(['apps'])
+  })
+
+  it('rejects an extra-prefix list above the configured limit with the received count', () => {
+    // #given one more entry than the configured extra-prefix limit
+    const input = Array.from({length: MAX_BROKERED_PUSH_EXTRA_PATHS + 1}, (_, index) => `apps/${index}`).join(',')
+
+    // #when parsing the extra path list
+    // #then parsing fails loudly with the received entry count
+    expect(() => parseBrokeredPushExtraPaths(input)).toThrow(
+      `received ${MAX_BROKERED_PUSH_EXTRA_PATHS + 1} unique entries`,
+    )
   })
 
   it('nFC-normalizes prefix entries', () => {

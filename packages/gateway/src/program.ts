@@ -6,6 +6,7 @@ import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
 import type {RunTask} from './execute/run.js'
+import type {DispatchWorkflow} from './github/dispatch.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
@@ -167,6 +168,8 @@ export interface BuildOperatorServerInputs {
    * a missing dep and verify the launch route is absent.
    */
   readonly launchWorkDeps?: NonNullable<OperatorServerDeps['launchWorkDeps']>
+  /** Existing transport-neutral workflow dispatcher shared with Discord dispatch. */
+  readonly dispatchWorkflow: DispatchWorkflow
   /**
    * Operator push subscription deps — threaded through only when push is
    * enabled AND the object store passed its startup CAS self-test. When
@@ -228,6 +231,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     approvalRegistry,
     cancelRunDeps,
     launchWorkDeps,
+    dispatchWorkflow,
     operatorPush,
     onSessionRevoke,
     operatorWebConfig,
@@ -296,6 +300,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     // launchWorkDeps: server.ts gates POST /operator/runs on this dep being present.
     // Shared with the Discord mention path so both use the same run-state instances.
     launchWorkDeps,
+    dispatchWorkflow,
     runObservationManager,
     runIndex,
     approvalRegistry,
@@ -807,6 +812,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           runObserver: runObservationManager,
         },
         launchWorkDeps: runEngineDeps,
+        dispatchWorkflow,
         operatorPush,
         // Session revoke → operator push deactivation. Only registered when
         // push is enabled (operatorPush is present here iff the self-test

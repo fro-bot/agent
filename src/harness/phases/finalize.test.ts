@@ -235,6 +235,30 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.setOutput.mock.calls.filter(([name]) => name === 'output-mode-migration')).toHaveLength(1)
   })
 
+  it('emits the effective brokered-push allowlist with configured extra prefixes', async () => {
+    // #given a bootstrap configuration with an opted-in consumer prefix
+    const bootstrap = createBootstrap({
+      inputs: {...createBootstrap().inputs, brokeredPushExtraPaths: ['apps', 'tools/cli']},
+    })
+    const routing = createRouting()
+    const execution = createExecution()
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize emits the normal action outputs
+    await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, Date.now(), createMockLogger())
+
+    // #then the serialized allowlist includes the enforcement defaults and configured extras
+    expect(mocks.setOutput).toHaveBeenCalledWith(
+      'brokered-push-allowlist',
+      JSON.stringify({
+        defaultPaths: ['src/', 'packages/*/src/', 'docs/'],
+        rootFiles: ['README.md', 'ARCHITECTURE.md', 'STRUCTURE.md'],
+        extraPrefixes: ['apps', 'tools/cli'],
+      }),
+    )
+  })
+
   it('fails the run when runResponsePost reports delivered: false', async () => {
     // #given file-convention delivery whose post attempt fails
     const bootstrap = createBootstrap()

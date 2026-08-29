@@ -1,5 +1,5 @@
 /**
- * Per-operator bounded in-memory idempotency guard for the launch route.
+ * Per-operator bounded in-memory idempotency guard for the launch and dispatch routes.
  *
  * Keys are namespaced per operator: `${githubUserId}:${clientKey}` so operator A
  * cannot replay operator B's key to suppress B's launch (cross-operator poisoning).
@@ -39,6 +39,9 @@ export const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000
 
 /** Maximum number of idempotency entries before eviction. */
 export const IDEMPOTENCY_MAX_ENTRIES = 10_000
+
+/** Maximum client-supplied idempotency-key length for operator write routes. */
+export const IDEMPOTENCY_KEY_MAX_LENGTH = 256
 
 // ---------------------------------------------------------------------------
 // Types

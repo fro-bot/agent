@@ -137,8 +137,15 @@ export interface ActionOutputs {
   readonly sessionId: string | null
   readonly resolvedOutputMode: ResolvedOutputMode | null
   readonly outputModeMigration?: OutputModeMigrationState | null
+  readonly brokeredPushAllowlist?: BrokeredPushAllowlist | null
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly duration: number
+}
+
+export interface BrokeredPushAllowlist {
+  readonly defaultPaths: readonly string[]
+  readonly rootFiles: readonly string[]
+  readonly extraPrefixes: readonly string[]
 }
 
 // Token usage tracking (matches OpenCode SDK structure)
