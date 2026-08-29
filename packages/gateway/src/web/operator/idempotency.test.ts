@@ -3,7 +3,12 @@
  */
 
 import {describe, expect, it} from 'vitest'
-import {createIdempotencyGuard, IDEMPOTENCY_MAX_ENTRIES, IDEMPOTENCY_TTL_MS} from './idempotency.js'
+import {
+  createIdempotencyGuard,
+  IDEMPOTENCY_KEY_MAX_LENGTH,
+  IDEMPOTENCY_MAX_ENTRIES,
+  IDEMPOTENCY_TTL_MS,
+} from './idempotency.js'
 
 describe('createIdempotencyGuard', () => {
   describe('check — new key', () => {
@@ -177,6 +182,10 @@ describe('createIdempotencyGuard', () => {
 
     it('exports the expected default max entries', () => {
       expect(IDEMPOTENCY_MAX_ENTRIES).toBe(10_000)
+    })
+
+    it('exports the shared client-key length cap', () => {
+      expect(IDEMPOTENCY_KEY_MAX_LENGTH).toBe(256)
     })
   })
 

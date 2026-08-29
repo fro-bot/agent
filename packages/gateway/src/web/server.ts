@@ -827,7 +827,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // DispatchWorkflow; it does not duplicate GitHub logic.
   // Route: POST /operator/dispatch — privileged (requires session + allowlist + CSRF).
   // Gate ordering: guard → operator rate limit → session token → body parse →
-  // binding → denylist → authz → dispatch.
+  // binding → denylist → write authz → dispatch.
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -852,7 +852,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
       dispatchWorkflow: deps.dispatchWorkflow,
-      idempotencyGuard: deps.dispatchIdempotencyGuard ?? createIdempotencyGuard(),
+      idempotencyGuard: deps.dispatchIdempotencyGuard ?? createIdempotencyGuard({now: clock}),
       auditLogger: deps.auditLogger,
       logger: deps.logger,
       now: clock,

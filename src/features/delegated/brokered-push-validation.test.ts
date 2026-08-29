@@ -20,6 +20,10 @@ function mutatedSiblingPath(defaultPath: string): string {
   return `${defaultPath.replaceAll('*', 'runtime').replace(/\/$/, '')}2/probe.ts`
 }
 
+function extraStarSegmentPath(defaultPath: string): string {
+  return `${defaultPath.replaceAll('*', 'a/b')}probe.ts`
+}
+
 describe('brokered-push allowlist serialization', () => {
   it('serializes the enforcement defaults, root files, and configured extras', () => {
     // #given configured extra prefixes
@@ -62,6 +66,12 @@ describe('brokered-push allowlist serialization', () => {
       // #then the serialized pattern predicts the validator's admission boundary
       expect(admittedResult).toEqual({valid: true, errors: []})
       expect(deniedResult.valid).toBe(false)
+    }
+
+    for (const defaultPath of defaultPaths.filter(path => path.includes('*'))) {
+      // #then a wildcard widened to multiple path segments would be rejected
+      const extraSegmentResult = validateBrokeredPushFiles([contentChange(extraStarSegmentPath(defaultPath))])
+      expect(extraSegmentResult.valid).toBe(false)
     }
   })
 

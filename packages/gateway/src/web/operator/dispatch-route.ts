@@ -13,7 +13,7 @@
  *   4. JSON body validation ({repo, task})
  *   5. Server-owned binding resolution
  *   6. Denylist check — before authz, with no oracle
- *   7. Repo authorization
+ *   7. Write-level repo authorization
  *   8. Idempotency check/reservation
  *   9. DispatchWorkflow
  *
@@ -36,9 +36,10 @@ import {createHash, randomUUID} from 'node:crypto'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {bindingToRepoKey} from '../../redaction/surface-gate.js'
 import {emitAudit} from '../audit.js'
-import {checkRepoAuthz} from '../auth/repo-authz.js'
+import {checkRepoWriteAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
+import {IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -62,7 +63,7 @@ const DISPATCH_IDEMPOTENCY_MAX_ENTRIES = 10_000
 export interface DispatchRouteDeps {
   readonly sessionStore: LaunchRouteSessionStore
   readonly bindingsLookup: LaunchRouteBindingsLookup
-  /** Must run before repo authz so denied repos never trigger a GitHub query. */
+  /** Must run before write authz so denied repos never trigger a GitHub query. */
   readonly isRepoDenied: (repoKey: RepoKey) => boolean
   readonly repoAuthzDeps: RepoAuthzDeps
   readonly dispatchWorkflow: DispatchWorkflow
@@ -165,6 +166,10 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
     }
     const {owner, repo} = parsedRepo
     const idempotencyKeyField = bodyObj.idempotencyKey
+    if (typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > IDEMPOTENCY_KEY_MAX_LENGTH) {
+      deps.logger.warn({githubUserId, gate: 'bad-body'}, 'dispatch: denied — idempotency key is too long')
+      return c.json({error: 'bad request'}, 400)
+    }
     const idempotencyKey =
       typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > 0 ? idempotencyKeyField : undefined
 
@@ -193,7 +198,7 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
 
     let authzResult
     try {
-      authzResult = await checkRepoAuthz(githubUserId, owner, repo, token, deps.repoAuthzDeps)
+      authzResult = await checkRepoWriteAuthz(githubUserId, owner, repo, token, deps.repoAuthzDeps)
     } catch {
       deps.logger.warn({githubUserId, gate: 'authz-denied'}, 'dispatch: denied — repo authz failed')
       return notFoundResponse(c)
@@ -205,7 +210,7 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
 
     if (idempotencyKey !== undefined) {
       const idempotencyMapKey = `${githubUserId}:${idempotencyKey}`
-      const fingerprint = fingerprintDispatchRequest(owner, repo, taskField)
+      const fingerprint = fingerprintDispatchRequest(owner, repo, taskField.trim())
       const priorMarker = deps.idempotencyGuard.check(githubUserId, idempotencyKey)
       if (priorMarker !== undefined) {
         const completed = completedDispatches.get(idempotencyMapKey)
@@ -229,8 +234,9 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
           }
         }
 
-        // A live guard marker without a completed or in-flight outcome can only
-        // come from an inconsistent/injected guard. Do not dispatch twice.
+        // A live guard marker without a completed or in-flight outcome can arise
+        // from independent in-process eviction (or an inconsistent/injected guard).
+        // Do not dispatch twice.
         deps.logger.warn({githubUserId, gate: 'idempotent'}, 'dispatch: idempotency outcome unavailable')
         return c.json({error: 'internal error'}, 500)
       }
@@ -241,14 +247,16 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
         const dispatchPromise = deps.dispatchWorkflow(owner, repo, taskField)
         inFlightDispatches.set(idempotencyMapKey, {fingerprint, promise: dispatchPromise})
         const outcome = await dispatchPromise
-        deps.idempotencyGuard.commit(githubUserId, idempotencyKey)
-        committed = true
-        completedDispatches.set(idempotencyMapKey, {
-          fingerprint,
-          outcome,
-          expiresAt: deps.now() + DISPATCH_IDEMPOTENCY_TTL_MS,
-        })
-        pruneCompletedDispatches(completedDispatches, deps.now())
+        if (outcome.outcome === 'accepted') {
+          deps.idempotencyGuard.commit(githubUserId, idempotencyKey)
+          committed = true
+          completedDispatches.set(idempotencyMapKey, {
+            fingerprint,
+            outcome,
+            expiresAt: deps.now() + DISPATCH_IDEMPOTENCY_TTL_MS,
+          })
+          pruneCompletedDispatches(completedDispatches, deps.now())
+        }
         emitDispatchAudit(deps.auditLogger, outcome, githubUserId, owner, repo)
         return c.json({outcome}, 200)
       } catch {

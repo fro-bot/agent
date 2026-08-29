@@ -45,7 +45,7 @@ function makeBindingsLookup(binding: RepoBinding | null = makeBinding()): Launch
 function makeRepoAuthzDeps(overrides?: Partial<RepoAuthzDeps>): RepoAuthzDeps {
   return {
     allowlist: {isAuthorized: vi.fn(() => true), size: 1},
-    fetch: vi.fn(async () => new Response('{"permission":"admin"}', {status: 200})),
+    fetch: vi.fn(async () => new Response('{"permissions":{"admin":true}}', {status: 200})),
     clock: () => 0,
     random: () => 0.5,
     auditLogger: {info: vi.fn(), warn: vi.fn()},
@@ -271,6 +271,43 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     expect(vi.mocked(repoAuthzDeps.auditLogger.warn)).not.toHaveBeenCalled()
   })
 
+  it('returns 404 for a write-authz denial without dispatching', async () => {
+    // #given — the operator can read the repo but lacks write permission
+    const repoAuthzDeps = makeRepoAuthzDeps({
+      fetch: vi.fn(async () => new Response('{"permissions":{}}', {status: 200})),
+    })
+    const dispatchWorkflow: DispatchWorkflow = vi.fn()
+    const deps = makeDeps({repoAuthzDeps, dispatchWorkflow})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postDispatch(app, {repo: 'acme/widget', task: 'do work'})
+
+    // #then
+    expect(response.status).toBe(404)
+    expect(dispatchWorkflow).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {success: true as const, data: null},
+    {success: false as const, error: new Error('lookup failed')},
+  ])('returns 404 for a binding lookup failure: $success', async bindingResult => {
+    // #given
+    const bindingsLookup: LaunchRouteBindingsLookup = {
+      getBindingByRepo: vi.fn(async () => bindingResult),
+    }
+    const dispatchWorkflow: DispatchWorkflow = vi.fn()
+    const deps = makeDeps({bindingsLookup, dispatchWorkflow})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postDispatch(app, {repo: 'acme/widget', task: 'do work'})
+
+    // #then
+    expect(response.status).toBe(404)
+    expect(dispatchWorkflow).not.toHaveBeenCalled()
+  })
+
   it('same operator and idempotency key twice dispatches only once and replays the outcome', async () => {
     // #given
     const dispatchWorkflow: DispatchWorkflow = vi.fn(async () => ({
@@ -365,6 +402,79 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     expect((await firstResponse).status).toBe(200)
   })
 
+  it('coalesces an in-flight replay with the same payload', async () => {
+    // #given — hold one dispatch open after reservation
+    let releaseDispatch: ((outcome: DispatchOutcome) => void) | undefined
+    const dispatchWorkflow: DispatchWorkflow = vi.fn(
+      async () =>
+        new Promise<DispatchOutcome>(resolve => {
+          releaseDispatch = resolve
+        }),
+    )
+    const deps = makeDeps({dispatchWorkflow})
+    const app = buildApp(deps)
+    const firstResponse = postDispatch(app, {repo: 'acme/widget', task: 'same task', idempotencyKey: 'flight-key'})
+    await vi.waitFor(() => expect(dispatchWorkflow).toHaveBeenCalledOnce())
+
+    // #when — repeat the exact payload while the first request is in flight
+    const secondResponse = postDispatch(app, {repo: 'acme/widget', task: 'same task', idempotencyKey: 'flight-key'})
+    releaseDispatch?.({outcome: 'accepted', owner: 'acme', repo: 'widget'})
+
+    // #then — both callers receive the one dispatch result
+    expect((await firstResponse).status).toBe(200)
+    expect((await secondResponse).status).toBe(200)
+    expect(dispatchWorkflow).toHaveBeenCalledOnce()
+  })
+
+  it('rolls back when dispatch throws so an immediate retry dispatches again', async () => {
+    // #given
+    const dispatchWorkflow: DispatchWorkflow = vi
+      .fn<DispatchWorkflow>()
+      .mockRejectedValueOnce(new Error('GitHub request failed'))
+      .mockResolvedValueOnce({outcome: 'accepted', owner: 'acme', repo: 'widget'})
+    const idempotencyGuard = createIdempotencyGuard()
+    const rollbackSpy = vi.spyOn(idempotencyGuard, 'rollback')
+    const deps = makeDeps({dispatchWorkflow, idempotencyGuard})
+    const app = buildApp(deps)
+
+    // #when
+    const firstResponse = await postDispatch(app, {repo: 'acme/widget', task: 'do work', idempotencyKey: 'throw-key'})
+    const secondResponse = await postDispatch(app, {repo: 'acme/widget', task: 'do work', idempotencyKey: 'throw-key'})
+
+    // #then
+    expect(firstResponse.status).toBe(500)
+    expect(secondResponse.status).toBe(200)
+    expect(dispatchWorkflow).toHaveBeenCalledTimes(2)
+    expect(rollbackSpy).toHaveBeenCalledOnce()
+  })
+
+  it('rolls back non-accepted outcomes so a failure can be retried with the same key', async () => {
+    // #given — the first GitHub attempt is unavailable, then the retry succeeds
+    const dispatchWorkflow: DispatchWorkflow = vi
+      .fn<DispatchWorkflow>()
+      .mockResolvedValueOnce({outcome: 'github-unavailable', owner: 'acme', repo: 'widget'})
+      .mockResolvedValueOnce({outcome: 'accepted', owner: 'acme', repo: 'widget'})
+    const deps = makeDeps({dispatchWorkflow})
+    const app = buildApp(deps)
+
+    // #when
+    const firstResponse = await postDispatch(app, {
+      repo: 'acme/widget',
+      task: 'do work',
+      idempotencyKey: 'failure-key',
+    })
+    const secondResponse = await postDispatch(app, {
+      repo: 'acme/widget',
+      task: 'do work',
+      idempotencyKey: 'failure-key',
+    })
+
+    // #then — non-accepted results are not sticky
+    expect(firstResponse.status).toBe(200)
+    expect(secondResponse.status).toBe(200)
+    expect(dispatchWorkflow).toHaveBeenCalledTimes(2)
+  })
+
   it('returns 404 when the session token is unavailable', async () => {
     // #given
     const sessionStore = makeSessionStore({getOperatorToken: vi.fn(() => undefined)})
@@ -391,6 +501,36 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     expect(response.status).toBe(429)
     expect(sessionStore.getOperatorToken).not.toHaveBeenCalled()
   })
+
+  it('returns 429 when the per-hour operator limit is exceeded', async () => {
+    // #given
+    const perHrRateLimiter = {allow: vi.fn(() => false)}
+    const deps = makeDeps({perHrRateLimiter})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postDispatch(app, {repo: 'acme/widget', task: 'do work'})
+
+    // #then
+    expect(response.status).toBe(429)
+    expect(perHrRateLimiter.allow).toHaveBeenCalledWith('1001')
+  })
+
+  it('short-circuits before consuming the hourly budget when the minute limit rejects', async () => {
+    // #given
+    const perMinRateLimiter = {allow: vi.fn(() => false)}
+    const perHrRateLimiter = {allow: vi.fn(() => false)}
+    const deps = makeDeps({perMinRateLimiter, perHrRateLimiter})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postDispatch(app, {repo: 'acme/widget', task: 'do work'})
+
+    // #then
+    expect(response.status).toBe(429)
+    expect(perMinRateLimiter.allow).toHaveBeenCalledOnce()
+    expect(perHrRateLimiter.allow).not.toHaveBeenCalled()
+  })
 })
 
 describe('POST /operator/dispatch — malformed bodies', () => {
@@ -416,6 +556,28 @@ describe('POST /operator/dispatch — malformed bodies', () => {
 
     // #then
     expect(response.status).toBe(400)
+  })
+
+  it('accepts the shared idempotency-key length boundary and rejects one character over', async () => {
+    // #given
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when
+    const boundaryResponse = await postDispatch(app, {
+      repo: 'acme/widget',
+      task: 'do work',
+      idempotencyKey: 'k'.repeat(256),
+    })
+    const overLimitResponse = await postDispatch(app, {
+      repo: 'acme/widget',
+      task: 'do work',
+      idempotencyKey: 'k'.repeat(257),
+    })
+
+    // #then
+    expect(boundaryResponse.status).toBe(200)
+    expect(overLimitResponse.status).toBe(400)
   })
 })
 

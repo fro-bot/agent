@@ -40,6 +40,9 @@ export const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000
 /** Maximum number of idempotency entries before eviction. */
 export const IDEMPOTENCY_MAX_ENTRIES = 10_000
 
+/** Maximum client-supplied idempotency-key length for operator write routes. */
+export const IDEMPOTENCY_KEY_MAX_LENGTH = 256
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
