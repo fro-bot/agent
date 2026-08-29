@@ -121,6 +121,7 @@ function createBootstrap(
       dedupWindow: 0,
       responseMode: 'github',
       reviewSkipLabel: null,
+      brokeredPushExtraPaths: [],
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},

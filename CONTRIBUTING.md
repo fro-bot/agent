@@ -59,9 +59,9 @@ Example: `feat(setup): add --skip-auth flag`.
 Hooks are installed automatically on `bun install`:
 
 - **pre-commit** — runs `lint-staged` (ESLint `--fix` on staged files).
-- **pre-push** — runs `bun run lint && bun run build`, including the committed-`dist/` sync check.
+- **pre-push** — syncs `node_modules` to the lockfile (`bun install --frozen-lockfile --ignore-scripts`), runs `bun run lint && bun run build`, then fails the push if the rebuilt `dist/` differs from `HEAD` (`git diff --ignore-space-at-eol --stat --exit-code HEAD -- dist/`).
 
-Run `bun run lint && bun run build` yourself before pushing to catch failures early.
+Run that same chain yourself before pushing to catch failures early — a build against stale `node_modules` reproduces its own drift and looks clean locally.
 
 ## Pull Requests
 

@@ -48,6 +48,7 @@ export const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readon
   {method: 'GET', path: '/operator/repos'},
   {method: 'GET', path: '/operator/runs'},
   {method: 'POST', path: '/operator/runs'},
+  {method: 'POST', path: '/operator/dispatch'},
   {method: 'GET', path: '/operator/runs/:runId/stream'},
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
   {method: 'GET', path: '/operator/runs/:runId/approvals'},
@@ -117,6 +118,10 @@ function makeStubCancelRunDeps() {
   // Registration only checks `deps.cancelRunDeps !== undefined`; the actual
   // shape is not inspected at construction time.
   return {} as NonNullable<Parameters<typeof buildOperatorApp>[0]['cancelRunDeps']>
+}
+
+function makeStubDispatchWorkflow() {
+  return async (owner: string, repo: string, _task: string) => ({outcome: 'accepted' as const, owner, repo})
 }
 
 function makeStubLaunchWorkDeps() {
@@ -326,6 +331,7 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     // sees the same value as production. When undefined (regression test), the
     // helper passes undefined to deps.launchWorkDeps and POST /operator/runs is absent.
     launchWorkDeps,
+    dispatchWorkflow: makeStubDispatchWorkflow(),
     // operatorPush flows through the helper so the route gate in server.ts sees
     // the same value as production. When undefined (regression test), the helper
     // passes undefined to deps.operatorPushStore/deps.operatorPushVapidKeyInfo

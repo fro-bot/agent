@@ -94,6 +94,7 @@ describe('parseActionInputs', () => {
       expect(result.success && result.data.storeConfig.region).toBe('')
       expect(result.success && result.data.storeConfig.prefix).toBe(DEFAULT_S3_PREFIX)
       expect(result.success && result.data.outputMode).toBe('auto')
+      expect(result.success && result.data.brokeredPushExtraPaths).toEqual([])
     })
 
     it('parses output-mode default value as auto when input is empty', () => {
@@ -488,6 +489,68 @@ describe('parseActionInputs', () => {
   })
 
   describe('with invalid inputs', () => {
+    it('returns normalized brokered-push extra paths', () => {
+      // #given consumer paths supplied through the action input
+      mockInputs({'brokered-push-extra-paths': ' apps/, tools/cli '})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the paths are normalized and threaded into ActionInputs
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.brokeredPushExtraPaths).toEqual(['apps', 'tools/cli'])
+    })
+
+    it('pins the empty action metadata default for brokered-push extra paths', () => {
+      // #given the committed action metadata
+      const actionYaml = readFileSync(resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+
+      // #when locating the brokered-push-extra-paths input block
+      const block = actionYaml.slice(actionYaml.indexOf('brokered-push-extra-paths:'))
+
+      // #then its metadata default keeps the opt-in disabled by default
+      expect(block.length).toBeGreaterThan(0)
+      expect(block.slice(0, block.indexOf('\n\n'))).toContain("default: ''")
+    })
+
+    it.each(['../etc', '/abs/path', 'docs/../.github/', '.github/', 'scripts/', 'package.json'])(
+      'returns an error naming invalid brokered-push path %s',
+      path => {
+        // #given a malformed or protected extra path
+        mockInputs({'brokered-push-extra-paths': path})
+
+        // #when parsing action inputs
+        const result = parseActionInputs()
+
+        // #then parsing fails and identifies the offending entry
+        expect(result.success).toBe(false)
+        expect(!result.success && result.error.message).toContain(path)
+      },
+    )
+
+    it('fails identically for malformed paths on workflow_dispatch-style input', () => {
+      // #given a malformed path under the normal issue-comment context
+      mockInputs({'brokered-push-extra-paths': 'docs/../.github/'})
+      vi.stubEnv('GITHUB_EVENT_NAME', 'issue_comment')
+
+      // #when parsing action inputs in the normal context and a manual-dispatch context
+      const issueCommentResult = parseActionInputs()
+      vi.stubEnv('GITHUB_EVENT_NAME', 'workflow_dispatch')
+      const workflowDispatchResult = parseActionInputs()
+
+      // #then the same parser error is returned independently of the trigger
+      expect(issueCommentResult.success === false).toBe(true)
+      expect(workflowDispatchResult.success === false).toBe(true)
+      expect(issueCommentResult.success === false && issueCommentResult.error.message).toContain('docs/../.github/')
+      expect(issueCommentResult.success === false && issueCommentResult.error.message).toContain('malformed')
+      expect(issueCommentResult.success === false && workflowDispatchResult.success === false).toBe(true)
+      expect(
+        issueCommentResult.success === false &&
+          workflowDispatchResult.success === false &&
+          issueCommentResult.error.message,
+      ).toBe(workflowDispatchResult.success ? '' : workflowDispatchResult.error.message)
+    })
+
     it('returns error for missing github-token', () => {
       mockInputs({
         'github-token': '',

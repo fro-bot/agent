@@ -587,7 +587,7 @@ Environment setup is integrated into the main action via auto-setup. The separat
 **Acceptance Criteria:**
 - [x] Auto-setup integrated into main action (`fro-bot/agent@v0`)
 - [x] OpenCode and oMo installed automatically on first run
-- [x] Outputs: `session-id`, `cache-status`, `duration`
+- [x] Outputs: `session-id`, `resolved-output-mode`, `output-mode-migration`, `cache-status`, `duration`, `brokered-push-allowlist`
 
 ---
 
