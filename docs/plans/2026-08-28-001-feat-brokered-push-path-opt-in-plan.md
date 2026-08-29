@@ -1,7 +1,7 @@
 ---
 title: 'Brokered push: consumer path opt-in and failure specificity'
 type: feat
-status: active
+status: done
 date: 2026-08-28
 deepened: 2026-08-28
 ---

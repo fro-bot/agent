@@ -45,6 +45,9 @@ Session notes #314 and #292: the agent-native review of #1489 flagged the write-
 
 - Representation-vs-enforcement drift is this repo's recurring failure (response-file deny-rule incident; #1493's nested-surface gap): R2 exists because of it.
 - `verify-behavior-not-signal-2026-08-23.md` — tests must assert the serialized output content and the route's response body, not branch entry.
+- `web-operator-launch-surface-2026-06-20.md` — operator write routes: server-owned resolution, denylist before authz, coarse pre-acceptance denials; the new route mirrors these verbatim.
+- `authenticated-sse-run-observation-2026-06-20.md` — no-oracle discipline: every pre-acceptance denial collapses to the same coarse response.
+- `key-credential-switch-on-operation-input-not-audit-token-2026-07-17.md` — auth and gating never key off correlation/audit identifiers.
 
 ## Prior-Art Survey
 
@@ -92,7 +95,11 @@ Session notes #314 and #292: the agent-native review of #1489 flagged the write-
 - **Finalize-only emission**: the output appears alongside `resolved-output-mode` in normal runs and is empty on early-exit paths — consistent with existing output semantics, no threading through `setUnavailableActionOutputs`. *(Confirmed at scope gate.)*
 - **Flat `200 + {outcome}` for all nine dispatcher outcomes**: the structured union is the contract this route exists to expose; HTTP statuses are reserved for transport failures (auth 404-coarse, malformed 400, rate limit 429, capacity 503). Mapping outcome classes onto statuses would re-collapse the union. *(Confirmed at scope gate.)*
 - **Gate ordering copied from launch-route verbatim**: binding lookup → denylist → authz — because the denylist predicate consumes binding deny keys, it cannot run earlier; docs are corrected to say what the code enforces (denylist before any authz/GitHub query).
-- **Audit event carries outcome discriminant + runId only**: no task text, no install URLs, no full outcome payload — matching `emitAudit`'s sanitization posture.
+- **Audit event carries outcome discriminant + runId + repo key only**: no task text, no install URLs, no full outcome payload. Repo identity follows the `launch.accepted` precedent (non-redacted repos only — the denylist gate precedes dispatch), and **no audit event fires on a denylist denial**, so redacted identity never reaches the audit stream. Correlation IDs are generated per-request, never the operator session ID (opaque secret — established gateway rule), and nothing keys auth on them.
+- **Route accepts an idempotency key** mirroring launch-route's guard: a network-retry double-POST must not fire two workflow runs. Fire-and-forget to GitHub makes this the only dedup point.
+- **Empty output means unresolved, not empty allowlist**: early-exit runs emit `''` for `brokered-push-allowlist` (consistent with `resolved-output-mode`); README documents that consumers must treat empty/absent as "not resolved" — a `{}` would falsely claim an empty policy.
+- **Serialized pattern language is documented**: `*` in a default path means exactly one path segment (matching the enforcement regex `[^/]+`); README states this so consumer-side glob libraries don't reinterpret it as unbounded depth. The drift-pin test enforces agreement.
+- **Extra-prefix count is capped at parse time** (loud failure), bounding output size and serialization cost.
 
 ## Open Questions
 
@@ -136,6 +143,10 @@ Session notes #314 and #292: the agent-native review of #1489 flagged the write-
 
 **Test scenarios:**
 - Happy: accepted outcome returns 200 with `runId`/`runUrl` when present; audit event emitted with discriminant + runId.
+- Accepted WITHOUT runId (GitHub 204-no-details path) returns 200 `{outcome:'accepted'}` cleanly; audit event omits runId; README documents the client contract for this state.
+- Idempotency: same key twice → one dispatcher call; guard behavior mirrors launch-route.
+- Registration: the privileged-route wrapping smoke test (`operator-route.test.ts`) receives dispatch deps so the route actually registers and is asserted wrapped — optional-dep omission must not silently skip it.
+- No audit event emitted on denylist denial (pin).
 - Every non-accepted variant returns 200 with its discriminant intact (parametrize all nine).
 - Error paths: unauthenticated → coarse 404; denylisted binding → coarse 404 with no GitHub call (pin call order); malformed body → 400; rate limit → 429.
 - Security projections: response and audit contain no task text echo, no install URLs in audit, no binding internals.
