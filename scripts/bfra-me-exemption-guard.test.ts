@@ -6,9 +6,11 @@ interface PackageJson {
   readonly workspaces?: unknown
   readonly dependencies?: unknown
   readonly devDependencies?: unknown
+  readonly peerDependencies?: unknown
+  readonly optionalDependencies?: unknown
 }
 
-interface BunfigExcludes {
+export interface BunfigExcludes {
   readonly entries: readonly string[]
   readonly lineNumber: number
 }
@@ -46,27 +48,30 @@ function isBfraMePackage(name: string): boolean {
 }
 
 function dependencyNames(packageJson: PackageJson): readonly string[] {
-  return (['dependencies', 'devDependencies'] as const).flatMap(field => {
+  return (['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'] as const).flatMap(field => {
     const value = packageJson[field]
     if (value === undefined) return []
     return Object.keys(recordValue(value, field))
   })
 }
 
-function readBunfigExcludes(path: string): BunfigExcludes {
-  const lines = readFileSync(path, 'utf8').split(/\r?\n/)
+const JSON_COMPATIBLE_ARRAY_ERROR =
+  'minimumReleaseAgeExcludes must be a JSON-compatible array (double quotes, no trailing comma, no inline comments)'
+
+export function parseBunfigExcludes(source: string): BunfigExcludes {
+  const lines = source.split(/\r?\n/)
   const lineIndex = lines.findIndex(line => /^\s*minimumReleaseAgeExcludes\s*=/.test(line))
   if (lineIndex === -1) {
-    throw new Error(`${path} must define minimumReleaseAgeExcludes`)
+    throw new Error('bunfig.toml must define minimumReleaseAgeExcludes')
   }
 
   const line = lines[lineIndex]
   if (line === undefined) {
-    throw new Error(`${path}:${lineIndex + 1} minimumReleaseAgeExcludes is unreadable`)
+    throw new Error(`bunfig.toml:${lineIndex + 1} minimumReleaseAgeExcludes is unreadable`)
   }
   const equalsIndex = line.indexOf('=')
   if (equalsIndex === -1) {
-    throw new Error(`${path}:${lineIndex + 1} minimumReleaseAgeExcludes must be an assignment`)
+    throw new Error(`bunfig.toml:${lineIndex + 1} minimumReleaseAgeExcludes must be an assignment`)
   }
   let arraySource = line.slice(equalsIndex + 1).trim()
   let nextLine = lineIndex + 1
@@ -79,14 +84,27 @@ function readBunfigExcludes(path: string): BunfigExcludes {
 
   const closingBracket = arraySource.indexOf(']')
   if (closingBracket === -1) {
-    throw new Error(`${path}:${lineIndex + 1} minimumReleaseAgeExcludes must be an array`)
+    throw new Error(`bunfig.toml:${lineIndex + 1} ${JSON_COMPATIBLE_ARRAY_ERROR}`)
   }
 
-  const entries = stringArray(
-    JSON.parse(arraySource.slice(0, closingBracket + 1)) as unknown,
-    `${path}:${lineIndex + 1}`,
-  )
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(arraySource.slice(0, closingBracket + 1)) as unknown
+  } catch {
+    throw new Error(`bunfig.toml:${lineIndex + 1} ${JSON_COMPATIBLE_ARRAY_ERROR}`)
+  }
+
+  let entries: readonly string[]
+  try {
+    entries = stringArray(parsed, `bunfig.toml:${lineIndex + 1}`)
+  } catch {
+    throw new Error(`bunfig.toml:${lineIndex + 1} ${JSON_COMPATIBLE_ARRAY_ERROR}`)
+  }
   return {entries, lineNumber: lineIndex + 1}
+}
+
+function readBunfigExcludes(path: string): BunfigExcludes {
+  return parseBunfigExcludes(readFileSync(path, 'utf8'))
 }
 
 export function checkBfraMeExemptions(
@@ -120,6 +138,57 @@ function actionableMessage(check: BfraMeExemptionCheck, lineNumber: number): str
   return messages.join(' ')
 }
 
+describe('parseBunfigExcludes', () => {
+  it('parses a multi-line JSON-compatible array and preserves its assignment line', () => {
+    // #given a Bun configuration whose exemption array spans multiple lines
+    const source = '[install]\nminimumReleaseAgeExcludes = [\n  "@bfra.me/es",\n  "@bfra.me/tsconfig"\n]\n'
+
+    // #when / #then
+    expect(parseBunfigExcludes(source)).toEqual({
+      entries: ['@bfra.me/es', '@bfra.me/tsconfig'],
+      lineNumber: 2,
+    })
+  })
+
+  it('ignores a trailing comment after the exemption array', () => {
+    // #given an exemption array followed by a TOML comment
+    const source = 'minimumReleaseAgeExcludes = ["@bfra.me/es"] # first-party package\n'
+
+    // #when / #then
+    expect(parseBunfigExcludes(source)).toEqual({entries: ['@bfra.me/es'], lineNumber: 1})
+  })
+
+  it('reports a missing exemption key', () => {
+    // #given Bun configuration without the exemption setting
+    const source = 'minimumReleaseAge = 259200\n'
+
+    // #when / #then
+    expect(() => parseBunfigExcludes(source)).toThrow('bunfig.toml must define minimumReleaseAgeExcludes')
+  })
+
+  it('reports an exemption array without a closing bracket', () => {
+    // #given an unterminated exemption array
+    const source = 'minimumReleaseAgeExcludes = ["@bfra.me/es"\n'
+
+    // #when / #then
+    expect(() => parseBunfigExcludes(source)).toThrow(`bunfig.toml:1 ${JSON_COMPATIBLE_ARRAY_ERROR}`)
+  })
+
+  it.each([
+    ['a trailing comma', 'minimumReleaseAgeExcludes = ["@bfra.me/es",]\n'],
+    ['single-quoted entries', "minimumReleaseAgeExcludes = ['@bfra.me/es']\n"],
+    [
+      'an inline comment inside the array',
+      'minimumReleaseAgeExcludes = ["@bfra.me/es", # comment\n"@bfra.me/tsconfig"]\n',
+    ],
+  ])('rejects %s with an instructive JSON compatibility error', (_label, source) => {
+    // #given an exemption array that is not valid JSON
+
+    // #when / #then
+    expect(() => parseBunfigExcludes(source)).toThrow(`bunfig.toml:1 ${JSON_COMPATIBLE_ARRAY_ERROR}`)
+  })
+})
+
 describe('checkBfraMeExemptions', () => {
   it('reports a first-party dependency missing from the exemption list', () => {
     // #given a newly introduced first-party dependency without a matching exemption
@@ -147,6 +216,20 @@ describe('checkBfraMeExemptions', () => {
 
     // #when / #then
     expect(check).toEqual({missingDependencies: [], invalidExcludes: []})
+  })
+
+  it('flags first-party peer and optional dependencies missing from exemptions', () => {
+    // #given first-party packages declared through the widened dependency fields
+    const dependencies = dependencyNames({
+      peerDependencies: {'@bfra.me/peer-package': '1.0.0'},
+      optionalDependencies: {'@bfra.me/optional-package': '1.0.0'},
+    })
+
+    // #when / #then
+    expect(checkBfraMeExemptions([], dependencies)).toEqual({
+      missingDependencies: ['@bfra.me/optional-package', '@bfra.me/peer-package'],
+      invalidExcludes: [],
+    })
   })
 })
 
