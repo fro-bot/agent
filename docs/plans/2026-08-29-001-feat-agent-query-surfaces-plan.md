@@ -110,7 +110,7 @@ Session notes #314 and #292: the agent-native review of #1489 flagged the write-
 
 ## Implementation Units
 
-- [ ] **Unit 1: `brokered-push-allowlist` action output**
+- [x] **Unit 1: `brokered-push-allowlist` action output**
 
 **Goal:** Agents read the effective allowlist from run outputs. (R1, R2)
 
@@ -128,7 +128,7 @@ Session notes #314 and #292: the agent-native review of #1489 flagged the write-
 
 **Verification:** an agent can parse the output JSON and predict admissibility of a candidate path without a delivery attempt.
 
-- [ ] **Unit 2: operator-web dispatch route + audit event**
+- [x] **Unit 2: operator-web dispatch route + audit event**
 
 **Goal:** Programmatic dispatch with structured outcome. (R3, R4)
 
@@ -154,7 +154,7 @@ Session notes #314 and #292: the agent-native review of #1489 flagged the write-
 
 **Verification:** an agent can POST a dispatch and branch on `outcome` without scraping prose; denylist ordering pinned by test.
 
-- [ ] **Unit 3: doc corrections + plan hygiene**
+- [x] **Unit 3: doc corrections + plan hygiene**
 
 **Goal:** Docs state enforced reality. (R5)
 
