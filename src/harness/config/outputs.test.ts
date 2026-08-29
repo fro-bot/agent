@@ -23,15 +23,24 @@ describe('setActionOutputs', () => {
     const outputs: ActionOutputs = {
       sessionId: 'ses_abc123',
       resolvedOutputMode: 'working-dir',
+      brokeredPushAllowlist: {
+        defaultPaths: ['src/'],
+        rootFiles: ['README.md'],
+        extraPrefixes: [],
+      },
       cacheStatus: 'hit',
       duration: 1500,
     }
 
     setActionOutputs(outputs)
 
-    expect(mockSetOutput).toHaveBeenCalledTimes(4)
+    expect(mockSetOutput).toHaveBeenCalledTimes(5)
     expect(mockSetOutput).toHaveBeenCalledWith('session-id', 'ses_abc123')
     expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', 'working-dir')
+    expect(mockSetOutput).toHaveBeenCalledWith(
+      'brokered-push-allowlist',
+      JSON.stringify({defaultPaths: ['src/'], rootFiles: ['README.md'], extraPrefixes: []}),
+    )
     expect(mockSetOutput).toHaveBeenCalledWith('cache-status', 'hit')
     expect(mockSetOutput).toHaveBeenCalledWith('duration', 1500)
   })
@@ -49,6 +58,7 @@ describe('setActionOutputs', () => {
 
     expect(mockSetOutput).toHaveBeenCalledWith('session-id', '')
     expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', '')
+    expect(mockSetOutput).toHaveBeenCalledWith('brokered-push-allowlist', '')
     expect(mockSetOutput).toHaveBeenCalledWith('cache-status', 'miss')
     expect(mockSetOutput).toHaveBeenCalledWith('duration', 500)
   })

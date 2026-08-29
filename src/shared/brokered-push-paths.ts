@@ -22,6 +22,7 @@ export const BROKERED_PUSH_PROTECTED_SURFACES: ReadonlySet<string> = new Set([
   'action.yml',
   'action.yaml',
 ])
+export const MAX_BROKERED_PUSH_EXTRA_PATHS = 64
 
 function isDockerfileVariant(prefix: string): boolean {
   // Keep the Dockerfile. suffix shape, but case-fold policy matching consistently.
@@ -142,13 +143,18 @@ export function isCanonicalBrokeredPushPath(path: string): boolean {
  */
 export function parseBrokeredPushExtraPaths(input: string): readonly string[] {
   const prefixes = new Set<string>()
+  const entries = input
+    .split(',')
+    .map(rawEntry => rawEntry.trim())
+    .filter(entry => entry.length > 0)
 
-  for (const rawEntry of input.split(',')) {
-    const entry = rawEntry.trim()
-    if (entry.length === 0) {
-      continue
-    }
+  if (entries.length > MAX_BROKERED_PUSH_EXTRA_PATHS) {
+    throw new Error(
+      `Invalid brokered-push-extra-paths: received ${entries.length} entries; maximum is ${MAX_BROKERED_PUSH_EXTRA_PATHS}`,
+    )
+  }
 
+  for (const entry of entries) {
     try {
       const normalized = normalizeBrokeredPushPrefix(entry)
       if (isProtectedSurfaceOverlap(normalized)) {

@@ -1,3 +1,4 @@
+import type {BrokeredPushAllowlist} from '@fro-bot/runtime'
 import type {FileChange} from './types.js'
 
 import {
@@ -10,9 +11,30 @@ import {
 } from '../../shared/brokered-push-paths.js'
 import {validateFiles} from './commit.js'
 
-const BROKERED_PUSH_ALLOWED_PATHS = [/^src\//, /^packages\/[^/]+\/src\//, /^docs\//]
-const BROKERED_PUSH_ALLOWED_ROOT_FILES = new Set(['README.md', 'ARCHITECTURE.md', 'STRUCTURE.md'])
+const BROKERED_PUSH_ALLOWED_PATH_DEFINITIONS = [
+  {defaultPath: 'src/', pattern: /^src\//},
+  {defaultPath: 'packages/*/src/', pattern: /^packages\/[^/]+\/src\//},
+  {defaultPath: 'docs/', pattern: /^docs\//},
+] as const
+export const BROKERED_PUSH_ALLOWED_PATHS = BROKERED_PUSH_ALLOWED_PATH_DEFINITIONS.map(definition => definition.pattern)
+export const BROKERED_PUSH_ALLOWED_ROOT_FILES: ReadonlySet<string> = new Set([
+  'README.md',
+  'ARCHITECTURE.md',
+  'STRUCTURE.md',
+])
 export const MAX_BROKERED_PUSH_FILES = 100
+
+export function createBrokeredPushAllowlist(extraPrefixes: readonly string[] = []): BrokeredPushAllowlist {
+  return {
+    defaultPaths: BROKERED_PUSH_ALLOWED_PATH_DEFINITIONS.map(definition => definition.defaultPath),
+    rootFiles: [...BROKERED_PUSH_ALLOWED_ROOT_FILES],
+    extraPrefixes: [...extraPrefixes],
+  }
+}
+
+export function serializeBrokeredPushAllowlist(allowlist: BrokeredPushAllowlist): string {
+  return JSON.stringify(allowlist)
+}
 
 export type BrokeredPushValidationResult =
   | {readonly valid: true; readonly errors: readonly []}

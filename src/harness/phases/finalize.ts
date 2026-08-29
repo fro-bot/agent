@@ -13,6 +13,7 @@ import * as core from '@actions/core'
 import {createErrorInfo, createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
 import {readAndParseResponseFile, runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
+import {createBrokeredPushAllowlist} from '../../features/delegated/brokered-push-validation.js'
 import {runBrokeredPush} from '../../features/delegated/brokered-push.js'
 import {writeJobSummary} from '../../features/observability/index.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
@@ -185,6 +186,7 @@ export async function runFinalize(
     sessionId: execution.sessionId,
     resolvedOutputMode: execution.resolvedOutputMode,
     outputModeMigration: execution.outputModeMigration,
+    brokeredPushAllowlist: createBrokeredPushAllowlist(bootstrap.inputs.brokeredPushExtraPaths),
     cacheStatus: cacheRestore.cacheStatus,
     duration,
   })
