@@ -808,7 +808,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         logger: deps.logger,
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
-      idempotencyGuard: deps.idempotencyGuard ?? createIdempotencyGuard(),
+      idempotencyGuard: deps.idempotencyGuard ?? createIdempotencyGuard({now: clock}),
       launchWorkDeps: deps.launchWorkDeps,
       logger: deps.logger,
       now: clock,

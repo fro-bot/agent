@@ -1,5 +1,5 @@
 /**
- * Per-operator bounded in-memory idempotency guard for the launch route.
+ * Per-operator bounded in-memory idempotency guard for the launch and dispatch routes.
  *
  * Keys are namespaced per operator: `${githubUserId}:${clientKey}` so operator A
  * cannot replay operator B's key to suppress B's launch (cross-operator poisoning).
