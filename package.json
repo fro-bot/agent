@@ -37,7 +37,7 @@
   },
   "simple-git-hooks": {
     "pre-commit": "bunx lint-staged",
-    "pre-push": "bun run lint && bun run build"
+    "pre-push": "bun install --frozen-lockfile --ignore-scripts && bun run lint && bun run build && git diff --ignore-space-at-eol --stat --exit-code HEAD -- dist/"
   },
   "lint-staged": {
     "*.{ts,js,jsx,tsx,css,md,json,yaml,yml}": [
@@ -62,7 +62,7 @@
     "postcss": ">=8.5.23",
     "tar": ">=7.5.21",
     "undici": ">=8.9.0",
-    "vite": "8.2.1",
+    "vite": "8.2.2",
     "yaml": ">=2.8.3"
   },
   "dependencies": {
@@ -72,23 +72,23 @@
     "@actions/exec": "3.0.0",
     "@actions/github": "9.1.1",
     "@actions/tool-cache": "4.0.0",
-    "@aws-sdk/client-s3": "3.1108.0",
+    "@aws-sdk/client-s3": "3.1119.0",
     "@bfra.me/es": "0.1.0",
     "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.2.0",
-    "@opencode-ai/sdk": "1.18.19"
+    "@opencode-ai/sdk": "1.18.21"
   },
   "devDependencies": {
-    "@bfra.me/eslint-config": "0.51.1",
-    "@bfra.me/prettier-config": "0.16.9",
-    "@bfra.me/tsconfig": "0.13.1",
+    "@bfra.me/eslint-config": "0.52.1",
+    "@bfra.me/prettier-config": "0.16.11",
+    "@bfra.me/tsconfig": "0.13.2",
     "@octokit/webhooks-types": "7.6.1",
     "@semantic-release/exec": "7.1.0",
     "@semantic-release/git": "11.0.1",
     "@types/node": "24.13.3",
     "@vitest/eslint-plugin": "1.6.27",
     "conventional-changelog-conventionalcommits": "10.4.0",
-    "eslint": "10.8.1",
+    "eslint": "10.9.1",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.6",
     "jiti": "2.7.0",

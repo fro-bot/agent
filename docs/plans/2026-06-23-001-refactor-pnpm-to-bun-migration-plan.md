@@ -209,7 +209,7 @@ Migration phases and their gate relationship:
 
 **Dependencies:** Units 1-4.
 
-**Files:** Create: `docs/plans/2026-06-23-001-bun-spike-findings.md` (decision artifact).
+**Files:** Create: `docs/decisions/2026-06-23-001-bun-spike-findings.md` (decision artifact).
 
 **Approach:**
 - Run `bun install --linker isolated` to surface phantom dependencies; weigh isolated (pnpm-semantics, phantom-dep protection, Bun 1.3 bug tail) vs hoisted (more stable, loses protection).

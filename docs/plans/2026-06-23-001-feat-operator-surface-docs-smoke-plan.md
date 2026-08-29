@@ -1,7 +1,7 @@
 ---
 title: "feat: Operator control-surface documentation and smoke coverage (Unit 8)"
 type: feat
-status: completed
+status: done
 date: 2026-06-23
 origin: docs/plans/2026-06-15-002-feat-gateway-web-operator-control-surface-plan.md
 ---

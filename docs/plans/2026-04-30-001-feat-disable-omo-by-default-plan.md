@@ -1,7 +1,7 @@
 ---
 title: "feat: Disable oMo by default"
 type: feat
-status: completed
+status: done
 date: 2026-04-30
 completed: 2026-05-09
 origin: docs/brainstorms/2026-04-29-disable-omo-by-default-requirements.md

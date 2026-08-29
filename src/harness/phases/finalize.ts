@@ -1,4 +1,4 @@
-import type {BrokeredPushOutcome} from '../../features/delegated/brokered-push.js'
+import type {BrokeredPushFailureClass, BrokeredPushOutcome} from '../../features/delegated/brokered-push.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CommentSummaryOptions} from '../../features/observability/types.js'
 import type {CommentTarget} from '../../services/github/types.js'
@@ -13,9 +13,11 @@ import * as core from '@actions/core'
 import {createErrorInfo, createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
 import {readAndParseResponseFile, runResponsePost} from '../../features/agent/response-post.js'
 import {formatErrorComment, postComment} from '../../features/comments/index.js'
+import {createBrokeredPushAllowlist} from '../../features/delegated/brokered-push-validation.js'
 import {runBrokeredPush} from '../../features/delegated/brokered-push.js'
 import {writeJobSummary} from '../../features/observability/index.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {setActionOutputs} from '../config/outputs.js'
 
@@ -34,9 +36,9 @@ const FILE_READ_FAILURE_FALLBACK_ACTION =
 const FILE_READ_FAILURE_AFTER_SUCCESS_ACTION =
   'The agent execution completed, but the response artifact was not found at the expected path, so no response was delivered.'
 
-const BROKERED_PUSH_ERROR_MESSAGE = 'Brokered push delivery failed. The model response was not posted.'
 const BROKERED_PUSH_ERROR_ACTION = 'Review the workflow logs and retry the run.'
 const MAX_FOOTER_PATHS = 50
+const MAX_BROKERED_PUSH_ERROR_PATHS = 10
 /** Keep brokered delivery below the job ceiling and bound reconstruction even when Git cannot observe AbortSignal. */
 export const BROKERED_PUSH_TIMEOUT_MS = 120_000
 const BROKERED_PUSH_TIMEOUT_REASON = 'brokered push exceeded time budget'
@@ -76,10 +78,61 @@ function failWithPrimaryExecutionError(execution: ExecutePhaseResult): number {
   return execution.exitCode
 }
 
-function createBrokeredPushError() {
-  return createErrorInfo('internal', BROKERED_PUSH_ERROR_MESSAGE, false, {
+const BROKERED_PUSH_FAILURE_MESSAGES: Readonly<Record<BrokeredPushFailureClass, string>> = {
+  validation: 'Brokered push failure (validation): a changed file path is outside the brokered-push allowlist.',
+  reconstruction: 'Brokered push failure (reconstruction): the changed files could not be reconstructed.',
+  'moved-head': 'Brokered push failure (moved-head): the pull request head moved during delivery.',
+  identity: 'Brokered push failure (identity): the pull request identity changed during delivery.',
+  permission: 'Brokered push failure (permission): the brokered-push permission check failed.',
+  commit: 'Brokered push failure (commit): the commit could not be created.',
+  timeout: 'Brokered push failure (timeout): delivery exceeded its time budget.',
+  unknown: 'Brokered push failure (unknown): delivery failed before the cause could be classified.',
+}
+
+function createBrokeredPushError(failureClass: BrokeredPushFailureClass) {
+  return createErrorInfo('internal', BROKERED_PUSH_FAILURE_MESSAGES[failureClass], false, {
     suggestedAction: BROKERED_PUSH_ERROR_ACTION,
   })
+}
+
+function toRepoRelativeBrokeredPushPath(value: string): string {
+  const normalizedValue = value
+    .replaceAll('\\', '/')
+    .replaceAll('\n', ' ')
+    .replaceAll('\r', ' ')
+    .replaceAll('\u2028', ' ')
+    .replaceAll('\u2029', ' ')
+  const workspace = (process.env.GITHUB_WORKSPACE ?? process.cwd()).replaceAll('\\', '/').replace(/\/+$/, '')
+
+  if (normalizedValue === workspace) return '.'
+  if (normalizedValue.startsWith(`${workspace}/`)) return normalizedValue.slice(workspace.length + 1)
+
+  return normalizedValue.replace(/^\/+/, '').replace(/^\.\//, '')
+}
+
+function sanitizeBrokeredPushPath(value: string): string {
+  return toRepoRelativeBrokeredPushPath(value).replaceAll('`', '').replaceAll('~', '')
+}
+
+function formatBrokeredPushError(outcome: Extract<BrokeredPushOutcome, {readonly kind: 'fail-loud'}>): string {
+  const errorComment = formatErrorComment(createBrokeredPushError(outcome.failureClass))
+  if (outcome.failureClass === 'validation') {
+    if (outcome.paths.length === 0) {
+      return errorComment
+    }
+
+    const visiblePaths = outcome.paths.slice(0, MAX_BROKERED_PUSH_ERROR_PATHS).map(sanitizeBrokeredPushPath)
+    const remainingPathCount = outcome.paths.length - visiblePaths.length
+    const pathSummary = remainingPathCount > 0 ? `\n… and ${remainingPathCount} more` : ''
+
+    return `${errorComment}\n\nOffending paths:\n\`\`\`\n${visiblePaths.join('\n')}\n\`\`\`${pathSummary}`
+  }
+
+  return errorComment
+}
+
+function createUnknownBrokeredPushOutcome(error: unknown): Extract<BrokeredPushOutcome, {readonly kind: 'fail-loud'}> {
+  return {kind: 'fail-loud', failureClass: 'unknown', reason: toErrorMessage(error)}
 }
 
 function escapeFooterCode(value: string): string {
@@ -133,6 +186,7 @@ export async function runFinalize(
     sessionId: execution.sessionId,
     resolvedOutputMode: execution.resolvedOutputMode,
     outputModeMigration: execution.outputModeMigration,
+    brokeredPushAllowlist: createBrokeredPushAllowlist(bootstrap.inputs.brokeredPushExtraPaths),
     cacheStatus: cacheRestore.cacheStatus,
     duration,
   })
@@ -225,7 +279,7 @@ export async function runFinalize(
       result = responsePrecheck
     } else {
       let deliveryFooter: string | undefined
-      if (execution.success === true && execution.commentsPosted === 0) {
+      if (execution.success === true) {
         const triggerContext = routing.triggerResult.context
         const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
         const eventFacts = {
@@ -251,25 +305,32 @@ export async function runFinalize(
           // race is the hard bound for a stalled subprocess. The losing promise
           // is abandoned but never leaks: main.ts exits via process.exit(exitCode)
           // once run() resolves, which terminates any still-live git child.
+          const brokeredPushPromise = Promise.resolve()
+            .then(async () =>
+              runBrokeredPush({
+                octokit: routing.githubClient,
+                execAdapter: createExecAdapter(),
+                logger,
+                eventFacts,
+                trustedHeadSha: bootstrap.trustedHeadSha,
+                expectedHeadBranch,
+                repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
+                extraPathPrefixes: bootstrap.inputs.brokeredPushExtraPaths,
+                signal: controller.signal,
+              }),
+            )
+            .catch(createUnknownBrokeredPushOutcome)
+
           const brokeredPush = await Promise.race<BrokeredPushOutcome>([
-            runBrokeredPush({
-              octokit: routing.githubClient,
-              execAdapter: createExecAdapter(),
-              logger,
-              eventFacts,
-              trustedHeadSha: bootstrap.trustedHeadSha,
-              expectedHeadBranch,
-              repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
-              signal: controller.signal,
-            }),
+            brokeredPushPromise,
             // This branch only ever resolves (to fail-loud), never rejects — a
-            // load-bearing invariant: runBrokeredPush is async and always resolves
-            // to fail-loud, so the race can never reject and the abandoned losing
-            // promise cannot surface as an unhandled rejection.
+            // load-bearing invariant: the brokered-push promise above also normalizes
+            // synchronous throws and rejected promises, so the race can never reject
+            // and the abandoned losing promise cannot surface as an unhandled rejection.
             new Promise<BrokeredPushOutcome>(resolve => {
               timeout = setTimeout(() => {
                 controller.abort()
-                resolve({kind: 'fail-loud', reason: BROKERED_PUSH_TIMEOUT_REASON})
+                resolve({kind: 'fail-loud', failureClass: 'timeout', reason: BROKERED_PUSH_TIMEOUT_REASON})
               }, BROKERED_PUSH_TIMEOUT_MS)
             }),
           ])
@@ -281,8 +342,8 @@ export async function runFinalize(
             // reconstructs the updated branch to nothing-to-deliver, so it self-heals.
             const commentTarget = resolveCommentTarget(routing)
             if (execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)) {
-              const safeError = createBrokeredPushError()
-              await postErrorComment(routing, commentTarget, formatErrorComment(safeError), metrics, logger)
+              const safeError = formatBrokeredPushError(brokeredPush)
+              await postErrorComment(routing, commentTarget, safeError, metrics, logger)
             } else if (execution.commentsPosted === 0 && !isResolvedCommentTarget(commentTarget)) {
               logger.warning('Cannot post brokered push failure comment: missing target context')
             }

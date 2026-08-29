@@ -54,6 +54,7 @@ import {bindingToRepoKey} from '../../redaction/surface-gate.js'
 import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
+import {IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
 import {createWebApprovalOnPending} from './web-approval.js'
 import {createWebReplySink, createWebStatusSink} from './web-sinks.js'
 
@@ -238,6 +239,10 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     const repoField = bodyObj.repo
     const promptField = bodyObj.prompt
     const idempotencyKeyField = bodyObj.idempotencyKey
+    if (typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > IDEMPOTENCY_KEY_MAX_LENGTH) {
+      deps.logger.warn({githubUserId, gate: 'bad-body'}, 'launch: denied — idempotency key is too long')
+      return c.json({error: 'bad request'}, 400)
+    }
 
     if (typeof repoField !== 'string' || repoField.trim().length === 0) {
       deps.logger.warn({githubUserId, gate: 'bad-body'}, 'launch: denied — missing or empty repo field')

@@ -1,7 +1,7 @@
 ---
 title: 'feat: Gateway web operator API surface'
 type: feat
-status: completed
+status: done
 completed: 2026-06-23
 date: 2026-06-15
 origin: docs/brainstorms/2026-06-15-gateway-control-surface-phase-b-requirements.md

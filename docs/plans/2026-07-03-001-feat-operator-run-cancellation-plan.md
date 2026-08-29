@@ -1,7 +1,7 @@
 ---
 title: 'feat: operator-initiated run cancellation'
 type: feat
-status: active
+status: done
 date: 2026-07-03
 origin: docs/brainstorms/2026-07-03-operator-run-cancellation-requirements.md
 deepened: 2026-07-03
@@ -102,7 +102,7 @@ Traceability to the origin doc's requirements:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Cancel signal seam — abort registry + `'cancelled'` error kind + CANCELLED error path**
+- [x] **Unit 1: Cancel signal seam — abort registry + `'cancelled'` error kind + CANCELLED error path**
 
 **Goal:** An in-flight run can be aborted by runId, and the run lifecycle settles it as `CANCELLED` (not `FAILED`) with partial output preserved.
 
@@ -135,7 +135,7 @@ Traceability to the origin doc's requirements:
 
 **Verification:** gateway `tsc` + full gateway suite green; a simulated in-flight run cancelled via the registry lands `CANCELLED` with all resources released (asserted via fakes, not sleeps).
 
-- [ ] **Unit 2: Cancel orchestrator — queue removal, approval cascade, thread notice, attribution**
+- [x] **Unit 2: Cancel orchestrator — queue removal, approval cascade, thread notice, attribution**
 
 **Goal:** A single transport-neutral `cancelRun(runId, actor, deps)` entry point that resolves the run's phase and executes the correct cancellation path.
 
@@ -170,7 +170,7 @@ Traceability to the origin doc's requirements:
 
 **Verification:** every origin acceptance example AE1–AE7 that is orchestrator-scoped has a corresponding passing test; queue removal is race-checked against concurrent `takeNext` in a deterministic test.
 
-- [ ] **Unit 3: Operator cancel route + contract 1.6.0 + pins + audit**
+- [x] **Unit 3: Operator cancel route + contract 1.6.0 + pins + audit**
 
 **Goal:** `POST /operator/runs/:runId/cancel` exposed on the operator surface with full guard parity, typed response, audit events, and the contract bump.
 
@@ -202,7 +202,7 @@ Traceability to the origin doc's requirements:
 
 **Verification:** ingress-pin, smoke, and full gateway suite green; the SSE ready-frame carries 1.6.0.
 
-- [ ] **Unit 4: Crash-consistency recovery — reconcile CANCELLED runs holding live locks**
+- [x] **Unit 4: Crash-consistency recovery — reconcile CANCELLED runs holding live locks**
 
 **Goal:** A crash between the `CANCELLED` transition and resource cleanup cannot strand the per-repo lock (origin R9).
 

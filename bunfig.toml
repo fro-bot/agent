@@ -12,3 +12,9 @@ linker = "hoisted"
 # Supply-chain age gate: refuse dependency versions published within this window.
 # Mirrors the prior pnpm minimumReleaseAge policy. Seconds (3 days).
 minimumReleaseAge = 259200
+
+# First-party packages, published from bfra-me/works under the same ownership as
+# this repo. The age gate buys a cooling-off period against a compromised upstream
+# publish; it has nothing to buy here, and it blocks Renovate's own update PRs from
+# installing for three days. Bun matches these exactly — no glob support.
+minimumReleaseAgeExcludes = ["@bfra.me/es", "@bfra.me/eslint-config", "@bfra.me/prettier-config", "@bfra.me/tsconfig"]

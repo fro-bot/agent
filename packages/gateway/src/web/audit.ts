@@ -4,6 +4,8 @@
  * Gateway restart clears all in-flight audit state; no durable queue in v1.
  */
 
+import type {DispatchOutcome} from '../github/dispatch.js'
+
 export interface AuditLogger {
   readonly info: (ctx: Record<string, unknown>, msg: string) => void
   readonly warn: (ctx: Record<string, unknown>, msg: string) => void
@@ -119,6 +121,16 @@ export interface LaunchRejectedEvent {
   readonly correlationId: string
   readonly githubUserId: number
   readonly reason: LaunchRejectedReason
+}
+
+/** Workflow dispatch completed with a structured dispatcher outcome. */
+export interface DispatchCompletedEvent {
+  readonly kind: 'dispatch.completed'
+  readonly correlationId: string
+  readonly githubUserId: number
+  readonly repoFullName: string
+  readonly outcome: DispatchOutcome['outcome']
+  readonly runId?: number
 }
 
 /** Approval decision submitted by operator. */
@@ -261,6 +273,7 @@ export type AuditEvent =
   | AuthzDeniedEvent
   | LaunchAcceptedEvent
   | LaunchRejectedEvent
+  | DispatchCompletedEvent
   | ApprovalDecisionEvent
   | ApprovalRejectedEvent
   | BindingReadEvent
@@ -327,11 +340,14 @@ function redactIfSensitive(value: string): string {
  * Exhaustive log-level map: every AuditEvent kind must be present.
  * Adding a new variant without updating this map is a compile-time error.
  *
- * Note: 'approval.rejected' and 'push.disabled' are intentionally absent —
- * their levels are reason-dependent. See approvalRejectedLevel() and
- * pushDisabledLevel() below.
+ * Note: 'approval.rejected', 'dispatch.completed', and 'push.disabled' are
+ * intentionally absent — their levels are outcome/reason-dependent. See
+ * approvalRejectedLevel(), dispatchCompletedLevel(), and pushDisabledLevel().
  */
-const LOG_LEVEL: Record<Exclude<AuditEvent['kind'], 'approval.rejected' | 'push.disabled'>, 'info' | 'warn'> = {
+const LOG_LEVEL: Record<
+  Exclude<AuditEvent['kind'], 'approval.rejected' | 'dispatch.completed' | 'push.disabled'>,
+  'info' | 'warn'
+> = {
   'auth.start': 'info',
   'auth.callback.success': 'info',
   'auth.callback.failure': 'warn',
@@ -375,6 +391,11 @@ function approvalRejectedLevel(reason: ApprovalRejectedReason): 'info' | 'warn' 
   }
 }
 
+/** Accepted dispatches are informational; every other outcome is actionable. */
+function dispatchCompletedLevel(outcome: DispatchOutcome['outcome']): 'info' | 'warn' {
+  return outcome === 'accepted' ? 'info' : 'warn'
+}
+
 /**
  * Per-reason log level for 'push.disabled' events.
  *
@@ -413,6 +434,7 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
       ctx.login = redactIfSensitive(event.login)
       break
     case 'launch.accepted':
+    case 'dispatch.completed':
     case 'binding.read':
       ctx.repoFullName = redactIfSensitive(event.repoFullName)
       break
@@ -448,9 +470,11 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
     const level =
       event.kind === 'approval.rejected'
         ? approvalRejectedLevel(event.reason)
-        : event.kind === 'push.disabled'
-          ? pushDisabledLevel(event.reason)
-          : LOG_LEVEL[event.kind]
+        : event.kind === 'dispatch.completed'
+          ? dispatchCompletedLevel(event.outcome)
+          : event.kind === 'push.disabled'
+            ? pushDisabledLevel(event.reason)
+            : LOG_LEVEL[event.kind]
     if (level === 'warn') {
       logger.warn(ctx, msg)
     } else {

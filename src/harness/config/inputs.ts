@@ -12,6 +12,7 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
 import {validateEndpoint, validatePrefix} from '@fro-bot/runtime'
+import {parseBrokeredPushExtraPaths} from '../../shared/brokered-push-paths.js'
 import {
   DEFAULT_DEDUP_WINDOW_MS,
   DEFAULT_OMO_PROVIDERS,
@@ -254,6 +255,8 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const reviewSkipLabelRaw = core.getInput('review-skip-label').trim()
     const reviewSkipLabel = reviewSkipLabelRaw.length > 0 ? reviewSkipLabelRaw : null
 
+    const brokeredPushExtraPaths = parseBrokeredPushExtraPaths(core.getInput('brokered-push-extra-paths'))
+
     // Optional numeric input with default
     const sessionRetentionRaw = core.getInput('session-retention').trim()
     const sessionRetention =
@@ -443,6 +446,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       systematicConfig,
       dedupWindow,
       reviewSkipLabel,
+      brokeredPushExtraPaths,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))

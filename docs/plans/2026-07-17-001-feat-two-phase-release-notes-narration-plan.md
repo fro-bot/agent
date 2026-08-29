@@ -1,7 +1,7 @@
 ---
 title: 'feat: Two-phase release-notes narration (read-only generate, trusted apply)'
 type: feat
-status: active
+status: done
 date: 2026-07-17
 ---
 
@@ -77,7 +77,7 @@ Release narratives are shallow reformats of commit subjects (e.g. v0.92.1) becau
 
 ## Implementation Units
 
-- [ ] **Unit 1: Trusted assembly module**
+- [x] **Unit 1: Trusted assembly module**
 
 **Goal:** Pure validation + assembly logic for the apply phase, plus its CLI entry.
 
@@ -104,7 +104,7 @@ Release narratives are shallow reformats of commit subjects (e.g. v0.92.1) becau
 
 **Verification:** New test file green under `bun run test:scripts`; no behavior change anywhere (module unused until Unit 3).
 
-- [ ] **Unit 2: Generation prompt rewrite**
+- [x] **Unit 2: Generation prompt rewrite**
 
 **Goal:** `buildNarrationPrompt` produces the gather/synthesize/candidate contract instead of rewrite/apply.
 
@@ -127,7 +127,7 @@ Release narratives are shallow reformats of commit subjects (e.g. v0.92.1) becau
 
 **Verification:** `test:scripts` green; prompt snapshot readable end-to-end.
 
-- [ ] **Unit 3: Workflow split — read-only generate job + trusted apply job**
+- [x] **Unit 3: Workflow split — read-only generate job + trusted apply job**
 
 **Goal:** Wire the credential boundary and candidate handoff in `.github/workflows/fro-bot.yaml`.
 
@@ -150,7 +150,7 @@ Release narratives are shallow reformats of commit subjects (e.g. v0.92.1) becau
 
 **Verification:** `bun run lint` green (workflow lint included); YAML parses; a plain `workflow_dispatch` without `release-tag` runs exactly as today (no apply job, PAT provisioned).
 
-- [ ] **Unit 4: Dispatcher passes the tag + monitoring update**
+- [x] **Unit 4: Dispatcher passes the tag + monitoring update**
 
 **Goal:** `dispatch-release-notes.ts` sends `release-tag` as a structured input and monitors the two-job outcome.
 
@@ -175,6 +175,8 @@ Release narratives are shallow reformats of commit subjects (e.g. v0.92.1) becau
 **Verification:** `test:scripts` green; a dry-run dispatch (Unit 5) proves end-to-end wiring.
 
 - [ ] **Unit 5: Docs + live verification**
+
+Open: verification evidence is a live release dry-run, so it leaves no tree artifact to confirm. The narration flow itself ships and is documented in `AGENTS.md`.
 
 **Goal:** Update operational docs and prove the pipeline on a real tag without mutating a real release incorrectly.
 

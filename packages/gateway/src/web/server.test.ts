@@ -1790,6 +1790,7 @@ function makeFullPrivilegedDeps(sessionStore: ReturnType<typeof createInMemorySe
     listBindings: async () => ({success: true, data: []}),
     getBindingByRepo: async () => ({success: true, data: null}),
     launchWorkDeps: makeStubLaunchWorkDeps(),
+    dispatchWorkflow: async (owner: string, repo: string) => ({outcome: 'accepted' as const, owner, repo}),
     approvalRegistry: makeStubApprovalRegistry(),
     cancelRunDeps: makeStubCancelRunDeps(),
     operatorPushStore: makeStubOperatorPushStore(),

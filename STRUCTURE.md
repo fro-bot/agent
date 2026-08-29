@@ -70,7 +70,7 @@ fro-bot/agent/
 │   ├── solutions/              # Documented solutions to past problems
 │   ├── product/                # Product requirements and feature docs
 │   ├── brainstorms/            # Requirements documents from design sessions
-│   ├── decisions/              # Architecture decision records
+│   ├── decisions/              # Architecture decision records, design docs, and spike findings
 │   └── …                       # audits/, examples/, ideation/, privacy/, reference/
 │
 ├── assets/                     # Repository images and branding

@@ -36,6 +36,8 @@ generatePRBody(options)                   // Markdown body with session info
 ## SECURITY
 
 - **Path validation**: Rejects `../`, `.git/`, and secrets (`.env`, `auth.json`, etc.)
+- **Brokered push allowlist**: Defaults to product/package source, docs, and three root docs; `brokered-push-extra-paths` opts into additional segment-boundary prefixes.
+- **Protected surfaces**: Prefix screening denies protected roots, and segment/basename screening denies protected surfaces nested within opted-in prefixes; files admitted by the default allowlist remain governed by the default rules.
 - **File size cap**: 5MB per file (enforced in `validateFiles`)
 - **No force push**: `updateRef` always uses `force: false`
 - **Default author**: Uses `fro-bot[bot]@users.noreply.github.com`
