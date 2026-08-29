@@ -27,6 +27,7 @@ import type {RepoBinding} from '../bindings/types.js'
 import type {CancelRunDeps} from '../execute/cancel.js'
 import type {RunIndex} from '../execute/run-index.js'
 import type {RunMentionDeps} from '../execute/run.js'
+import type {DispatchWorkflow} from '../github/dispatch.js'
 import type {DenylistCache} from '../redaction/denylist.js'
 import type {BindingsLookup} from '../redaction/surface-gate.js'
 import type {AuditLogger} from './audit.js'
@@ -56,6 +57,7 @@ import {buildVapidPublicKeyRoute} from './operator-push/vapid-public-key-route.j
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
 import {buildCancelRoute} from './operator/cancel-route.js'
 import {buildDecisionRoute} from './operator/decision-route.js'
+import {buildDispatchRoute} from './operator/dispatch-route.js'
 import {createIdempotencyGuard} from './operator/idempotency.js'
 import {buildLaunchRoute} from './operator/launch-route.js'
 import {buildPendingApprovalsRoute} from './operator/pending-approvals-route.js'
@@ -206,6 +208,14 @@ export interface OperatorServerDeps {
    * Required when getBindingByRepo is present; ignored otherwise.
    */
   readonly launchWorkDeps?: RunMentionDeps
+  /**
+   * Transport-neutral workflow dispatcher for POST /operator/dispatch.
+   * Required alongside getBindingByRepo for the dispatch route; omitted in
+   * tests or deployments that intentionally do not expose that route.
+   */
+  readonly dispatchWorkflow?: DispatchWorkflow
+  /** Per-operator idempotency guard for workflow dispatch retries. */
+  readonly dispatchIdempotencyGuard?: IdempotencyGuard
   /**
    * Per-operator idempotency guard for the launch route.
    * When absent and the launch route is registered, a fresh in-memory guard is created.
@@ -365,6 +375,7 @@ function validateForwardedHeaders(
  *   - GET /operator/repos: when browser guard + sessionStore + denylistCache + listBindings are set
  *   - GET /operator/runs: when browser guard + sessionStore + denylistCache + listBindings + runIndex are set
  *   - POST /operator/runs: when browser guard + sessionStore + denylistCache + getBindingByRepo + launchWorkDeps are set
+ *   - POST /operator/dispatch: when browser guard + sessionStore + denylistCache + getBindingByRepo + dispatchWorkflow are set
  *   - GET /operator/runs/:runId/stream: when browser guard + sessionStore + denylistCache + bindingsLookup + runObservationManager + runIndex are set
  *   - POST /operator/runs/:runId/approvals/:requestId/decision: when browser guard + sessionStore + denylistCache + bindingsLookup + runIndex + approvalRegistry are set
  *   - GET /operator/runs/:runId/approvals: when browser guard + sessionStore + denylistCache + bindingsLookup + runIndex + approvalRegistry are set
@@ -806,6 +817,45 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       // (e.g. in tests that don't exercise streaming), the sink degrades to a
       // buffering no-op. Mirrors the optional pattern used by buildRunStreamRoute.
       runObservationManager: deps.runObservationManager,
+    })
+  }
+
+  // ── Workflow dispatch route ───────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard and all server-owned dispatch
+  // dependencies are available. The route reuses the existing transport-neutral
+  // DispatchWorkflow; it does not duplicate GitHub logic.
+  // Route: POST /operator/dispatch — privileged (requires session + allowlist + CSRF).
+  // Gate ordering: guard → operator rate limit → session token → body parse →
+  // binding → denylist → authz → dispatch.
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.getBindingByRepo !== undefined &&
+    deps.dispatchWorkflow !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    buildDispatchRoute(app, {
+      sessionStore: deps.sessionStore,
+      bindingsLookup: {getBindingByRepo: deps.getBindingByRepo},
+      isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
+      repoAuthzDeps: {
+        allowlist: deps.allowlist,
+        fetch: globalThis.fetch,
+        clock,
+        random: Math.random.bind(Math),
+        auditLogger: deps.auditLogger,
+        logger: deps.logger,
+        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+      },
+      dispatchWorkflow: deps.dispatchWorkflow,
+      idempotencyGuard: deps.dispatchIdempotencyGuard ?? createIdempotencyGuard(),
+      auditLogger: deps.auditLogger,
+      logger: deps.logger,
+      now: clock,
     })
   }
 

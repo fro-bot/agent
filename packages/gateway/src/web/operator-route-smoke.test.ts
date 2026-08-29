@@ -80,6 +80,10 @@ function makeStubLaunchWorkDeps() {
   return {} as NonNullable<Parameters<typeof buildOperatorApp>[0]['launchWorkDeps']>
 }
 
+function makeStubDispatchWorkflow() {
+  return async (owner: string, repo: string, _task: string) => ({outcome: 'accepted' as const, owner, repo})
+}
+
 function makeStubOperatorWebConfig() {
   const noopLogger = {
     debug: vi.fn(),
@@ -126,6 +130,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       runIndex,
       approvalRegistry,
       launchWorkDeps: makeStubLaunchWorkDeps(),
+      dispatchWorkflow: makeStubDispatchWorkflow(),
       operatorWebConfig,
     })
 
@@ -180,6 +185,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       runIndex,
       approvalRegistry,
       launchWorkDeps: makeStubLaunchWorkDeps(),
+      dispatchWorkflow: makeStubDispatchWorkflow(),
       operatorPush: {
         store: {
           subscribe: async () => ({
@@ -241,6 +247,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       runIndex,
       approvalRegistry,
       launchWorkDeps: makeStubLaunchWorkDeps(),
+      dispatchWorkflow: makeStubDispatchWorkflow(),
       operatorWebConfig,
     })
 
@@ -277,6 +284,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       runIndex,
       approvalRegistry,
       launchWorkDeps: makeStubLaunchWorkDeps(),
+      dispatchWorkflow: makeStubDispatchWorkflow(),
       operatorWebConfig,
     })
 

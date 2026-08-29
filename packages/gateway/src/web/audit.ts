@@ -4,6 +4,8 @@
  * Gateway restart clears all in-flight audit state; no durable queue in v1.
  */
 
+import type {DispatchOutcome} from '../github/dispatch.js'
+
 export interface AuditLogger {
   readonly info: (ctx: Record<string, unknown>, msg: string) => void
   readonly warn: (ctx: Record<string, unknown>, msg: string) => void
@@ -119,6 +121,16 @@ export interface LaunchRejectedEvent {
   readonly correlationId: string
   readonly githubUserId: number
   readonly reason: LaunchRejectedReason
+}
+
+/** Workflow dispatch completed with a structured dispatcher outcome. */
+export interface DispatchCompletedEvent {
+  readonly kind: 'dispatch.completed'
+  readonly correlationId: string
+  readonly githubUserId: number
+  readonly repoFullName: string
+  readonly outcome: DispatchOutcome['outcome']
+  readonly runId?: number
 }
 
 /** Approval decision submitted by operator. */
@@ -261,6 +273,7 @@ export type AuditEvent =
   | AuthzDeniedEvent
   | LaunchAcceptedEvent
   | LaunchRejectedEvent
+  | DispatchCompletedEvent
   | ApprovalDecisionEvent
   | ApprovalRejectedEvent
   | BindingReadEvent
@@ -340,6 +353,7 @@ const LOG_LEVEL: Record<Exclude<AuditEvent['kind'], 'approval.rejected' | 'push.
   'authz.denied': 'warn',
   'launch.accepted': 'info',
   'launch.rejected': 'warn',
+  'dispatch.completed': 'info',
   'approval.decision': 'info',
   'binding.read': 'info',
   'bearer.rejected': 'warn',
@@ -413,6 +427,7 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
       ctx.login = redactIfSensitive(event.login)
       break
     case 'launch.accepted':
+    case 'dispatch.completed':
     case 'binding.read':
       ctx.repoFullName = redactIfSensitive(event.repoFullName)
       break
