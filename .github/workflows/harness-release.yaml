@@ -471,7 +471,7 @@ jobs:
           # Derive the GitHub Release tag.
           # Mirrors the publish job's "Resolve params" derivation.
           SHORT_SHA="${INTEGRATION_COMMIT:0:8}"
-          RELEASE_TAG="${BASE_VERSION}+harness.${SHORT_SHA}"
+          RELEASE_TAG="${BASE_VERSION}-harness.${SHORT_SHA}"
 
           {
             echo "integration_commit=${INTEGRATION_COMMIT}"
@@ -789,7 +789,9 @@ jobs:
               fi
             } > "${NOTES_FILE}"
 
-            # Quote the tag — it contains '+' which some shells/tools misinterpret.
+            # The non-v prefix keeps harness tags outside semantic-release's ^v(.+) scan.
+            # The -harness. prerelease identifier plus --prerelease keeps them out of
+            # Renovate's stable candidates.
             # --latest=false: a harness release must never take GitHub's "latest"
             # pointer from the product agent releases.
             echo "Creating GitHub Release: ${RELEASE_TAG}"
@@ -797,6 +799,7 @@ jobs:
               --title "${RELEASE_TAG}" \
               --notes-file "${NOTES_FILE}" \
               --latest=false \
+              --prerelease \
               opencode-linux-x64.tar.gz \
               opencode-linux-arm64.tar.gz \
               opencode-darwin-x64.zip \
@@ -913,13 +916,12 @@ jobs:
             exit 1
           fi
 
-          # Derive the npm prerelease version and GitHub Release tag.
-          # npm strips SemVer build metadata (§10), so npm uses a prerelease hyphen;
-          # the GitHub Release tag uses build metadata (plus) to match the binary's
-          # self-reported version from buildHarnessVersion().
+          # Derive the npm prerelease version and GitHub Release tag separately.
+          # Both use the hyphen form; the binary's self-reported version intentionally
+          # keeps build metadata (+harness.<sha>) in buildHarnessVersion().
           SHORT_SHA="${INTEGRATION_COMMIT:0:8}"
           NPM_VERSION="${BASE_VERSION}-harness.${SHORT_SHA}"
-          RELEASE_TAG="${BASE_VERSION}+harness.${SHORT_SHA}"
+          RELEASE_TAG="${BASE_VERSION}-harness.${SHORT_SHA}"
 
           {
             echo "integration_commit=${INTEGRATION_COMMIT}"
@@ -1111,9 +1113,10 @@ jobs:
   # build version, with rebuilt action dist/, so future harness releases flow
   # into the action default automatically.
   #
-  # Replaces Renovate tracking for the harness version (Renovate can't order
-  # +harness.<sha> tags). Runs only after a successful real publish; never on
-  # dry-run. The release is already done — this job is best-effort.
+  # Replaces Renovate tracking for the harness version. Legacy +harness.<sha> tags
+  # cannot be ordered; new -harness.<sha> tags are prereleases. Runs only after a
+  # successful real publish; never on dry-run. The release is already done — this
+  # job is best-effort.
   # ---------------------------------------------------------------------------
   sync-default-version:
     name: sync-default-version (bump DEFAULT_OPENCODE_VERSION)
@@ -1300,10 +1303,10 @@ jobs:
 
             Future harness releases flow into both the action default and the
             workspace image automatically via this mechanism, replacing Renovate
-            tracking (which cannot order `+harness.<sha>` build-metadata tags).
+            tracking (legacy `+harness.<sha>` build-metadata tags cannot be ordered;
+            new `-harness.<sha>` tags are prereleases).
             Merging this PR is the gate; not merging holds both surfaces at the
             prior build.
           base: main
           author: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
           committer: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
-
