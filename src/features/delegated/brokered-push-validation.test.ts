@@ -13,11 +13,11 @@ function contentChange(path: string): FileChange {
 }
 
 function probePath(defaultPath: string): string {
-  return `${defaultPath.replace('*', 'runtime')}probe.ts`
+  return `${defaultPath.replaceAll('*', 'runtime')}probe.ts`
 }
 
 function mutatedSiblingPath(defaultPath: string): string {
-  return `${defaultPath.replace('*', 'runtime').replace(/\/$/, '')}2/probe.ts`
+  return `${defaultPath.replaceAll('*', 'runtime').replace(/\/$/, '')}2/probe.ts`
 }
 
 describe('brokered-push allowlist serialization', () => {
