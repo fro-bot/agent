@@ -133,9 +133,12 @@ describe('validateBrokeredPushFiles', () => {
   it.each([
     'apps/web/package.json',
     'apps/web/Dockerfile',
+    'apps/web/dockerfile',
+    'apps/web/Package.json',
     'apps/web/bun.lock',
     'apps/deploy/scripts/release.ts',
     'apps/web/.github/workflows/ci.yml',
+    'apps/web/.GitHub/workflows/ci.yml',
     'apps/web/.npmrc',
     'apps/web/.gitmodules',
   ])('rejects protected nested path %s under an opted-in prefix', path => {
@@ -191,6 +194,17 @@ describe('validateBrokeredPushFiles', () => {
     expect(result.errors).toContain('apps/web/src/index.ts: path is not allowed for brokered push')
   })
 
+  it.each(['src/dockerfile', 'src/Package.json', 'src/.GitHub/workflows/ci.yml'])(
+    'keeps case-variant protected names deliverable on the default axis when %s is allowlisted',
+    path => {
+      // #given a case-variant protected name under the default source prefix
+      const result = validateBrokeredPushFiles([contentChange(path)])
+
+      // #then default-axis admission remains unchanged; protected-surface checks apply to opted-in extras
+      expect(result).toEqual({valid: true, errors: []})
+    },
+  )
+
   it('matches extra prefixes only at segment boundaries and treats overlaps as a union', () => {
     // #given sibling and nested paths plus overlapping extra prefixes
     const files = [
@@ -219,6 +233,35 @@ describe('validateBrokeredPushFiles', () => {
     if (result.valid) throw new Error('Expected validation failure')
     expect(result.errors).toContain(`${path}: path is not canonical for brokered push`)
     expect(result.paths).toContain(path)
+  })
+
+  it.each(['src//x.ts', 'src/./x.ts'])('rejects non-canonical default-path file %s', path => {
+    // #given a file admitted by the default source prefix only after Git normalizes its spelling
+    const result = validateBrokeredPushFiles([contentChange(path)])
+
+    // #then validation catches the latent Git tree API failure before delivery
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.errors).toContain(`${path}: path is not canonical for brokered push`)
+    expect(result.paths).toContain(path)
+  })
+
+  it('accepts a canonical default-path file', () => {
+    // #given a plainly spelled file under the default source prefix
+    const result = validateBrokeredPushFiles([contentChange('src/x.ts')])
+
+    // #then the existing default-axis behavior remains unchanged
+    expect(result).toEqual({valid: true, errors: []})
+  })
+
+  it('names the overlapping protected surface rather than echoing a containing prefix', () => {
+    // #given a prefix that contains the protected deploy/scripts surface
+    const result = validateBrokeredPushFiles([], ['deploy'])
+
+    // #then the enforcement error identifies the actual protected surface
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error('Expected validation failure')
+    expect(result.errors).toContain('deploy: path prefix overlaps protected brokered-push surface deploy/scripts')
   })
 
   it.each([

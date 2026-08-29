@@ -1,10 +1,12 @@
 import type {FileChange} from './types.js'
 
 import {
+  BROKERED_PUSH_PROTECTED_SURFACES,
   hasProtectedSegment,
   isBrokeredPushProtectedPrefix,
   isCanonicalBrokeredPushPath,
   matchesBrokeredPushPrefix,
+  normalizeBrokeredPushPrefix,
 } from '../../shared/brokered-push-paths.js'
 import {validateFiles} from './commit.js'
 
@@ -18,7 +20,27 @@ export type BrokeredPushValidationResult =
 
 function protectedSurfaceForPrefix(prefix: string): string | null {
   try {
-    return isBrokeredPushProtectedPrefix(prefix) ? prefix : null
+    const normalizedPrefix = normalizeBrokeredPushPrefix(prefix)
+    if (isBrokeredPushProtectedPrefix(normalizedPrefix) === false) {
+      return null
+    }
+
+    for (const surface of BROKERED_PUSH_PROTECTED_SURFACES) {
+      const isDockerfileVariant =
+        surface === 'Dockerfile' &&
+        (normalizedPrefix.toLowerCase() === 'dockerfile' || normalizedPrefix.toLowerCase().startsWith('dockerfile.'))
+      if (
+        matchesBrokeredPushPrefix(normalizedPrefix, surface) ||
+        matchesBrokeredPushPrefix(surface, normalizedPrefix)
+      ) {
+        return surface
+      }
+      if (isDockerfileVariant) {
+        return surface
+      }
+    }
+
+    return normalizedPrefix
   } catch {
     // Enforcement is fail-closed for callers that bypass the input parser.
     return prefix
@@ -70,17 +92,17 @@ export function validateBrokeredPushFiles(
     const allowedByExtra = extraPrefixes.some(prefix => matchesExtraPrefix(file.path, prefix))
     const allowed = allowedByDefault || allowedByExtra
 
+    if (isCanonicalBrokeredPushPath(file.path) === false) {
+      errors.push(`${file.path}: path is not canonical for brokered push`)
+      paths.add(file.path)
+    }
+
     if (allowed === false) {
       errors.push(`${file.path}: path is not allowed for brokered push`)
       paths.add(file.path)
-    } else if (allowedByDefault === false && allowedByExtra) {
-      if (isCanonicalBrokeredPushPath(file.path) === false) {
-        errors.push(`${file.path}: path is not canonical for brokered push`)
-        paths.add(file.path)
-      } else if (hasProtectedSegment(file.path)) {
-        errors.push(`${file.path}: path is within a protected brokered-push surface`)
-        paths.add(file.path)
-      }
+    } else if (allowedByDefault === false && allowedByExtra && hasProtectedSegment(file.path)) {
+      errors.push(`${file.path}: path is within a protected brokered-push surface`)
+      paths.add(file.path)
     }
   }
 

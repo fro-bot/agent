@@ -24,8 +24,14 @@ export const BROKERED_PUSH_PROTECTED_SURFACES: ReadonlySet<string> = new Set([
 ])
 
 function isDockerfileVariant(prefix: string): boolean {
-  // Case-sensitive prefix matching mirrors Docker's own default-filename case sensitivity; this is intentional.
-  return prefix === 'Dockerfile' || prefix.startsWith('Dockerfile.')
+  // Keep the Dockerfile. suffix shape, but case-fold policy matching consistently.
+  const foldedPrefix = prefix.toLowerCase()
+  return foldedPrefix === 'dockerfile' || foldedPrefix.startsWith('dockerfile.')
+}
+
+function isProtectedSurfaceName(value: string): boolean {
+  const foldedValue = value.toLowerCase()
+  return [...BROKERED_PUSH_PROTECTED_SURFACES].some(surface => surface.toLowerCase() === foldedValue)
 }
 
 function isProtectedSurfaceOverlap(prefix: string): boolean {
@@ -110,8 +116,8 @@ export function hasProtectedSegment(path: string): boolean {
   const segments = normalized.split('/')
   const basename = segments.at(-1) ?? ''
   return (
-    segments.some(segment => BROKERED_PUSH_PROTECTED_SURFACES.has(segment)) ||
-    BROKERED_PUSH_PROTECTED_SURFACES.has(basename) ||
+    segments.some(segment => isProtectedSurfaceName(segment)) ||
+    isProtectedSurfaceName(basename) ||
     isDockerfileVariant(basename)
   )
 }

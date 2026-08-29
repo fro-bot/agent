@@ -107,6 +107,9 @@ describe('brokered-push path primitives', () => {
     'apps/web/package.json',
     'apps/web/.github/workflows/ci.yml',
     'apps/web/Dockerfile.dev',
+    'apps/web/dockerfile',
+    'apps/web/Package.json',
+    'apps/web/.GitHub/workflows/ci.yml',
     'apps/web/src/index.ts',
   ])('checks protected segments and basenames for %s', path => {
     // #when checking the path against the shared protected-surface policy
