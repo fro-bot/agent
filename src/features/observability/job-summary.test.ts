@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/unbound-method */
 import type {CommentSummaryOptions, RunMetrics} from './types.js'
 import * as core from '@actions/core'
 import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
