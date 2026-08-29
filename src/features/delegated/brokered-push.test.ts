@@ -65,7 +65,12 @@ function allowGateSequence(changes: readonly object[]): void {
 }
 
 async function run(
-  options: {readonly octokit?: Octokit; readonly signal?: AbortSignal; readonly trustedHeadSha?: string} = {},
+  options: {
+    readonly octokit?: Octokit
+    readonly signal?: AbortSignal
+    readonly trustedHeadSha?: string
+    readonly extraPathPrefixes?: readonly string[]
+  } = {},
 ) {
   return runBrokeredPush({
     octokit: options.octokit ?? createMockOctokit(),
@@ -83,6 +88,7 @@ async function run(
     trustedHeadSha: options.trustedHeadSha ?? TRUSTED_HEAD_SHA,
     expectedHeadBranch: BRANCH,
     repoRoot: '/workspace',
+    extraPathPrefixes: options.extraPathPrefixes ?? [],
     signal: options.signal,
   })
 }
@@ -127,6 +133,34 @@ describe('runBrokeredPush', () => {
     )
   })
 
+  it('delivers a consumer-layout change set when an extra path prefix is opted in', async () => {
+    // #given an eligible PR mention whose reconstructed changes live under a consumer app
+    const changes = [{path: 'apps/web/src/index.ts', content: 'export const app = true'}]
+    allowGateSequence(changes)
+    const updateRef = vi.fn().mockResolvedValue({data: {}})
+    const octokit = createMockOctokit({
+      getRef: {object: {sha: TRUSTED_HEAD_SHA}},
+      getCommit: {tree: {sha: 'base-tree-sha'}},
+      createBlob: {sha: 'blob-sha'},
+      createTree: {sha: 'tree-sha'},
+      createCommit: vi.fn().mockResolvedValue({
+        data: {sha: 'commit-sha', html_url: 'https://github.com/owner/repo/commit/commit-sha', message: 'fix'},
+      }),
+      updateRef,
+    })
+
+    // #when brokered push delivery runs with the consumer path opt-in
+    const outcome = await run({octokit, extraPathPrefixes: ['apps']})
+
+    // #then the consumer-layout change is delivered and the opt-in reaches validation
+    expect(outcome.kind).toBe('pushed')
+    expect(outcome).toMatchObject({branch: BRANCH, paths: ['apps/web/src/index.ts']})
+    expect(mocks.validateFiles).toHaveBeenCalledWith(changes, ['apps'])
+    expect(updateRef).toHaveBeenCalledWith(
+      expect.objectContaining({owner: OWNER, repo: REPO, ref: `heads/${BRANCH}`, sha: 'commit-sha', force: false}),
+    )
+  })
+
   it('fails loud when the branch head changes before createCommit constructs the tree', async () => {
     // #given the live pre-write gate passed, but the commit primitive observes a newer head
     allowGateSequence([{path: 'src/fix.ts', content: 'fixed'}])
@@ -147,6 +181,8 @@ describe('runBrokeredPush', () => {
     // #then the TOCTOU mismatch is fail-loud and no write-side API is called
     expect(outcome.kind).toBe('fail-loud')
     if (outcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(outcome.failureClass).toBe('moved-head')
+    expect(outcome).not.toHaveProperty('paths')
     expect(outcome.reason).toContain('Branch head changed before commit construction')
     expect(createBlob).not.toHaveBeenCalled()
     expect(createTree).not.toHaveBeenCalled()
@@ -184,15 +220,27 @@ describe('runBrokeredPush', () => {
 
   it('fails loud when reconstructed changes are rejected by the brokered allowlist', async () => {
     // #given reconstruction produced a change outside the brokered allowlist
-    const changes = [{path: '.github/workflows/ci.yml', content: 'unsafe'}]
+    const changes = [
+      {path: '.github/workflows/ci.yml', content: 'unsafe'},
+      {path: 'foo.md', content: 'also unsafe'},
+    ]
     allowGateSequence(changes)
-    mocks.validateFiles.mockReturnValue({valid: false, errors: ['path is not allowed']})
+    mocks.validateFiles.mockReturnValue({
+      valid: false,
+      errors: ['path is not allowed'],
+      paths: ['.github/workflows/ci.yml', 'foo.md'],
+    })
 
     // #when brokered push delivery runs
     const outcome = await run()
 
     // #then the model response must be suppressed by a typed failure
-    expect(outcome).toEqual({kind: 'fail-loud', reason: 'path is not allowed'})
+    expect(outcome).toEqual({
+      kind: 'fail-loud',
+      reason: 'path is not allowed',
+      failureClass: 'validation',
+      paths: ['.github/workflows/ci.yml', 'foo.md'],
+    })
     expect(mocks.checkPreWriteGate).not.toHaveBeenCalled()
   })
 
@@ -205,7 +253,9 @@ describe('runBrokeredPush', () => {
     const permissionOutcome = await run()
 
     // #then no workspace or write operation is attempted
-    expect(permissionOutcome).toEqual({kind: 'fail-loud', reason: 'permission removed'})
+    expect(permissionOutcome).toMatchObject({kind: 'fail-loud', failureClass: 'permission'})
+    if (permissionOutcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(permissionOutcome.reason).toEqual(expect.stringContaining('permission'))
     expect(mocks.reconstructChanges).not.toHaveBeenCalled()
 
     // #given reconstruction itself fails
@@ -218,7 +268,9 @@ describe('runBrokeredPush', () => {
     const reconstructionOutcome = await run()
 
     // #then reconstruction errors fail loud instead of becoming a bypass
-    expect(reconstructionOutcome).toEqual({kind: 'fail-loud', reason: 'head moved'})
+    expect(reconstructionOutcome).toMatchObject({kind: 'fail-loud', failureClass: 'reconstruction'})
+    if (reconstructionOutcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(reconstructionOutcome.reason).toEqual(expect.stringContaining('head moved'))
 
     // #given a live pre-write gate denial
     vi.clearAllMocks()
@@ -229,7 +281,56 @@ describe('runBrokeredPush', () => {
     const preWriteOutcome = await run()
 
     // #then no commit is reported or created
-    expect(preWriteOutcome).toEqual({kind: 'fail-loud', reason: 'head SHA changed'})
+    expect(preWriteOutcome).toMatchObject({kind: 'fail-loud', failureClass: 'identity'})
+    if (preWriteOutcome.kind !== 'fail-loud') throw new Error('Expected fail-loud outcome')
+    expect(preWriteOutcome.reason).toEqual(expect.stringContaining('head SHA changed'))
+  })
+
+  it('classifies a 404 from the pre-write PR lookup as an identity failure', async () => {
+    // #given all prior gates pass and the PR disappears before the final identity check
+    const changes = [{path: 'src/fix.ts', content: 'fixed'}]
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockResolvedValue({decision: 'allowed', permission: 'write'})
+    mocks.reconstructChanges.mockResolvedValue({success: true, data: {kind: 'changes', changes}})
+    mocks.validateFiles.mockReturnValue({valid: true, errors: []})
+    mocks.checkPreWriteGate.mockImplementation(async (wrappedOctokit: Octokit) => {
+      try {
+        await wrappedOctokit.rest.pulls.get({owner: OWNER, repo: REPO, pull_number: 42})
+      } catch {
+        // The real gate converts the lookup failure into a denied outcome.
+      }
+      return {decision: 'denied', reason: 'Unable to re-resolve PR before write: Not Found'}
+    })
+    const octokit = createMockOctokit({
+      getPullRequest: vi.fn().mockRejectedValue(Object.assign(new Error('Not Found'), {status: 404})),
+    })
+
+    // #when brokered push delivery runs
+    const outcome = await run({octokit})
+
+    // #then deletion or transfer is reported as identity drift, not permission failure
+    expect(outcome).toEqual({
+      kind: 'fail-loud',
+      reason: 'Unable to re-resolve PR before write: Not Found',
+      failureClass: 'identity',
+    })
+  })
+
+  it.each([
+    'Unable to diff workspace against trusted head SHA: diff failed',
+    'Unable to enumerate untracked workspace files: ls-files failed',
+    'Reconstructed file validation failed: src/fix.ts: invalid content',
+  ])('classifies %s as reconstruction', async reason => {
+    // #given an eligible delivery whose reconstruction stage reports a failure
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockResolvedValue({decision: 'allowed', permission: 'write'})
+    mocks.reconstructChanges.mockResolvedValue({success: false, error: new Error(reason)})
+
+    // #when brokered push delivery runs
+    const outcome = await run()
+
+    // #then all reconstruction failure sites share the stable reconstruction class
+    expect(outcome).toEqual({kind: 'fail-loud', reason, failureClass: 'reconstruction'})
   })
 
   it('fails loud when the ref update rejects after commit creation', async () => {
@@ -251,7 +352,7 @@ describe('runBrokeredPush', () => {
     const outcome = await run({octokit})
 
     // #then the unreachable commit is never reported as delivered
-    expect(outcome).toEqual({kind: 'fail-loud', reason: 'reference update rejected'})
+    expect(outcome).toEqual({kind: 'fail-loud', reason: 'reference update rejected', failureClass: 'commit'})
   })
 
   it('maps an aborted octokit-backed path to the brokered push budget reason', async () => {
@@ -269,12 +370,24 @@ describe('runBrokeredPush', () => {
     const outcome = await run({signal: controller.signal})
 
     // #then the raw abort error is replaced with the clear fail-loud budget reason
-    expect(outcome).toEqual({kind: 'fail-loud', reason: 'brokered push exceeded time budget'})
+    expect(outcome).toEqual({kind: 'fail-loud', reason: 'brokered push exceeded time budget', failureClass: 'timeout'})
     expect(mocks.checkPermission).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
       expect.anything(),
       controller.signal,
     )
+  })
+
+  it('classifies unexpected thrown exceptions as unknown', async () => {
+    // #given an eligible event whose permission gate throws an unclassified exception
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockRejectedValue(new Error('unexpected gate failure'))
+
+    // #when brokered push delivery runs
+    const outcome = await run()
+
+    // #then the failure is machine-distinguishable without parsing its reason
+    expect(outcome).toEqual({kind: 'fail-loud', reason: 'unexpected gate failure', failureClass: 'unknown'})
   })
 })

@@ -112,6 +112,8 @@ export interface ActionInputs {
   // Label name that suppresses automatic PR-event reviews when present (case-insensitive at
   // comparison time). null = feature disabled (trimmed-empty input).
   readonly reviewSkipLabel: string | null
+  // Additional relative path prefixes allowed for brokered pushes after protected-surface checks.
+  readonly brokeredPushExtraPaths: readonly string[]
 }
 
 // OMO Slim presets (single-name selection, unlike oMo's provider list).
