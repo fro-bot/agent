@@ -668,6 +668,30 @@ jobs:
           echo "$logs" | grep -q "auth: absent"
           docker exec "$cid" sh -c '! test -f /root/.local/share/opencode/auth.json'
           echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
+      - name: Check harness release tag URL (positive checksum path test)
+        run: |
+          set -euo pipefail
+          default_version="$(node -e "
+            const fs = require('fs');
+            const src = fs.readFileSync('packages/runtime/src/shared/constants.ts', 'utf8');
+            const match = src.match(/DEFAULT_OPENCODE_VERSION\s*=\s*'([^']+)'/);
+            if (!match) process.exit(1);
+            process.stdout.write(match[1]);
+          ")"
+          case "${default_version}" in
+            *+harness.*) : ;;
+            *) echo "DEFAULT_OPENCODE_VERSION is not a harness version: ${default_version}" >&2; exit 1 ;;
+          esac
+          tag_version="${default_version//+harness./-harness.}"
+          sums_url="https://github.com/fro-bot/agent/releases/download/${tag_version}/SHA256SUMS"
+          http_status="$(curl --silent --show-error --location --retry 3 --retry-delay 2 \
+            --output /dev/null --write-out '%{http_code}' "${sums_url}")"
+          if [ "${http_status}" != "200" ]; then
+            echo "Expected ${sums_url} to return HTTP 200, got ${http_status}" >&2
+            exit 1
+          fi
+          echo "OK: ${sums_url} returned HTTP ${http_status}"
+
       - name: Checksum fail-closed negative test (bogus version → build must abort)
         run: |
           # Negative test: prove the Dockerfile's SHA256SUMS verification is fail-closed.
@@ -695,9 +719,9 @@ jobs:
           echo "--- docker build output (expected failure) ---"
           echo "${build_output}"
           # Secondary guard: confirm the failure is in the download/checksum path.
-          # Acceptable signals: curl exit/error, %2B URL 404, or Dockerfile error strings.
+          # Acceptable signals: curl exit/error, URL 404, or Dockerfile error strings.
           if echo "${build_output}" | grep -qiE \
-            'curl|SHA256SUMS does not contain|does not match expected|%2B|404'; then
+            'curl|SHA256SUMS does not contain|does not match expected|404'; then
             echo "OK: docker build correctly aborted for bogus version '${bogus_version}' — failure is in the download/checksum path (fail-closed verified)"
           else
             echo "::warning::Checksum negative test: docker build failed for bogus version '${bogus_version}' but the failure signal is NOT in the expected download/checksum path (curl/SHA256SUMS/hash-mismatch). Fail-closed still holds — the build aborted — but the failure may be a stage-1 (network/apk) issue rather than the checksum path. Investigate if this recurs. Build output is printed above."

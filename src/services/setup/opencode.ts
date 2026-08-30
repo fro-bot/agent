@@ -20,7 +20,7 @@ export const FALLBACK_VERSION = '1.18.21'
 
 /**
  * Semver-ish pattern for version validation (defense-in-depth, path-traversal guard).
- * Matches: 1.2.3, 1.2.3-rc.1, 1.2.3+harness.abc12345, 1.2.3+harness.abc12345-extra
+ * Matches: 1.2.3, 1.2.3-rc.1, 1.2.3+harness.abc12345, 1.2.3-harness.abc12345
  * Rejects: anything with `/`, `..`, shell metacharacters, or other traversal sequences.
  */
 const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:[.-][\w.-]+)?(?:\+[\w.-]+)?$/
@@ -28,32 +28,44 @@ const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:[.-][\w.-]+)?(?:\+[\w.-]+)?$/
 /**
  * Returns true when the version string is a harness-pinned build.
  *
- * Harness versions use the `+harness.<sha>` build-metadata suffix (semver §10),
- * e.g. `1.17.3+harness.abc12345`. The `+` form is the binary/release form used
- * by fro-bot/agent releases. The npm-compatible hyphen form (`1.17.3-harness.x`)
- * is intentionally NOT treated as a harness version here.
+ * Harness versions use either the `+harness.<sha>` build-metadata suffix
+ * (semver §10) or the equivalent `-harness.<sha>` prerelease suffix, e.g.
+ * `1.17.3+harness.abc12345` or `1.17.3-harness.abc12345`. Both forms identify
+ * fro-bot/agent harness releases; the hyphen form is also the public release-tag
+ * form users may copy from GitHub.
  */
 export function isHarnessVersion(version: string): boolean {
-  return version.includes(HARNESS_MARKER)
+  return version.includes(HARNESS_MARKER) || version.includes('-harness.')
 }
 
 /**
- * Convert a version string to a form safe for @actions/tool-cache.
+ * Convert a harness build version to its prerelease representation.
  *
- * `@actions/tool-cache` passes the version through `semver.clean()` internally
+ * This form is used for both the @actions/tool-cache key and the harness release
+ * tag. `@actions/tool-cache` passes the version through `semver.clean()` internally
  * (find, cacheDir, _createToolPath). `semver.clean('1.17.3+harness.2c9cdbd2')`
  * strips build-metadata and returns `'1.17.3'` — colliding with a stock 1.17.3
  * cache entry. Converting the `+harness.` build-metadata marker to `-harness.`
  * (a prerelease segment) preserves the full identity:
  * `semver.clean('1.17.3-harness.2c9cdbd2') === '1.17.3-harness.2c9cdbd2'`.
+ * Release tags use the same prerelease segment so Renovate's stable-candidate
+ * discovery excludes harness releases.
  *
- * Only the `+harness.` marker is converted — all other version forms are
- * returned unchanged. Use this ONLY at tool-cache call sites (find, cacheDir).
- * Download URLs, checksums, return values, and logs must keep the raw `+harness.`
- * form.
+ * Only the `+harness.` marker is converted — an already-prerelease `-harness.`
+ * form and all other version forms are returned unchanged.
+ */
+export function toHarnessReleaseTag(version: string): string {
+  return version.includes(HARNESS_MARKER) ? version.replace(HARNESS_MARKER, '-harness.') : version
+}
+
+/**
+ * Convert a version string to the form used by @actions/tool-cache.
+ *
+ * This delegates to `toHarnessReleaseTag`; the cache behavior is intentionally
+ * unchanged, including leaving non-harness versions untouched.
  */
 export function toolCacheVersion(version: string): string {
-  return version.includes(HARNESS_MARKER) ? version.replace(HARNESS_MARKER, '-harness.') : version
+  return toHarnessReleaseTag(version)
 }
 
 /**
@@ -87,10 +99,11 @@ export function getPlatformInfo(): PlatformInfo {
 /**
  * Encode a harness version string as a URL-safe release tag.
  *
- * Harness release tags are NON-v-prefixed (e.g. `1.17.3+harness.<sha>`).
- * Strips any leading `v` and percent-encodes `+` as `%2B` so the URL path
- * segment is valid — GitHub stores tags URL-encoded and a raw `+` is
- * misread as a space.
+ * Harness release tags are NON-v-prefixed (e.g. `1.17.3-harness.<sha>`).
+ * Strips any leading `v` and percent-encodes any `+` as `%2B` so this helper
+ * remains safe for legacy tags — GitHub stores tags URL-encoded and a raw `+`
+ * is misread as a space. Current harness callers map `+harness.` to
+ * `-harness.` before reaching this function.
  */
 function encodeHarnessTag(version: string): string {
   const rawTag = version.startsWith('v') ? version.slice(1) : version
@@ -116,10 +129,11 @@ function assertValidVersion(version: string): void {
 /**
  * Build download URL for OpenCode binary.
  *
- * Harness-pinned versions (containing `+harness.`) are routed to the
- * fro-bot/agent releases. The `+` in the version tag MUST be percent-encoded
- * as `%2B` in the URL path segment — GitHub stores the tag URL-encoded and a
- * raw `+` is misread as a space. Stock versions route to anomalyco/opencode
+ * Harness-pinned versions (containing `+harness.` or `-harness.`) are routed
+ * to the fro-bot/agent releases. Their release tag is derived with
+ * `toHarnessReleaseTag`, which maps the `+harness.` input form to the
+ * `-harness.` release-tag form and leaves an existing hyphen form unchanged.
+ * Stock versions route to anomalyco/opencode
  * with no encoding changes.
  *
  * Throws if the version does not match the semver-ish pattern (path-traversal guard).
@@ -130,7 +144,7 @@ export function buildDownloadUrl(version: string, info: PlatformInfo): string {
   const filename = `opencode-${info.os}-${info.arch}${info.ext}`
 
   if (isHarnessVersion(version)) {
-    const encodedTag = encodeHarnessTag(version)
+    const encodedTag = encodeHarnessTag(toHarnessReleaseTag(version))
     return `${HARNESS_DOWNLOAD_BASE_URL}/${encodedTag}/${filename}`
   }
 
@@ -142,8 +156,8 @@ export function buildDownloadUrl(version: string, info: PlatformInfo): string {
  * Build the SHA256SUMS asset URL for a harness release.
  *
  * The SHA256SUMS file lives in the same release as the archive, at the same
- * base URL but with filename `SHA256SUMS`. The `+` in the version tag is
- * percent-encoded as `%2B` (same as in `buildDownloadUrl`).
+ * base URL but with filename `SHA256SUMS`. The release tag is derived with
+ * `toHarnessReleaseTag`, matching `buildDownloadUrl`.
  *
  * Throws if `version` is not a harness version — SHA256SUMS only exists for
  * harness releases.
@@ -151,9 +165,9 @@ export function buildDownloadUrl(version: string, info: PlatformInfo): string {
 export function buildChecksumsUrl(version: string): string {
   assertValidVersion(version)
   if (!isHarnessVersion(version)) {
-    throw new Error('buildChecksumsUrl requires a harness version (must contain +harness.)')
+    throw new Error('buildChecksumsUrl requires a harness version (must contain +harness. or -harness.)')
   }
-  const encodedTag = encodeHarnessTag(version)
+  const encodedTag = encodeHarnessTag(toHarnessReleaseTag(version))
   return `${HARNESS_DOWNLOAD_BASE_URL}/${encodedTag}/SHA256SUMS`
 }
 

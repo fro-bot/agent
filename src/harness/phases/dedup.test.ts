@@ -348,7 +348,7 @@ describe('runDedup', () => {
       entity: {entityType: 'pr', entityNumber: 42},
     })
     expect(vi.mocked(setActionOutputs)).not.toHaveBeenCalled()
-    // eslint-disable-next-line @typescript-eslint/unbound-method
+
     expect(core.summary.write).toHaveBeenCalled()
   })
 })

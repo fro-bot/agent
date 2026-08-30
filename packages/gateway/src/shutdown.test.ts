@@ -23,10 +23,11 @@ function makeLogger(): {logger: GatewayLogger; calls: {method: string; ctx: Reco
   return {logger, calls}
 }
 
-function makeClient(destroyDelay = 0): Client {
-  return {
-    destroy: vi.fn().mockImplementation(async () => new Promise<void>(resolve => setTimeout(resolve, destroyDelay))),
-  } as unknown as Client
+function makeClient(destroyDelay = 0): Client & {destroySpy: ReturnType<typeof vi.fn>} {
+  const destroySpy = vi
+    .fn()
+    .mockImplementation(async () => new Promise<void>(resolve => setTimeout(resolve, destroyDelay)))
+  return {destroy: destroySpy, destroySpy} as unknown as Client & {destroySpy: ReturnType<typeof vi.fn>}
 }
 
 /** Make a fake CloseableServer handle. */
@@ -161,9 +162,7 @@ describe('installShutdownHandlers', () => {
     expect(exitCodes.filter(c => c === 0)).toHaveLength(1)
     expect(exitCodes).not.toContain(1)
     // client.destroy called exactly once — no concurrent destroy chain
-    // eslint-disable-next-line @typescript-eslint/unbound-method
-    const destroyMock = client.destroy as unknown as ReturnType<typeof vi.fn>
-    expect(destroyMock).toHaveBeenCalledOnce()
+    expect(client.destroySpy).toHaveBeenCalledOnce()
     // The ignored signal is logged at debug so operators can see what happened
     const ignored = calls.filter(c => c.method === 'debug' && c.msg.includes('already shutting down'))
     expect(ignored).toHaveLength(1)

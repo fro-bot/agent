@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-08-09"
-updated-by: "c006768"
+last-updated: "2026-08-24"
+updated-by: "ses_fd0b1eaf4ffeTMI146lECk0yxc"
 sources:
   - src/main.ts
   - src/post.ts
@@ -14,6 +14,10 @@ sources:
   - packages/gateway/src/main.ts
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/http/server.ts
+  - packages/gateway/src/discord/commands/dispatch.ts
+  - packages/gateway/src/discord/commands/fro-bot.ts
+  - packages/gateway/src/github/dispatch.ts
+  - packages/gateway/src/github/app-client.ts
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/approvals/coordinator.ts
   - packages/runtime/src/agent/remote-client.ts
@@ -87,7 +91,7 @@ The package ships as `@fro.bot/harness` (the main resolver) plus four per-platfo
 
 The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges Discord mentions to Fro Bot agent runs and executes those runs end-to-end against a remote OpenCode server. Key modules:
 
-**Discord** (`discord/`) — Client lifecycle wrapper (`client.ts`), slash command registry (`commands/`, including `/add-project` and `/fro-bot`), mention handler (`mentions.ts`), channel helpers (`channels.ts`), presence updates (`presence.ts`), and streaming (`streaming.ts`). The streaming module relays OpenCode event output back into the Discord thread as the run progresses.
+**Discord** (`discord/`) — Client lifecycle wrapper (`client.ts`), slash command registry (`commands/`), mention handler (`mentions.ts`), channel helpers (`channels.ts`), presence updates (`presence.ts`), and streaming (`streaming.ts`). The streaming module relays OpenCode event output back into the Discord thread as the run progresses. The `/fro-bot` parent command hosts subcommands built through a shared guild-command factory (`guild-command.ts`) that owns the defer → guild-guard → authorize → work → failure-reply pipeline: `ping`, `add-project` (bind a repo to a channel), `clear-queue`, and `force-release-lock`. A `dispatch` subcommand (`commands/dispatch.ts`) is deliberately different from the mention path — instead of entering the gateway's per-channel queue or acquiring a local execution slot, it only asks GitHub Actions to accept a `workflow_dispatch` for the channel's bound repository and reports back the accepted run link. That request is issued through the gateway's GitHub App client and dispatch helper (`github/app-client.ts`, `github/dispatch.ts`), so a Discord operator can kick off an autonomous Action run without the gateway itself executing it.
 
 **Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention or a web launch. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits via a serial queue (`queue.ts`), and `recovery.ts` handles interrupted runs. An in-memory abort registry (`abort-registry.ts`) plus `cancel.ts` back operator-initiated cancellation: a run registered under its `runId` can be aborted mid-flight and settles as `CANCELLED` rather than `FAILED` (see [[Operator Web Control Surface]]). `run-core.ts` also counts inbound events so a stalled run can be distinguished from a lost-event timeout. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
 

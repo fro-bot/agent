@@ -1,6 +1,6 @@
 ---
 type: index
-last-updated: "2026-08-09"
+last-updated: "2026-08-24"
 summary: "Navigable entry point for the Fro Bot Agent project wiki"
 ---
 
@@ -17,7 +17,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | Page | Type | Summary |
 | --- | --- | --- |
 | [Architecture Overview](Architecture%20Overview.md) | architecture | Monorepo structure, action + harness + gateway + workspace-agent packages, and module map |
-| [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Phase-by-phase walkthrough of a single action run, including review reconciliation |
+| [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Phase-by-phase walkthrough of a single action run, including review reconciliation and brokered push |
 
 ### Subsystems
 

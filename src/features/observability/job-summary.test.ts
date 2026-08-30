@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/unbound-method */
 import type {CommentSummaryOptions, RunMetrics} from './types.js'
 import * as core from '@actions/core'
 import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
@@ -101,7 +100,7 @@ describe('writeJobSummary', () => {
     await writeJobSummary(options, logger)
 
     // #then
-    const tableCall = vi.mocked(core.summary.addTable).mock.calls[0]![0]
+    const tableCall = vi.mocked(core.summary).addTable.mock.calls[0]![0]
     expect(tableCall).toBeDefined()
     expect(tableCall.some(row => Array.isArray(row) && row.includes('issue_comment'))).toBe(true)
     expect(tableCall.some(row => Array.isArray(row) && row.includes('owner/repo'))).toBe(true)
@@ -116,7 +115,7 @@ describe('writeJobSummary', () => {
     await writeJobSummary(options, logger)
 
     // #then
-    const tableCall = vi.mocked(core.summary.addTable).mock.calls[0]![0]
+    const tableCall = vi.mocked(core.summary).addTable.mock.calls[0]![0]
     expect(tableCall).toContainEqual(['Agent', 'build (default)'])
   })
 
@@ -128,7 +127,7 @@ describe('writeJobSummary', () => {
     await writeJobSummary(options, logger)
 
     // #then
-    const tableCall = vi.mocked(core.summary.addTable).mock.calls[0]![0]
+    const tableCall = vi.mocked(core.summary).addTable.mock.calls[0]![0]
     expect(tableCall).toContainEqual(['Output Mode', 'working-dir'])
   })
 
@@ -140,7 +139,7 @@ describe('writeJobSummary', () => {
     await writeJobSummary(options, logger)
 
     // #then
-    const tableCall = vi.mocked(core.summary.addTable).mock.calls[0]![0]
+    const tableCall = vi.mocked(core.summary).addTable.mock.calls[0]![0]
     expect(tableCall).toContainEqual(['Output Mode', 'N/A'])
   })
 
