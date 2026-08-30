@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-// One-off, create-first migration for legacy +harness releases.
+// COMPLETED one-off migration for legacy +harness releases; ran 2026-08-29 and processed all 18 releases.
+// Do not re-run this migration. EXPECTED_SOURCE_RELEASE_COUNT = 18 is intentionally tied to the completed run;
+// `gh release list --limit 100` will eventually throw as the v0.x release line grows beyond that window.
 // Dry-run is the default. Only --execute permits release creation or edits.
 
 import {execFileSync} from 'node:child_process'
@@ -56,27 +58,22 @@ function requiredString(value: unknown, field: string): string {
 
 /** Convert a legacy +harness tag to its prerelease-tag equivalent. Pure. */
 export function convertHarnessTag(tag: string): string | null {
-  const match = /^(\d+\.\d+\.\d+)\+harness\.([0-9a-f]{8,40})$/i.exec(tag)
-  if (match === null || match[1] === undefined || match[2] === undefined) {
-    return null
-  }
-
-  return `${match[1]}-harness.${match[2]}`
+  return parseHarnessTag(tag)?.targetTag ?? null
 }
 
 /** Parse a valid legacy harness tag and derive both public tag forms. Pure. */
 export function parseHarnessTag(tag: string): HarnessTagParts | null {
-  const targetTag = convertHarnessTag(tag)
-  if (targetTag === null) {
-    return null
-  }
-
   const match = /^(\d+\.\d+\.\d+)\+harness\.([0-9a-f]{8,40})$/i.exec(tag)
   if (match === null || match[1] === undefined || match[2] === undefined) {
     return null
   }
 
-  return {baseVersion: match[1], shortSha: match[2], sourceTag: tag, targetTag}
+  return {
+    baseVersion: match[1],
+    shortSha: match[2],
+    sourceTag: tag,
+    targetTag: `${match[1]}-harness.${match[2]}`,
+  }
 }
 
 /** Build the canonical GitHub release asset URL for either tag form. Pure. */
@@ -144,7 +141,7 @@ function parseReleaseTags(rawJson: string): readonly string[] {
   })
 }
 
-function parseReleaseDetails(rawJson: string): ReleaseDetails {
+export function parseReleaseDetails(rawJson: string): ReleaseDetails {
   const parsed: unknown = JSON.parse(rawJson)
   if (!isRecord(parsed)) {
     throw new Error('gh release view returned a non-object response')
@@ -403,14 +400,13 @@ async function migrateOne(
     writeLine(`original release ${source.tagName} is already prerelease; skip edit`)
   } else {
     runGh(editArgs(repo, source.tagName), dryRun, true)
+    await verifyAssetUrls(repo, source.tagName, source.assets, dryRun)
   }
 
   const prereleaseCheck = runGh(releasePrereleaseViewArgs(repo, source.tagName), dryRun, false)
   if (dryRun === false && parsePrereleaseFlag(prereleaseCheck) === false) {
     throw new Error(`original release ${source.tagName} was not marked prerelease`)
   }
-
-  await verifyAssetUrls(repo, source.tagName, source.assets, dryRun)
 }
 
 export async function main(): Promise<void> {

@@ -4,6 +4,7 @@ import {
   convertHarnessTag,
   evaluateHeadStatus,
   parseHarnessTag,
+  parseReleaseDetails,
   shouldSkipDuplicate,
 } from './duplicate-harness-release-tags.js'
 
@@ -34,6 +35,21 @@ describe('parseHarnessTag', () => {
       sourceTag: '1.18.21+harness.abc12345',
       targetTag: '1.18.21-harness.abc12345',
     })
+  })
+})
+
+describe('parseReleaseDetails', () => {
+  it.each(['nested/asset.tar.gz', '..'])('rejects unsafe asset path: %s', assetName => {
+    // #given
+    const release = JSON.stringify({
+      tagName: '1.18.21+harness.abc12345',
+      targetCommitish: 'abc12345',
+      isPrerelease: false,
+      assets: [{name: assetName}],
+    })
+
+    // #when / #then
+    expect(() => parseReleaseDetails(release)).toThrow(/unsafe path/)
   })
 })
 
