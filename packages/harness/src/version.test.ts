@@ -1,3 +1,4 @@
+import {readFileSync} from 'node:fs'
 import {describe, expect, it} from 'vitest'
 import {buildHarnessNpmVersion, buildHarnessReleaseTag, buildHarnessVersion} from './version.js'
 
@@ -133,16 +134,36 @@ describe('buildHarnessReleaseTag', () => {
 
 // ---------------------------------------------------------------------------
 // Round-trip: buildHarnessVersion output satisfies the harness predicate;
-// buildHarnessNpmVersion output does NOT (npm hyphen form ≠ binary form).
-// FIX 10: ensures the binary/release form and the npm form are correctly
-// distinguished by the action's isHarnessVersion predicate.
+// buildHarnessNpmVersion output does too (the forms share an identity).
+// FIX 10: ensures both forms are recognized by the action's isHarnessVersion predicate.
 // ---------------------------------------------------------------------------
 
-// Inline the predicate from src/services/setup/opencode.ts — same logic,
-// no cross-package import needed (the predicate is a one-liner).
-const isHarnessVersion = (v: string): boolean => v.includes('+harness.')
+// The harness package has an independent tsconfig, so its test cannot import root src/.
+// Keep this mirror constrained by a source-level assertion against the real predicate.
+const isHarnessVersion = (v: string): boolean => v.includes('+harness.') || v.includes('-harness.')
+
+function assertActionPredicateSource(): void {
+  const source = readFileSync(new URL('../../../src/services/setup/opencode.ts', import.meta.url), 'utf8')
+  if (
+    source.includes('version.includes(HARNESS_MARKER)') === false ||
+    source.includes("version.includes('-harness.')") === false
+  ) {
+    throw new Error(
+      "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
+    )
+  }
+}
 
 describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
+  it('keeps the local mirror equivalent to the action predicate source', () => {
+    // #given the action's real predicate source
+    // #when its accepted harness markers are checked against the local test mirror
+    // #then both build-metadata and prerelease forms must remain represented
+    expect(() => assertActionPredicateSource()).not.toThrow()
+    expect(isHarnessVersion('1.17.3+harness.abc12345')).toBe(true)
+    expect(isHarnessVersion('1.17.3-harness.abc12345')).toBe(true)
+  })
+
   it('buildHarnessVersion output satisfies isHarnessVersion (binary/release form)', () => {
     // #given
     const baseVersion = '1.17.3'
@@ -156,7 +177,7 @@ describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
     expect(binaryVersion).toContain('+harness.')
   })
 
-  it('buildHarnessNpmVersion output does NOT satisfy isHarnessVersion (npm hyphen form)', () => {
+  it('buildHarnessNpmVersion output satisfies isHarnessVersion (npm hyphen form)', () => {
     // #given
     const baseVersion = '1.17.3'
     const integrationCommit = 'abc123456789abcd'
@@ -164,8 +185,8 @@ describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
     // #when
     const npmVersion = buildHarnessNpmVersion(baseVersion, integrationCommit)
 
-    // #then — the npm form uses a hyphen and must NOT be treated as a harness download version
-    expect(isHarnessVersion(npmVersion)).toBe(false)
+    // #then — the production predicate recognizes both the binary and npm harness forms
+    expect(isHarnessVersion(npmVersion)).toBe(true)
     expect(npmVersion).toContain('-harness.')
     expect(npmVersion).not.toContain('+harness.')
   })

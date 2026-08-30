@@ -88,9 +88,15 @@ function assertDockerfileDerivation(source: string): void {
 }
 
 function assertOpencodeSetupConversion(source: string): void {
-  const sourceWithoutComments = source.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '')
-  if (/['"`]-harness\.['"`]/.test(sourceWithoutComments) === false) {
-    throw new Error(`${OPENCODE_SETUP_MODULE}: expected harness conversion to target the -harness. prerelease form`)
+  const hasHyphenConversionCall = source.split(/\r?\n/).some(line => {
+    const hasReplaceCall = line.includes('.replace(') || line.includes('.replaceAll(')
+    const hasHyphenTarget = line.includes("'-harness.'") || line.includes('"-harness."') || line.includes('`-harness.`')
+    return hasReplaceCall && hasHyphenTarget
+  })
+  if (hasHyphenConversionCall === false) {
+    throw new Error(
+      `${OPENCODE_SETUP_MODULE}: expected toHarnessReleaseTag to replace the harness marker with '-harness.'`,
+    )
   }
 }
 
@@ -179,6 +185,17 @@ describe('harness tag derivation guard', () => {
     // #given an unrelated URL containing percent-encoded + alongside a valid harness URL
     // #when / #then only the scoped harness URL construction is checked
     expect(() => assertDockerfileDerivation(VALID_DOCKERFILE)).not.toThrow()
+  })
+
+  it('rejects a setup conversion reverted to +harness. despite an unrelated hyphen literal', () => {
+    // #given a setup module whose conversion emits +harness. while another string retains -harness.
+    const sources = validSources()
+    const setupModule = 'return version.replace(HARNESS_MARKER, "+harness.")\nconst publicTag = "-harness."'
+
+    // #when / #then the conversion call site, not the unrelated literal, determines the result
+    expect(() => assertHarnessTagDerivations({...sources, opencodeSetupModule: setupModule})).toThrow(
+      `${OPENCODE_SETUP_MODULE}: expected toHarnessReleaseTag to replace the harness marker with '-harness.'`,
+    )
   })
 })
 
