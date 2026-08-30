@@ -61,7 +61,11 @@ function makeTriggerResult(eventType: TriggerResultProcess['context']['eventType
       runId: 1,
       actor: 'someone',
       action: null,
-      author: null,
+      // Production never yields a null author for a comment event: the context
+      // builders always populate one, defaulting a missing association to 'NONE'.
+      // Surface derivation fails closed on a null author, so a realistic
+      // authorized commenter is required to exercise the review-permitted path.
+      author: {login: 'maintainer', association: 'MEMBER', isBot: false},
       target: null,
       commentBody: null,
       commentId: null,

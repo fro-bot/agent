@@ -2,15 +2,38 @@ import type {AgentContext, ResponseSurface, TriggerContext} from '@fro-bot/runti
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import {parseResponseFile} from '@fro-bot/runtime'
+import {isAuthorizedAssociation} from '../triggers/author-utils.js'
+import {ALLOWED_ASSOCIATIONS} from '../triggers/types.js'
 
 export type ResponseFileStatus = 'present' | 'absent' | 'unknown'
 
+type ResponseSurfaceTriggerContext = Pick<TriggerContext, 'eventType'> & {
+  readonly author?:
+    | (Partial<NonNullable<TriggerContext['author']>> & {
+        readonly association?: NonNullable<TriggerContext['author']>['association'] | undefined
+      })
+    | null
+  readonly hasMention?: TriggerContext['hasMention'] | undefined
+}
+
 export function resolveResponseSurface(
   agentContext: Pick<AgentContext, 'issueType'>,
-  triggerContext: Pick<TriggerContext, 'eventType'> | null | undefined,
+  triggerContext: ResponseSurfaceTriggerContext | null | undefined,
 ): ResponseSurface {
   if (triggerContext?.eventType === 'pull_request') return 'pr-review'
-  if (triggerContext?.eventType === 'issue_comment' && agentContext.issueType === 'pr') return 'pr-review-permitted'
+  // Routing is the primary authorization boundary; repeat its comment checks here so this resolver fails closed.
+  const author = triggerContext?.author
+  if (
+    triggerContext?.eventType === 'issue_comment' &&
+    agentContext.issueType === 'pr' &&
+    author != null &&
+    author.isBot === false &&
+    typeof author.association === 'string' &&
+    isAuthorizedAssociation(author.association, ALLOWED_ASSOCIATIONS) &&
+    triggerContext.hasMention === true
+  ) {
+    return 'pr-review-permitted'
+  }
   if (agentContext.issueType === 'pr') return 'pr-comment'
   return 'issue-comment'
 }

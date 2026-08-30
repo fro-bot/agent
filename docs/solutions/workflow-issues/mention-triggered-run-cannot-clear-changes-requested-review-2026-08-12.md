@@ -38,7 +38,7 @@ The verdict was right. Delivering it as a review was structurally impossible, an
 
 ```ts
 if (triggerContext?.eventType === 'pull_request') return 'pr-review'
-if (triggerContext?.eventType === 'issue_comment' && agentContext.issueType === 'pr') return 'pr-review-optional'
+if (triggerContext?.eventType === 'issue_comment' && agentContext.issueType === 'pr') return 'pr-review-permitted'
 if (agentContext.issueType === 'pr') return 'pr-comment'
 return 'issue-comment'
 ```
@@ -104,11 +104,13 @@ The operational trap from the incident still stands: **prose agreement from a su
 | Trigger | Surface | Verdict | Can supersede a blocking review |
 |---|---|---|---|
 | `pull_request` | `pr-review` | required | yes |
-| authorized `issue_comment` on a PR | `pr-review-optional` | permitted | yes |
+| authorized `issue_comment` on a PR | `pr-review-permitted` | permitted | yes |
 | `pull_request_review_comment` | `pr-comment` | rejected | no |
 | `issue_comment` on an issue | `issue-comment` | rejected | n/a |
 
 `pull_request_review_comment` is deliberately not promoted: widening review authority to inline review comments is a separate trust question.
+
+**Accepted residual: self-approval by proxy.** A `COLLABORATOR` can comment `@fro-bot approve this` on their own non-fork PR and obtain an approving review from the required approver — `checkForkOrSelfGuard` only refuses PRs authored by the *bot*. This is not new capability: the same user could already add the bot as a reviewer to reach the `pull_request` path. What the mention path adds is an author-controlled *instruction* channel alongside it. Accepted on the same basis as the rest of the mention surface: the association gate is the boundary, and a `COLLABORATOR` who wants to merge unreviewed code has simpler routes than steering a review bot.
 
 ## Related
 
