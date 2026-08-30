@@ -453,7 +453,7 @@ ${trimmedCustomPrompt}`,
     }
   }
 
-  if (options.triggerContext != null && RESPONSE_SURFACE_POLICIES[responseSurface].reviewCapable) {
+  if (options.triggerContext != null) {
     parts.push(wrapXml('output_contract', buildOutputContractSection(context, responseDelivery, responseSurface)))
   }
 
@@ -772,9 +772,9 @@ ${runSummaryBlock}
   if (responseDelivery === 'file-convention') {
     const surfacePolicy = RESPONSE_SURFACE_POLICIES[responseSurface]
     const verdictRule = surfacePolicy.verdictRequired
-      ? `    5. **For a PR review, include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.`
+      ? `5. **For a PR review, include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.`
       : surfacePolicy.verdictPermitted
-        ? `    5. **For an optional PR review, you MAY include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). Include it when you want to submit a review; omit it when a comment is the right response. A verdict is available on this surface but is not required. For comments, no frontmatter is required; the file body is your response.`
+        ? `5. **For an optional PR review, you MAY include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). Include it when you want to submit a review; omit it when a comment is the right response. A verdict is available on this surface but is not required. For comments, no frontmatter is required; the file body is your response.`
         : null
     const verdictExample = surfacePolicy.verdictRequired
       ? `**File Format (PR review, with verdict frontmatter):**
@@ -805,7 +805,7 @@ You MUST deliver exactly ONE response per invocation by writing it to the respon
 2. **Write to this exact path:** \`${responseFilePath ?? '<response file path>'}\`
 3. **Write SYNCHRONOUSLY, in the foreground.** Use a blocking command such as a heredoc (\`cat > "${responseFilePath ?? '<response file path>'}" <<'EOF' ... EOF\`). Do NOT background the write (no \`&\`, \`nohup\`, or \`disown\`) — a backgrounded write may not be flushed to disk before this run ends, and your response will be lost.
 4. **One write per run.** Write the file exactly once. Do not write it more than once.
-${verdictRule == null ? '' : `${verdictRule}\n`}6. **Include the Run Summary** at the end of the body (see template below), including the \`<!-- fro-bot-agent -->\` marker.
+${verdictRule == null ? '' : `${verdictRule}\n`}${verdictRule == null ? 5 : 6}. **Include the Run Summary** at the end of the body (see template below), including the \`<!-- fro-bot-agent -->\` marker.
 
 **File Format (comment, no frontmatter):**
 ${runSummaryTemplate}${verdictExampleSection}`
@@ -826,8 +826,7 @@ You MUST post exactly ONE comment or review per invocation. All of your output �
 2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
 3. **NEVER post the Run Summary as a separate comment.** This is the most common mistake. The Run Summary goes INSIDE your response.
 4. **Include the bot marker.** Your response must contain \`<!-- fro-bot-agent -->\` (inside the Run Summary block) so the system can identify your comment.
-${reviewInstruction == null ? '' : reviewInstruction}
-6. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
+${reviewInstruction == null ? '' : `${reviewInstruction}\n`}${reviewInstruction == null ? 5 : 6}. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
 
 **Response Format:**
 Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:
@@ -955,22 +954,24 @@ function buildOutputContractSection(
   const lines: string[] = ['## Output Contract']
   const surfacePolicy = RESPONSE_SURFACE_POLICIES[responseSurface]
 
-  if (responseDelivery === 'file-convention') {
-    lines.push(
-      surfacePolicy.verdictRequired
-        ? `- Review action (REQUIRED): deliver the verdict that matches your review via the \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key in the response file — PASS → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\`, CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\`. Omitting \`${RESPONSE_FILE_VERDICT_KEY}:\` does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it via the frontmatter. This applies on re-reviews too — never omit the \`${RESPONSE_FILE_VERDICT_KEY}:\` key.`
-        : `- Review action (OPTIONAL): when a review is warranted, deliver the verdict via the \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key — PASS → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\`, CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\`. Omit the key when a comment is the right response. A verdict is available on this surface but is not required.`,
-    )
-  } else if (responseDelivery === 'none') {
-    lines.push(
-      '- This run is non-posting automation. Do not call `gh` or write a response file — report your findings only in your assistant message and session summary.',
-    )
-  } else {
-    lines.push(
-      surfacePolicy.verdictRequired
-        ? `- Review action (REQUIRED): submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. A comment-only review does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it as the matching event. This applies on re-reviews too — never substitute a plain comment for a review event.`
-        : `- Review action (OPTIONAL): when a review is warranted, submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. Post a PR comment instead when a review is not warranted. A verdict is available on this surface but is not required.`,
-    )
+  if (surfacePolicy.reviewCapable) {
+    if (responseDelivery === 'file-convention') {
+      lines.push(
+        surfacePolicy.verdictRequired
+          ? `- Review action (REQUIRED): deliver the verdict that matches your review via the \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key in the response file — PASS → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\`, CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\`. Omitting \`${RESPONSE_FILE_VERDICT_KEY}:\` does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it via the frontmatter. This applies on re-reviews too — never omit the \`${RESPONSE_FILE_VERDICT_KEY}:\` key.`
+          : `- Review action (OPTIONAL): when a review is warranted, deliver the verdict via the \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key — PASS → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\`, CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\`. Omit the key when a comment is the right response. A verdict is available on this surface but is not required.`,
+      )
+    } else if (responseDelivery === 'none') {
+      lines.push(
+        '- This run is non-posting automation. Do not call `gh` or write a response file — report your findings only in your assistant message and session summary.',
+      )
+    } else {
+      lines.push(
+        surfacePolicy.verdictRequired
+          ? `- Review action (REQUIRED): submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. A comment-only review does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it as the matching event. This applies on re-reviews too — never substitute a plain comment for a review event.`
+          : `- Review action (OPTIONAL): when a review is warranted, submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. Post a PR comment instead when a review is not warranted. A verdict is available on this surface but is not required.`,
+      )
+    }
   }
 
   lines.push(`- Requested reviewer: ${context.isRequestedReviewer ? 'yes' : 'no'}`)

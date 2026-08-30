@@ -2270,7 +2270,7 @@ describe('output contract', () => {
     expect(contractIndex).toBeLessThan(agentContextIndex)
   })
 
-  it('does not include output contract for non-PR triggers', () => {
+  it('includes surface-independent output context for non-PR triggers', () => {
     // #given
     const context = createMockContext({eventName: 'issue_comment'})
     const triggerContext = createMockTriggerContext({eventType: 'issue_comment'})
@@ -2287,8 +2287,10 @@ describe('output contract', () => {
     const prompt = result.text
 
     // #then
-    expect(prompt).not.toContain('<output_contract>')
-    expect(prompt).not.toContain('## Output Contract')
+    expect(prompt).toContain('<output_contract>')
+    expect(prompt).toContain('## Output Contract')
+    expect(prompt).toContain('- Requested reviewer: no')
+    expect(prompt).not.toContain('Review action')
   })
 })
 
@@ -2304,9 +2306,10 @@ describe('buildAgentPrompt response delivery gating', () => {
     responseFilePath: string | null,
     eventType: TriggerContext['eventType'] = 'pull_request',
     responseSurface: ResponseSurface,
+    contextOverrides: Partial<AgentContext> = {},
   ): string {
     const options: PromptOptions = {
-      context: createMockContext({eventName: eventType, issueNumber: 42, issueType: 'pr'}),
+      context: createMockContext({eventName: eventType, issueNumber: 42, issueType: 'pr', ...contextOverrides}),
       customPrompt: null,
       cacheStatus: 'hit',
       triggerContext: createMockTriggerContext({
@@ -2339,7 +2342,7 @@ describe('buildAgentPrompt response delivery gating', () => {
     expect(prompt).toContain('gh` CLI is NOT available')
   })
 
-  it('keeps the required response-file verdict rule at its exact indentation', () => {
+  it('renders the required response-file verdict rule as a list item', () => {
     // #given / #when
     const prompt = buildPromptForDelivery(
       'file-convention',
@@ -2351,8 +2354,61 @@ describe('buildAgentPrompt response delivery gating', () => {
 
     // #then
     expect(verdictRuleLine).toBeDefined()
-    expect(verdictRuleLine?.startsWith('    5.')).toBe(true)
-    expect(verdictRuleLine?.startsWith('     5.')).toBe(false)
+    expect(verdictRuleLine?.startsWith('5.')).toBe(true)
+    expect(verdictRuleLine?.startsWith('    5.')).toBe(false)
+  })
+
+  it.each([
+    ['pr-review', 'pull_request', [1, 2, 3, 4, 5, 6]],
+    ['pr-review-permitted', 'issue_comment', [1, 2, 3, 4, 5, 6]],
+    ['pr-comment', 'pull_request_review_comment', [1, 2, 3, 4, 5]],
+    ['issue-comment', 'issue_comment', [1, 2, 3, 4, 5]],
+  ] as const)('keeps the %s file-convention response protocol list contiguous', (surface, eventType, expectedRules) => {
+    // #given a response surface whose protocol may include an optional review rule
+    const prompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      eventType,
+      surface,
+    )
+    const protocol = getXmlBlock(prompt, 'agent_context')
+    const rulesStart = protocol.indexOf('**Rules:**')
+    const responseFormatStart = protocol.indexOf('**File Format')
+    const rules = protocol.slice(rulesStart, responseFormatStart)
+    const ruleLines = rules
+      .split('\n')
+      .map((line, index) => ({line, index}))
+      .filter(({line}) => /^\d+\. /.test(line))
+
+    // #then every rendered rule is a real, adjacent Markdown list item
+    expect(ruleLines.map(({line}) => Number(line.match(/^(\d+)\./)?.[1]))).toEqual(expectedRules)
+    expect(ruleLines.map(({index}) => index)).toEqual(
+      expectedRules.map((_, index) => (ruleLines[0]?.index ?? -1) + index),
+    )
+  })
+
+  it.each([
+    ['pr-review', 'pull_request', [1, 2, 3, 4, 5, 6]],
+    ['pr-review-permitted', 'issue_comment', [1, 2, 3, 4, 5, 6]],
+    ['pr-comment', 'pull_request_review_comment', [1, 2, 3, 4, 5]],
+    ['issue-comment', 'issue_comment', [1, 2, 3, 4, 5]],
+  ] as const)('keeps the %s model-gh response protocol list contiguous', (surface, eventType, expectedRules) => {
+    // #given a response surface whose protocol may include an optional review rule
+    const prompt = buildPromptForDelivery('model-gh', null, eventType, surface)
+    const protocol = getXmlBlock(prompt, 'agent_context')
+    const rulesStart = protocol.indexOf('**Rules:**')
+    const responseFormatStart = protocol.indexOf('**Response Format:**')
+    const rules = protocol.slice(rulesStart, responseFormatStart)
+    const ruleLines = rules
+      .split('\n')
+      .map((line, index) => ({line, index}))
+      .filter(({line}) => /^\d+\. /.test(line))
+
+    // #then every rendered rule is a real, adjacent Markdown list item
+    expect(ruleLines.map(({line}) => Number(line.match(/^(\d+)\./)?.[1]))).toEqual(expectedRules)
+    expect(ruleLines.map(({index}) => index)).toEqual(
+      expectedRules.map((_, index) => (ruleLines[0]?.index ?? -1) + index),
+    )
   })
 
   it('omits gh posting instructions for file-convention delivery', () => {
@@ -2464,28 +2520,39 @@ describe('buildAgentPrompt response delivery gating', () => {
   it.each([
     ['issue-comment', 'issue_comment'],
     ['pr-comment', 'pull_request_review_comment'],
-  ] as const)('omits verdict instructions and examples on the %s comment surface', (surface, eventType) => {
-    // #given a comment-only run
-    const prompt = buildPromptForDelivery(
-      'file-convention',
-      '/tmp/fro-bot-response/1-1/nonce123.md',
-      eventType,
-      surface,
-    )
+  ] as const)(
+    'keeps surface-independent output context without review instructions on the %s comment surface',
+    (surface, eventType) => {
+      // #given a comment-only run
+      const prompt = buildPromptForDelivery(
+        'file-convention',
+        '/tmp/fro-bot-response/1-1/nonce123.md',
+        eventType,
+        surface,
+      )
 
-    // #then the model is never instructed to emit a verdict its validator will reject
-    expect(prompt).not.toContain('verdict')
-    expect(prompt).not.toContain('PR review, with verdict frontmatter')
-    expect(prompt).not.toContain('<output_contract>')
-  })
+      // #then the model gets context useful on every surface without a review action it cannot perform
+      expect(prompt).toContain('<output_contract>')
+      expect(prompt).toContain('## Output Contract')
+      expect(prompt).toContain('- Requested reviewer: no')
+      expect(prompt).not.toContain('Review action')
+      expect(prompt).not.toContain('verdict')
+      expect(prompt).not.toContain('PR review, with verdict frontmatter')
+    },
+  )
 
-  it('does not attach a verdict-required output contract to pull_request_review_comment', () => {
+  it('keeps requested reviewer and author association context on pull_request_review_comment', () => {
     // #given an inline review-comment trigger on the comment-only surface
-    const prompt = buildPromptForDelivery('model-gh', null, 'pull_request_review_comment', 'pr-comment')
+    const prompt = buildPromptForDelivery('model-gh', null, 'pull_request_review_comment', 'pr-comment', {
+      authorAssociation: 'CONTRIBUTOR',
+      isRequestedReviewer: true,
+    })
 
-    // #then no review-required contract is rendered
-    expect(prompt).not.toContain('<output_contract>')
-    expect(prompt).not.toContain('## Output Contract')
+    // #then surface-independent context is retained without a review instruction
+    expect(prompt).toContain('<output_contract>')
+    expect(prompt).toContain('## Output Contract')
+    expect(prompt).toContain('- Requested reviewer: yes')
+    expect(prompt).toContain('- Author association: CONTRIBUTOR')
     expect(prompt).not.toContain('Review action (REQUIRED)')
   })
 

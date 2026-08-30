@@ -284,8 +284,8 @@ describe('registerSlashCommands', () => {
     await registerSlashCommands(token, applicationId, null, registry)
 
     // #then
-    expect(Routes.applicationCommands).toHaveBeenCalledWith(applicationId) // eslint-disable-line @typescript-eslint/unbound-method
-    expect(Routes.applicationGuildCommands).not.toHaveBeenCalled() // eslint-disable-line @typescript-eslint/unbound-method
+    expect(Routes.applicationCommands).toHaveBeenCalledWith(applicationId)
+    expect(Routes.applicationGuildCommands).not.toHaveBeenCalled()
     expect(restPutMock).toHaveBeenCalledWith('GLOBAL:app-123', {body: [{name: 'cmd'}]})
   })
 
@@ -305,8 +305,8 @@ describe('registerSlashCommands', () => {
     await registerSlashCommands(token, applicationId, guildId, registry)
 
     // #then
-    expect(Routes.applicationGuildCommands).toHaveBeenCalledWith(applicationId, guildId) // eslint-disable-line @typescript-eslint/unbound-method
-    expect(Routes.applicationCommands).not.toHaveBeenCalled() // eslint-disable-line @typescript-eslint/unbound-method
+    expect(Routes.applicationGuildCommands).toHaveBeenCalledWith(applicationId, guildId)
+    expect(Routes.applicationCommands).not.toHaveBeenCalled()
     expect(restPutMock).toHaveBeenCalledWith('GUILD:app-123:guild-456', {body: [{name: 'cmd'}]})
   })
 })

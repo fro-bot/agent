@@ -122,13 +122,19 @@ async function createMissingResponsePath(): Promise<string> {
   return path.join(dir, 'expected-response.md')
 }
 
-function routeMention(overrides: Parameters<typeof createIssueCommentCreatedEvent>[0]) {
+function routeMention(
+  overrides: Parameters<typeof createIssueCommentCreatedEvent>[0],
+  config: Parameters<typeof routeEvent>[2] = {},
+) {
   const payload = createIssueCommentCreatedEvent({
     isPullRequest: true,
     commentBody: '@fro-bot review this PR',
     ...overrides,
   })
-  return routeEvent(createMockGitHubContext('issue_comment', payload), createMockLogger(), {botLogin: 'fro-bot'})
+  return routeEvent(createMockGitHubContext('issue_comment', payload), createMockLogger(), {
+    botLogin: 'fro-bot',
+    ...config,
+  })
 }
 
 describe('mention review authorization coupling', () => {
@@ -160,6 +166,17 @@ describe('mention review authorization coupling', () => {
     expect(result.shouldProcess).toBe(true)
     expect(result.context.target?.kind).toBe('pr')
     expect(resolveResponseSurface({issueType: 'pr'}, result.context)).toBe('pr-review-permitted')
+  })
+
+  it('skips a trusted PR comment without a mention when mention routing is required', () => {
+    // #given a trusted PR comment with no bot mention and the production mention requirement enabled
+    const result = routeMention(
+      {authorAssociation: 'MEMBER', commentBody: 'please review this'},
+      {requireMention: true},
+    )
+
+    // #then the real router rejects it before the permitted review surface can be reached
+    expect(result).toMatchObject({shouldProcess: false, skipReason: 'no_mention'})
   })
 })
 
@@ -571,6 +588,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('issue_comment'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
+        deliveryFooter: '### Brokered push delivered\n- Branch: `feature/fix`',
       },
       logger,
     )
@@ -681,7 +699,7 @@ describe('runResponsePost', () => {
       expect.objectContaining({event: 'REQUEST_CHANGES', pull_number: 7, commit_id: 'head-sha'}),
     )
     const request = octokit.rest.pulls.createReview.mock.calls[0]?.[0] as {readonly body: string}
-    expect(request.body).not.toContain('Brokered push delivered')
+    expect(request.body).toContain('Brokered push delivered')
   })
 
   it('submits a fallback-sourced approving verdict as a non-approving COMMENT review', async () => {
@@ -846,6 +864,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('issue_comment'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
+        deliveryFooter: '### Brokered push delivered\n- Branch: `feature/fix`',
       },
       logger,
     )
@@ -1203,6 +1222,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('issue_comment'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
+        deliveryFooter: '### Brokered push delivered\n- Branch: `feature/fix`',
       },
       logger,
     )
@@ -1212,7 +1232,119 @@ describe('runResponsePost', () => {
     expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({event: 'APPROVE', owner: 'owner', repo: 'repo', pull_number: 7, commit_id: 'head-sha'}),
     )
+    const request = octokit.rest.pulls.createReview.mock.calls[0]?.[0] as {readonly body: string}
+    expect(request.body).toContain('### Brokered push delivered\n- Branch: `feature/fix`')
     expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it('degrades to a comment when the bot login is unavailable on the permitted surface', async () => {
+    // #given a valid approving response but no bot login for review submission
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post on a review-permitted surface
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'issue_comment', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: null,
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the response is delivered as a comment rather than discarded
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledTimes(1)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalledWith('Response-post: verdict could not be submitted; degrading to comment', {
+      surface: 'pr-review-permitted',
+      reason: 'missing-target-context',
+    })
+  })
+
+  it('fails closed when the bot login is unavailable on the required review surface', async () => {
+    // #given a valid approving response but no bot login for review submission
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post on a review-required surface
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: null,
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then nothing is posted: a required review must never silently become a comment
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'missing-target-context',
+      detail: 'Cannot submit a review: bot login is unavailable',
+    })
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('degrades an invalid verdict on the permitted review surface to a comment', async () => {
+    // #given a permitted-surface response with a verdict value the parser cannot accept
+    const filePath = await writeFixture('---\nverdict: lgtm\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post for an issue_comment on a PR
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the unparseable verdict is not accepted, but its validated prose is delivered as a comment
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({body: expect.stringContaining('LGTM.') as unknown as string}),
+    )
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Response-post: invalid verdict on permitted surface; posting response body as a comment',
+      {surface: 'pr-review-permitted', reason: 'unknown-verdict'},
+    )
+  })
+
+  it('fails closed for an invalid verdict on the required review surface', async () => {
+    // #given a required review response with a verdict value the parser cannot accept
+    const filePath = await writeFixture('---\nverdict: lgtm\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post for a pull_request trigger
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the malformed verdict remains a parse failure with no delivery
+    expect(result).toEqual({delivered: false, reason: 'parse-failed', detail: 'Unknown verdict value: "lgtm"'})
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
   })
 
   it('keeps a required pull_request review fail-closed when its verdict is missing', async () => {
@@ -1243,7 +1375,7 @@ describe('runResponsePost', () => {
     expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
   })
 
-  it('blocks an approving mention review on a fork through the existing guard', async () => {
+  it('degrades a guard-blocked approving mention review on a fork to a comment', async () => {
     // #given an approving mention response and a fork PR
     const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
     tempFiles.push(filePath)
@@ -1269,21 +1401,18 @@ describe('runResponsePost', () => {
       logger,
     )
 
-    // #then the shared fork guard blocks APPROVE before review creation
-    expect(result).toEqual({
-      delivered: false,
-      reason: 'review-guard-blocked',
-      detail: 'Review guard blocked submission: self-or-fork',
-    })
+    // #then the shared fork guard blocks APPROVE and the permitted surface delivers the body as a comment
+    expect(result).toEqual({delivered: true, kind: 'comment'})
     expect(logger.warning).toHaveBeenCalledWith(
-      'Response-post: review guard blocked the verdict, no review submitted',
-      {reason: 'self-or-fork', prNumber: 7},
+      'Response-post: review guard blocked the verdict; degrading to comment',
+      {reason: 'self-or-fork', prNumber: 7, surface: 'pr-review-permitted'},
     )
     expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledTimes(1)
   })
 
-  it('blocks an approving mention review on a self-authored PR through the existing guard', async () => {
-    // #given an approving mention response and a PR authored by the bot
+  it('blocks an approving required review on a self-authored PR through the existing guard', async () => {
+    // #given an approving pull_request response and a PR authored by the bot
     const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
     tempFiles.push(filePath)
     const octokit = makeOctokit({
@@ -1296,12 +1425,12 @@ describe('runResponsePost', () => {
       }),
     })
 
-    // #when running response-post for an issue_comment on that PR
+    // #when running response-post for the required review surface
     const result = await runResponsePost(
       {
         octokit: octokit as unknown as Octokit,
-        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
-        triggerResult: makeTriggerResult('issue_comment'),
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
       },
@@ -1317,7 +1446,10 @@ describe('runResponsePost', () => {
     expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
   })
 
-  it('aborts a mention review when the PR head moves before submission', async () => {
+  it.each([
+    {surface: 'pr-review-permitted' as const, eventType: 'issue_comment' as const},
+    {surface: 'pr-review' as const, eventType: 'pull_request' as const},
+  ])('aborts a $surface review when the PR head moves before submission', async ({eventType}) => {
     // #given an approving mention response and a head that changes during the guarded path
     const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
     tempFiles.push(filePath)
@@ -1338,19 +1470,19 @@ describe('runResponsePost', () => {
         },
       })
 
-    // #when running response-post for an issue_comment on that PR
+    // #when running response-post for the selected PR surface
     const result = await runResponsePost(
       {
         octokit: octokit as unknown as Octokit,
-        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
-        triggerResult: makeTriggerResult('issue_comment'),
+        agentContext: makeAgentContext({eventName: eventType, issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult(eventType),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
       },
       logger,
     )
 
-    // #then the TOCTOU guard aborts without creating a review
+    // #then the TOCTOU guard aborts without creating a review or degrading stale content to a comment
     expect(result).toEqual({
       delivered: false,
       reason: 'review-guard-blocked',
