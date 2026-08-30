@@ -88,7 +88,27 @@ function assertDockerfileDerivation(source: string): void {
 }
 
 function assertOpencodeSetupConversion(source: string): void {
-  const hasHyphenConversionCall = source.split(/\r?\n/).some(line => {
+  // Coupling contract: this guard matches source text, so refactoring the matched expression requires updating it.
+  const sourceWithoutComments = source.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '')
+  const functionStart = sourceWithoutComments.indexOf('function toHarnessReleaseTag')
+  const functionBodyStart = functionStart === -1 ? -1 : sourceWithoutComments.indexOf('{', functionStart)
+  let functionEnd = -1
+  if (functionBodyStart !== -1) {
+    let braceDepth = 0
+    for (let index = functionBodyStart; index < sourceWithoutComments.length; index += 1) {
+      const character = sourceWithoutComments[index]
+      if (character === '{') braceDepth += 1
+      if (character === '}') {
+        braceDepth -= 1
+        if (braceDepth === 0) {
+          functionEnd = index + 1
+          break
+        }
+      }
+    }
+  }
+  const functionSource = functionEnd === -1 ? '' : sourceWithoutComments.slice(functionBodyStart, functionEnd)
+  const hasHyphenConversionCall = functionSource.split(/\r?\n/).some(line => {
     const hasReplaceCall = line.includes('.replace(') || line.includes('.replaceAll(')
     const hasHyphenTarget = line.includes("'-harness.'") || line.includes('"-harness."') || line.includes('`-harness.`')
     return hasReplaceCall && hasHyphenTarget
@@ -125,7 +145,8 @@ const VALID_DOCKERFILE = [
   `&& base_url="${HARNESS_RELEASE_PREFIX}\${tag_version}" \\`,
 ].join('\n')
 
-const VALID_SETUP_MODULE = 'return version.replace(HARNESS_MARKER, "-harness.")'
+const VALID_SETUP_MODULE =
+  'function toHarnessReleaseTag(version: string): string {\n  return version.replace(HARNESS_MARKER, "-harness.")\n}'
 
 function validSources(): HarnessTagSources {
   return {
@@ -190,7 +211,9 @@ describe('harness tag derivation guard', () => {
   it('rejects a setup conversion reverted to +harness. despite an unrelated hyphen literal', () => {
     // #given a setup module whose conversion emits +harness. while another string retains -harness.
     const sources = validSources()
-    const setupModule = 'return version.replace(HARNESS_MARKER, "+harness.")\nconst publicTag = "-harness."'
+    const setupModule =
+      'function toHarnessReleaseTag(version: string): string {\n  return version.replace(HARNESS_MARKER, "+harness.")\n}\n' +
+      'const publicTag = "-harness."'
 
     // #when / #then the conversion call site, not the unrelated literal, determines the result
     expect(() => assertHarnessTagDerivations({...sources, opencodeSetupModule: setupModule})).toThrow(

@@ -1,6 +1,6 @@
 import {readFileSync} from 'node:fs'
 import {describe, expect, it} from 'vitest'
-import {buildHarnessNpmVersion, buildHarnessReleaseTag, buildHarnessVersion} from './version.js'
+import {buildHarnessNpmVersion, buildHarnessVersion} from './version.js'
 
 // ---------------------------------------------------------------------------
 // buildHarnessVersion
@@ -86,53 +86,6 @@ describe('buildHarnessNpmVersion', () => {
 })
 
 // ---------------------------------------------------------------------------
-// buildHarnessReleaseTag
-// ---------------------------------------------------------------------------
-
-describe('buildHarnessReleaseTag', () => {
-  it('exact output for known base + commit → <baseVersion>+harness.<shortSha>', () => {
-    // #given / #when
-    const result = buildHarnessReleaseTag('1.17.3', 'ed359558abcdef1234567890abcdef1234567890')
-
-    // #then
-    expect(result).toBe('1.17.3+harness.ed359558')
-  })
-
-  it('full 40-char SHA truncates to first 8 chars', () => {
-    // #given
-    const fullSha = 'abcdef1234567890abcdef1234567890abcdef12'
-
-    // #when
-    const result = buildHarnessReleaseTag('1.17.3', fullSha)
-
-    // #then
-    expect(result).toBe('1.17.3+harness.abcdef12')
-    expect(result.split('+harness.')[1]).toBe(fullSha.slice(0, 8))
-  })
-
-  it('8-char commit is used unchanged', () => {
-    // #given
-    const shortCommit = 'ed359558'
-
-    // #when
-    const result = buildHarnessReleaseTag('1.17.3', shortCommit)
-
-    // #then
-    expect(result).toBe('1.17.3+harness.ed359558')
-  })
-
-  it('is NOT v-prefixed and uses build-metadata plus separator (not prerelease hyphen)', () => {
-    // #given / #when
-    const result = buildHarnessReleaseTag('1.17.3', 'ed359558abcdef12')
-
-    // #then — non-v so it stays out of the product `v${version}` tag space; build metadata (+), NOT prerelease (-)
-    expect(result).not.toMatch(/^v/)
-    expect(result).toContain('+harness.')
-    expect(result).not.toContain('-harness.')
-  })
-})
-
-// ---------------------------------------------------------------------------
 // Round-trip: buildHarnessVersion output satisfies the harness predicate;
 // buildHarnessNpmVersion output does too (the forms share an identity).
 // FIX 10: ensures both forms are recognized by the action's isHarnessVersion predicate.
@@ -142,11 +95,12 @@ describe('buildHarnessReleaseTag', () => {
 // Keep this mirror constrained by a source-level assertion against the real predicate.
 const isHarnessVersion = (v: string): boolean => v.includes('+harness.') || v.includes('-harness.')
 
-function assertActionPredicateSource(): void {
-  const source = readFileSync(new URL('../../../src/services/setup/opencode.ts', import.meta.url), 'utf8')
+function assertActionPredicateSource(source: string): void {
+  // Coupling contract: this guard matches source text, so refactoring the matched expression requires updating it.
+  const sourceWithoutComments = source.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '')
   if (
-    source.includes('version.includes(HARNESS_MARKER)') === false ||
-    source.includes("version.includes('-harness.')") === false
+    sourceWithoutComments.includes('version.includes(HARNESS_MARKER)') === false ||
+    sourceWithoutComments.includes("version.includes('-harness.')") === false
   ) {
     throw new Error(
       "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
@@ -154,12 +108,16 @@ function assertActionPredicateSource(): void {
   }
 }
 
+function readActionPredicateSource(): string {
+  return readFileSync(new URL('../../../src/services/setup/opencode.ts', import.meta.url), 'utf8')
+}
+
 describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
   it('keeps the local mirror equivalent to the action predicate source', () => {
     // #given the action's real predicate source
     // #when its accepted harness markers are checked against the local test mirror
     // #then both build-metadata and prerelease forms must remain represented
-    expect(() => assertActionPredicateSource()).not.toThrow()
+    expect(() => assertActionPredicateSource(readActionPredicateSource())).not.toThrow()
     expect(isHarnessVersion('1.17.3+harness.abc12345')).toBe(true)
     expect(isHarnessVersion('1.17.3-harness.abc12345')).toBe(true)
   })
@@ -189,5 +147,15 @@ describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
     expect(isHarnessVersion(npmVersion)).toBe(true)
     expect(npmVersion).toContain('-harness.')
     expect(npmVersion).not.toContain('+harness.')
+  })
+
+  it('rejects an action predicate narrowed to +harness. only', () => {
+    // #given a source whose predicate lost the prerelease marker, despite a comment retaining its text
+    const narrowedSource = "// version.includes('-harness.')\nreturn version.includes(HARNESS_MARKER)"
+
+    // #when / #then the source-level equivalence guard rejects the drift
+    expect(() => assertActionPredicateSource(narrowedSource)).toThrow(
+      "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
+    )
   })
 })
