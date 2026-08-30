@@ -142,8 +142,9 @@ RUN apk add --no-cache git ca-certificates libgcc libstdc++ ripgrep curl
 # Download source: https://github.com/fro-bot/agent/releases
 # Version form: <base>+harness.<sha> (e.g. 1.17.3+harness.2c9cdbd2)
 #
-# The '+' in the version tag is percent-encoded as '%2B' in the URL path —
-# GitHub stores tags URL-encoded and a raw '+' is misread as a space.
+# The version keeps +harness. build metadata while the release tag uses the
+# -harness. prerelease form. Mirrors toHarnessReleaseTag() in
+# src/services/setup/opencode.ts.
 #
 # SHA256SUMS verification is fail-closed: any download failure, checksum fetch
 # failure, hash mismatch, missing entry, or partial download aborts the build
@@ -164,9 +165,9 @@ RUN set -euo pipefail \
          arm64) oc_asset="opencode-linux-arm64-musl" ;; \
          *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
        esac \
-    # Encode '+' as '%2B' for the URL path segment (GitHub tag URL encoding).
-    && encoded_version="${OPENCODE_VERSION//+/%2B}" \
-    && base_url="https://github.com/fro-bot/agent/releases/download/${encoded_version}" \
+    # Derive the prerelease tag from the build-metadata version form.
+    && tag_version="${OPENCODE_VERSION//+harness./-harness.}" \
+    && base_url="https://github.com/fro-bot/agent/releases/download/${tag_version}" \
     # Download the asset archive and the SHA256SUMS file for this release.
     # --retry 3 --retry-delay 2: absorbs transient CDN blips; persistent 404/auth still aborts.
     && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \

@@ -1,3 +1,5 @@
+import {join} from 'node:path'
+
 import {defineConfig} from '@bfra.me/eslint-config'
 
 export default defineConfig(
@@ -70,11 +72,11 @@ export default defineConfig(
           // extraneous-dependency errors for that package's imports.
           packageDir: [
             import.meta.dirname,
-            `${import.meta.dirname}/apps/action`,
-            `${import.meta.dirname}/apps/workspace-agent`,
-            `${import.meta.dirname}/packages/runtime`,
-            `${import.meta.dirname}/packages/gateway`,
-            `${import.meta.dirname}/packages/harness`,
+            join(import.meta.dirname, 'apps/action'),
+            join(import.meta.dirname, 'apps/workspace-agent'),
+            join(import.meta.dirname, 'packages/runtime'),
+            join(import.meta.dirname, 'packages/gateway'),
+            join(import.meta.dirname, 'packages/harness'),
           ],
           // devDependencies are legitimate in tests, test support, config, and
           // build scripts.
