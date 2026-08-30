@@ -13,6 +13,7 @@ import {
   getPlatformInfo,
   installOpenCode,
   isHarnessVersion,
+  toHarnessReleaseTag,
   toolCacheVersion,
 } from './opencode.js'
 
@@ -302,10 +303,12 @@ describe('opencode', () => {
       expect(() => buildChecksumsUrl('1.17.3')).toThrow(/requires a harness version/)
     })
 
-    it('throws for the hyphen release-tag form when supplied as a version input', () => {
-      // #given / #when / #then
-      // Release tags now use this hyphen form, but binary version inputs still use +harness.
-      expect(() => buildChecksumsUrl('1.17.3-harness.abc12345')).toThrow(/requires a harness version/)
+    it('accepts the hyphen release-tag form when supplied as a version input', () => {
+      // #given / #when
+      const url = buildChecksumsUrl('1.17.3-harness.abc12345')
+
+      // #then — the public release-tag form is already the canonical target.
+      expect(url).toBe('https://github.com/fro-bot/agent/releases/download/1.17.3-harness.abc12345/SHA256SUMS')
     })
 
     it('maps a +harness. VERSION input to a -harness. TAG in the checksums URL', () => {
@@ -341,9 +344,9 @@ describe('opencode', () => {
       expect(isHarnessVersion('1.17.3')).toBe(false)
     })
 
-    it('returns false for a hyphen-form version (npm form, not binary form)', () => {
+    it('returns true for a hyphen-form version copied from the public release tag', () => {
       // #given / #when / #then
-      expect(isHarnessVersion('1.17.3-harness.abc12345')).toBe(false)
+      expect(isHarnessVersion('1.17.3-harness.abc12345')).toBe(true)
     })
 
     it('returns false for latest', () => {
@@ -379,6 +382,13 @@ describe('opencode', () => {
 
       // #then — preserves the full harness identity (and is therefore distinct from stock 1.17.3)
       expect(converted).toBe('1.17.3-harness.2c9cdbd2')
+    })
+  })
+
+  describe('toHarnessReleaseTag', () => {
+    it('leaves an already-prerelease hyphen form unchanged', () => {
+      // #given / #when / #then
+      expect(toHarnessReleaseTag('1.17.3-harness.x')).toBe('1.17.3-harness.x')
     })
   })
 
@@ -635,6 +645,33 @@ describe('opencode', () => {
       const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
       const stockCalls = calls.filter(([url]) => url.includes('anomalyco'))
       expect(stockCalls).toHaveLength(0)
+    })
+
+    it('fail-closed: hyphen-form harness pin uses the harness URL and does not fall back to stock', async () => {
+      // #given — users may copy the hyphen-form identity directly from the Releases page
+      Object.defineProperty(process, 'platform', {value: 'linux'})
+      Object.defineProperty(process, 'arch', {value: 'x64'})
+
+      const HARNESS_VERSION = '1.17.3-harness.abc12345'
+      const mockToolCache = createMockToolCache({
+        find: vi.fn().mockReturnValue(''),
+        downloadTool: vi.fn().mockImplementation(async (url: string) => {
+          if (url.endsWith('SHA256SUMS')) throw new Error('HTTP 404: Not Found')
+          return Promise.resolve('/tmp/opencode-linux-x64.tar.gz')
+        }),
+      })
+      const mockExec = createMockExecAdapter()
+
+      // #when / #then — the full install path must take the harness branch and fail closed
+      await expect(installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)).rejects.toThrow(
+        /fail-closed|harness.*failed|404/i,
+      )
+
+      const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
+      expect(calls[0]?.[0]).toContain('https://github.com/fro-bot/agent/releases/download/1.17.3-harness.abc12345/')
+      expect(calls.some(([url]) => url.endsWith('SHA256SUMS'))).toBe(true)
+      expect(calls.filter(([url]) => url.includes('anomalyco'))).toHaveLength(0)
+      expect(mockLogger.warning).not.toHaveBeenCalled()
     })
   })
 
