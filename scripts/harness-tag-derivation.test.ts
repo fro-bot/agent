@@ -11,6 +11,8 @@ import {describe, expect, it} from 'vitest'
 const HARNESS_RELEASE_WORKFLOW = '.github/workflows/harness-release.yaml'
 const WORKSPACE_DOCKERFILE = 'deploy/workspace.Dockerfile'
 const OPENCODE_SETUP_MODULE = 'src/services/setup/opencode.ts'
+const HARNESS_VERSION_TEST = 'packages/harness/src/version.test.ts'
+const HARNESS_TAG_GUARD_TEST = 'scripts/harness-tag-derivation.test.ts'
 const HARNESS_RELEASE_PREFIX = 'https://github.com/fro-bot/agent/releases/download/'
 const EXPECTED_RELEASE_TAG_ASSIGNMENT = 'RELEASE_TAG="${BASE_VERSION}-harness.${SHORT_SHA}"'
 
@@ -89,6 +91,8 @@ function assertDockerfileDerivation(source: string): void {
 
 function assertOpencodeSetupConversion(source: string): void {
   // Coupling contract: this guard matches source text, so refactoring the matched expression requires updating it.
+  // Limitation: regex literals are not parsed, so an unbalanced quote such as /['"]/ can enter string state and
+  // under-strip subsequent comments (a weaker guard), never lose code.
   const sourceWithoutComments = stripCommentsPreservingStrings(source)
   const functionStart = sourceWithoutComments.indexOf('function toHarnessReleaseTag')
   const functionBodyStart = functionStart === -1 ? -1 : sourceWithoutComments.indexOf('{', functionStart)
@@ -175,6 +179,25 @@ function stripCommentsPreservingStrings(source: string): string {
   }
 
   return result
+}
+
+function extractStripperBlock(source: string, file: string): string {
+  const start = source.indexOf('function stripCommentsPreservingStrings')
+  const end = start === -1 ? -1 : source.indexOf('\n  }\n', start)
+  if (start === -1 || end === -1) {
+    throw new Error(`${file}: expected stripCommentsPreservingStrings function block`)
+  }
+  return source.slice(start, end + 4)
+}
+
+function assertStripperBlocksEqual(versionTestSource: string, guardSource: string): void {
+  const versionBlock = extractStripperBlock(versionTestSource, HARNESS_VERSION_TEST)
+  const guardBlock = extractStripperBlock(guardSource, HARNESS_TAG_GUARD_TEST)
+  if (versionBlock !== guardBlock) {
+    throw new Error(
+      `${HARNESS_VERSION_TEST}: expected stripCommentsPreservingStrings block to match ${HARNESS_TAG_GUARD_TEST}`,
+    )
+  }
 }
 
 export function assertHarnessTagDerivations(sources: HarnessTagSources): void {
@@ -290,6 +313,19 @@ describe('harness tag derivation guard', () => {
       `${OPENCODE_SETUP_MODULE}: expected toHarnessReleaseTag to replace the harness marker with '-harness.'`,
     )
   })
+
+  it('rejects non-equivalent comment stripper blocks', () => {
+    // #given two synthetic stripper blocks that differ by one character
+    const versionTestSource =
+      'function stripCommentsPreservingStrings(source: string): string {\n  return source\n  }\n'
+    const guardSource =
+      'function stripCommentsPreservingStrings(source: string): string {\n  return source.trim()\n  }\n'
+
+    // #when / #then the mismatch names both source files and the required equivalence
+    expect(() => assertStripperBlocksEqual(versionTestSource, guardSource)).toThrow(
+      `${HARNESS_VERSION_TEST}: expected stripCommentsPreservingStrings block to match ${HARNESS_TAG_GUARD_TEST}`,
+    )
+  })
 })
 
 describe('checked-in harness tag producers', () => {
@@ -299,5 +335,15 @@ describe('checked-in harness tag producers', () => {
 
     // #when / #then all three producers must agree on the public release-tag form
     expect(() => assertHarnessTagDerivations(sources)).not.toThrow()
+  })
+
+  it('keeps the duplicated comment strippers byte-for-byte identical', () => {
+    // #given both checked-in source files containing the shared stripper implementation
+    const root = process.cwd()
+    const versionTestSource = readFileSync(join(root, HARNESS_VERSION_TEST), 'utf8')
+    const guardSource = readFileSync(join(root, HARNESS_TAG_GUARD_TEST), 'utf8')
+
+    // #when / #then the duplicated implementation must remain synchronized
+    expect(() => assertStripperBlocksEqual(versionTestSource, guardSource)).not.toThrow()
   })
 })

@@ -97,6 +97,8 @@ const isHarnessVersion = (v: string): boolean => v.includes('+harness.') || v.in
 
 function assertActionPredicateSource(source: string): void {
   // Coupling contract: this guard matches source text, so refactoring the matched expression requires updating it.
+  // Limitation: regex literals are not parsed, so an unbalanced quote such as /['"]/ can enter string state and
+  // under-strip subsequent comments (a weaker guard), never lose code.
   const sourceWithoutComments = stripCommentsPreservingStrings(source)
   if (
     sourceWithoutComments.includes('version.includes(HARNESS_MARKER)') === false ||
