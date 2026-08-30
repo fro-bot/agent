@@ -1,5 +1,5 @@
 ---
-title: A mention-triggered run cannot clear a blocking review, by design
+title: A mention-triggered run could not clear a blocking review — and the stated reason was wrong
 date: 2026-08-12
 category: workflow-issues
 module: development-workflow
@@ -20,7 +20,9 @@ tags:
   - security-boundary
 ---
 
-# A mention-triggered run cannot clear a blocking review, by design
+# A mention-triggered run could not clear a blocking review — and the stated reason was wrong
+
+> **Resolved 2026-08-29 (#1504).** An authorized mention on a PR now resolves to a review-permitted surface and can submit a real review. The original constraint below was real, but the security rationale this doc gave for it was mistaken — see [Why This Matters](#why-this-matters). The incident and the diagnosis are preserved; the guidance is corrected.
 
 ## Context
 
@@ -32,15 +34,18 @@ The verdict was right. Delivering it as a review was structurally impossible, an
 
 ## Guidance
 
-**The response surface is keyed off the triggering event, not the target.** The whole of `resolveResponseSurface` in `src/features/agent/response-file.ts`:
+**The response surface is keyed off the triggering event, not the target.** That remains true — but the mapping now distinguishes three states rather than two, in `src/features/agent/response-file.ts`:
 
 ```ts
 if (triggerContext?.eventType === 'pull_request') return 'pr-review'
+if (triggerContext?.eventType === 'issue_comment' && agentContext.issueType === 'pr') return 'pr-review-optional'
 if (agentContext.issueType === 'pr') return 'pr-comment'
 return 'issue-comment'
 ```
 
-A mention is an `issue_comment` event. It resolves to `pr-comment` — a comment on a PR, never a review. Only a review event supersedes `CHANGES_REQUESTED`; a comment, however well-reasoned, never does.
+At the time of the incident the middle case did not exist, so a mention resolved to `pr-comment` and a verdict was rejected outright — the run reached a conclusion and delivered nothing at all.
+
+The distinction that was missing is **required** versus **permitted**. A `pull_request` run must produce a verdict; a missing one fails closed, because silently commenting would downgrade a required review while reporting success. A mention may produce one: a verdict submits a real review, and its absence posts a comment. Collapsing both into one surface is what made the capability unreachable — and promoting mentions to review-*required* instead would have been the same bug mirrored, forcing a verdict out of a run that was only ever asked a question.
 
 **The reconciliation backstop does not rescue this.** It no-ops on the same distinction, in `src/harness/phases/review-reconciliation.ts`:
 
@@ -56,7 +61,9 @@ if (isPullRequestReviewTrigger === false) {
 
 where `isPullRequestReviewTrigger` is derived in `src/harness/run.ts` as `triggerContext.eventType === 'pull_request'`.
 
-**What resolves it:** re-run the CI job that carries the review. That replays the `pull_request` event, reaches the `pr-review` surface, and produces a real review superseding the stale one.
+**What resolves it now:** mention the bot. An authorized mention reaches the review-permitted surface and submits a real review, which supersedes the stale one — GitHub scores the latest review per reviewer, so no explicit dismissal is needed.
+
+**What resolved it before:** re-running the CI job that carries the review, replaying the `pull_request` event to reach the `pr-review` surface.
 
 **What does not:** re-requesting review. The workflow subscribes to a fixed type list in `.github/workflows/ci.yaml`:
 
@@ -72,11 +79,19 @@ Avoid an empty commit to force `synchronize`; it pollutes history to solve a rou
 
 ## Why This Matters
 
-This is a security property, not a defect. A comment-triggered run is initiated by anyone who can comment. If such a run could clear a blocking review, unblocking a PR would be one comment away.
+The original version of this doc called the restriction a security property and justified it this way:
 
-The same rule is stated explicitly in `src/features/reviews/review-guards.ts`, where the fork/self refusal applies only to `APPROVE`: request-changes and comment can only ever block a PR, so they are safe from any source, while approve can unblock and needs the stricter surface. The asymmetry is consistent and deliberate.
+> A comment-triggered run is initiated by anyone who can comment. If such a run could clear a blocking review, unblocking a PR would be one comment away.
 
-The operational trap: **prose agreement from a surface that cannot act looks resolved in the transcript and changes nothing on the PR.** The reply said the blocker was gone. The blocker was not gone. Both were true.
+**That premise was false when written.** `checkIssueCommentSkipConditions` in `src/features/triggers/skip-conditions-comment.ts` rejects bot authors and any association outside `OWNER`, `MEMBER`, `COLLABORATOR` — before the run ever executes. A mention run has never been reachable by "anyone who can comment." The surface restriction was not what made mentions safe; the association gate was, and it already existed.
+
+The lasting lesson is not about review surfaces. It is that **a constraint can be correct while the reason given for it is wrong**, and the wrong reason is what survives in documentation and blocks the fix. This doc argued the restriction was load-bearing security. It was actually an unfinished capability wearing a security justification — and that framing is why the gap sat unaddressed while the machinery to close it safely was already in the codebase.
+
+When recording a constraint as deliberate, state which mechanism enforces the property and check that it is the one you are naming. Had this doc traced the actual gate, it would have documented a missing feature rather than a security boundary.
+
+The genuine security property is narrower and unchanged: `src/features/reviews/review-guards.ts` refuses `APPROVE` on fork and self-authored PRs while permitting request-changes and comment, because only approve can unblock. Mention-initiated reviews traverse that identical guard, plus the head-SHA re-check that anchors a review to the tree it was made against.
+
+The operational trap from the incident still stands: **prose agreement from a surface that cannot act looks resolved in the transcript and changes nothing on the PR.** The reply said the blocker was gone. The blocker was not gone. Both were true.
 
 ## When to Apply
 
@@ -86,11 +101,14 @@ The operational trap: **prose agreement from a surface that cannot act looks res
 
 ## Examples
 
-| Trigger | Surface | Can supersede a blocking review |
-|---|---|---|
-| `pull_request` | `pr-review` | yes |
-| `issue_comment` on a PR | `pr-comment` | no |
-| `issue_comment` on an issue | `issue-comment` | n/a |
+| Trigger | Surface | Verdict | Can supersede a blocking review |
+|---|---|---|---|
+| `pull_request` | `pr-review` | required | yes |
+| authorized `issue_comment` on a PR | `pr-review-optional` | permitted | yes |
+| `pull_request_review_comment` | `pr-comment` | rejected | no |
+| `issue_comment` on an issue | `issue-comment` | rejected | n/a |
+
+`pull_request_review_comment` is deliberately not promoted: widening review authority to inline review comments is a separate trust question.
 
 ## Related
 

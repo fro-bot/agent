@@ -42,7 +42,7 @@
     },
     {
       "id": "issue-known-files",
-      "promptHash": "14bf7c34f8e70cba9e0470cf8bd03ba31f65b33576ebaf945d84306c8cf301e9",
+      "promptHash": "656fc652ad66f395b1e448477745ead9a20f0c430780890a2fea2c97558a54c6",
       "scenarioCommitSha": "07a4cc53a1c110b6432d6228c63011c8d210b847",
       "state": "passed",
       "passedGateIds": [
@@ -56,7 +56,7 @@
     },
     {
       "id": "continuation-relevant",
-      "promptHash": "f8eec24b078bf79dcbe4afa4edb96f650f70f35cf9612ca3b94a662e8efd9653",
+      "promptHash": "6a69c74b8f00122533348c89c9800171647d23019d01d1335dfe4cbc987f9288",
       "scenarioCommitSha": "c4fa14cfe1b2e137d5813c356412a58e24523584",
       "state": "passed",
       "passedGateIds": [
@@ -70,7 +70,7 @@
     },
     {
       "id": "continuation-irrelevant-non-degradation",
-      "promptHash": "7658cb03afa15312de5da9b89c5a051f90d7a7418f7e9ab3e49deefe6d4609d2",
+      "promptHash": "3f018a2ea83cd107df180a3198a6ecd0fea8814c64538314e48b359e5fdff5b1",
       "scenarioCommitSha": "c4fa14cfe1b2e137d5813c356412a58e24523584",
       "state": "passed",
       "passedGateIds": [
