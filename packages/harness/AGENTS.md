@@ -47,9 +47,11 @@ Harness builds target **linux and darwin only** (x64 + arm64); Windows is unsupp
 The harness is distributed through **two channels** from one release run:
 
 - **npm** — for local `bunx @fro.bot/harness` / `mise` use. Published as a SemVer **prerelease**: `<base>-harness.<short8>` (e.g. `1.17.3-harness.ed359558`), with the `latest` dist-tag set explicitly (prereleases are not `latest` by default).
-- **GitHub Release** — for the Fro Bot action to download (the same way it downloads stock OpenCode). The release is tagged with SemVer **build metadata**: `v<base>+harness.<short8>`, carrying OpenCode-shaped assets `opencode-{linux-x64,linux-arm64}.tar.gz` / `opencode-{darwin-x64,darwin-arm64}.zip` (binary at archive root) plus `SHA256SUMS`.
+- **GitHub Release** — for the Fro Bot action to download (the same way it downloads stock OpenCode). The release tag uses the same SemVer **prerelease** string as npm: `<base>-harness.<short8>` (no `v`), carrying OpenCode-shaped assets `opencode-{linux-x64,linux-arm64}.tar.gz` / `opencode-{darwin-x64,darwin-arm64}.zip` (binary at archive root) plus `SHA256SUMS`.
 
-The `-` (npm) vs `+` (GitHub) asymmetry is forced by npm: npm strips SemVer build metadata on publish, so `+harness.<sha>` would collapse to the bare base version. The binary self-reports the `+harness.<short8>` form (`harness --version`).
+The tag has no `v` so semantic-release's `^v(.+)` scan ignores harness releases. The `-harness.` prerelease identifier keeps them out of Renovate stable candidates. The binary self-reports the `+harness.<sha>` build-metadata form (`harness --version`).
+
+The harness test suite reads repo-root `src/services/setup/opencode.ts` as source text to keep its local predicate mirror honest, so the suite requires the full monorepo checkout.
 
 ## Integrate→Build Bridge
 
