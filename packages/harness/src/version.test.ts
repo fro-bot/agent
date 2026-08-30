@@ -1,5 +1,6 @@
+import {readFileSync} from 'node:fs'
 import {describe, expect, it} from 'vitest'
-import {buildHarnessNpmVersion, buildHarnessReleaseTag, buildHarnessVersion} from './version.js'
+import {buildHarnessNpmVersion, buildHarnessVersion} from './version.js'
 
 // ---------------------------------------------------------------------------
 // buildHarnessVersion
@@ -85,64 +86,101 @@ describe('buildHarnessNpmVersion', () => {
 })
 
 // ---------------------------------------------------------------------------
-// buildHarnessReleaseTag
-// ---------------------------------------------------------------------------
-
-describe('buildHarnessReleaseTag', () => {
-  it('exact output for known base + commit → <baseVersion>+harness.<shortSha>', () => {
-    // #given / #when
-    const result = buildHarnessReleaseTag('1.17.3', 'ed359558abcdef1234567890abcdef1234567890')
-
-    // #then
-    expect(result).toBe('1.17.3+harness.ed359558')
-  })
-
-  it('full 40-char SHA truncates to first 8 chars', () => {
-    // #given
-    const fullSha = 'abcdef1234567890abcdef1234567890abcdef12'
-
-    // #when
-    const result = buildHarnessReleaseTag('1.17.3', fullSha)
-
-    // #then
-    expect(result).toBe('1.17.3+harness.abcdef12')
-    expect(result.split('+harness.')[1]).toBe(fullSha.slice(0, 8))
-  })
-
-  it('8-char commit is used unchanged', () => {
-    // #given
-    const shortCommit = 'ed359558'
-
-    // #when
-    const result = buildHarnessReleaseTag('1.17.3', shortCommit)
-
-    // #then
-    expect(result).toBe('1.17.3+harness.ed359558')
-  })
-
-  it('is NOT v-prefixed and uses build-metadata plus separator (not prerelease hyphen)', () => {
-    // #given / #when
-    const result = buildHarnessReleaseTag('1.17.3', 'ed359558abcdef12')
-
-    // #then — non-v so it stays out of the product `v${version}` tag space; build metadata (+), NOT prerelease (-)
-    expect(result).not.toMatch(/^v/)
-    expect(result).toContain('+harness.')
-    expect(result).not.toContain('-harness.')
-  })
-})
-
-// ---------------------------------------------------------------------------
 // Round-trip: buildHarnessVersion output satisfies the harness predicate;
-// buildHarnessNpmVersion output does NOT (npm hyphen form ≠ binary form).
-// FIX 10: ensures the binary/release form and the npm form are correctly
-// distinguished by the action's isHarnessVersion predicate.
+// buildHarnessNpmVersion output does too (the forms share an identity).
+// FIX 10: ensures both forms are recognized by the action's isHarnessVersion predicate.
 // ---------------------------------------------------------------------------
 
-// Inline the predicate from src/services/setup/opencode.ts — same logic,
-// no cross-package import needed (the predicate is a one-liner).
-const isHarnessVersion = (v: string): boolean => v.includes('+harness.')
+// The harness package has an independent tsconfig, so its test cannot import root src/.
+// Keep this mirror constrained by a source-level assertion against the real predicate.
+const isHarnessVersion = (v: string): boolean => v.includes('+harness.') || v.includes('-harness.')
+
+function assertActionPredicateSource(source: string): void {
+  // Coupling contract: this guard matches source text, so refactoring the matched expression requires updating it.
+  // Limitation: regex literals are not parsed, so an unbalanced quote such as /['"]/ can enter string state and
+  // under-strip subsequent comments (a weaker guard), never lose code.
+  const sourceWithoutComments = stripCommentsPreservingStrings(source)
+  if (
+    sourceWithoutComments.includes('version.includes(HARNESS_MARKER)') === false ||
+    sourceWithoutComments.includes("version.includes('-harness.')") === false
+  ) {
+    throw new Error(
+      "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
+    )
+  }
+}
+
+type CommentStripState = 'code' | 'single-quote' | 'double-quote' | 'template' | 'line-comment' | 'block-comment'
+
+function stripCommentsPreservingStrings(source: string): string {
+  let state: CommentStripState = 'code'
+  let result = ''
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]
+    const nextCharacter = source[index + 1]
+    if (character === undefined) continue
+
+    if (state === 'code') {
+      if (character === '/' && nextCharacter === '/') {
+        state = 'line-comment'
+        index += 1
+      } else if (character === '/' && nextCharacter === '*') {
+        state = 'block-comment'
+        index += 1
+      } else if (character === "'") {
+        state = 'single-quote'
+        result += character
+      } else if (character === '"') {
+        state = 'double-quote'
+        result += character
+      } else if (character === '`') {
+        state = 'template'
+        result += character
+      } else {
+        result += character
+      }
+    } else if (state === 'line-comment') {
+      if (character === '\n') {
+        state = 'code'
+        result += character
+      }
+    } else if (state === 'block-comment') {
+      if (character === '*' && nextCharacter === '/') {
+        state = 'code'
+        index += 1
+      } else if (character === '\n') {
+        result += character
+      }
+    } else {
+      const quote = state === 'single-quote' ? "'" : state === 'double-quote' ? '"' : '`'
+      result += character
+      if (character === '\\' && nextCharacter !== undefined) {
+        result += nextCharacter
+        index += 1
+      } else if (character === quote) {
+        state = 'code'
+      }
+    }
+  }
+
+  return result
+}
+
+function readActionPredicateSource(): string {
+  return readFileSync(new URL('../../../src/services/setup/opencode.ts', import.meta.url), 'utf8')
+}
 
 describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
+  it('keeps the local mirror equivalent to the action predicate source', () => {
+    // #given the action's real predicate source
+    // #when its accepted harness markers are checked against the local test mirror
+    // #then both build-metadata and prerelease forms must remain represented
+    expect(() => assertActionPredicateSource(readActionPredicateSource())).not.toThrow()
+    expect(isHarnessVersion('1.17.3+harness.abc12345')).toBe(true)
+    expect(isHarnessVersion('1.17.3-harness.abc12345')).toBe(true)
+  })
+
   it('buildHarnessVersion output satisfies isHarnessVersion (binary/release form)', () => {
     // #given
     const baseVersion = '1.17.3'
@@ -156,7 +194,7 @@ describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
     expect(binaryVersion).toContain('+harness.')
   })
 
-  it('buildHarnessNpmVersion output does NOT satisfy isHarnessVersion (npm hyphen form)', () => {
+  it('buildHarnessNpmVersion output satisfies isHarnessVersion (npm hyphen form)', () => {
     // #given
     const baseVersion = '1.17.3'
     const integrationCommit = 'abc123456789abcd'
@@ -164,9 +202,29 @@ describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
     // #when
     const npmVersion = buildHarnessNpmVersion(baseVersion, integrationCommit)
 
-    // #then — the npm form uses a hyphen and must NOT be treated as a harness download version
-    expect(isHarnessVersion(npmVersion)).toBe(false)
+    // #then — the production predicate recognizes both the binary and npm harness forms
+    expect(isHarnessVersion(npmVersion)).toBe(true)
     expect(npmVersion).toContain('-harness.')
     expect(npmVersion).not.toContain('+harness.')
+  })
+
+  it('rejects an action predicate narrowed to +harness. only', () => {
+    // #given a source whose predicate lost the prerelease marker, despite a comment retaining its text
+    const narrowedSource = "// version.includes('-harness.')\nreturn version.includes(HARNESS_MARKER)"
+
+    // #when / #then the source-level equivalence guard rejects the drift
+    expect(() => assertActionPredicateSource(narrowedSource)).toThrow(
+      "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
+    )
+  })
+
+  it('rejects a narrowed action predicate rescued only by a trailing comment', () => {
+    // #given a source whose prerelease marker appears only in a trailing comment
+    const narrowedSource = "return version.includes(HARNESS_MARKER) // version.includes('-harness.')"
+
+    // #when / #then comment text cannot satisfy the source-level equivalence guard
+    expect(() => assertActionPredicateSource(narrowedSource)).toThrow(
+      "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
+    )
   })
 })
