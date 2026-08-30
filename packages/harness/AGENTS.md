@@ -51,6 +51,8 @@ The harness is distributed through **two channels** from one release run:
 
 The tag has no `v` so semantic-release's `^v(.+)` scan ignores harness releases. The `-harness.` prerelease identifier keeps them out of Renovate stable candidates. The binary self-reports the `+harness.<sha>` build-metadata form (`harness --version`).
 
+The harness test suite reads repo-root `src/services/setup/opencode.ts` as source text to keep its local predicate mirror honest, so the suite requires the full monorepo checkout.
+
 ## Integrate→Build Bridge
 
 The release workflow connects the LLM merge to the per-platform build matrix via a **pushed git ref**. The merge runs through the Fro Bot workflow (which already installs OpenCode and provisions auth); the merged tree is pushed to a throwaway ref the build matrix fetches.

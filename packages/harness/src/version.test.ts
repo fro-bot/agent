@@ -97,7 +97,7 @@ const isHarnessVersion = (v: string): boolean => v.includes('+harness.') || v.in
 
 function assertActionPredicateSource(source: string): void {
   // Coupling contract: this guard matches source text, so refactoring the matched expression requires updating it.
-  const sourceWithoutComments = source.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '')
+  const sourceWithoutComments = stripCommentsPreservingStrings(source)
   if (
     sourceWithoutComments.includes('version.includes(HARNESS_MARKER)') === false ||
     sourceWithoutComments.includes("version.includes('-harness.')") === false
@@ -106,6 +106,63 @@ function assertActionPredicateSource(source: string): void {
       "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
     )
   }
+}
+
+type CommentStripState = 'code' | 'single-quote' | 'double-quote' | 'template' | 'line-comment' | 'block-comment'
+
+function stripCommentsPreservingStrings(source: string): string {
+  let state: CommentStripState = 'code'
+  let result = ''
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]
+    const nextCharacter = source[index + 1]
+    if (character === undefined) continue
+
+    if (state === 'code') {
+      if (character === '/' && nextCharacter === '/') {
+        state = 'line-comment'
+        index += 1
+      } else if (character === '/' && nextCharacter === '*') {
+        state = 'block-comment'
+        index += 1
+      } else if (character === "'") {
+        state = 'single-quote'
+        result += character
+      } else if (character === '"') {
+        state = 'double-quote'
+        result += character
+      } else if (character === '`') {
+        state = 'template'
+        result += character
+      } else {
+        result += character
+      }
+    } else if (state === 'line-comment') {
+      if (character === '\n') {
+        state = 'code'
+        result += character
+      }
+    } else if (state === 'block-comment') {
+      if (character === '*' && nextCharacter === '/') {
+        state = 'code'
+        index += 1
+      } else if (character === '\n') {
+        result += character
+      }
+    } else {
+      const quote = state === 'single-quote' ? "'" : state === 'double-quote' ? '"' : '`'
+      result += character
+      if (character === '\\' && nextCharacter !== undefined) {
+        result += nextCharacter
+        index += 1
+      } else if (character === quote) {
+        state = 'code'
+      }
+    }
+  }
+
+  return result
 }
 
 function readActionPredicateSource(): string {
@@ -154,6 +211,16 @@ describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
     const narrowedSource = "// version.includes('-harness.')\nreturn version.includes(HARNESS_MARKER)"
 
     // #when / #then the source-level equivalence guard rejects the drift
+    expect(() => assertActionPredicateSource(narrowedSource)).toThrow(
+      "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
+    )
+  })
+
+  it('rejects a narrowed action predicate rescued only by a trailing comment', () => {
+    // #given a source whose prerelease marker appears only in a trailing comment
+    const narrowedSource = "return version.includes(HARNESS_MARKER) // version.includes('-harness.')"
+
+    // #when / #then comment text cannot satisfy the source-level equivalence guard
     expect(() => assertActionPredicateSource(narrowedSource)).toThrow(
       "src/services/setup/opencode.ts: expected isHarnessVersion to accept both '+harness.' and '-harness.' forms",
     )
