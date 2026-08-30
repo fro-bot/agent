@@ -11,7 +11,26 @@ import {err, ok} from '../shared/types.js'
  */
 export const MAX_BODY_BYTES = 65_536
 
-export type ResponseSurface = 'issue-comment' | 'pr-comment' | 'pr-review' | 'pr-review-optional'
+export type ResponseSurface = 'issue-comment' | 'pr-comment' | 'pr-review' | 'pr-review-permitted'
+
+export interface ResponseSurfacePolicy {
+  readonly target: 'issue' | 'pr'
+  readonly verdictRequired: boolean
+  readonly verdictPermitted: boolean
+  readonly reviewCapable: boolean
+}
+
+/**
+ * The complete policy for each response surface. Keeping this table total
+ * makes adding a surface a compile-time change rather than a silent fallback
+ * through one of the consumers.
+ */
+export const RESPONSE_SURFACE_POLICIES = {
+  'issue-comment': {target: 'issue', verdictRequired: false, verdictPermitted: false, reviewCapable: false},
+  'pr-comment': {target: 'pr', verdictRequired: false, verdictPermitted: false, reviewCapable: false},
+  'pr-review': {target: 'pr', verdictRequired: true, verdictPermitted: true, reviewCapable: true},
+  'pr-review-permitted': {target: 'pr', verdictRequired: false, verdictPermitted: true, reviewCapable: true},
+} as const satisfies Record<ResponseSurface, ResponseSurfacePolicy>
 
 /**
  * The frontmatter key that carries a PR review verdict. Exported so prompt
@@ -299,11 +318,11 @@ export function parseResponseFile(
     return ok({body: trimmedBody})
   }
 
-  if (options.surface !== 'pr-review' && options.surface !== 'pr-review-optional') {
+  if (RESPONSE_SURFACE_POLICIES[options.surface].verdictPermitted === false) {
     return err(
       createResponseFileError(
         'verdict-on-non-review',
-        `"verdict" is only valid for surface "pr-review", got "${options.surface}"`,
+        `"verdict" is only valid for review-capable surfaces, got "${options.surface}"`,
       ),
     )
   }

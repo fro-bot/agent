@@ -12,7 +12,7 @@ import {formatCacheStatus, formatDuration} from './run-summary.js'
  * Non-blocking: logs warning on failure but doesn't throw.
  */
 export async function writeJobSummary(options: CommentSummaryOptions, logger: Logger): Promise<void> {
-  const {eventType, repo, ref, runId, runUrl, metrics, agent, resolvedOutputMode} = options
+  const {eventType, repo, ref, runId, runUrl, metrics, agent, resolvedOutputMode, deliveryKind} = options
 
   try {
     core.summary.addHeading('Fro Bot Agent Run', 2).addTable([
@@ -26,6 +26,7 @@ export async function writeJobSummary(options: CommentSummaryOptions, logger: Lo
       ['Run ID', `[${runId}](${runUrl})`],
       ['Agent', agent],
       ['Output Mode', resolvedOutputMode ?? 'N/A'],
+      ['Delivery Kind', deliveryKind],
       ['Cache Status', formatCacheStatus(metrics.cacheStatus)],
       ['Duration', metrics.duration == null ? 'N/A' : formatDuration(metrics.duration)],
     ])

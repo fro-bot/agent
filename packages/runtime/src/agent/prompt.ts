@@ -25,7 +25,12 @@ import {
   buildHarnessRulesSection,
   buildThreadIdentitySection,
 } from './prompt-thread.js'
-import {RESPONSE_FILE_VERDICT_KEY, RESPONSE_FILE_VERDICTS, type ResponseSurface} from './response-file.js'
+import {
+  RESPONSE_FILE_VERDICT_KEY,
+  RESPONSE_FILE_VERDICTS,
+  RESPONSE_SURFACE_POLICIES,
+  type ResponseSurface,
+} from './response-file.js'
 
 export interface TriggerDirective {
   readonly directive: string
@@ -448,7 +453,7 @@ ${trimmedCustomPrompt}`,
     }
   }
 
-  if (options.triggerContext != null && (responseSurface === 'pr-review' || responseSurface === 'pr-review-optional')) {
+  if (options.triggerContext != null && RESPONSE_SURFACE_POLICIES[responseSurface].reviewCapable) {
     parts.push(wrapXml('output_contract', buildOutputContractSection(context, responseDelivery, responseSurface)))
   }
 
@@ -765,15 +770,14 @@ ${runSummaryBlock}
 `
 
   if (responseDelivery === 'file-convention') {
-    const verdictRule =
-      responseSurface === 'pr-review'
-        ? `    5. **For a PR review, include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.`
-        : responseSurface === 'pr-review-optional'
-          ? `    5. **For an optional PR review, you MAY include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). Include it when you want to submit a review; omit it when a comment is the right response. A verdict is available on this surface but is not required. For comments, no frontmatter is required; the file body is your response.`
-          : null
-    const verdictExample =
-      responseSurface === 'pr-review'
-        ? `**File Format (PR review, with verdict frontmatter):**
+    const surfacePolicy = RESPONSE_SURFACE_POLICIES[responseSurface]
+    const verdictRule = surfacePolicy.verdictRequired
+      ? `    5. **For a PR review, include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.`
+      : surfacePolicy.verdictPermitted
+        ? `    5. **For an optional PR review, you MAY include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). Include it when you want to submit a review; omit it when a comment is the right response. A verdict is available on this surface but is not required. For comments, no frontmatter is required; the file body is your response.`
+        : null
+    const verdictExample = surfacePolicy.verdictRequired
+      ? `**File Format (PR review, with verdict frontmatter):**
 \`\`\`markdown
 ---
 ${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}
@@ -781,8 +785,8 @@ ${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}
 ${runSummaryBlock}
 \`\`\`
 `
-        : responseSurface === 'pr-review-optional'
-          ? `**File Format (optional PR review, with verdict frontmatter):**
+      : surfacePolicy.verdictPermitted
+        ? `**File Format (optional PR review, with verdict frontmatter):**
 \`\`\`markdown
 ---
 ${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}
@@ -790,7 +794,7 @@ ${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}
 ${runSummaryBlock}
 \`\`\`
 `
-          : ''
+        : ''
     const verdictExampleSection = verdictExample.length > 0 ? `\n${verdictExample}` : ''
 
     return `### Response Protocol (REQUIRED)
@@ -807,12 +811,12 @@ ${verdictRule == null ? '' : `${verdictRule}\n`}6. **Include the Run Summary** a
 ${runSummaryTemplate}${verdictExampleSection}`
   }
 
-  const reviewInstruction =
-    responseSurface === 'pr-review'
-      ? '5. **For PR reviews — match the event to your verdict.** Submit exactly ONE review via `gh pr review`: use `--approve` for a PASS verdict and `--request-changes` for a CONDITIONAL or REJECT verdict. Put your full response (analysis + Run Summary) in the `--body` argument. A comment-only review (`gh pr review --comment` or `gh pr comment`) does NOT count as the review and leaves the PR blocked on review-required — never use it to deliver a verdict. This applies equally on re-reviews (after a push or dismissed review): a follow-up validation is still a review event, not a comment. Do not post a separate PR comment afterward.'
-      : responseSurface === 'pr-review-optional'
-        ? '5. **For an optional PR review — choose the event that fits the response.** If your findings warrant a review event, submit exactly ONE review via `gh pr review`: use `--approve` for a PASS verdict or `--request-changes` for a CONDITIONAL or REJECT verdict. If the mention is a question or explanation, post exactly ONE PR comment instead. A review verdict is available on this surface but is not required; do not create a review merely because the trigger is on a PR.'
-        : null
+  const surfacePolicy = RESPONSE_SURFACE_POLICIES[responseSurface]
+  const reviewInstruction = surfacePolicy.verdictRequired
+    ? '5. **For PR reviews — match the event to your verdict.** Submit exactly ONE review via `gh pr review`: use `--approve` for a PASS verdict and `--request-changes` for a CONDITIONAL or REJECT verdict. Put your full response (analysis + Run Summary) in the `--body` argument. A comment-only review (`gh pr review --comment` or `gh pr comment`) does NOT count as the review and leaves the PR blocked on review-required — never use it to deliver a verdict. This applies equally on re-reviews (after a push or dismissed review): a follow-up validation is still a review event, not a comment. Do not post a separate PR comment afterward.'
+    : surfacePolicy.verdictPermitted
+      ? '5. **For an optional PR review — choose the event that fits the response.** If your findings warrant a review event, submit exactly ONE review via `gh pr review`: use `--approve` for a PASS verdict or `--request-changes` for a CONDITIONAL or REJECT verdict. If the mention is a question or explanation, post exactly ONE PR comment instead. A review verdict is available on this surface but is not required; do not create a review merely because the trigger is on a PR.'
+      : null
 
   return `### Response Protocol (REQUIRED)
 This is the authoritative delivery contract for this run.
@@ -949,10 +953,11 @@ function buildOutputContractSection(
   responseSurface: ResponseSurface,
 ): string {
   const lines: string[] = ['## Output Contract']
+  const surfacePolicy = RESPONSE_SURFACE_POLICIES[responseSurface]
 
   if (responseDelivery === 'file-convention') {
     lines.push(
-      responseSurface === 'pr-review'
+      surfacePolicy.verdictRequired
         ? `- Review action (REQUIRED): deliver the verdict that matches your review via the \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key in the response file — PASS → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\`, CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\`. Omitting \`${RESPONSE_FILE_VERDICT_KEY}:\` does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it via the frontmatter. This applies on re-reviews too — never omit the \`${RESPONSE_FILE_VERDICT_KEY}:\` key.`
         : `- Review action (OPTIONAL): when a review is warranted, deliver the verdict via the \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key — PASS → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}\`, CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}\`. Omit the key when a comment is the right response. A verdict is available on this surface but is not required.`,
     )
@@ -962,7 +967,7 @@ function buildOutputContractSection(
     )
   } else {
     lines.push(
-      responseSurface === 'pr-review'
+      surfacePolicy.verdictRequired
         ? `- Review action (REQUIRED): submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. A comment-only review does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it as the matching event. This applies on re-reviews too — never substitute a plain comment for a review event.`
         : `- Review action (OPTIONAL): when a review is warranted, submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. Post a PR comment instead when a review is not warranted. A verdict is available on this surface but is not required.`,
     )

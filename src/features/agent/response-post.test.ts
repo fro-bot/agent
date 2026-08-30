@@ -4,12 +4,13 @@ import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import {ALLOWED_ASSOCIATIONS} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {BOT_COMMENT_MARKER, type Octokit} from '../../services/github/types.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {checkIssueCommentSkipConditions} from '../triggers/skip-conditions-comment.js'
-import {DEFAULT_TRIGGER_CONFIG} from '../triggers/types.js'
+import {createIssueCommentCreatedEvent} from '../triggers/__fixtures__/payloads.js'
+import {routeEvent} from '../triggers/router.js'
+import {createMockGitHubContext} from '../triggers/test-helpers.js'
+import {resolveResponseSurface} from './response-file.js'
 import {readAndParseResponseFile, runResponsePost} from './response-post.js'
 
 const fsMocks = vi.hoisted(() => ({
@@ -121,36 +122,44 @@ async function createMissingResponsePath(): Promise<string> {
   return path.join(dir, 'expected-response.md')
 }
 
+function routeMention(overrides: Parameters<typeof createIssueCommentCreatedEvent>[0]) {
+  const payload = createIssueCommentCreatedEvent({
+    isPullRequest: true,
+    commentBody: '@fro-bot review this PR',
+    ...overrides,
+  })
+  return routeEvent(createMockGitHubContext('issue_comment', payload), createMockLogger(), {botLogin: 'fro-bot'})
+}
+
 describe('mention review authorization coupling', () => {
-  it('pins the mention gate association allowlist to the trusted set', () => {
-    // #given the default configuration consumed by checkIssueCommentSkipConditions
-    // #when comparing its association allowlist with the shared trusted set
-    const trustedAssociations = ['OWNER', 'MEMBER', 'COLLABORATOR'] as const
-    expect(ALLOWED_ASSOCIATIONS).toEqual(trustedAssociations)
-    expect(DEFAULT_TRIGGER_CONFIG.allowedAssociations).toEqual(trustedAssociations)
+  it('skips an unauthorized PR mention at the routing boundary before execution', () => {
+    // #given a real issue_comment payload from an unauthorized contributor
+    // #when the production routing entry point evaluates the event
+    const result = routeMention({authorAssociation: 'CONTRIBUTOR'})
 
-    // #then every trusted association passes the same gate and an untrusted one does not
-    for (const association of trustedAssociations) {
-      const result = checkIssueCommentSkipConditions(
-        {
-          ...makeTriggerResult('issue_comment').context,
-          action: 'created',
-          author: {login: 'commenter', association, isBot: false},
-        },
-        DEFAULT_TRIGGER_CONFIG,
-      )
-      expect(result).toEqual({shouldSkip: false})
-    }
+    // #then execution is skipped before any response-post path can be reached
+    expect(result).toMatchObject({shouldProcess: false, skipReason: 'unauthorized_author'})
+    expect(result.context.target?.kind).toBe('pr')
+  })
 
-    const unauthorizedResult = checkIssueCommentSkipConditions(
-      {
-        ...makeTriggerResult('issue_comment').context,
-        action: 'created',
-        author: {login: 'commenter', association: 'CONTRIBUTOR', isBot: false},
-      },
-      DEFAULT_TRIGGER_CONFIG,
-    )
-    expect(unauthorizedResult).toMatchObject({shouldSkip: true, reason: 'unauthorized_author'})
+  it('skips a bot-authored PR mention at the routing boundary before execution', () => {
+    // #given a real issue_comment payload authored by a bot
+    // #when the production routing entry point evaluates the event
+    const result = routeMention({isBotComment: true})
+
+    // #then bot rejection wins before response delivery can run
+    expect(result).toMatchObject({shouldProcess: false, skipReason: 'self_comment'})
+  })
+
+  it('allows a trusted PR mention and derives the review-permitted surface', () => {
+    // #given a real issue_comment payload from an allowed repository member
+    // #when the production routing entry point evaluates the event
+    const result = routeMention({authorAssociation: 'MEMBER'})
+
+    // #then the gate admits the run and the trusted context reaches the permitted review surface
+    expect(result.shouldProcess).toBe(true)
+    expect(result.context.target?.kind).toBe('pr')
+    expect(resolveResponseSurface({issueType: 'pr'}, result.context)).toBe('pr-review-permitted')
   })
 })
 
@@ -880,6 +889,10 @@ describe('runResponsePost', () => {
       reason: 'review-guard-blocked',
       detail: 'Review guard blocked submission: self-or-fork',
     })
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Response-post: review guard blocked the verdict, no review submitted',
+      {reason: 'self-or-fork', prNumber: 7},
+    )
     expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
   })
 
@@ -1262,6 +1275,10 @@ describe('runResponsePost', () => {
       reason: 'review-guard-blocked',
       detail: 'Review guard blocked submission: self-or-fork',
     })
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Response-post: review guard blocked the verdict, no review submitted',
+      {reason: 'self-or-fork', prNumber: 7},
+    )
     expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
   })
 

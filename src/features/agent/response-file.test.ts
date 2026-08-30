@@ -26,7 +26,7 @@ describe('resolveResponseSurface', () => {
     const surface = resolveResponseSurface(makeAgentContext('pr'), makeTriggerContext('issue_comment'))
 
     // #then a verdict is permitted without making it mandatory
-    expect(surface).toBe('pr-review-optional')
+    expect(surface).toBe('pr-review-permitted')
   })
 
   it('keeps issue_comment triggers on issues as comment-only', () => {

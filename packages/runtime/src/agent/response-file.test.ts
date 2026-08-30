@@ -192,23 +192,23 @@ describe('parseResponseFile', () => {
     expect(result).toEqual({success: true, data: {body: 'Please fix the tests', verdict: 'request-changes'}})
   })
 
-  it('parses a verdict with body for pr-review-optional', () => {
+  it('parses a verdict with body for pr-review-permitted', () => {
     // #given
     const raw = '---\nverdict: approve\n---\nLooks good to me'
 
     // #when
-    const result = parseResponseFile(raw, {surface: 'pr-review-optional'})
+    const result = parseResponseFile(raw, {surface: 'pr-review-permitted'})
 
     // #then
     expect(result).toEqual({success: true, data: {body: 'Looks good to me', verdict: 'approve'}})
   })
 
-  it('accepts a missing verdict for pr-review-optional', () => {
+  it('accepts a missing verdict for pr-review-permitted', () => {
     // #given
     const raw = 'A question about this pull request'
 
     // #when
-    const result = parseResponseFile(raw, {surface: 'pr-review-optional'})
+    const result = parseResponseFile(raw, {surface: 'pr-review-permitted'})
 
     // #then
     expect(result).toEqual({success: true, data: {body: 'A question about this pull request'}})
@@ -326,7 +326,7 @@ describe('parseResponseFile', () => {
     expect(result.success === false ? result.error : undefined).toMatchObject({
       code: 'RESPONSE_FILE_ERROR',
       reason: 'verdict-on-non-review',
-      message: `"verdict" is only valid for surface "pr-review", got "${surface}"`,
+      message: `"verdict" is only valid for review-capable surfaces, got "${surface}"`,
     })
   })
 

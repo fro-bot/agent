@@ -143,6 +143,9 @@ outputs:
     description: OpenCode session ID used for this run
   resolved-output-mode:
     description: Resolved delivery mode for this run (working-dir, branch-pr, or empty string)
+  delivery-kind:
+    description: >-
+      Response delivery kind for this run: review, comment, or none when no response was delivered.
   output-mode-migration:
     description: >-
       JSON migration record with requested state (omitted, auto, or explicit),

@@ -234,6 +234,7 @@ export async function runExecute(
     responseMode: bootstrap.inputs.responseMode,
     responseDelivery: bootstrap.delivery,
     responseFilePath: bootstrap.responseFilePath,
+    responseSurface: resolveResponseSurface(routing.agentContext, routing.triggerResult.context),
   }
 
   const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'

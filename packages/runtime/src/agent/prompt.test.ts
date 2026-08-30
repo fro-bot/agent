@@ -11,7 +11,12 @@ import type {
 } from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
-import {RESPONSE_FILE_VERDICT_KEY, RESPONSE_FILE_VERDICTS, type ResponseSurface} from './response-file.js'
+import {
+  RESPONSE_FILE_VERDICT_KEY,
+  RESPONSE_FILE_VERDICTS,
+  RESPONSE_SURFACE_POLICIES,
+  type ResponseSurface,
+} from './response-file.js'
 
 function createMockLogger(): Logger {
   return {
@@ -2377,7 +2382,7 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('renders neither file-write nor gh-posting instructions for none delivery', () => {
     // #given / #when
-    const prompt = buildPromptForDelivery('none', null, 'issue_comment', 'pr-review-optional')
+    const prompt = buildPromptForDelivery('none', null, 'issue_comment', 'pr-review-permitted')
 
     // #then
     expect(prompt).not.toContain('gh issue comment')
@@ -2436,7 +2441,7 @@ describe('buildAgentPrompt response delivery gating', () => {
       'file-convention',
       '/tmp/fro-bot-response/1-1/nonce123.md',
       'issue_comment',
-      'pr-review-optional',
+      'pr-review-permitted',
     )
 
     // #then a verdict remains available without forcing a review for a question-shaped mention
@@ -2446,6 +2451,14 @@ describe('buildAgentPrompt response delivery gating', () => {
     expect(prompt).toContain(`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}`)
     expect(prompt).not.toContain('never omit it')
     expect(prompt).not.toContain('does not satisfy review-required')
+  })
+
+  it('has an explicit policy entry for every response surface', () => {
+    // #given the response-surface policy table
+    const surfaces = Object.keys(RESPONSE_SURFACE_POLICIES).sort()
+
+    // #then every union member has an explicit entry rather than falling through a default
+    expect(surfaces).toEqual(['issue-comment', 'pr-comment', 'pr-review', 'pr-review-permitted'])
   })
 
   it.each([

@@ -19,7 +19,7 @@ import type {ReviewEvent} from '../reviews/types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
-import {parseResponseFile} from '@fro-bot/runtime'
+import {parseResponseFile, RESPONSE_SURFACE_POLICIES} from '@fro-bot/runtime'
 import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../services/github/types.js'
 import {readThread} from '../comments/reader.js'
 import {postComment} from '../comments/writer.js'
@@ -331,7 +331,7 @@ function deriveSurfaceAndTarget(
 
   return {
     surface,
-    target: {type: surface === 'issue-comment' ? 'issue' : 'pr', number, owner, repo},
+    target: {type: RESPONSE_SURFACE_POLICIES[surface].target, number, owner, repo},
   }
 }
 
@@ -429,7 +429,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     // structured verdict — falling through to a plain comment here would
     // silently downgrade a required review into a comment and still report
     // delivered:true. Fail closed instead; nothing is posted.
-    if (surface === 'pr-review') {
+    if (RESPONSE_SURFACE_POLICIES[surface].verdictRequired) {
       logger.error('Response-post: pr-review surface has no verdict frontmatter', {
         responseFileDirectory: path.dirname(responseFilePath),
       })
@@ -446,8 +446,8 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return {delivered: true, kind: 'comment'}
   }
 
-  // Both pr-review and pr-review-optional structured verdicts use the same
-  // guarded review path. The response file never selects or changes the surface.
+  // All review-capable structured verdicts use the same guarded review path.
+  // The response file never selects or changes the surface.
   if (botLogin == null || botLogin.length === 0) {
     return failure('missing-target-context', 'Cannot submit a review: bot login is unavailable')
   }

@@ -133,11 +133,14 @@ export interface OmoProviders {
 }
 
 // Action outputs
+export type ResponseDeliveryKind = 'none' | 'comment' | 'review'
+
 export interface ActionOutputs {
   readonly sessionId: string | null
   readonly resolvedOutputMode: ResolvedOutputMode | null
   readonly outputModeMigration?: OutputModeMigrationState | null
   readonly brokeredPushAllowlist?: BrokeredPushAllowlist | null
+  readonly deliveryKind: ResponseDeliveryKind
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly duration: number
 }
