@@ -11,7 +11,7 @@ import type {
 } from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
-import {RESPONSE_FILE_VERDICT_KEY, RESPONSE_FILE_VERDICTS} from './response-file.js'
+import {RESPONSE_FILE_VERDICT_KEY, RESPONSE_FILE_VERDICTS, type ResponseSurface} from './response-file.js'
 
 function createMockLogger(): Logger {
   return {
@@ -108,6 +108,7 @@ describe('buildAgentPrompt', () => {
   it('includes environment context section', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -130,6 +131,7 @@ describe('buildAgentPrompt', () => {
   it('offers prior session context and tools without prescribing a tool-call order', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -155,6 +157,7 @@ describe('buildAgentPrompt', () => {
   it('includes harness rules at top without constraint reminder', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -181,6 +184,7 @@ describe('buildAgentPrompt', () => {
   it('includes thread identity section when logical key is provided', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -202,6 +206,7 @@ describe('buildAgentPrompt', () => {
   it('shows fresh thread identity status when logical key exists without continuation', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -236,6 +241,7 @@ describe('buildAgentPrompt', () => {
       ],
     }
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -270,6 +276,7 @@ describe('buildAgentPrompt', () => {
   it('includes CI environment awareness with operating environment section', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -290,6 +297,7 @@ describe('buildAgentPrompt', () => {
   it('includes issue context when issue number is present', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         issueNumber: 123,
         issueTitle: 'Bug: Something broken',
@@ -312,6 +320,7 @@ describe('buildAgentPrompt', () => {
   it('includes PR context when issue type is pr', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'pr-comment',
       context: createMockContext({
         issueNumber: 456,
         issueTitle: 'feat: Add feature',
@@ -334,6 +343,7 @@ describe('buildAgentPrompt', () => {
   it('includes trigger comment when present for actual comment events', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         commentBody: 'Please fix the bug in auth.ts',
         commentAuthor: 'reporter',
@@ -361,6 +371,7 @@ describe('buildAgentPrompt', () => {
   it('cleans escaped markdown in trigger comments before injection', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         commentBody: 'Please use \`code\` and \| tables',
         commentAuthor: 'reporter',
@@ -434,6 +445,7 @@ describe('buildAgentPrompt', () => {
       },
     })
     const options: PromptOptions = {
+      responseSurface: 'pr-review',
       context,
       customPrompt: null,
       cacheStatus: 'hit',
@@ -457,6 +469,7 @@ describe('buildAgentPrompt', () => {
   it('includes session management instructions', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -478,6 +491,7 @@ describe('buildAgentPrompt', () => {
   it('includes Response Protocol requiring single output', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -497,6 +511,7 @@ describe('buildAgentPrompt', () => {
   it('includes unified response format template with bot marker', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -515,6 +530,7 @@ describe('buildAgentPrompt', () => {
   it('places Response Protocol after Session Management and before GitHub Operations', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -540,6 +556,7 @@ describe('buildAgentPrompt', () => {
   it('includes gh CLI operation examples referencing Response Protocol', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({issueNumber: 42, defaultBranch: 'develop'}),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -564,6 +581,7 @@ describe('buildAgentPrompt', () => {
   it('includes run summary template in Response Protocol section', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         eventName: 'issue_comment',
         repo: 'owner/repo',
@@ -591,6 +609,7 @@ describe('buildAgentPrompt', () => {
   it('includes actual sessionId in run summary when provided', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         eventName: 'issue_comment',
         repo: 'owner/repo',
@@ -613,6 +632,7 @@ describe('buildAgentPrompt', () => {
   it('uses placeholder when sessionId not provided', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -629,6 +649,7 @@ describe('buildAgentPrompt', () => {
   it('wraps custom prompt in user_supplied_instructions when provided without trigger context', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: 'Focus on security vulnerabilities and performance issues.',
       cacheStatus: 'hit',
@@ -649,6 +670,7 @@ describe('buildAgentPrompt', () => {
   it('excludes custom instructions section when customPrompt is null', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -665,6 +687,7 @@ describe('buildAgentPrompt', () => {
   it('excludes custom instructions section when customPrompt is empty', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: '   ',
       cacheStatus: 'hit',
@@ -681,6 +704,7 @@ describe('buildAgentPrompt', () => {
   it('includes task directive for comment-triggered runs', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({commentBody: 'Do something'}),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -699,6 +723,7 @@ describe('buildAgentPrompt', () => {
   it('includes generic task directive for non-comment runs', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({commentBody: null, repo: 'org/project'}),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -717,6 +742,7 @@ describe('buildAgentPrompt', () => {
   it('logs prompt metadata', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: 'Custom',
       cacheStatus: 'hit',
@@ -738,6 +764,7 @@ describe('buildAgentPrompt', () => {
   it('handles missing issue context gracefully', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         issueNumber: null,
         issueTitle: null,
@@ -772,6 +799,7 @@ describe('buildAgentPrompt', () => {
       commentBody: null,
     })
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context,
       customPrompt: 'Run weekly maintenance',
       cacheStatus: 'hit',
@@ -808,6 +836,7 @@ describe('buildAgentPrompt', () => {
       target: undefined,
     })
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context,
       customPrompt: `  ${duplicatedTask}  `,
       cacheStatus: 'hit',
@@ -832,6 +861,7 @@ describe('buildAgentPrompt', () => {
       priorWorkContext: [createMockSearchResult()],
     }
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         diffContext: createMockDiffContext(),
       }),
@@ -873,6 +903,7 @@ describe('buildAgentPrompt', () => {
       priorWorkContext: [createMockSearchResult()],
     }
     const options: PromptOptions = {
+      responseSurface: 'pr-comment',
       context: createMockContext({
         issueType: 'pr',
         diffContext: createMockDiffContext({
@@ -936,6 +967,7 @@ describe('buildAgentPrompt', () => {
   it('omits attached reference section when no extractable content exists', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         eventName: 'schedule',
         issueNumber: null,
@@ -959,6 +991,7 @@ describe('buildAgentPrompt', () => {
   it('renders pull request reviews and comments as per-item metadata with file attachments', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'pr-review',
       context: createMockContext({
         eventName: 'pull_request',
         issueType: 'pr',
@@ -1078,6 +1111,7 @@ describe('buildAgentPrompt', () => {
   it('renders issue comments as per-item metadata with file attachments', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         issueType: 'issue',
         issueNumber: 7,
@@ -1133,6 +1167,7 @@ describe('buildAgentPrompt', () => {
   it('falls back to standalone diff summary inside PR section when hydrated context is absent', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'pr-comment',
       context: createMockContext({
         issueType: 'pr',
         issueNumber: 55,
@@ -1173,6 +1208,7 @@ describe('buildAgentPrompt', () => {
         priorWorkContext: [],
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1192,6 +1228,7 @@ describe('buildAgentPrompt', () => {
     it('excludes session context section when sessionContext is undefined', () => {
       // #given
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1227,6 +1264,7 @@ describe('buildAgentPrompt', () => {
         priorWorkContext: [],
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1253,6 +1291,7 @@ describe('buildAgentPrompt', () => {
         priorWorkContext: [],
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1284,6 +1323,7 @@ describe('buildAgentPrompt', () => {
         ],
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1319,6 +1359,7 @@ describe('buildAgentPrompt', () => {
         priorWorkContext: results,
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1347,6 +1388,7 @@ describe('buildAgentPrompt', () => {
         priorWorkContext: [],
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1369,6 +1411,7 @@ describe('buildAgentPrompt', () => {
         priorWorkContext: [],
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1389,6 +1432,7 @@ describe('buildAgentPrompt', () => {
         priorWorkContext: [],
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1410,6 +1454,7 @@ describe('buildAgentPrompt', () => {
         priorWorkContext: [],
       }
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext(),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1433,6 +1478,7 @@ describe('buildAgentPrompt', () => {
     it('renders Response Protocol when responseMode is github (default)', () => {
       // #given
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext({issueNumber: 42}),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1454,6 +1500,7 @@ describe('buildAgentPrompt', () => {
     it('renders Response Protocol when responseMode is omitted (defaults to github)', () => {
       // #given
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext({issueNumber: 42}),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1475,6 +1522,7 @@ describe('buildAgentPrompt', () => {
     it('suppresses Response Protocol when responseMode is none', () => {
       // #given
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext({issueNumber: 42}),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1496,6 +1544,7 @@ describe('buildAgentPrompt', () => {
     it('renders non-posting contract when responseMode is none', () => {
       // #given
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext({issueNumber: 42}),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1517,6 +1566,7 @@ describe('buildAgentPrompt', () => {
     it('still includes Session Management when responseMode is none', () => {
       // #given
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext({issueNumber: 42}),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1538,6 +1588,7 @@ describe('buildAgentPrompt', () => {
     it('still includes GitHub Operations section when responseMode is none', () => {
       // #given
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context: createMockContext({issueNumber: 42}),
         customPrompt: null,
         cacheStatus: 'hit',
@@ -1574,6 +1625,7 @@ describe('buildAgentPrompt', () => {
         commentBody: null,
       })
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context,
         customPrompt: 'Perform daily maintenance',
         cacheStatus: 'hit',
@@ -1612,6 +1664,7 @@ describe('buildAgentPrompt', () => {
         commentBody: null,
       })
       const options: PromptOptions = {
+        responseSurface: 'issue-comment',
         context,
         customPrompt: 'Perform daily maintenance',
         cacheStatus: 'hit',
@@ -1890,6 +1943,7 @@ describe('buildTaskSection', () => {
   it('routes append-mode custom prompt into user_supplied_instructions instead of task', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({commentBody: 'Please review this carefully'}),
       customPrompt: 'Focus on security issues',
       cacheStatus: 'hit',
@@ -1913,6 +1967,7 @@ describe('buildTaskSection', () => {
   it('keeps schedule custom prompt in task without user_supplied_instructions block', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         eventName: 'schedule',
         issueNumber: null,
@@ -1936,6 +1991,7 @@ describe('buildTaskSection', () => {
   it('renders working-dir preamble before ## Task heading for workflow_dispatch with output-mode: working-dir', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         eventName: 'workflow_dispatch',
         issueNumber: null,
@@ -1962,6 +2018,7 @@ describe('buildTaskSection', () => {
   it('renders branch-pr preamble before ## Task heading for workflow_dispatch with output-mode: branch-pr', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         eventName: 'workflow_dispatch',
         issueNumber: null,
@@ -1988,6 +2045,7 @@ describe('buildTaskSection', () => {
   it('does not render Delivery Mode preamble for issue_comment trigger', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext(),
       customPrompt: null,
       cacheStatus: 'hit',
@@ -2006,6 +2064,7 @@ describe('buildTaskSection', () => {
   it('does not render Delivery Mode preamble for pull_request trigger (self-review regression)', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'pr-review',
       context: createMockContext({
         eventName: 'pull_request',
         issueType: 'pr',
@@ -2032,6 +2091,7 @@ describe('buildTaskSection', () => {
   it('preamble defers to <harness_rules> authority and does not re-declare priority', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({
         eventName: 'workflow_dispatch',
         issueNumber: null,
@@ -2108,6 +2168,7 @@ describe('output contract', () => {
       target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
     })
     const options: PromptOptions = {
+      responseSurface: 'pr-review',
       context,
       customPrompt: null,
       cacheStatus: 'hit',
@@ -2148,6 +2209,7 @@ describe('output contract', () => {
       target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
     })
     const options: PromptOptions = {
+      responseSurface: 'pr-review',
       context,
       customPrompt: null,
       cacheStatus: 'hit',
@@ -2180,6 +2242,7 @@ describe('output contract', () => {
       target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
     })
     const options: PromptOptions = {
+      responseSurface: 'pr-review',
       context,
       customPrompt: null,
       cacheStatus: 'hit',
@@ -2207,6 +2270,7 @@ describe('output contract', () => {
     const context = createMockContext({eventName: 'issue_comment'})
     const triggerContext = createMockTriggerContext({eventType: 'issue_comment'})
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context,
       customPrompt: null,
       cacheStatus: 'hit',
@@ -2234,6 +2298,7 @@ describe('buildAgentPrompt response delivery gating', () => {
     responseDelivery: ResponseDelivery,
     responseFilePath: string | null,
     eventType: TriggerContext['eventType'] = 'pull_request',
+    responseSurface: ResponseSurface,
   ): string {
     const options: PromptOptions = {
       context: createMockContext({eventName: eventType, issueNumber: 42, issueType: 'pr'}),
@@ -2246,6 +2311,7 @@ describe('buildAgentPrompt response delivery gating', () => {
       responseMode: responseDelivery === 'none' ? 'none' : 'github',
       responseDelivery,
       responseFilePath,
+      responseSurface,
     }
 
     return buildAgentPrompt(options, mockLogger).text
@@ -2253,7 +2319,12 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('instructs the model to write the response file synchronously and to the exact path for file-convention delivery', () => {
     // #given / #when
-    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+    const prompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      'pull_request',
+      'pr-review',
+    )
 
     // #then
     expect(prompt).toContain('/tmp/fro-bot-response/1-1/nonce123.md')
@@ -2265,7 +2336,12 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('omits gh posting instructions for file-convention delivery', () => {
     // #given / #when
-    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+    const prompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      'pull_request',
+      'pr-review',
+    )
 
     // #then
     expect(prompt).not.toContain('gh pr review')
@@ -2275,7 +2351,7 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('keeps gh posting instructions unchanged for model-gh delivery', () => {
     // #given / #when
-    const prompt = buildPromptForDelivery('model-gh', null)
+    const prompt = buildPromptForDelivery('model-gh', null, 'pull_request', 'pr-review')
 
     // #then
     expect(prompt).toContain('gh pr review')
@@ -2285,7 +2361,7 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('renders neither file-write nor gh-posting instructions for none delivery', () => {
     // #given / #when
-    const prompt = buildPromptForDelivery('none', null, 'issue_comment')
+    const prompt = buildPromptForDelivery('none', null, 'issue_comment', 'pr-review-optional')
 
     // #then
     expect(prompt).not.toContain('gh issue comment')
@@ -2296,7 +2372,12 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('keeps the bot marker and Run Summary guidance for file-convention delivery', () => {
     // #given / #when
-    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+    const prompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      'pull_request',
+      'pr-review',
+    )
 
     // #then
     expect(prompt).toContain('<!-- fro-bot-agent -->')
@@ -2305,8 +2386,13 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('gates the harness rules gh instruction on file-convention delivery', () => {
     // #given / #when
-    const filePrompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
-    const ghPrompt = buildPromptForDelivery('model-gh', null)
+    const filePrompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      'pull_request',
+      'pr-review',
+    )
+    const ghPrompt = buildPromptForDelivery('model-gh', null, 'pull_request', 'pr-review')
 
     // #then
     expect(filePrompt).toContain('The `gh` CLI is NOT available for GitHub posting in this run')
@@ -2315,7 +2401,12 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('contains every exported response-file verdict value for pull_request file-convention delivery', () => {
     // #given / #when
-    const prompt = buildPromptForDelivery('file-convention', '/tmp/fro-bot-response/1-1/nonce123.md')
+    const prompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      'pull_request',
+      'pr-review',
+    )
 
     // #then
     for (const verdict of RESPONSE_FILE_VERDICTS) {
@@ -2323,14 +2414,60 @@ describe('buildAgentPrompt response delivery gating', () => {
     }
   })
 
+  it('offers, but does not require, both verdict values on the review-permitted surface', () => {
+    // #given a mention-triggered PR run using file-convention delivery
+    const prompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      'issue_comment',
+      'pr-review-optional',
+    )
+
+    // #then a verdict remains available without forcing a review for a question-shaped mention
+    expect(prompt).toContain('you MAY include a `verdict:` frontmatter key')
+    expect(prompt).toContain('A verdict is available on this surface but is not required')
+    expect(prompt).toContain(`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[0]}`)
+    expect(prompt).toContain(`${RESPONSE_FILE_VERDICT_KEY}: ${RESPONSE_FILE_VERDICTS[1]}`)
+    expect(prompt).not.toContain('never omit it')
+    expect(prompt).not.toContain('does not satisfy review-required')
+  })
+
+  it.each([
+    ['issue-comment', 'issue_comment'],
+    ['pr-comment', 'pull_request_review_comment'],
+  ] as const)('omits verdict instructions and examples on the %s comment surface', (surface, eventType) => {
+    // #given a comment-only run
+    const prompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      eventType,
+      surface,
+    )
+
+    // #then the model is never instructed to emit a verdict its validator will reject
+    expect(prompt).not.toContain('verdict')
+    expect(prompt).not.toContain('PR review, with verdict frontmatter')
+    expect(prompt).not.toContain('<output_contract>')
+  })
+
+  it('does not attach a verdict-required output contract to pull_request_review_comment', () => {
+    // #given an inline review-comment trigger on the comment-only surface
+    const prompt = buildPromptForDelivery('model-gh', null, 'pull_request_review_comment', 'pr-comment')
+
+    // #then no review-required contract is rendered
+    expect(prompt).not.toContain('<output_contract>')
+    expect(prompt).not.toContain('## Output Contract')
+    expect(prompt).not.toContain('Review action (REQUIRED)')
+  })
+
   it('keeps each response delivery contract item exact in generated prompt text', () => {
     // #given
     const responseFilePath = '/tmp/fro-bot-response/1-1/nonce123.md'
 
     // #when
-    const filePrompt = buildPromptForDelivery('file-convention', responseFilePath)
-    const silentPrompt = buildPromptForDelivery('none', null, 'pull_request')
-    const modelPrompt = buildPromptForDelivery('model-gh', null)
+    const filePrompt = buildPromptForDelivery('file-convention', responseFilePath, 'pull_request', 'pr-review')
+    const silentPrompt = buildPromptForDelivery('none', null, 'pull_request', 'pr-review')
+    const modelPrompt = buildPromptForDelivery('model-gh', null, 'pull_request', 'pr-review')
 
     // #then
     expect(filePrompt).toContain(`**Write to this exact path:** \`${responseFilePath}\``)
@@ -2353,6 +2490,7 @@ describe('buildAgentPrompt response delivery gating', () => {
   it('keeps delivery-mode authority over user-supplied instructions in generated prompt text', () => {
     // #given
     const options: PromptOptions = {
+      responseSurface: 'issue-comment',
       context: createMockContext({eventName: 'schedule'}),
       customPrompt: 'Commit and open a pull request.',
       cacheStatus: 'hit',
@@ -2373,7 +2511,7 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('renders no response-file instruction and no gh-posting instruction for pull_request delivery none', () => {
     // #given / #when
-    const prompt = buildPromptForDelivery('none', null, 'pull_request')
+    const prompt = buildPromptForDelivery('none', null, 'pull_request', 'pr-review')
 
     // #then
     expect(prompt).not.toContain('Write to this exact path')

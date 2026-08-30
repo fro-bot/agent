@@ -605,6 +605,7 @@ function buildTriggerContextForScenario(
 interface PreparedScenarioPrompt {
   readonly scenarioInput: ScenarioInput
   readonly triggerContext: TriggerContext
+  readonly responseSurface: ResponseSurface
   readonly sessionPrep: EvalSessionPrepSelection
 }
 
@@ -615,11 +616,18 @@ function prepareScenarioPrompt(
 ): PreparedScenarioPrompt {
   const scenarioInput = buildScenarioInput(scenario)
   const triggerContext = buildTriggerContextForScenario(scenario, headSha, scenarioInput)
+  const responseSurface = resolveResponseSurface(
+    {
+      issueType: triggerContext.target?.kind === 'pr' ? 'pr' : null,
+    },
+    triggerContext,
+  )
   const logicalKey = buildLogicalKey(triggerContext)
 
   return {
     scenarioInput,
     triggerContext,
+    responseSurface,
     sessionPrep: sessionPrepStrategy({priorWork: scenario.priorWork, logicalKey}),
   }
 }
@@ -662,6 +670,7 @@ function buildPromptOptionsFromPrepared(
     },
     customPrompt: scenario.prompt,
     cacheStatus: 'miss',
+    responseSurface: prepared.responseSurface,
     triggerContext,
     resolvedOutputMode: 'working-dir',
     responseMode: 'github',
@@ -987,7 +996,7 @@ export async function runScenario(
       }
     }
     const promptOptions = buildPromptOptionsFromPrepared(scenario, environment.responseFilePath, preparedScenario)
-    const responseSurface = resolveResponseSurface(promptOptions.context, promptOptions.triggerContext)
+    const {responseSurface} = preparedScenario
     const timeoutMs = resolveEvalTimeoutMs()
     const executionConfig: ExecutionConfig = {
       agent: 'build',

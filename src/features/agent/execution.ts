@@ -14,7 +14,7 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
-import {inspectResponseFile, resolveResponseSurface} from './response-file.js'
+import {inspectResponseFile} from './response-file.js'
 import {
   createExecutionDeadline,
   MAX_LLM_RETRIES,
@@ -64,6 +64,7 @@ export async function executeOpenCode(
   serverHandle?: OpenCodeServerHandle,
 ): Promise<AgentResult> {
   const startTime = Date.now()
+  const {responseSurface} = promptOptions
   const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const deadline: ExecutionDeadline = createExecutionDeadline(timeoutMs, logger)
   const ownsServer = serverHandle == null
@@ -142,7 +143,10 @@ export async function executeOpenCode(
     }
     if (sessionId == null) throw new Error('OpenCode session was not initialized')
     const activeSessionId = sessionId
-    const {text: initialPrompt, referenceFiles} = buildAgentPrompt({...promptOptions, sessionId}, logger)
+    const {text: initialPrompt, referenceFiles} = buildAgentPrompt(
+      {...promptOptions, responseSurface, sessionId},
+      logger,
+    )
     const directory = getGitHubWorkspace()
     const logPath = getOpenCodeLogPath()
     await deadline.run(async () => fs.mkdir(logPath, {recursive: true}), 'OpenCode log directory creation')
@@ -240,11 +244,7 @@ export async function executeOpenCode(
       const promptWasAccepted = promptAccepted
       if (result.outcome !== 'submit_failed') promptAccepted = true
 
-      const responseFileStatus = await inspectResponseFile(
-        promptOptions.responseFilePath,
-        resolveResponseSurface(promptOptions.context, promptOptions.triggerContext),
-        logger,
-      )
+      const responseFileStatus = await inspectResponseFile(promptOptions.responseFilePath, responseSurface, logger)
       if (responseFileStatus !== 'absent') break
 
       const canResendOriginalPrompt =
