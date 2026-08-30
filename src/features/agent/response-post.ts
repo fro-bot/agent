@@ -92,6 +92,7 @@ export type ReadAndParseResponseFileResult =
         readonly surface: ResponseSurface
         readonly recoveredFromFallback: boolean
         readonly actualResponseFilePath: string
+        readonly droppedVerdict?: true
       }
     }
   | ResponsePostFailure
@@ -229,6 +230,37 @@ export async function readAndParseResponseFile(
 
   const surface = resolveResponseSurface(agentContext, triggerResult.context)
   const parsed = parseResponseFile(raw, {surface})
+  const recoveredFromFallback = actualResponseFilePath !== responseFilePath
+
+  if (parsed.success === false && parsed.error.reason === 'verdict-on-non-review') {
+    // Keep parseResponseFile strict for its other callers, but recover the
+    // already-validated prose for delivery when a verdict accidentally lands
+    // on a comment surface. Parsing against the review surface is only a
+    // recovery step: an invalid verdict or any other parse error still fails.
+    const recoverable = parseResponseFile(raw, {surface: 'pr-review'})
+    if (recoverable.success) {
+      if (recoveredFromFallback) {
+        logger.warning('Response-post: recovered response file from fallback location', {
+          expectedResponsePath: responsePathForLog(responseFilePath),
+          actualResponsePath: responsePathForLog(actualResponseFilePath),
+          expectedResponseDirectory: path.dirname(responseFilePath),
+          actualResponseDirectory: path.dirname(actualResponseFilePath),
+        })
+      }
+
+      return {
+        success: true,
+        data: {
+          parsed: {body: recoverable.data.body},
+          surface,
+          recoveredFromFallback,
+          actualResponseFilePath,
+          droppedVerdict: true,
+        },
+      }
+    }
+  }
+
   if (parsed.success === false) {
     logger.error('Response-post: response file failed validation', {
       responseFileDirectory: path.dirname(actualResponseFilePath),
@@ -237,7 +269,6 @@ export async function readAndParseResponseFile(
     return failure('parse-failed', parsed.error.message)
   }
 
-  const recoveredFromFallback = actualResponseFilePath !== responseFilePath
   if (recoveredFromFallback) {
     logger.warning('Response-post: recovered response file from fallback location', {
       expectedResponsePath: responsePathForLog(responseFilePath),
@@ -286,7 +317,10 @@ function withRunMarker(body: string): string {
 function deriveSurfaceAndTarget(
   agentContext: AgentContext,
   triggerResult: TriggerResultProcess,
-): {readonly surface: 'issue-comment' | 'pr-comment' | 'pr-review'; readonly target: CommentTarget | null} {
+): {readonly surface: ResponseSurface; readonly target: CommentTarget | null} {
+  // issue_comment on a PR is review-permitted only because
+  // checkIssueCommentSkipConditions (src/features/triggers/skip-conditions-comment.ts)
+  // has already rejected bots and authors outside the configured trusted association set.
   const surface = resolveResponseSurface(agentContext, triggerResult.context)
   const [owner, repo] = agentContext.repo.split('/')
   if (owner == null || owner.length === 0 || repo == null || repo.length === 0 || agentContext.issueNumber == null) {
@@ -374,12 +408,18 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return prepared
   }
 
-  const {surface, parsed, recoveredFromFallback, actualResponseFilePath} = prepared.data
+  const {surface, parsed, recoveredFromFallback, actualResponseFilePath, droppedVerdict} = prepared.data
   const {target} = deriveSurfaceAndTarget(agentContext, triggerResult)
 
   if (target == null) {
     logger.error('Response-post: missing target context', {agentContext: {repo: agentContext.repo}})
     return failure('missing-target-context', 'Cannot post: missing owner/repo/issue number in routing context')
+  }
+
+  if (droppedVerdict === true) {
+    logger.warning(`Response-post: dropped verdict on "${surface}" surface; posting response body as a comment`, {
+      surface,
+    })
   }
 
   const body = withMarker(parsed.body)
@@ -396,6 +436,8 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
       return failure('missing-verdict', 'pull_request responses must carry a verdict frontmatter')
     }
 
+    // A mention on a PR is review-permitted, not review-required. Its no-verdict
+    // response intentionally falls through to the normal comment delivery path.
     const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
     const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
     if (posted === false) {
@@ -404,7 +446,8 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return {delivered: true, kind: 'comment'}
   }
 
-  // pr-review surface with a structured verdict.
+  // Both pr-review and pr-review-optional structured verdicts use the same
+  // guarded review path. The response file never selects or changes the surface.
   if (botLogin == null || botLogin.length === 0) {
     return failure('missing-target-context', 'Cannot submit a review: bot login is unavailable')
   }

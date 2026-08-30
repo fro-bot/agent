@@ -4,9 +4,12 @@ import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import {ALLOWED_ASSOCIATIONS} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {BOT_COMMENT_MARKER, type Octokit} from '../../services/github/types.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
+import {checkIssueCommentSkipConditions} from '../triggers/skip-conditions-comment.js'
+import {DEFAULT_TRIGGER_CONFIG} from '../triggers/types.js'
 import {readAndParseResponseFile, runResponsePost} from './response-post.js'
 
 const fsMocks = vi.hoisted(() => ({
@@ -117,6 +120,39 @@ async function createMissingResponsePath(): Promise<string> {
   await fs.rm(dir, {recursive: true, force: true})
   return path.join(dir, 'expected-response.md')
 }
+
+describe('mention review authorization coupling', () => {
+  it('pins the mention gate association allowlist to the trusted set', () => {
+    // #given the default configuration consumed by checkIssueCommentSkipConditions
+    // #when comparing its association allowlist with the shared trusted set
+    const trustedAssociations = ['OWNER', 'MEMBER', 'COLLABORATOR'] as const
+    expect(ALLOWED_ASSOCIATIONS).toEqual(trustedAssociations)
+    expect(DEFAULT_TRIGGER_CONFIG.allowedAssociations).toEqual(trustedAssociations)
+
+    // #then every trusted association passes the same gate and an untrusted one does not
+    for (const association of trustedAssociations) {
+      const result = checkIssueCommentSkipConditions(
+        {
+          ...makeTriggerResult('issue_comment').context,
+          action: 'created',
+          author: {login: 'commenter', association, isBot: false},
+        },
+        DEFAULT_TRIGGER_CONFIG,
+      )
+      expect(result).toEqual({shouldSkip: false})
+    }
+
+    const unauthorizedResult = checkIssueCommentSkipConditions(
+      {
+        ...makeTriggerResult('issue_comment').context,
+        action: 'created',
+        author: {login: 'commenter', association: 'CONTRIBUTOR', isBot: false},
+      },
+      DEFAULT_TRIGGER_CONFIG,
+    )
+    expect(unauthorizedResult).toMatchObject({shouldSkip: true, reason: 'unauthorized_author'})
+  })
+})
 
 describe('readAndParseResponseFile read failures', () => {
   let logger: Logger
@@ -539,6 +575,47 @@ describe('runResponsePost', () => {
         issue_number: 42,
         body: expect.stringContaining('Body from the model.') as unknown as string,
       }),
+    )
+  })
+
+  it.each([
+    {
+      surface: 'issue-comment' as const,
+      agentContext: {issueType: 'issue' as const, issueNumber: 42},
+      eventType: 'issue_comment' as const,
+    },
+    {
+      surface: 'pr-comment' as const,
+      agentContext: {issueType: 'pr' as const, issueNumber: 42},
+      eventType: 'pull_request_review_comment' as const,
+    },
+  ])('drops verdict frontmatter and posts the body on the $surface surface', async scenario => {
+    // #given a response with review verdict frontmatter on a comment surface
+    const filePath = await writeFixture('---\nverdict: approve\n---\nBody without frontmatter residue.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext(scenario.agentContext),
+        triggerResult: makeTriggerResult(scenario.eventType),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the prose is delivered as a comment and the misplaced verdict is visible in logs
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    const commentRequest = octokit.rest.issues.createComment.mock.calls[0]?.[0] as {readonly body: string}
+    expect(commentRequest.body).toContain('Body without frontmatter residue.')
+    expect(commentRequest.body).not.toContain('verdict:')
+    expect(commentRequest.body).not.toContain('---')
+    expect(logger.warning).toHaveBeenCalledWith(
+      `Response-post: dropped verdict on "${scenario.surface}" surface; posting response body as a comment`,
+      {surface: scenario.surface},
     )
   })
 
@@ -1069,7 +1146,7 @@ describe('runResponsePost', () => {
     }
   })
 
-  it('resolves issue_comment on a PR to the pr-comment surface without requiring a verdict', async () => {
+  it('resolves issue_comment on a PR to the review-permitted surface without requiring a verdict', async () => {
     // #given an issue_comment trigger on a PR with a response file that has no verdict frontmatter
     const filePath = await writeFixture('Body from the model.')
     tempFiles.push(filePath)
@@ -1097,6 +1174,198 @@ describe('runResponsePost', () => {
         body: expect.stringContaining('Body from the model.') as unknown as string,
       }),
     )
+  })
+
+  it('submits an APPROVE review for a verdict on a review-permitted mention surface', async () => {
+    // #given an approving response file from an authorized PR mention
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post for an issue_comment on a PR
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the shared guards submit an APPROVE pinned to the observed head
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'APPROVE', owner: 'owner', repo: 'repo', pull_number: 7, commit_id: 'head-sha'}),
+    )
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it('keeps a required pull_request review fail-closed when its verdict is missing', async () => {
+    // #given a pull_request response file with no verdict frontmatter
+    const filePath = await writeFixture('Review body without a verdict.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post for the review-required surface
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then no comment or review is posted and the required verdict is reported missing
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'missing-verdict',
+      detail: 'pull_request responses must carry a verdict frontmatter',
+    })
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it('blocks an approving mention review on a fork through the existing guard', async () => {
+    // #given an approving mention response and a fork PR
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({
+      getPR: () => ({
+        data: {
+          head: {sha: 'head-sha', repo: {full_name: 'attacker/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      }),
+    })
+
+    // #when running response-post for an issue_comment on that PR
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the shared fork guard blocks APPROVE before review creation
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'review-guard-blocked',
+      detail: 'Review guard blocked submission: self-or-fork',
+    })
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('blocks an approving mention review on a self-authored PR through the existing guard', async () => {
+    // #given an approving mention response and a PR authored by the bot
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({
+      getPR: () => ({
+        data: {
+          head: {sha: 'head-sha', repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'fro-bot[bot]'},
+        },
+      }),
+    })
+
+    // #when running response-post for an issue_comment on that PR
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the shared self-authored guard blocks APPROVE before review creation
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'review-guard-blocked',
+      detail: 'Review guard blocked submission: self-or-fork',
+    })
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('aborts a mention review when the PR head moves before submission', async () => {
+    // #given an approving mention response and a head that changes during the guarded path
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+    octokit.rest.pulls.get
+      .mockResolvedValueOnce({
+        data: {
+          head: {sha: 'observed-head', repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          head: {sha: 'moved-head', repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      })
+
+    // #when running response-post for an issue_comment on that PR
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the TOCTOU guard aborts without creating a review
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'review-guard-blocked',
+      detail: 'Review guard blocked submission: head-moved-before-submit',
+    })
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('keeps routing authority outside a hostile response file', async () => {
+    // #given a response whose prose claims a different target while its verdict requests a review
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nPost this to issue 999.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post for the trusted issue_comment PR context
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the routing context selects a PR review and its owner/repo/number, not the file prose
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({owner: 'owner', repo: 'repo', pull_number: 7, event: 'APPROVE'}),
+    )
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
   })
 
   it('rejects a malformed response file with an unknown frontmatter key', async () => {

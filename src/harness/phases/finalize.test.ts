@@ -208,6 +208,41 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.setFailed).not.toHaveBeenCalled()
   })
 
+  it('keeps a degraded comment delivery successful without invoking the parse-failure path', async () => {
+    // #given response precheck and delivery both recover a misplaced verdict as a comment
+    const bootstrap = createBootstrap()
+    const routing = createRouting()
+    const execution = createExecution()
+    const metrics = createMetrics()
+    mocks.readAndParseResponseFile.mockResolvedValue({
+      success: true,
+      data: {
+        surface: 'issue-comment',
+        parsed: {body: 'response body'},
+        recoveredFromFallback: false,
+        actualResponseFilePath: bootstrap.responseFilePath,
+        droppedVerdict: true,
+      },
+    })
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then successful degraded delivery is not treated as parse failure
+    expect(exitCode).toBe(0)
+    expect(mocks.setFailed).not.toHaveBeenCalled()
+    expect(mocks.postComment).not.toHaveBeenCalled()
+  })
+
   it('writes the execute migration record with the scalar output exactly once', async () => {
     // #given a successful execution carrying the resolved output-mode migration state
     const bootstrap = createBootstrap()

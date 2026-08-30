@@ -380,6 +380,9 @@ export async function runFinalize(
     }
 
     if (result.delivered === false) {
+      // A misplaced verdict is normalized to successful comment delivery by
+      // readAndParseResponseFile. Keep every other parse failure fail-closed;
+      // unlike missing artifacts, it must not trigger an error-comment fallback.
       if (result.reason === 'file-read-failed') {
         if (execution.success === false && execution.commentsPosted === 0) {
           const commentTarget = resolveCommentTarget(routing)
