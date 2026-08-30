@@ -10,6 +10,7 @@ export function resolveResponseSurface(
   triggerContext: Pick<TriggerContext, 'eventType'> | null | undefined,
 ): ResponseSurface {
   if (triggerContext?.eventType === 'pull_request') return 'pr-review'
+  if (triggerContext?.eventType === 'issue_comment' && agentContext.issueType === 'pr') return 'pr-review-optional'
   if (agentContext.issueType === 'pr') return 'pr-comment'
   return 'issue-comment'
 }

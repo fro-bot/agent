@@ -11,7 +11,7 @@ import {err, ok} from '../shared/types.js'
  */
 export const MAX_BODY_BYTES = 65_536
 
-export type ResponseSurface = 'issue-comment' | 'pr-comment' | 'pr-review'
+export type ResponseSurface = 'issue-comment' | 'pr-comment' | 'pr-review' | 'pr-review-optional'
 
 /**
  * The frontmatter key that carries a PR review verdict. Exported so prompt
@@ -299,7 +299,7 @@ export function parseResponseFile(
     return ok({body: trimmedBody})
   }
 
-  if (options.surface !== 'pr-review') {
+  if (options.surface !== 'pr-review' && options.surface !== 'pr-review-optional') {
     return err(
       createResponseFileError(
         'verdict-on-non-review',
