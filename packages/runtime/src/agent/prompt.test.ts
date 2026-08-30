@@ -2334,6 +2334,22 @@ describe('buildAgentPrompt response delivery gating', () => {
     expect(prompt).toContain('gh` CLI is NOT available')
   })
 
+  it('keeps the required response-file verdict rule at its exact indentation', () => {
+    // #given / #when
+    const prompt = buildPromptForDelivery(
+      'file-convention',
+      '/tmp/fro-bot-response/1-1/nonce123.md',
+      'pull_request',
+      'pr-review',
+    )
+    const verdictRuleLine = prompt.split('\n').find(line => line.includes('For a PR review, include'))
+
+    // #then
+    expect(verdictRuleLine).toBeDefined()
+    expect(verdictRuleLine?.startsWith('    5.')).toBe(true)
+    expect(verdictRuleLine?.startsWith('     5.')).toBe(false)
+  })
+
   it('omits gh posting instructions for file-convention delivery', () => {
     // #given / #when
     const prompt = buildPromptForDelivery(

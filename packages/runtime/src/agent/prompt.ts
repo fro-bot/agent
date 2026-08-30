@@ -767,9 +767,9 @@ ${runSummaryBlock}
   if (responseDelivery === 'file-convention') {
     const verdictRule =
       responseSurface === 'pr-review'
-        ? `     5. **For a PR review, include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.`
+        ? `    5. **For a PR review, include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). This applies on re-reviews too — never omit it. For comments, no frontmatter is required; the file body is your response.`
         : responseSurface === 'pr-review-optional'
-          ? `     5. **For an optional PR review, you MAY include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). Include it when you want to submit a review; omit it when a comment is the right response. A verdict is available on this surface but is not required. For comments, no frontmatter is required; the file body is your response.`
+          ? `    5. **For an optional PR review, you MAY include a \`${RESPONSE_FILE_VERDICT_KEY}:\` frontmatter key** at the top of the file with value \`${RESPONSE_FILE_VERDICTS[0]}\` or \`${RESPONSE_FILE_VERDICTS[1]}\` (PASS → \`${RESPONSE_FILE_VERDICTS[0]}\`; CONDITIONAL or REJECT → \`${RESPONSE_FILE_VERDICTS[1]}\`). Include it when you want to submit a review; omit it when a comment is the right response. A verdict is available on this surface but is not required. For comments, no frontmatter is required; the file body is your response.`
           : null
     const verdictExample =
       responseSurface === 'pr-review'
@@ -791,6 +791,7 @@ ${runSummaryBlock}
 \`\`\`
 `
           : ''
+    const verdictExampleSection = verdictExample.length > 0 ? `\n${verdictExample}` : ''
 
     return `### Response Protocol (REQUIRED)
 This is the authoritative delivery contract for this run.
@@ -800,13 +801,10 @@ You MUST deliver exactly ONE response per invocation by writing it to the respon
 2. **Write to this exact path:** \`${responseFilePath ?? '<response file path>'}\`
 3. **Write SYNCHRONOUSLY, in the foreground.** Use a blocking command such as a heredoc (\`cat > "${responseFilePath ?? '<response file path>'}" <<'EOF' ... EOF\`). Do NOT background the write (no \`&\`, \`nohup\`, or \`disown\`) — a backgrounded write may not be flushed to disk before this run ends, and your response will be lost.
 4. **One write per run.** Write the file exactly once. Do not write it more than once.
-${verdictRule == null ? '' : verdictRule}
-6. **Include the Run Summary** at the end of the body (see template below), including the \`<!-- fro-bot-agent -->\` marker.
+${verdictRule == null ? '' : `${verdictRule}\n`}6. **Include the Run Summary** at the end of the body (see template below), including the \`<!-- fro-bot-agent -->\` marker.
 
 **File Format (comment, no frontmatter):**
-${runSummaryTemplate}
-${verdictExample}
-`
+${runSummaryTemplate}${verdictExampleSection}`
   }
 
   const reviewInstruction =
