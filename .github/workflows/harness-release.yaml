@@ -762,6 +762,7 @@ jobs:
           # is repaired. If the release does not exist, create it with all assets.
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "Release ${RELEASE_TAG} already exists; ensuring all assets are present (clobber upload)."
+            gh release edit "${RELEASE_TAG}" --prerelease
             gh release upload "${RELEASE_TAG}" \
               opencode-linux-x64.tar.gz \
               opencode-linux-arm64.tar.gz \
