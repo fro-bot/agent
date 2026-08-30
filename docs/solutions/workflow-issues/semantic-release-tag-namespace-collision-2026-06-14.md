@@ -47,7 +47,31 @@ If a repo runs semantic-release with `v${version}` and also publishes other rele
 + 1.17.3+harness.94c10df9    # invisible to /^v(.+)/, isolated namespace
 ```
 
-Verified anchors: `.github/workflows/harness-release.yaml` (`RELEASE_TAG="${BASE_VERSION}+harness.${SHORT_SHA}"`, no `v`); `src/services/setup/opencode.ts` `encodeHarnessTag()` strips a leading `v` for the harness download URL while `buildDownloadUrl()` keeps the `v` for stock `anomalyco/opencode` downloads (separate path, regression-tested).
+Verified anchors: `.github/workflows/harness-release.yaml` (`RELEASE_TAG="${BASE_VERSION}-harness.${SHORT_SHA}"`, no `v`); `src/services/setup/opencode.ts` derives the release tag from the `+harness.` version form via `toHarnessReleaseTag()` while `buildDownloadUrl()` keeps the `v` for stock `anomalyco/opencode` downloads (separate path, regression-tested).
+
+#### 1a. The tag has a second, adversarial consumer: version datasources
+
+The non-`v` fix above was correct and remains necessary — but it is not sufficient. It made the tag invisible to a `^v(.+)` scan while leaving it a **perfectly valid bare semver tag**, which is exactly what a version datasource wants. Renovate's `github-actions` manager resolves `uses: owner/repo@ref` pins from the **`github-tags` datasource** — candidates come from git tags, with GitHub Release objects consulted only as optional `isStable` enrichment. So `1.18.21+harness.22dee0ee` parsed as stable `1.18.21` (SemVer ignores build metadata for precedence) and outranked the real `v0.x` action line, breaking a downstream update branch (#1492).
+
+The two consumers pull in opposite directions on the same string:
+
+| Consumer | Sees the tag via | Needs the harness tag to be |
+| --- | --- | --- |
+| semantic-release | `^v(.+)` regex on tag names | not `v`-prefixed |
+| Renovate / version datasources | git tags parsed as SemVer | not a stable version |
+
+One form satisfies both — a non-`v` tag whose suffix is a SemVer **prerelease identifier** rather than build metadata:
+
+```diff
+- 1.18.21+harness.22dee0ee   # invisible to /^v(.+)/, but parses as stable 1.18.21
++ 1.18.21-harness.22dee0ee   # invisible to /^v(.+)/, and SemVer-unstable
+```
+
+`-harness.<sha>` is a prerelease identifier, so Renovate's default `ignoreUnstable: true` excludes it from stable candidates by specification rather than by enrichment behavior. It is also the string the npm package already publishes (`NPM_VERSION`), so the tag and npm identities unify.
+
+**Release-object flags are not a substitute.** `--latest=false` moves only the "latest" pointer; `--prerelease` marks the release object, which a tag-based datasource is not obliged to consult. Both are worth setting — they are correct metadata and they help where enrichment exists — but the tag *name* is the only lever that binds.
+
+**Corollary for the general case:** when an auxiliary tag is read by more than one tool, enumerate every consumer and the mechanism each uses to see it *before* choosing the tag shape. Solving for one consumer's matcher can hand the string straight to another's. The distinguishing question is not "is this tag hidden?" but "hidden from which parser, and what does every other parser make of it?"
 
 ### 2. semantic-release has no tag-exclusion knob — don't try to fix this in config
 
