@@ -11,6 +11,8 @@ import {describe, expect, it} from 'vitest'
 const HARNESS_RELEASE_WORKFLOW = '.github/workflows/harness-release.yaml'
 const WORKSPACE_DOCKERFILE = 'deploy/workspace.Dockerfile'
 const OPENCODE_SETUP_MODULE = 'src/services/setup/opencode.ts'
+const HARNESS_VERSION_TEST = 'packages/harness/src/version.test.ts'
+const HARNESS_TAG_GUARD_TEST = 'scripts/harness-tag-derivation.test.ts'
 const HARNESS_RELEASE_PREFIX = 'https://github.com/fro-bot/agent/releases/download/'
 const EXPECTED_RELEASE_TAG_ASSIGNMENT = 'RELEASE_TAG="${BASE_VERSION}-harness.${SHORT_SHA}"'
 
@@ -88,9 +90,113 @@ function assertDockerfileDerivation(source: string): void {
 }
 
 function assertOpencodeSetupConversion(source: string): void {
-  const sourceWithoutComments = source.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '')
-  if (/['"`]-harness\.['"`]/.test(sourceWithoutComments) === false) {
-    throw new Error(`${OPENCODE_SETUP_MODULE}: expected harness conversion to target the -harness. prerelease form`)
+  // Coupling contract: this guard matches source text, so refactoring the matched expression requires updating it.
+  // Limitation: regex literals are not parsed, so an unbalanced quote such as /['"]/ can enter string state and
+  // under-strip subsequent comments (a weaker guard), never lose code.
+  const sourceWithoutComments = stripCommentsPreservingStrings(source)
+  const functionStart = sourceWithoutComments.indexOf('function toHarnessReleaseTag')
+  const functionBodyStart = functionStart === -1 ? -1 : sourceWithoutComments.indexOf('{', functionStart)
+  let functionEnd = -1
+  if (functionBodyStart !== -1) {
+    let braceDepth = 0
+    for (let index = functionBodyStart; index < sourceWithoutComments.length; index += 1) {
+      const character = sourceWithoutComments[index]
+      if (character === '{') braceDepth += 1
+      if (character === '}') {
+        braceDepth -= 1
+        if (braceDepth === 0) {
+          functionEnd = index + 1
+          break
+        }
+      }
+    }
+  }
+  const functionSource = functionEnd === -1 ? '' : sourceWithoutComments.slice(functionBodyStart, functionEnd)
+  const hasHyphenConversionCall = functionSource.split(/\r?\n/).some(line => {
+    const hasReplaceCall = line.includes('.replace(') || line.includes('.replaceAll(')
+    const hasHyphenTarget = line.includes("'-harness.'") || line.includes('"-harness."') || line.includes('`-harness.`')
+    return hasReplaceCall && hasHyphenTarget
+  })
+  if (hasHyphenConversionCall === false) {
+    throw new Error(
+      `${OPENCODE_SETUP_MODULE}: expected toHarnessReleaseTag to replace the harness marker with '-harness.'`,
+    )
+  }
+}
+
+type CommentStripState = 'code' | 'single-quote' | 'double-quote' | 'template' | 'line-comment' | 'block-comment'
+
+function stripCommentsPreservingStrings(source: string): string {
+  let state: CommentStripState = 'code'
+  let result = ''
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]
+    const nextCharacter = source[index + 1]
+    if (character === undefined) continue
+
+    if (state === 'code') {
+      if (character === '/' && nextCharacter === '/') {
+        state = 'line-comment'
+        index += 1
+      } else if (character === '/' && nextCharacter === '*') {
+        state = 'block-comment'
+        index += 1
+      } else if (character === "'") {
+        state = 'single-quote'
+        result += character
+      } else if (character === '"') {
+        state = 'double-quote'
+        result += character
+      } else if (character === '`') {
+        state = 'template'
+        result += character
+      } else {
+        result += character
+      }
+    } else if (state === 'line-comment') {
+      if (character === '\n') {
+        state = 'code'
+        result += character
+      }
+    } else if (state === 'block-comment') {
+      if (character === '*' && nextCharacter === '/') {
+        state = 'code'
+        index += 1
+      } else if (character === '\n') {
+        result += character
+      }
+    } else {
+      const quote = state === 'single-quote' ? "'" : state === 'double-quote' ? '"' : '`'
+      result += character
+      if (character === '\\' && nextCharacter !== undefined) {
+        result += nextCharacter
+        index += 1
+      } else if (character === quote) {
+        state = 'code'
+      }
+    }
+  }
+
+  return result
+}
+
+function extractStripperBlock(source: string, file: string): string {
+  const start = source.indexOf('function stripCommentsPreservingStrings')
+  const end = start === -1 ? -1 : source.indexOf('\n  }\n', start)
+  if (start === -1 || end === -1) {
+    throw new Error(`${file}: expected stripCommentsPreservingStrings function block`)
+  }
+  return source.slice(start, end + 4)
+}
+
+function assertStripperBlocksEqual(versionTestSource: string, guardSource: string): void {
+  const versionBlock = extractStripperBlock(versionTestSource, HARNESS_VERSION_TEST)
+  const guardBlock = extractStripperBlock(guardSource, HARNESS_TAG_GUARD_TEST)
+  if (versionBlock !== guardBlock) {
+    throw new Error(
+      `${HARNESS_VERSION_TEST}: expected stripCommentsPreservingStrings block to match ${HARNESS_TAG_GUARD_TEST}`,
+    )
   }
 }
 
@@ -119,7 +225,8 @@ const VALID_DOCKERFILE = [
   `&& base_url="${HARNESS_RELEASE_PREFIX}\${tag_version}" \\`,
 ].join('\n')
 
-const VALID_SETUP_MODULE = 'return version.replace(HARNESS_MARKER, "-harness.")'
+const VALID_SETUP_MODULE =
+  'function toHarnessReleaseTag(version: string): string {\n  return version.replace(HARNESS_MARKER, "-harness.")\n}'
 
 function validSources(): HarnessTagSources {
   return {
@@ -180,6 +287,45 @@ describe('harness tag derivation guard', () => {
     // #when / #then only the scoped harness URL construction is checked
     expect(() => assertDockerfileDerivation(VALID_DOCKERFILE)).not.toThrow()
   })
+
+  it('rejects a setup conversion reverted to +harness. despite an unrelated hyphen literal', () => {
+    // #given a setup module whose conversion emits +harness. while another string retains -harness.
+    const sources = validSources()
+    const setupModule =
+      'function toHarnessReleaseTag(version: string): string {\n  return version.replace(HARNESS_MARKER, "+harness.")\n}\n' +
+      'const publicTag = "-harness."'
+
+    // #when / #then the conversion call site, not the unrelated literal, determines the result
+    expect(() => assertHarnessTagDerivations({...sources, opencodeSetupModule: setupModule})).toThrow(
+      `${OPENCODE_SETUP_MODULE}: expected toHarnessReleaseTag to replace the harness marker with '-harness.'`,
+    )
+  })
+
+  it('rejects a setup conversion rescued only by a trailing comment', () => {
+    // #given a reverted conversion whose expected target appears only in a trailing comment
+    const sources = validSources()
+    const setupModule = `function toHarnessReleaseTag(version: string): string {
+  return version.replace(HARNESS_MARKER, "+harness.") // version.replace(HARNESS_MARKER, '-harness.')
+}`
+
+    // #when / #then the trailing comment cannot satisfy the conversion guard
+    expect(() => assertHarnessTagDerivations({...sources, opencodeSetupModule: setupModule})).toThrow(
+      `${OPENCODE_SETUP_MODULE}: expected toHarnessReleaseTag to replace the harness marker with '-harness.'`,
+    )
+  })
+
+  it('rejects non-equivalent comment stripper blocks', () => {
+    // #given two synthetic stripper blocks that differ by one character
+    const versionTestSource =
+      'function stripCommentsPreservingStrings(source: string): string {\n  return source\n  }\n'
+    const guardSource =
+      'function stripCommentsPreservingStrings(source: string): string {\n  return source.trim()\n  }\n'
+
+    // #when / #then the mismatch names both source files and the required equivalence
+    expect(() => assertStripperBlocksEqual(versionTestSource, guardSource)).toThrow(
+      `${HARNESS_VERSION_TEST}: expected stripCommentsPreservingStrings block to match ${HARNESS_TAG_GUARD_TEST}`,
+    )
+  })
 })
 
 describe('checked-in harness tag producers', () => {
@@ -189,5 +335,15 @@ describe('checked-in harness tag producers', () => {
 
     // #when / #then all three producers must agree on the public release-tag form
     expect(() => assertHarnessTagDerivations(sources)).not.toThrow()
+  })
+
+  it('keeps the duplicated comment strippers byte-for-byte identical', () => {
+    // #given both checked-in source files containing the shared stripper implementation
+    const root = process.cwd()
+    const versionTestSource = readFileSync(join(root, HARNESS_VERSION_TEST), 'utf8')
+    const guardSource = readFileSync(join(root, HARNESS_TAG_GUARD_TEST), 'utf8')
+
+    // #when / #then the duplicated implementation must remain synchronized
+    expect(() => assertStripperBlocksEqual(versionTestSource, guardSource)).not.toThrow()
   })
 })
