@@ -6,7 +6,14 @@ import {createS3Adapter, syncSessionsFromStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys} from './cache-key.js'
-import {buildRestoreCachePaths, deleteAuthJson, isAuthPathSafe, isPathInsideDirectory} from './paths.js'
+import {
+  buildDbFamilyPaths,
+  buildDbShmPath,
+  buildRestoreCachePaths,
+  deleteAuthJson,
+  isAuthPathSafe,
+  isPathInsideDirectory,
+} from './paths.js'
 import {defaultCacheAdapter, type RestoreCacheOptions} from './types.js'
 
 export {isAuthPathSafe, isPathInsideDirectory}
@@ -47,6 +54,33 @@ async function cleanStorage(storagePath: string): Promise<void> {
     await fs.rm(storagePath, {recursive: true, force: true})
     await fs.mkdir(storagePath, {recursive: true})
   } catch {}
+
+  // The database family lives beside storagePath (path.dirname(storagePath)), not inside
+  // it. "Proceeding with clean state" must actually be clean, or the database survives
+  // every call site below untouched and the next restore finds it again.
+  for (const dbFile of buildDbFamilyPaths(storagePath)) {
+    try {
+      await fs.rm(dbFile, {force: true})
+    } catch {}
+  }
+}
+
+// opencode.db-shm is a machine-local wal-index that SQLite never syncs. A copy restored
+// from another runner is stale by construction and safe to delete locally — SQLite
+// rebuilds it on demand. Deleting it (rather than waiting for old cache entries to age
+// out) removes the hazard immediately after every restore, cache or object-store.
+async function deleteRestoredShm(storagePath: string, logger: RestoreCacheOptions['logger']): Promise<void> {
+  const shmPath = buildDbShmPath(storagePath)
+  try {
+    await fs.unlink(shmPath)
+    logger.debug('Deleted restored opencode.db-shm (machine-local, stale by construction)')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      logger.warning('Failed to delete restored opencode.db-shm', {
+        error: toErrorMessage(error),
+      })
+    }
+  }
 }
 
 async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<CacheResult> {
@@ -76,10 +110,27 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
     if (syncResult.mainDbRestored === true) {
       // The object store sync writes opencode.db beside storagePath; ensure this cache directory exists before returning.
       await fs.mkdir(storagePath, {recursive: true})
+      await deleteRestoredShm(storagePath, logger)
 
+      // A successful object-store restore used to return here, before either integrity
+      // check ever ran — the path that wins on restore had no checks. A corrupt or
+      // version-mismatched database in the bucket must not be accepted as a hit.
       const isCorrupted = await checkStorageCorruption(storagePath, logger)
       if (isCorrupted === true) {
         logger.warning('Object store restore produced corrupt storage - falling back to cache')
+        await cleanStorage(storagePath)
+        return {
+          hit: false,
+          key: null,
+          restoredPath: null,
+          corrupted: true,
+          source: null,
+        }
+      }
+
+      const versionMatch = await checkStorageVersion(storagePath, logger)
+      if (versionMatch === false) {
+        logger.warning('Object store restore has storage version mismatch - falling back to cache')
         await cleanStorage(storagePath)
         return {
           hit: false,
@@ -174,6 +225,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     }
 
     logger.info('Cache restored', {restoredKey})
+    await deleteRestoredShm(storagePath, logger)
 
     const isCorrupted = await checkStorageCorruption(storagePath, logger)
     if (isCorrupted === true) {

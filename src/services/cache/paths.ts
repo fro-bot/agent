@@ -1,7 +1,13 @@
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import {isSqliteBackend} from '@fro-bot/runtime'
+import {
+  DB_FAMILY_BASENAMES,
+  DB_MAIN_BASENAME,
+  DB_SHM_BASENAME,
+  DB_WAL_BASENAME,
+  isSqliteBackend,
+} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 
 export function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
@@ -36,8 +42,31 @@ export async function deleteAuthJson(authPath: string, storagePath: string, logg
 }
 
 // Restore mode always includes -wal and -shm even if absent: @actions/cache tolerates
-// missing paths in the archive. Save mode filters by existence because @actions/cache
-// fails if any save path is missing at archive time.
+// missing paths in the archive, and accepting -shm on restore preserves compatibility with
+// caches written before -shm was dropped from the save set (see buildSaveCachePaths below).
+// Save mode filters by existence because @actions/cache fails if any save path is missing
+// at archive time, and it never includes -shm: it is a machine-local wal-index that SQLite
+// never syncs, so a copy transported from another runner is stale by construction.
+
+/**
+ * Re-exported, not redefined. `@fro-bot/runtime` owns these names because the object-store
+ * sync lives there and cannot import from this package — defining them here too would leave
+ * two lists that must agree about which files constitute the database, which is the drift
+ * shape this repository has been bitten by before.
+ */
+export {DB_FAMILY_BASENAMES, DB_MAIN_BASENAME, DB_SHM_BASENAME, DB_WAL_BASENAME} from '@fro-bot/runtime'
+
+/** Builds absolute paths for every DB-family file beside `storagePath`, present or not. */
+export function buildDbFamilyPaths(storagePath: string): string[] {
+  const dbDir = path.dirname(storagePath)
+  return DB_FAMILY_BASENAMES.map(basename => path.join(dbDir, basename))
+}
+
+/** The machine-local wal-index sidecar path beside `storagePath`. Never valid to transport. */
+export function buildDbShmPath(storagePath: string): string {
+  return path.join(path.dirname(storagePath), DB_SHM_BASENAME)
+}
+
 export async function buildRestoreCachePaths(
   storagePath: string,
   projectIdPath: string | undefined,
@@ -48,8 +77,7 @@ export async function buildRestoreCachePaths(
     paths.push(projectIdPath)
   }
   if (await isSqliteBackend(opencodeVersion ?? null)) {
-    const dbPath = path.join(path.dirname(storagePath), 'opencode.db')
-    paths.push(dbPath, `${dbPath}-wal`, `${dbPath}-shm`)
+    paths.push(...buildDbFamilyPaths(storagePath))
   }
   return paths
 }
@@ -64,15 +92,16 @@ export async function buildSaveCachePaths(
     paths.push(projectIdPath)
   }
   if (await isSqliteBackend(opencodeVersion ?? null)) {
-    const dbPath = path.join(path.dirname(storagePath), 'opencode.db')
+    const dbDir = path.dirname(storagePath)
+    const dbPath = path.join(dbDir, DB_MAIN_BASENAME)
     paths.push(dbPath)
-    for (const suffix of ['-wal', '-shm']) {
-      try {
-        await fs.access(`${dbPath}${suffix}`)
-        paths.push(`${dbPath}${suffix}`)
-      } catch {
-        // sidecar file missing — safe to skip
-      }
+
+    const walPath = path.join(dbDir, DB_WAL_BASENAME)
+    try {
+      await fs.access(walPath)
+      paths.push(walPath)
+    } catch {
+      // sidecar file missing — safe to skip
     }
   }
   return paths

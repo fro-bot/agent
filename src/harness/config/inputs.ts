@@ -19,6 +19,7 @@ import {
   DEFAULT_OMO_VERSION,
   DEFAULT_OPENCODE_VERSION,
   DEFAULT_S3_PREFIX,
+  DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
   DEFAULT_SESSION_RETENTION,
   DEFAULT_SYSTEMATIC_VERSION,
   DEFAULT_TIMEOUT_MS,
@@ -352,6 +353,12 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const timeoutRaw = core.getInput('timeout').trim()
     const timeoutMs = timeoutRaw.length > 0 ? parseTimeoutMs(timeoutRaw) : DEFAULT_TIMEOUT_MS
 
+    const serverBootstrapTimeoutRaw = core.getInput('server-bootstrap-timeout').trim()
+    const serverBootstrapTimeoutMs =
+      serverBootstrapTimeoutRaw.length > 0
+        ? validatePositiveInteger(serverBootstrapTimeoutRaw, 'server-bootstrap-timeout')
+        : DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS
+
     // Setup consolidation inputs
     const opencodeVersionRaw = core.getInput('opencode-version').trim()
     const opencodeVersion = opencodeVersionRaw.length > 0 ? opencodeVersionRaw : DEFAULT_OPENCODE_VERSION
@@ -434,6 +441,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       agent,
       model,
       timeoutMs,
+      serverBootstrapTimeoutMs,
       enableOmo,
       enableOmoSlim,
       opencodeVersion,

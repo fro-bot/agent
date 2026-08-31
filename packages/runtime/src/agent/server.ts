@@ -6,6 +6,7 @@ import type {EnsureOpenCodeResult} from './types.js'
 import net from 'node:net'
 import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
+import {DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS} from '../shared/constants.js'
 import {err, ok} from '../shared/types.js'
 import {withScrubbedEnv} from './with-scrubbed-env.js'
 
@@ -46,7 +47,15 @@ export interface OpenCodeServerHandle {
 export async function bootstrapOpenCodeServer(
   signal: AbortSignal,
   logger: Logger,
+  timeoutMs: number = DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
 ): Promise<Result<OpenCodeServerHandle, Error>> {
+  const startedAt = Date.now()
+  // Time spent inside createOpencode specifically — the only window timeoutMs governs.
+  let budgetedMs: number | null = null
+  // Captured as soon as a server handle exists so the catch block can close it on any
+  // failure that occurs after acquisition (e.g. a throw between obtaining the handle
+  // and returning it) rather than leaking the child to the SDK's abort binding alone.
+  let acquiredServer: {readonly url: string; close: () => void} | undefined
   try {
     const port = await pickFreePort()
     const pinnedUrl = `http://127.0.0.1:${port}`
@@ -56,8 +65,16 @@ export async function bootstrapOpenCodeServer(
     // is intentionally NOT reverted after bootstrap: it remains set in the
     // harness process too, which is harmless and aids debugging.
     process.env.FRO_BOT_OPENCODE_URL = pinnedUrl
-    const opencode = await withScrubbedEnv(async () => createOpencode({signal, hostname: '127.0.0.1', port}), logger)
+    const spawnOptions = {signal, hostname: '127.0.0.1', port, timeout: timeoutMs}
+    // Measured separately from the total: timeoutMs bounds this call alone, so comparing
+    // it against time that also covers port acquisition would misreport the real margin.
+    // Keeping both also separates a slow port bind from slow server init, which are
+    // different faults on a contended runner.
+    const spawnStartedAt = Date.now()
+    const opencode = await withScrubbedEnv(async () => createOpencode(spawnOptions), logger)
+    budgetedMs = Date.now() - spawnStartedAt
     const {client, server} = opencode
+    acquiredServer = server
     if (server.url !== pinnedUrl) {
       // The child server (and the bundled session-tools file tool running inside it)
       // already captured pinnedUrl via FRO_BOT_OPENCODE_URL at spawn time. If the actual
@@ -67,7 +84,8 @@ export async function bootstrapOpenCodeServer(
       server.close()
       return err(new Error(`OpenCode server URL mismatch: pinned ${pinnedUrl} but server bound to ${server.url}`))
     }
-    logger.debug('OpenCode server bootstrapped', {url: server.url})
+    const elapsedMs = Date.now() - startedAt
+    logger.debug('OpenCode server bootstrapped', {url: server.url, timeoutMs, budgetedMs, elapsedMs})
     return ok({
       client,
       server,
@@ -76,8 +94,15 @@ export async function bootstrapOpenCodeServer(
       },
     })
   } catch (error) {
+    const elapsedMs = Date.now() - startedAt
     const message = error instanceof Error ? error.message : String(error)
-    logger.warning('Failed to bootstrap OpenCode server', {error: message})
+    // budgetedMs is null when the failure happened before or inside the spawn; a null
+    // here with elapsedMs at roughly timeoutMs is the signature of a budget timeout,
+    // while a null with a much smaller elapsedMs points at port acquisition instead.
+    logger.warning('Failed to bootstrap OpenCode server', {error: message, timeoutMs, budgetedMs, elapsedMs})
+    // Defensive cleanup: if a handle was acquired before the failure, do not leave the
+    // child's fate to the SDK's abort binding alone.
+    acquiredServer?.close()
     return err(new Error(`Server bootstrap failed: ${message}`))
   }
 }

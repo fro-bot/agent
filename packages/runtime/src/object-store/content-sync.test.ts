@@ -50,7 +50,8 @@ describe('content sync', () => {
     await fs.rm(tempDir, {recursive: true, force: true})
   })
 
-  it('uploads all 3 DB files when present', async () => {
+  it('uploads db and wal when present, excluding shm', async () => {
+    // #given a db, a wal, and a shm file all present on disk
     await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db')
     await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal')
     await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm')
@@ -58,14 +59,15 @@ describe('content sync', () => {
     const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
     const adapter = createAdapter({upload})
 
+    // #when syncing sessions to the store
     const result = await syncSessionsToStore(adapter, config, 'github', 'owner/repo', storagePath, createLogger())
 
-    expect(result).toEqual({uploaded: 3, failed: 0})
-    expect(upload).toHaveBeenCalledTimes(3)
+    // #then only db and wal are uploaded; shm never crosses the boundary
+    expect(result).toEqual({uploaded: 2, failed: 0})
+    expect(upload).toHaveBeenCalledTimes(2)
     expect(upload.mock.calls.map(([key]) => key)).toEqual([
       'fro-bot-state/github/owner/repo/sessions/opencode.db',
       'fro-bot-state/github/owner/repo/sessions/opencode.db-wal',
-      'fro-bot-state/github/owner/repo/sessions/opencode.db-shm',
     ])
   })
 

@@ -54,7 +54,11 @@ export async function runCacheRestore(
 
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const abortController = new AbortController()
-  const bootstrapResult = await bootstrapOpenCodeServer(abortController.signal, serverLogger)
+  const bootstrapResult = await bootstrapOpenCodeServer(
+    abortController.signal,
+    serverLogger,
+    bootstrap.inputs.serverBootstrapTimeoutMs,
+  )
 
   if (!bootstrapResult.success) {
     core.setFailed(`OpenCode server bootstrap failed: ${bootstrapResult.error.message}`)

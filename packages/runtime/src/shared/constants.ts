@@ -12,6 +12,12 @@ export const DEFAULT_MAX_AGE_DAYS = 30
 // SDK execution defaults - per RFC-013
 export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 
+// OpenCode server bootstrap budget - mirrors the @opencode-ai/sdk createOpencode
+// default (server.js does Object.assign({..., timeout: 5000}, options)). Passing
+// this explicitly rather than omitting `timeout` keeps the unset-input behavior
+// byte-for-byte identical to today while making the budget observable/adjustable.
+export const DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS = 5000
+
 // Default model for OpenCode Zen - ensures inference starts
 export const DEFAULT_MODEL = {
   providerID: 'opencode',

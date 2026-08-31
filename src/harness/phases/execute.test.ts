@@ -108,6 +108,7 @@ function createBootstrap(
       agent: null,
       model: null,
       timeoutMs,
+      serverBootstrapTimeoutMs: 5000,
       enableOmo: false,
       enableOmoSlim: false,
       opencodeVersion: '1.0.0',

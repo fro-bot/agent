@@ -76,6 +76,15 @@ inputs:
     description: 'Execution timeout in milliseconds for OpenCode execution only (not the whole GitHub Actions job). 0 = no Action-internal execution deadline. Default: 1800000 (30 minutes). Set the job-level timeout-minutes as the whole-job backstop, with headroom beyond this value for setup, fallback response delivery, and cleanup.'
     required: false
     default: '1800000'
+  server-bootstrap-timeout:
+    description: >-
+      Budget in milliseconds for the OpenCode server to finish starting (runtime boot,
+      config parse, plugin loading, DB open) before bootstrap is declared failed.
+      Distinct from `timeout`, which only bounds agent execution and never reaches
+      server startup. Increase this on runners with high startup variance. Must be a
+      positive integer. Default: 5000 (matches the OpenCode SDK's own default).
+    required: false
+    default: '5000'
   opencode-version:
     description: OpenCode CLI version to install if auto-setup is needed. Defaults to version pinned in source code if not set.
     required: false

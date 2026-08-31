@@ -60,7 +60,17 @@ export type {
 } from './types.js'
 
 // Version detection
-export {compareVersions, getOpenCodeDbPath, isSqliteBackend, OPENCODE_SQLITE_VERSION} from './version.js'
+export {
+  compareVersions,
+  DB_FAMILY_BASENAMES,
+  DB_MAIN_BASENAME,
+  DB_SHM_BASENAME,
+  DB_TRANSPORTABLE_BASENAMES,
+  DB_WAL_BASENAME,
+  getOpenCodeDbPath,
+  isSqliteBackend,
+  OPENCODE_SQLITE_VERSION,
+} from './version.js'
 
 // Writeback
 export {writeSessionSummary} from './writeback.js'

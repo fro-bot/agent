@@ -327,4 +327,71 @@ describe('restore/save object-store integration flow', () => {
     expect(saveResult).toBe(true)
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
   })
+
+  it('excludes opencode.db-shm from the object store even when it exists locally', async () => {
+    const cache = createMockCacheAdapter(undefined)
+    const store = createInMemoryStoreAdapter()
+
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(sessionFilePath, '{"session":"created"}', 'utf8')
+    await fs.writeFile(dbPath, 'db-data')
+    await fs.writeFile(`${dbPath}-wal`, 'wal-data')
+    await fs.writeFile(`${dbPath}-shm`, 'shm-data')
+
+    const saveOptions: SaveCacheOptions = {
+      components: testComponents,
+      runId: 606,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: cache.adapter,
+      storeConfig: testStoreConfig,
+      storeAdapter: store.adapter,
+    }
+
+    // #given a db, wal, and shm all present locally
+
+    // #when saving cache
+    const saveResult = await saveCache(saveOptions)
+
+    // #then the object store receives db and wal but never shm, and the cache adapter agrees
+    expect(saveResult).toBe(true)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db')).toBe(true)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-wal')).toBe(true)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-shm')).toBe(false)
+    expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath, `${dbPath}-wal`], expect.any(String))
+  })
+
+  it('deletes a stale opencode.db-shm restored from the object store before returning a hit', async () => {
+    const cache = createMockCacheAdapter(undefined)
+    const store = createInMemoryStoreAdapter({
+      initialObjects: new Map([
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('object-store-db')],
+        // A shm object uploaded before this fix shipped; download must remain tolerant of it.
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db-shm', Buffer.from('stale-machine-local-shm')],
+      ]),
+    })
+
+    const restoreOptions: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: cache.adapter,
+      storeConfig: testStoreConfig,
+      storeAdapter: store.adapter,
+    }
+
+    // #given an object store still holding a pre-fix shm object alongside the main db
+
+    // #when restoring cache
+    const restoreResult = await restoreCache(restoreOptions)
+
+    // #then the restore is a hit, the db is present, and the stale local shm copy is deleted
+    expect(restoreResult).toMatchObject({hit: true, source: 'storage'})
+    expect(await fs.readFile(dbPath, 'utf8')).toBe('object-store-db')
+    await expect(fs.access(`${dbPath}-shm`)).rejects.toThrow()
+  })
 })

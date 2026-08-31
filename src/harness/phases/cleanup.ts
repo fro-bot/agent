@@ -44,6 +44,7 @@ export interface CleanupPhaseOptions {
   readonly agentSuccess: boolean
   readonly attachmentResult: AttachmentResult | null
   readonly serverHandle: OpenCodeServerHandle | null
+  readonly sessionRetention: number | null
   readonly detectedOpencodeVersion: string | null
   readonly storeConfig: ObjectStoreConfig
   readonly metrics: MetricsCollector
@@ -66,6 +67,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     agentSuccess,
     attachmentResult,
     serverHandle,
+    sessionRetention,
     detectedOpencodeVersion,
     storeConfig,
     metrics,
@@ -90,12 +92,11 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     const finalWorkspace = getGitHubWorkspace()
     if (serverHandle != null) {
       const normalizedFinalWorkspace = normalizeWorkspacePath(finalWorkspace)
-      const pruneResult = await pruneSessions(
-        serverHandle.client,
-        normalizedFinalWorkspace,
-        DEFAULT_PRUNING_CONFIG,
-        pruneLogger,
-      )
+      const pruningConfig = {
+        ...DEFAULT_PRUNING_CONFIG,
+        maxSessions: sessionRetention == null ? DEFAULT_PRUNING_CONFIG.maxSessions : sessionRetention,
+      }
+      const pruneResult = await pruneSessions(serverHandle.client, normalizedFinalWorkspace, pruningConfig, pruneLogger)
       if (pruneResult.prunedCount > 0) {
         pruneLogger.info('Pruned old sessions', {
           pruned: pruneResult.prunedCount,
