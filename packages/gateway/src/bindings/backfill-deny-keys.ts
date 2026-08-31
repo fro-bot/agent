@@ -19,6 +19,7 @@ import type {BindingsStore} from './store.js'
 import type {RepoBinding} from './types.js'
 import {err, ok} from '@fro-bot/runtime'
 
+import {isUsableRepositoryId} from '../shared/repository-id.js'
 import {withOptionalDatabaseId} from './types.js'
 
 // ---------------------------------------------------------------------------
@@ -99,9 +100,9 @@ export async function backfillActiveBindingDenyKeys(deps: BackfillDeps): Promise
   for (const binding of bindings) {
     const {owner, repo} = binding
 
-    // Skip bindings that already have the primary deny key (databaseId).
-    // Only a usable numeric id is complete; malformed stored data is backfilled.
-    if (typeof binding.databaseId === 'number') {
+    // Skip bindings that already have a usable deny key. A non-empty nodeId is
+    // sufficient when the repository has no exactly representable numeric id.
+    if (isUsableRepositoryId(binding.databaseId) || (typeof binding.nodeId === 'string' && binding.nodeId.length > 0)) {
       skipped++
       continue
     }

@@ -34,6 +34,7 @@ import {err, ok} from '@fro-bot/runtime'
 import {parse} from 'yaml'
 
 import {safeErrorMessage} from '../github/errors.js'
+import {isUsableRepositoryId} from '../shared/repository-id.js'
 
 // ---------------------------------------------------------------------------
 // Reader interface (injectable — tests inject a fake, production injects real)
@@ -273,14 +274,14 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
       // matching is format-fragile and could miss a cross-format skew.
       const hasValidNodeId = typeof entry.node_id === 'string' && entry.node_id.length > 0
       const rawDbId = entry.database_id ?? entry.id
-      const hasDirectDatabaseId = typeof rawDbId === 'number' && Number.isFinite(rawDbId)
+      const hasDirectDatabaseId = isUsableRepositoryId(rawDbId)
 
       // Fail closed: no usable deny key at all.
       // No-oracle: do NOT include owner/name in the error message.
       if (hasValidNodeId === false && hasDirectDatabaseId === false) {
         return err(
           new MetadataSchemaError(
-            `${METADATA_PATH}: redacted entry has no usable deny key (node_id missing or empty, database_id absent)`,
+            `${METADATA_PATH}: redacted entry has no usable deny key (node_id missing or empty, database_id missing or unusable)`,
           ),
         )
       }
@@ -306,7 +307,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
         redactedNodeIds.add(nodeIdStr)
       }
 
-      if (hasDirectDatabaseId && typeof rawDbId === 'number') {
+      if (isUsableRepositoryId(rawDbId)) {
         redactedDatabaseIds.add(rawDbId)
       }
 

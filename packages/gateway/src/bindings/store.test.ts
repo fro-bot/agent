@@ -4,7 +4,13 @@ import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 
 import {createBindingsStore} from './store.js'
-import {hasValidChannelIndexShape, hasValidRepoBindingShape, type PartialWriteError, type RepoBinding} from './types.js'
+import {
+  hasValidChannelIndexShape,
+  hasValidRepoBindingShape,
+  withOptionalDatabaseId,
+  type PartialWriteError,
+  type RepoBinding,
+} from './types.js'
 
 const STORE_CONFIG: ObjectStoreConfig = {
   enabled: true,
@@ -110,6 +116,37 @@ describe('hasValidRepoBindingShape', () => {
 
     // #when / #then
     expect(hasValidRepoBindingShape(value)).toBe(false)
+  })
+})
+
+describe('withOptionalDatabaseId', () => {
+  it('omits a stored databaseId when the replacement id is null', () => {
+    // #given — a binding that already carries a database id
+    const binding = makeBinding({databaseId: 5})
+
+    // #when — the replacement id is unavailable
+    const result = withOptionalDatabaseId(binding, null)
+
+    // #then — the optional field is absent, not null, and the result remains valid
+    expect(result).not.toHaveProperty('databaseId')
+    expect(hasValidRepoBindingShape(result)).toBe(true)
+  })
+
+  it.each([
+    ['NaN', Number.NaN],
+    ['zero', 0],
+    ['negative', -1],
+    ['unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+  ])('omits an unusable %s databaseId', (_label, databaseId) => {
+    // #given — a binding with an existing database id
+    const binding = makeBinding({databaseId: 5})
+
+    // #when — the replacement id is unusable
+    const result = withOptionalDatabaseId(binding, databaseId)
+
+    // #then — the unusable id is not persisted
+    expect(result).not.toHaveProperty('databaseId')
+    expect(hasValidRepoBindingShape(result)).toBe(true)
   })
 })
 

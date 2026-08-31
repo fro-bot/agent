@@ -63,7 +63,7 @@ node dist/main.mjs backfill-deny-keys --help
 | `1` | Config or setup failure — cannot proceed (check logs for the missing var or adapter error) |
 | `2` | Partial failure — some bindings failed to resolve or write; inspect logs, re-run to retry |
 
-The command is idempotent: bindings that already carry a `databaseId` are skipped.
+The command is idempotent: a binding is skipped once it carries a usable deny key — a numeric `databaseId`, or a `nodeId` when the repository's id is not exactly representable and no numeric key is obtainable.
 
 **Stale-redaction window:** A repo redacted in `repos.yaml` after ingest may surface until the next denylist refresh (bounded by TTL + grace window). Long-lived operator streams re-check on each request. This is a documented accepted risk.
 

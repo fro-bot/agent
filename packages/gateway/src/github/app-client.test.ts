@@ -696,6 +696,40 @@ describe('createAppClient.getRepoIdentity', () => {
     expect(result.data.nodeId).toBe('R_zero-id')
   })
 
+  it('returns null for a zero bigint databaseId and preserves nodeId', async () => {
+    // #given — zero is not a valid GitHub repository id, including in bigint form
+    mockRequest
+      .mockResolvedValueOnce(INSTALLATION_RESPONSE)
+      .mockResolvedValueOnce({data: {id: 0n, node_id: 'R_zero-bigint-id'}})
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then — reject the numeric key and retain nodeId for matching
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.databaseId).toBeNull()
+    expect(result.data.nodeId).toBe('R_zero-bigint-id')
+  })
+
+  it('returns null for a negative bigint databaseId and preserves nodeId', async () => {
+    // #given — negative ids are not valid GitHub repository ids, including in bigint form
+    mockRequest
+      .mockResolvedValueOnce(INSTALLATION_RESPONSE)
+      .mockResolvedValueOnce({data: {id: -42n, node_id: 'R_negative-bigint-id'}})
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then — reject the numeric key and retain nodeId for matching
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.databaseId).toBeNull()
+    expect(result.data.nodeId).toBe('R_negative-bigint-id')
+  })
+
   it('preserves nodeId and returns ok with null databaseId for an unsafe bigint', async () => {
     // #given — an id that cannot be represented exactly as a JavaScript number
     const logger = makeLogger()

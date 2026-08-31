@@ -14,6 +14,7 @@ import {err, ok} from '@fro-bot/runtime'
 import {createAppAuth} from '@octokit/auth-app'
 import {Octokit} from '@octokit/core'
 
+import {isUsableRepositoryId} from '../shared/repository-id.js'
 import {isOctokitNotFound, safeErrorMessage} from './errors.js'
 
 // ---------------------------------------------------------------------------
@@ -400,14 +401,14 @@ function toSafeRepositoryId(id: number | bigint): number | null {
     if (id <= 0n) return null
 
     const numericId = Number(id)
-    if (Number.isSafeInteger(numericId) && BigInt(numericId) === id) {
+    if (isUsableRepositoryId(numericId) && BigInt(numericId) === id) {
       return numericId
     }
 
     return null
   }
 
-  if (Number.isSafeInteger(id) === false || id <= 0) {
+  if (isUsableRepositoryId(id) === false) {
     return null
   }
 

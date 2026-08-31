@@ -1,3 +1,5 @@
+import {isUsableRepositoryId} from '../shared/repository-id.js'
+
 export interface RepoBinding {
   readonly owner: string
   readonly repo: string
@@ -32,7 +34,7 @@ export function withOptionalDatabaseId(binding: RepoBinding, databaseId: number 
   const bindingWithoutDatabaseId = {...binding}
   delete bindingWithoutDatabaseId.databaseId
 
-  if (databaseId === null || databaseId === undefined) {
+  if (isUsableRepositoryId(databaseId) === false) {
     return bindingWithoutDatabaseId
   }
 

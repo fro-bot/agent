@@ -241,6 +241,26 @@ describe('readRepoDenylist — happy path', () => {
     expect(result.success).toBe(true)
     expect(result.success === true ? result.data.redactedDatabaseIds.has(1869154) : false).toBe(true)
   })
+
+  it('fails closed when a redacted entry has only an unrepresentable database_id', async () => {
+    // #given — the direct numeric deny key cannot be represented safely as a JavaScript integer
+    const yaml = makeYaml([
+      {
+        owner: '[REDACTED]',
+        name: '[REDACTED]',
+        private: true,
+        database_id: Number.MAX_SAFE_INTEGER + 1,
+        // no node_id — the unrepresentable id is the entry's only deny key
+      },
+    ])
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — the entire denylist load fails closed
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+  })
 })
 
 // ---------------------------------------------------------------------------
