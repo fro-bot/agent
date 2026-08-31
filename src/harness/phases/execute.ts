@@ -234,6 +234,7 @@ export async function runExecute(
     responseMode: bootstrap.inputs.responseMode,
     responseDelivery: bootstrap.delivery,
     responseFilePath: bootstrap.responseFilePath,
+    responseSurface: resolveResponseSurface(routing.agentContext, routing.triggerResult.context),
   }
 
   const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'
@@ -309,7 +310,7 @@ export async function runExecute(
     const credentialProvisioned = executionConfig.credentialProvisioned === true
     const responseFileStatus = await inspectResponseFile(
       bootstrap.responseFilePath,
-      resolveResponseSurface(routing.agentContext, routing.triggerResult.context),
+      promptOptions.responseSurface,
       execLogger,
     )
     // Provisioned credentials can hide completed external writes; only a non-provisioned run without a valid response may be replayed.

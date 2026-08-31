@@ -14,7 +14,7 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
-import {inspectResponseFile, resolveResponseSurface} from './response-file.js'
+import {inspectResponseFile} from './response-file.js'
 import {
   createExecutionDeadline,
   MAX_LLM_RETRIES,
@@ -242,7 +242,7 @@ export async function executeOpenCode(
 
       const responseFileStatus = await inspectResponseFile(
         promptOptions.responseFilePath,
-        resolveResponseSurface(promptOptions.context, promptOptions.triggerContext),
+        promptOptions.responseSurface,
         logger,
       )
       if (responseFileStatus !== 'absent') break

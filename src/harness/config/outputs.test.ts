@@ -22,6 +22,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: 'ses_abc123',
+      deliveryKind: 'comment',
       resolvedOutputMode: 'working-dir',
       brokeredPushAllowlist: {
         defaultPaths: ['src/'],
@@ -34,9 +35,10 @@ describe('setActionOutputs', () => {
 
     setActionOutputs(outputs)
 
-    expect(mockSetOutput).toHaveBeenCalledTimes(5)
+    expect(mockSetOutput).toHaveBeenCalledTimes(6)
     expect(mockSetOutput).toHaveBeenCalledWith('session-id', 'ses_abc123')
     expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', 'working-dir')
+    expect(mockSetOutput).toHaveBeenCalledWith('delivery-kind', 'comment')
     expect(mockSetOutput).toHaveBeenCalledWith(
       'brokered-push-allowlist',
       JSON.stringify({defaultPaths: ['src/'], rootFiles: ['README.md'], extraPrefixes: []}),
@@ -49,6 +51,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: null,
+      deliveryKind: 'none',
       resolvedOutputMode: null,
       cacheStatus: 'miss',
       duration: 500,
@@ -58,6 +61,7 @@ describe('setActionOutputs', () => {
 
     expect(mockSetOutput).toHaveBeenCalledWith('session-id', '')
     expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', '')
+    expect(mockSetOutput).toHaveBeenCalledWith('delivery-kind', 'none')
     expect(mockSetOutput).toHaveBeenCalledWith('brokered-push-allowlist', '')
     expect(mockSetOutput).toHaveBeenCalledWith('cache-status', 'miss')
     expect(mockSetOutput).toHaveBeenCalledWith('duration', 500)
@@ -67,6 +71,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: 'ses_xyz789',
+      deliveryKind: 'none',
       resolvedOutputMode: 'branch-pr',
       cacheStatus: 'corrupted',
       duration: 2000,
@@ -81,6 +86,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: null,
+      deliveryKind: 'none',
       resolvedOutputMode: null,
       cacheStatus: 'miss',
       duration: 0,
@@ -95,6 +101,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: 'ses_output_mode',
+      deliveryKind: 'none',
       resolvedOutputMode: 'branch-pr',
       cacheStatus: 'hit',
       duration: 42,
@@ -109,6 +116,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: 'ses_output_mode',
+      deliveryKind: 'none',
       resolvedOutputMode: null,
       cacheStatus: 'hit',
       duration: 42,
@@ -127,6 +135,7 @@ describe('setActionOutputs', () => {
     }
     const outputs: ActionOutputs = {
       sessionId: 'ses_output_mode_migration',
+      deliveryKind: 'none',
       resolvedOutputMode: 'working-dir',
       outputModeMigration,
       cacheStatus: 'hit',
@@ -146,6 +155,7 @@ describe('setActionOutputs', () => {
     }
     const outputs: ActionOutputs = {
       sessionId: null,
+      deliveryKind: 'none',
       resolvedOutputMode: null,
       outputModeMigration,
       cacheStatus: 'miss',

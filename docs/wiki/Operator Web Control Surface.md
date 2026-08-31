@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-07-12"
-updated-by: "schedule-d7190410-29208059688"
+last-updated: "2026-08-30"
+updated-by: "schedule-d7190410-33338713321"
 sources:
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/web/operator-route.ts
@@ -9,6 +9,8 @@ sources:
   - packages/gateway/src/web/operator/launch-route.ts
   - packages/gateway/src/web/operator/runs-route.ts
   - packages/gateway/src/web/operator/cancel-route.ts
+  - packages/gateway/src/web/operator/dispatch-route.ts
+  - packages/gateway/src/github/dispatch.ts
   - packages/gateway/src/web/operator/repos-route.ts
   - packages/gateway/src/web/operator/pending-approvals-route.ts
   - packages/gateway/src/web/operator/decision-route.ts
@@ -53,7 +55,7 @@ sources:
   - packages/gateway/src/operator-contract/repo-summary.ts
   - packages/gateway/src/operator-contract/version.ts
   - docs/decisions/2026-06-19-s2-operator-auth-authority.md
-summary: "Authenticated browser surface that lets operators launch, observe, and approve gateway agent runs over HTTP and SSE"
+summary: "Authenticated browser surface that lets operators launch, dispatch, observe, and approve gateway agent runs over HTTP and SSE"
 ---
 
 # Operator Web Control Surface
@@ -122,6 +124,16 @@ The browser guard validates Fetch Metadata headers and an HMAC-signed CSRF token
 The idempotency guard (`web/operator/idempotency.ts`) namespaces its key by the operator's numeric ID (`{githubUserId}:{clientKey}`), so one operator can never suppress another's launch. It uses a two-phase reserve-then-commit lifecycle: the key is reserved before `launchWork` is called and committed only on success, so a concurrent duplicate during the reservation window is recognized as in-flight rather than launching the work twice. On rejection the reservation is rolled back so no dead `runId` is echoed.
 
 Admission itself goes through the gateway's single `launchWork` gate (see [[Execution Lifecycle]] for how that same admission path now records queued and failed runs).
+
+## Dispatching a GitHub Action Run
+
+Launching is not the only way to start work from the browser. `POST /operator/dispatch` (`web/operator/dispatch-route.ts`) triggers the Fro Bot **GitHub Action** in the target repository rather than a gateway-hosted run — the same capability the Discord `/dispatch` command exposes, projected onto the web surface.
+
+The route deliberately owns nothing but the operator gate stack and the response projection; all GitHub authentication and workflow-dispatch behavior lives in the injected, transport-neutral `DispatchWorkflow` (`github/dispatch.ts`), which Discord and the web share unchanged. Its gate ordering mirrors the launch route — browser guard, operator-keyed rate limit (deliberately tighter here: three per minute, ten per hour), session token resolution, body validation, server-owned binding resolution, denylist check _before_ authorization, and finally a per-operator idempotency reservation so a retried POST dispatches once. Unlike listing or observing a run, dispatching requires **write-level** repository authorization.
+
+The response shape is the notable design decision. Dispatch has many ways to not-happen that are not server errors — the GitHub App is not installed, it lacks the Actions permission, it is missing other permissions, the repository or workflow cannot be found, the task text is invalid, or GitHub rejects the dispatch. All nine `DispatchOutcome` variants are returned as `200 {outcome}` rather than mapped onto HTTP status codes, so a browser client branches on one discriminated union instead of guessing intent from a status. Several of those variants carry an installation URL to make the failure actionable.
+
+The audit boundary is drawn tightly around that: an audit event records the outcome discriminant, the repository key, and an optional run ID — never the task text and never the install URL — and no audit event fires at all on a denylist denial, so the audit log itself cannot become a repository-existence oracle. Correlation identifiers are minted per request and are never the session ID.
 
 ## Listing Runs
 

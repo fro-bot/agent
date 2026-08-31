@@ -73,6 +73,7 @@ vi.mock('./phases/execute.js', () => ({
 
 vi.mock('./phases/finalize.js', () => ({
   runFinalize: vi.fn(),
+  runFinalizeWithResult: vi.fn().mockResolvedValue({exitCode: 0, deliveryKind: 'none'}),
 }))
 
 vi.mock('./phases/routing.js', () => ({
@@ -189,6 +190,7 @@ describe('run', () => {
       sessionId: null,
       resolvedOutputMode: null,
       outputModeMigration: unavailableOutputModeMigration,
+      deliveryKind: 'none',
       cacheStatus: 'miss',
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       duration: expect.any(Number),
@@ -208,6 +210,7 @@ describe('run', () => {
       sessionId: null,
       resolvedOutputMode: null,
       outputModeMigration: unavailableOutputModeMigration,
+      deliveryKind: 'none',
       cacheStatus: 'miss',
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       duration: expect.any(Number),
@@ -246,6 +249,7 @@ describe('run', () => {
       sessionId: null,
       resolvedOutputMode: null,
       outputModeMigration: unavailableOutputModeMigration,
+      deliveryKind: 'none',
       cacheStatus: 'miss',
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       duration: expect.any(Number),

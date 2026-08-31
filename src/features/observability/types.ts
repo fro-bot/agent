@@ -1,4 +1,4 @@
-import type {ClassificationPath} from '@fro-bot/runtime'
+import type {ClassificationPath, ResponseDeliveryKind} from '@fro-bot/runtime'
 import type {ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 
 export interface ErrorRecord {
@@ -35,4 +35,5 @@ export interface CommentSummaryOptions {
   readonly metrics: RunMetrics
   readonly agent: string
   readonly resolvedOutputMode: ResolvedOutputMode | null
+  readonly deliveryKind: ResponseDeliveryKind
 }

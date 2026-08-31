@@ -11,7 +11,26 @@ import {err, ok} from '../shared/types.js'
  */
 export const MAX_BODY_BYTES = 65_536
 
-export type ResponseSurface = 'issue-comment' | 'pr-comment' | 'pr-review'
+export type ResponseSurface = 'issue-comment' | 'pr-comment' | 'pr-review' | 'pr-review-permitted'
+
+export interface ResponseSurfacePolicy {
+  readonly target: 'issue' | 'pr'
+  readonly verdictRequired: boolean
+  readonly verdictPermitted: boolean
+  readonly reviewCapable: boolean
+}
+
+/**
+ * The complete policy for each response surface. Keeping this table total
+ * makes adding a surface a compile-time change rather than a silent fallback
+ * through one of the consumers.
+ */
+export const RESPONSE_SURFACE_POLICIES = {
+  'issue-comment': {target: 'issue', verdictRequired: false, verdictPermitted: false, reviewCapable: false},
+  'pr-comment': {target: 'pr', verdictRequired: false, verdictPermitted: false, reviewCapable: false},
+  'pr-review': {target: 'pr', verdictRequired: true, verdictPermitted: true, reviewCapable: true},
+  'pr-review-permitted': {target: 'pr', verdictRequired: false, verdictPermitted: true, reviewCapable: true},
+} as const satisfies Record<ResponseSurface, ResponseSurfacePolicy>
 
 /**
  * The frontmatter key that carries a PR review verdict. Exported so prompt
@@ -48,6 +67,22 @@ export type ResponseFileErrorReason =
   | 'missing-verdict-value'
   | 'unknown-verdict'
   | 'body-too-large'
+
+/**
+ * Classifies every response-file parse error so adding a new reason requires
+ * an explicit recovery decision at compile time. Only malformed verdicts are
+ * recoverable on verdict-optional review surfaces; verdict-on-non-review has
+ * a separate re-validation path in response-post.
+ */
+export const RESPONSE_FILE_VERDICT_REJECTION_REASONS = {
+  empty: false,
+  'malformed-frontmatter': false,
+  'unknown-key': false,
+  'verdict-on-non-review': false,
+  'missing-verdict-value': true,
+  'unknown-verdict': true,
+  'body-too-large': false,
+} as const satisfies Record<ResponseFileErrorReason, boolean>
 
 export interface ResponseFileError extends Error {
   readonly code: 'RESPONSE_FILE_ERROR'
@@ -299,11 +334,11 @@ export function parseResponseFile(
     return ok({body: trimmedBody})
   }
 
-  if (options.surface !== 'pr-review') {
+  if (RESPONSE_SURFACE_POLICIES[options.surface].verdictPermitted === false) {
     return err(
       createResponseFileError(
         'verdict-on-non-review',
-        `"verdict" is only valid for surface "pr-review", got "${options.surface}"`,
+        `"verdict" is only valid for review-capable surfaces, got "${options.surface}"`,
       ),
     )
   }

@@ -6,6 +6,7 @@ import {
   buildResponseFilePathCandidates,
   MAX_BODY_BYTES,
   parseResponseFile,
+  RESPONSE_FILE_VERDICT_REJECTION_REASONS,
 } from './response-file.js'
 
 describe('buildResponseFileDir', () => {
@@ -192,6 +193,28 @@ describe('parseResponseFile', () => {
     expect(result).toEqual({success: true, data: {body: 'Please fix the tests', verdict: 'request-changes'}})
   })
 
+  it('parses a verdict with body for pr-review-permitted', () => {
+    // #given
+    const raw = '---\nverdict: approve\n---\nLooks good to me'
+
+    // #when
+    const result = parseResponseFile(raw, {surface: 'pr-review-permitted'})
+
+    // #then
+    expect(result).toEqual({success: true, data: {body: 'Looks good to me', verdict: 'approve'}})
+  })
+
+  it('accepts a missing verdict for pr-review-permitted', () => {
+    // #given
+    const raw = 'A question about this pull request'
+
+    // #when
+    const result = parseResponseFile(raw, {surface: 'pr-review-permitted'})
+
+    // #then
+    expect(result).toEqual({success: true, data: {body: 'A question about this pull request'}})
+  })
+
   it('rejects frontmatter carrying a "number" key as unknown-key', () => {
     // #given
     const raw = '---\nnumber: 999\nverdict: approve\n---\nBody'
@@ -293,15 +316,19 @@ describe('parseResponseFile', () => {
     expect(result).toEqual({success: true, data: {body: raw}})
   })
 
-  it('rejects verdict on a non-review surface', () => {
+  it.each(['issue-comment', 'pr-comment'] as const)('rejects verdict on the %s comment surface', surface => {
     // #given
     const raw = '---\nverdict: approve\n---\nBody'
 
     // #when
-    const result = parseResponseFile(raw, {surface: 'issue-comment'})
+    const result = parseResponseFile(raw, {surface})
 
     // #then
-    expect(result.success === false ? result.error.reason : undefined).toBe('verdict-on-non-review')
+    expect(result.success === false ? result.error : undefined).toMatchObject({
+      code: 'RESPONSE_FILE_ERROR',
+      reason: 'verdict-on-non-review',
+      message: `"verdict" is only valid for review-capable surfaces, got "${surface}"`,
+    })
   })
 
   it('rejects an unknown verdict value on pr-review', () => {
@@ -364,5 +391,19 @@ describe('parseResponseFile', () => {
 
     // #then
     expect(result.success === true ? result.data : undefined).toEqual({body: 'Body', verdict: 'approve'})
+  })
+})
+
+describe('RESPONSE_FILE_VERDICT_REJECTION_REASONS', () => {
+  it('contains exactly the verdict rejection reasons', () => {
+    // #given the exhaustively classified response-file error reasons
+    // #when selecting the reasons classified as verdict rejection
+    const reasons = Object.entries(RESPONSE_FILE_VERDICT_REJECTION_REASONS)
+      .filter(([, isVerdictRejection]) => isVerdictRejection)
+      .map(([reason]) => reason)
+      .sort()
+
+    // #then only malformed verdict values are recoverable on verdict-optional surfaces
+    expect(reasons).toEqual(['missing-verdict-value', 'unknown-verdict'])
   })
 })

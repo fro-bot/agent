@@ -77,7 +77,7 @@ These are CI-enforced constraints. Violating any of them breaks the build or the
 2. **Committed `dist/` must stay in sync.** CI runs `bun run build` and fails if `git diff dist/` shows changes. The pre-push hook enforces the same check locally. Never edit `dist/` by hand.
 3. **Strict booleans.** No implicit falsy checks (`!value`). Use explicit comparisons (`=== null`, `=== undefined`, `.length === 0`). Enforced by ESLint.
 4. **Functions only — no classes for stateful patterns.** Closures, not ES6 classes, carry state across the codebase (the only classes are a handful of `Error` subclasses in the gateway). Enforced by convention and code review.
-5. **Exactly one comment or review per invocation (Response Protocol).** Exactly one GitHub comment or PR review is delivered per Action run. For `pull_request`/`issue_comment`/`issues` triggers this is **action-enforced**: the model writes its response to a run-scoped file and the harness posts it once via the Octokit writers, binding the target and surface to the trusted event. For `workflow_dispatch`/`schedule` the model still self-posts via `gh`, and the one-response rule remains prompt-enforced in `buildHarnessRulesSection()`.
+5. **Exactly one comment or review per invocation (Response Protocol).** Exactly one GitHub comment or PR review is delivered per Action run. For `pull_request`/`issue_comment`/`issues` triggers this is **action-enforced**: the model writes its response to a run-scoped file and the harness posts it once via the Octokit writers, binding the target and surface to the trusted event. For `workflow_dispatch`/`schedule` the model still self-posts via `gh`, and the one-response rule remains prompt-enforced in `buildHarnessRulesSection()`. The Action's response surface is derived from trusted routing context: `pull_request` is review-required; an authorized `issue_comment` mention on a pull request is review-permitted (a verdict submits a real review, while omitting it posts a comment); all other response-file-triggered paths are comment-only. The response file cannot select its own target or surface.
 6. **`NormalizedEvent` is never bypassed.** All webhook payloads must pass through `normalizeEvent()` before routing. The router never reads `context.payload` directly. Raw event access is an anti-pattern caught in code review.
 7. **No type suppression.** `as any`, `@ts-ignore`, and `@ts-expect-error` are forbidden project-wide.
 8. **Redaction-before-query (gateway operator surface).** On operator-web routes, the denylist check runs after the server-owned binding lookup (the predicate consumes the binding's deny keys) and before any authorization check, run-state read, or GitHub API call. A repo redacted in `metadata/repos.yaml` is never queried and never reaches the audit stream. Cold-start failure → deny all (fail-closed). Discord surfaces do not currently consult the denylist post-binding.
@@ -130,6 +130,7 @@ main.ts
 
         ├─→ finalize phase
         │     set outputs → writeJobSummary → enforce/deliver response contract
+        │       (review-required, review-permitted, or comment-only from trusted routing context)
         │
         └─→ cleanup phase
               prune sessions → shutdown server → sync artifacts and metadata
