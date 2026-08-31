@@ -1,11 +1,14 @@
+import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
+import * as core from '@actions/core'
 import {createS3Adapter, syncSessionsToStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildSaveCacheKey} from './cache-key.js'
-import {buildSaveCachePaths, DB_FAMILY_BASENAMES, deleteAuthJson} from './paths.js'
+import {checkpointDatabase} from './checkpoint.js'
+import {buildSaveCachePaths, DB_FAMILY_BASENAMES, DB_MAIN_BASENAME, DB_WAL_BASENAME, deleteAuthJson} from './paths.js'
 import {defaultCacheAdapter, type SaveCacheOptions} from './types.js'
 
 async function writeStorageVersion(storagePath: string): Promise<void> {
@@ -65,6 +68,29 @@ async function hasCacheableContent(storagePath: string, cachePaths: readonly str
   return false
 }
 
+/**
+ * A declined save must be loud: a silent skip here reproduces the read-only-token
+ * incident, where a discarded signal hid lost session continuity for a month. This
+ * writes directly via `core.summary` (the same primitive `writeJobSummary` and the
+ * dedup-skip summary use) because `saveCache` runs in both the cleanup and post-hook
+ * paths, neither of which carries the full `RunMetrics` that `writeJobSummary` expects.
+ * Non-blocking: logs a warning on failure but never throws.
+ */
+async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Promise<void> {
+  try {
+    core.summary
+      .addHeading('Fro Bot Agent Run — Cache Save Declined', 2)
+      .addRaw(
+        'Session cache was not saved this run because the SQLite write-ahead log could not be checkpointed.\n\n' +
+          `**Reason:** ${reason}\n\n` +
+          '> The next run may restore an older session and pay recovery cost for any previously uncheckpointed state.\n',
+      )
+    await core.summary.write()
+  } catch (error) {
+    logger.warning('Failed to write cache-save-declined summary', {error: toErrorMessage(error)})
+  }
+}
+
 export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   const {
     components,
@@ -89,6 +115,21 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
 
   try {
     await deleteAuthJson(authPath, storagePath, logger)
+
+    // Checkpoint before anything inspects file sizes or transports bytes: this moves
+    // data out of the write-ahead log into the main database file, which changes which
+    // files are non-empty for both hasCacheableContent below and the S3 sync at :97.
+    const dbDir = path.dirname(storagePath)
+    const dbPath = path.join(dbDir, DB_MAIN_BASENAME)
+    const walPath = path.join(dbDir, DB_WAL_BASENAME)
+    const checkpointOutcome = await checkpointDatabase({dbPath, walPath, logger})
+    if (checkpointOutcome.status === 'failed') {
+      logger.warning('Declining cache save: SQLite checkpoint did not complete', {
+        reason: checkpointOutcome.reason,
+      })
+      await writeCheckpointDeclineSummary(checkpointOutcome.reason, logger)
+      return false
+    }
 
     const hasContent = await hasCacheableContent(storagePath, cachePaths)
     if (hasContent === false) {

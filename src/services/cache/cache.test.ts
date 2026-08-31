@@ -1,9 +1,11 @@
 import type {ObjectStoreAdapter, ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {CacheKeyComponents} from './cache-key.js'
+import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import {DatabaseSync} from 'node:sqlite'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {ok} from '../../shared/types.js'
 import {
@@ -870,10 +872,18 @@ describe('saveCache', () => {
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
 
+    // A real hot-WAL database, deliberately left open rather than cleanly closed —
+    // saveCache now checkpoints before building the upload set, so this must be real
+    // SQLite for that checkpoint to succeed rather than decline the save.
     const dbDir = path.dirname(storagePath)
-    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'main db')
-    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal data')
-    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm data')
+    const db = new DatabaseSync(path.join(dbDir, 'opencode.db'))
+    db.exec('PRAGMA journal_mode=WAL')
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    // A page-aligned, zero-filled placeholder, not arbitrary text: a wrong-sized -shm
+    // file segfaults node:sqlite (SIGBUS via mmap past EOF) the instant a database next
+    // to it is opened — verified on both Node 24 and Bun.
+    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), Buffer.alloc(32768))
 
     const upload = vi.fn(async () => ok(undefined))
     const saveCacheSpy = vi.fn(async () => 1)
@@ -897,6 +907,8 @@ describe('saveCache', () => {
     expect(upload).toHaveBeenCalledTimes(2)
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
     expect(upload.mock.invocationCallOrder[0]).toBeLessThan(saveCacheSpy.mock.invocationCallOrder[0] ?? 0)
+
+    db.close()
   })
 
   it('writes to cache only when object store is not configured', async () => {
@@ -1329,14 +1341,22 @@ describe('saveCache', () => {
   })
 
   it('includes SQLite WAL but excludes SHM even when both exist', async () => {
-    // #given storage with content, a SQLite db, WAL, and SHM files
+    // #given storage with content, a real hot-WAL SQLite db, and an SHM file
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
 
+    // A real hot-WAL database, deliberately left open rather than cleanly closed —
+    // saveCache now checkpoints before building the upload set, so this must be real
+    // SQLite for that checkpoint to succeed rather than decline the save.
     const dbDir = path.dirname(storagePath)
-    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'main db')
-    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal data')
-    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm data')
+    const db = new DatabaseSync(path.join(dbDir, 'opencode.db'))
+    db.exec('PRAGMA journal_mode=WAL')
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    // A page-aligned, zero-filled placeholder, not arbitrary text: a wrong-sized -shm
+    // file segfaults node:sqlite (SIGBUS via mmap past EOF) the instant a database next
+    // to it is opened — verified on both Node 24 and Bun.
+    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), Buffer.alloc(32768))
 
     let capturedPaths: string[] = []
     const adapter: CacheAdapter = {
@@ -1363,6 +1383,8 @@ describe('saveCache', () => {
     expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db'))
     expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-wal'))
     expect(capturedPaths).not.toContain(path.join(dbDir, 'opencode.db-shm'))
+
+    db.close()
   })
 
   it('omits WAL and SHM files when they do not exist', async () => {

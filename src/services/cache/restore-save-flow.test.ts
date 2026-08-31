@@ -5,9 +5,22 @@ import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import {DatabaseSync} from 'node:sqlite'
+import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {err, ok} from '../../shared/types.js'
 import {restoreCache, saveCache, type CacheAdapter, type RestoreCacheOptions, type SaveCacheOptions} from './index.js'
+
+// The checkpoint decline path writes a job summary via core.summary. None of these tests
+// depend on real @actions/core behavior otherwise (logging uses the local test logger
+// stub, and object-store calls use the in-memory adapter below), so mocking it here is safe.
+vi.mock('@actions/core', () => ({
+  summary: {
+    addHeading: vi.fn().mockReturnThis(),
+    addRaw: vi.fn().mockReturnThis(),
+    write: vi.fn().mockResolvedValue(undefined),
+  },
+}))
 
 const testComponents: CacheKeyComponents = {
   agentIdentity: 'github',
@@ -334,9 +347,21 @@ describe('restore/save object-store integration flow', () => {
 
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(sessionFilePath, '{"session":"created"}', 'utf8')
-    await fs.writeFile(dbPath, 'db-data')
-    await fs.writeFile(`${dbPath}-wal`, 'wal-data')
-    await fs.writeFile(`${dbPath}-shm`, 'shm-data')
+
+    // A real hot-WAL database, deliberately left open rather than cleanly closed —
+    // mirrors server.close() sending proc.kill() without awaiting a checkpoint. saveCache
+    // now checkpoints before building the upload set, so this must be real SQLite for
+    // that checkpoint to succeed rather than decline the save.
+    const db = new DatabaseSync(dbPath)
+    db.exec('PRAGMA journal_mode=WAL')
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    // A page-aligned, zero-filled placeholder — NOT arbitrary text. A wrong-sized -shm
+    // file causes node:sqlite to segfault (SIGBUS via mmap past EOF) the instant a
+    // database next to it is opened, verified on both Node 24 and Bun. This exact size
+    // is what a real SQLite-managed -shm looks like, so it exercises exclusion without
+    // crashing the checkpoint this save now performs.
+    await fs.writeFile(`${dbPath}-shm`, Buffer.alloc(32768))
 
     const saveOptions: SaveCacheOptions = {
       components: testComponents,
@@ -350,7 +375,7 @@ describe('restore/save object-store integration flow', () => {
       storeAdapter: store.adapter,
     }
 
-    // #given a db, wal, and shm all present locally
+    // #given a hot-WAL db, its write-ahead log, and a shm sidecar all present locally
 
     // #when saving cache
     const saveResult = await saveCache(saveOptions)
@@ -361,6 +386,8 @@ describe('restore/save object-store integration flow', () => {
     expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-wal')).toBe(true)
     expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-shm')).toBe(false)
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath, `${dbPath}-wal`], expect.any(String))
+
+    db.close()
   })
 
   it('deletes a stale opencode.db-shm restored from the object store before returning a hit', async () => {
@@ -393,5 +420,58 @@ describe('restore/save object-store integration flow', () => {
     expect(restoreResult).toMatchObject({hit: true, source: 'storage'})
     expect(await fs.readFile(dbPath, 'utf8')).toBe('object-store-db')
     await expect(fs.access(`${dbPath}-shm`)).rejects.toThrow()
+  })
+
+  it('declines the save when the checkpoint cannot complete, and surfaces the reason in the log and job summary', async () => {
+    const cache = createMockCacheAdapter(undefined)
+    const store = createInMemoryStoreAdapter()
+
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(sessionFilePath, '{"session":"created"}', 'utf8')
+
+    // A database held under an exclusive lock by an in-progress transaction on another
+    // connection — the harness's only signal that a writer is still alive, since
+    // serverHandle.shutdown() cannot observe the child process's exit.
+    const holder = new DatabaseSync(dbPath)
+    holder.exec('PRAGMA journal_mode=WAL')
+    holder.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    holder.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    holder.exec('PRAGMA locking_mode=EXCLUSIVE')
+    holder.exec('BEGIN IMMEDIATE')
+    holder.exec("INSERT INTO sessions (data) VALUES ('in-flight')")
+
+    const warningSpy = vi.fn<Logger['warning']>()
+    const logger: Logger = {...createTestLogger(), warning: warningSpy}
+
+    const saveOptions: SaveCacheOptions = {
+      components: testComponents,
+      runId: 707,
+      logger,
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: cache.adapter,
+      storeConfig: testStoreConfig,
+      storeAdapter: store.adapter,
+    }
+
+    // #given a database the checkpoint cannot merge because another connection holds it locked
+
+    // #when saving cache
+    const saveResult = await saveCache(saveOptions)
+
+    // #then the save is declined, the reason is logged, the cache adapter is never invoked,
+    // and the decline is surfaced via the job summary
+    expect(saveResult).toBe(false)
+    expect(cache.saveCache).not.toHaveBeenCalled()
+    expect(warningSpy).toHaveBeenCalledWith(
+      'Declining cache save: SQLite checkpoint did not complete',
+      expect.objectContaining({reason: expect.any(String) as unknown as string}),
+    )
+    expect(core.summary.addHeading).toHaveBeenCalledWith('Fro Bot Agent Run — Cache Save Declined', 2)
+    expect(core.summary.write).toHaveBeenCalled()
+
+    holder.exec('COMMIT')
+    holder.close()
   })
 })

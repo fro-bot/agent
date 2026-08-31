@@ -106,10 +106,10 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     }
 
     // Shut down the OpenCode server BEFORE saving the cache.
-    // A clean shutdown triggers a SQLite WAL checkpoint, merging all
-    // session data written during this run into the main database file.
-    // Without this, sessions in the WAL are lost when only the .db file
-    // is restored from cache on the next run.
+    // Shutdown does NOT trigger a SQLite WAL checkpoint: it sends the child a kill
+    // signal and returns without awaiting its exit or merging the write-ahead log
+    // into the main database file (see save.ts's checkpointDatabase call, which runs
+    // inside saveCache below and is what actually performs that merge before save).
     if (serverHandle != null) {
       try {
         serverHandle.shutdown()

@@ -1,5 +1,7 @@
 export {buildCacheKeyComponents, buildPrimaryCacheKey, buildRestoreKeys, buildSaveCacheKey} from './cache-key.js'
 export type {CacheKeyComponents} from './cache-key.js'
+export {checkpointDatabase} from './checkpoint.js'
+export type {CheckpointOptions, CheckpointOutcome} from './checkpoint.js'
 export {isAuthPathSafe, isPathInsideDirectory, restoreCache} from './restore.js'
 export {saveCache} from './save.js'
 export {defaultCacheAdapter} from './types.js'
