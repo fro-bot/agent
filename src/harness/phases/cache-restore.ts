@@ -5,7 +5,8 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
 import {bootstrapOpenCodeServer} from '../../features/agent/index.js'
-import {buildCacheKeyComponents, restoreCache} from '../../services/cache/index.js'
+import {buildCacheKeyComponents, checkpointDatabase, restoreCache} from '../../services/cache/index.js'
+import {DB_MAIN_BASENAME, DB_WAL_BASENAME} from '../../services/cache/paths.js'
 import {ensureProjectId} from '../../services/setup/project-id.js'
 import {getGitHubWorkspace, getOpenCodeAuthPath, getOpenCodeStoragePath} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
@@ -26,10 +27,12 @@ export async function runCacheRestore(
   const workspacePath = getGitHubWorkspace()
   const projectIdPath = path.join(workspacePath, '.git', 'opencode')
 
+  const storagePath = getOpenCodeStoragePath()
+
   const cacheResult = await restoreCache({
     components: cacheComponents,
     logger: cacheLogger,
-    storagePath: getOpenCodeStoragePath(),
+    storagePath,
     authPath: getOpenCodeAuthPath(),
     projectIdPath,
     opencodeVersion: bootstrap.opencodeResult.version,
@@ -50,6 +53,28 @@ export async function runCacheRestore(
     cacheLogger.warning('Failed to generate project ID (continuing)', {error: projectIdResult.error})
   } else {
     cacheLogger.debug('Project ID ready', {projectId: projectIdResult.projectId, source: projectIdResult.source})
+  }
+
+  // Repair a restored database before the server ever opens it. Restore keys are
+  // prefixes returning the most recent entry, and save keys are unique per run, so a run
+  // that declines to save leaves a poisoned entry as the newest one for the next restore
+  // to hit again. Checkpointing here — outside the bootstrap budget that only times
+  // createOpencode — heals a stuck repository in place instead of discarding its history.
+  // Only a 'hit' has a restored database to repair: a miss has nothing on disk yet, and a
+  // 'corrupted' result already had its DB family deleted by cleanStorage.
+  if (cacheStatus === 'hit') {
+    const dbDir = path.dirname(storagePath)
+    const repairOutcome = await checkpointDatabase({
+      dbPath: path.join(dbDir, DB_MAIN_BASENAME),
+      walPath: path.join(dbDir, DB_WAL_BASENAME),
+      logger: cacheLogger,
+    })
+    if (repairOutcome.status === 'checkpointed') {
+      cacheLogger.info('Repaired restored database: checkpointed write-ahead log before bootstrap')
+    } else if (repairOutcome.status === 'failed') {
+      cacheLogger.warning('Failed to repair restored database before bootstrap', {reason: repairOutcome.reason})
+    }
+    // 'nothing-to-checkpoint' is the common healthy-run case and is deliberately silent.
   }
 
   const serverLogger = createLogger({phase: 'server-bootstrap'})
