@@ -2270,7 +2270,7 @@ describe('output contract', () => {
     expect(contractIndex).toBeLessThan(agentContextIndex)
   })
 
-  it('includes surface-independent output context for non-PR triggers', () => {
+  it('omits the output contract section for non-PR triggers', () => {
     // #given
     const context = createMockContext({eventName: 'issue_comment'})
     const triggerContext = createMockTriggerContext({eventType: 'issue_comment'})
@@ -2287,10 +2287,8 @@ describe('output contract', () => {
     const prompt = result.text
 
     // #then
-    expect(prompt).toContain('<output_contract>')
-    expect(prompt).toContain('## Output Contract')
-    expect(prompt).toContain('- Requested reviewer: no')
-    expect(prompt).not.toContain('Review action')
+    expect(prompt).not.toContain('<output_contract>')
+    expect(prompt).not.toContain('## Output Contract')
   })
 })
 

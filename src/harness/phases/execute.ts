@@ -310,7 +310,7 @@ export async function runExecute(
     const credentialProvisioned = executionConfig.credentialProvisioned === true
     const responseFileStatus = await inspectResponseFile(
       bootstrap.responseFilePath,
-      resolveResponseSurface(routing.agentContext, routing.triggerResult.context),
+      promptOptions.responseSurface,
       execLogger,
     )
     // Provisioned credentials can hide completed external writes; only a non-provisioned run without a valid response may be replayed.

@@ -235,7 +235,8 @@ export async function readAndParseResponseFile(
   if (
     parsed.success === false &&
     (parsed.error.reason === 'verdict-on-non-review' ||
-      (RESPONSE_SURFACE_POLICIES[surface].verdictRequired === false && parsed.error.reason === 'unknown-verdict'))
+      (RESPONSE_SURFACE_POLICIES[surface].verdictRequired === false &&
+        (parsed.error.reason === 'unknown-verdict' || parsed.error.reason === 'missing-verdict-value')))
   ) {
     // Keep parseResponseFile strict for its other callers, but recover the
     // already-validated prose for delivery rather than discarding the turn.
@@ -245,8 +246,9 @@ export async function readAndParseResponseFile(
     //    surface. Re-parse the file unchanged against the review surface, which
     //    RE-VALIDATES the verdict — a malformed one still fails here rather
     //    than being waved through.
-    //  - unknown-verdict on a verdict-optional surface: the verdict is already
-    //    known bad, so strip the frontmatter and parse the remaining prose.
+    //  - a verdict the parser cannot accept on a verdict-optional surface: the
+    //    verdict is already known bad, so strip the frontmatter and parse the
+    //    remaining prose.
     const isStrayVerdict = parsed.error.reason === 'verdict-on-non-review'
     const recoverableRaw = isStrayVerdict ? raw : bodyWithoutFrontmatter(raw)
     const recoverable =
@@ -254,7 +256,7 @@ export async function readAndParseResponseFile(
         ? null
         : parseResponseFile(recoverableRaw, {surface: isStrayVerdict ? 'pr-review' : surface})
     if (recoverable != null && recoverable.success) {
-      if (parsed.error.reason === 'unknown-verdict') {
+      if (isStrayVerdict === false) {
         logger.warning('Response-post: invalid verdict on permitted surface; posting response body as a comment', {
           surface,
           reason: parsed.error.reason,

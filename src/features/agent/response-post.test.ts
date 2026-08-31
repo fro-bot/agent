@@ -1351,6 +1351,64 @@ describe('runResponsePost', () => {
     expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
   })
 
+  it('degrades an empty verdict on the permitted review surface to a comment', async () => {
+    // #given a permitted-surface response with an empty verdict value
+    const filePath = await writeFixture('---\nverdict:\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post for an issue_comment on a PR
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the unparseable verdict is not accepted, but its prose is delivered as a comment
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({body: expect.stringContaining('LGTM.') as unknown as string}),
+    )
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Response-post: invalid verdict on permitted surface; posting response body as a comment',
+      {surface: 'pr-review-permitted', reason: 'missing-verdict-value'},
+    )
+  })
+
+  it('fails closed for an empty verdict on the required review surface', async () => {
+    // #given a required review response with an empty verdict value
+    const filePath = await writeFixture('---\nverdict:\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post for a pull_request trigger
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the malformed verdict remains a parse failure with no delivery
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'parse-failed',
+      detail: 'Frontmatter "verdict" key has no value',
+    })
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
   it('keeps a required pull_request review fail-closed when its verdict is missing', async () => {
     // #given a pull_request response file with no verdict frontmatter
     const filePath = await writeFixture('Review body without a verdict.')

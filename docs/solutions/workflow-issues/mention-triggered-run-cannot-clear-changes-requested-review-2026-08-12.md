@@ -38,12 +38,26 @@ The verdict was right. Delivering it as a review was structurally impossible, an
 
 ```ts
 if (triggerContext?.eventType === 'pull_request') return 'pr-review'
-if (triggerContext?.eventType === 'issue_comment' && agentContext.issueType === 'pr') return 'pr-review-permitted'
+// Routing is the primary authorization boundary; repeat its comment checks here so this resolver fails closed.
+const author = triggerContext?.author
+if (
+  triggerContext?.eventType === 'issue_comment' &&
+  agentContext.issueType === 'pr' &&
+  author != null &&
+  author.isBot === false &&
+  typeof author.association === 'string' &&
+  isAuthorizedAssociation(author.association, ALLOWED_ASSOCIATIONS) &&
+  triggerContext.hasMention === true
+) {
+  return 'pr-review-permitted'
+}
 if (agentContext.issueType === 'pr') return 'pr-comment'
 return 'issue-comment'
 ```
 
 At the time of the incident the middle case did not exist, so a mention resolved to `pr-comment` and a verdict was rejected outright — the run reached a conclusion and delivered nothing at all.
+
+The association, bot, and mention checks in that middle case are deliberately redundant with the routing gate rather than trusting it. Routing remains the primary boundary — an unauthorized comment never reaches execution — but a resolver that grants review authority from event type alone is only safe by cross-file convention, and conventions are not guards. Checking against the canonical `ALLOWED_ASSOCIATIONS` rather than the caller's config also keeps it closed if routing's own allowlist were ever widened.
 
 The distinction that was missing is **required** versus **permitted**. A `pull_request` run must produce a verdict; a missing one fails closed, because silently commenting would downgrade a required review while reporting success. A mention may produce one: a verdict submits a real review, and its absence posts a comment. Collapsing both into one surface is what made the capability unreachable — and promoting mentions to review-*required* instead would have been the same bug mirrored, forcing a verdict out of a run that was only ever asked a question.
 

@@ -453,7 +453,7 @@ ${trimmedCustomPrompt}`,
     }
   }
 
-  if (options.triggerContext != null) {
+  if (options.triggerContext != null && context.issueType === 'pr') {
     parts.push(wrapXml('output_contract', buildOutputContractSection(context, responseDelivery, responseSurface)))
   }
 
@@ -955,6 +955,8 @@ function buildOutputContractSection(
   const surfacePolicy = RESPONSE_SURFACE_POLICIES[responseSurface]
 
   if (surfacePolicy.reviewCapable) {
+    // Non-PR runs receive equivalent non-posting guidance from
+    // buildAgentContextSection; keep this branch scoped to PR surfaces.
     if (responseDelivery === 'file-convention') {
       lines.push(
         surfacePolicy.verdictRequired
