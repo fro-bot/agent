@@ -6,6 +6,7 @@ import {
   buildResponseFilePathCandidates,
   MAX_BODY_BYTES,
   parseResponseFile,
+  RESPONSE_FILE_VERDICT_REJECTION_REASONS,
 } from './response-file.js'
 
 describe('buildResponseFileDir', () => {
@@ -390,5 +391,19 @@ describe('parseResponseFile', () => {
 
     // #then
     expect(result.success === true ? result.data : undefined).toEqual({body: 'Body', verdict: 'approve'})
+  })
+})
+
+describe('RESPONSE_FILE_VERDICT_REJECTION_REASONS', () => {
+  it('contains exactly the verdict rejection reasons', () => {
+    // #given the exhaustively classified response-file error reasons
+    // #when selecting the reasons classified as verdict rejection
+    const reasons = Object.entries(RESPONSE_FILE_VERDICT_REJECTION_REASONS)
+      .filter(([, isVerdictRejection]) => isVerdictRejection)
+      .map(([reason]) => reason)
+      .sort()
+
+    // #then only malformed verdict values are recoverable on verdict-optional surfaces
+    expect(reasons).toEqual(['missing-verdict-value', 'unknown-verdict'])
   })
 })

@@ -68,6 +68,22 @@ export type ResponseFileErrorReason =
   | 'unknown-verdict'
   | 'body-too-large'
 
+/**
+ * Classifies every response-file parse error so adding a new reason requires
+ * an explicit recovery decision at compile time. Only malformed verdicts are
+ * recoverable on verdict-optional review surfaces; verdict-on-non-review has
+ * a separate re-validation path in response-post.
+ */
+export const RESPONSE_FILE_VERDICT_REJECTION_REASONS = {
+  empty: false,
+  'malformed-frontmatter': false,
+  'unknown-key': false,
+  'verdict-on-non-review': false,
+  'missing-verdict-value': true,
+  'unknown-verdict': true,
+  'body-too-large': false,
+} as const satisfies Record<ResponseFileErrorReason, boolean>
+
 export interface ResponseFileError extends Error {
   readonly code: 'RESPONSE_FILE_ERROR'
   readonly reason: ResponseFileErrorReason

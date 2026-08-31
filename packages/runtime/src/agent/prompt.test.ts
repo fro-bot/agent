@@ -2516,26 +2516,31 @@ describe('buildAgentPrompt response delivery gating', () => {
   })
 
   it.each([
-    ['issue-comment', 'issue_comment'],
-    ['pr-comment', 'pull_request_review_comment'],
+    ['issue-comment', 'issue_comment', {issueType: 'issue'}, '<agent_context>', '## Issue #42', '<output_contract>'],
+    [
+      'pr-comment',
+      'pull_request_review_comment',
+      {issueType: 'pr'},
+      '<output_contract>',
+      '- Requested reviewer: no',
+      'Review action',
+    ],
   ] as const)(
     'keeps surface-independent output context without review instructions on the %s comment surface',
-    (surface, eventType) => {
+    (surface, eventType, contextOverrides, expectedSection, expectedContext, forbiddenText) => {
       // #given a comment-only run
       const prompt = buildPromptForDelivery(
         'file-convention',
         '/tmp/fro-bot-response/1-1/nonce123.md',
         eventType,
         surface,
+        contextOverrides,
       )
 
-      // #then the model gets context useful on every surface without a review action it cannot perform
-      expect(prompt).toContain('<output_contract>')
-      expect(prompt).toContain('## Output Contract')
-      expect(prompt).toContain('- Requested reviewer: no')
-      expect(prompt).not.toContain('Review action')
-      expect(prompt).not.toContain('verdict')
-      expect(prompt).not.toContain('PR review, with verdict frontmatter')
+      // #then each real surface gets its applicable context without a review action it cannot perform
+      expect(prompt).toContain(expectedSection)
+      expect(prompt).toContain(expectedContext)
+      expect(prompt).not.toContain(forbiddenText)
     },
   )
 

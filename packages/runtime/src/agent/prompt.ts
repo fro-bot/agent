@@ -453,7 +453,7 @@ ${trimmedCustomPrompt}`,
     }
   }
 
-  if (options.triggerContext != null && context.issueType === 'pr') {
+  if (options.triggerContext != null && RESPONSE_SURFACE_POLICIES[responseSurface].target === 'pr') {
     parts.push(wrapXml('output_contract', buildOutputContractSection(context, responseDelivery, responseSurface)))
   }
 

@@ -19,7 +19,7 @@ import type {ReviewEvent} from '../reviews/types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
-import {parseResponseFile, RESPONSE_SURFACE_POLICIES} from '@fro-bot/runtime'
+import {parseResponseFile, RESPONSE_FILE_VERDICT_REJECTION_REASONS, RESPONSE_SURFACE_POLICIES} from '@fro-bot/runtime'
 import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../services/github/types.js'
 import {readThread} from '../comments/reader.js'
 import {postComment} from '../comments/writer.js'
@@ -236,7 +236,7 @@ export async function readAndParseResponseFile(
     parsed.success === false &&
     (parsed.error.reason === 'verdict-on-non-review' ||
       (RESPONSE_SURFACE_POLICIES[surface].verdictRequired === false &&
-        (parsed.error.reason === 'unknown-verdict' || parsed.error.reason === 'missing-verdict-value')))
+        RESPONSE_FILE_VERDICT_REJECTION_REASONS[parsed.error.reason] === true))
   ) {
     // Keep parseResponseFile strict for its other callers, but recover the
     // already-validated prose for delivery rather than discarding the turn.
