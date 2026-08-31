@@ -112,8 +112,11 @@ export interface AppClientAuthResult {
 
 /** The repo's immutable GitHub identity, captured at ingest for deny-key matching. */
 export interface RepoIdentity {
-  /** GitHub numeric repository id (database_id). Stable across rename/transfer. */
-  readonly databaseId: number
+  /**
+   * GitHub numeric repository id (database_id), stable across rename/transfer.
+   * Null means the id could not be represented exactly; match on nodeId.
+   */
+  readonly databaseId: number | null
   /** GitHub node_id string for the repository. */
   readonly nodeId: string
 }
@@ -153,8 +156,9 @@ export interface AppClient {
    * Call this during the add-project ingest flow where a legitimate repo query
    * already happens. Do NOT call at run-creation or surface time.
    *
-   * Returns the stable numeric `databaseId` (immutable across rename/transfer)
-   * and the `nodeId` string for use as deny keys in the redaction gate.
+   * Returns the stable numeric `databaseId` (immutable across rename/transfer),
+   * or `null` when the id cannot be represented exactly, plus the `nodeId`
+   * string for use as deny keys in the redaction gate.
    *
    * Error mapping (FIX 9):
    * - AppNotInstalledError: authForRepo failed (App not installed on this repo).
@@ -358,7 +362,21 @@ export function createAppClient(options: AppClientOptions): AppClient {
       })
 
       const {id, node_id: nodeId} = response.data
-      return ok({databaseId: id, nodeId})
+      const databaseId =
+        typeof id === 'bigint'
+          ? (() => {
+              const numericId = Number(id)
+              return Number.isSafeInteger(numericId) && BigInt(numericId) === id ? numericId : null
+            })()
+          : Number.isSafeInteger(id)
+            ? id
+            : null
+
+      if (databaseId === null) {
+        logger?.warn('Repository database id cannot be represented exactly; matching on nodeId', {owner, repo})
+      }
+
+      return ok({databaseId, nodeId})
     } catch (error) {
       if (isOctokitNotFound(error)) {
         // FIX 9: 404 after successful auth = repo gone (deleted/renamed), not App not installed.

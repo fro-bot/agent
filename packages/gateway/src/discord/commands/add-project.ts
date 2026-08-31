@@ -420,7 +420,9 @@ async function runAddProjectPhases(
       repo,
     })
   } else {
-    databaseId = identityResult.data.databaseId
+    if (identityResult.data.databaseId !== null) {
+      databaseId = identityResult.data.databaseId
+    }
     nodeId = identityResult.data.nodeId
   }
 

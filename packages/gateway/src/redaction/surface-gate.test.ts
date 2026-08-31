@@ -22,7 +22,7 @@ import type {RepoKey} from './denylist.js'
 import type {BindingsLookup} from './surface-gate.js'
 
 import {describe, expect, it, vi} from 'vitest'
-import {filterDeniedRecords, projectRunStatus, resolveRunRepoKey} from './surface-gate.js'
+import {bindingToRepoKey, filterDeniedRecords, projectRunStatus, resolveRunRepoKey} from './surface-gate.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -93,6 +93,14 @@ const allowAll: (key: RepoKey) => boolean = () => false
 // ---------------------------------------------------------------------------
 
 describe('resolveRunRepoKey', () => {
+  it('preserves nodeId when databaseId is null', () => {
+    // #given — an identity whose numeric id is not representable exactly
+    const bindingKey = bindingToRepoKey({databaseId: null, nodeId: 'R_unsafe-id'})
+
+    // #then — nodeId remains available as an independent deny key
+    expect(bindingKey).toEqual({databaseId: null, nodeId: 'R_unsafe-id'})
+  })
+
   it('resolves a run entity_ref to the binding deny keys', async () => {
     // #given a run with entity_ref 'acme/widget#1' and a binding with deny keys
     const binding = makeBinding({databaseId: 42, nodeId: 'MDEwOlJlcG9zaXRvcnk0Mg=='})

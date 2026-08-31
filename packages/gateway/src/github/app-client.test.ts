@@ -611,6 +611,63 @@ describe('createAppClient.getRepoIdentity', () => {
     expect(result.data.nodeId).toBe('R_kgDOBcdefg')
   })
 
+  it('preserves Number.MAX_SAFE_INTEGER as a numeric databaseId', async () => {
+    // #given — the largest exactly representable integer
+    mockRequest
+      .mockResolvedValueOnce(INSTALLATION_RESPONSE)
+      .mockResolvedValueOnce({data: {id: Number.MAX_SAFE_INTEGER, node_id: 'R_max-safe'}})
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.databaseId).toBe(Number.MAX_SAFE_INTEGER)
+    expect(typeof result.data.databaseId).toBe('number')
+  })
+
+  it('converts a bigint databaseId within the safe range to a number', async () => {
+    // #given — a response shape from @octokit/types v17 with a safely representable bigint
+    mockRequest
+      .mockResolvedValueOnce(INSTALLATION_RESPONSE)
+      .mockResolvedValueOnce({data: {id: 123n, node_id: 'R_safe-bigint'}})
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.databaseId).toBe(123)
+    expect(typeof result.data.databaseId).toBe('number')
+  })
+
+  it('preserves nodeId and returns ok with null databaseId for an unsafe bigint', async () => {
+    // #given — an id that cannot be represented exactly as a JavaScript number
+    const logger = makeLogger()
+    mockRequest
+      .mockResolvedValueOnce(INSTALLATION_RESPONSE)
+      .mockResolvedValueOnce({data: {id: BigInt(Number.MAX_SAFE_INTEGER) + 1n, node_id: 'R_unsafe-bigint'}})
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, logger})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then — the identity remains usable through nodeId
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.databaseId).toBeNull()
+    expect(result.data.nodeId).toBe('R_unsafe-bigint')
+    const warning = logger.lines.find(line => line.startsWith('WARN:'))
+    expect(warning).toBeDefined()
+    expect(warning).toContain('owner')
+    expect(warning).toContain('repo')
+    expect(warning).not.toContain(String(Number.MAX_SAFE_INTEGER + 1))
+  })
+
   it('uses the authenticated octokit from authForRepo (no extra auth round-trip)', async () => {
     // #given — track all request calls
     mockRequest.mockResolvedValueOnce(INSTALLATION_RESPONSE).mockResolvedValueOnce(REPO_IDENTITY_RESPONSE) // discovery then identity

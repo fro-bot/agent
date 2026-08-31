@@ -27,12 +27,13 @@ export interface BackfillDeps {
   readonly bindingsStore: BindingsStore
   /**
    * Narrow repo-identity accessor — issues GET /repos/{owner}/{repo} and
-   * returns {databaseId, nodeId}. Injected for testability.
+   * returns {databaseId, nodeId}. `databaseId: null` means the numeric id could
+   * not be represented exactly; the nodeId remains usable. Injected for testability.
    */
   readonly getRepoIdentity: (
     owner: string,
     repo: string,
-  ) => Promise<Result<{databaseId: number; nodeId: string}, Error>>
+  ) => Promise<Result<{databaseId: number | null; nodeId: string}, Error>>
   /**
    * Write the updated binding back to the store. Injected for testability.
    * In production, wire this to the store's unconditional-put or a dedicated
@@ -116,7 +117,11 @@ export async function backfillActiveBindingDenyKeys(deps: BackfillDeps): Promise
     }
 
     const {databaseId, nodeId} = identityResult.data
-    const updatedBinding: RepoBinding = {...binding, databaseId, nodeId}
+    const updatedBinding: RepoBinding = {
+      ...binding,
+      ...(databaseId === null ? {} : {databaseId}),
+      nodeId,
+    }
 
     // #then — write the updated binding back (skipped in dry-run mode)
     if (dryRun === true) {
