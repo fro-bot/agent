@@ -3,6 +3,7 @@ title: 'fix: Break the session-cache bootstrap trap'
 type: fix
 status: active
 date: 2026-08-31
+deepened: 2026-08-31
 ---
 
 # fix: Break the session-cache bootstrap trap
@@ -32,6 +33,7 @@ This matters more than the trap itself: **every** cached database is transported
 - R5. The bootstrap budget must be observable in logs and adjustable by a consumer.
 - R6. `session-retention` must either control retention or stop claiming to.
 - R7. Existing session continuity on healthy runs must not regress.
+- R8. A repository already caught in the loop must recover without a human deleting cache entries.
 
 ## Scope Boundaries
 
@@ -129,12 +131,14 @@ A 40× difference. Against a 5000 ms budget this is decisive at `bfra-me/.github
 
 ## Key Technical Decisions
 
-- **Checkpoint before capture, rather than refuse to capture.** Refusing would be simpler, but nothing is checkpointed today, so a refusal gate would block every save and trade an absorbing failure for a total loss of continuity (violating R7). Adding an explicit checkpoint fixes the cause instead of declining to carry its symptom.
-- **The checkpoint is fallible and its outcome is the gate.** Attempt it; if it cannot complete, that is the signal to decline the save — with a reason. This satisfies R4 without inventing a second notion of "clean."
-- **One authority for whether state is safe to persist.** Both save paths consult the same recorded outcome. Neither re-derives it.
-- **Stop transporting `-shm`.** It is machine-local by design. Removing it from the save path set is not a behavior trade — it is deleting a file that was never valid to move.
-- **Extend `cleanStorage` to the database family.** "Proceed with clean state" must mean it. This is the in-code equivalent of the manual purge both reporters ran.
-- **Wire `session-retention` rather than remove it.** It is the one control that would have let either reporter bound the problem before hitting it, and removing a documented input is a breaking change for anyone who set it.
+- **Repair on restore, not only on save.** This is the decision the first draft missed, and it is what actually breaks the loop. Declining to persist bad state prevents *new* poisoning but cannot escape *existing* poisoning: save keys are unique per run (`src/services/cache/cache-key.ts:51`) and restore keys are prefixes returning the most recent match, so a run that declines to save leaves the poisoned entry as the newest one and the next run restores it again. Checkpointing the restored database *before* bootstrap recovers the session instead of discarding it, and heals a stuck repository in one run.
+- **The repair happens outside the bootstrap budget.** `restoreCache` completes at `src/harness/phases/cache-restore.ts:37` and `bootstrapOpenCodeServer` is called at `:57`, with no timer spanning them. The 5000 ms budget covers only `createOpencode`. Doing the checkpoint between them moves the measured 2416.8 ms recovery cost out of the window that was failing.
+- **Checkpoint in place; do not snapshot.** External guidance favours capturing a consistent snapshot (`VACUUM INTO`, backup API) over transporting a live database. Rejected here: the cache *is* the next run's live working set, not an archive. A snapshot would add a second representation that still has to be restored back into a live database, moving the "make it live" step to restore time and reintroducing the same hazard one run later. The hybrid we do adopt is normalising what gets transported — database plus `-wal`, never `-shm`.
+- **The checkpoint belongs at the cache boundary, not in the session runtime.** `src/harness/phases/cleanup.ts:172` and `src/harness/post.ts:100` both call the same `saveCache` (`src/services/cache/save.ts:64`), which also owns the S3 sync at `:97`. Placing the checkpoint there means one definition serves every capture path structurally, instead of a flag two callers must agree to read. A `packages/runtime/src/session/` primitive would put a persistence-policy decision in a layer that has no persistence context.
+- **Do not require observing the child's exit.** The first draft said to await it. The harness cannot: `shutdown()` returns `void` (`packages/runtime/src/agent/server.ts:74-76`) and the SDK owns the process handle. The checkpoint attempt is itself the liveness probe — a live writer surfaces as busy — so bounded retry on that signal replaces an unobservable wait.
+- **Trust the observed effect, not the pragma's return row.** Verified on Node 24.20.0: `PRAGMA wal_checkpoint(TRUNCATE)` returned `{busy: 0, log: 0, checkpointed: 0}` while truncating a 1.1 MB write-ahead log to zero. The `checkpointed` count is not a success signal; the write-ahead log's size on disk is.
+- **Stop transporting `-shm`.** It is machine-local by design. Removing it from the save set is not a behaviour trade — it is declining to move a file that was never valid to move.
+- **Wire `session-retention` rather than remove it.** It is the one control that would have let either reporter bound the problem before hitting it, and removing a documented input breaks anyone who set it.
 
 ## Open Questions
 
@@ -145,17 +149,20 @@ A 40× difference. Against a 5000 ms budget this is decisive at `bfra-me/.github
 - Can pruning be made offline? Not without reimplementing session discovery against the database. Out of scope, and unnecessary once the checkpoint and clean-state fixes land.
 - Does S3 avoid the problem? No. `packages/runtime/src/object-store/content-sync.ts:10` carries the same database family, and a successful S3 restore returns before `cleanStorage` is ever reached (`restore.ts:76-99`).
 
+- Can the action runtime checkpoint SQLite at all? Yes, with no new dependency. Verified on Node 24.20.0 (the runtime is `using: node24`, `action.yaml:165`): `node:sqlite` is available unflagged and `wal_checkpoint(TRUNCATE)` truncated a 1,104,192-byte write-ahead log to zero.
+- Does declining to save escape an existing poisoned cache? No — see the first Key Technical Decision. This was the first draft's central error.
+- Is a stale `-shm` safe to leave for future saves to age out? No. It is machine-local and a foreign copy can interfere with recovery, so restore should delete it rather than wait.
+
 ### Deferred to Implementation
 
-- Whether the checkpoint runs in-process against the database file or by invoking a SQLite binary. Depends on what is available in the action runtime without adding a dependency.
-- Exact backoff for a `SQLITE_BUSY` checkpoint attempt.
-- Whether existing caches carrying a stale `-shm` need explicit deletion on restore, or whether omitting it from future saves is sufficient as they age out.
+- Retry shape for a busy checkpoint. The bootstrap-failure path is the hard case: the SDK has already called `stop(proc)`, so the writer may be dead, dying, or wedged, and only that path can show which bound is right.
+- Whether the restore-side repair should also run on a cache miss, to sweep leftovers on self-hosted runners where the workspace is not guaranteed clean.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Stop transporting the machine-local wal-index**
+- [ ] **Unit 1: Normalize what crosses the cache boundary**
 
-**Goal:** Remove `-shm` from the saved path set so a foreign wal-index is never restored onto another runner.
+**Goal:** Stop capturing the machine-local wal-index, and delete any foreign copy a previous cache carried in.
 
 **Requirements:** R2
 
@@ -164,88 +171,100 @@ A 40× difference. Against a 5000 ms budget this is decisive at `bfra-me/.github
 **Files:**
 - Modify: `src/services/cache/paths.ts`
 - Modify: `src/services/cache/save.ts` (the database-family basename set in `hasCacheableContent`)
+- Modify: `src/services/cache/restore.ts`
 - Modify: `packages/runtime/src/object-store/content-sync.ts`
 - Test: `src/services/cache/cache.test.ts`
+- Test: `src/services/cache/restore-save-flow.test.ts`
 
 **Approach:**
-- Keep `-shm` in the *restore* path set if its absence would break restoring older caches; it is only the save side that must stop capturing it. Confirm which direction each list governs before editing.
-- `hasCacheableContent` currently counts a non-empty `-shm` as evidence of cacheable content. Once `-shm` is not saved, that is a false positive — a run with only a `-shm` would report content and save nothing useful.
+- Keep `-shm` in the *restore* path set so caches written before this change still restore; only the save side stops capturing it. Confirm which direction each list governs before editing.
+- After restoring, delete `opencode.db-shm`. SQLite rebuilds it locally, and a copy from another runner is stale by construction — waiting for old entries to age out leaves the hazard in place for as long as they survive.
+- `hasCacheableContent` currently counts a non-empty `-shm` as evidence of cacheable content. Once `-shm` is not saved, that is a false positive: a workspace with only a `-shm` would claim content and persist nothing useful.
 
 **Patterns to follow:**
 - `src/services/cache/paths.ts` already distinguishes restore-mode from save-mode path construction.
 
 **Test scenarios:**
-- Happy path: save paths for a workspace with all three database files include `opencode.db` and `-wal` and exclude `-shm`.
-- Edge case: a workspace with only `opencode.db-shm` present reports no cacheable content.
-- Edge case: restore path construction is unchanged, so an older cache containing `-shm` still restores.
+- Happy path: save paths for a workspace with all three database files include `opencode.db` and `-wal`, and exclude `-shm`.
+- Happy path: a restored `-shm` is deleted before bootstrap.
+- Edge case: a workspace with only `opencode.db-shm` reports no cacheable content.
+- Edge case: restore path construction still accepts an older cache containing `-shm`.
 
 **Verification:**
-- No save path set includes a `-shm` entry; restoring a cache saved before this change still succeeds.
+- No save path set contains a `-shm` entry, and no `-shm` survives a restore.
 
-- [ ] **Unit 2: Checkpoint the database before it is captured**
+- [ ] **Unit 2: Checkpoint at the cache-save boundary, and gate the save on the result**
 
-**Goal:** Merge the write-ahead log into the main database before the cache is read, and record whether that succeeded.
+**Goal:** Merge the write-ahead log into the database before anything captures it, and refuse to persist state that could not be merged.
 
-**Requirements:** R2, R4
+**Requirements:** R2, R4, R7
 
 **Dependencies:** Unit 1
 
 **Files:**
-- Create: `packages/runtime/src/session/checkpoint.ts`
-- Modify: `src/harness/phases/cleanup.ts`
-- Test: `packages/runtime/src/session/checkpoint.test.ts`
-- Test: `src/harness/phases/cleanup.test.ts`
+- Create: `src/services/cache/checkpoint.ts`
+- Modify: `src/services/cache/save.ts`
+- Modify: `src/harness/phases/cleanup.ts` (comment correction only)
+- Test: `src/services/cache/checkpoint.test.ts`
+- Test: `src/services/cache/restore-save-flow.test.ts`
 
 **Approach:**
-- Await the OpenCode child's exit before touching its database. `shutdown()` currently returns immediately after SIGTERM (`packages/runtime/src/agent/server.ts:74-76`); the harness needs to know the writer is gone before it checkpoints. Bound the wait.
-- Then run `PRAGMA wal_checkpoint(TRUNCATE)` against the database and report a definite outcome: checkpointed, or not, with a reason.
-- Correct the misleading comment at `cleanup.ts:107-111` — it currently asserts behavior the code does not have, and `save.ts:35-37` says the opposite twenty lines away in another file.
-- Do not fail the run when a checkpoint fails. Cleanup must still complete (`build-pipeline-fallible-preflight-and-finally-cleanup`); the outcome is a signal, not a fatal error.
+- Run the checkpoint inside `saveCache`, before `hasCacheableContent` and before the S3 sync at `save.ts:97`. Both save paths and the object-store path then inherit it from one place, and no cross-phase flag is needed to keep them agreeing. Order matters: checkpointing moves bytes from the write-ahead log into the database, which changes which files are non-empty.
+- Use `node:sqlite`. Verified available unflagged on Node 24.20.0, so this adds no dependency.
+- Treat the attempt as the liveness probe rather than trying to observe the child's exit, which the harness cannot do. A live writer surfaces as busy; retry within a bound and then report.
+- Report a three-state outcome — checkpointed, nothing to checkpoint, or could not checkpoint with a reason. Two states would collapse "already clean" into "failed" and decline saves that were always safe, which is how this unit could regress R7.
+- Judge success by the write-ahead log's size on disk, not the pragma's `checkpointed` count. The count read zero on a verified-successful truncation.
+- Declining to save must log a warning naming the reason and surface it in the job summary. A silent skip here reproduces the incident in `read-only-actions-cache-token-broke-session-continuity`, where a discarded signal hid lost continuity for a month.
+- Do not fail the run on a failed checkpoint; cleanup must still finish.
+- Correct the comment at `cleanup.ts:107-111`, which claims a clean shutdown checkpoints. It does not, and `save.ts:35-37` says the opposite in another file.
 
 **Test scenarios:**
-- Happy path: a database with a populated WAL is checkpointed; the WAL is emptied and the main database contains the data.
-- Error path: a database locked by another reader yields a not-checkpointed outcome with a reason, and does not throw.
+- Happy path: a database with a populated write-ahead log is checkpointed, the log empties, and the data is readable from the database alone.
+- Happy path: an already-clean database returns "nothing to checkpoint" and the save proceeds.
+- Error path: a busy database retries within the bound, then returns a reason without throwing.
 - Error path: a missing or zero-byte database yields a definite outcome rather than an exception.
-- Edge case: the child process does not exit within the bounded wait — the outcome reflects that, and the run continues.
-- Integration: cleanup on a healthy run reaches the checkpoint and records success.
+- Error path: an unsuccessful checkpoint declines the save and the reason appears in the log and job summary.
+- Edge case: a checkpoint that truncates the log while reporting `checkpointed: 0` is treated as success.
+- Integration: cleanup and the post hook both inherit the same decision through `saveCache`, with no separate flag.
 
 **Verification:**
-- After a healthy run, `opencode.db-wal` is empty or absent and the session data is readable from `opencode.db` alone.
+- After a healthy run the write-ahead log is empty or absent; after a failed checkpoint no cache entry is written for that run and the run output names why.
 
-- [ ] **Unit 3: One authority for whether state may be persisted**
+- [ ] **Unit 3: Repair a hot restored database before bootstrap**
 
-**Goal:** Make both save paths consult a single recorded outcome, and make a declined save loud.
+**Goal:** Give a repository already stuck in the loop a way out that does not involve a human deleting cache entries.
 
-**Requirements:** R1, R4
+**Requirements:** R1, R7, R8
 
-**Dependencies:** Unit 2
+**Dependencies:** Unit 2 (reuses its checkpoint helper)
 
 **Files:**
-- Modify: `src/harness/config/state-keys.ts`
-- Modify: `src/harness/phases/cleanup.ts`
-- Modify: `src/harness/post.ts`
-- Test: `src/harness/phases/cleanup.test.ts`
-- Test: `src/harness/post.test.ts`
+- Modify: `src/harness/phases/cache-restore.ts`
+- Test: `src/harness/phases/cache-restore.test.ts`
 
 **Approach:**
-- Record the checkpoint outcome from Unit 2 through the established state-key mechanism (`routing.ts:67` and `post.ts:65` are the model).
-- Both `cleanup.ts:172` and `post.ts:100` read that one value. Neither re-derives it — the duplicate-source-of-truth failure is documented and this is the shape that causes it.
-- A declined save must log at warning level with the reason and appear in the job summary. A silent skip here reproduces the read-only-cache-token incident with a new cause; that doc is explicit that a discarded signal hid the failure for a month.
-- Bootstrap failure means no checkpoint ran, so no persist. That is the change that makes the failure re-runnable.
+- After the restore completes (`cache-restore.ts:37`) and before `bootstrapOpenCodeServer` (`:57`), checkpoint the restored database if its write-ahead log is non-empty. No timer spans those lines, so the cost lands outside the 5000 ms budget that was failing.
+- This recovers the session rather than discarding it. Wiping the database would also break the loop, but it destroys history on every transient bootstrap failure — which is the second reporter's case exactly, and a direct R7 regression.
+- Post-Unit-2, a healthy save always leaves an empty log, so a non-empty log on restore means the entry predates the fix or something went wrong. Either way it warrants repair, and a clean log means this unit does nothing.
+- No writer exists yet at this point in the run, so this is the one checkpoint that should not contend.
+- Log when a repair occurs. It is the signal that a stuck repository healed itself, and its absence in later runs is the evidence the fix held.
+
+**Patterns to follow:**
+- Unit 2's checkpoint helper, called with a different reason for the log.
 
 **Test scenarios:**
-- Happy path: a checkpointed run saves from cleanup and the post hook does not save again.
-- Error path: a run whose checkpoint failed declines both saves and logs the reason.
-- Error path: a bootstrap-failed run declines both saves; the previous cache entry is left intact rather than overwritten.
-- Edge case: cleanup saved successfully, so the post hook skips — the existing `CACHE_SAVED` behavior is unchanged.
-- Integration: the post hook's decision matches cleanup's, driven by the same recorded value rather than an independent check.
+- Happy path: a restored database with a populated write-ahead log is checkpointed before bootstrap and the repair is logged.
+- Happy path: a restored database with an empty log is left untouched and nothing is logged.
+- Edge case: a cache miss performs no repair.
+- Edge case: a failed repair does not fail the run — bootstrap still proceeds and may still succeed.
+- Integration: the sequence restore → repair → bootstrap holds, and the repair is not inside the bootstrap budget.
 
 **Verification:**
-- A simulated bootstrap failure leaves the prior cache entry unmodified and reports why in the run's output.
+- A cache entry containing a hot write-ahead log produces a successful bootstrap on the first run after this ships, with no manual purge.
 
 - [ ] **Unit 4: Make "clean state" actually clean**
 
-**Goal:** Extend corruption recovery to the database family so the declared clean state is real.
+**Goal:** Extend corruption recovery to the database family, and give the object-store path the same checks as the cache path.
 
 **Requirements:** R3
 
@@ -257,20 +276,23 @@ A 40× difference. Against a 5000 ms budget this is decisive at `bfra-me/.github
 
 **Approach:**
 - `cleanStorage` removes `storagePath`; the database family sits at `path.dirname(storagePath)`. Remove `opencode.db` and its sidecars alongside it.
-- Derive the file set from the same definition `paths.ts` uses. Two lists of database-family filenames in two files is the drift shape this repo has been bitten by before.
-- Check every `cleanStorage` call site — object-store corruption fallback, regular cache corruption, and storage-version mismatch (`restore.ts:80-84,178-182,185-189`) — and confirm deleting the database is correct at each, not just the one that motivated it.
+- Derive the file set from the same definition `paths.ts` uses. Two lists of database-family filenames in two files is the drift shape this repository has been bitten by before.
+- Check every `cleanStorage` call site — object-store corruption fallback, cache corruption, and storage-version mismatch (`restore.ts:80-84,178-182,185-189`) — and confirm deleting the database is correct at each, not only the one that motivated it.
+- A successful object-store restore returns at `restore.ts:163-165`, before `checkStorageCorruption` and `checkStorageVersion` ever run. So the path that is authoritative on restore is also the one with no integrity checks: a corrupt or version-mismatched database in the bucket is accepted without inspection. Give it the same two checks.
 
 **Patterns to follow:**
 - `src/services/cache/paths.ts` as the single owner of database-family filenames.
 
 **Test scenarios:**
 - Happy path: declaring corruption removes the database, `-wal`, and `-shm` along with the storage directory.
+- Happy path: an object-store restore runs the corruption and version checks.
 - Edge case: a missing database family is not an error.
-- Edge case: a storage-version mismatch also clears the database, so the next run starts genuinely fresh.
+- Edge case: a storage-version mismatch clears the database, so the next run starts genuinely fresh.
+- Error path: a corrupt database from the object store is detected rather than accepted as a hit.
 - Integration: after recovery, a subsequent restore does not find a stale database.
 
 **Verification:**
-- Following a declared-corrupt restore, no `opencode.db*` file remains in the workspace.
+- No `opencode.db*` file survives a declared-corrupt restore, by either source.
 
 - [ ] **Unit 5: Give the bootstrap budget a knob and a log line**
 
@@ -336,28 +358,32 @@ A 40× difference. Against a 5000 ms budget this is decisive at `bfra-me/.github
 
 ## System-Wide Impact
 
-- **Interaction graph:** Both save paths, the restore corruption paths, the bootstrap phase, and the S3 sync all touch the database family. Unit 1's path-set change and Unit 4's clean-state change must agree on one definition of which files that means.
-- **Error propagation:** A failed checkpoint must not fail the run — cleanup has to finish. It must, however, prevent the save and say so.
-- **State lifecycle risks:** Declining to persist has a real cost: a run's session work is lost. That is the correct trade against poisoning every subsequent run, but it must be visible rather than silent.
+- **Interaction graph:** Both save paths, the restore corruption paths, the bootstrap phase, and the object-store sync all touch the database family. Units 1 and 4 must agree on one definition of which files that means, and Units 2 and 3 must share one checkpoint implementation.
+- **Error propagation:** A failed checkpoint must not fail the run — cleanup has to finish, and a failed repair must still allow bootstrap to try. Both must be visible.
+- **State lifecycle risks:** Declining to persist discards a run's session work. Unit 3 is what keeps that rare, by removing the recurring cause rather than repeatedly paying its price.
 - **API surface parity:** The gateway also runs OpenCode and has its own session handling. This plan does not touch it; whether it shares the checkpoint gap is worth a separate look.
-- **Unchanged invariants:** The cache key strategy, restore-key fallback, and S3-before-Actions save ordering are unchanged. Healthy runs continue to persist session state; Unit 2 makes that state *more* restorable, not less.
+- **Unchanged invariants:** Cache key strategy, restore-key fallback, and object-store-before-Actions save ordering are unchanged. Healthy runs continue to persist session state; Units 2 and 3 make that state *more* restorable, not less.
 
 ## Risks & Dependencies
 
 | Risk | Mitigation |
 | --- | --- |
-| A declined save silently loses session continuity, recreating the read-only-token incident | Unit 3 requires a warning and job-summary line naming the reason; a test asserts the decline is reported, not just that it happened |
-| The checkpoint itself becomes a new bootstrap-time cost | Checkpointing happens at cleanup, not at startup; the measured effect on the next run's open is 2416.8 ms → 60.2 ms |
-| Awaiting child exit adds latency or hangs cleanup | The wait is bounded and its expiry is a recorded outcome, not a stall |
-| Removing `-shm` breaks restore of existing caches | Unit 1 changes the save side only; restore continues to tolerate its presence |
-| The fix addresses recovery cost but `dashboard`'s failure was variance-driven | Unit 5 addresses the variance case directly; the plan states plainly that neither unit alone covers both reports |
-| `session-retention` wiring changes behavior for existing consumers | Input default and hardcoded default are both 50, so an unset input is a no-op; asserted by test |
+| A declined save silently loses session continuity, recreating the read-only-token incident | Unit 2 requires a warning and job-summary line naming the reason; a test asserts the decline is reported, not merely that it happened |
+| Declining to save is a deliberate discard of the run's session work, not a free safety measure | Unit 3 makes the common cause of that decline self-healing, so the discard is rare rather than routine; the trade is stated in the job summary so it is visible when it happens |
+| A two-state checkpoint outcome collapses "already clean" into "failed" and declines safe saves | Unit 2 reports three states; a test pins the already-clean path proceeding to save |
+| A busy or partially-progressed checkpoint is treated as success and persists half-merged state | Success is judged by the write-ahead log's size on disk, not the pragma's return row, which read zero on a verified-successful truncation |
+| The object store holds older state than the Actions cache after a non-fatal upload failure (`save.ts:109-113`), and restore prefers the object store (`restore.ts:163-165`) | Not addressed here; recorded as a distinct defect, since it predates this plan and has its own fix |
+| The checkpoint becomes a new bootstrap-time cost | Unit 3 runs between restore and bootstrap, outside the 5000 ms budget; measured effect on open is 2416.8 ms → 60.2 ms |
+| Removing `-shm` breaks restore of existing caches | Unit 1 changes the save side only; restore still tolerates its presence and deletes it locally |
+| The fix addresses recovery cost but `dashboard`'s failure was variance-driven | Unit 5 addresses variance directly; neither unit alone covers both reports, and the plan says so |
+| `session-retention` wiring changes behaviour for existing consumers | Input default and hardcoded default are both 50, so an unset input is a no-op; asserted by test |
+| Concurrent runs on one cache key still race | Unchanged by this plan; gating reduces poisoned writes but does not serialise healthy ones |
 
 ## Documentation / Operational Notes
 
 - `action.yaml` gains a bootstrap-budget input; document that it is distinct from the execution `timeout`.
-- Once Unit 3 ships, a repo stuck in the loop today still needs one manual cache purge to escape — the fix prevents recurrence, it does not retroactively clean a poisoned entry. Worth saying in the issue when it closes.
-- Both reporters offered live reproductions. Unit 5's budget logging is what would confirm the variance reading on `dashboard`, and is the cheapest thing to validate against a real runner.
+- With Unit 3, a repository stuck today recovers on its first run after the fix, with no manual purge. That is the claim to make when the issue closes, and the repair log line is the evidence for it.
+- Both reporters offered live reproductions. Unit 5's budget logging is what would confirm the variance reading on `dashboard`; Unit 3's repair line is what would confirm the recovery reading on `bfra-me/.github`. Both are cheap to validate against a real runner.
 
 ## Sources & References
 
