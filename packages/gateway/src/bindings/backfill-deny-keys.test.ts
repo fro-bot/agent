@@ -186,6 +186,32 @@ describe('backfillActiveBindingDenyKeys', () => {
     expect(result.data.skipped).toBe(1)
   })
 
+  it('resolves keys for a binding whose stored databaseId is not numeric', async () => {
+    // #given — malformed data at rest crossed the store boundary
+    const binding = {...makeBinding(), databaseId: 'not-a-number'} as unknown as RepoBinding
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: 42, nodeId: 'resolved-node-id'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+    })
+
+    // #then — malformed data is not treated as a usable deny key
+    expect(result.success).toBe(true)
+    expect(getRepoIdentity).toHaveBeenCalledExactlyOnceWith('testowner', 'testrepo')
+    expect(writeBinding).toHaveBeenCalledWith(expect.objectContaining({databaseId: 42, nodeId: 'resolved-node-id'}))
+    if (result.success === false) return
+    expect(result.data.skipped).toBe(0)
+    expect(result.data.updated).toBe(1)
+  })
+
   it('happy path: empty binding list → no updates, no errors', async () => {
     // #given — no bindings
     const listBindings = vi.fn().mockResolvedValue(ok([]))

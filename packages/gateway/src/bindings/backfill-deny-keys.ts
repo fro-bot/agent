@@ -19,6 +19,8 @@ import type {BindingsStore} from './store.js'
 import type {RepoBinding} from './types.js'
 import {err, ok} from '@fro-bot/runtime'
 
+import {withOptionalDatabaseId} from './types.js'
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -27,8 +29,8 @@ export interface BackfillDeps {
   readonly bindingsStore: BindingsStore
   /**
    * Narrow repo-identity accessor — issues GET /repos/{owner}/{repo} and
-   * returns {databaseId, nodeId}. `databaseId: null` means the numeric id could
-   * not be represented exactly; the nodeId remains usable. Injected for testability.
+   * returns {databaseId, nodeId}. `databaseId: null` means the numeric id is not
+   * usable as a deny key; the nodeId remains usable. Injected for testability.
    */
   readonly getRepoIdentity: (
     owner: string,
@@ -67,9 +69,9 @@ export interface BackfillResult {
 /**
  * Backfill deny keys (databaseId + nodeId) for active bindings that lack them.
  *
- * Bindings that already have a databaseId are skipped — the primary deny key
- * is already present. Bindings missing databaseId are resolved via
- * getRepoIdentity and written back.
+ * Bindings that already have a usable numeric databaseId are skipped — the
+ * primary deny key is already present. Bindings missing a usable databaseId
+ * are resolved via getRepoIdentity and written back.
  *
  * Returns a summary of counts. Per-binding failures are logged and counted
  * as `failed`; they do not abort the backfill.
@@ -98,8 +100,8 @@ export async function backfillActiveBindingDenyKeys(deps: BackfillDeps): Promise
     const {owner, repo} = binding
 
     // Skip bindings that already have the primary deny key (databaseId).
-    // A binding with databaseId is considered complete — nodeId is secondary.
-    if (binding.databaseId !== undefined) {
+    // Only a usable numeric id is complete; malformed stored data is backfilled.
+    if (typeof binding.databaseId === 'number') {
       skipped++
       continue
     }
@@ -117,11 +119,7 @@ export async function backfillActiveBindingDenyKeys(deps: BackfillDeps): Promise
     }
 
     const {databaseId, nodeId} = identityResult.data
-    const updatedBinding: RepoBinding = {
-      ...binding,
-      ...(databaseId === null ? {} : {databaseId}),
-      nodeId,
-    }
+    const updatedBinding = withOptionalDatabaseId({...binding, nodeId}, databaseId)
 
     // #then — write the updated binding back (skipped in dry-run mode)
     if (dryRun === true) {

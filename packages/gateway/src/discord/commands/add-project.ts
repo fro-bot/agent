@@ -20,6 +20,7 @@ import type {AuthDecision, GuildCommandCtx, GuildCommandDeps, PreDeferCtx, PreDe
 import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
 
+import {withOptionalDatabaseId} from '../../bindings/types.js'
 import {AppNotInstalledError} from '../../github/app-client.js'
 import {workspaceRepoPath} from '../../workspace-api/client.js'
 import {createChannelWithCollisionSuffix} from '../channels.js'
@@ -662,18 +663,20 @@ async function runAddProjectPhases(
   phase = 'WRITING_BINDING'
   logger.info('add-project phase', {correlationId, phase, owner, repo, channelName: channel.name, outcome: 'start'})
 
-  const binding = {
-    owner,
-    repo,
-    channelId: channel.id,
-    channelName: channel.name,
-    workspacePath,
-    createdAt: new Date().toISOString(),
-    createdByDiscordId: interaction.user.id,
-    // Deny keys for the redaction gate — captured at ingest, absent on failure (fails closed later).
-    ...(databaseId === undefined ? {} : {databaseId}),
-    ...(nodeId === undefined ? {} : {nodeId}),
-  }
+  const binding = withOptionalDatabaseId(
+    {
+      owner,
+      repo,
+      channelId: channel.id,
+      channelName: channel.name,
+      workspacePath,
+      createdAt: new Date().toISOString(),
+      createdByDiscordId: interaction.user.id,
+      // Deny keys for the redaction gate — captured at ingest, absent on failure (fails closed later).
+      ...(nodeId === undefined ? {} : {nodeId}),
+    },
+    databaseId,
+  )
 
   const bindingResult = await bindingsStore.createBinding(binding)
   if (bindingResult.success === false) {

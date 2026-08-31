@@ -22,6 +22,23 @@ export interface RepoBinding {
   readonly nodeId?: string
 }
 
+/**
+ * Add a repository database id only when it is usable.
+ *
+ * The binding store represents an unavailable id by omitting the optional field;
+ * callers must not persist `null` as though it were a numeric deny key.
+ */
+export function withOptionalDatabaseId(binding: RepoBinding, databaseId: number | null | undefined): RepoBinding {
+  const bindingWithoutDatabaseId = {...binding}
+  delete bindingWithoutDatabaseId.databaseId
+
+  if (databaseId === null || databaseId === undefined) {
+    return bindingWithoutDatabaseId
+  }
+
+  return {...bindingWithoutDatabaseId, databaseId}
+}
+
 export interface ChannelIndex {
   readonly owner: string
   readonly repo: string

@@ -114,7 +114,7 @@ export interface AppClientAuthResult {
 export interface RepoIdentity {
   /**
    * GitHub numeric repository id (database_id), stable across rename/transfer.
-   * Null means the id could not be represented exactly; match on nodeId.
+   * Null means the id is not a positive, safely representable integer; match on nodeId.
    */
   readonly databaseId: number | null
   /** GitHub node_id string for the repository. */
@@ -157,8 +157,8 @@ export interface AppClient {
    * already happens. Do NOT call at run-creation or surface time.
    *
    * Returns the stable numeric `databaseId` (immutable across rename/transfer),
-   * or `null` when the id cannot be represented exactly, plus the `nodeId`
-   * string for use as deny keys in the redaction gate.
+   * or `null` when the id is not a positive, safely representable integer,
+   * plus the `nodeId` string for use as deny keys in the redaction gate.
    *
    * Error mapping (FIX 9):
    * - AppNotInstalledError: authForRepo failed (App not installed on this repo).
@@ -362,18 +362,10 @@ export function createAppClient(options: AppClientOptions): AppClient {
       })
 
       const {id, node_id: nodeId} = response.data
-      const databaseId =
-        typeof id === 'bigint'
-          ? (() => {
-              const numericId = Number(id)
-              return Number.isSafeInteger(numericId) && BigInt(numericId) === id ? numericId : null
-            })()
-          : Number.isSafeInteger(id)
-            ? id
-            : null
+      const databaseId = toSafeRepositoryId(id)
 
       if (databaseId === null) {
-        logger?.warn('Repository database id cannot be represented exactly; matching on nodeId', {owner, repo})
+        logger?.warn('Repository database id cannot be used as a numeric deny key; matching on nodeId', {owner, repo})
       }
 
       return ok({databaseId, nodeId})
@@ -396,6 +388,31 @@ export function createAppClient(options: AppClientOptions): AppClient {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Narrow an Octokit repository id to a positive, exactly representable number.
+ *
+ * The parameter accepts both Octokit response shapes: v16 exposes `id` as a
+ * number, while v17 may expose `number | bigint`.
+ */
+function toSafeRepositoryId(id: number | bigint): number | null {
+  if (typeof id === 'bigint') {
+    if (id <= 0n) return null
+
+    const numericId = Number(id)
+    if (Number.isSafeInteger(numericId) && BigInt(numericId) === id) {
+      return numericId
+    }
+
+    return null
+  }
+
+  if (Number.isSafeInteger(id) === false || id <= 0) {
+    return null
+  }
+
+  return id
+}
 
 /**
  * Verify that the installation's granted permissions meet the minimum
