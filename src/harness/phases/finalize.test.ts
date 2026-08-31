@@ -61,7 +61,7 @@ vi.mock('../../shared/logger.js', () => ({
   createLogger: () => ({debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}),
 }))
 
-const {BROKERED_PUSH_TIMEOUT_MS, runFinalize} = await import('./finalize.js')
+const {BROKERED_PUSH_TIMEOUT_MS, runFinalize, runFinalizeWithResult} = await import('./finalize.js')
 
 function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): BootstrapPhaseResult {
   return {
@@ -206,6 +206,65 @@ describe('runFinalize file-convention delivery', () => {
       expect.anything(),
     )
     expect(mocks.setFailed).not.toHaveBeenCalled()
+  })
+
+  it('returns the final delivery kind and publishes it for review delivery', async () => {
+    // #given a successful file-convention response that was delivered as a review
+    const bootstrap = createBootstrap()
+    const routing = createRouting()
+    const execution = createExecution()
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'review'})
+
+    // #when finalization returns its consumer-facing result
+    const result = await runFinalizeWithResult(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then both the result and Action output identify the review delivery
+    expect(result).toEqual({exitCode: 0, deliveryKind: 'review'})
+    expect(mocks.setOutput).toHaveBeenCalledWith('delivery-kind', 'review')
+  })
+
+  it('keeps a degraded comment delivery successful without invoking the parse-failure path', async () => {
+    // #given response precheck and delivery both recover a misplaced verdict as a comment
+    const bootstrap = createBootstrap()
+    const routing = createRouting()
+    const execution = createExecution()
+    const metrics = createMetrics()
+    mocks.readAndParseResponseFile.mockResolvedValue({
+      success: true,
+      data: {
+        surface: 'issue-comment',
+        parsed: {body: 'response body'},
+        recoveredFromFallback: false,
+        actualResponseFilePath: bootstrap.responseFilePath,
+        droppedVerdict: true,
+      },
+    })
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then successful degraded delivery is not treated as parse failure
+    expect(exitCode).toBe(0)
+    expect(mocks.setFailed).not.toHaveBeenCalled()
+    expect(mocks.postComment).not.toHaveBeenCalled()
   })
 
   it('writes the execute migration record with the scalar output exactly once', async () => {

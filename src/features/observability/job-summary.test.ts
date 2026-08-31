@@ -60,6 +60,7 @@ function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): Comm
     metrics: createMockMetrics(),
     agent: 'sisyphus',
     resolvedOutputMode: resolvedOutputMode ?? null,
+    deliveryKind: 'none',
     ...restOverrides,
   }
 }
@@ -129,6 +130,18 @@ describe('writeJobSummary', () => {
     // #then
     const tableCall = vi.mocked(core.summary).addTable.mock.calls[0]![0]
     expect(tableCall).toContainEqual(['Output Mode', 'working-dir'])
+  })
+
+  it('includes the delivery kind in the main metrics table', async () => {
+    // #given a run that delivered a review
+    const options = createMockOptions({deliveryKind: 'review'})
+
+    // #when
+    await writeJobSummary(options, logger)
+
+    // #then the consumer-visible summary identifies the delivered response
+    const tableCall = vi.mocked(core.summary).addTable.mock.calls[0]![0]
+    expect(tableCall).toContainEqual(['Delivery Kind', 'review'])
   })
 
   it('renders Output Mode as N/A when resolved mode is null', async () => {

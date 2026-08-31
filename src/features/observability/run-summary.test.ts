@@ -43,6 +43,7 @@ function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): Comm
     metrics: createMockMetrics(),
     agent: 'sisyphus',
     resolvedOutputMode: resolvedOutputMode ?? null,
+    deliveryKind: 'none',
     ...restOverrides,
   }
 }

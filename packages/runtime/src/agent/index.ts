@@ -37,6 +37,8 @@ export {
   MAX_BODY_BYTES,
   parseResponseFile,
   RESPONSE_FILE_DIR_SEGMENT,
+  RESPONSE_FILE_VERDICT_REJECTION_REASONS,
+  RESPONSE_SURFACE_POLICIES,
 } from './response-file.js'
 export type {
   ParsedResponse,
@@ -44,6 +46,7 @@ export type {
   ResponseFileErrorReason,
   ResponseFilePathCandidates,
   ResponseSurface,
+  ResponseSurfacePolicy,
 } from './response-file.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
 export type {OpenCodeServerHandle} from './server.js'

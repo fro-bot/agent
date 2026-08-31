@@ -1,3 +1,4 @@
+import type {ResponseDeliveryKind} from '@fro-bot/runtime'
 import type {BrokeredPushFailureClass, BrokeredPushOutcome} from '../../features/delegated/brokered-push.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CommentSummaryOptions} from '../../features/observability/types.js'
@@ -19,7 +20,7 @@ import {writeJobSummary} from '../../features/observability/index.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
-import {setActionOutputs} from '../config/outputs.js'
+import {setActionOutputs, setDeliveryKindOutput} from '../config/outputs.js'
 
 /**
  * Fixed, non-retryable guidance surfaced via `core.setFailed` for quota
@@ -160,18 +161,25 @@ async function postErrorComment(
   errorCommentBody: string,
   metrics: MetricsCollector,
   logger: Logger,
-): Promise<void> {
+): Promise<boolean> {
   const commentResult = await postComment(routing.githubClient, commentTarget, {body: errorCommentBody}, logger)
 
   if (commentResult == null) {
     logger.warning('Failed to post LLM error comment')
+    return false
   } else {
     logger.info('Posted LLM error comment', {commentUrl: commentResult.url})
     metrics.incrementComments()
+    return true
   }
 }
 
-export async function runFinalize(
+export interface FinalizeResult {
+  readonly exitCode: number
+  readonly deliveryKind: ResponseDeliveryKind
+}
+
+export async function runFinalizeWithResult(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
   cacheRestore: CacheRestorePhaseResult,
@@ -179,7 +187,7 @@ export async function runFinalize(
   metrics: MetricsCollector,
   startTime: number,
   logger: Logger,
-): Promise<number> {
+): Promise<FinalizeResult> {
   const duration = Date.now() - startTime
 
   setActionOutputs({
@@ -187,11 +195,12 @@ export async function runFinalize(
     resolvedOutputMode: execution.resolvedOutputMode,
     outputModeMigration: execution.outputModeMigration,
     brokeredPushAllowlist: createBrokeredPushAllowlist(bootstrap.inputs.brokeredPushExtraPaths),
+    deliveryKind: 'none',
     cacheStatus: cacheRestore.cacheStatus,
     duration,
   })
 
-  const summaryOptions: CommentSummaryOptions = {
+  const baseSummaryOptions: Omit<CommentSummaryOptions, 'deliveryKind'> = {
     eventType: routing.agentContext.eventName,
     repo: routing.agentContext.repo,
     ref: routing.agentContext.ref,
@@ -201,12 +210,16 @@ export async function runFinalize(
     agent: bootstrap.inputs.agent ?? 'build (default)',
     resolvedOutputMode: execution.resolvedOutputMode,
   }
-  if (execution.overflowRecovery?.recovered === true) {
-    core.summary.addRaw(
-      `Recovered from context overflow (fresh review session; archived ${execution.overflowRecovery.archivedSessionId})\n`,
-    )
+  const finish = async (exitCode: number, deliveryKind: ResponseDeliveryKind = 'none'): Promise<FinalizeResult> => {
+    setDeliveryKindOutput(deliveryKind)
+    if (execution.overflowRecovery?.recovered === true) {
+      core.summary.addRaw(
+        `Recovered from context overflow (fresh review session; archived ${execution.overflowRecovery.archivedSessionId})\n`,
+      )
+    }
+    await writeJobSummary({...baseSummaryOptions, deliveryKind}, logger)
+    return {exitCode, deliveryKind}
   }
-  await writeJobSummary(summaryOptions, logger)
 
   // Rebuilds a safe ErrorInfo instead of trusting the incoming llmError; skips runResponsePost entirely.
   // Posts at most once, only when delivery isn't 'none' and no response was already posted; always fails closed.
@@ -218,7 +231,9 @@ export async function runFinalize(
     if (shouldPost) {
       const safeError = createQuotaExceededError({resetTime: execution.llmError.resetTime})
       const errorCommentBody = formatErrorComment(safeError)
-      await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+      const posted = await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+      core.setFailed(QUOTA_EXCEEDED_SET_FAILED_MESSAGE)
+      return finish(1, posted ? 'comment' : 'none')
     } else if (
       bootstrap.delivery !== 'none' &&
       execution.commentsPosted === 0 &&
@@ -228,7 +243,7 @@ export async function runFinalize(
     }
 
     core.setFailed(QUOTA_EXCEEDED_SET_FAILED_MESSAGE)
-    return 1
+    return finish(1, execution.commentsPosted > 0 ? 'comment' : 'none')
   }
 
   // Rebuilds a safe ErrorInfo instead of trusting the incoming llmError; skips runResponsePost entirely.
@@ -241,7 +256,9 @@ export async function runFinalize(
     if (shouldPost) {
       const safeError = createProviderAuthError()
       const errorCommentBody = formatErrorComment(safeError)
-      await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+      const posted = await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+      core.setFailed(PROVIDER_AUTH_SET_FAILED_MESSAGE)
+      return finish(1, posted ? 'comment' : 'none')
     } else if (
       bootstrap.delivery !== 'none' &&
       execution.commentsPosted === 0 &&
@@ -251,7 +268,7 @@ export async function runFinalize(
     }
 
     core.setFailed(PROVIDER_AUTH_SET_FAILED_MESSAGE)
-    return 1
+    return finish(1, execution.commentsPosted > 0 ? 'comment' : 'none')
   }
 
   // For file-convention delivery, the `execution.success → return 0` early
@@ -261,7 +278,7 @@ export async function runFinalize(
   if (bootstrap.delivery === 'file-convention') {
     if (bootstrap.responseFilePath == null) {
       core.setFailed('File-convention delivery is active but no response file path was resolved at bootstrap')
-      return 1
+      return finish(1)
     }
 
     const responsePostLogger = createLogger({phase: 'response-post'})
@@ -341,15 +358,16 @@ export async function runFinalize(
             // non-atomic property as the pushed/response-post ordering below. A re-run
             // reconstructs the updated branch to nothing-to-deliver, so it self-heals.
             const commentTarget = resolveCommentTarget(routing)
+            let posted = false
             if (execution.commentsPosted === 0 && isResolvedCommentTarget(commentTarget)) {
               const safeError = formatBrokeredPushError(brokeredPush)
-              await postErrorComment(routing, commentTarget, safeError, metrics, logger)
+              posted = await postErrorComment(routing, commentTarget, safeError, metrics, logger)
             } else if (execution.commentsPosted === 0 && !isResolvedCommentTarget(commentTarget)) {
               logger.warning('Cannot post brokered push failure comment: missing target context')
             }
 
             core.setFailed(`Brokered push delivery failed: ${brokeredPush.reason}`)
-            return 1
+            return await finish(1, posted ? 'comment' : 'none')
           }
 
           if (brokeredPush.kind === 'pushed') {
@@ -380,28 +398,40 @@ export async function runFinalize(
     }
 
     if (result.delivered === false) {
+      // A misplaced verdict is normalized to successful comment delivery by
+      // readAndParseResponseFile. Keep every other parse failure fail-closed;
+      // unlike missing artifacts, it must not trigger an error-comment fallback.
       if (result.reason === 'file-read-failed') {
         if (execution.success === false && execution.commentsPosted === 0) {
           const commentTarget = resolveCommentTarget(routing)
           if (isResolvedCommentTarget(commentTarget)) {
-            await postErrorComment(routing, commentTarget, formatFileReadFailureFallback(false), metrics, logger)
+            const posted = await postErrorComment(
+              routing,
+              commentTarget,
+              formatFileReadFailureFallback(false),
+              metrics,
+              logger,
+            )
+            const exitCode = failWithPrimaryExecutionError(execution)
+            return finish(exitCode, posted ? 'comment' : 'none')
           } else {
             logger.warning('Cannot post missing-response fallback comment: missing target context')
           }
 
-          return failWithPrimaryExecutionError(execution)
+          const exitCode = failWithPrimaryExecutionError(execution)
+          return finish(exitCode)
         }
 
         if (execution.success === true) {
           core.setFailed(formatFileReadFailureFallback(true))
-          return 1
+          return finish(1)
         }
       }
 
       core.setFailed(
         `Failed to deliver the agent's response from ${path.dirname(bootstrap.responseFilePath)}: ${result.reason} — ${result.detail}`,
       )
-      return 1
+      return finish(1)
     }
 
     responsePostLogger.info('Delivered file-convention response', {kind: result.kind})
@@ -414,7 +444,7 @@ export async function runFinalize(
     if (execution.success === false) {
       if (execution.llmError == null) {
         core.setFailed(`Agent execution failed with exit code ${execution.exitCode}`)
-        return execution.exitCode
+        return finish(execution.exitCode, result.kind)
       }
 
       // Recoverable LLM error, but the response was already delivered above —
@@ -425,21 +455,21 @@ export async function runFinalize(
         type: execution.llmError.type,
         durationMs: duration,
       })
-      return 0
+      return finish(0, result.kind)
     }
 
     logger.info('Agent run completed successfully', {durationMs: duration})
-    return 0
+    return finish(0, result.kind)
   }
 
   if (execution.success) {
     logger.info('Agent run completed successfully', {durationMs: duration})
-    return 0
+    return finish(0, execution.commentsPosted > 0 ? 'comment' : 'none')
   }
 
   if (execution.llmError == null) {
     core.setFailed(`Agent execution failed with exit code ${execution.exitCode}`)
-    return execution.exitCode
+    return finish(execution.exitCode, execution.commentsPosted > 0 ? 'comment' : 'none')
   }
 
   logger.info('Agent failed with recoverable LLM error', {
@@ -452,14 +482,27 @@ export async function runFinalize(
 
   if (isResolvedCommentTarget(commentTarget)) {
     const errorCommentBody = formatErrorComment(execution.llmError)
-    await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+    const posted = await postErrorComment(routing, commentTarget, errorCommentBody, metrics, logger)
+    return finish(0, posted ? 'comment' : 'none')
   } else {
     logger.warning('Cannot post error comment: missing target context')
     core.setFailed(
       'Agent execution failed with a recoverable LLM error, and no delivery surface was available to report it.',
     )
-    return execution.exitCode === 0 ? 1 : execution.exitCode
+    return finish(execution.exitCode === 0 ? 1 : execution.exitCode)
   }
+}
 
-  return 0
+/** Backward-compatible exit-code-only facade for phase callers and existing integrations. */
+export async function runFinalize(
+  bootstrap: BootstrapPhaseResult,
+  routing: RoutingPhaseResult,
+  cacheRestore: CacheRestorePhaseResult,
+  execution: ExecutePhaseResult,
+  metrics: MetricsCollector,
+  startTime: number,
+  logger: Logger,
+): Promise<number> {
+  const result = await runFinalizeWithResult(bootstrap, routing, cacheRestore, execution, metrics, startTime, logger)
+  return result.exitCode
 }

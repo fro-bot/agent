@@ -16,7 +16,7 @@ import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
 import {resolveRequestedOutputModeState, runExecute} from './phases/execute.js'
-import {runFinalize} from './phases/finalize.js'
+import {runFinalizeWithResult} from './phases/finalize.js'
 import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
@@ -56,6 +56,7 @@ export async function run(): Promise<number> {
       sessionId: null,
       resolvedOutputMode: null,
       outputModeMigration: createUnavailableOutputModeMigration(),
+      deliveryKind: 'none',
       cacheStatus: 'miss',
       duration,
     })
@@ -163,7 +164,16 @@ export async function run(): Promise<number> {
 
     metrics.end()
     finalizationStarted = true
-    exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, startTime, bootstrap.logger)
+    const finalization = await runFinalizeWithResult(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      startTime,
+      bootstrap.logger,
+    )
+    exitCode = finalization.exitCode
 
     // Dedup marker is saved only after a confirmed successful outcome (which,
     // for file-convention runs, means finalize's delivery assertion passed —
