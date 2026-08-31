@@ -2541,6 +2541,11 @@ describe('buildAgentPrompt response delivery gating', () => {
       expect(prompt).toContain(expectedSection)
       expect(prompt).toContain(expectedContext)
       expect(prompt).not.toContain(forbiddenText)
+      // The originating defect: a comment surface was told to emit a verdict its
+      // own parser rejects. Assert the absence directly rather than inferring it
+      // from rule numbering — the verdict EXAMPLE renders after the run-summary
+      // template, outside the slice the contiguity test inspects.
+      expect(prompt).not.toContain(RESPONSE_FILE_VERDICT_KEY)
     },
   )
 
