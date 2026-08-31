@@ -86,6 +86,7 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
     },
     customPrompt: null,
     cacheStatus: 'hit',
+    responseSurface: 'issue-comment',
     ...overrides,
   }
 }

@@ -1,9 +1,10 @@
 ---
 type: guide
-last-updated: "2026-08-09"
-updated-by: "c006768"
+last-updated: "2026-08-30"
+updated-by: "schedule-d7190410-33338713321"
 sources:
   - action.yaml
+  - src/shared/brokered-push-paths.ts
   - src/features/delegated/brokered-push.ts
   - src/features/delegated/brokered-push-validation.ts
   - packages/gateway/src/web/operator-route.ts
@@ -49,10 +50,12 @@ If the agent times out before completing:
 When an authorized `@fro-bot` PR comment produces workspace edits but no commit appears on the PR head branch, the [[Execution Lifecycle|brokered push]] step suppressed itself. It is fail-closed by design, so a missing push almost always means one of its trust gates declined rather than a bug:
 
 - **Missing trust anchor** — the workflow must pass `trusted-head-sha` (from the PR head SHA) for the push to be eligible. Without it the step bypasses silently. See [[Setup and Configuration]].
-- **Path outside the allowlist** — brokered pushes are limited to `src/`, package `src/`, `docs/`, and the top-level `README.md`, `ARCHITECTURE.md`, and `STRUCTURE.md`, capped at 100 files. Edits to config, scripts, or CI files are rejected and the run fails loudly.
+- **Path outside the allowlist** — brokered pushes are limited to `src/`, package `src/`, `docs/`, and the top-level `README.md`, `ARCHITECTURE.md`, and `STRUCTURE.md`, capped at 100 files. Edits to config, scripts, or CI files are rejected and the run fails loudly. A consumer can widen the set with the `brokered-push-extra-paths` input (comma-separated prefixes), but protected surfaces stay denied no matter what is listed, and a malformed or overlapping entry fails the run at parse time on _every_ trigger rather than waiting until a push is attempted. To see what the run actually resolved, read the `brokered-push-allowlist` output — it reports the effective `defaultPaths`, `rootFiles`, and `extraPrefixes` as JSON (empty when the run exits before finalize).
 - **Live re-check failed** — the actor's write permission, the PR's open state, and the head branch and SHA are all re-verified immediately before the commit. A moved head, a renamed branch, a closed PR, or a permission lookup error all abort the push.
 - **Not a same-repo PR comment** — the step only runs for `issue_comment` events on a pull request in the same repository from an `OWNER`, `MEMBER`, or `COLLABORATOR`. Fork PRs and other event types never broker a push.
 - **Timed out** — the push has a 120-second ceiling. If it fires after the commit already landed server-side, the run reports failure but the commit exists; a re-run reconstructs a clean workspace and does nothing rather than double-committing.
+
+Since the failure paths above are hard to tell apart from a reason string alone, the brokered-push outcome now carries a closed `failureClass` discriminant — `validation`, `reconstruction`, `moved-head`, `identity`, `permission`, `commit`, `timeout`, or `unknown` — and validation rejections additionally list the offending paths. That is the field to read in the logs when diagnosing a suppressed push; the human-readable reason strings are unchanged and no caller branches on their text.
 
 ## Known Gateway Test Flake
 

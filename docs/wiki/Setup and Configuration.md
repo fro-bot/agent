@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-08-24"
-updated-by: "ses_fd0b1eaf4ffeTMI146lECk0yxc"
+last-updated: "2026-08-30"
+updated-by: "schedule-d7190410-33338713321"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -17,6 +17,9 @@ sources:
   - packages/runtime/src/agent/with-scrubbed-env.ts
   - packages/runtime/src/agent/response-delivery.ts
   - packages/harness/harness.config.json
+  - packages/harness/src/version.ts
+  - scripts/harness/duplicate-harness-release-tags.ts
+  - .github/workflows/harness-release.yaml
   - packages/runtime/src/shared/constants.ts
   - src/shared/constants.ts
   - src/harness/config/inputs.ts
@@ -94,17 +97,33 @@ The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.2
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.18.21`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.18.21+harness.22dee0ee`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries twelve such refs on top of the `1.18.21` base, spanning provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, and several memory-leak and stability patches; as the base advanced up the `1.18.x` line to `1.18.21`, superseded and low-value carries were retired so the set stays lean. The exact carry set is defined in the `integrationRefs` list of `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.18.21`) published by the `anomalyco/opencode` project. A _harness_ version carries a `harness.<sha>` suffix (for example `1.18.21+harness.22dee0ee`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries twelve such refs on top of the `1.18.21` base, spanning provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, and several memory-leak and stability patches; as the base advanced up the `1.18.x` line to `1.18.21`, superseded and low-value carries were retired so the set stays lean. The exact carry set is defined in the `integrationRefs` list of `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
-The presence of the `+harness.` marker drives three behavioral differences in `src/services/setup/opencode.ts`:
+### Two Spellings of the Same Build
 
-- **Download source** — Harness versions are routed to the `fro-bot/agent` releases URL instead of the upstream `anomalyco/opencode` releases. Because harness release tags are non-`v`-prefixed and GitHub stores tags URL-encoded, the `+` in the version is percent-encoded as `%2B` when building the download path. Stock versions keep their conventional `v`-prefixed upstream URL.
+A harness build has one identity but two written forms, and understanding why they differ explains most of the surrounding machinery.
+
+The **build-metadata form** — `1.18.21+harness.22dee0ee` — is what the binary self-reports and what the version pin in `packages/runtime/src/shared/constants.ts` records. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
+
+The **prerelease form** — `1.18.21-harness.22dee0ee` — is the published GitHub release tag, the npm package version, and the tool-cache key.
+
+The prerelease form is not cosmetic. Harness releases live in the same tag namespace as the action's own `v0.x` product releases, and that namespace has two adversarial readers. Semantic-release scans tags matching `^v(.+)` to compute the next product version, so harness tags dropped the `v` prefix in mid-2026 to stay invisible to it. But bare-semver tags with build metadata created a second problem: because SemVer strips build metadata for precedence, Renovate's `github-tags` datasource — which discovers candidates from git tags, not release objects — read `1.18.21+harness.22dee0ee` as a _stable_ `1.18.21` that outranked the real `v0.x` action line, quietly breaking grouped update branches in consuming repositories. Marking the GitHub release object as a prerelease does not help, because candidate discovery never looks at release objects.
+
+Moving the tag to a genuine SemVer prerelease identifier fixes it at the level of the spec rather than at the level of a tool's enrichment behavior: prereleases are excluded by Renovate's default `ignoreUnstable` setting. The two constraints are therefore satisfied by different properties of the same tag — the missing `v` hides it from semantic-release, and the prerelease identifier hides it from Renovate. The eighteen legacy `+harness.` releases were migrated by duplication rather than rename (`scripts/harness/duplicate-harness-release-tags.ts`, a completed one-off), because their asset URLs are load-bearing for any pinned run still referencing them.
+
+### How the Marker Changes the Install Path
+
+`src/services/setup/opencode.ts` recognizes either spelling as a harness build, and converts to the release-tag form at the boundaries that need it (`toHarnessReleaseTag()`; `toolCacheVersion()` is a named alias for the same conversion). Three behaviors follow:
+
+- **Download source** — Harness versions are routed to the `fro-bot/agent` releases URL instead of the upstream `anomalyco/opencode` releases, with the tag derived through the prerelease conversion. Percent-encoding of `+` as `%2B` is retained for the migrated legacy tags, since GitHub stores tags URL-encoded and a raw `+` is misread as a space. Stock versions keep their conventional `v`-prefixed upstream URL.
 
 - **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary; the stock fallback (`FALLBACK_VERSION`, currently `1.18.21`) is reached only on the `latest`-resolution path.
 
-- **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build-metadata and would collapse a harness build onto a stock cache entry of the same base version. To preserve identity, the `+harness.` marker is rewritten to a `-harness.` prerelease segment (`toolCacheVersion()`) _only_ at tool-cache call sites. Download URLs, checksums, logs, and return values keep the raw `+harness.` form. This guarantees a harness build and a stock build of the same base version never share a cache slot.
+- **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build metadata and would collapse a harness build onto a stock cache entry of the same base version. The prerelease form survives `semver.clean()` intact, so using it as the cache key guarantees a harness build and a stock build of the same base version never share a cache slot. Logs and the binary's own `--version` output keep the build-metadata form.
 
 If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`, currently `1.18.21`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
+
+Because the tag shape is now load-bearing for two external tools and is derived in more than one place — the release workflow, the npm version builder, and the setup module — the test suite carries drift guards that read the repository's source text and fail if one producer is changed without the others. These guards exist because an earlier mirrored copy of the harness-version predicate asserted the opposite of production behavior and still passed, testing its own copy rather than the module.
 
 ## Configuration Assembly
 

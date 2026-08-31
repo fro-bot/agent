@@ -38,7 +38,7 @@ describe('createCancelNoticeDispatcher', () => {
     await dispatch('', 'run-1')
 
     // #then
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- vi.fn() mock reference, not a real method
+
     expect(client.channels.fetch).not.toHaveBeenCalled()
     expect(logger.info).toHaveBeenCalledWith(
       {runId: 'run-1'},
@@ -57,7 +57,7 @@ describe('createCancelNoticeDispatcher', () => {
     await dispatch('thread-1', 'run-1')
 
     // #then
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- vi.fn() mock reference, not a real method
+
     expect(client.channels.fetch).toHaveBeenCalledWith('thread-1')
     expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({content: CANCELLED_NOTICE_TEXT}))
   })

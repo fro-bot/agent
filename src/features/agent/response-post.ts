@@ -19,7 +19,7 @@ import type {ReviewEvent} from '../reviews/types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
-import {parseResponseFile} from '@fro-bot/runtime'
+import {parseResponseFile, RESPONSE_FILE_VERDICT_REJECTION_REASONS, RESPONSE_SURFACE_POLICIES} from '@fro-bot/runtime'
 import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../services/github/types.js'
 import {readThread} from '../comments/reader.js'
 import {postComment} from '../comments/writer.js'
@@ -92,6 +92,7 @@ export type ReadAndParseResponseFileResult =
         readonly surface: ResponseSurface
         readonly recoveredFromFallback: boolean
         readonly actualResponseFilePath: string
+        readonly droppedVerdict?: true
       }
     }
   | ResponsePostFailure
@@ -229,6 +230,60 @@ export async function readAndParseResponseFile(
 
   const surface = resolveResponseSurface(agentContext, triggerResult.context)
   const parsed = parseResponseFile(raw, {surface})
+  const recoveredFromFallback = actualResponseFilePath !== responseFilePath
+
+  if (
+    parsed.success === false &&
+    (parsed.error.reason === 'verdict-on-non-review' ||
+      (RESPONSE_SURFACE_POLICIES[surface].verdictRequired === false &&
+        RESPONSE_FILE_VERDICT_REJECTION_REASONS[parsed.error.reason] === true))
+  ) {
+    // Keep parseResponseFile strict for its other callers, but recover the
+    // already-validated prose for delivery rather than discarding the turn.
+    //
+    // Two distinct recoveries, and the difference is load-bearing:
+    //  - verdict-on-non-review: a well-formed verdict landed on a comment
+    //    surface. Re-parse the file unchanged against the review surface, which
+    //    RE-VALIDATES the verdict — a malformed one still fails here rather
+    //    than being waved through.
+    //  - a verdict the parser cannot accept on a verdict-optional surface: the
+    //    verdict is already known bad, so strip the frontmatter and parse the
+    //    remaining prose.
+    const isStrayVerdict = parsed.error.reason === 'verdict-on-non-review'
+    const recoverableRaw = isStrayVerdict ? raw : bodyWithoutFrontmatter(raw)
+    const recoverable =
+      recoverableRaw == null
+        ? null
+        : parseResponseFile(recoverableRaw, {surface: isStrayVerdict ? 'pr-review' : surface})
+    if (recoverable != null && recoverable.success) {
+      if (isStrayVerdict === false) {
+        logger.warning('Response-post: invalid verdict on permitted surface; posting response body as a comment', {
+          surface,
+          reason: parsed.error.reason,
+        })
+      }
+      if (recoveredFromFallback) {
+        logger.warning('Response-post: recovered response file from fallback location', {
+          expectedResponsePath: responsePathForLog(responseFilePath),
+          actualResponsePath: responsePathForLog(actualResponseFilePath),
+          expectedResponseDirectory: path.dirname(responseFilePath),
+          actualResponseDirectory: path.dirname(actualResponseFilePath),
+        })
+      }
+
+      return {
+        success: true,
+        data: {
+          parsed: {body: recoverable.data.body},
+          surface,
+          recoveredFromFallback,
+          actualResponseFilePath,
+          droppedVerdict: true,
+        },
+      }
+    }
+  }
+
   if (parsed.success === false) {
     logger.error('Response-post: response file failed validation', {
       responseFileDirectory: path.dirname(actualResponseFilePath),
@@ -237,7 +292,6 @@ export async function readAndParseResponseFile(
     return failure('parse-failed', parsed.error.message)
   }
 
-  const recoveredFromFallback = actualResponseFilePath !== responseFilePath
   if (recoveredFromFallback) {
     logger.warning('Response-post: recovered response file from fallback location', {
       expectedResponsePath: responsePathForLog(responseFilePath),
@@ -252,6 +306,26 @@ export async function readAndParseResponseFile(
 
 function withMarker(body: string): string {
   return body.includes(BOT_COMMENT_MARKER) ? body : `${body}\n\n${BOT_COMMENT_MARKER}`
+}
+
+function bodyWithoutFrontmatter(raw: string): string | null {
+  const delimiter = '---'
+  if (raw.startsWith(delimiter) === false) return null
+
+  const afterOpen = raw.slice(delimiter.length)
+  const openNewlineIndex = afterOpen.indexOf('\n')
+  if (openNewlineIndex === -1) return null
+
+  const rest = afterOpen.slice(openNewlineIndex + 1)
+  const closeDelimiter = `\n${delimiter}`
+  const closeIndex = rest.indexOf(closeDelimiter)
+  if (closeIndex === -1) return null
+
+  const afterClose = rest.slice(closeIndex + closeDelimiter.length)
+  const bodyStartMatch = /^[ \t]*\n/.exec(afterClose)
+  if (bodyStartMatch == null) return null
+
+  return afterClose.slice(bodyStartMatch[0].length)
 }
 
 function appendDeliveryFooter(body: string, deliveryFooter: string | undefined): string {
@@ -286,7 +360,10 @@ function withRunMarker(body: string): string {
 function deriveSurfaceAndTarget(
   agentContext: AgentContext,
   triggerResult: TriggerResultProcess,
-): {readonly surface: 'issue-comment' | 'pr-comment' | 'pr-review'; readonly target: CommentTarget | null} {
+): {readonly surface: ResponseSurface; readonly target: CommentTarget | null} {
+  // issue_comment on a PR is review-permitted only because
+  // checkIssueCommentSkipConditions (src/features/triggers/skip-conditions-comment.ts)
+  // has already rejected bots and authors outside the configured trusted association set.
   const surface = resolveResponseSurface(agentContext, triggerResult.context)
   const [owner, repo] = agentContext.repo.split('/')
   if (owner == null || owner.length === 0 || repo == null || repo.length === 0 || agentContext.issueNumber == null) {
@@ -297,7 +374,7 @@ function deriveSurfaceAndTarget(
 
   return {
     surface,
-    target: {type: surface === 'issue-comment' ? 'issue' : 'pr', number, owner, repo},
+    target: {type: RESPONSE_SURFACE_POLICIES[surface].target, number, owner, repo},
   }
 }
 
@@ -354,13 +431,10 @@ async function postCommentWithRetry(
  *
  * Comment surfaces post via `postComment`. A `pr-review` surface with a
  * verdict submits through the shared fork/self/head-SHA/TOCTOU guards
- * (`review-guards.ts`) before calling `submitReview`. A guard-blocked
- * APPROVE/REQUEST_CHANGES on a fork or self-authored PR is treated as
- * `review-guard-blocked` — a legitimate refusal, not a partial post, but it
- * still fails the delivery assertion because the model was instructed to
- * respond and nothing was posted. Operators reading the failure reason can
- * distinguish "guard correctly blocked an unsafe approve" from a genuine
- * writer outage.
+ * (`review-guards.ts`) before calling `submitReview`. A guard-blocked APPROVE
+ * on a permitted mention surface degrades to a comment: the review is refused,
+ * but the model's response is still delivered. Required review surfaces remain
+ * fail-closed when a guarded review cannot be submitted.
  */
 export async function runResponsePost(params: RunResponsePostParams, logger: Logger): Promise<ResponsePostResult> {
   const {octokit, agentContext, triggerResult, botLogin, responseFilePath, responseFilePathCandidates, deliveryFooter} =
@@ -374,7 +448,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return prepared
   }
 
-  const {surface, parsed, recoveredFromFallback, actualResponseFilePath} = prepared.data
+  const {surface, parsed, recoveredFromFallback, actualResponseFilePath, droppedVerdict} = prepared.data
   const {target} = deriveSurfaceAndTarget(agentContext, triggerResult)
 
   if (target == null) {
@@ -382,20 +456,28 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return failure('missing-target-context', 'Cannot post: missing owner/repo/issue number in routing context')
   }
 
-  const body = withMarker(parsed.body)
+  if (droppedVerdict === true) {
+    logger.warning(`Response-post: dropped verdict on "${surface}" surface; posting response body as a comment`, {
+      surface,
+    })
+  }
+
+  const body = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
 
   if (parsed.verdict == null) {
     // A pull_request trigger's surface is always 'pr-review' and requires a
     // structured verdict — falling through to a plain comment here would
     // silently downgrade a required review into a comment and still report
     // delivered:true. Fail closed instead; nothing is posted.
-    if (surface === 'pr-review') {
+    if (RESPONSE_SURFACE_POLICIES[surface].verdictRequired) {
       logger.error('Response-post: pr-review surface has no verdict frontmatter', {
         responseFileDirectory: path.dirname(responseFilePath),
       })
       return failure('missing-verdict', 'pull_request responses must carry a verdict frontmatter')
     }
 
+    // A mention on a PR is review-permitted, not review-required. Its no-verdict
+    // response intentionally falls through to the normal comment delivery path.
     const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
     const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
     if (posted === false) {
@@ -404,8 +486,22 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return {delivered: true, kind: 'comment'}
   }
 
-  // pr-review surface with a structured verdict.
+  // All review-capable structured verdicts use the same guarded review path.
+  // The response file never selects or changes the surface.
   if (botLogin == null || botLogin.length === 0) {
+    if (RESPONSE_SURFACE_POLICIES[surface].verdictRequired === false) {
+      logger.warning('Response-post: verdict could not be submitted; degrading to comment', {
+        surface,
+        reason: 'missing-target-context',
+      })
+      const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+      const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
+      if (posted === false) {
+        return failure('post-failed', 'postComment returned null after retries')
+      }
+      return {delivered: true, kind: 'comment'}
+    }
+
     return failure('missing-target-context', 'Cannot submit a review: bot login is unavailable')
   }
 
@@ -427,6 +523,20 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
   )
 
   if (guard.allowed === false) {
+    if (RESPONSE_SURFACE_POLICIES[surface].verdictRequired === false) {
+      logger.warning('Response-post: review guard blocked the verdict; degrading to comment', {
+        reason: guard.reason,
+        prNumber: target.number,
+        surface,
+      })
+      const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+      const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
+      if (posted === false) {
+        return failure('post-failed', 'postComment returned null after retries')
+      }
+      return {delivered: true, kind: 'comment'}
+    }
+
     logger.warning('Response-post: review guard blocked the verdict, no review submitted', {
       reason: guard.reason,
       prNumber: target.number,
@@ -454,6 +564,8 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     )
 
     if (outcome.submitted === false) {
+      // Unlike an authorization refusal, a moved head makes the generated content stale;
+      // never publish that stale content as a comment, even on a permitted surface.
       return failure('review-guard-blocked', `Review guard blocked submission: ${outcome.reason}`)
     }
 

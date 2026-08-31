@@ -1,9 +1,11 @@
 ---
 type: convention
-last-updated: "2026-08-09"
-updated-by: "c006768"
+last-updated: "2026-08-30"
+updated-by: "schedule-d7190410-33338713321"
 sources:
   - AGENTS.md
+  - scripts/module-taxonomy.test.ts
+  - scripts/harness-tag-derivation.test.ts
   - packages/runtime/src/shared/logger.ts
   - packages/runtime/src/shared/types.ts
   - src/shared/logger.ts
@@ -103,6 +105,18 @@ Test files use BDD-style comments to structure assertions:
 ```
 
 External dependencies (`@actions/core`, `@actions/github`, `@opencode-ai/sdk`) are mocked with `vi.mock()`. Internal modules are not mocked — tests exercise real code paths through the layer below.
+
+One directory sits outside this convention. `deploy/scripts/` is plain Node ESM (`.mjs`) tested with the built-in `node --test` runner: it is not a workspace package, has no build step, and is exercised in CI by a dedicated smoke job. The split is deliberate — deployment scripts run on hosts where the monorepo's toolchain may not exist, so they are kept dependency-free rather than folded into Vitest.
+
+### Drift Guards
+
+A second, less common pattern appears where one fact is necessarily produced in more than one place — for example the harness release-tag shape, which is derived independently by the release workflow, the npm version builder, and the setup module (see [[Setup and Configuration]]). Rather than accept that these will silently diverge, the suite carries **drift guards**: tests that read the repository's own source text and fail by name when one producer is changed without the others.
+
+The guards exist because the obvious alternative failed in practice. A mirrored copy of the harness-version predicate, added under a comment claiming it matched production, kept passing after production changed — it was asserting against its own copy, not the module. That is the failure mode drift guards are built to prevent, and it is why they are written to fail in a specific, nameable direction rather than to merely pattern-match a line. Their known limitations (for instance, the shared comment-stripper does not parse regex literals) are documented at the guard, and are chosen so that a parse failure produces a _weaker_ guard rather than a false pass on missing code.
+
+## Documented Solutions
+
+Solved problems are written up under `docs/solutions/`, organized by category, each carrying YAML frontmatter with `module`, `tags`, and `problem_type`. The `module` field is not free text: it draws from a closed taxonomy enforced by a test (`scripts/module-taxonomy.test.ts`). Closing the set was a deliberate trade — it costs a small explicit step when a genuinely new subsystem appears, and in exchange it keeps retrieval reliable, since near-synonym modules would otherwise accumulate and quietly split a topic's documents across several labels.
 
 ## Naming
 

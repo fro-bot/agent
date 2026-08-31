@@ -77,6 +77,10 @@ gh CLI Reference (always)
 | `pull_request`                 | true        | Code review directive + custom appended             |
 | `schedule`/`workflow_dispatch` | false       | Custom prompt IS the directive (replaces, required) |
 
+### Response surfaces
+
+The Action derives the response surface from trusted routing context and carries it through prompting, parsing, and delivery. A `pull_request` run requires a review; an authorized `issue_comment` mention on a pull request permits either a review when the response includes a verdict or a comment when it does not; other response-file paths are comment-only. Mention authorization uses the existing `OWNER`/`MEMBER`/`COLLABORATOR` association gate. The response file supplies response content, never the delivery target or surface.
+
 ## PATTERNS
 
 - **SDK Lifecycle (RFC-013)**: Spawn server → connect client → create session → send prompt → stream events → close
