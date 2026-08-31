@@ -14,7 +14,7 @@
   "dependencies": {
     "@fro-bot/runtime": "workspace:*",
     "@hono/node-server": "2.1.1",
-    "@octokit/core": "7.0.6",
+    "@octokit/core": "7.0.7",
     "discord.js": "14.27.0",
     "effect": "3.22.1",
     "hono": "4.13.5",
