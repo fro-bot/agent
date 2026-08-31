@@ -398,6 +398,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
  */
 function toSafeRepositoryId(id: number | bigint): number | null {
   if (typeof id === 'bigint') {
+    // Fast path: avoid Number() for non-positive bigint values; the usability predicate below remains authoritative.
     if (id <= 0n) return null
 
     const numericId = Number(id)

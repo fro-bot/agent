@@ -260,6 +260,7 @@ describe('readRepoDenylist — happy path', () => {
     // #then — the entire denylist load fails closed
     expect(result.success).toBe(false)
     expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+    expect(result.success === false ? result.error.message : '').toContain('redacted entry at index 0')
   })
 })
 
@@ -286,6 +287,34 @@ describe('readRepoDenylist — R_-format fail-closed hardening', () => {
     // #then — whole load fails closed
     expect(result.success).toBe(false)
     expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+  })
+
+  it('identifies a later R_-format entry with an unusable database_id and describes the defect', async () => {
+    // #given — a valid entry followed by an R_ node_id paired with database_id: 0
+    const yaml = makeYaml([
+      {
+        owner: 'public-owner',
+        name: 'public-repo',
+        private: false,
+      },
+      {
+        owner: '[REDACTED]',
+        name: '[REDACTED]',
+        node_id: 'R_kgDOJ_bMaQ',
+        private: true,
+        database_id: 0,
+      },
+    ])
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — the error points to the zero-based offending entry and names the unusable field
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe(
+      'metadata/repos.yaml: redacted entry at index 1 has no usable numeric database_id ' +
+        '(R_-format node_id with missing or unusable database_id)',
+    )
   })
 
   it('succeeds when a redacted entry has an R_-format node_id AND a direct database_id', async () => {

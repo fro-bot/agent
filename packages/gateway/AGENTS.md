@@ -10,7 +10,7 @@ Gateway operator surfaces honor the `metadata/repos.yaml` denylist from `fro-bot
 
 **Deny keys** (`databaseId` / `nodeId`) are captured at ingest time (`add-project`) via `GET /repos/{owner}/{repo}` and stored on the `RepoBinding` (gateway-local; the shared `RunState` is not changed). At surface time the gate resolves run → binding → deny keys — no GitHub call is made to resolve repo identity. This is the denylist-before-query invariant.
 
-GitHub models repository ids as int64. `getRepoIdentity` converts one to a `number` only when the value round-trips exactly, and yields `null` otherwise rather than a lossy id that could collide with another repo's key; the binding then carries `nodeId` alone. A binding deny key is therefore best-effort per key and fail-closed in aggregate — distinct from the `repos.yaml` rule below, which governs the denylist source and is unchanged.
+GitHub models repository ids as int64, so a numeric id is only usable as a deny key when it is a positive integer JavaScript can represent exactly. `isUsableRepositoryId` (`src/shared/repository-id.ts`) is the single definition of that, and both sides of the match consult it: `getRepoIdentity` yields `null` rather than a lossy id that could collide with another repo's key, leaving the binding to carry `nodeId` alone, and a redacted `repos.yaml` entry whose only key is unrepresentable fails the load closed. A binding deny key is therefore best-effort per key and fail-closed in aggregate. Keep the two sides on one predicate — when they disagreed, an oversized id matched itself only by both sides being lossy in the same way.
 
 **Fail-closed posture:**
 - Cold start (never successfully loaded) → deny all. No last-known-good to fall back to.

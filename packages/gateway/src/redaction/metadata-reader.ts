@@ -248,7 +248,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
   const redactedNodeIds = new Set<string>()
   const redactedDatabaseIds = new Set<number>()
 
-  for (const rawEntry of doc.repos) {
+  for (const [entryIndex, rawEntry] of doc.repos.entries()) {
     if (rawEntry === null || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
       // FIX 8: Fail closed on malformed/null entries — a null or non-object entry in the
       // repos array is a corruption signal. Silently skipping it could miss a redaction
@@ -281,7 +281,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
       if (hasValidNodeId === false && hasDirectDatabaseId === false) {
         return err(
           new MetadataSchemaError(
-            `${METADATA_PATH}: redacted entry has no usable deny key (node_id missing or empty, database_id missing or unusable)`,
+            `${METADATA_PATH}: redacted entry at index ${entryIndex} has no usable deny key (node_id missing or empty, database_id missing or unusable)`,
           ),
         )
       }
@@ -298,7 +298,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
       if (hasUsableNumericId === false) {
         return err(
           new MetadataSchemaError(
-            `${METADATA_PATH}: redacted entry has no usable numeric database_id (R_-format node_id with no direct database_id field)`,
+            `${METADATA_PATH}: redacted entry at index ${entryIndex} has no usable numeric database_id (R_-format node_id with missing or unusable database_id)`,
           ),
         )
       }
