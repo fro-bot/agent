@@ -256,7 +256,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
       // the denylist, allowing the repo to surface). Fail the whole load closed instead.
       return err(
         new MetadataSchemaError(
-          `${METADATA_PATH}: repos array contains a malformed entry (null or non-object) — failing closed`,
+          `${METADATA_PATH}: repos array contains a malformed entry at index ${entryIndex} (null or non-object) — failing closed`,
         ),
       )
     }

@@ -493,6 +493,22 @@ describe('readRepoDenylist — malformed entry fail-closed (FIX 8)', () => {
     expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
   })
 
+  it('names the offending index for a malformed entry so a deny-all failure is locatable', async () => {
+    // #given — a well-formed entry first, so the reported index cannot be a coincidence
+    // of the offending row being the only one. A stray dash or a commented-out body makes
+    // this the most reachable of the three fail-closed paths.
+    const yaml = 'version: 1\nrepos:\n  - name: allowed\n    owner: acme\n    private: false\n  - null\n'
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — the index identifies the position in repos, not a counter over redacted rows
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : null).toBe(
+      'metadata/repos.yaml: repos array contains a malformed entry at index 1 (null or non-object) — failing closed',
+    )
+  })
+
   it('fails closed (MetadataSchemaError) when the repos array contains a non-object entry (string)', async () => {
     // #given — repos array with a string entry (corruption)
     const yaml = 'version: 1\nrepos:\n  - "not-an-object"\n'
