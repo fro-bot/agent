@@ -15,6 +15,7 @@ export function setOutputModeMigration(outputModeMigration: OutputModeMigrationS
 export function setActionOutputs(outputs: ActionOutputs): void {
   core.setOutput('session-id', outputs.sessionId ?? '')
   core.setOutput('resolved-output-mode', outputs.resolvedOutputMode ?? '')
+  core.setOutput('delivery-kind', outputs.deliveryKind)
   if (outputs.outputModeMigration != null) {
     setOutputModeMigration(outputs.outputModeMigration)
   }
@@ -24,4 +25,8 @@ export function setActionOutputs(outputs: ActionOutputs): void {
   )
   core.setOutput('cache-status', outputs.cacheStatus)
   core.setOutput('duration', outputs.duration)
+}
+
+export function setDeliveryKindOutput(deliveryKind: ActionOutputs['deliveryKind']): void {
+  core.setOutput('delivery-kind', deliveryKind)
 }

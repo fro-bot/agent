@@ -3,6 +3,7 @@ import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../se
 import type {ModelConfig, OmoProviders, ResolvedOutputMode, ResponseMode, TokenUsage} from '../shared/types.js'
 import type {ErrorInfo} from './error-format/types.js'
 import type {ResponseDelivery} from './response-delivery.js'
+import type {ResponseSurface} from './response-file.js'
 
 export type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 export type {OutputMode, ResolvedOutputMode, ResponseMode} from '../shared/types.js'
@@ -259,6 +260,12 @@ export interface PromptOptions {
    * callers that don't thread this field keep today's behavior.
    */
   readonly responseDelivery?: ResponseDelivery
+  /**
+   * The trusted response surface for this run. Action execution always
+   * supplies this value. Prompt construction consumes it without deriving or
+   * changing the delivery authority selected by the Action layer.
+   */
+  readonly responseSurface: ResponseSurface
   /**
    * The exact run-scoped path (outside the checkout) the model must write
    * its response to. Required and non-null whenever
