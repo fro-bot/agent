@@ -241,6 +241,27 @@ describe('readRepoDenylist — happy path', () => {
     expect(result.success).toBe(true)
     expect(result.success === true ? result.data.redactedDatabaseIds.has(1869154) : false).toBe(true)
   })
+
+  it('fails closed when a redacted entry has only an unrepresentable database_id', async () => {
+    // #given — the direct numeric deny key cannot be represented safely as a JavaScript integer
+    const yaml = makeYaml([
+      {
+        owner: '[REDACTED]',
+        name: '[REDACTED]',
+        private: true,
+        database_id: Number.MAX_SAFE_INTEGER + 1,
+        // no node_id — the unrepresentable id is the entry's only deny key
+      },
+    ])
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — the entire denylist load fails closed
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+    expect(result.success === false ? result.error.message : '').toContain('redacted entry at index 0')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -266,6 +287,34 @@ describe('readRepoDenylist — R_-format fail-closed hardening', () => {
     // #then — whole load fails closed
     expect(result.success).toBe(false)
     expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+  })
+
+  it('identifies a later R_-format entry with an unusable database_id and describes the defect', async () => {
+    // #given — a valid entry followed by an R_ node_id paired with database_id: 0
+    const yaml = makeYaml([
+      {
+        owner: 'public-owner',
+        name: 'public-repo',
+        private: false,
+      },
+      {
+        owner: '[REDACTED]',
+        name: '[REDACTED]',
+        node_id: 'R_kgDOJ_bMaQ',
+        private: true,
+        database_id: 0,
+      },
+    ])
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — the error points to the zero-based offending entry and names the unusable field
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe(
+      'metadata/repos.yaml: redacted entry at index 1 has no usable numeric database_id ' +
+        '(R_-format node_id with missing or unusable database_id)',
+    )
   })
 
   it('succeeds when a redacted entry has an R_-format node_id AND a direct database_id', async () => {
@@ -442,6 +491,22 @@ describe('readRepoDenylist — malformed entry fail-closed (FIX 8)', () => {
     // #then — whole load fails closed
     expect(result.success).toBe(false)
     expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+  })
+
+  it('names the offending index for a malformed entry so a deny-all failure is locatable', async () => {
+    // #given — a well-formed entry first, so the reported index cannot be a coincidence
+    // of the offending row being the only one. A stray dash or a commented-out body makes
+    // this the most reachable of the three fail-closed paths.
+    const yaml = 'version: 1\nrepos:\n  - name: allowed\n    owner: acme\n    private: false\n  - null\n'
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — the index identifies the position in repos, not a counter over redacted rows
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : null).toBe(
+      'metadata/repos.yaml: repos array contains a malformed entry at index 1 (null or non-object) — failing closed',
+    )
   })
 
   it('fails closed (MetadataSchemaError) when the repos array contains a non-object entry (string)', async () => {

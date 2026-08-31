@@ -22,7 +22,7 @@ import type {RepoKey} from './denylist.js'
 import type {BindingsLookup} from './surface-gate.js'
 
 import {describe, expect, it, vi} from 'vitest'
-import {filterDeniedRecords, projectRunStatus, resolveRunRepoKey} from './surface-gate.js'
+import {bindingToRepoKey, filterDeniedRecords, projectRunStatus, resolveRunRepoKey} from './surface-gate.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -82,8 +82,14 @@ function makeDenyById(deniedId: number): (key: RepoKey) => boolean {
   return key => key.databaseId !== null && key.databaseId === deniedId
 }
 
-/** isRepoDenied that denies null/null keys (fail-closed). */
-const denyMissingKey: (key: RepoKey) => boolean = key => key.databaseId === null && key.nodeId === null
+/** isRepoDenied that denies a specific nodeId. */
+function makeDenyByNodeId(deniedNodeId: string): (key: RepoKey) => boolean {
+  return key => key.nodeId !== null && key.nodeId === deniedNodeId
+}
+
+/** isRepoDenied that denies null/null or empty-nodeId keys (fail-closed). */
+const denyMissingKey: (key: RepoKey) => boolean = key =>
+  key.databaseId === null && (key.nodeId === null || key.nodeId === '')
 
 /** isRepoDenied that allows everything. */
 const allowAll: (key: RepoKey) => boolean = () => false
@@ -93,6 +99,14 @@ const allowAll: (key: RepoKey) => boolean = () => false
 // ---------------------------------------------------------------------------
 
 describe('resolveRunRepoKey', () => {
+  it('preserves nodeId when databaseId is null', () => {
+    // #given — an identity whose numeric id is not representable exactly
+    const bindingKey = bindingToRepoKey({databaseId: null, nodeId: 'R_unsafe-id'})
+
+    // #then — nodeId remains available as an independent deny key
+    expect(bindingKey).toEqual({databaseId: null, nodeId: 'R_unsafe-id'})
+  })
+
   it('resolves a run entity_ref to the binding deny keys', async () => {
     // #given a run with entity_ref 'acme/widget#1' and a binding with deny keys
     const binding = makeBinding({databaseId: 42, nodeId: 'MDEwOlJlcG9zaXRvcnk0Mg=='})
@@ -199,6 +213,60 @@ describe('projectRunStatus', () => {
     })
 
     // #then the run is omitted (null)
+    expect(result).toBeNull()
+  })
+
+  it('denies a null databaseId when the binding nodeId is denylisted', async () => {
+    // #given — the numeric key is unusable, but the nodeId is denylisted
+    const binding = {...makeBinding({nodeId: 'denied-node-id'}), databaseId: null} as unknown as RepoBinding
+    const lookup = fakeBindingsLookup(binding)
+    const runState = makeRunState({entity_ref: 'acme/widget#1'})
+
+    // #when projected through the real binding → predicate path
+    const result = await projectRunStatus(runState, {
+      nowMs: BASE_NOW_MS,
+      staleThresholdMs: STALE_THRESHOLD_MS,
+      bindingsLookup: lookup,
+      isRepoDenied: makeDenyByNodeId('denied-node-id'),
+    })
+
+    // #then — nodeId still enforces denial when databaseId is unusable
+    expect(result).toBeNull()
+  })
+
+  it('allows a null databaseId when the binding nodeId is not denylisted', async () => {
+    // #given — the numeric key is unusable, but the nodeId is allowed
+    const binding = {...makeBinding({nodeId: 'allowed-node-id'}), databaseId: null} as unknown as RepoBinding
+    const lookup = fakeBindingsLookup(binding)
+    const runState = makeRunState({entity_ref: 'acme/widget#1'})
+
+    // #when projected through the real binding → predicate path
+    const result = await projectRunStatus(runState, {
+      nowMs: BASE_NOW_MS,
+      staleThresholdMs: STALE_THRESHOLD_MS,
+      bindingsLookup: lookup,
+      isRepoDenied: makeDenyByNodeId('denied-node-id'),
+    })
+
+    // #then — an allowed nodeId remains visible
+    expect(result).not.toBeNull()
+  })
+
+  it('denies a binding when neither databaseId nor nodeId is usable', async () => {
+    // #given — both deny keys are unusable
+    const binding = {...makeBinding({nodeId: ''}), databaseId: null} as unknown as RepoBinding
+    const lookup = fakeBindingsLookup(binding)
+    const runState = makeRunState({entity_ref: 'acme/widget#1'})
+
+    // #when projected through the real binding → predicate path
+    const result = await projectRunStatus(runState, {
+      nowMs: BASE_NOW_MS,
+      staleThresholdMs: STALE_THRESHOLD_MS,
+      bindingsLookup: lookup,
+      isRepoDenied: denyMissingKey,
+    })
+
+    // #then — no usable deny key fails closed
     expect(result).toBeNull()
   })
 

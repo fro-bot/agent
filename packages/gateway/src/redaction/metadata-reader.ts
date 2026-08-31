@@ -34,6 +34,7 @@ import {err, ok} from '@fro-bot/runtime'
 import {parse} from 'yaml'
 
 import {safeErrorMessage} from '../github/errors.js'
+import {isUsableRepositoryId} from '../shared/repository-id.js'
 
 // ---------------------------------------------------------------------------
 // Reader interface (injectable — tests inject a fake, production injects real)
@@ -247,7 +248,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
   const redactedNodeIds = new Set<string>()
   const redactedDatabaseIds = new Set<number>()
 
-  for (const rawEntry of doc.repos) {
+  for (const [entryIndex, rawEntry] of doc.repos.entries()) {
     if (rawEntry === null || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
       // FIX 8: Fail closed on malformed/null entries — a null or non-object entry in the
       // repos array is a corruption signal. Silently skipping it could miss a redaction
@@ -255,7 +256,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
       // the denylist, allowing the repo to surface). Fail the whole load closed instead.
       return err(
         new MetadataSchemaError(
-          `${METADATA_PATH}: repos array contains a malformed entry (null or non-object) — failing closed`,
+          `${METADATA_PATH}: repos array contains a malformed entry at index ${entryIndex} (null or non-object) — failing closed`,
         ),
       )
     }
@@ -273,14 +274,14 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
       // matching is format-fragile and could miss a cross-format skew.
       const hasValidNodeId = typeof entry.node_id === 'string' && entry.node_id.length > 0
       const rawDbId = entry.database_id ?? entry.id
-      const hasDirectDatabaseId = typeof rawDbId === 'number' && Number.isFinite(rawDbId)
+      const hasDirectDatabaseId = isUsableRepositoryId(rawDbId)
 
       // Fail closed: no usable deny key at all.
       // No-oracle: do NOT include owner/name in the error message.
       if (hasValidNodeId === false && hasDirectDatabaseId === false) {
         return err(
           new MetadataSchemaError(
-            `${METADATA_PATH}: redacted entry has no usable deny key (node_id missing or empty, database_id absent)`,
+            `${METADATA_PATH}: redacted entry at index ${entryIndex} has no usable deny key (node_id missing or empty, database_id missing or unusable)`,
           ),
         )
       }
@@ -297,7 +298,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
       if (hasUsableNumericId === false) {
         return err(
           new MetadataSchemaError(
-            `${METADATA_PATH}: redacted entry has no usable numeric database_id (R_-format node_id with no direct database_id field)`,
+            `${METADATA_PATH}: redacted entry at index ${entryIndex} has no usable numeric database_id (R_-format node_id with missing or unusable database_id)`,
           ),
         )
       }
@@ -306,7 +307,7 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
         redactedNodeIds.add(nodeIdStr)
       }
 
-      if (hasDirectDatabaseId && typeof rawDbId === 'number') {
+      if (isUsableRepositoryId(rawDbId)) {
         redactedDatabaseIds.add(rawDbId)
       }
 

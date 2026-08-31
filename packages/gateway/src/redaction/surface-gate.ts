@@ -51,7 +51,9 @@ export interface BindingsLookup {
   readonly getBindingByRepo: (
     owner: string,
     repo: string,
-  ) => Promise<{success: true; data: {databaseId?: number; nodeId?: string} | null} | {success: false; error: Error}>
+  ) => Promise<
+    {success: true; data: {databaseId?: number | null; nodeId?: string} | null} | {success: false; error: Error}
+  >
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +68,7 @@ export interface BindingsLookup {
  * a missing/wrong-typed key yields `null` for that field (fail-closed at the
  * denylist check).
  */
-export function bindingToRepoKey(binding: {readonly databaseId?: number; readonly nodeId?: string}): RepoKey {
+export function bindingToRepoKey(binding: {readonly databaseId?: number | null; readonly nodeId?: string}): RepoKey {
   return {
     databaseId: typeof binding.databaseId === 'number' ? binding.databaseId : null,
     nodeId: typeof binding.nodeId === 'string' ? binding.nodeId : null,

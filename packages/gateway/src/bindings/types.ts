@@ -1,3 +1,5 @@
+import {isUsableRepositoryId} from '../shared/repository-id.js'
+
 export interface RepoBinding {
   readonly owner: string
   readonly repo: string
@@ -20,6 +22,23 @@ export interface RepoBinding {
    * INTERNAL: must NOT appear on any operator-facing projection (e.g. OperatorRunStatus).
    */
   readonly nodeId?: string
+}
+
+/**
+ * Add a repository database id only when it is usable.
+ *
+ * The binding store represents an unavailable id by omitting the optional field;
+ * callers must not persist `null` as though it were a numeric deny key.
+ */
+export function withOptionalDatabaseId(binding: RepoBinding, databaseId: number | null | undefined): RepoBinding {
+  const bindingWithoutDatabaseId = {...binding}
+  delete bindingWithoutDatabaseId.databaseId
+
+  if (isUsableRepositoryId(databaseId) === false) {
+    return bindingWithoutDatabaseId
+  }
+
+  return {...bindingWithoutDatabaseId, databaseId}
 }
 
 export interface ChannelIndex {
