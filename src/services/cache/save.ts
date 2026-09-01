@@ -35,13 +35,20 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
  * inside storagePath itself. Without this check the old guard would return false on every
  * real run, skipping the cache save and breaking session continuity.
  *
- * WAL mode note: server.close() sends proc.kill() without awaiting a checkpoint, so a
- * valid session can have opencode.db still at its WAL-mode header-page size (verified on
- * Node 24.20.0: 4096 bytes, never 0) with the actual session data sitting in
- * opencode.db-wal instead. A checkpoint runs earlier in saveCache to merge that data back
- * into opencode.db before this check ever runs, but that checkpoint can decline (a live
- * writer, an unmergeable log); when it does, the WAL is where the real content still is.
- * We must treat any non-empty DB-family file as sufficient evidence of cacheable content.
+ * WAL mode note: this function is only reached after checkpointDatabase has already run
+ * and resolved to 'checkpointed' or 'nothing-to-checkpoint' — a 'failed' outcome makes
+ * saveCache return false before this is ever called (see the checkpoint block above). So
+ * the write-ahead log here is always already empty or absent: either just merged into
+ * opencode.db, or never held anything to merge. It can no longer be the sole holder of
+ * unmerged content the way it can be earlier in the process's life — server.close() sends
+ * proc.kill() without awaiting a checkpoint, so a valid session can have opencode.db still
+ * at its WAL-mode header-page size (verified on Node 24.20.0: 4096 bytes, never 0) with
+ * the actual session data sitting in opencode.db-wal instead, but checkpointDatabase
+ * merges exactly that case into opencode.db before this check ever runs —
+ * checkpoint.test.ts pins it as 'checkpointed', not skipped as 'nothing-to-checkpoint'.
+ * We still check every DB-family path here, not just opencode.db, as a defensive property
+ * rather than a load-bearing one: a genuinely empty write-ahead log simply fails the
+ * size > 0 check below.
  *
  * opencode.db-shm is deliberately excluded: buildSaveCachePaths never includes it (it is
  * machine-local and stale by construction), so it never appears in cachePaths here. A
@@ -89,13 +96,19 @@ async function hasCacheableContent(storagePath: string, cachePaths: readonly str
  */
 async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Promise<void> {
   try {
-    core.summary
-      .addHeading('Fro Bot Agent Run — Cache Save Declined', 2)
-      .addRaw(
-        'Session cache was not saved this run because the SQLite write-ahead log could not be checkpointed.\n\n' +
-          `**Reason:** ${reason}\n\n` +
-          '> The next run may restore an older session and pay recovery cost for any previously uncheckpointed state.\n',
-      )
+    core.summary.addHeading('Fro Bot Agent Run — Cache Save Declined', 2).addRaw(
+      'The session cache was not saved at this point because the SQLite write-ahead log could not be checkpointed.\n\n' +
+        `**Reason:** ${reason}\n\n` +
+        // core.summary.write() appends by default, so this block is never edited or
+        // removed after the fact once written — it must describe only what is true right
+        // now, not a predicted final outcome. It used to assert "the next run may restore
+        // an older session," which reads as false the moment the post-action hook's
+        // retry (src/harness/post.ts) succeeds — the documented, common recovery this
+        // decline exists to make room for. That retry does not itself write a job summary
+        // entry on success, so this wording is deliberately conditional rather than
+        // promising a correction that may never visibly appear.
+        '> A retry from the post-action hook may still save the cache later in this run. Only if that retry also fails does the next run risk restoring an older session.\n',
+    )
     await core.summary.write()
   } catch (error) {
     logger.warning('Failed to write cache-save-declined summary', {error: toErrorMessage(error)})
