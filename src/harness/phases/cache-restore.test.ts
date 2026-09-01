@@ -2,9 +2,13 @@ import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ActionInputs, CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
+import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
 import * as path from 'node:path'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {DatabaseSync} from 'node:sqlite'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
+import {checkpointDatabase as realCheckpointDatabase} from '../../services/cache/checkpoint.js'
 import {DB_MAIN_BASENAME, DB_WAL_BASENAME} from '../../services/cache/paths.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {ok} from '../../shared/types.js'
@@ -253,5 +257,92 @@ describe('runCacheRestore database repair', () => {
     // regression here would silently move the checkpoint cost back inside the bootstrap
     // budget it was moved out of
     expect(order).toEqual(['restoreCache', 'checkpointDatabase', 'bootstrapOpenCodeServer'])
+  })
+})
+
+// The suite above mocks checkpointDatabase entirely, which proves the phase calls it in
+// the right order but never that a real restored database is actually repaired — a
+// wiring regression in the database path selection (dbDir/dbPath/walPath computation)
+// would pass every test above today. This suite wires mocks.checkpointDatabase to the
+// real implementation (imported directly from checkpoint.js, bypassing the index.js mock
+// above) and points getOpenCodeStoragePath at a real temp directory with a real hot-WAL
+// SQLite database sitting exactly where the phase expects it.
+describe('runCacheRestore database repair (end-to-end against a real database)', () => {
+  let tempDir: string
+  let realStoragePath: string
+  let dbPath: string
+  let walPath: string
+  const openHandles: DatabaseSync[] = []
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cache-restore-e2e-'))
+    realStoragePath = path.join(tempDir, 'storage')
+    await fs.mkdir(realStoragePath, {recursive: true})
+    dbPath = path.join(tempDir, DB_MAIN_BASENAME)
+    walPath = path.join(tempDir, DB_WAL_BASENAME)
+
+    mocks.buildCacheKeyComponents.mockReturnValue({
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      ref: 'main',
+      os: 'Linux',
+    })
+    mocks.getGitHubWorkspace.mockReturnValue(tempDir)
+    mocks.getOpenCodeAuthPath.mockReturnValue(path.join(tempDir, 'auth.json'))
+    mocks.getOpenCodeStoragePath.mockReturnValue(realStoragePath)
+    mocks.ensureProjectId.mockResolvedValue({projectId: 'a'.repeat(40), source: 'cached'})
+    mocks.bootstrapOpenCodeServer.mockResolvedValue(ok(stubServerHandle))
+    mocks.restoreCache.mockResolvedValue(
+      createCacheResult({hit: true, corrupted: false, source: 'cache', restoredPath: realStoragePath}),
+    )
+    // The one substitution that matters for this suite: delegate the mocked
+    // checkpointDatabase call to the real implementation instead of a canned outcome.
+    mocks.checkpointDatabase.mockImplementation(realCheckpointDatabase)
+  })
+
+  afterEach(async () => {
+    while (openHandles.length > 0) {
+      const handle = openHandles.pop()
+      try {
+        handle?.close()
+      } catch {
+        // best effort — some handles may already be closed by the test itself
+      }
+    }
+    await fs.rm(tempDir, {recursive: true, force: true})
+  })
+
+  it('checkpoints a real hot-WAL database beside the restored storage path and still runs bootstrap', async () => {
+    // #given a real database with a populated write-ahead log placed exactly where
+    // runCacheRestore computes it (path.dirname(storagePath)), never cleanly closed —
+    // mirroring server.close() sending proc.kill() without awaiting a checkpoint
+    const db = new DatabaseSync(dbPath)
+    db.exec('PRAGMA journal_mode=WAL')
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('restored-session')")
+    openHandles.push(db)
+    expect((await fs.stat(walPath)).size).toBeGreaterThan(0)
+
+    const {runCacheRestore} = await import('./cache-restore.js')
+
+    // #when the cache-restore phase runs against the real filesystem
+    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+
+    // #then the write-ahead log is empty afterwards — the real repair happened, not a
+    // mock reporting success — and bootstrap still ran
+    expect(result).not.toBeNull()
+    expect((await fs.stat(walPath)).size).toBe(0)
+    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+
+    // #then the data that lived only in the write-ahead log survived the checkpoint
+    const verifyDb = new DatabaseSync(dbPath)
+    try {
+      const rows = verifyDb.prepare('SELECT data FROM sessions').all()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.data).toBe('restored-session')
+    } finally {
+      verifyDb.close()
+    }
   })
 })

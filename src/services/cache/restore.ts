@@ -12,6 +12,7 @@ import {
   buildRestoreCachePaths,
   deleteAuthJson,
   isAuthPathSafe,
+  isErrnoException,
   isPathInsideDirectory,
 } from './paths.js'
 import {defaultCacheAdapter, type RestoreCacheOptions} from './types.js'
@@ -75,7 +76,7 @@ async function deleteRestoredShm(storagePath: string, logger: RestoreCacheOption
     await fs.unlink(shmPath)
     logger.debug('Deleted restored opencode.db-shm (machine-local, stale by construction)')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') {
       logger.warning('Failed to delete restored opencode.db-shm', {
         error: toErrorMessage(error),
       })

@@ -20,6 +20,20 @@ export function isAuthPathSafe(authPath: string, storagePath: string): boolean {
   return !isPathInsideDirectory(authPath, storagePath)
 }
 
+/**
+ * Type guard for Node's `NodeJS.ErrnoException` convention (a `.code` string attached to
+ * filesystem errors). A broad `catch (error)` cannot assume every thrown value carries
+ * `.code` — asserting it via `as NodeJS.ErrnoException` is a cast on an unverified shape,
+ * which is the same risk `as any` and `@ts-ignore` carry. This narrows before reading it.
+ *
+ * Shared by both delete-and-tolerate-ENOENT call sites in this module and in restore.ts
+ * (deleteRestoredShm imports this rather than redefining it — restore.ts already depends
+ * on paths.ts, so this direction adds no new edge).
+ */
+export function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === 'object' && error !== null && 'code' in error
+}
+
 export async function deleteAuthJson(authPath: string, storagePath: string, logger: Logger): Promise<void> {
   if (!isPathInsideDirectory(authPath, storagePath)) {
     logger.debug('auth.json is outside storage path - skipping deletion', {
@@ -33,7 +47,7 @@ export async function deleteAuthJson(authPath: string, storagePath: string, logg
     await fs.unlink(authPath)
     logger.debug('Deleted auth.json from cache storage')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') {
       logger.warning('Failed to delete auth.json', {
         error: toErrorMessage(error),
       })

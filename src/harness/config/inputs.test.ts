@@ -922,6 +922,42 @@ describe('parseActionInputs', () => {
       expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(12000)
     })
 
+    it('leaves a server-bootstrap-timeout within the maximum unchanged and does not warn', () => {
+      mockInputs({
+        'server-bootstrap-timeout': '120000',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(120_000)
+      expect(mocks.warning).not.toHaveBeenCalled()
+    })
+
+    it('clips a server-bootstrap-timeout above the maximum and warns', () => {
+      mockInputs({
+        'server-bootstrap-timeout': '600000',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(120_000)
+      expect(mocks.warning).toHaveBeenCalledWith(
+        expect.stringContaining('server-bootstrap-timeout of 600000ms exceeds the maximum of 120000ms'),
+      )
+    })
+
+    it('leaves the unset server-bootstrap-timeout default unchanged and does not warn', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(5000) // DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS
+      expect(mocks.warning).not.toHaveBeenCalled()
+    })
+
     it('parses dedup-window with default value', () => {
       mockInputs({})
 

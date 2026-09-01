@@ -571,6 +571,77 @@ describe('restoreCache', () => {
     await expect(fs.access(path.join(dbDir, 'opencode.db'))).resolves.toBeUndefined()
   })
 
+  it('suppresses ENOENT when no opencode.db-shm was restored', async () => {
+    // #given a cache adapter that restores a plain db with no shm sidecar at all — the
+    // errno guard's ENOENT branch must stay silent for this, the common case
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const dbDir = path.dirname(storagePath)
+    const adapter: CacheAdapter = {
+      restoreCache: async () => {
+        await fs.mkdir(storagePath, {recursive: true})
+        await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db data')
+        return restoredKey
+      },
+      saveCache: async () => 1,
+    }
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+
+    const result = await restoreCache({
+      components: testComponents,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
+
+    // #then the restore succeeds and the missing-shm ENOENT is suppressed, not logged
+    expect(result.hit).toBe(true)
+    expect(logger.warning).not.toHaveBeenCalled()
+  })
+
+  it('logs a warning instead of suppressing when opencode.db-shm exists but cannot be deleted', async () => {
+    // #given opencode.db-shm is a directory, not a file — fs.unlink fails with a real
+    // non-ENOENT error (EISDIR/EPERM depending on platform), which the errno guard must
+    // not misclassify as "nothing to delete"
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const dbDir = path.dirname(storagePath)
+    const adapter: CacheAdapter = {
+      restoreCache: async () => {
+        await fs.mkdir(storagePath, {recursive: true})
+        await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db data')
+        await fs.mkdir(path.join(dbDir, 'opencode.db-shm'), {recursive: true})
+        return restoredKey
+      },
+      saveCache: async () => 1,
+    }
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+
+    const result = await restoreCache({
+      components: testComponents,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
+
+    // #then the restore still succeeds, but the non-ENOENT deletion failure is logged
+    expect(result.hit).toBe(true)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Failed to delete restored opencode.db-shm',
+      expect.objectContaining({error: expect.any(String) as unknown as string}),
+    )
+  })
+
   it('deletes auth.json if present inside storage after restore', async () => {
     // #given auth.json exists inside storage directory after cache restore
     const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
@@ -1338,6 +1409,67 @@ describe('saveCache', () => {
 
     // #then auth.json outside storage is NOT deleted
     await expect(fs.access(authPath)).resolves.toBeUndefined()
+  })
+
+  it('suppresses ENOENT when auth.json does not exist inside storage', async () => {
+    // #given storage with content but no auth.json inside it at all
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+    const authInsideStorage = path.join(storagePath, 'auth.json')
+
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const adapter = createMockCacheAdapter({saveResult: 12345})
+
+    // #when saving cache
+    await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath: authInsideStorage,
+      cacheAdapter: adapter,
+    })
+
+    // #then the missing-auth.json ENOENT is suppressed, not logged
+    expect(logger.warning).not.toHaveBeenCalled()
+  })
+
+  it('logs a warning instead of suppressing when auth.json exists but cannot be deleted', async () => {
+    // #given auth.json is a directory, not a file — fs.unlink fails with a real
+    // non-ENOENT error, which the errno guard must not misclassify as "nothing to delete"
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+    const authInsideStorage = path.join(storagePath, 'auth.json')
+    await fs.mkdir(authInsideStorage, {recursive: true})
+
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const adapter = createMockCacheAdapter({saveResult: 12345})
+
+    // #when saving cache
+    await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath: authInsideStorage,
+      cacheAdapter: adapter,
+    })
+
+    // #then the non-ENOENT deletion failure is logged
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Failed to delete auth.json',
+      expect.objectContaining({error: expect.any(String) as unknown as string}),
+    )
   })
 
   it('includes SQLite WAL but excludes SHM even when both exist', async () => {

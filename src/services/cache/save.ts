@@ -36,7 +36,11 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
  * real run, skipping the cache save and breaking session continuity.
  *
  * WAL mode note: server.close() sends proc.kill() without awaiting a checkpoint, so a
- * valid session can have opencode.db at 0 bytes with all data still in opencode.db-wal.
+ * valid session can have opencode.db still at its WAL-mode header-page size (verified on
+ * Node 24.20.0: 4096 bytes, never 0) with the actual session data sitting in
+ * opencode.db-wal instead. A checkpoint runs earlier in saveCache to merge that data back
+ * into opencode.db before this check ever runs, but that checkpoint can decline (a live
+ * writer, an unmergeable log); when it does, the WAL is where the real content still is.
  * We must treat any non-empty DB-family file as sufficient evidence of cacheable content.
  *
  * opencode.db-shm is deliberately excluded: buildSaveCachePaths never includes it (it is

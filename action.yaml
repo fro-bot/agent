@@ -82,7 +82,9 @@ inputs:
       config parse, plugin loading, DB open) before bootstrap is declared failed.
       Distinct from `timeout`, which only bounds agent execution and never reaches
       server startup. Increase this on runners with high startup variance. Must be a
-      positive integer. Default: 5000 (matches the OpenCode SDK's own default).
+      positive integer, clamped to a maximum of 120000 (2 minutes) - values above that
+      are clipped with a warning, since a server that has not started within two minutes
+      is not going to. Default: 5000 (matches the OpenCode SDK's own default).
     required: false
     default: '5000'
   opencode-version:

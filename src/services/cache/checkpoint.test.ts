@@ -80,6 +80,36 @@ describe('checkpointDatabase', () => {
     }
   })
 
+  it('checkpoints a database whose main file is only a header page while the write-ahead log holds all the data (regression guard: see save.ts hasCacheableContent doc comment)', async () => {
+    // #given a database in WAL mode that was never checkpointed: on real Node 24.20.0 this
+    // leaves the main file at exactly the WAL-mode header-page size, never 0 bytes, with
+    // every row actually living in the write-ahead log
+    openHotWalDatabase(dbPath)
+    const dbSizeBefore = await fileSizeOrZero(dbPath)
+    expect(dbSizeBefore).toBeGreaterThan(0)
+    expect(dbSizeBefore).toBeLessThanOrEqual(4096)
+    expect(await fileSizeOrZero(walPath)).toBeGreaterThan(0)
+
+    // #when checkpointing
+    const outcome = await checkpointDatabase({dbPath, walPath, logger})
+
+    // #then it is checkpointed, not skipped as "nothing-to-checkpoint" - a header-page-only
+    // main file is real, cacheable content, not an empty database
+    expect(outcome).toEqual({status: 'checkpointed'})
+    expect(await fileSizeOrZero(walPath)).toBe(0)
+
+    // #then the data that lived only in the write-ahead log is now readable from the main
+    // database file alone
+    const verifyDb = new DatabaseSync(dbPath)
+    try {
+      const rows = verifyDb.prepare('SELECT data FROM sessions').all()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.data).toBe('session-1')
+    } finally {
+      verifyDb.close()
+    }
+  })
+
   it('returns nothing-to-checkpoint for an already-clean database and lets the save proceed', async () => {
     // #given a database that was cleanly closed, leaving no write-ahead log behind
     const db = openHotWalDatabase(dbPath)
