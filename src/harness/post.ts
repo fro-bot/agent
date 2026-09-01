@@ -1,5 +1,6 @@
 import type {ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../shared/logger.js'
+import * as path from 'node:path'
 import * as core from '@actions/core'
 import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-bot/runtime'
 import {uploadLogArtifact} from '../services/artifact/index.js'
@@ -8,6 +9,7 @@ import {
   getGitHubRepository,
   getGitHubRunAttempt,
   getGitHubRunId,
+  getGitHubWorkspace,
   getOpenCodeAuthPath,
   getOpenCodeLogPath,
   getOpenCodeStoragePath,
@@ -87,12 +89,19 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
     const runId = String(getGitHubRunId())
     try {
       const components = buildCacheKeyComponents()
+      // GITHUB_WORKSPACE is a runner-level environment variable set for the whole job,
+      // not something that requires STATE handoff from the main step — it is available
+      // here exactly the way getOpenCodeStoragePath/getOpenCodeAuthPath already are.
+      // Deriving it the same way cleanup.ts does (cleanup.ts:179) keeps the two save call
+      // sites symmetric: a save that only lands here still archives .git/opencode.
+      const projectIdPath = path.join(getGitHubWorkspace(), '.git', 'opencode')
       const cacheSaveOptions = {
         components,
         runId: getGitHubRunId(),
         logger,
         storagePath: getOpenCodeStoragePath(),
         authPath: getOpenCodeAuthPath(),
+        projectIdPath,
         opencodeVersion,
         ...(storeConfig == null ? {} : {storeConfig}),
       }

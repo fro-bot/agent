@@ -109,6 +109,14 @@ export async function runCacheRestore(
       if (repairOutcome.structural) {
         await handleStructuralCorruption(repairOutcome.reason)
       } else {
+        // The usability probe below is deliberately not also run here. A database that is
+        // locked or otherwise environmentally unavailable would fail the probe's own
+        // schema read for the same reason it just failed the checkpoint attempt, so
+        // re-probing would only spend another SQLite open for a second chance to
+        // misclassify a transient fault as corruption — it cannot add information the
+        // checkpoint attempt did not already have. A database that is both locked and
+        // genuinely corrupt reaches bootstrap unprobed as a result; that is accepted as
+        // the narrower, safer failure mode against the alternative of probing more often.
         cacheLogger.warning('Failed to repair restored database before bootstrap', {reason: repairOutcome.reason})
       }
     } else {

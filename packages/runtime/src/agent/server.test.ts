@@ -254,4 +254,31 @@ describe('bootstrapOpenCodeServer', () => {
     expect(result.success).toBe(false)
     expect(closeSpy).toHaveBeenCalledTimes(1)
   })
+
+  it("still returns a failed Result rather than rejecting when the acquired server's close() itself throws", async () => {
+    // #given a failure after handle acquisition (as above), but this time close() itself
+    // throws — the one path the never-throw contract must survive: the whole function
+    // exists to return err() instead of rejecting, and an unguarded cleanup call would
+    // turn exactly this case into a rejection instead
+    const logger = createMockLogger()
+    const closeSpy = vi.fn(() => {
+      throw new Error('close() itself failed')
+    })
+    vi.mocked(logger.debug).mockImplementationOnce(() => {
+      throw new Error('unexpected failure after handle acquisition')
+    })
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      const port = (options as {port?: number}).port
+      return {
+        client: {} as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when / #then — the promise must resolve, not reject
+    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    expect(result.success).toBe(false)
+    expect(closeSpy).toHaveBeenCalledTimes(1)
+  })
 })

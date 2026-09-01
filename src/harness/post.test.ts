@@ -111,6 +111,33 @@ describe('post action', () => {
       expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
     })
 
+    it('includes projectIdPath derived from GITHUB_WORKSPACE, matching cleanup.ts (symmetric save call sites)', async () => {
+      // #given a save landing only in the post hook (the case a declined cleanup save
+      // relies on) — GITHUB_WORKSPACE is a runner-level env var available here exactly as
+      // it is in the main step, not something requiring STATE handoff
+      process.env.GITHUB_WORKSPACE = '/home/runner/work/agent/agent'
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'false'
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue(true)
+
+      const {runPost} = await import('./post.js')
+      await runPost({logger: createMockLogger()})
+
+      // #then the archive includes .git/opencode, the same way cleanup.ts's save does —
+      // without this, a save that only lands in the post hook omits it from the archive
+      expect(saveCache).toHaveBeenCalledWith(
+        expect.objectContaining({projectIdPath: '/home/runner/work/agent/agent/.git/opencode'}),
+      )
+
+      delete process.env.GITHUB_WORKSPACE
+    })
+
     it('reconstructs storeConfig from state and passes it to saveCache', async () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {

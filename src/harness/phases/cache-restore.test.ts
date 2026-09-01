@@ -1,7 +1,9 @@
+import type {ObjectStoreAdapter} from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ActionInputs, CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
+import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -11,7 +13,7 @@ import {createMetricsCollector} from '../../features/observability/index.js'
 import {checkpointDatabase as realCheckpointDatabase} from '../../services/cache/checkpoint.js'
 import {verifyDatabaseUsable as realVerifyDatabaseUsable} from '../../services/cache/integrity.js'
 import {DB_MAIN_BASENAME, DB_WAL_BASENAME} from '../../services/cache/paths.js'
-import {cleanStorage as realCleanStorage} from '../../services/cache/restore.js'
+import {cleanStorage as realCleanStorage, restoreCache as realRestoreCache} from '../../services/cache/restore.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {ok} from '../../shared/types.js'
 
@@ -26,6 +28,7 @@ const mocks = vi.hoisted(() => ({
   getGitHubWorkspace: vi.fn(),
   getOpenCodeAuthPath: vi.fn(),
   getOpenCodeStoragePath: vi.fn(),
+  createS3Adapter: vi.fn(),
   loggerDebug: vi.fn<Logger['debug']>(),
   loggerInfo: vi.fn<Logger['info']>(),
   loggerWarning: vi.fn<Logger['warning']>(),
@@ -53,6 +56,15 @@ vi.mock('../../shared/env.js', () => ({
   getOpenCodeAuthPath: mocks.getOpenCodeAuthPath,
   getOpenCodeStoragePath: mocks.getOpenCodeStoragePath,
 }))
+
+// Only used by the object-store e2e suite below, which sets storeConfig.enabled: true and
+// delegates mocks.restoreCache to the real implementation. Every other describe block in
+// this file keeps storeConfig disabled (the ActionInputs default), so restoreFromObjectStore
+// returns before ever calling createS3Adapter -- this mock is inert for them.
+vi.mock('@fro-bot/runtime', async (importOriginal: () => Promise<typeof import('@fro-bot/runtime')>) => {
+  const original = await importOriginal()
+  return {...original, createS3Adapter: mocks.createS3Adapter}
+})
 
 // Both cacheLogger and serverLogger in runCacheRestore come from createLogger, so a single
 // shared stub is enough to assert on the repair log call regardless of which phase name
@@ -575,6 +587,106 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     } finally {
       verifyDb.close()
     }
+    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+  })
+})
+
+// The object store *wins* on restore (restoreFromObjectStore returns before the cache
+// path ever runs) and its own integrity checks are near-tautologies: checkStorageCorruption
+// only asks whether storagePath is a readable directory, which the mkdir two lines above it
+// already guarantees. The usability probe is therefore the only real defense against a
+// structurally corrupt database arriving via this source, and every other e2e case above
+// reaches the probe via the cache path (source: 'cache') instead. This suite drives a real
+// corrupt database in through the real object-store restore code (not a mocked CacheResult
+// shape) via an in-memory ObjectStoreAdapter, reusing the pattern from
+// restore-save-flow.test.ts, to prove the cacheStatus === 'hit' gate covers this source too.
+function createInMemoryStoreAdapter(seed: ReadonlyMap<string, Buffer>): ObjectStoreAdapter {
+  const objects = new Map(seed)
+  return {
+    upload: async (key, localPath) => {
+      objects.set(key, await fs.readFile(localPath))
+      return ok(undefined)
+    },
+    download: async (key, localPath) => {
+      const contents = objects.get(key)
+      if (contents == null) {
+        return {success: false, error: new Error(`Missing object for key: ${key}`)}
+      }
+      await fs.mkdir(path.dirname(localPath), {recursive: true})
+      await fs.writeFile(localPath, contents)
+      return ok(undefined)
+    },
+    list: async prefix => ok([...objects.keys()].filter(key => key.startsWith(prefix))),
+  }
+}
+
+describe('runCacheRestore usability probe via the object-store restore source (end-to-end)', () => {
+  let tempDir: string
+  let realStoragePath: string
+  let dbPath: string
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cache-restore-object-store-e2e-'))
+    realStoragePath = path.join(tempDir, 'storage')
+    await fs.mkdir(realStoragePath, {recursive: true})
+    dbPath = path.join(tempDir, DB_MAIN_BASENAME)
+
+    mocks.buildCacheKeyComponents.mockReturnValue({
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      ref: 'main',
+      os: 'Linux',
+    })
+    mocks.getGitHubWorkspace.mockReturnValue(tempDir)
+    mocks.getOpenCodeAuthPath.mockReturnValue(path.join(tempDir, 'auth.json'))
+    mocks.getOpenCodeStoragePath.mockReturnValue(realStoragePath)
+    mocks.ensureProjectId.mockResolvedValue({projectId: 'a'.repeat(40), source: 'cached'})
+    mocks.bootstrapOpenCodeServer.mockResolvedValue(ok(stubServerHandle))
+    // Delegate to the real restore/checkpoint/probe implementations so this suite exercises
+    // the actual restoreFromObjectStore -> syncSessionsFromStore -> checkpointDatabase ->
+    // verifyDatabaseUsable chain, not a mocked CacheResult shape.
+    mocks.restoreCache.mockImplementation(realRestoreCache)
+    mocks.checkpointDatabase.mockImplementation(realCheckpointDatabase)
+    mocks.cleanStorage.mockImplementation(realCleanStorage)
+    mocks.verifyDatabaseUsable.mockImplementation(realVerifyDatabaseUsable)
+  })
+
+  afterEach(async () => {
+    await fs.rm(tempDir, {recursive: true, force: true})
+  })
+
+  it('cleans storage and reports a corrupted cache for a structurally corrupt database arriving via the object-store source, and still runs bootstrap', async () => {
+    // #given the object store holds a structurally corrupt opencode.db under the exact key
+    // syncSessionsFromStore expects, and nothing else (no write-ahead log, matching the
+    // near-tautology this concern is about: checkStorageCorruption only checks the storage
+    // directory itself, never the database content)
+    const objectKey = 'fro-bot-state/github/owner/repo/sessions/opencode.db'
+    const corruptDbBytes = Buffer.from('not a real sqlite database file, just garbage bytes'.repeat(50))
+    mocks.createS3Adapter.mockReturnValue(createInMemoryStoreAdapter(new Map([[objectKey, corruptDbBytes]])))
+
+    const bootstrap = createBootstrapPhaseResult({
+      inputs: createActionInputs({
+        storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      }),
+    })
+    const {runCacheRestore} = await import('./cache-restore.js')
+
+    // #when the cache-restore phase runs against the real filesystem and the real
+    // object-store restore code path
+    const result = await runCacheRestore(bootstrap, createMetricsCollector())
+
+    // #then the object store reports a hit (source: 'storage'), which the cacheStatus ===
+    // 'hit' gate covers exactly like a cache-sourced hit, the usability probe (not the
+    // checkpoint attempt, since there is no write-ahead log) catches the corruption, and
+    // storage is wiped rather than handed to bootstrap
+    expect(result).not.toBeNull()
+    expect(mocks.createS3Adapter).toHaveBeenCalled()
+    expect(result?.cacheStatus).toBe('corrupted')
+    expect(result?.cacheResult.hit).toBe(false)
+    expect(result?.cacheResult.restoredPath).toBeNull()
+    await expect(fs.access(dbPath)).rejects.toThrow()
+    await expect(fs.readdir(realStoragePath)).resolves.toEqual([])
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
   })
 })

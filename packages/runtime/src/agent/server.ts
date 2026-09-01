@@ -101,8 +101,16 @@ export async function bootstrapOpenCodeServer(
     // while a null with a much smaller elapsedMs points at port acquisition instead.
     logger.warning('Failed to bootstrap OpenCode server', {error: message, timeoutMs, budgetedMs, elapsedMs})
     // Defensive cleanup: if a handle was acquired before the failure, do not leave the
-    // child's fate to the SDK's abort binding alone.
-    acquiredServer?.close()
+    // child's fate to the SDK's abort binding alone. Best-effort, matching the convention
+    // this module's own checkpoint/integrity probes use for their close() calls
+    // (checkpoint.ts, integrity.ts): this function's entire contract is to return a
+    // Result rather than reject, and close() throwing here is the one path that would
+    // otherwise turn a bootstrap failure into a rejection instead of an err().
+    try {
+      acquiredServer?.close()
+    } catch {
+      // best effort — the original failure is already captured in the err() returned below
+    }
     return err(new Error(`Server bootstrap failed: ${message}`))
   }
 }
