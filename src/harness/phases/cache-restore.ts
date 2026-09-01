@@ -35,7 +35,7 @@ export async function runCacheRestore(
 
   const storagePath = getOpenCodeStoragePath()
 
-  const cacheResult = await restoreCache({
+  let cacheResult = await restoreCache({
     components: cacheComponents,
     logger: cacheLogger,
     storagePath,
@@ -82,7 +82,20 @@ export async function runCacheRestore(
       })
       await cleanStorage(storagePath)
       cacheStatus = 'corrupted'
+      // Keep cacheResult in agreement with the downgraded cacheStatus: it is a public
+      // field of CacheRestorePhaseResult, and a caller reading a stale {hit: true,
+      // restoredPath} for storage that was just deleted would be a real, if currently
+      // latent, bug. Mirrors the shape restoreCache itself returns for its own
+      // corruption/version-mismatch paths (see restoreAfterCorruption in restore.ts).
+      cacheResult = {
+        hit: false,
+        key: cacheResult.key,
+        restoredPath: null,
+        corrupted: true,
+        source: null,
+      }
       metrics.setCacheStatus(cacheStatus)
+      metrics.setCacheSource(cacheResult.source)
     }
 
     const repairOutcome = await checkpointDatabase({
@@ -93,10 +106,10 @@ export async function runCacheRestore(
     if (repairOutcome.status === 'checkpointed') {
       cacheLogger.info('Repaired restored database: checkpointed write-ahead log before bootstrap')
     } else if (repairOutcome.status === 'failed') {
-      if (repairOutcome.retryable) {
-        cacheLogger.warning('Failed to repair restored database before bootstrap', {reason: repairOutcome.reason})
-      } else {
+      if (repairOutcome.structural) {
         await handleStructuralCorruption(repairOutcome.reason)
+      } else {
+        cacheLogger.warning('Failed to repair restored database before bootstrap', {reason: repairOutcome.reason})
       }
     } else {
       // 'nothing-to-checkpoint' is the common healthy-run case: there was no write-ahead

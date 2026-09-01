@@ -75,6 +75,30 @@ describe('verifyDatabaseUsable', () => {
     expect(result.usable === false ? result.reason.toLowerCase() : '').toContain('malformed')
   })
 
+  it('reports usable for a real database that cannot be opened due to a permissions fault, not corruption', async () => {
+    // #given a real, healthy database made unreadable by permissions — an environmental
+    // fault (SQLITE_CANTOPEN: "unable to open database file"), not evidence of corruption.
+    // This is the blocking case the review caught: any thrown error previously became
+    // usable: false, which would have reported a perfectly healthy database as corrupt
+    // and let the caller delete a repository's session history over a transient fault.
+    const db = new DatabaseSync(dbPath)
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    db.close()
+    await fs.chmod(dbPath, 0o000)
+
+    try {
+      // #when verifying
+      const result = await verifyDatabaseUsable(dbPath)
+
+      // #then it reports usable — the safe default for an unrecognized SQLite error is to
+      // leave the database alone, not report it corrupt
+      expect(result).toEqual({usable: true})
+    } finally {
+      await fs.chmod(dbPath, 0o644)
+    }
+  })
+
   it('reports usable without creating a file for a database path that does not exist', async () => {
     // #given a path nothing has ever written to
     await expect(fs.access(dbPath)).rejects.toThrow()

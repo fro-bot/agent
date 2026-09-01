@@ -234,6 +234,15 @@ describe('runCacheRestore database repair', () => {
       {reason: 'file is not a database'},
     )
     expect(result?.cacheStatus).toBe('corrupted')
+    // #then cacheResult agrees with the downgraded cacheStatus — no stale {hit: true,
+    // restoredPath} for storage that was just deleted
+    expect(result?.cacheResult).toEqual({
+      hit: false,
+      key: 'test-key',
+      restoredPath: null,
+      corrupted: true,
+      source: null,
+    })
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
   })
 
@@ -255,11 +264,11 @@ describe('runCacheRestore database repair', () => {
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
   })
 
-  it('does not fail the run when repair fails on a retryable (busy/locked) database — bootstrap is still attempted', async () => {
+  it('does not fail the run when repair fails on a non-structural (busy/locked) database — bootstrap is still attempted', async () => {
     // #given a cache hit whose write-ahead log could not be merged (e.g. a live writer) —
     // a transient failure, not a structurally corrupt database
     mocks.restoreCache.mockResolvedValue(createCacheResult({hit: true, corrupted: false, source: 'cache'}))
-    mocks.checkpointDatabase.mockResolvedValue({status: 'failed', reason: 'database is locked', retryable: true})
+    mocks.checkpointDatabase.mockResolvedValue({status: 'failed', reason: 'database is locked', structural: false})
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
@@ -273,17 +282,42 @@ describe('runCacheRestore database repair', () => {
     })
     expect(mocks.cleanStorage).not.toHaveBeenCalled()
     expect(result?.cacheStatus).toBe('hit')
+    expect(result?.cacheResult.hit).toBe(true)
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
   })
 
-  it('cleans storage and reports a corrupted cache when repair fails on a structurally corrupt (non-retryable) database', async () => {
+  it('reports usable: true (leave-alone) for a non-structural checkpoint failure like "unable to open database file", not wiping storage', async () => {
+    // #given a checkpoint failure that is neither busy/locked nor a positively-matched
+    // corruption message — the exact wrong-polarity case the review caught: an
+    // unrecognized SQLite error must default to leave-alone, not delete
+    mocks.restoreCache.mockResolvedValue(createCacheResult({hit: true, corrupted: false, source: 'cache'}))
+    mocks.checkpointDatabase.mockResolvedValue({
+      status: 'failed',
+      reason: 'unable to open database file',
+      structural: false,
+    })
+    const {runCacheRestore} = await import('./cache-restore.js')
+
+    // #when the cache-restore phase runs
+    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+
+    // #then storage is left intact, the run still reports a hit, and cacheResult agrees
+    expect(result).not.toBeNull()
+    expect(mocks.cleanStorage).not.toHaveBeenCalled()
+    expect(result?.cacheStatus).toBe('hit')
+    expect(result?.cacheResult.hit).toBe(true)
+    expect(result?.cacheResult.corrupted).toBe(false)
+    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+  })
+
+  it('cleans storage and reports a corrupted cache when repair fails on a structurally corrupt database', async () => {
     // #given a cache hit whose restored database SQLite itself reports as unusable — not a
     // live writer, not a slow truncation
     mocks.restoreCache.mockResolvedValue(createCacheResult({hit: true, corrupted: false, source: 'cache'}))
     mocks.checkpointDatabase.mockResolvedValue({
       status: 'failed',
       reason: 'file is not a database',
-      retryable: false,
+      structural: true,
     })
     const {runCacheRestore} = await import('./cache-restore.js')
 
@@ -299,6 +333,15 @@ describe('runCacheRestore database repair', () => {
       {reason: 'file is not a database'},
     )
     expect(result?.cacheStatus).toBe('corrupted')
+    // #then cacheResult agrees with the downgraded cacheStatus — no stale {hit: true,
+    // restoredPath} for storage that was just deleted
+    expect(result?.cacheResult).toEqual({
+      hit: false,
+      key: 'test-key',
+      restoredPath: null,
+      corrupted: true,
+      source: null,
+    })
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
   })
 
@@ -437,13 +480,15 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     // re-persist the malformed database under a fresh key
     expect(result).not.toBeNull()
     expect(result?.cacheStatus).toBe('corrupted')
+    expect(result?.cacheResult.hit).toBe(false)
+    expect(result?.cacheResult.restoredPath).toBeNull()
     await expect(fs.access(dbPath)).rejects.toThrow()
     await expect(fs.access(walPath)).rejects.toThrow()
     await expect(fs.readdir(realStoragePath)).resolves.toEqual([])
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
   })
 
-  it('retries and reports a retryable failure for a real locked database, leaving storage intact and still running bootstrap', async () => {
+  it('retries and reports a non-structural failure for a real locked database, leaving storage intact and still running bootstrap', async () => {
     // #given a database held under an exclusive lock by an in-progress transaction on
     // another connection — the same EXCLUSIVE-locked-holder shape as
     // checkpoint.test.ts's unit test, reused here to exercise the real restore-side
@@ -493,6 +538,8 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     // storage is wiped, and the run is reported as corrupted instead of a hit
     expect(result).not.toBeNull()
     expect(result?.cacheStatus).toBe('corrupted')
+    expect(result?.cacheResult.hit).toBe(false)
+    expect(result?.cacheResult.restoredPath).toBeNull()
     await expect(fs.access(dbPath)).rejects.toThrow()
     await expect(fs.readdir(realStoragePath)).resolves.toEqual([])
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()

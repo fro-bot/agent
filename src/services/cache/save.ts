@@ -120,16 +120,17 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   }
 
   const saveKey = buildSaveCacheKey(components, runId)
-  const cachePaths = await buildSaveCachePaths(storagePath, projectIdPath, opencodeVersion)
-
-  logger.info('Saving cache', {saveKey, paths: cachePaths})
 
   try {
     await deleteAuthJson(authPath, storagePath, logger)
 
-    // Checkpoint before anything inspects file sizes or transports bytes: this moves
-    // data out of the write-ahead log into the main database file, which changes which
-    // files are non-empty for both hasCacheableContent below and the S3 sync at :97.
+    // Checkpoint before anything inspects file sizes, builds the save path list, or
+    // transports bytes: this moves data out of the write-ahead log into the main database
+    // file, which changes which files are non-empty for hasCacheableContent below and the
+    // S3 sync further down, and — now that buildSaveCachePaths runs after this, not before
+    // — whether opencode.db-wal exists at all for its existence guard (paths.ts). Computing
+    // the path list first used to let a write-ahead log this same call just truncated to
+    // zero bytes ride along in cachePaths anyway, shipping an empty file every healthy save.
     const dbDir = path.dirname(storagePath)
     const dbPath = path.join(dbDir, DB_MAIN_BASENAME)
     const walPath = path.join(dbDir, DB_WAL_BASENAME)
@@ -141,6 +142,9 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
       await writeCheckpointDeclineSummary(checkpointOutcome.reason, logger)
       return false
     }
+
+    const cachePaths = await buildSaveCachePaths(storagePath, projectIdPath, opencodeVersion)
+    logger.info('Saving cache', {saveKey, paths: cachePaths})
 
     const hasContent = await hasCacheableContent(storagePath, cachePaths)
     if (hasContent === false) {

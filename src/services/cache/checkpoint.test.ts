@@ -159,18 +159,19 @@ describe('checkpointDatabase', () => {
     // #when checkpointing with a small bound so the test stays fast
     const outcome = await checkpointDatabase({dbPath, walPath, logger, maxAttempts: 3, retryDelayMs: 1})
 
-    // #then it retries and reports failure without throwing, classified retryable since
-    // the database itself is fine and merely locked by a live writer
+    // #then it retries and reports failure without throwing. Not structural: a busy
+    // lock is not evidence the database itself is corrupt — the safe default here is
+    // leave it alone, and only a positively-matched corruption message flips this to true
     expect(outcome.status).toBe('failed')
     const reason = outcome.status === 'failed' ? outcome.reason : ''
     expect(reason.length).toBeGreaterThan(0)
-    expect(outcome.status === 'failed' && outcome.retryable).toBe(true)
+    expect(outcome.status === 'failed' && outcome.structural).toBe(false)
     expect(logger.warning).toHaveBeenCalled()
 
     holder.exec('COMMIT')
   })
 
-  it('reports a non-retryable failure for a database SQLite itself cannot open, without retrying', async () => {
+  it('reports a structural failure for a database SQLite itself cannot open, without retrying', async () => {
     // #given a database file that is not valid SQLite at all, with a populated
     // write-ahead log beside it so the early-return does not skip opening it
     await fs.writeFile(dbPath, 'not a real sqlite database file, just garbage bytes'.repeat(50))
@@ -180,17 +181,41 @@ describe('checkpointDatabase', () => {
     const outcome = await checkpointDatabase({dbPath, walPath, logger, maxAttempts: 3, retryDelayMs: 1})
 
     // #then it fails on the very first attempt — SQLite reports the file itself is not a
-    // usable database, which is structural and not worth retrying
+    // usable database, which is a positively-matched structural failure, not worth retrying
     expect(outcome.status).toBe('failed')
     const reason = outcome.status === 'failed' ? outcome.reason : ''
     expect(reason.toLowerCase()).toContain('not a database')
-    expect(outcome.status === 'failed' && outcome.retryable).toBe(false)
+    expect(outcome.status === 'failed' && outcome.structural).toBe(true)
     expect(logger.warning).toHaveBeenCalledWith('SQLite checkpoint attempt failed', {
       attempt: 1,
       maxAttempts: 3,
       reason,
     })
     expect(logger.debug).not.toHaveBeenCalled()
+  })
+
+  it('reports a non-structural failure for a real permissions fault ("unable to open database file"), the blocking case this pins', async () => {
+    // #given a real, healthy hot-WAL database made unreadable by permissions rather than
+    // corrupted — an environmental fault (SQLITE_CANTOPEN), not evidence of corruption.
+    // This is the exact wrong-polarity case the review caught: an allowlist of retryable
+    // errors previously fell through to "structural" for anything unrecognized, which
+    // would have wiped a repository's session history over a transient permissions fault.
+    openHotWalDatabase(dbPath)
+    await fs.chmod(dbPath, 0o000)
+
+    try {
+      // #when checkpointing
+      const outcome = await checkpointDatabase({dbPath, walPath, logger, maxAttempts: 3, retryDelayMs: 1})
+
+      // #then it fails, but is NOT classified structural — the safe default for an
+      // unrecognized SQLite error is to leave the database alone, not delete it
+      expect(outcome.status).toBe('failed')
+      const reason = outcome.status === 'failed' ? outcome.reason : ''
+      expect(reason.toLowerCase()).toContain('unable to open database file')
+      expect(outcome.status === 'failed' && outcome.structural).toBe(false)
+    } finally {
+      await fs.chmod(dbPath, 0o644)
+    }
   })
 
   it('never interrupts attempt 1 but stops before attempt 2 once the deadline has elapsed, reporting a retryable failure', async () => {
@@ -214,12 +239,12 @@ describe('checkpointDatabase', () => {
 
     // #then attempt 1 still ran (never interrupted mid-checkpoint) and failed on the lock,
     // but the deadline stopped any further attempt rather than exhausting maxAttempts —
-    // the failure remains classified retryable since the database itself is fine, merely
-    // slow to become available
+    // the failure remains non-structural since the database itself is fine, merely slow
+    // to become available
     expect(outcome.status).toBe('failed')
     const reason = outcome.status === 'failed' ? outcome.reason : ''
     expect(reason).toContain('deadline')
-    expect(outcome.status === 'failed' && outcome.retryable).toBe(true)
+    expect(outcome.status === 'failed' && outcome.structural).toBe(false)
     expect(logger.warning).toHaveBeenCalledWith(
       'SQLite checkpoint deadline exceeded, declining further attempts',
       expect.objectContaining({attempt: 1, maxAttempts: 5, deadlineMs: 1}),

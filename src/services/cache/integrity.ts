@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises'
 import {DatabaseSync} from 'node:sqlite'
 import {toErrorMessage} from '../../shared/errors.js'
+import {isStructuralCorruptionError} from './sqlite-errors.js'
 
 export type DatabaseUsability = {readonly usable: true} | {readonly usable: false; readonly reason: string}
 
@@ -42,6 +43,15 @@ export type DatabaseUsability = {readonly usable: true} | {readonly usable: fals
  * there is nothing here for this probe to find corrupt, and the caller's own
  * `nothing-to-checkpoint` / cache-hit gating already established there is a restored
  * database worth checking in the first place.
+ *
+ * `usable: false` is a positive classification via `isStructuralCorruptionError`, not a
+ * catch-all for any thrown error. This probe opens read-write (the only mode
+ * `DatabaseSync` supports without extra options), so a database that is merely
+ * unwritable but perfectly readable, or unreachable because of a transient environmental
+ * fault (permission denied, disk full, I/O error, fd exhaustion, a missing parent
+ * directory), must not be reported unusable — those are not evidence the database is
+ * corrupt, and the caller deletes the repository's session history on `usable: false`.
+ * The safe default for anything not positively identified as corrupt is `usable: true`.
  */
 export async function verifyDatabaseUsable(dbPath: string): Promise<DatabaseUsability> {
   const stat = await fs.stat(dbPath).catch(() => null)
@@ -55,7 +65,10 @@ export async function verifyDatabaseUsable(dbPath: string): Promise<DatabaseUsab
     db.prepare('SELECT count(*) FROM sqlite_master').get()
     return {usable: true}
   } catch (error) {
-    return {usable: false, reason: toErrorMessage(error)}
+    if (isStructuralCorruptionError(error)) {
+      return {usable: false, reason: toErrorMessage(error)}
+    }
+    return {usable: true}
   } finally {
     try {
       db?.close()

@@ -2,6 +2,7 @@ import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import {DatabaseSync} from 'node:sqlite'
 import {toErrorMessage} from '../../shared/errors.js'
+import {isRetryableError, isStructuralCorruptionError} from './sqlite-errors.js'
 
 /**
  * Outcome of a checkpoint attempt against a SQLite database's write-ahead log.
@@ -16,20 +17,24 @@ import {toErrorMessage} from '../../shared/errors.js'
  * - `nothing-to-checkpoint`: there was no database, no write-ahead log, or the log was
  *   already empty. Nothing needed to happen, and the caller should proceed exactly as
  *   if a checkpoint had succeeded.
- * - `failed`: a write-ahead log existed and held data, but it could not be merged
- *   (a live writer held the database, every attempt could not fully truncate it, or the
- *   repair deadline elapsed between attempts). `reason` is a human-readable explanation
- *   for logs and the job summary. `retryable` distinguishes why: `true` means the
- *   database itself is presumably fine and merely busy, slow, or still not fully
- *   truncated within budget; `false` means SQLite itself reported the file is not a
- *   usable database (e.g. "file is not a database", "database disk image is malformed")
- *   — a structural failure no amount of retrying would fix. Callers use this to decide
- *   whether to treat the database as corrupted rather than merely busy.
+ * - `failed`: a write-ahead log existed and held data, but it could not be merged (a live
+ *   writer held the database, every attempt could not fully truncate it, the repair
+ *   deadline elapsed between attempts, or SQLite itself declared the file unusable).
+ *   `reason` is a human-readable explanation for logs and the job summary. `structural`
+ *   is a positive classification, not a default: it is `true` only when SQLite reported
+ *   the file is not a usable database (e.g. "file is not a database", "database disk
+ *   image is malformed") via `isStructuralCorruptionError`. Every other failure —
+ *   exhausted busy/locked retries, a deadline exceeded, a WAL that never fully truncated,
+ *   or any unrecognized SQLite error (permission denied, disk full, I/O error, a missing
+ *   parent directory) — reports `structural: false`. Callers use this to decide whether
+ *   to treat the database as corrupted (delete it) rather than merely unavailable right
+ *   now (leave it alone); the safe default for anything not positively identified as
+ *   corrupt is to leave it alone.
  */
 export type CheckpointOutcome =
   | {readonly status: 'checkpointed'}
   | {readonly status: 'nothing-to-checkpoint'}
-  | {readonly status: 'failed'; readonly reason: string; readonly retryable: boolean}
+  | {readonly status: 'failed'; readonly reason: string; readonly structural: boolean}
 
 export interface CheckpointOptions {
   readonly dbPath: string
@@ -70,21 +75,6 @@ async function delay(ms: number): Promise<void> {
   return new Promise(resolve => {
     setTimeout(resolve, ms)
   })
-}
-
-/**
- * A busy or locked database is the harness's only signal that the OpenCode child (or some
- * other process) still holds the database open. `node:sqlite` surfaces this as a thrown
- * error rather than a return value, and Node's typings for that error carry no structured
- * code — only a message. Matching on wording is what's available; both "database is
- * locked" (SQLITE_BUSY on open/exec) and "busy" cover the cases observed in practice.
- */
-function isRetryableError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false
-  }
-  const message = error.message.toLowerCase()
-  return message.includes('locked') || message.includes('busy')
 }
 
 /**
@@ -129,7 +119,7 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
   }
 
   let lastReason = 'unknown checkpoint failure'
-  let lastRetryable = true
+  let lastStructural = false
   const startedAt = Date.now()
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -137,7 +127,7 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
     // regardless of this budget, and an in-flight PRAGMA is never aborted.
     if (attempt > 1 && Date.now() - startedAt >= deadlineMs) {
       lastReason = `checkpoint deadline of ${deadlineMs}ms exceeded after attempt ${attempt - 1}/${maxAttempts}`
-      lastRetryable = true
+      lastStructural = false
       logger.warning('SQLite checkpoint deadline exceeded, declining further attempts', {
         attempt: attempt - 1,
         maxAttempts,
@@ -164,8 +154,9 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
 
     if (caughtError !== undefined) {
       lastReason = toErrorMessage(caughtError)
-      lastRetryable = isRetryableError(caughtError)
-      if (!lastRetryable || attempt === maxAttempts) {
+      lastStructural = isStructuralCorruptionError(caughtError)
+      const retryable = isRetryableError(caughtError)
+      if (!retryable || attempt === maxAttempts) {
         logger.warning('SQLite checkpoint attempt failed', {attempt, maxAttempts, reason: lastReason})
         break
       }
@@ -180,7 +171,7 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
     }
 
     lastReason = `write-ahead log still ${walSizeAfter} bytes after checkpoint attempt ${attempt}/${maxAttempts}`
-    lastRetryable = true
+    lastStructural = false
     if (attempt === maxAttempts) {
       break
     }
@@ -192,5 +183,5 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
     await delay(retryDelayMs)
   }
 
-  return {status: 'failed', reason: lastReason, retryable: lastRetryable}
+  return {status: 'failed', reason: lastReason, structural: lastStructural}
 }
