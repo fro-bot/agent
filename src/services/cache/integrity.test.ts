@@ -56,10 +56,13 @@ describe('verifyDatabaseUsable', () => {
     }
     db.exec('COMMIT')
     db.close()
-    const fullSize = (await fs.stat(dbPath)).size
+    // Size the file through the open handle rather than stat-then-open: resolving the
+    // path twice is a check-then-use window, and the truncation must apply to the same
+    // file that was measured.
     const fileHandle = await fs.open(dbPath, 'r+')
     try {
-      await fileHandle.truncate(Math.floor(fullSize / 2))
+      const {size} = await fileHandle.stat()
+      await fileHandle.truncate(Math.floor(size / 2))
     } finally {
       await fileHandle.close()
     }
