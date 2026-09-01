@@ -5,7 +5,13 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
 import {bootstrapOpenCodeServer} from '../../features/agent/index.js'
-import {buildCacheKeyComponents, checkpointDatabase, restoreCache} from '../../services/cache/index.js'
+import {
+  buildCacheKeyComponents,
+  checkpointDatabase,
+  cleanStorage,
+  restoreCache,
+  verifyDatabaseUsable,
+} from '../../services/cache/index.js'
 import {DB_MAIN_BASENAME, DB_WAL_BASENAME} from '../../services/cache/paths.js'
 import {ensureProjectId} from '../../services/setup/project-id.js'
 import {getGitHubWorkspace, getOpenCodeAuthPath, getOpenCodeStoragePath} from '../../shared/env.js'
@@ -39,11 +45,7 @@ export async function runCacheRestore(
     storeConfig: bootstrap.inputs.storeConfig,
   })
 
-  const cacheStatus: 'corrupted' | 'hit' | 'miss' = cacheResult.corrupted
-    ? 'corrupted'
-    : cacheResult.hit
-      ? 'hit'
-      : 'miss'
+  let cacheStatus: 'corrupted' | 'hit' | 'miss' = cacheResult.corrupted ? 'corrupted' : cacheResult.hit ? 'hit' : 'miss'
   metrics.setCacheStatus(cacheStatus)
   metrics.setCacheSource(cacheResult.source)
   bootstrap.logger.info('Cache restore completed', {cacheStatus, key: cacheResult.key})
@@ -64,17 +66,51 @@ export async function runCacheRestore(
   // 'corrupted' result already had its DB family deleted by cleanStorage.
   if (cacheStatus === 'hit') {
     const dbDir = path.dirname(storagePath)
+    const dbPath = path.join(dbDir, DB_MAIN_BASENAME)
+
+    // SQLite itself reports this file is not a usable database (e.g. "file is not a
+    // database", "database disk image is malformed") — not a live writer and not a slow
+    // truncation. Re-persisting it under a fresh key would trap the repository in the same
+    // self-perpetuating loop this PR exists to break, reached through corruption instead of
+    // a hot write-ahead log. Route it into the same clean-slate path restoreCache already
+    // uses for corrupted or version-mismatched storage, and report the run as a corrupted
+    // cache so the save that follows starts from a clean state instead of re-saving the
+    // malformed database.
+    const handleStructuralCorruption = async (reason: string): Promise<void> => {
+      cacheLogger.warning('Restored database is structurally corrupt - cleaning storage before bootstrap', {
+        reason,
+      })
+      await cleanStorage(storagePath)
+      cacheStatus = 'corrupted'
+      metrics.setCacheStatus(cacheStatus)
+    }
+
     const repairOutcome = await checkpointDatabase({
-      dbPath: path.join(dbDir, DB_MAIN_BASENAME),
+      dbPath,
       walPath: path.join(dbDir, DB_WAL_BASENAME),
       logger: cacheLogger,
     })
     if (repairOutcome.status === 'checkpointed') {
       cacheLogger.info('Repaired restored database: checkpointed write-ahead log before bootstrap')
     } else if (repairOutcome.status === 'failed') {
-      cacheLogger.warning('Failed to repair restored database before bootstrap', {reason: repairOutcome.reason})
+      if (repairOutcome.retryable) {
+        cacheLogger.warning('Failed to repair restored database before bootstrap', {reason: repairOutcome.reason})
+      } else {
+        await handleStructuralCorruption(repairOutcome.reason)
+      }
+    } else {
+      // 'nothing-to-checkpoint' is the common healthy-run case: there was no write-ahead
+      // log to merge, either because the database was cleanly closed or because there was
+      // no database at all. Neither shape is visible to checkpointDatabase's WAL-driven
+      // contract, so a structurally corrupt database with no hot WAL to betray it would
+      // otherwise sail through untouched. This probe is the one place that catches it —
+      // it is a no-op (reports usable) for a missing or empty database, matching
+      // checkpointDatabase's own treatment of that case.
+      const usability = await verifyDatabaseUsable(dbPath)
+      if (usability.usable === false) {
+        await handleStructuralCorruption(usability.reason)
+      }
     }
-    // 'nothing-to-checkpoint' is the common healthy-run case and is deliberately silent.
   }
 
   const serverLogger = createLogger({phase: 'server-bootstrap'})

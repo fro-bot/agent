@@ -79,6 +79,13 @@ async function hasCacheableContent(storagePath: string, cachePaths: readonly str
  * dedup-skip summary use) because `saveCache` runs in both the cleanup and post-hook
  * paths, neither of which carries the full `RunMetrics` that `writeJobSummary` expects.
  * Non-blocking: logs a warning on failure but never throws.
+ *
+ * A decline here rarely costs a run its session work: `runCleanup` only marks
+ * `CACHE_SAVED` when this call returns `true`, so a decline at cleanup time leaves
+ * `runPost` (src/harness/post.ts) to retry the save later — by which point the main step
+ * has ended and the OpenCode child has almost certainly exited, making the retry's
+ * checkpoint succeed. A future refactor that sets `CACHE_SAVED` on decline (to avoid
+ * apparently-duplicate work) would silently remove that safety net.
  */
 async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Promise<void> {
   try {

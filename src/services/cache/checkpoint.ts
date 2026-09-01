@@ -17,13 +17,19 @@ import {toErrorMessage} from '../../shared/errors.js'
  *   already empty. Nothing needed to happen, and the caller should proceed exactly as
  *   if a checkpoint had succeeded.
  * - `failed`: a write-ahead log existed and held data, but it could not be merged
- *   (a live writer held the database, or every attempt could not fully truncate it).
- *   `reason` is a human-readable explanation for logs and the job summary.
+ *   (a live writer held the database, every attempt could not fully truncate it, or the
+ *   repair deadline elapsed between attempts). `reason` is a human-readable explanation
+ *   for logs and the job summary. `retryable` distinguishes why: `true` means the
+ *   database itself is presumably fine and merely busy, slow, or still not fully
+ *   truncated within budget; `false` means SQLite itself reported the file is not a
+ *   usable database (e.g. "file is not a database", "database disk image is malformed")
+ *   — a structural failure no amount of retrying would fix. Callers use this to decide
+ *   whether to treat the database as corrupted rather than merely busy.
  */
 export type CheckpointOutcome =
   | {readonly status: 'checkpointed'}
   | {readonly status: 'nothing-to-checkpoint'}
-  | {readonly status: 'failed'; readonly reason: string}
+  | {readonly status: 'failed'; readonly reason: string; readonly retryable: boolean}
 
 export interface CheckpointOptions {
   readonly dbPath: string
@@ -33,10 +39,23 @@ export interface CheckpointOptions {
   readonly maxAttempts?: number
   /** Delay between retry attempts, in milliseconds. Default 200. */
   readonly retryDelayMs?: number
+  /**
+   * Wall-clock budget in milliseconds for the whole repair, checked only between
+   * attempts. An in-flight `PRAGMA wal_checkpoint(TRUNCATE)` is never interrupted, so a
+   * slow-but-succeeding first attempt always completes regardless of this value. Default
+   * 5000. The pragma itself has no bound: this PR's own measurement put a 185 MB
+   * write-ahead log at ~2.4s for a single attempt, so 5 default attempts could otherwise
+   * add ~12s of unbounded time ahead of every cache-hit's bootstrap. 5000ms guarantees at
+   * least one full attempt completes even for an unusually large log, while capping the
+   * worst case to roughly one attempt beyond the budget instead of unbounded attempts
+   * times unbounded per-attempt duration.
+   */
+  readonly deadlineMs?: number
 }
 
 const DEFAULT_MAX_ATTEMPTS = 5
 const DEFAULT_RETRY_DELAY_MS = 200
+const DEFAULT_DEADLINE_MS = 5000
 
 async function fileSize(filePath: string): Promise<number | null> {
   try {
@@ -90,7 +109,14 @@ function isRetryableError(error: unknown): boolean {
  * expect to find.
  */
 export async function checkpointDatabase(options: CheckpointOptions): Promise<CheckpointOutcome> {
-  const {dbPath, walPath, logger, maxAttempts = DEFAULT_MAX_ATTEMPTS, retryDelayMs = DEFAULT_RETRY_DELAY_MS} = options
+  const {
+    dbPath,
+    walPath,
+    logger,
+    maxAttempts = DEFAULT_MAX_ATTEMPTS,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+    deadlineMs = DEFAULT_DEADLINE_MS,
+  } = options
 
   const dbSize = await fileSize(dbPath)
   if (dbSize == null || dbSize === 0) {
@@ -103,8 +129,23 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
   }
 
   let lastReason = 'unknown checkpoint failure'
+  let lastRetryable = true
+  const startedAt = Date.now()
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Checked between attempts only, never mid-checkpoint: attempt 1 always runs
+    // regardless of this budget, and an in-flight PRAGMA is never aborted.
+    if (attempt > 1 && Date.now() - startedAt >= deadlineMs) {
+      lastReason = `checkpoint deadline of ${deadlineMs}ms exceeded after attempt ${attempt - 1}/${maxAttempts}`
+      lastRetryable = true
+      logger.warning('SQLite checkpoint deadline exceeded, declining further attempts', {
+        attempt: attempt - 1,
+        maxAttempts,
+        deadlineMs,
+      })
+      break
+    }
+
     let db: DatabaseSync | undefined
     let caughtError: unknown
 
@@ -123,7 +164,8 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
 
     if (caughtError !== undefined) {
       lastReason = toErrorMessage(caughtError)
-      if (!isRetryableError(caughtError) || attempt === maxAttempts) {
+      lastRetryable = isRetryableError(caughtError)
+      if (!lastRetryable || attempt === maxAttempts) {
         logger.warning('SQLite checkpoint attempt failed', {attempt, maxAttempts, reason: lastReason})
         break
       }
@@ -138,6 +180,7 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
     }
 
     lastReason = `write-ahead log still ${walSizeAfter} bytes after checkpoint attempt ${attempt}/${maxAttempts}`
+    lastRetryable = true
     if (attempt === maxAttempts) {
       break
     }
@@ -149,5 +192,5 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
     await delay(retryDelayMs)
   }
 
-  return {status: 'failed', reason: lastReason}
+  return {status: 'failed', reason: lastReason, retryable: lastRetryable}
 }

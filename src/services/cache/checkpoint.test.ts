@@ -159,11 +159,71 @@ describe('checkpointDatabase', () => {
     // #when checkpointing with a small bound so the test stays fast
     const outcome = await checkpointDatabase({dbPath, walPath, logger, maxAttempts: 3, retryDelayMs: 1})
 
-    // #then it retries and reports failure without throwing
+    // #then it retries and reports failure without throwing, classified retryable since
+    // the database itself is fine and merely locked by a live writer
     expect(outcome.status).toBe('failed')
     const reason = outcome.status === 'failed' ? outcome.reason : ''
     expect(reason.length).toBeGreaterThan(0)
+    expect(outcome.status === 'failed' && outcome.retryable).toBe(true)
     expect(logger.warning).toHaveBeenCalled()
+
+    holder.exec('COMMIT')
+  })
+
+  it('reports a non-retryable failure for a database SQLite itself cannot open, without retrying', async () => {
+    // #given a database file that is not valid SQLite at all, with a populated
+    // write-ahead log beside it so the early-return does not skip opening it
+    await fs.writeFile(dbPath, 'not a real sqlite database file, just garbage bytes'.repeat(50))
+    await fs.writeFile(walPath, 'also not a real write-ahead log, just more garbage'.repeat(50))
+
+    // #when checkpointing
+    const outcome = await checkpointDatabase({dbPath, walPath, logger, maxAttempts: 3, retryDelayMs: 1})
+
+    // #then it fails on the very first attempt — SQLite reports the file itself is not a
+    // usable database, which is structural and not worth retrying
+    expect(outcome.status).toBe('failed')
+    const reason = outcome.status === 'failed' ? outcome.reason : ''
+    expect(reason.toLowerCase()).toContain('not a database')
+    expect(outcome.status === 'failed' && outcome.retryable).toBe(false)
+    expect(logger.warning).toHaveBeenCalledWith('SQLite checkpoint attempt failed', {
+      attempt: 1,
+      maxAttempts: 3,
+      reason,
+    })
+    expect(logger.debug).not.toHaveBeenCalled()
+  })
+
+  it('never interrupts attempt 1 but stops before attempt 2 once the deadline has elapsed, reporting a retryable failure', async () => {
+    // #given a database held under an exclusive lock, guaranteeing every attempt fails
+    // retryably, and a deadline so small it is certainly exceeded by the time attempt 1's
+    // delay elapses
+    const holder = openHotWalDatabase(dbPath)
+    holder.exec('PRAGMA locking_mode=EXCLUSIVE')
+    holder.exec('BEGIN IMMEDIATE')
+    holder.exec("INSERT INTO sessions (data) VALUES ('in-flight')")
+
+    // #when checkpointing with a deadline smaller than the retry delay
+    const outcome = await checkpointDatabase({
+      dbPath,
+      walPath,
+      logger,
+      maxAttempts: 5,
+      retryDelayMs: 50,
+      deadlineMs: 1,
+    })
+
+    // #then attempt 1 still ran (never interrupted mid-checkpoint) and failed on the lock,
+    // but the deadline stopped any further attempt rather than exhausting maxAttempts —
+    // the failure remains classified retryable since the database itself is fine, merely
+    // slow to become available
+    expect(outcome.status).toBe('failed')
+    const reason = outcome.status === 'failed' ? outcome.reason : ''
+    expect(reason).toContain('deadline')
+    expect(outcome.status === 'failed' && outcome.retryable).toBe(true)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'SQLite checkpoint deadline exceeded, declining further attempts',
+      expect.objectContaining({attempt: 1, maxAttempts: 5, deadlineMs: 1}),
+    )
 
     holder.exec('COMMIT')
   })

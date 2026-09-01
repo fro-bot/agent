@@ -58,9 +58,15 @@ export async function deleteAuthJson(authPath: string, storagePath: string, logg
 // Restore mode always includes -wal and -shm even if absent: @actions/cache tolerates
 // missing paths in the archive, and accepting -shm on restore preserves compatibility with
 // caches written before -shm was dropped from the save set (see buildSaveCachePaths below).
-// Save mode filters by existence because @actions/cache fails if any save path is missing
-// at archive time, and it never includes -shm: it is a machine-local wal-index that SQLite
-// never syncs, so a copy transported from another runner is stale by construction.
+// Save mode pushes storagePath and opencode.db unconditionally, whether or not they exist
+// yet, and only opencode.db-wal gets an fs.access existence guard below. This is safe:
+// @actions/cache's saveCache resolves every given path via glob and only throws "Path(s)
+// ... do(es) not exist" when that resolution comes back empty for all of them, not when
+// some of them are individually missing. storagePath and opencode.db are the two paths
+// that make that failure unreachable in practice; the -wal guard exists because it is
+// ordinarily absent (a healthy checkpoint leaves no write-ahead log behind), and save mode
+// never includes -shm at all: it is a machine-local wal-index that SQLite never syncs, so
+// a copy transported from another runner is stale by construction.
 
 /**
  * Re-exported, not redefined. `@fro-bot/runtime` owns these names because the object-store

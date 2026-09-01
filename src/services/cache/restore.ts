@@ -50,7 +50,15 @@ async function checkStorageVersion(storagePath: string, logger: RestoreCacheOpti
   }
 }
 
-async function cleanStorage(storagePath: string): Promise<void> {
+/**
+ * Wipes the storage directory and the DB-family files beside it (opencode.db and its
+ * write-ahead log/shm sidecars), then recreates an empty storage directory. Exported so
+ * callers outside restoreCache — the restore-side repair in cache-restore.ts — can route
+ * a structurally corrupt database (SQLite itself reports the file unusable, not merely
+ * busy) into the same clean-slate path this module already uses for corrupted or
+ * version-mismatched storage.
+ */
+export async function cleanStorage(storagePath: string): Promise<void> {
   try {
     await fs.rm(storagePath, {recursive: true, force: true})
     await fs.mkdir(storagePath, {recursive: true})
