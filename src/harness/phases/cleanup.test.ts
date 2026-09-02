@@ -314,6 +314,46 @@ describe('runCleanup', () => {
     expect(pruneSessions).toHaveBeenCalledWith({}, '/tmp/workspace', DEFAULT_PRUNING_CONFIG, expect.any(Object))
   })
 
+  it('warns when shutdown() cannot confirm quiescence, so an operator can see the checkpoint that follows may have raced a writer', async () => {
+    // #given a server handle whose shutdown() times out without confirming the child
+    // exited — every other test in this suite mocks shutdown as quiesced: true, so this
+    // branch (cleanup.ts's `if (!shutdownResult.quiesced)`) is otherwise never observed
+    const logger = createMockLogger()
+    const serverHandle: NonNullable<CleanupPhaseOptions['serverHandle']> = {
+      client: {} as NonNullable<CleanupPhaseOptions['serverHandle']>['client'],
+      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+      shutdown: vi.fn().mockResolvedValue({quiesced: false}),
+    }
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup shuts the server down
+    await runCleanup({
+      bootstrapLogger: logger,
+      reactionCtx: null,
+      githubClient: null,
+      agentSuccess: true,
+      attachmentResult: null,
+      serverHandle,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then the unconfirmed quiescence is surfaced as a warning, distinct from the
+    // separate 'Server shutdown failed' warning that only fires when shutdown() itself
+    // throws
+    expect(serverHandle.shutdown).toHaveBeenCalledTimes(1)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'OpenCode server did not confirm shutdown within the quiescence window; the checkpoint that follows may race a still-live writer',
+    )
+    expect(logger.warning).not.toHaveBeenCalledWith('Server shutdown failed (non-fatal)', expect.any(Object))
+  })
+
   it('skips pruning when there is no live server handle', async () => {
     // #given no live server handle
     const {pruneSessions} = await import('@fro-bot/runtime')

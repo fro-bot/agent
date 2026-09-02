@@ -25,14 +25,26 @@ async function delay(ms: number): Promise<void> {
 // instant the connection is refused (or otherwise errors) -- which, for a port this
 // process itself bound moments earlier via pickFreePort/createOpencode, only happens once
 // the process holding it has actually exited and the OS has reclaimed the socket.
-async function isPortOpen(hostname: string, port: number): Promise<boolean> {
+//
+// Bounded by its own socket timeout (`timeoutMs`, one poll interval's worth) rather than
+// relying solely on `connect`/`error` firing: a connection attempt that neither succeeds
+// nor is refused -- a firewalled port, a host that silently drops SYNs -- would otherwise
+// never settle this promise, which would stall waitForServerQuiescence's do/while loop
+// forever despite its own `timeoutMs` parameter. `finish` is guarded against running twice
+// so a `timeout` that fires and a subsequent `error` from the torn-down socket cannot both
+// resolve the same promise.
+async function isPortOpen(hostname: string, port: number, timeoutMs: number): Promise<boolean> {
   return new Promise(resolve => {
+    let settled = false
     const socket = net.connect({host: hostname, port})
     const finish = (result: boolean): void => {
+      if (settled) return
+      settled = true
       socket.removeAllListeners()
       socket.destroy()
       resolve(result)
     }
+    socket.setTimeout(timeoutMs, () => finish(false))
     socket.once('connect', () => finish(true))
     socket.once('error', () => finish(false))
   })
@@ -71,9 +83,20 @@ export async function waitForServerQuiescence(
     return {quiesced: false}
   }
 
+  // A URL with no explicit port (parsed.port === '') yields 0 here, and connecting to port
+  // 0 errors immediately -- isPortOpen would report "closed" on the first attempt without
+  // having checked anything real, turning a malformed URL into a false quiesced: true.
+  // bootstrapOpenCodeServer always pins an explicit port and rejects a URL mismatch before
+  // a handle is ever returned (see the check above acquiredServer/server.url), so this is
+  // unreachable in practice; guarded here so that invariant is enforced in code, not left
+  // as an assumption about what callers happen to pass.
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    return {quiesced: false}
+  }
+
   const deadline = Date.now() + timeoutMs
   do {
-    const stillOpen = await isPortOpen(hostname, port)
+    const stillOpen = await isPortOpen(hostname, port, pollIntervalMs)
     if (!stillOpen) {
       return {quiesced: true}
     }

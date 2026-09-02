@@ -112,15 +112,21 @@ async function deleteRestoredShm(storagePath: string, logger: RestoreCacheOption
 // (see checkpoint.ts's doc comment for the real-node:sqlite reproduction of that silent-
 // replay case).
 //
-// Runs unconditionally right after syncSessionsFromStore returns, regardless of whether a
-// main database was restored: a sidecar-only download (no opencode.db object present)
-// falls through this function to the Actions-cache path in restoreCache below, and on an
-// Actions-cache miss that path never touches storagePath's sibling directory at all — a
-// write-ahead log left on disk here would still be sitting there when bootstrap opens
-// whatever fresh database OpenCode itself creates next. Nothing between here and that
-// bootstrap opens the database with node:sqlite (checkStorageCorruption/checkStorageVersion
-// below only stat/read the storage directory and its .version marker), so deleting
-// immediately after the sync call is also the earliest point that closes the window.
+// Called from a `finally` around the whole object-store restore attempt in
+// restoreFromObjectStore below, not inline after syncSessionsFromStore's own return — a
+// call sitting inside that function's try block only runs on the non-throwing path, and
+// syncSessionsFromStore's download loop has a real throw site (fs.mkdir per key,
+// content-sync.ts) that a bare inline call would silently skip, leaving the very log this
+// function exists to remove sitting on disk for whatever the Actions-cache restore
+// extracts next. A `finally` fires on every exit from that try: the thrown-error path, and
+// every early return inside it (a corrupt or version-mismatched hit, and the successful hit
+// itself). It deliberately does NOT run when the object store is disabled — that guard
+// returns before the try block is ever entered — so a self-hosted runner with the object
+// store turned off never has a locally-persistent write-ahead log touched by this function.
+// Nothing between the try block's start and its end ever opens the database with
+// node:sqlite (checkStorageCorruption/checkStorageVersion only stat/read the storage
+// directory and its .version marker), so running the deletion at any point up to and
+// including the try's exit is still strictly before anything could open it.
 async function deleteDownloadedObjectStoreWal(
   storagePath: string,
   logger: RestoreCacheOptions['logger'],
@@ -161,8 +167,6 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
       storagePath,
       logger,
     )
-
-    await deleteDownloadedObjectStoreWal(storagePath, logger)
 
     if (syncResult.mainDbRestored === true) {
       // The object store sync writes opencode.db beside storagePath; ensure this cache directory exists before returning.
@@ -217,6 +221,8 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
     logger.warning('Object store restore failed - treating as miss', {
       error: toErrorMessage(error),
     })
+  } finally {
+    await deleteDownloadedObjectStoreWal(storagePath, logger)
   }
 
   return {

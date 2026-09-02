@@ -479,4 +479,60 @@ describe('restore/save object-store integration flow', () => {
     holder.exec('COMMIT')
     holder.close()
   })
+
+  it('deletes the downloaded write-ahead log even when the object-store download loop throws partway through (regression: deletion previously lived inside the try it could never reach)', async () => {
+    // #given a healthy-looking object-store restore where opencode.db and opencode.db-wal
+    // both download successfully, but a later key in the same listing throws mid-loop --
+    // mirroring content-sync.ts's real throw site (fs.mkdir per key) under ENOSPC/EACCES.
+    // Keys download in the store's listed order (lexicographic, matching real S3), so
+    // 'opencode.db' and 'opencode.db-wal' both land on disk before the trigger key is ever
+    // reached, proving the wal was genuinely downloaded and not merely absent.
+    const store = createInMemoryStoreAdapter({
+      initialObjects: new Map([
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('object-store-db')],
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db-wal', Buffer.from('stale-generation-wal')],
+        ['fro-bot-state/github/owner/repo/sessions/zzz-throw-trigger', Buffer.from('irrelevant')],
+      ]),
+    })
+    store.download.mockImplementation(async (key, localPath) => {
+      if (key.endsWith('zzz-throw-trigger')) {
+        throw new Error('ENOSPC: no space left on device, mkdir')
+      }
+      await fs.mkdir(path.dirname(localPath), {recursive: true})
+      await fs.writeFile(localPath, store.objects.get(key) ?? Buffer.alloc(0))
+      return ok(undefined)
+    })
+
+    // The Actions cache is what the object-store throw falls through to. Its own
+    // restoreCache writes a fresh opencode.db, simulating a real @actions/cache extract --
+    // the shape that would silently pair with a leftover object-store wal if the deletion
+    // above never ran.
+    const actionsCacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => {
+      await fs.mkdir(storagePath, {recursive: true})
+      await fs.writeFile(dbPath, 'actions-cache-db', 'utf8')
+      return 'actions-cache-key'
+    })
+
+    const restoreOptions: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: {restoreCache: actionsCacheRestore, saveCache: async () => 1},
+      storeConfig: testStoreConfig,
+      storeAdapter: store.adapter,
+    }
+
+    // #when restoring cache
+    const restoreResult = await restoreCache(restoreOptions)
+
+    // #then the object-store throw is treated as a miss and the Actions cache wins, but --
+    // the property this test exists to pin -- the write-ahead log downloaded moments
+    // earlier from the object store does not survive to be paired with it
+    expect(restoreResult).toMatchObject({hit: true, source: 'cache', key: 'actions-cache-key'})
+    expect(actionsCacheRestore).toHaveBeenCalledTimes(1)
+    await expect(fs.readFile(dbPath, 'utf8')).resolves.toBe('actions-cache-db')
+    await expect(fs.access(`${dbPath}-wal`)).rejects.toThrow()
+  })
 })

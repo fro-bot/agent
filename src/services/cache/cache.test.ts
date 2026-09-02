@@ -9,6 +9,7 @@ import {DatabaseSync} from 'node:sqlite'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {ok} from '../../shared/types.js'
 import {
+  checkpointDatabase,
   isAuthPathSafe,
   isPathInsideDirectory,
   restoreCache,
@@ -907,6 +908,78 @@ describe('restoreCache', () => {
     expect(result.hit).toBe(false)
     expect(download).not.toHaveBeenCalled()
     expect(logger.warning).toHaveBeenCalled()
+  })
+
+  it('restores a legacy Actions-cache db+wal pair via a genuine cacheAdapter.restoreCache call, then preserves its committed transaction through the restore-side checkpoint repair', async () => {
+    // #given a legacy cache entry: one atomic Actions-cache archive holding both
+    // opencode.db and a populated opencode.db-wal, written by a save that predates this
+    // repository's checkpoint-before-save fix. Deliberately built INSIDE the cacheAdapter's
+    // own restoreCache callback — mirroring what @actions/cache's real restoreCache does
+    // when it extracts an archive — rather than pre-placed on disk before restoreCache is
+    // called, so this pins a genuine restore rather than a local fixture the test set up
+    // itself. The pair is genuinely consistent because one Actions-cache entry is one
+    // atomic save, unlike an object-store restore: see deleteDownloadedObjectStoreWal's
+    // doc comment in restore.ts for why that source is treated oppositely (discarded,
+    // never checkpointed).
+    const dbDir = path.dirname(storagePath)
+    const legacyDbPath = path.join(dbDir, 'opencode.db')
+    const legacyWalPath = `${legacyDbPath}-wal`
+    let legacyDb: DatabaseSync | undefined
+
+    const adapter: CacheAdapter = {
+      restoreCache: async () => {
+        await fs.mkdir(storagePath, {recursive: true})
+        legacyDb = new DatabaseSync(legacyDbPath)
+        legacyDb.exec('PRAGMA journal_mode=WAL')
+        legacyDb.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+        legacyDb.exec("INSERT INTO sessions (data) VALUES ('legacy-committed-session')")
+        return 'legacy-cache-key'
+      },
+      saveCache: async () => 1,
+    }
+
+    const options: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: adapter,
+    }
+
+    try {
+      // #when restoring cache through the Actions-cache path (no object store configured)
+      const result = await restoreCache(options)
+
+      // #then the restore is a hit sourced from the cache, and the legacy pair is left
+      // alone — restoreCache itself never checkpoints or deletes the write-ahead log for
+      // this source, unlike the object-store path
+      expect(result).toMatchObject({hit: true, source: 'cache', key: 'legacy-cache-key'})
+      expect((await fs.stat(legacyWalPath)).size).toBeGreaterThan(0)
+
+      // #when the restore-side repair runs next, exactly as runCacheRestore
+      // (src/harness/phases/cache-restore.ts) does for every cacheStatus === 'hit' before
+      // bootstrap ever opens the database
+      const checkpointOutcome = await checkpointDatabase({
+        dbPath: legacyDbPath,
+        walPath: legacyWalPath,
+        logger: createTestLogger(),
+      })
+
+      // #then the pair is checkpointed in place — not discarded — and the committed
+      // transaction that lived only in the write-ahead log survives intact
+      expect(checkpointOutcome.status).toBe('checkpointed')
+      const verifyDb = new DatabaseSync(legacyDbPath)
+      try {
+        const rows = verifyDb.prepare('SELECT data FROM sessions').all()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]?.data).toBe('legacy-committed-session')
+      } finally {
+        verifyDb.close()
+      }
+    } finally {
+      legacyDb?.close()
+    }
   })
 })
 
