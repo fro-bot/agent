@@ -183,16 +183,20 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
         try {
           await pipeline(response.Body, fs.createWriteStream(localPath))
         } catch (pipelineError) {
-          // pipeline() opens localPath via createWriteStream (truncating any pre-existing
-          // file at that path) before streaming a single byte, so a failure partway
-          // through the transfer leaves a partial -- and, for a path that already held a
-          // file, now-corrupted -- file on disk rather than no file at all. That matters
-          // specifically for the main session database: an unprobed partial opencode.db
-          // reaching bootstrap is worse than a clean miss. Best-effort unlink, scoped to
-          // exactly this failure: a GetObjectCommand rejection ABOVE this line (network,
-          // auth, a missing object) never reaches here, so a pre-existing local file this
-          // download attempt never touched is never at risk from this cleanup -- only a
-          // file this exact pipeline() call just opened for writing.
+          // A mid-transfer failure here leaves a partial -- and, for a path that already
+          // held a file, now-corrupted -- file on disk rather than no file at all. That
+          // matters specifically for the main session database: an unprobed partial
+          // opencode.db reaching bootstrap is worse than a clean miss. Best-effort unlink.
+          // Guaranteed scope: a GetObjectCommand rejection ABOVE this line (network, auth,
+          // a missing object) never reaches this catch, so a pre-existing local file is
+          // never at risk when the failure happens before any write was attempted. NOT
+          // guaranteed: if createWriteStream itself cannot open localPath -- e.g. it names
+          // an existing directory, or an existing file this process lacks permission to
+          // write -- pipeline() rejects before truncating anything, and this unlink still
+          // fires against a file this attempt never wrote a byte to. unlink() only needs
+          // write permission on the containing directory, not the target file, so that
+          // call can still succeed. Accepted: the failure mode is a clean subsequent miss,
+          // not silent corruption, and this is believed rare in practice.
           await fsp.unlink(localPath).catch(() => {})
           throw pipelineError
         }

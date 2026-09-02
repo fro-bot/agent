@@ -388,6 +388,38 @@ describe('waitForServerQuiescence', () => {
     // #then the failure is reported as an unconfirmed quiescence, not an exception
     expect(result).toEqual({quiesced: false})
   })
+
+  // This is the end-to-end counterpart to isPortOpen's own polarity test below: that test
+  // pins isPortOpen's *return value* (true) for an inconclusive probe, but nothing pinned
+  // that waitForServerQuiescence's do/while loop actually treats that `true` as "keep
+  // polling" rather than "the child exited". A one-line call-site regression --
+  // `if (stillOpen) return {quiesced: true}` -- inverts that read, passes every other test
+  // in this file (isPortOpen's own polarity test doesn't touch this call site, and the
+  // real-listener tests above never exercise the timeout branch at all), and silently
+  // reintroduces the bug this PR fixed one line away from the fix. Threading the same
+  // optional `connect` injector through to this level is what makes the loop's own read of
+  // that return value directly assertable without depending on real network timing.
+  it('never reports quiesced: true from repeated inconclusive probes -- only a genuinely refused connection, or the deadline, may produce a result', async () => {
+    // #given a connect() that always times out inconclusively (fires isPortOpen's own
+    // setTimeout branch, never 'connect' or 'error') -- standing in for a firewalled port
+    // or a host silently dropping SYNs on every single poll attempt
+    let connectCalls = 0
+    const alwaysInconclusive = (): QuiescenceProbeSocket => {
+      connectCalls++
+      const fake = createFakeSocket()
+      queueMicrotask(fake.fireTimeout)
+      return fake.socket
+    }
+
+    // #when waiting for quiescence with a budget that allows several poll cycles
+    const result = await waitForServerQuiescence('http://127.0.0.1:4096', 60, 10, alwaysInconclusive)
+
+    // #then the deadline is what ends the wait, reporting the honest unconfirmed state --
+    // never quiesced: true, which would mean an inconclusive probe was misread as "the
+    // child exited"
+    expect(result).toEqual({quiesced: false})
+    expect(connectCalls).toBeGreaterThan(1)
+  })
 })
 
 // isPortOpen's own socket-timeout branch is otherwise unreachable from a deterministic

@@ -56,7 +56,12 @@ function defaultConnect(hostname: string, port: number): QuiescenceProbeSocket {
 // "cannot confirm the child exited", not to a manufactured `quiesced: true`. Resolving
 // `true` here means the do/while loop simply keeps polling on the next interval; the outer
 // `waitForServerQuiescence` deadline is what eventually produces an honest `quiesced:
-// false` if the port genuinely never stops answering. `finish` is guarded against running
+// false` if the port genuinely never stops answering -- the cost of that correctness is
+// that a genuinely inconclusive probe now rides out the full outer timeout budget
+// (`DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS`, 5000ms as of writing) instead of returning after
+// a single poll interval; this is one server per run and bounded, so it is an acceptable,
+// intended trade, not a regression, but a future change to either constant should account
+// for it deliberately rather than rediscovering it. `finish` is guarded against running
 // twice so a `timeout` that fires and a subsequent `error` from the torn-down socket cannot
 // both resolve the same promise. `destroy()` runs before `removeAllListeners()`, not after:
 // removing the `error` listener first would leave a socket that is mid-connect (and may
@@ -104,6 +109,7 @@ export async function waitForServerQuiescence(
   url: string,
   timeoutMs: number = DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
   pollIntervalMs: number = DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS,
+  connect: (hostname: string, port: number) => QuiescenceProbeSocket = defaultConnect,
 ): Promise<ShutdownResult> {
   let hostname: string
   let port: number
@@ -130,7 +136,7 @@ export async function waitForServerQuiescence(
 
   const deadline = Date.now() + timeoutMs
   do {
-    const stillOpen = await isPortOpen(hostname, port, pollIntervalMs)
+    const stillOpen = await isPortOpen(hostname, port, pollIntervalMs, connect)
     if (!stillOpen) {
       return {quiesced: true}
     }
