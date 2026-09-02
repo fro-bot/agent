@@ -35,7 +35,7 @@ An OpenCode server bootstrap timed out. The run then persisted session state tha
 
 ## What Didn't Work
 
-This section is the useful one. Five plausible fixes were tried and refuted, each by evidence rather than argument.
+This section is the useful one. Seven plausible fixes were tried and refuted, each by evidence rather than argument.
 
 **"Only persist cleanly-checkpointed state."** Inverted by reality. `server.close()` sends `proc.kill()` without awaiting a checkpoint, so nothing had _ever_ produced a checkpointed database. This rule would have blocked every save in the repository's history.
 
@@ -85,7 +85,7 @@ The ordering is what matters. Restore finishes before bootstrap starts with no t
 
 A note on the Actions-cache change, stated at the strength the evidence supports: in WAL mode the main database file is mutated only during a checkpoint, so archiving `opencode.db` alone beside a live writer generally yields a consistent, slightly-stale database — strictly better than copying a concurrently-appended log, which is the torn-read shape that produces `malformed`. This is not unconditional. SQLite's default `wal_autocheckpoint` is 1000 pages, and a live writer crossing that threshold mutates the main file with no explicit checkpoint at all — measured going from 4096 to 860160 bytes mid-write. The claim is "much safer", not "safe".
 
-## The regression the fix introduced
+## The Regression the Fix Introduced
 
 Worth recording, because it was caused by the fix and found only in review.
 
