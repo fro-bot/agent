@@ -5,9 +5,22 @@ import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import {DatabaseSync} from 'node:sqlite'
+import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {err, ok} from '../../shared/types.js'
 import {restoreCache, saveCache, type CacheAdapter, type RestoreCacheOptions, type SaveCacheOptions} from './index.js'
+
+// The checkpoint decline path writes a job summary via core.summary. None of these tests
+// depend on real @actions/core behavior otherwise (logging uses the local test logger
+// stub, and object-store calls use the in-memory adapter below), so mocking it here is safe.
+vi.mock('@actions/core', () => ({
+  summary: {
+    addHeading: vi.fn().mockReturnThis(),
+    addRaw: vi.fn().mockReturnThis(),
+    write: vi.fn().mockResolvedValue(undefined),
+  },
+}))
 
 const testComponents: CacheKeyComponents = {
   agentIdentity: 'github',
@@ -326,5 +339,200 @@ describe('restore/save object-store integration flow', () => {
     // #then cache save still succeeds
     expect(saveResult).toBe(true)
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
+  })
+
+  it('excludes both opencode.db-wal and opencode.db-shm from the object store even when both exist locally', async () => {
+    const cache = createMockCacheAdapter(undefined)
+    const store = createInMemoryStoreAdapter()
+
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(sessionFilePath, '{"session":"created"}', 'utf8')
+
+    // A real hot-WAL database, deliberately left open rather than cleanly closed —
+    // mirrors server.close() sending proc.kill() without awaiting a checkpoint. saveCache
+    // now checkpoints before building the upload set, so this must be real SQLite for
+    // that checkpoint to succeed rather than decline the save. The connection stays open
+    // through the assertions below, so the checkpoint truncates the write-ahead log to
+    // zero bytes but does not unlink it — proving exclusion is by design (never selected
+    // for transport), not merely because the file happened to be absent.
+    const db = new DatabaseSync(dbPath)
+    db.exec('PRAGMA journal_mode=WAL')
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    // A page-aligned, zero-filled placeholder — NOT arbitrary text. A wrong-sized -shm
+    // file causes node:sqlite to segfault (SIGBUS via mmap past EOF) the instant a
+    // database next to it is opened, verified on both Node 24 and Bun. This exact size
+    // is what a real SQLite-managed -shm looks like, so it exercises exclusion without
+    // crashing the checkpoint this save now performs.
+    await fs.writeFile(`${dbPath}-shm`, Buffer.alloc(32768))
+
+    const saveOptions: SaveCacheOptions = {
+      components: testComponents,
+      runId: 606,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: cache.adapter,
+      storeConfig: testStoreConfig,
+      storeAdapter: store.adapter,
+    }
+
+    // #given a hot-WAL db, its (now-truncated-but-still-present) write-ahead log, and a
+    // shm sidecar all present locally
+
+    // #when saving cache
+    const saveResult = await saveCache(saveOptions)
+
+    // #then the object store receives only the main db — neither sidecar ever crosses the
+    // boundary — and the cache adapter agrees
+    expect(saveResult).toBe(true)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db')).toBe(true)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-wal')).toBe(false)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-shm')).toBe(false)
+    expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
+
+    db.close()
+  })
+
+  it('deletes a stale opencode.db-shm restored from the object store before returning a hit', async () => {
+    const cache = createMockCacheAdapter(undefined)
+    const store = createInMemoryStoreAdapter({
+      initialObjects: new Map([
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('object-store-db')],
+        // A shm object uploaded before this fix shipped; download must remain tolerant of it.
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db-shm', Buffer.from('stale-machine-local-shm')],
+      ]),
+    })
+
+    const restoreOptions: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: cache.adapter,
+      storeConfig: testStoreConfig,
+      storeAdapter: store.adapter,
+    }
+
+    // #given an object store still holding a pre-fix shm object alongside the main db
+
+    // #when restoring cache
+    const restoreResult = await restoreCache(restoreOptions)
+
+    // #then the restore is a hit, the db is present, and the stale local shm copy is deleted
+    expect(restoreResult).toMatchObject({hit: true, source: 'storage'})
+    expect(await fs.readFile(dbPath, 'utf8')).toBe('object-store-db')
+    await expect(fs.access(`${dbPath}-shm`)).rejects.toThrow()
+  })
+
+  it('declines the save when the checkpoint cannot complete, and surfaces the reason in the log and job summary', async () => {
+    const cache = createMockCacheAdapter(undefined)
+    const store = createInMemoryStoreAdapter()
+
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(sessionFilePath, '{"session":"created"}', 'utf8')
+
+    // A database held under an exclusive lock by an in-progress transaction on another
+    // connection — the harness's only signal that a writer is still alive, since
+    // serverHandle.shutdown() cannot observe the child process's exit.
+    const holder = new DatabaseSync(dbPath)
+    holder.exec('PRAGMA journal_mode=WAL')
+    holder.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    holder.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    holder.exec('PRAGMA locking_mode=EXCLUSIVE')
+    holder.exec('BEGIN IMMEDIATE')
+    holder.exec("INSERT INTO sessions (data) VALUES ('in-flight')")
+
+    const warningSpy = vi.fn<Logger['warning']>()
+    const logger: Logger = {...createTestLogger(), warning: warningSpy}
+
+    const saveOptions: SaveCacheOptions = {
+      components: testComponents,
+      runId: 707,
+      logger,
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: cache.adapter,
+      storeConfig: testStoreConfig,
+      storeAdapter: store.adapter,
+    }
+
+    // #given a database the checkpoint cannot merge because another connection holds it locked
+
+    // #when saving cache
+    const saveResult = await saveCache(saveOptions)
+
+    // #then the save is declined, the reason is logged, the cache adapter is never invoked,
+    // and the decline is surfaced via the job summary
+    expect(saveResult).toBe(false)
+    expect(cache.saveCache).not.toHaveBeenCalled()
+    expect(warningSpy).toHaveBeenCalledWith(
+      'Declining cache save: SQLite checkpoint did not complete',
+      expect.objectContaining({reason: expect.any(String) as unknown as string}),
+    )
+    expect(core.summary.addHeading).toHaveBeenCalledWith('Fro Bot Agent Run — Cache Save Declined', 2)
+    expect(core.summary.write).toHaveBeenCalled()
+
+    holder.exec('COMMIT')
+    holder.close()
+  })
+
+  it('deletes the downloaded write-ahead log even when the object-store download loop throws partway through (regression: deletion previously lived inside the try it could never reach)', async () => {
+    // #given a healthy-looking object-store restore where opencode.db and opencode.db-wal
+    // both download successfully, but a later key in the same listing throws mid-loop --
+    // mirroring content-sync.ts's real throw site (fs.mkdir per key) under ENOSPC/EACCES.
+    // Keys download in the store's listed order (lexicographic, matching real S3), so
+    // 'opencode.db' and 'opencode.db-wal' both land on disk before the trigger key is ever
+    // reached, proving the wal was genuinely downloaded and not merely absent.
+    const store = createInMemoryStoreAdapter({
+      initialObjects: new Map([
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('object-store-db')],
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db-wal', Buffer.from('stale-generation-wal')],
+        ['fro-bot-state/github/owner/repo/sessions/zzz-throw-trigger', Buffer.from('irrelevant')],
+      ]),
+    })
+    store.download.mockImplementation(async (key, localPath) => {
+      if (key.endsWith('zzz-throw-trigger')) {
+        throw new Error('ENOSPC: no space left on device, mkdir')
+      }
+      await fs.mkdir(path.dirname(localPath), {recursive: true})
+      await fs.writeFile(localPath, store.objects.get(key) ?? Buffer.alloc(0))
+      return ok(undefined)
+    })
+
+    // The Actions cache is what the object-store throw falls through to. Its own
+    // restoreCache writes a fresh opencode.db, simulating a real @actions/cache extract --
+    // the shape that would silently pair with a leftover object-store wal if the deletion
+    // above never ran.
+    const actionsCacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => {
+      await fs.mkdir(storagePath, {recursive: true})
+      await fs.writeFile(dbPath, 'actions-cache-db', 'utf8')
+      return 'actions-cache-key'
+    })
+
+    const restoreOptions: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: {restoreCache: actionsCacheRestore, saveCache: async () => 1},
+      storeConfig: testStoreConfig,
+      storeAdapter: store.adapter,
+    }
+
+    // #when restoring cache
+    const restoreResult = await restoreCache(restoreOptions)
+
+    // #then the object-store throw is treated as a miss and the Actions cache wins, but --
+    // the property this test exists to pin -- the write-ahead log downloaded moments
+    // earlier from the object store does not survive to be paired with it
+    expect(restoreResult).toMatchObject({hit: true, source: 'cache', key: 'actions-cache-key'})
+    expect(actionsCacheRestore).toHaveBeenCalledTimes(1)
+    await expect(fs.readFile(dbPath, 'utf8')).resolves.toBe('actions-cache-db')
+    await expect(fs.access(`${dbPath}-wal`)).rejects.toThrow()
   })
 })

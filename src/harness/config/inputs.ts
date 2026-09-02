@@ -19,6 +19,7 @@ import {
   DEFAULT_OMO_VERSION,
   DEFAULT_OPENCODE_VERSION,
   DEFAULT_S3_PREFIX,
+  DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
   DEFAULT_SESSION_RETENTION,
   DEFAULT_SYSTEMATIC_VERSION,
   DEFAULT_TIMEOUT_MS,
@@ -88,6 +89,13 @@ const VALID_OMO_PROVIDERS = [
 
 const VALID_OUTPUT_MODES = ['auto', 'working-dir', 'branch-pr'] as const
 const VALID_RESPONSE_MODES = ['github', 'none'] as const
+
+// A server that has not finished starting (runtime boot, config parse, plugin loading,
+// DB open) within two minutes is not going to - it will hang until the GitHub Actions
+// job timeout instead of failing fast, which is the opposite of the observability this
+// input exists for. 120000ms gives generous headroom over the 5000ms SDK default for a
+// contended runner while still failing well inside any realistic job timeout.
+const MAX_SERVER_BOOTSTRAP_TIMEOUT_MS = 120_000
 
 function parseOmoSlimPreset(input: string): OmoSlimPreset {
   if (!VALID_OMO_SLIM_PRESETS.includes(input as OmoSlimPreset)) {
@@ -352,6 +360,18 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const timeoutRaw = core.getInput('timeout').trim()
     const timeoutMs = timeoutRaw.length > 0 ? parseTimeoutMs(timeoutRaw) : DEFAULT_TIMEOUT_MS
 
+    const serverBootstrapTimeoutRaw = core.getInput('server-bootstrap-timeout').trim()
+    const requestedServerBootstrapTimeoutMs =
+      serverBootstrapTimeoutRaw.length > 0
+        ? validatePositiveInteger(serverBootstrapTimeoutRaw, 'server-bootstrap-timeout')
+        : DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS
+    const serverBootstrapTimeoutMs = Math.min(requestedServerBootstrapTimeoutMs, MAX_SERVER_BOOTSTRAP_TIMEOUT_MS)
+    if (serverBootstrapTimeoutMs !== requestedServerBootstrapTimeoutMs) {
+      core.warning(
+        `server-bootstrap-timeout of ${requestedServerBootstrapTimeoutMs}ms exceeds the maximum of ${MAX_SERVER_BOOTSTRAP_TIMEOUT_MS}ms and was clipped to ${MAX_SERVER_BOOTSTRAP_TIMEOUT_MS}ms. A server that has not started within that budget will not start.`,
+      )
+    }
+
     // Setup consolidation inputs
     const opencodeVersionRaw = core.getInput('opencode-version').trim()
     const opencodeVersion = opencodeVersionRaw.length > 0 ? opencodeVersionRaw : DEFAULT_OPENCODE_VERSION
@@ -434,6 +454,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       agent,
       model,
       timeoutMs,
+      serverBootstrapTimeoutMs,
       enableOmo,
       enableOmoSlim,
       opencodeVersion,

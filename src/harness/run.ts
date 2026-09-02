@@ -36,6 +36,7 @@ export async function run(): Promise<number> {
   let serverHandle: OpenCodeServerHandle | null = null
   let repo = ''
   let runId = ''
+  let sessionRetention: number | null = null
   let lockEtag: string | null = null
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
@@ -76,6 +77,7 @@ export async function run(): Promise<number> {
     }
     detectedOpencodeVersion = bootstrap.opencodeResult.version
     storeConfig = bootstrap.inputs.storeConfig
+    sessionRetention = bootstrap.inputs.sessionRetention
 
     const routing = await runRouting(bootstrap, startTime)
     if (routing == null) {
@@ -215,6 +217,7 @@ export async function run(): Promise<number> {
       agentSuccess: deliverySucceeded,
       attachmentResult,
       serverHandle,
+      sessionRetention,
       detectedOpencodeVersion,
       storeConfig,
       metrics,

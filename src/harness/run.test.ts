@@ -97,6 +97,7 @@ function createBootstrap(): BootstrapPhaseResult {
       agent: null,
       model: null,
       timeoutMs: 1_000,
+      serverBootstrapTimeoutMs: 5000,
       enableOmo: false,
       enableOmoSlim: false,
       opencodeVersion: '1.0.0',
