@@ -327,7 +327,7 @@ describe('createS3Adapter', () => {
     await expect(fs.access(localPath)).rejects.toThrow()
   })
 
-  it('does not touch a pre-existing local file at a different path when the GetObjectCommand call itself rejects before any write begins', async () => {
+  it('leaves a pre-existing local file at the download target path untouched when the GetObjectCommand call itself rejects before any write begins', async () => {
     // #given the S3 call fails before a response (and therefore before createWriteStream)
     // is ever reached -- the counterpart case to the mid-transfer test above, pinning that
     // cleanup is scoped to files this exact pipeline() call opened, not applied broadly

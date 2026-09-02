@@ -411,8 +411,14 @@ describe('waitForServerQuiescence', () => {
       return fake.socket
     }
 
-    // #when waiting for quiescence with a budget that allows several poll cycles
-    const result = await waitForServerQuiescence('http://127.0.0.1:4096', 60, 10, alwaysInconclusive)
+    // #when waiting for quiescence with a budget that allows many poll cycles. The budget is
+    // deliberately ~100x the poll interval rather than ~6x: the do/while checks the deadline
+    // only after the first iteration, so a budget close to the interval lets a single stalled
+    // delay() on a contended runner exit after one probe and fail the connectCalls assertion.
+    // The quiesced: false assertion below is stall-immune either way -- a stalled loop still
+    // cannot produce quiesced: true -- so the headroom protects against a spurious red, never
+    // against a wrong green.
+    const result = await waitForServerQuiescence('http://127.0.0.1:4096', 500, 5, alwaysInconclusive)
 
     // #then the deadline is what ends the wait, reporting the honest unconfirmed state --
     // never quiesced: true, which would mean an inconclusive probe was misread as "the
