@@ -180,7 +180,23 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
           return err(createObjectStoreOperationError('Object store download failed: response body was not readable'))
         }
 
-        await pipeline(response.Body, fs.createWriteStream(localPath))
+        try {
+          await pipeline(response.Body, fs.createWriteStream(localPath))
+        } catch (pipelineError) {
+          // pipeline() opens localPath via createWriteStream (truncating any pre-existing
+          // file at that path) before streaming a single byte, so a failure partway
+          // through the transfer leaves a partial -- and, for a path that already held a
+          // file, now-corrupted -- file on disk rather than no file at all. That matters
+          // specifically for the main session database: an unprobed partial opencode.db
+          // reaching bootstrap is worse than a clean miss. Best-effort unlink, scoped to
+          // exactly this failure: a GetObjectCommand rejection ABOVE this line (network,
+          // auth, a missing object) never reaches here, so a pre-existing local file this
+          // download attempt never touched is never at risk from this cleanup -- only a
+          // file this exact pipeline() call just opened for writing.
+          await fsp.unlink(localPath).catch(() => {})
+          throw pipelineError
+        }
+
         logger.info('Downloaded object store file', {key, localPath})
         return ok(undefined)
       } catch (error) {
