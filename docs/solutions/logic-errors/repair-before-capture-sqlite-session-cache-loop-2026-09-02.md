@@ -12,9 +12,6 @@ symptoms:
 root_cause: async_timing
 resolution_type: code_fix
 severity: critical
-related_components:
-  - background_job
-  - database
 tags:
   - sqlite
   - wal
@@ -100,6 +97,8 @@ Two outcomes, both reproduced:
 - The checkpoint **succeeded and silently replayed the stale log**: a database holding 3000 rows came back with 2000. No error, no warning, nothing.
 
 Which one occurs depends on whether SQLite's WAL header salt matches. The silent variant is worse and has no second line of defense, since the usability probe only runs when the checkpoint reports nothing to do.
+
+This is fixed, not outstanding. The pairing is unreachable by construction now: the log is gone from both transports (see Solution), and any log arriving from an object store is deleted before anything opens the database (see the source-specific split).
 
 ## Prevention
 
