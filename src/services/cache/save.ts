@@ -28,8 +28,7 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
 
 /**
  * Returns true if there is any real cacheable content: either storagePath has files,
- * or a SQLite DB-family file that actually crosses the save boundary (opencode.db,
- * opencode.db-wal) exists and is non-empty in cachePaths.
+ * or opencode.db itself exists and is non-empty in cachePaths.
  *
  * OpenCode 1.17.x persists sessions in opencode.db at path.dirname(storagePath), NOT
  * inside storagePath itself. Without this check the old guard would return false on every
@@ -37,18 +36,18 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
  *
  * WAL mode note: this function is only reached after checkpointDatabase has already run
  * and resolved to 'checkpointed' or 'nothing-to-checkpoint' — a 'failed' outcome makes
- * saveCache return false before this is ever called (see the checkpoint block above). So
- * the write-ahead log here is always already empty or absent: either just merged into
- * opencode.db, or never held anything to merge. It can no longer be the sole holder of
- * unmerged content the way it can be earlier in the process's life — server.close() sends
- * proc.kill() without awaiting a checkpoint, so a valid session can have opencode.db still
- * at its WAL-mode header-page size (verified on Node 24.20.0: 4096 bytes, never 0) with
- * the actual session data sitting in opencode.db-wal instead, but checkpointDatabase
- * merges exactly that case into opencode.db before this check ever runs —
- * checkpoint.test.ts pins it as 'checkpointed', not skipped as 'nothing-to-checkpoint'.
- * We still check every DB-family path here, not just opencode.db, as a defensive property
- * rather than a load-bearing one: a genuinely empty write-ahead log simply fails the
- * size > 0 check below.
+ * saveCache return false before this is ever called (see the checkpoint block above). A
+ * healthy run therefore has all its data already merged into opencode.db by the time this
+ * runs: checkpointDatabase merges a hot write-ahead log into the main file before this
+ * check ever sees it (checkpoint.test.ts pins that as 'checkpointed', not skipped as
+ * 'nothing-to-checkpoint'). This matters more now than it used to: neither
+ * buildSaveCachePaths (paths.ts) nor the object-store upload set
+ * (DB_TRANSPORTABLE_BASENAMES, packages/runtime/src/session/version.ts) includes the
+ * write-ahead log at all any more, so if content were still sitting only in the WAL by
+ * this point, it would be invisible here — not merely deprioritized. We still check every
+ * DB-family path present in cachePaths here (not a hardcoded opencode.db reference), as a
+ * defensive property rather than a load-bearing one: today that set is just opencode.db,
+ * since neither the write-ahead log nor -shm are ever included.
  *
  * opencode.db-shm is deliberately excluded: buildSaveCachePaths never includes it (it is
  * machine-local and stale by construction), so it never appears in cachePaths here. A
@@ -139,11 +138,13 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
 
     // Checkpoint before anything inspects file sizes, builds the save path list, or
     // transports bytes: this moves data out of the write-ahead log into the main database
-    // file, which changes which files are non-empty for hasCacheableContent below and the
-    // S3 sync further down, and — now that buildSaveCachePaths runs after this, not before
-    // — whether opencode.db-wal exists at all for its existence guard (paths.ts). Computing
-    // the path list first used to let a write-ahead log this same call just truncated to
-    // zero bytes ride along in cachePaths anyway, shipping an empty file every healthy save.
+    // file, which changes which files are non-empty for hasCacheableContent below and for
+    // the S3 sync further down. buildSaveCachePaths (paths.ts) never includes the
+    // write-ahead log at all any more — neither transport does (see
+    // DB_TRANSPORTABLE_BASENAMES, packages/runtime/src/session/version.ts) — so ordering
+    // this checkpoint first is what guarantees a healthy save's data is actually reachable
+    // through opencode.db by the time either transport looks for it, rather than sitting
+    // unmerged in a file neither one will ever pick up.
     const dbDir = path.dirname(storagePath)
     const dbPath = path.join(dbDir, DB_MAIN_BASENAME)
     const walPath = path.join(dbDir, DB_WAL_BASENAME)

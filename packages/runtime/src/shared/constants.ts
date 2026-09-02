@@ -18,6 +18,20 @@ export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 // byte-for-byte identical to today while making the budget observable/adjustable.
 export const DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS = 5000
 
+// Bound on how long shutdown() waits for the OpenCode child to actually go away before
+// returning control to the caller (src/harness/phases/cleanup.ts, immediately ahead of
+// the SQLite checkpoint). The SDK (@opencode-ai/sdk dist/server.js) exposes only
+// {url, close()} -- no pid, no child-process handle, no exit event -- so the harness
+// cannot await the real process. This polls the server's own listening port instead:
+// once connection attempts start failing, the OS has reclaimed the port, which only
+// happens when the process that held it has actually exited. The pinned upstream clone's
+// serve command (cli/cmd/serve.ts) registers no SIGTERM handler, so default signal
+// disposition terminates it near-instantly under normal conditions; 5s covers slow signal
+// delivery on a loaded runner without materially extending cleanup, which -- unlike the
+// server-bootstrap budget above -- is not on the critical path any run is timed against.
+export const DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS = 5000
+export const DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS = 100
+
 // Default model for OpenCode Zen - ensures inference starts
 export const DEFAULT_MODEL = {
   providerID: 'opencode',

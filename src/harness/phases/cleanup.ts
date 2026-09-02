@@ -106,13 +106,24 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     }
 
     // Shut down the OpenCode server BEFORE saving the cache.
-    // Shutdown does NOT trigger a SQLite WAL checkpoint: it sends the child a kill
-    // signal and returns without awaiting its exit or merging the write-ahead log
-    // into the main database file (see save.ts's checkpointDatabase call, which runs
-    // inside saveCache below and is what actually performs that merge before save).
+    // Shutdown does NOT itself trigger a SQLite WAL checkpoint: merging the write-ahead
+    // log into the main database file is still checkpointDatabase's job, called inside
+    // saveCache below. What shutdown() now does is send the child's kill signal and then
+    // wait (bounded, best-effort, via a port-liveness poll -- the SDK exposes no pid or
+    // exit event to await directly) for the child to actually go away before returning,
+    // so the checkpoint that follows is not racing a writer that is still alive but idle
+    // (verified: a checkpoint can report success and then have the write-ahead log grow
+    // again moments later from a write that was already in flight). A `quiesced: false`
+    // result means that wait timed out without confirming the child exited -- the run
+    // still proceeds, but the checkpoint right after should not be read as a guarantee.
     if (serverHandle != null) {
       try {
-        serverHandle.shutdown()
+        const shutdownResult = await serverHandle.shutdown()
+        if (!shutdownResult.quiesced) {
+          bootstrapLogger.warning(
+            'OpenCode server did not confirm shutdown within the quiescence window; the checkpoint that follows may race a still-live writer',
+          )
+        }
       } catch (shutdownError) {
         bootstrapLogger.warning('Server shutdown failed (non-fatal)', {
           error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),

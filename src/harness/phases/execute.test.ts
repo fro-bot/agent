@@ -199,7 +199,7 @@ function createCacheRestore(): CacheRestorePhaseResult {
     serverHandle: {
       client: {} as CacheRestorePhaseResult['serverHandle']['client'],
       server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-      shutdown: vi.fn(),
+      shutdown: vi.fn().mockResolvedValue({quiesced: true}),
     },
   }
 }

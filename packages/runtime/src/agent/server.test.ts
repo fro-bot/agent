@@ -1,8 +1,9 @@
 import type {Logger} from '../shared/logger.js'
+import net from 'node:net'
 import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {bootstrapOpenCodeServer} from './server.js'
+import {bootstrapOpenCodeServer, waitForServerQuiescence} from './server.js'
 
 vi.mock('@opencode-ai/sdk', () => ({
   createOpencode: vi.fn(),
@@ -280,5 +281,110 @@ describe('bootstrapOpenCodeServer', () => {
     const result = await bootstrapOpenCodeServer(controller.signal, logger)
     expect(result.success).toBe(false)
     expect(closeSpy).toHaveBeenCalledTimes(1)
+  })
+
+  describe('shutdown() quiescence', () => {
+    it("calls server.close() synchronously before the returned promise's quiescence wait resolves", async () => {
+      // #given a bootstrapped handle backed by the mocked SDK — nothing is actually
+      // listening on the pinned port (createOpencode never binds it for real), so the
+      // quiescence poll should observe the port as already closed on its first attempt
+      const logger = createMockLogger()
+      const closeSpy = vi.fn()
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: {} as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
+        }
+      })
+      const controller = new AbortController()
+      const bootstrapResult = await bootstrapOpenCodeServer(controller.signal, logger)
+      expect(bootstrapResult.success).toBe(true)
+      if (!bootstrapResult.success) return
+
+      // #when calling shutdown()
+      const shutdownPromise = bootstrapResult.data.shutdown()
+
+      // #then close() has already run synchronously, before the quiescence wait is awaited
+      expect(closeSpy).toHaveBeenCalledTimes(1)
+      await expect(shutdownPromise).resolves.toEqual({quiesced: true})
+    })
+  })
+})
+
+async function listenOnEphemeralPort(): Promise<{server: net.Server; url: string}> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      if (address === null || typeof address === 'string') {
+        reject(new Error('failed to bind ephemeral port'))
+        return
+      }
+      resolve({server, url: `http://127.0.0.1:${String(address.port)}`})
+    })
+  })
+}
+
+async function closeServer(server: net.Server): Promise<void> {
+  return new Promise(resolve => server.close(() => resolve()))
+}
+
+describe('waitForServerQuiescence', () => {
+  it('resolves quiesced: true almost immediately when nothing is listening on the port', async () => {
+    // #given a port that was briefly bound, then released — mirroring pickFreePort's own
+    // bind-then-release trick, and the shape of a mocked SDK that never truly listens
+    const {server, url} = await listenOnEphemeralPort()
+    await closeServer(server)
+
+    // #when waiting for quiescence with a generous budget
+    const startedAt = Date.now()
+    const result = await waitForServerQuiescence(url, 2000, 20)
+    const elapsedMs = Date.now() - startedAt
+
+    // #then it resolves quiesced: true well within the budget — the very first poll
+    // already finds the port closed
+    expect(result).toEqual({quiesced: true})
+    expect(elapsedMs).toBeLessThan(1000)
+  })
+
+  it('resolves quiesced: true once a live listener closes mid-poll (the real quiescence case)', async () => {
+    // #given a real listener standing in for a still-live OpenCode child
+    const {server, url} = await listenOnEphemeralPort()
+
+    // #when starting the quiescence wait, then closing the listener shortly after —
+    // simulating the child finally exiting a couple of poll cycles in
+    const waitPromise = waitForServerQuiescence(url, 2000, 20)
+    await new Promise(resolve => setTimeout(resolve, 60))
+    await closeServer(server)
+
+    // #then the wait observes the closure and reports quiesced: true, not a timeout
+    await expect(waitPromise).resolves.toEqual({quiesced: true})
+  })
+
+  it('resolves quiesced: false when the port keeps accepting connections past the timeout budget', async () => {
+    // #given a listener that never closes — a child that is still alive and did not exit
+    // within the wait budget
+    const {server, url} = await listenOnEphemeralPort()
+
+    try {
+      // #when waiting for quiescence with a short, deliberately-exceeded budget
+      const result = await waitForServerQuiescence(url, 120, 20)
+
+      // #then the wait times out rather than hanging, and reports the unconfirmed state
+      // honestly instead of assuming success
+      expect(result).toEqual({quiesced: false})
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it('resolves quiesced: false immediately for a URL it cannot parse, rather than throwing out of a cleanup path', async () => {
+    // #given a malformed URL that new URL() rejects
+    const result = await waitForServerQuiescence('not a url', 500, 20)
+
+    // #then the failure is reported as an unconfirmed quiescence, not an exception
+    expect(result).toEqual({quiesced: false})
   })
 })

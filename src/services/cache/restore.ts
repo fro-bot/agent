@@ -9,6 +9,7 @@ import {buildPrimaryCacheKey, buildRestoreKeys} from './cache-key.js'
 import {
   buildDbFamilyPaths,
   buildDbShmPath,
+  buildDbWalPath,
   buildRestoreCachePaths,
   deleteAuthJson,
   isAuthPathSafe,
@@ -92,6 +93,51 @@ async function deleteRestoredShm(storagePath: string, logger: RestoreCacheOption
   }
 }
 
+// The object store carries no generation marker across its two independently-overwritten
+// keys (see DB_TRANSPORTABLE_BASENAMES in packages/runtime/src/session/version.ts), so a
+// downloaded write-ahead log cannot be trusted to belong to the opencode.db object it
+// arrived beside — unlike an Actions-cache entry, where one archive is one atomic save and
+// a legacy db+wal pair is genuinely consistent by construction. Healthy saves no longer
+// upload this file at all, so any object still present is either a pre-fix artifact or,
+// worse, a stale generation the non-atomic upload sequence left behind after a healthy
+// save reused the same db key. Reproduced against real node:sqlite: pairing a fresh
+// database with an older log this way can either surface as an outright "database disk
+// image is malformed" or, worse, checkpoint successfully while silently replaying stale
+// rows the fresh database never had. Deleting the downloaded copy before anything opens
+// the database trades a definite, bounded loss — this generation's last transactions, if
+// the log genuinely still held any uncheckpointed writes from between saves — for an
+// open-ended one: a silent rollback to an arbitrary older generation with no error, no log
+// line, and no way for a later run to tell it happened. That trade is not free, but it is
+// the only one of the two failure modes that is bounded, visible, and consistent every time
+// (see checkpoint.ts's doc comment for the real-node:sqlite reproduction of that silent-
+// replay case).
+//
+// Runs unconditionally right after syncSessionsFromStore returns, regardless of whether a
+// main database was restored: a sidecar-only download (no opencode.db object present)
+// falls through this function to the Actions-cache path in restoreCache below, and on an
+// Actions-cache miss that path never touches storagePath's sibling directory at all — a
+// write-ahead log left on disk here would still be sitting there when bootstrap opens
+// whatever fresh database OpenCode itself creates next. Nothing between here and that
+// bootstrap opens the database with node:sqlite (checkStorageCorruption/checkStorageVersion
+// below only stat/read the storage directory and its .version marker), so deleting
+// immediately after the sync call is also the earliest point that closes the window.
+async function deleteDownloadedObjectStoreWal(
+  storagePath: string,
+  logger: RestoreCacheOptions['logger'],
+): Promise<void> {
+  const walPath = buildDbWalPath(storagePath)
+  try {
+    await fs.unlink(walPath)
+    logger.debug('Deleted write-ahead log downloaded from object store (untrusted pairing, see restore.ts)')
+  } catch (error) {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') {
+      logger.warning('Failed to delete write-ahead log downloaded from object store', {
+        error: toErrorMessage(error),
+      })
+    }
+  }
+}
+
 async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<CacheResult> {
   const {storeConfig, storeAdapter, logger, storagePath, components} = options
 
@@ -115,6 +161,8 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
       storagePath,
       logger,
     )
+
+    await deleteDownloadedObjectStoreWal(storagePath, logger)
 
     if (syncResult.mainDbRestored === true) {
       // The object store sync writes opencode.db beside storagePath; ensure this cache directory exists before returning.

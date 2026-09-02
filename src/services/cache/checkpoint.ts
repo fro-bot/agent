@@ -82,10 +82,16 @@ async function delay(ms: number): Promise<void> {
  * `PRAGMA wal_checkpoint(TRUNCATE)`, using `node:sqlite` (available unflagged on Node 24;
  * no new dependency).
  *
- * The harness cannot observe whether the process that was writing to this database has
- * actually exited — `serverHandle.shutdown()` sends a signal and returns without waiting.
- * The checkpoint attempt is itself the liveness probe: a live writer surfaces as a busy
- * database, and this function retries that within a bound before reporting failure.
+ * The harness cannot be certain the process that was writing to this database has
+ * actually exited: `serverHandle.shutdown()` (`packages/runtime/src/agent/server.ts`) now
+ * sends the kill signal and then waits, bounded and best-effort, for the child's port to
+ * stop answering before returning — closing the common case where an otherwise-idle
+ * writer completes an in-flight write moments after a checkpoint reports success. But the
+ * SDK exposes no pid or exit event, so that wait can time out without confirming the exit,
+ * and even a confirmed port close is a proxy, not a guarantee, that every write finished.
+ * The checkpoint attempt therefore remains a second, independent line of defense: a live
+ * writer still surfaces as a busy database, and this function retries that within a bound
+ * before reporting failure, regardless of what shutdown() observed.
  *
  * Success is judged by the write-ahead log's size on disk after the attempt, never by
  * the pragma's returned `checkpointed` count. Verified on Node 24.20.0: the pragma

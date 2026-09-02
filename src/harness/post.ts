@@ -88,6 +88,15 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
   } else {
     const runId = String(getGitHubRunId())
     try {
+      // No shutdown()/quiescence wait happens here, unlike cleanup.ts. There is no
+      // OpenCodeServerHandle in this process at all -- runPost is the Action's separate
+      // `post:` step, invoked by the runner as a fresh process well after the main step
+      // (and everything it spawned, including the OpenCode child cleanup.ts shut down)
+      // has already exited. A process boundary is a strictly stronger guarantee than the
+      // port-liveness poll cleanup.ts relies on: there is no live writer left to race
+      // against a checkpoint here, only the possibility that the main step's own shutdown
+      // sequence never got far enough to attempt one (e.g. it crashed first). That is what
+      // this retry exists to cover, and it needs no quiescence step of its own to do it.
       const components = buildCacheKeyComponents()
       // GITHUB_WORKSPACE is a runner-level environment variable set for the whole job,
       // not something that requires STATE handoff from the main step — it is available

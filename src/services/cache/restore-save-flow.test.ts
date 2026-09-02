@@ -341,7 +341,7 @@ describe('restore/save object-store integration flow', () => {
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
   })
 
-  it('excludes opencode.db-shm from the object store even when it exists locally', async () => {
+  it('excludes both opencode.db-wal and opencode.db-shm from the object store even when both exist locally', async () => {
     const cache = createMockCacheAdapter(undefined)
     const store = createInMemoryStoreAdapter()
 
@@ -351,7 +351,10 @@ describe('restore/save object-store integration flow', () => {
     // A real hot-WAL database, deliberately left open rather than cleanly closed —
     // mirrors server.close() sending proc.kill() without awaiting a checkpoint. saveCache
     // now checkpoints before building the upload set, so this must be real SQLite for
-    // that checkpoint to succeed rather than decline the save.
+    // that checkpoint to succeed rather than decline the save. The connection stays open
+    // through the assertions below, so the checkpoint truncates the write-ahead log to
+    // zero bytes but does not unlink it — proving exclusion is by design (never selected
+    // for transport), not merely because the file happened to be absent.
     const db = new DatabaseSync(dbPath)
     db.exec('PRAGMA journal_mode=WAL')
     db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
@@ -375,17 +378,19 @@ describe('restore/save object-store integration flow', () => {
       storeAdapter: store.adapter,
     }
 
-    // #given a hot-WAL db, its write-ahead log, and a shm sidecar all present locally
+    // #given a hot-WAL db, its (now-truncated-but-still-present) write-ahead log, and a
+    // shm sidecar all present locally
 
     // #when saving cache
     const saveResult = await saveCache(saveOptions)
 
-    // #then the object store receives db and wal but never shm, and the cache adapter agrees
+    // #then the object store receives only the main db — neither sidecar ever crosses the
+    // boundary — and the cache adapter agrees
     expect(saveResult).toBe(true)
     expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db')).toBe(true)
-    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-wal')).toBe(true)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-wal')).toBe(false)
     expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-shm')).toBe(false)
-    expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath, `${dbPath}-wal`], expect.any(String))
+    expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
 
     db.close()
   })

@@ -6,9 +6,82 @@ import type {EnsureOpenCodeResult} from './types.js'
 import net from 'node:net'
 import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
-import {DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS} from '../shared/constants.js'
+import {
+  DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
+  DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS,
+  DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
+} from '../shared/constants.js'
 import {err, ok} from '../shared/types.js'
 import {withScrubbedEnv} from './with-scrubbed-env.js'
+
+async function delay(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms)
+  })
+}
+
+// Best-effort liveness probe for the OpenCode child, used only by shutdown() below.
+// Resolves true while something answers a TCP connect on the given host/port, false the
+// instant the connection is refused (or otherwise errors) -- which, for a port this
+// process itself bound moments earlier via pickFreePort/createOpencode, only happens once
+// the process holding it has actually exited and the OS has reclaimed the socket.
+async function isPortOpen(hostname: string, port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = net.connect({host: hostname, port})
+    const finish = (result: boolean): void => {
+      socket.removeAllListeners()
+      socket.destroy()
+      resolve(result)
+    }
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+  })
+}
+
+/**
+ * Polls `url`'s listening port until connections start being refused (the child has
+ * exited and the OS reclaimed the socket) or `timeoutMs` elapses, whichever comes first.
+ *
+ * This exists because the SDK gives the harness nothing else to wait on: `createOpencode`
+ * (`@opencode-ai/sdk` dist/index.js) returns only `{client, server: {url, close}}` --
+ * `close()` itself (dist/server.js) calls `stop(proc)`, i.e. `proc.kill()`, on a child
+ * process object that is never exposed to the caller. There is no pid, no exit event, no
+ * awaitable handle. Port-liveness is the best boundary reachable without patching the SDK.
+ *
+ * Not a proof of quiescence: a timeout here means the child's fate is genuinely unknown,
+ * not that it is still running, and a small window remains even on `quiesced: true` (the OS
+ * can reclaim a listening socket slightly before or after in-flight I/O the process was
+ * doing at exit finishes). It is a large, measured improvement over the previous fire-and-
+ * forget `close()` — which returned before the signal was even delivered — not a guarantee.
+ */
+export async function waitForServerQuiescence(
+  url: string,
+  timeoutMs: number = DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
+  pollIntervalMs: number = DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS,
+): Promise<ShutdownResult> {
+  let hostname: string
+  let port: number
+  try {
+    const parsed = new URL(url)
+    hostname = parsed.hostname
+    port = Number(parsed.port)
+  } catch {
+    // Cannot parse the server's own URL - nothing to poll. Report unconfirmed rather than
+    // throwing out of a cleanup path; the caller treats this the same as a timeout.
+    return {quiesced: false}
+  }
+
+  const deadline = Date.now() + timeoutMs
+  do {
+    const stillOpen = await isPortOpen(hostname, port)
+    if (!stillOpen) {
+      return {quiesced: true}
+    }
+    await delay(pollIntervalMs)
+  } while (Date.now() < deadline)
+
+  return {quiesced: false}
+}
 
 // Picks a free ephemeral port by binding to port 0, reading the assigned
 // port, then releasing it. There is an inherent TOCTOU window between close()
@@ -38,10 +111,22 @@ async function pickFreePort(): Promise<number> {
   })
 }
 
+/**
+ * Outcome of `OpenCodeServerHandle.shutdown()`. `quiesced: true` means the server's port
+ * stopped accepting connections within the wait budget, which only happens once the child
+ * process has actually exited. `quiesced: false` means the budget elapsed without that
+ * happening -- the child's fate is unknown (still running, dying slowly, or the port check
+ * itself failed), and any checkpoint attempted right after should not be read as running
+ * against a guaranteed-quiet database.
+ */
+export interface ShutdownResult {
+  readonly quiesced: boolean
+}
+
 export interface OpenCodeServerHandle {
   readonly client: SessionClient
   readonly server: {readonly url: string; close: () => void}
-  readonly shutdown: () => void
+  readonly shutdown: () => Promise<ShutdownResult>
 }
 
 export async function bootstrapOpenCodeServer(
@@ -89,8 +174,13 @@ export async function bootstrapOpenCodeServer(
     return ok({
       client,
       server,
-      shutdown: () => {
+      // Sends the kill signal via server.close(), then waits (bounded, best-effort) for
+      // the child's port to stop answering before returning. See waitForServerQuiescence
+      // above for why a port poll is the best available boundary and what quiesced: false
+      // does and does not mean.
+      shutdown: async () => {
         server.close()
+        return waitForServerQuiescence(server.url)
       },
     })
   } catch (error) {

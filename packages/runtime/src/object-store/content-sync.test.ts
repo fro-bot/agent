@@ -50,7 +50,7 @@ describe('content sync', () => {
     await fs.rm(tempDir, {recursive: true, force: true})
   })
 
-  it('uploads db and wal when present, excluding shm', async () => {
+  it('uploads only the main db when db, wal, and shm are all present, excluding both sidecars', async () => {
     // #given a db, a wal, and a shm file all present on disk
     await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db')
     await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal')
@@ -62,13 +62,12 @@ describe('content sync', () => {
     // #when syncing sessions to the store
     const result = await syncSessionsToStore(adapter, config, 'github', 'owner/repo', storagePath, createLogger())
 
-    // #then only db and wal are uploaded; shm never crosses the boundary
-    expect(result).toEqual({uploaded: 2, failed: 0})
-    expect(upload).toHaveBeenCalledTimes(2)
-    expect(upload.mock.calls.map(([key]) => key)).toEqual([
-      'fro-bot-state/github/owner/repo/sessions/opencode.db',
-      'fro-bot-state/github/owner/repo/sessions/opencode.db-wal',
-    ])
+    // #then only db is uploaded; neither the write-ahead log nor shm ever cross the
+    // boundary (see DB_TRANSPORTABLE_BASENAMES in ../session/version.js for why the log
+    // was removed: per-key upload/overwrite here is not atomic across two files)
+    expect(result).toEqual({uploaded: 1, failed: 0})
+    expect(upload).toHaveBeenCalledTimes(1)
+    expect(upload.mock.calls.map(([key]) => key)).toEqual(['fro-bot-state/github/owner/repo/sessions/opencode.db'])
   })
 
   it('uploads 1 DB file when WAL and SHM are absent', async () => {

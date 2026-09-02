@@ -35,12 +35,12 @@ describe('attachOpencode', () => {
       expect(() => handle.server.close()).not.toThrow()
     })
 
-    it('shutdown() is a no-op (does not throw)', () => {
+    it('shutdown() is a no-op (does not throw) and resolves quiesced: true', async () => {
       // #given
       const handle = attachOpencode('http://workspace:9200', 'secret-token')
 
       // #when / #then
-      expect(() => handle.shutdown()).not.toThrow()
+      await expect(handle.shutdown()).resolves.toEqual({quiesced: true})
     })
 
     it('server.close() returns undefined (not a promise)', () => {
@@ -54,7 +54,7 @@ describe('attachOpencode', () => {
       expect(result).toBeUndefined()
     })
 
-    it('shutdown() returns undefined (not a promise)', () => {
+    it('shutdown() returns a promise (the interface is async, unlike server.close())', () => {
       // #given
       const handle = attachOpencode('http://workspace:9200', 'secret-token')
 
@@ -62,7 +62,7 @@ describe('attachOpencode', () => {
       const result = handle.shutdown()
 
       // #then
-      expect(result).toBeUndefined()
+      expect(result).toBeInstanceOf(Promise)
     })
   })
 

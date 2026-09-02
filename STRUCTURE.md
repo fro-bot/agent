@@ -10,7 +10,7 @@ fro-bot/agent/
 │   ├── shared/                 # Layer 0: pure types, utils, constants (only @bfra.me/es Result; no heavy deps)
 │   ├── services/               # Layer 1: external adapters (GitHub, cache, setup, object-store, artifact)
 │   │   ├── github/             # Octokit client, context parsing, NormalizedEvent
-│   │   ├── cache/              # Restore/save with corruption detection
+│   │   ├── cache/              # Restore/save with WAL checkpoint repair and corruption detection
 │   │   ├── setup/              # Bun, oMo, OpenCode + Systematic install/config
 │   │   └── artifact/           # Artifact upload
 │   ├── features/               # Layer 2: business logic

@@ -86,7 +86,7 @@ const expectedWalPath = path.join(testDbDir, DB_WAL_BASENAME)
 const stubServerHandle = {
   client: {} as unknown as OpenCodeServerHandle['client'],
   server: {url: 'http://localhost:0', close: vi.fn()},
-  shutdown: vi.fn(),
+  shutdown: vi.fn().mockResolvedValue({quiesced: true}),
 } satisfies OpenCodeServerHandle
 
 function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
@@ -687,6 +687,64 @@ describe('runCacheRestore usability probe via the object-store restore source (e
     expect(result?.cacheResult.restoredPath).toBeNull()
     await expect(fs.access(dbPath)).rejects.toThrow()
     await expect(fs.readdir(realStoragePath)).resolves.toEqual([])
+    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+  })
+
+  it('removes a stale write-ahead log downloaded from the object store before the restored database is ever opened (fresh db + stale wal never reaches SQLite)', async () => {
+    // #given a healthy, cleanly-checkpointed database in the object store alongside a
+    // stale write-ahead log object left behind by a prior, non-atomic upload/overwrite
+    // cycle (see DB_TRANSPORTABLE_BASENAMES in packages/runtime/src/session/version.ts).
+    // SQLite cannot reliably tell this pairing is stale: it can throw "database disk
+    // image is malformed" or, worse, silently replay a subset of rows. Either way it must
+    // never be attempted — the downloaded wal has to be deleted before anything opens the
+    // database that arrived beside it.
+    const seedDbPath = path.join(tempDir, 'seed-healthy.db')
+    const seedDb = new DatabaseSync(seedDbPath)
+    seedDb.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    seedDb.exec("INSERT INTO sessions (data) VALUES ('healthy-session')")
+    seedDb.close()
+    const healthyDbBytes = await fs.readFile(seedDbPath)
+
+    const dbObjectKey = 'fro-bot-state/github/owner/repo/sessions/opencode.db'
+    const walObjectKey = 'fro-bot-state/github/owner/repo/sessions/opencode.db-wal'
+    const staleWalBytes = Buffer.from('stale write-ahead log from an unrelated generation'.repeat(20))
+    mocks.createS3Adapter.mockReturnValue(
+      createInMemoryStoreAdapter(
+        new Map([
+          [dbObjectKey, healthyDbBytes],
+          [walObjectKey, staleWalBytes],
+        ]),
+      ),
+    )
+
+    const bootstrap = createBootstrapPhaseResult({
+      inputs: createActionInputs({
+        storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      }),
+    })
+    const {runCacheRestore} = await import('./cache-restore.js')
+
+    // #when the cache-restore phase runs against the real filesystem and the real
+    // object-store restore code path
+    const result = await runCacheRestore(bootstrap, createMetricsCollector())
+
+    // #then the restore is a healthy hit, not corrupted — the stale wal was deleted
+    // before the restore-side checkpoint repair ever opened the database, so the
+    // mismatched pairing never reached SQLite at all
+    expect(result).not.toBeNull()
+    expect(result?.cacheStatus).toBe('hit')
+    expect(result?.cacheResult.source).toBe('storage')
+    const walPath = path.join(tempDir, DB_WAL_BASENAME)
+    await expect(fs.access(walPath)).rejects.toThrow()
+
+    const verifyDb = new DatabaseSync(dbPath)
+    try {
+      const rows = verifyDb.prepare('SELECT data FROM sessions').all()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.data).toBe('healthy-session')
+    } finally {
+      verifyDb.close()
+    }
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
   })
 })
