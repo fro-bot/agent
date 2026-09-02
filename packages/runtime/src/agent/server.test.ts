@@ -1,9 +1,10 @@
 import type {Logger} from '../shared/logger.js'
+import type {QuiescenceProbeSocket} from './server.js'
 import net from 'node:net'
 import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {bootstrapOpenCodeServer, waitForServerQuiescence} from './server.js'
+import {bootstrapOpenCodeServer, isPortOpen, waitForServerQuiescence} from './server.js'
 
 vi.mock('@opencode-ai/sdk', () => ({
   createOpencode: vi.fn(),
@@ -386,5 +387,142 @@ describe('waitForServerQuiescence', () => {
 
     // #then the failure is reported as an unconfirmed quiescence, not an exception
     expect(result).toEqual({quiesced: false})
+  })
+
+  // This is the end-to-end counterpart to isPortOpen's own polarity test below: that test
+  // pins isPortOpen's *return value* (true) for an inconclusive probe, but nothing pinned
+  // that waitForServerQuiescence's do/while loop actually treats that `true` as "keep
+  // polling" rather than "the child exited". A one-line call-site regression --
+  // `if (stillOpen) return {quiesced: true}` -- inverts that read, passes every other test
+  // in this file (isPortOpen's own polarity test doesn't touch this call site, and the
+  // real-listener tests above never exercise the timeout branch at all), and silently
+  // reintroduces the bug this PR fixed one line away from the fix. Threading the same
+  // optional `connect` injector through to this level is what makes the loop's own read of
+  // that return value directly assertable without depending on real network timing.
+  it('never reports quiesced: true from repeated inconclusive probes -- only a genuinely refused connection, or the deadline, may produce a result', async () => {
+    // #given a connect() that always times out inconclusively (fires isPortOpen's own
+    // setTimeout branch, never 'connect' or 'error') -- standing in for a firewalled port
+    // or a host silently dropping SYNs on every single poll attempt
+    let connectCalls = 0
+    const alwaysInconclusive = (): QuiescenceProbeSocket => {
+      connectCalls++
+      const fake = createFakeSocket()
+      queueMicrotask(fake.fireTimeout)
+      return fake.socket
+    }
+
+    // #when waiting for quiescence with a budget that allows many poll cycles. The budget is
+    // deliberately ~100x the poll interval rather than ~6x: the do/while checks the deadline
+    // only after the first iteration, so a budget close to the interval lets a single stalled
+    // delay() on a contended runner exit after one probe and fail the connectCalls assertion.
+    // The quiesced: false assertion below is stall-immune either way -- a stalled loop still
+    // cannot produce quiesced: true -- so the headroom protects against a spurious red, never
+    // against a wrong green.
+    const result = await waitForServerQuiescence('http://127.0.0.1:4096', 500, 5, alwaysInconclusive)
+
+    // #then the deadline is what ends the wait, reporting the honest unconfirmed state --
+    // never quiesced: true, which would mean an inconclusive probe was misread as "the
+    // child exited"
+    expect(result).toEqual({quiesced: false})
+    expect(connectCalls).toBeGreaterThan(1)
+  })
+})
+
+// isPortOpen's own socket-timeout branch is otherwise unreachable from a deterministic
+// test: a real socket only reaches it by actually hanging for the full timeout budget,
+// which depends on real network/OS behavior a CI sandbox cannot guarantee (a black-holed
+// address may instead fail fast with ECONNREFUSED/ENETUNREACH, silently skipping the
+// branch entirely). Injecting a fake QuiescenceProbeSocket makes the branch, and the
+// polarity it resolves to, directly and deterministically assertable.
+function createFakeSocket(): {
+  readonly socket: QuiescenceProbeSocket
+  readonly fireTimeout: () => void
+  readonly fireConnect: () => void
+  readonly fireError: () => void
+  readonly calls: string[]
+} {
+  const calls: string[] = []
+  let timeoutCallback: (() => void) | undefined
+  let connectListener: (() => void) | undefined
+  let errorListener: (() => void) | undefined
+
+  const socket: QuiescenceProbeSocket = {
+    once: (event, listener) => {
+      if (event === 'connect') connectListener = listener
+      if (event === 'error') errorListener = listener
+    },
+    setTimeout: (_ms, onTimeout) => {
+      timeoutCallback = onTimeout
+    },
+    destroy: () => calls.push('destroy'),
+    removeAllListeners: () => calls.push('removeAllListeners'),
+  }
+
+  return {
+    socket,
+    fireTimeout: () => timeoutCallback?.(),
+    fireConnect: () => connectListener?.(),
+    fireError: () => errorListener?.(),
+    calls,
+  }
+}
+
+describe('isPortOpen', () => {
+  it('resolves true when the socket times out without connect or error ever firing (the pessimistic default this fix exists to pin)', async () => {
+    // #given a connection attempt that neither succeeds nor is refused within the budget
+    const fake = createFakeSocket()
+    const connect = vi.fn(() => fake.socket)
+
+    // #when the probe's own timeout fires
+    const resultPromise = isPortOpen('127.0.0.1', 4096, 50, connect)
+    fake.fireTimeout()
+
+    // #then it resolves true ("still open as far as this attempt could tell"), NOT false --
+    // an inconclusive attempt must not be read as "the child exited". Every other unknown
+    // in this change resolves the same way (verifyDatabaseUsable: usable: true by default;
+    // isStructuralCorruptionError: false unless SQLite positively says otherwise).
+    await expect(resultPromise).resolves.toBe(true)
+    expect(connect).toHaveBeenCalledWith('127.0.0.1', 4096)
+  })
+
+  it('resolves false when the connection is refused (error fires, no timeout)', async () => {
+    // #given a connection that is actively refused -- the real "child has exited" signal
+    const fake = createFakeSocket()
+    const connect = vi.fn(() => fake.socket)
+
+    const resultPromise = isPortOpen('127.0.0.1', 4096, 50, connect)
+    fake.fireError()
+
+    await expect(resultPromise).resolves.toBe(false)
+  })
+
+  it('resolves true when the connection succeeds (the port is still held by a live process)', async () => {
+    const fake = createFakeSocket()
+    const connect = vi.fn(() => fake.socket)
+
+    const resultPromise = isPortOpen('127.0.0.1', 4096, 50, connect)
+    fake.fireConnect()
+
+    await expect(resultPromise).resolves.toBe(true)
+  })
+
+  it('destroys the socket before removing its listeners, and never settles twice when a stale event fires after the outcome is already decided', async () => {
+    // #given a socket whose timeout fires first
+    const fake = createFakeSocket()
+    const connect = vi.fn(() => fake.socket)
+
+    const resultPromise = isPortOpen('127.0.0.1', 4096, 50, connect)
+    fake.fireTimeout()
+    // #and a stale 'error' event arrives afterward, as destroying a mid-connect socket can
+    // trigger -- this must not flip an already-decided true result to false
+    fake.fireError()
+
+    const result = await resultPromise
+
+    // #then the first-decided outcome wins, and teardown ran destroy() before
+    // removeAllListeners() so removing the error handler can never itself be the cause of
+    // an unhandled error from a socket still mid-connect
+    expect(result).toBe(true)
+    expect(fake.calls).toEqual(['destroy', 'removeAllListeners'])
   })
 })

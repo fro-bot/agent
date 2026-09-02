@@ -466,9 +466,14 @@ describe('restore/save object-store integration flow', () => {
     const saveResult = await saveCache(saveOptions)
 
     // #then the save is declined, the reason is logged, the cache adapter is never invoked,
-    // and the decline is surfaced via the job summary
+    // the object store is never uploaded to either -- a declined save must leave the
+    // bucket exactly as it was, so a subsequent successful save is what overwrites it
+    // rather than this run shipping a half-checkpointed database -- and the decline is
+    // surfaced via the job summary
     expect(saveResult).toBe(false)
     expect(cache.saveCache).not.toHaveBeenCalled()
+    expect(store.upload).not.toHaveBeenCalled()
+    expect(store.objects.size).toBe(0)
     expect(warningSpy).toHaveBeenCalledWith(
       'Declining cache save: SQLite checkpoint did not complete',
       expect.objectContaining({reason: expect.any(String) as unknown as string}),

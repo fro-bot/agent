@@ -20,6 +20,24 @@ async function delay(ms: number): Promise<void> {
   })
 }
 
+// The subset of net.Socket that isPortOpen depends on. Narrowed to an interface (rather
+// than importing net.Socket directly into the signature) so tests can inject a fake that
+// deterministically exercises the setTimeout branch -- a real socket only reaches that
+// branch by actually hanging for `timeoutMs`, which depends on real network/OS behavior
+// (a black-holed address may instead fail fast with ECONNREFUSED/ENETUNREACH in a
+// sandboxed CI network, silently skipping the very branch a test aims to pin) and is slow
+// even when it works.
+export interface QuiescenceProbeSocket {
+  readonly once: (event: 'connect' | 'error', listener: (error?: Error) => void) => void
+  readonly setTimeout: (ms: number, onTimeout: () => void) => void
+  readonly destroy: () => void
+  readonly removeAllListeners: () => void
+}
+
+function defaultConnect(hostname: string, port: number): QuiescenceProbeSocket {
+  return net.connect({host: hostname, port})
+}
+
 // Best-effort liveness probe for the OpenCode child, used only by shutdown() below.
 // Resolves true while something answers a TCP connect on the given host/port, false the
 // instant the connection is refused (or otherwise errors) -- which, for a port this
@@ -30,21 +48,42 @@ async function delay(ms: number): Promise<void> {
 // relying solely on `connect`/`error` firing: a connection attempt that neither succeeds
 // nor is refused -- a firewalled port, a host that silently drops SYNs -- would otherwise
 // never settle this promise, which would stall waitForServerQuiescence's do/while loop
-// forever despite its own `timeoutMs` parameter. `finish` is guarded against running twice
-// so a `timeout` that fires and a subsequent `error` from the torn-down socket cannot both
-// resolve the same promise.
-async function isPortOpen(hostname: string, port: number, timeoutMs: number): Promise<boolean> {
+// forever despite its own `timeoutMs` parameter. A timeout here resolves `true` ("still
+// open as far as this attempt could tell"), NOT `false`: every other unknown this change
+// introduces resolves pessimistically (verifyDatabaseUsable defaults to usable: true only
+// for a *recognized-safe* throw shape; isStructuralCorruptionError defaults to false unless
+// SQLite positively says otherwise), and "connection attempt inconclusive" must default to
+// "cannot confirm the child exited", not to a manufactured `quiesced: true`. Resolving
+// `true` here means the do/while loop simply keeps polling on the next interval; the outer
+// `waitForServerQuiescence` deadline is what eventually produces an honest `quiesced:
+// false` if the port genuinely never stops answering -- the cost of that correctness is
+// that a genuinely inconclusive probe now rides out the full outer timeout budget
+// (`DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS`, 5000ms as of writing) instead of returning after
+// a single poll interval; this is one server per run and bounded, so it is an acceptable,
+// intended trade, not a regression, but a future change to either constant should account
+// for it deliberately rather than rediscovering it. `finish` is guarded against running
+// twice so a `timeout` that fires and a subsequent `error` from the torn-down socket cannot
+// both resolve the same promise. `destroy()` runs before `removeAllListeners()`, not after:
+// removing the `error` listener first would leave a socket that is mid-connect (and may
+// still emit `error` as a side effect of being destroyed) with no listener attached, which
+// Node treats as an uncaught exception.
+export async function isPortOpen(
+  hostname: string,
+  port: number,
+  timeoutMs: number,
+  connect: (hostname: string, port: number) => QuiescenceProbeSocket = defaultConnect,
+): Promise<boolean> {
   return new Promise(resolve => {
     let settled = false
-    const socket = net.connect({host: hostname, port})
+    const socket = connect(hostname, port)
     const finish = (result: boolean): void => {
       if (settled) return
       settled = true
-      socket.removeAllListeners()
       socket.destroy()
+      socket.removeAllListeners()
       resolve(result)
     }
-    socket.setTimeout(timeoutMs, () => finish(false))
+    socket.setTimeout(timeoutMs, () => finish(true))
     socket.once('connect', () => finish(true))
     socket.once('error', () => finish(false))
   })
@@ -70,6 +109,7 @@ export async function waitForServerQuiescence(
   url: string,
   timeoutMs: number = DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
   pollIntervalMs: number = DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS,
+  connect: (hostname: string, port: number) => QuiescenceProbeSocket = defaultConnect,
 ): Promise<ShutdownResult> {
   let hostname: string
   let port: number
@@ -96,7 +136,7 @@ export async function waitForServerQuiescence(
 
   const deadline = Date.now() + timeoutMs
   do {
-    const stillOpen = await isPortOpen(hostname, port, pollIntervalMs)
+    const stillOpen = await isPortOpen(hostname, port, pollIntervalMs, connect)
     if (!stillOpen) {
       return {quiesced: true}
     }

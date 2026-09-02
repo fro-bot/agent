@@ -1,5 +1,6 @@
 import type {Logger} from '../shared/logger.js'
 import type {ObjectStoreConfig} from './types.js'
+import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -72,6 +73,15 @@ function createLogger(): Logger {
     warning: vi.fn(),
     error: vi.fn(),
   }
+}
+
+// Yields a real chunk before the stream itself errors, so pipeline() has already opened
+// the destination via createWriteStream and written that chunk by the time this rejects --
+// mirroring a real network failure partway through an S3 GetObject transfer rather than a
+// failure before any byte was ever written.
+async function* partialThenFail(): AsyncGenerator<Buffer> {
+  yield Buffer.from('partial-bytes-before-mid-transfer-failure')
+  throw new Error('simulated mid-transfer network failure')
 }
 
 function getCommandInput(callIndex: number): Record<string, unknown> {
@@ -299,6 +309,42 @@ describe('createS3Adapter', () => {
 
     expect(result.success).toBe(true)
     await expect(fs.readFile(localPath, 'utf8')).resolves.toBe('downloaded bytes')
+  })
+
+  it('removes the partial file left by a mid-transfer download failure, rather than leaving a truncated file on disk', async () => {
+    // #given a response body that yields real bytes before the stream itself errors
+    sendMock.mockResolvedValue({Body: Readable.from(partialThenFail())})
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const localPath = path.join(tempDir, 'download', 'opencode.db')
+
+    // #when downloading
+    const result = await adapter.download('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
+
+    // #then the download reports failure, and — the property this test exists to pin — no
+    // partial file is left behind for a caller to later mistake for a usable database
+    expect(result.success).toBe(false)
+    await expect(fs.access(localPath)).rejects.toThrow()
+  })
+
+  it('leaves a pre-existing local file at the download target path untouched when the GetObjectCommand call itself rejects before any write begins', async () => {
+    // #given the S3 call fails before a response (and therefore before createWriteStream)
+    // is ever reached -- the counterpart case to the mid-transfer test above, pinning that
+    // cleanup is scoped to files this exact pipeline() call opened, not applied broadly
+    sendMock.mockRejectedValue(new Error('ECONNREFUSED'))
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const localPath = path.join(tempDir, 'download', 'opencode.db')
+    await fs.mkdir(path.dirname(localPath), {recursive: true})
+    await fs.writeFile(localPath, 'pre-existing-legitimate-local-database')
+
+    // #when downloading
+    const result = await adapter.download('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
+
+    // #then the download reports failure, and the pre-existing local file this attempt
+    // never got far enough to write to is left completely untouched
+    expect(result.success).toBe(false)
+    await expect(fs.readFile(localPath, 'utf8')).resolves.toBe('pre-existing-legitimate-local-database')
   })
 
   it('conditionally uploads object data and returns the etag on success', async () => {
