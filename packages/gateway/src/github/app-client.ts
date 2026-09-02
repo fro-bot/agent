@@ -14,6 +14,7 @@ import {err, ok} from '@fro-bot/runtime'
 import {createAppAuth} from '@octokit/auth-app'
 import {Octokit} from '@octokit/core'
 
+import {isUsableRepositoryId} from '../shared/repository-id.js'
 import {isOctokitNotFound, safeErrorMessage} from './errors.js'
 
 // ---------------------------------------------------------------------------
@@ -112,8 +113,11 @@ export interface AppClientAuthResult {
 
 /** The repo's immutable GitHub identity, captured at ingest for deny-key matching. */
 export interface RepoIdentity {
-  /** GitHub numeric repository id (database_id). Stable across rename/transfer. */
-  readonly databaseId: number
+  /**
+   * GitHub numeric repository id (database_id), stable across rename/transfer.
+   * Null means the id is not a positive, safely representable integer; match on nodeId.
+   */
+  readonly databaseId: number | null
   /** GitHub node_id string for the repository. */
   readonly nodeId: string
 }
@@ -153,8 +157,9 @@ export interface AppClient {
    * Call this during the add-project ingest flow where a legitimate repo query
    * already happens. Do NOT call at run-creation or surface time.
    *
-   * Returns the stable numeric `databaseId` (immutable across rename/transfer)
-   * and the `nodeId` string for use as deny keys in the redaction gate.
+   * Returns the stable numeric `databaseId` (immutable across rename/transfer),
+   * or `null` when the id is not a positive, safely representable integer,
+   * plus the `nodeId` string for use as deny keys in the redaction gate.
    *
    * Error mapping (FIX 9):
    * - AppNotInstalledError: authForRepo failed (App not installed on this repo).
@@ -358,7 +363,13 @@ export function createAppClient(options: AppClientOptions): AppClient {
       })
 
       const {id, node_id: nodeId} = response.data
-      return ok({databaseId: id, nodeId})
+      const databaseId = toSafeRepositoryId(id)
+
+      if (databaseId === null) {
+        logger?.warn('Repository database id cannot be used as a numeric deny key; matching on nodeId', {owner, repo})
+      }
+
+      return ok({databaseId, nodeId})
     } catch (error) {
       if (isOctokitNotFound(error)) {
         // FIX 9: 404 after successful auth = repo gone (deleted/renamed), not App not installed.
@@ -378,6 +389,32 @@ export function createAppClient(options: AppClientOptions): AppClient {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Narrow an Octokit repository id to a positive, exactly representable number.
+ *
+ * The parameter accepts both Octokit response shapes: v16 exposes `id` as a
+ * number, while v17 may expose `number | bigint`.
+ */
+function toSafeRepositoryId(id: number | bigint): number | null {
+  if (typeof id === 'bigint') {
+    // Fast path: avoid Number() for non-positive bigint values; the usability predicate below remains authoritative.
+    if (id <= 0n) return null
+
+    const numericId = Number(id)
+    if (isUsableRepositoryId(numericId) && BigInt(numericId) === id) {
+      return numericId
+    }
+
+    return null
+  }
+
+  if (isUsableRepositoryId(id) === false) {
+    return null
+  }
+
+  return id
+}
 
 /**
  * Verify that the installation's granted permissions meet the minimum

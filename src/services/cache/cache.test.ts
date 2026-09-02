@@ -1,12 +1,15 @@
 import type {ObjectStoreAdapter, ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {CacheKeyComponents} from './cache-key.js'
+import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import {DatabaseSync} from 'node:sqlite'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {ok} from '../../shared/types.js'
 import {
+  checkpointDatabase,
   isAuthPathSafe,
   isPathInsideDirectory,
   restoreCache,
@@ -205,12 +208,53 @@ describe('restoreCache', () => {
       // #then corrupt object-store state falls through to the usable cache
       expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
       expect(cacheRestore).toHaveBeenCalledTimes(1)
+
+      // #and the corrupt/suspect database downloaded from the object store is removed, not left behind
+      await fs.chmod(storagePath, 0o700)
+      await expect(fs.access(path.join(path.dirname(storagePath), 'opencode.db'))).rejects.toThrow()
     } finally {
       await fs.chmod(storagePath, 0o700)
     }
   })
 
-  it('falls through to cache when object store restores only sidecars', async () => {
+  it('falls through to cache when object-store storage has a version mismatch', async () => {
+    // #given a cache hit and an object store restore whose storage carries a stale version marker
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
+    await fs.writeFile(path.join(storagePath, '.version'), '999')
+
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
+    const storeAdapter = createMockStoreAdapter({
+      list: vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db'])),
+      download: vi.fn(async (_key: string, localPath: string) => {
+        await fs.mkdir(path.dirname(localPath), {recursive: true})
+        await fs.writeFile(localPath, 'versioned-store-db')
+        return ok(undefined)
+      }),
+    })
+
+    // #when restoring cache
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {
+        restoreCache: cacheRestore,
+        saveCache: async () => 1,
+      },
+      storeConfig: testStoreConfig,
+      storeAdapter,
+    })
+
+    // #then the version mismatch is caught before the object-store restore is accepted as a hit,
+    // and it falls through to the Actions cache instead
+    expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
+    expect(cacheRestore).toHaveBeenCalledTimes(1)
+    await expect(fs.access(path.join(path.dirname(storagePath), 'opencode.db'))).rejects.toThrow()
+  })
+
+  it('falls through to cache when object store restores only sidecars, deleting the untrusted downloaded wal first', async () => {
     // #given an object store with a sidecar but no main session database
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
@@ -241,13 +285,51 @@ describe('restoreCache', () => {
       storeAdapter,
     })
 
-    // #then sidecars are not authoritative and the Actions cache is used
+    // #then sidecars are not authoritative and the Actions cache is used. The downloaded
+    // write-ahead log is untrusted (no main db arrived beside it to pair it with) and is
+    // deleted immediately after the object-store sync returns, not left on disk for
+    // whatever the Actions cache restores next to be paired with.
     expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
     expect(storeList).toHaveBeenCalledTimes(1)
     expect(storeDownload).toHaveBeenCalledTimes(1)
-    await expect(fs.readFile(path.join(path.dirname(storagePath), 'opencode.db-wal'), 'utf8')).resolves.toBe('sidecar')
+    await expect(fs.access(path.join(path.dirname(storagePath), 'opencode.db-wal'))).rejects.toThrow()
     expect(cacheRestore).toHaveBeenCalledTimes(1)
     expect(storeList.mock.invocationCallOrder[0]).toBeLessThan(cacheRestore.mock.invocationCallOrder[0] ?? 0)
+  })
+
+  it('deletes a sidecar-only object-store wal even when the Actions cache also misses (fresh db never pairs with a stale log)', async () => {
+    // #given an object store with only a stale write-ahead log sidecar, and an Actions
+    // cache that also misses — the harder ordering case: restoreCache's own miss branch
+    // (restoredKey == null) never touches storagePath's sibling directory, so a wal left
+    // behind here would still be sitting beside whatever fresh opencode.db bootstrap
+    // creates next
+    const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => undefined)
+    const storeList = vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db-wal']))
+    const storeDownload = vi.fn<ObjectStoreAdapter['download']>(async (_key, localPath) => {
+      await fs.mkdir(path.dirname(localPath), {recursive: true})
+      await fs.writeFile(localPath, 'stale-generation-wal')
+      return ok(undefined)
+    })
+    const storeAdapter = createMockStoreAdapter({list: storeList, download: storeDownload})
+
+    // #when restoring cache
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {
+        restoreCache: cacheRestore,
+        saveCache: async () => 1,
+      },
+      storeConfig: testStoreConfig,
+      storeAdapter,
+    })
+
+    // #then the restore is a genuine miss, and no stale write-ahead log survives to be
+    // paired with a database OpenCode has not created yet
+    expect(result).toMatchObject({hit: false, source: null})
+    await expect(fs.access(path.join(path.dirname(storagePath), 'opencode.db-wal'))).rejects.toThrow()
   })
 
   it('falls through to cache when object store is disabled', async () => {
@@ -393,6 +475,210 @@ describe('restoreCache', () => {
     expect(result.hit).toBe(false)
     expect(result.corrupted).toBe(true)
     expect(result.source).toBeNull()
+  })
+
+  it('removes the database family, not just storagePath, when declaring cache corruption', async () => {
+    // #given a cache hit whose storage is corrupted, with a full DB family present beside it
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const adapter = createMockCacheAdapter({restoreResult: restoredKey})
+    const dbDir = path.dirname(storagePath)
+
+    await fs.mkdir(dbDir, {recursive: true})
+    await fs.writeFile(storagePath, 'not a directory') // corrupts storage: file instead of dir
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db data')
+    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal data')
+    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm data')
+
+    const options: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    }
+
+    // #when restoring cache
+    const result = await restoreCache(options)
+
+    // #then corruption is reported and the whole database family is removed, not left behind
+    expect(result.corrupted).toBe(true)
+    await expect(fs.access(path.join(dbDir, 'opencode.db'))).rejects.toThrow()
+    await expect(fs.access(path.join(dbDir, 'opencode.db-wal'))).rejects.toThrow()
+    await expect(fs.access(path.join(dbDir, 'opencode.db-shm'))).rejects.toThrow()
+  })
+
+  it('removes the database family when the storage version mismatches', async () => {
+    // #given a cache hit whose storage version does not match, with a DB family present
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const adapter = createMockCacheAdapter({restoreResult: restoredKey})
+    const dbDir = path.dirname(storagePath)
+
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, '.version'), '999')
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db data')
+    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal data')
+
+    const options: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    }
+
+    // #when restoring cache
+    const result = await restoreCache(options)
+
+    // #then the mismatch clears the database family so the next run starts genuinely fresh
+    expect(result.corrupted).toBe(true)
+    await expect(fs.access(path.join(dbDir, 'opencode.db'))).rejects.toThrow()
+    await expect(fs.access(path.join(dbDir, 'opencode.db-wal'))).rejects.toThrow()
+  })
+
+  it('does not throw when the database family is already absent during cleanup', async () => {
+    // #given a corrupted restore where no DB-family file was ever written
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const adapter = createMockCacheAdapter({restoreResult: restoredKey})
+
+    await fs.mkdir(path.dirname(storagePath), {recursive: true})
+    await fs.writeFile(storagePath, 'not a directory')
+
+    const options: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    }
+
+    // #when restoring cache (a missing database family must not be an error)
+    const result = await restoreCache(options)
+
+    // #then corruption is still reported cleanly, without throwing
+    expect(result.corrupted).toBe(true)
+  })
+
+  it('still includes -shm in the restore path set for backward compatibility with older caches', async () => {
+    // #given a cache adapter that records the paths requested for restore
+    const restoreCacheSpy = vi.fn<CacheAdapter['restoreCache']>(async () => undefined)
+
+    const options: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.17.6',
+      cacheAdapter: {restoreCache: restoreCacheSpy, saveCache: async () => 1},
+    }
+
+    // #when restoring cache
+    await restoreCache(options)
+
+    // #then the restore-side path set still includes -shm so older cache archives extract cleanly
+    const requestedPaths = restoreCacheSpy.mock.calls[0]?.[0]
+    expect(requestedPaths).toContain(path.join(path.dirname(storagePath), 'opencode.db-shm'))
+  })
+
+  it('deletes a restored opencode.db-shm before returning a hit', async () => {
+    // #given a cache adapter that "restores" a stale shm sidecar alongside the db
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const dbDir = path.dirname(storagePath)
+    const adapter: CacheAdapter = {
+      restoreCache: async () => {
+        await fs.mkdir(storagePath, {recursive: true})
+        await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db data')
+        await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'stale shm')
+        return restoredKey
+      },
+      saveCache: async () => 1,
+    }
+
+    const options: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    }
+
+    // #when restoring cache
+    const result = await restoreCache(options)
+
+    // #then the restore succeeds but the stale, machine-local shm sidecar is deleted
+    expect(result.hit).toBe(true)
+    await expect(fs.access(path.join(dbDir, 'opencode.db-shm'))).rejects.toThrow()
+    await expect(fs.access(path.join(dbDir, 'opencode.db'))).resolves.toBeUndefined()
+  })
+
+  it('suppresses ENOENT when no opencode.db-shm was restored', async () => {
+    // #given a cache adapter that restores a plain db with no shm sidecar at all — the
+    // errno guard's ENOENT branch must stay silent for this, the common case
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const dbDir = path.dirname(storagePath)
+    const adapter: CacheAdapter = {
+      restoreCache: async () => {
+        await fs.mkdir(storagePath, {recursive: true})
+        await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db data')
+        return restoredKey
+      },
+      saveCache: async () => 1,
+    }
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+
+    const result = await restoreCache({
+      components: testComponents,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
+
+    // #then the restore succeeds and the missing-shm ENOENT is suppressed, not logged
+    expect(result.hit).toBe(true)
+    expect(logger.warning).not.toHaveBeenCalled()
+  })
+
+  it('logs a warning instead of suppressing when opencode.db-shm exists but cannot be deleted', async () => {
+    // #given opencode.db-shm is a directory, not a file — fs.unlink fails with a real
+    // non-ENOENT error (EISDIR/EPERM depending on platform), which the errno guard must
+    // not misclassify as "nothing to delete"
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const dbDir = path.dirname(storagePath)
+    const adapter: CacheAdapter = {
+      restoreCache: async () => {
+        await fs.mkdir(storagePath, {recursive: true})
+        await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db data')
+        await fs.mkdir(path.join(dbDir, 'opencode.db-shm'), {recursive: true})
+        return restoredKey
+      },
+      saveCache: async () => 1,
+    }
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+
+    const result = await restoreCache({
+      components: testComponents,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
+
+    // #then the restore still succeeds, but the non-ENOENT deletion failure is logged
+    expect(result.hit).toBe(true)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Failed to delete restored opencode.db-shm',
+      expect.objectContaining({error: expect.any(String) as unknown as string}),
+    )
   })
 
   it('deletes auth.json if present inside storage after restore', async () => {
@@ -623,6 +909,78 @@ describe('restoreCache', () => {
     expect(download).not.toHaveBeenCalled()
     expect(logger.warning).toHaveBeenCalled()
   })
+
+  it('restores a legacy Actions-cache db+wal pair via a genuine cacheAdapter.restoreCache call, then preserves its committed transaction through the restore-side checkpoint repair', async () => {
+    // #given a legacy cache entry: one atomic Actions-cache archive holding both
+    // opencode.db and a populated opencode.db-wal, written by a save that predates this
+    // repository's checkpoint-before-save fix. Deliberately built INSIDE the cacheAdapter's
+    // own restoreCache callback — mirroring what @actions/cache's real restoreCache does
+    // when it extracts an archive — rather than pre-placed on disk before restoreCache is
+    // called, so this pins a genuine restore rather than a local fixture the test set up
+    // itself. The pair is genuinely consistent because one Actions-cache entry is one
+    // atomic save, unlike an object-store restore: see deleteDownloadedObjectStoreWal's
+    // doc comment in restore.ts for why that source is treated oppositely (discarded,
+    // never checkpointed).
+    const dbDir = path.dirname(storagePath)
+    const legacyDbPath = path.join(dbDir, 'opencode.db')
+    const legacyWalPath = `${legacyDbPath}-wal`
+    let legacyDb: DatabaseSync | undefined
+
+    const adapter: CacheAdapter = {
+      restoreCache: async () => {
+        await fs.mkdir(storagePath, {recursive: true})
+        legacyDb = new DatabaseSync(legacyDbPath)
+        legacyDb.exec('PRAGMA journal_mode=WAL')
+        legacyDb.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+        legacyDb.exec("INSERT INTO sessions (data) VALUES ('legacy-committed-session')")
+        return 'legacy-cache-key'
+      },
+      saveCache: async () => 1,
+    }
+
+    const options: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.2.0',
+      cacheAdapter: adapter,
+    }
+
+    try {
+      // #when restoring cache through the Actions-cache path (no object store configured)
+      const result = await restoreCache(options)
+
+      // #then the restore is a hit sourced from the cache, and the legacy pair is left
+      // alone — restoreCache itself never checkpoints or deletes the write-ahead log for
+      // this source, unlike the object-store path
+      expect(result).toMatchObject({hit: true, source: 'cache', key: 'legacy-cache-key'})
+      expect((await fs.stat(legacyWalPath)).size).toBeGreaterThan(0)
+
+      // #when the restore-side repair runs next, exactly as runCacheRestore
+      // (src/harness/phases/cache-restore.ts) does for every cacheStatus === 'hit' before
+      // bootstrap ever opens the database
+      const checkpointOutcome = await checkpointDatabase({
+        dbPath: legacyDbPath,
+        walPath: legacyWalPath,
+        logger: createTestLogger(),
+      })
+
+      // #then the pair is checkpointed in place — not discarded — and the committed
+      // transaction that lived only in the write-ahead log survives intact
+      expect(checkpointOutcome.status).toBe('checkpointed')
+      const verifyDb = new DatabaseSync(legacyDbPath)
+      try {
+        const rows = verifyDb.prepare('SELECT data FROM sessions').all()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]?.data).toBe('legacy-committed-session')
+      } finally {
+        verifyDb.close()
+      }
+    } finally {
+      legacyDb?.close()
+    }
+  })
 })
 
 describe('saveCache', () => {
@@ -696,12 +1054,20 @@ describe('saveCache', () => {
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
 
+    // A real hot-WAL database, deliberately left open rather than cleanly closed —
+    // saveCache now checkpoints before building the upload set, so this must be real
+    // SQLite for that checkpoint to succeed rather than decline the save.
     const dbDir = path.dirname(storagePath)
-    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'main db')
-    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal data')
-    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm data')
+    const db = new DatabaseSync(path.join(dbDir, 'opencode.db'))
+    db.exec('PRAGMA journal_mode=WAL')
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    // A page-aligned, zero-filled placeholder, not arbitrary text: a wrong-sized -shm
+    // file segfaults node:sqlite (SIGBUS via mmap past EOF) the instant a database next
+    // to it is opened — verified on both Node 24 and Bun.
+    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), Buffer.alloc(32768))
 
-    const upload = vi.fn(async () => ok(undefined))
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
     const saveCacheSpy = vi.fn(async () => 1)
 
     const result = await saveCache({
@@ -719,10 +1085,16 @@ describe('saveCache', () => {
       storeAdapter: createMockStoreAdapter({upload}),
     })
 
+    // #then only the main db is uploaded — the write-ahead log never crosses the object-
+    // store boundary, even though the test's own connection keeps it present (truncated
+    // to zero bytes by the checkpoint, not unlinked, since the connection stays open)
     expect(result).toBe(true)
-    expect(upload).toHaveBeenCalledTimes(3)
+    expect(upload).toHaveBeenCalledTimes(1)
+    expect(upload.mock.calls[0]?.[0]).toBe('fro-bot-state/github/owner/repo/sessions/opencode.db')
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
     expect(upload.mock.invocationCallOrder[0]).toBeLessThan(saveCacheSpy.mock.invocationCallOrder[0] ?? 0)
+
+    db.close()
   })
 
   it('writes to cache only when object store is not configured', async () => {
@@ -938,10 +1310,18 @@ describe('saveCache', () => {
     expect(saveCacheSpy).not.toHaveBeenCalled()
   })
 
-  it('proceeds with save when storage is empty but opencode.db-wal is non-empty (WAL-only session)', async () => {
-    // #given storagePath is empty, opencode.db is 0 bytes, but opencode.db-wal has data
-    // This reproduces the WAL-only gap: server.close() sends proc.kill() without awaiting
-    // a WAL checkpoint, so all session data may live in the WAL file while the main db is empty.
+  it('reports no cacheable content when the main db is zero-size, even if opencode.db-wal has data (WAL never crosses the save boundary)', async () => {
+    // #given storagePath is empty, opencode.db is 0 bytes, and opencode.db-wal has data.
+    // Before the write-ahead log was removed from the save boundary, this combination
+    // proceeded with save because buildSaveCachePaths captured a non-empty wal directly.
+    // It no longer can: the log is never selected for transport on save (see
+    // DB_TRANSPORTABLE_BASENAMES in packages/runtime/src/session/version.ts and
+    // buildSaveCachePaths in paths.ts), so its content is invisible to hasCacheableContent
+    // regardless of size. In practice this exact shape — a genuinely zero-byte main db
+    // with real committed data sitting only in its write-ahead log — does not occur for a
+    // real SQLite database that has ever been opened for writing (checkpoint.ts's own
+    // doc comment: the main file sits at its WAL-mode header-page size, never 0, the
+    // moment a session exists), so this pins the boundary rather than a reachable case.
     const dbDir = path.dirname(storagePath)
     await fs.mkdir(dbDir, {recursive: true})
     await fs.writeFile(path.join(dbDir, 'opencode.db'), '') // zero-size main db
@@ -964,16 +1344,16 @@ describe('saveCache', () => {
     // #when saving cache
     const result = await saveCache(options)
 
-    // #then save proceeds — WAL content is sufficient; cacheAdapter.saveCache is called
-    expect(result).toBe(true)
-    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
-    const capturedPaths = saveCacheSpy.mock.calls[0]?.[0]
-    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-wal'))
+    // #then no cacheable content is reported and the adapter is never called — the WAL
+    // content is real but unreachable through the save boundary
+    expect(result).toBe(false)
+    expect(saveCacheSpy).not.toHaveBeenCalled()
   })
 
-  it('proceeds with save when storage is empty but opencode.db-shm is non-empty (SHM-only)', async () => {
-    // #given storagePath is empty, opencode.db is 0 bytes, but opencode.db-shm has data
-    // Unusual but symmetric with WAL: any non-empty DB-family file counts as cacheable.
+  it('reports no cacheable content when only opencode.db-shm is non-empty (SHM-only)', async () => {
+    // #given storagePath is empty, opencode.db is 0 bytes, and only opencode.db-shm has data
+    // -shm never crosses the save boundary (buildSaveCachePaths excludes it), so a
+    // workspace whose only non-empty file is -shm has nothing real to cache.
     const dbDir = path.dirname(storagePath)
     await fs.mkdir(dbDir, {recursive: true})
     await fs.writeFile(path.join(dbDir, 'opencode.db'), '') // zero-size main db
@@ -996,11 +1376,9 @@ describe('saveCache', () => {
     // #when saving cache
     const result = await saveCache(options)
 
-    // #then save proceeds — SHM content is sufficient; cacheAdapter.saveCache is called
-    expect(result).toBe(true)
-    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
-    const capturedPaths = saveCacheSpy.mock.calls[0]?.[0]
-    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-shm'))
+    // #then no cacheable content is reported and the adapter is never called
+    expect(result).toBe(false)
+    expect(saveCacheSpy).not.toHaveBeenCalled()
   })
 
   it('returns false when storage empty AND all DB-family files absent or zero-size (genuinely empty, all variants)', async () => {
@@ -1155,15 +1533,87 @@ describe('saveCache', () => {
     await expect(fs.access(authPath)).resolves.toBeUndefined()
   })
 
-  it('includes SQLite WAL and SHM files when they exist', async () => {
-    // #given storage with content, a SQLite db, WAL, and SHM files
+  it('suppresses ENOENT when auth.json does not exist inside storage', async () => {
+    // #given storage with content but no auth.json inside it at all
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+    const authInsideStorage = path.join(storagePath, 'auth.json')
+
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const adapter = createMockCacheAdapter({saveResult: 12345})
+
+    // #when saving cache
+    await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath: authInsideStorage,
+      cacheAdapter: adapter,
+    })
+
+    // #then the missing-auth.json ENOENT is suppressed, not logged
+    expect(logger.warning).not.toHaveBeenCalled()
+  })
+
+  it('logs a warning instead of suppressing when auth.json exists but cannot be deleted', async () => {
+    // #given auth.json is a directory, not a file — fs.unlink fails with a real
+    // non-ENOENT error, which the errno guard must not misclassify as "nothing to delete"
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+    const authInsideStorage = path.join(storagePath, 'auth.json')
+    await fs.mkdir(authInsideStorage, {recursive: true})
+
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const adapter = createMockCacheAdapter({saveResult: 12345})
+
+    // #when saving cache
+    await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath: authInsideStorage,
+      cacheAdapter: adapter,
+    })
+
+    // #then the non-ENOENT deletion failure is logged
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Failed to delete auth.json',
+      expect.objectContaining({error: expect.any(String) as unknown as string}),
+    )
+  })
+
+  it('excludes both WAL and SHM from the save path set even when both exist', async () => {
+    // #given storage with content, a real hot-WAL SQLite db, and an SHM file
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
 
+    // A real hot-WAL database, deliberately left open rather than cleanly closed —
+    // saveCache now checkpoints before building the upload set, so this must be real
+    // SQLite for that checkpoint to succeed rather than decline the save. The connection
+    // stays open through the assertions below, so the write-ahead log is truncated to
+    // zero bytes by the checkpoint but not unlinked — proving exclusion from cachePaths
+    // is unconditional, not merely because the file happened to be absent.
     const dbDir = path.dirname(storagePath)
-    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'main db')
-    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal data')
-    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm data')
+    const db = new DatabaseSync(path.join(dbDir, 'opencode.db'))
+    db.exec('PRAGMA journal_mode=WAL')
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    // A page-aligned, zero-filled placeholder, not arbitrary text: a wrong-sized -shm
+    // file segfaults node:sqlite (SIGBUS via mmap past EOF) the instant a database next
+    // to it is opened — verified on both Node 24 and Bun.
+    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), Buffer.alloc(32768))
 
     let capturedPaths: string[] = []
     const adapter: CacheAdapter = {
@@ -1186,10 +1636,13 @@ describe('saveCache', () => {
     // #when saving cache
     await saveCache(options)
 
-    // #then WAL and SHM files are included in cache paths
+    // #then only the main db crosses the save boundary — neither sidecar does, even
+    // though both exist on disk
     expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db'))
-    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-wal'))
-    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-shm'))
+    expect(capturedPaths).not.toContain(path.join(dbDir, 'opencode.db-wal'))
+    expect(capturedPaths).not.toContain(path.join(dbDir, 'opencode.db-shm'))
+
+    db.close()
   })
 
   it('omits WAL and SHM files when they do not exist', async () => {

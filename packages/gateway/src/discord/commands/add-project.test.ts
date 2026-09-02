@@ -1614,6 +1614,30 @@ describe('executeAddProject', () => {
       )
     })
 
+    it('identity with an unrepresentable databaseId writes nodeId without a null databaseId', async () => {
+      // #given — getRepoIdentity preserves only the independently usable nodeId
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction} = makeInteraction({guild, userId})
+
+      const getRepoIdentity = vi.fn().mockResolvedValue(ok({databaseId: null, nodeId: 'node-unsafe-id'}))
+      const createBinding = vi.fn().mockResolvedValue(ok({primaryEtag: 'e1', indexEtag: 'e2'}))
+      const appClient = {...makeAppClient(), getRepoIdentity} as unknown as AppClient
+      const deps = makeDeps({
+        appClient,
+        bindingsStore: makeBindingsStore({createBinding}),
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — null is not persisted as a bogus numeric deny key
+      const calls = createBinding.mock.calls as [{databaseId?: number; nodeId?: string}][]
+      expect(calls[0]?.[0]?.databaseId).toBeUndefined()
+      expect(calls[0]?.[0]?.nodeId).toBe('node-unsafe-id')
+    })
+
     it('security: getRepoIdentity is called with the same owner/repo as the binding (canonicalized)', async () => {
       // #given — URL with mixed case; identity call must use canonicalized lowercase
       const userId = uniqueUserId()

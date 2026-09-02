@@ -10,8 +10,8 @@ import {runtimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js
 
 export type {OpenCodeServerHandle} from '@fro-bot/runtime'
 
-export async function bootstrapOpenCodeServer(signal: AbortSignal, logger: Logger) {
-  return bootstrapRuntimeOpenCodeServer(signal, logger)
+export async function bootstrapOpenCodeServer(signal: AbortSignal, logger: Logger, timeoutMs?: number) {
+  return bootstrapRuntimeOpenCodeServer(signal, logger, timeoutMs)
 }
 
 export async function ensureOpenCodeAvailable(options: {

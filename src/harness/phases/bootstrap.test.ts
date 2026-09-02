@@ -55,6 +55,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     agent: null,
     model: null,
     timeoutMs: 600_000,
+    serverBootstrapTimeoutMs: 5000,
     enableOmo: false,
     skipCache: false,
     omoVersion: '1.0.0',

@@ -1,12 +1,12 @@
-import type {SessionClient} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import * as exec from '@actions/exec'
 
-export interface OpenCodeServerHandle {
-  readonly client: SessionClient
-  readonly server: {readonly url: string; close: () => void}
-  readonly shutdown: () => void
-}
+// OpenCodeServerHandle is NOT redefined here. The canonical definition lives in
+// @fro-bot/runtime (packages/runtime/src/agent/server.ts) and is re-exported by
+// ./server-adapter.ts; a second local copy previously drifted from it silently (the
+// runtime's shutdown() became async while this one stayed `() => void`, and nothing
+// caught it because a Promise-returning function is structurally assignable to a
+// void-returning one). Import the type from ./server-adapter.js instead.
 
 export async function verifyOpenCodeAvailable(
   opencodePath: string | null,

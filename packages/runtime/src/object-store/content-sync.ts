@@ -3,18 +3,30 @@ import type {ObjectStoreAdapter, ObjectStoreConfig} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import {DB_MAIN_BASENAME, DB_TRANSPORTABLE_BASENAMES} from '../session/version.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {buildObjectStoreKey} from './key-builder.js'
 import {validateDownloadPath} from './validation.js'
 
-const SESSION_DB_FILENAMES = ['opencode.db', 'opencode.db-wal', 'opencode.db-shm'] as const
-const MAIN_DB_FILENAME = 'opencode.db' as const
+// The transportable subset is the main database file only. It excludes opencode.db-shm, a
+// machine-local wal-index SQLite never syncs: uploading it is useless at best and can
+// interfere with recovery on another runner. It also excludes opencode.db-wal: uploads
+// here happen per-key and never delete, so a healthy save (which now checkpoints before
+// transport) could overwrite a fresh opencode.db while an older opencode.db-wal object
+// from a prior generation sat untouched at the same key -- see DB_TRANSPORTABLE_BASENAMES
+// in ../session/version.js for the full reasoning and the failure modes that motivated it.
+// Download stays tolerant of both sidecars (syncSessionsFromStore below downloads whatever
+// the store lists, unfiltered) so objects uploaded before this change still restore; the
+// restore path (src/services/cache/restore.ts) is what deletes a downloaded write-ahead
+// log locally before anything opens the database.
+const SESSION_DB_UPLOAD_FILENAMES = DB_TRANSPORTABLE_BASENAMES
+const MAIN_DB_FILENAME = DB_MAIN_BASENAME
 
 function getSessionDbDirectory(sessionStoragePath: string): string {
   return path.dirname(sessionStoragePath)
 }
 
-function getSessionDbPath(sessionStoragePath: string, fileName: (typeof SESSION_DB_FILENAMES)[number]): string {
+function getSessionDbPath(sessionStoragePath: string, fileName: string): string {
   return path.join(getSessionDbDirectory(sessionStoragePath), fileName)
 }
 
@@ -63,7 +75,7 @@ export async function syncSessionsToStore(
   let uploaded = 0
   let failed = 0
 
-  for (const fileName of SESSION_DB_FILENAMES) {
+  for (const fileName of SESSION_DB_UPLOAD_FILENAMES) {
     const localPath = getSessionDbPath(sessionStoragePath, fileName)
     try {
       await fs.access(localPath)

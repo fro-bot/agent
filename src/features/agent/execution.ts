@@ -1,6 +1,6 @@
 import type {ErrorInfo} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
-import type {OpenCodeServerHandle} from './server.js'
+import type {OpenCodeServerHandle} from './server-adapter.js'
 import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
