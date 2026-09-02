@@ -1,7 +1,7 @@
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {ExecutionDeadline} from './retry.js'
-import type {OpenCodeServerHandle} from './server.js'
+import type {OpenCodeServerHandle} from './server-adapter.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'

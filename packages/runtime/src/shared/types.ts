@@ -89,6 +89,10 @@ export interface ActionInputs {
   readonly agent: string | null
   readonly model: ModelConfig | null
   readonly timeoutMs: number
+  // OpenCode server bootstrap budget in ms, passed through to createOpencode's
+  // `timeout` option. Distinct from timeoutMs (agent execution timeout) — this
+  // governs server startup only. Default 5000 mirrors the SDK's own default.
+  readonly serverBootstrapTimeoutMs: number
   // oMo mode flag (default: false)
   readonly enableOmo: boolean
   // OMO Slim mode flag (default: false). Mutually exclusive with enableOmo.

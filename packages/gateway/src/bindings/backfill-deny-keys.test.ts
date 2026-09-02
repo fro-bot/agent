@@ -48,7 +48,7 @@ function makeBindingsStore(overrides?: {listBindings?: ReturnType<typeof vi.fn>}
 }
 
 function makeGetRepoIdentity(
-  result: {databaseId: number; nodeId: string} | Error = {databaseId: 42, nodeId: 'node-1'},
+  result: {databaseId: number | null; nodeId: string} | Error = {databaseId: 42, nodeId: 'node-1'},
 ) {
   if (result instanceof Error) {
     return vi.fn().mockResolvedValue(err(result))
@@ -103,6 +103,36 @@ describe('backfillActiveBindingDenyKeys', () => {
     expect(result.data.failed).toBe(0)
   })
 
+  it('preserves nodeId without persisting a null databaseId', async () => {
+    // #given — identity resolution cannot represent the numeric id exactly
+    const binding = makeBinding()
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: null, nodeId: 'node-unsafe-id'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+    })
+
+    // #then — write the usable nodeId, but retain the existing absent-field storage shape
+    expect(result.success).toBe(true)
+    expect(writeBinding).toHaveBeenCalledWith(
+      expect.objectContaining({
+        owner: 'testowner',
+        repo: 'testrepo',
+        nodeId: 'node-unsafe-id',
+      }),
+    )
+    const writtenBinding = writeBinding.mock.calls[0]?.[0] as RepoBinding
+    expect(writtenBinding.databaseId).toBeUndefined()
+  })
+
   it('happy path: binding that already has both deny keys is skipped (no write call)', async () => {
     // #given — binding already has databaseId and nodeId
     const binding = makeBinding({databaseId: 999, nodeId: 'existing-node-id'})
@@ -154,6 +184,84 @@ describe('backfillActiveBindingDenyKeys', () => {
     expect(getRepoIdentity).not.toHaveBeenCalled()
     if (result.success === false) return
     expect(result.data.skipped).toBe(1)
+  })
+
+  it('skips a binding with a present nodeId when no numeric databaseId is available', async () => {
+    // #given — a previous pass preserved the usable nodeId but could not store a numeric id
+    const binding = makeBinding({nodeId: 'existing-node-id'})
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: null, nodeId: 'fresh-node-id'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+    })
+
+    // #then — the completed nodeId-only state converges without another lookup or write
+    expect(result.success).toBe(true)
+    expect(getRepoIdentity).not.toHaveBeenCalled()
+    expect(writeBinding).not.toHaveBeenCalled()
+    if (result.success === false) return
+    expect(result.data.skipped).toBe(1)
+    expect(result.data.updated).toBe(0)
+  })
+
+  it('processes a binding with an unusable numeric databaseId when nodeId is absent', async () => {
+    // #given — an unusable numeric id cannot stand in for a deny key by itself
+    const binding = makeBinding({databaseId: 0})
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: 42, nodeId: 'resolved-node-id'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+    })
+
+    // #then — a binding without a usable deny key is still processed
+    expect(result.success).toBe(true)
+    expect(getRepoIdentity).toHaveBeenCalledExactlyOnceWith('testowner', 'testrepo')
+    expect(writeBinding).toHaveBeenCalledWith(expect.objectContaining({databaseId: 42, nodeId: 'resolved-node-id'}))
+    if (result.success === false) return
+    expect(result.data.skipped).toBe(0)
+    expect(result.data.updated).toBe(1)
+  })
+
+  it('defensively resolves keys for a malformed binding state excluded by the production store filter', async () => {
+    // #given — a malformed binding state that production listBindings filters out before backfill
+    const binding = {...makeBinding(), databaseId: 'not-a-number'} as unknown as RepoBinding
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: 42, nodeId: 'resolved-node-id'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+    })
+
+    // #then — defense-in-depth does not treat malformed data as a usable deny key
+    expect(result.success).toBe(true)
+    expect(getRepoIdentity).toHaveBeenCalledExactlyOnceWith('testowner', 'testrepo')
+    expect(writeBinding).toHaveBeenCalledWith(expect.objectContaining({databaseId: 42, nodeId: 'resolved-node-id'}))
+    if (result.success === false) return
+    expect(result.data.skipped).toBe(0)
+    expect(result.data.updated).toBe(1)
   })
 
   it('happy path: empty binding list → no updates, no errors', async () => {

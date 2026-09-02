@@ -1,3 +1,4 @@
+import type {CleanupPhaseOptions} from './cleanup.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -40,6 +41,12 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
 })
 
 describe('runCleanup', () => {
+  const createServerHandle = (): NonNullable<CleanupPhaseOptions['serverHandle']> => ({
+    client: {} as NonNullable<CleanupPhaseOptions['serverHandle']>['client'],
+    server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+    shutdown: vi.fn().mockResolvedValue({quiesced: true}),
+  })
+
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
@@ -81,6 +88,7 @@ describe('runCleanup', () => {
       agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
+      sessionRetention: null,
       detectedOpencodeVersion: '1.0.0',
       storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
       metrics,
@@ -128,6 +136,7 @@ describe('runCleanup', () => {
       agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
+      sessionRetention: null,
       detectedOpencodeVersion: '1.0.0',
       storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
       metrics: createMetricsCollector(),
@@ -161,6 +170,7 @@ describe('runCleanup', () => {
         agentSuccess: true,
         attachmentResult: null,
         serverHandle: null,
+        sessionRetention: null,
         detectedOpencodeVersion: '1.0.0',
         storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
         metrics: createMetricsCollector(),
@@ -196,6 +206,7 @@ describe('runCleanup', () => {
         agentSuccess: true,
         attachmentResult: null,
         serverHandle: null,
+        sessionRetention: null,
         detectedOpencodeVersion: '1.0.0',
         storeConfig: {
           enabled: true,
@@ -212,5 +223,161 @@ describe('runCleanup', () => {
     ).resolves.toBeUndefined()
 
     expect(syncMetadataToStore).toHaveBeenCalled()
+  })
+
+  it('passes configured session retention to pruning while preserving the age limit', async () => {
+    // #given a live server and a configured session retention value
+    const {pruneSessions} = await import('@fro-bot/runtime')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup prunes sessions
+    await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      agentSuccess: true,
+      attachmentResult: null,
+      serverHandle: createServerHandle(),
+      sessionRetention: 10,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then the configured count is used without changing the age limit
+    expect(pruneSessions).toHaveBeenCalledWith(
+      {},
+      '/tmp/workspace',
+      {maxSessions: 10, maxAgeDays: 30},
+      expect.any(Object),
+    )
+  })
+
+  it('keeps the current pruning config when the default retention is used', async () => {
+    // #given a live server and the input's default retention value
+    const {DEFAULT_PRUNING_CONFIG, pruneSessions} = await import('@fro-bot/runtime')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup prunes sessions
+    await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      agentSuccess: true,
+      attachmentResult: null,
+      serverHandle: createServerHandle(),
+      sessionRetention: 50,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then pruning receives today's hardcoded config unchanged
+    expect(pruneSessions).toHaveBeenCalledWith({}, '/tmp/workspace', DEFAULT_PRUNING_CONFIG, expect.any(Object))
+  })
+
+  it('keeps the current pruning config when no retention is configured', async () => {
+    // #given a live server and no retention value at all — the branch a consumer
+    // who never set the input actually takes, which differs from passing the
+    // default value explicitly
+    const {DEFAULT_PRUNING_CONFIG, pruneSessions} = await import('@fro-bot/runtime')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup prunes sessions
+    await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      agentSuccess: true,
+      attachmentResult: null,
+      serverHandle: createServerHandle(),
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then behaviour is byte-identical to today's — this is the property that
+    // makes wiring the input safe to ship rather than a behaviour change
+    expect(pruneSessions).toHaveBeenCalledWith({}, '/tmp/workspace', DEFAULT_PRUNING_CONFIG, expect.any(Object))
+  })
+
+  it('warns when shutdown() cannot confirm quiescence, so an operator can see the checkpoint that follows may have raced a writer', async () => {
+    // #given a server handle whose shutdown() times out without confirming the child
+    // exited — every other test in this suite mocks shutdown as quiesced: true, so this
+    // branch (cleanup.ts's `if (!shutdownResult.quiesced)`) is otherwise never observed
+    const logger = createMockLogger()
+    const serverHandle: NonNullable<CleanupPhaseOptions['serverHandle']> = {
+      client: {} as NonNullable<CleanupPhaseOptions['serverHandle']>['client'],
+      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+      shutdown: vi.fn().mockResolvedValue({quiesced: false}),
+    }
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup shuts the server down
+    await runCleanup({
+      bootstrapLogger: logger,
+      reactionCtx: null,
+      githubClient: null,
+      agentSuccess: true,
+      attachmentResult: null,
+      serverHandle,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then the unconfirmed quiescence is surfaced as a warning, distinct from the
+    // separate 'Server shutdown failed' warning that only fires when shutdown() itself
+    // throws
+    expect(serverHandle.shutdown).toHaveBeenCalledTimes(1)
+    expect(logger.warning).toHaveBeenCalledWith(
+      'OpenCode server did not confirm shutdown within the quiescence window; the checkpoint that follows may race a still-live writer',
+    )
+    expect(logger.warning).not.toHaveBeenCalledWith('Server shutdown failed (non-fatal)', expect.any(Object))
+  })
+
+  it('skips pruning when there is no live server handle', async () => {
+    // #given no live server handle
+    const {pruneSessions} = await import('@fro-bot/runtime')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      agentSuccess: true,
+      attachmentResult: null,
+      serverHandle: null,
+      sessionRetention: 10,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then pruning is skipped
+    expect(pruneSessions).not.toHaveBeenCalled()
   })
 })

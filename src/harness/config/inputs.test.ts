@@ -644,6 +644,28 @@ describe('parseActionInputs', () => {
       expect(!result.success && result.error.message).toContain('session-retention')
     })
 
+    it('returns error for invalid server-bootstrap-timeout (negative)', () => {
+      mockInputs({
+        'server-bootstrap-timeout': '-5',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('server-bootstrap-timeout')
+    })
+
+    it('returns error for invalid server-bootstrap-timeout (not a number)', () => {
+      mockInputs({
+        'server-bootstrap-timeout': 'abc',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('server-bootstrap-timeout')
+    })
+
     it('returns an error when s3-backup is true and s3-bucket is empty without echoing values', () => {
       mockInputs({
         's3-backup': 'true',
@@ -729,6 +751,16 @@ describe('parseActionInputs', () => {
     it('rejects zero for session-retention (must be positive)', () => {
       mockInputs({
         'session-retention': '0',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects zero for server-bootstrap-timeout (must be positive)', () => {
+      mockInputs({
+        'server-bootstrap-timeout': '0',
       })
 
       const result = parseActionInputs()
@@ -868,6 +900,62 @@ describe('parseActionInputs', () => {
 
       expect(result.success).toBe(true)
       expect(result.success && result.data.timeoutMs).toBe(0)
+    })
+
+    it('parses server-bootstrap-timeout input with default value', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(5000) // DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS
+    })
+
+    it('parses custom server-bootstrap-timeout input', () => {
+      mockInputs({
+        'server-bootstrap-timeout': '12000',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(12000)
+    })
+
+    it('leaves a server-bootstrap-timeout within the maximum unchanged and does not warn', () => {
+      mockInputs({
+        'server-bootstrap-timeout': '120000',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(120_000)
+      expect(mocks.warning).not.toHaveBeenCalled()
+    })
+
+    it('clips a server-bootstrap-timeout above the maximum and warns', () => {
+      mockInputs({
+        'server-bootstrap-timeout': '600000',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(120_000)
+      expect(mocks.warning).toHaveBeenCalledWith(
+        expect.stringContaining('server-bootstrap-timeout of 600000ms exceeds the maximum of 120000ms'),
+      )
+    })
+
+    it('leaves the unset server-bootstrap-timeout default unchanged and does not warn', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.serverBootstrapTimeoutMs).toBe(5000) // DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS
+      expect(mocks.warning).not.toHaveBeenCalled()
     })
 
     it('parses dedup-window with default value', () => {

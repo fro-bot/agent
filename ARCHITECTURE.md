@@ -29,6 +29,9 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `writeSystematicConfig` | Function | `src/services/setup/systematic-config.ts` | Systematic plugin config writer |
 | `restoreCache` | Function | `src/services/cache/restore.ts` | Restore OpenCode state |
 | `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache |
+| `checkpointDatabase` | Function | `src/services/cache/checkpoint.ts` | Merge SQLite WAL into main DB before save/restore hand-off |
+| `verifyDatabaseUsable` | Function | `src/services/cache/integrity.ts` | Restore-side probe for structurally corrupt SQLite files |
+| `isStructuralCorruptionError` | Function | `src/services/cache/sqlite-errors.ts` | Positive-allowlist classifier for SQLite corruption vs. transient errors |
 | `executeOpenCode` | Function | `src/features/agent/execution.ts` | SDK execution orchestration |
 | `normalizeEvent` | Function | `src/services/github/context.ts` | Raw payload → typed NormalizedEvent |
 | `parseGitHubContext` | Function | `src/services/github/context.ts` | Global context → typed GitHubContext |
@@ -114,6 +117,8 @@ main.ts
         │
         ├─→ cache-restore phase
         │     restore from S3 first → fall back to Actions cache when needed
+        │     → repair the restored SQLite database before the server opens it:
+        │       checkpoint its WAL, or clean-slate it if SQLite reports it structurally corrupt
         │
         ├─→ session-prep phase
         │     processAttachments → buildAgentPrompt (packages/runtime)
@@ -134,7 +139,8 @@ main.ts
         │
         └─→ cleanup phase
               prune sessions → shutdown server → sync artifacts and metadata
-              → saveCache (S3 before Actions cache) → release lock in finally
+              → saveCache (checkpoints the WAL before capturing files; S3 before Actions cache)
+              → release lock in finally
 
 post.ts (separate Action step)
   └─→ harness/post.ts (runPost)
@@ -247,6 +253,16 @@ Session persistence spans two distinct layers that are easy to conflate. During 
 ### OIDC Trusted Publishing
 
 The harness release workflow publishes to npm via OIDC (no long-lived npm token). `id-token: write` is scoped to the `publish` job only; `integrate` and `build` jobs run with `contents: read` and no `id-token`. Each of the five packages (`@fro.bot/harness` + four per-platform packages) requires a one-time trusted-publisher configuration on npmjs.com before OIDC publishes can succeed.
+
+### SQLite WAL Checkpoint Repair (Cache Bootstrap Trap)
+
+`src/services/cache/checkpoint.ts` (`checkpointDatabase`) merges the OpenCode session database's write-ahead log into the main `opencode.db` file via `PRAGMA wal_checkpoint(TRUNCATE)` (`node:sqlite`, unflagged on Node 24), and runs at two call sites: inside `saveCache` (`src/services/cache/save.ts`), before file sizes are inspected or bytes transported, and again on the restore side in `runCacheRestore` (`src/harness/phases/cache-restore.ts`), before `bootstrapOpenCodeServer` ever opens the database. Restore keys are prefixes that return the most recent entry and save keys are unique per run, so a run that declines to save leaves a poisoned entry as the newest one for the next restore to hit again — checkpointing on restore heals a stuck repository in place instead of letting it loop. Success is judged by the WAL's on-disk size after the attempt, never by the pragma's own `checkpointed` count (verified to under-report on a fully successful truncation). A busy or lock-contended writer surfaces as a busy database and is retried within a bounded attempt count and wall-clock deadline; the deadline is checked only between attempts, so an in-flight pragma is never interrupted. An **idle** live writer does not surface this way at all: a checkpoint against it can report success and then have the WAL grow again moments later from a write that was already in flight when the child was signalled. Closing that gap is `packages/runtime/src/agent/server.ts`'s job, not the checkpoint's — `OpenCodeServerHandle.shutdown()` sends the child's kill signal and then polls its listening port (bounded, best-effort; the SDK exposes no pid or exit event to await directly) until connections start being refused or a timeout elapses, and `src/harness/phases/cleanup.ts` awaits that before `saveCache` ever runs. A timed-out poll does not fail the run, but is logged, since the checkpoint that follows is not then running against a confirmed-quiet database.
+
+The write-ahead log itself no longer crosses either transport on save: `DB_TRANSPORTABLE_BASENAMES` (`packages/runtime/src/session/version.ts`) and `buildSaveCachePaths` (`src/services/cache/paths.ts`) both include only the main database file. The object store's per-key upload/overwrite is not atomic across two files, so a healthy save that only refreshes `opencode.db` could otherwise leave an older `opencode.db-wal` object paired with a newer database on the next restore; `src/services/cache/restore.ts` deletes any write-ahead log downloaded from the object store immediately after the sync call returns, before anything opens the database. The Actions cache is unaffected by that specific hazard (one entry is one atomic archive), so a legacy database+WAL pair restored from there is left alone and repaired in place by the same restore-side checkpoint described above, rather than discarded.
+
+`src/services/cache/integrity.ts` (`verifyDatabaseUsable`) closes the gap a hot WAL would otherwise mask: a structurally corrupt database with no pending write-ahead data reports `nothing-to-checkpoint` and would sail through unprobed, later getting re-persisted under a fresh key. It runs only on the restore path (`SELECT count(*) FROM sqlite_master`, a schema-page read, not a full `PRAGMA integrity_check`) and only when `checkpointDatabase` itself reports `nothing-to-checkpoint`.
+
+`src/services/cache/sqlite-errors.ts` (`isStructuralCorruptionError`) is a positive allowlist — matching only SQLite's own wording for "file is not a database" and "database disk image is malformed" — never a catch-all. Deleting a repository's session history (`cleanStorage`) is the most destructive action either module takes, so any unrecognized failure (permission denied, disk full, I/O error, a missing parent directory, a merely non-writable-but-readable database) defaults to `structural: false` / `usable: true` and is left alone rather than wiped. Only a positive corruption classification routes into `cleanStorage`, the same clean-slate path `restoreCache` already uses for cache-corruption and storage-version mismatches.
 
 ### S3 Conditional-Write Lock (Action + Gateway)
 

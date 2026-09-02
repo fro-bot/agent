@@ -49,7 +49,7 @@ export type {
   ResponseSurfacePolicy,
 } from './response-file.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
-export type {OpenCodeServerHandle} from './server.js'
+export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
 export {createSessionTools, info, list, read, search} from './session-tools.js'
 export type {SessionToolDefinition, SessionTools} from './session-tools.js'
 export type {SetupAdapter} from './setup-adapter.js'
