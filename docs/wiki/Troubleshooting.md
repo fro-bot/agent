@@ -30,10 +30,11 @@ If the agent does not react to a mention or event:
 
 If sessions are not persisting between runs:
 
-1. Check the GitHub Actions cache size (Settings → Actions → Cache). The cache has a 10 GB per-repository limit and entries expire after 7 days of inactivity.
-2. Enable S3 backup (`s3-backup: true`) for durable persistence that outlives cache eviction.
-3. Verify `skip-cache` is not set to `true`.
-4. Review run logs for cache-corruption warnings — a corrupted restore falls back to S3 when configured.
+1. Check which trigger the run used. `issue_comment` and `issues` runs cannot write the Actions cache at all — GitHub scopes the cache token by trigger class, so this applies regardless of who triggered the run, and no `permissions:` change affects it. If the bot forgets between mentions while `workflow_dispatch` runs remember fine, this is the cause and `s3-backup` is the only fix. See [[Session Persistence]].
+2. Check the GitHub Actions cache size (Settings → Actions → Cache). The cache has a 10 GB per-repository limit and entries expire after 7 days of inactivity.
+3. Enable S3 backup (`s3-backup: true`) for durable persistence that outlives cache eviction, and for continuity on the mention triggers above.
+4. Verify `skip-cache` is not set to `true`.
+5. Review run logs for cache-corruption warnings — a corrupted restore falls back to S3 when configured.
 
 See [[Session Persistence]] for how memory survives across runs.
 
