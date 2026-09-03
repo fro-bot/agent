@@ -242,7 +242,7 @@ The bolded row is the double-sync bug: durable in the object store, reported as 
 
 **Verification:** On a comment-triggered run without `s3-backup`, the summary states the state did not persist and names the remedy. On a dispatch run, the same output reports success.
 
-- [ ] **Unit 4: Document the constraint**
+- [x] **Unit 4: Document the constraint**
 
 **Goal:** The `s3-backup` requirement for mention-driven workflows is written where a consumer finds it before hitting the failure.
 
