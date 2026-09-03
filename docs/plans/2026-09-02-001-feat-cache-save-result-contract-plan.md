@@ -26,7 +26,7 @@ The only signal today is one `logger.warning` per run. No output, no summary lin
 Three defects follow from the same root, all verified against `main`:
 
 1. **Both poles of the boolean are overloaded.** `false` spans a declined checkpoint, no cacheable content, a rejected cache write, and a thrown error. `true` spans a real write, a deliberate `SKIP_CACHE`, and a benign key collision. `post.ts:123` reports every falsey outcome as `"Post-action: no cache content to save"` — a stronger and more misleading claim than the warning it replaces.
-2. **The boolean conflates two backends.** The object-store sync runs at `save.ts:171-188`, the cache write at `:189`. When the store succeeds and the cache write is rejected, the function returns `false`, `cleanup.ts:196` never sets `CACHE_SAVED`, and the post hook repeats the entire save — a second checkpoint, a **second full object-store upload**, and a second doomed cache write. State is durable; the run pays twice and reports failure.
+2. **The boolean conflates two backends.** The object-store sync runs at `save.ts:171-188`, the cache write at `:190`. When the store succeeds and the cache write is rejected, the function returns `false`, `cleanup.ts:196` never sets `CACHE_SAVED`, and the post hook repeats the entire save — a second checkpoint, a **second full object-store upload**, and a second doomed cache write. State is durable; the run pays twice and reports failure.
 3. **No queryable signal.** The existing output and job-summary machinery already carries `cache-status` for the restore side. Nothing carries the save side.
 
 ## Requirements Trace
@@ -56,7 +56,7 @@ Three defects follow from the same root, all verified against `main`:
 - `src/services/cache/save.ts` — `saveCache`, all seven return paths.
 - `src/services/cache/checkpoint.ts` — `CheckpointOutcome`, a three-state discriminated union added in #1519. **The closest existing convention** and the one to mirror: it exists precisely so a successful no-op is not collapsed into failure.
 - `src/services/cache/restore.ts` — `CacheResult` (`hit`, `key`, `restoredPath`, `corrupted`, `source`). The restore-side shape a save-side result should rhyme with.
-- `src/harness/config/outputs.ts` — `setActionOutputs`, the single seam from `ActionOutputs` to `core.setOutput`. `action.yaml` declares six outputs today, including `cache-status`.
+- `src/harness/config/outputs.ts` — `setActionOutputs`, the single seam from `ActionOutputs` to `core.setOutput`. `action.yaml` declares seven outputs today, including `cache-status`.
 - `src/features/observability/job-summary.ts` — `writeJobSummary` builds a fixed table via `core.summary.addTable`, already formatting cache status. Adding a row is isolated to this writer.
 - `src/harness/phases/cleanup.ts:196` and `src/harness/post.ts:86` — the two call sites, communicating only through the `CACHE_SAVED` state key.
 
