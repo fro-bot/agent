@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-08-24"
-updated-by: "ses_fd0b1eaf4ffeTMI146lECk0yxc"
+last-updated: "2026-09-02"
+updated-by: "pr-1527"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
@@ -59,7 +59,7 @@ Cache saves happen twice: once during the cleanup phase of the main step, and ag
 
 ### Trigger-specific cache write availability
 
-On affected runs, the Actions cache can still restore state, but its write token is not equally capable. GitHub scopes the cache JWT by **trigger class**, not by who fired the individual run: because `issue_comment` and `issues` are initiable by an actor without repository write access, every run on those triggers gets a read-only `ACTIONS_RUNTIME_TOKEN`. A run started by a maintainer is affected exactly as much as one started by an outside contributor — this repository's own workflow admits only `OWNER`, `MEMBER`, and `COLLABORATOR` on `issue_comment`, and its cache writes were still denied. `@actions/cache` authenticates with that runner-injected token rather than `GITHUB_TOKEN`, so adding or changing a workflow `permissions:` block cannot make the cache writable; the permissions shown for `GITHUB_TOKEN` are irrelevant to this cache operation. `workflow_dispatch` and `schedule` runs are not affected.
+GitHub scopes the cache JWT by **trigger class**, not by who fired the individual run: because `issue_comment` and `issues` are initiable by an actor without repository write access, every run on those triggers gets a read-only `ACTIONS_RUNTIME_TOKEN`. On those runs the Actions cache can still restore state, but its write token is not equally capable. A run started by a maintainer is affected exactly as much as one started by an outside contributor — this repository's own workflow admits only `OWNER`, `MEMBER`, and `COLLABORATOR` on `issue_comment`, and its cache writes were still denied. `@actions/cache` authenticates with that runner-injected token rather than `GITHUB_TOKEN`, so adding or changing a workflow `permissions:` block cannot make the cache writable; the permissions shown for `GITHUB_TOKEN` are irrelevant to this cache operation. `workflow_dispatch` and `schedule` runs are not affected.
 
 This mapping from event to cache scope is attributed to a platform policy change and is not documented by GitHub; it is the current best explanation for the observed behavior on GitHub-hosted runners rather than a published contract. The triggers named here are the ones whose behavior was observed directly — `pull_request` and `pull_request_review_comment` were not, and fork pull requests carry their own separate cache-scope restrictions. See [the incident write-up](../solutions/integration-issues/read-only-actions-cache-token-broke-session-continuity-2026-08-11.md) for the evidence and the month it went unnoticed.
 
