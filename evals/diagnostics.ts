@@ -134,11 +134,11 @@ function boundDiagnostic(text: string, maxBytes: number, marker: string): string
     return ''
   }
 
-  let prefix = bytes.subarray(0, maxBytes - markerBytes).toString('utf8')
-  while (Buffer.byteLength(prefix, 'utf8') + markerBytes > maxBytes) {
-    prefix = prefix.slice(0, -1)
+  let suffix = bytes.subarray(bytes.length - (maxBytes - markerBytes)).toString('utf8')
+  while (Buffer.byteLength(suffix, 'utf8') + markerBytes > maxBytes) {
+    suffix = suffix.slice(1)
   }
-  return `${prefix}${marker}`
+  return `${marker}${suffix}`
 }
 
 function diagnosticContent(

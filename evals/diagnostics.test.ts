@@ -130,7 +130,7 @@ describe('diagnostic persistence boundaries', {timeout: 30_000}, () => {
   })
 
   it('enforces one total persisted log budget while retaining useful normal diagnostics', () => {
-    // #given multiple normal-sized logs whose combined content exceeds the total budget
+    // #given two fixed-size ASCII logs whose combined 80,020 bytes exceed the 65,536-byte total budget
     const sourceDirectory = createTemporaryDirectory('fro-bot-log-total-source-')
     const outputDirectory = createTemporaryDirectory('fro-bot-log-total-output-')
     writeFileSync(path.join(sourceDirectory, 'a.log'), `${'A'.repeat(40_000)} useful-a\n`, 'utf8')
@@ -154,5 +154,6 @@ describe('diagnostic persistence boundaries', {timeout: 30_000}, () => {
     const persistedText = files.map(fileName => readPersistedFile(diagnosticsPath, fileName)).join('\n')
     expect(persistedBytes).toBeLessThanOrEqual(65_536)
     expect(persistedText).toContain('useful-a')
+    expect(persistedText).toContain('useful-b')
   })
 })
