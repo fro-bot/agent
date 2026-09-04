@@ -71,14 +71,14 @@ Separate binary persistence from session state using distinct cache key prefix.
 
 **Cache Key Structure:**
 ```typescript
-opencode-tools-{os}-oc{opencodeVersion}-omo{omoVersion}
+opencode-tools-v2-{os}-oc{opencodeVersion}-omo{omoVersion}
 ```
 
 **Fallback Restore Chain:**
 ```typescript
 [
-  "opencode-tools-{os}-oc{version}-omo{version}-",  // Exact match or prefix
-  "opencode-tools-{os}-"                             // Same OS, any versions
+  "opencode-tools-v2-{os}-oc{version}-omo{version}-",  // Exact match or prefix
+  "opencode-tools-v2-{os}-"                             // Same OS, any versions
 ]
 ```
 
@@ -132,8 +132,8 @@ Scope: Session state, conversation history
 
 **Tools Cache** (new):
 ```
-TOOLS_CACHE_PREFIX = 'opencode-tools'
-Key: opencode-tools-{os}-oc{opencodeVersion}-omo{omoVersion}
+TOOLS_CACHE_PREFIX = 'opencode-tools-v2'
+Key: opencode-tools-v2-{os}-oc{opencodeVersion}-omo{omoVersion}
 Scope: Immutable binaries (OpenCode, oMo)
 ```
 
@@ -188,7 +188,7 @@ export async function restoreToolsCache(options: RestoreToolsCacheOptions): Prom
 
 ## Prevention Strategies
 
-1. **Separate Cache Concerns by Prefix** — Always use distinct cache key prefixes for different concerns (e.g., `opencode-storage` for session state, `opencode-tools` for binary/tool caches). This prevents naming collisions, enables independent cache management, and makes it clear which component manages which data. Establishes a scaling pattern for future cache layers.
+1. **Separate Cache Concerns by Prefix** — Always use distinct cache key prefixes for different concerns (e.g., `opencode-storage` for session state, `opencode-tools-v2` for binary/tool caches). This prevents naming collisions, enables independent cache management, and makes it clear which component manages which data. Establishes a scaling pattern for future cache layers.
 
 2. **Enforce Input → Type → Constant Flow** — Route all action inputs through a consistent transformation pipeline: kebab-case in `action.yaml` → camelCase in `ActionInputs` interface → UPPERCASE_UNDERSCORE in constants. This prevents copy-paste errors, ensures type safety early, and makes the pattern reusable for new inputs.
 
@@ -202,7 +202,7 @@ export async function restoreToolsCache(options: RestoreToolsCacheOptions): Prom
 
 ## Best Practices
 
-- **Cache Key Design**: Include version info, OS, and tool name in the cache key itself rather than storing metadata separately. Example pattern: `opencode-tools-{os}-oc{version}-omo{version}`. This enables fallback chains and self-documenting cache invalidation.
+- **Cache Key Design**: Include version info, OS, and tool name in the cache key itself rather than storing metadata separately. Example pattern: `opencode-tools-v2-{os}-oc{version}-omo{version}`. This enables fallback chains and self-documenting cache invalidation.
 
 - **Version Pinning**: Always accept `version: string` parameters in setup functions. Default to pinned versions (not "latest"). This breaks dependency on registry lookups and makes determinism the default, not an exception.
 
