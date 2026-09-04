@@ -177,24 +177,34 @@ describe('diagnostic persistence boundaries', {timeout: 30_000}, () => {
   })
 
   it('keeps the diagnostic truncation marker at the front for multibyte log tails', () => {
-    // #given a first log that leaves a multibyte second log only part of the total budget
+    // #given two identical multibyte logs whose combined size exceeds the total budget.
+    // They must be the same size: visitImmediateEntries reads the directory unsorted, so a
+    // fixture that assumes which file is visited first reproduces the very ordering
+    // dependency this test exists to guard against.
     const sourceDirectory = createTemporaryDirectory('fro-bot-log-marker-source-')
     const outputDirectory = createTemporaryDirectory('fro-bot-log-marker-output-')
-    writeFileSync(path.join(sourceDirectory, 'a.log'), 'A'.repeat(65_000), 'utf8')
-    writeFileSync(path.join(sourceDirectory, 'b.jsonl'), '😀'.repeat(1_000), 'utf8')
+    const multibyteLog = `X${'😀'.repeat(10_000)}`
+    writeFileSync(path.join(sourceDirectory, 'a.log'), multibyteLog, 'utf8')
+    writeFileSync(path.join(sourceDirectory, 'b.jsonl'), multibyteLog, 'utf8')
 
     // #when the flat diagnostics are captured
     const diagnosticsPath = captureDiagnostics(sourceDirectory, outputDirectory, 'marker-position', [])
 
-    // #then the tail-retained log starts with its dynamic truncation marker and remains valid UTF-16
+    // #then whichever log was visited second is tail-retained, leads with its dynamic
+    // truncation marker, stays within its partial budget, and remains valid UTF-16
     expect(diagnosticsPath).not.toBeNull()
     if (diagnosticsPath == null) {
       throw new Error('Expected marker-position diagnostics path')
     }
-    const persistedLog = readPersistedFile(diagnosticsPath, 'b.jsonl')
-    expect(persistedLog.startsWith('\n\n[diagnostic truncated at 536 bytes]\n')).toBe(true)
-    expect(Buffer.byteLength(persistedLog, 'utf8')).toBeLessThanOrEqual(536)
-    expect(containsLoneSurrogate(persistedLog)).toBe(false)
+    const remainingBytes = 65_536 - Buffer.byteLength(multibyteLog, 'utf8')
+    const expectedMarker = `\n\n[diagnostic truncated at ${remainingBytes} bytes]\n`
+    const persistedLogs = ['a.log', 'b.jsonl'].map(fileName => readPersistedFile(diagnosticsPath, fileName))
+    const truncatedLog = persistedLogs.find(log => log.startsWith(expectedMarker))
+    expect(truncatedLog).toBeDefined()
+    expect(Buffer.byteLength(truncatedLog ?? '', 'utf8')).toBeLessThanOrEqual(remainingBytes)
+    for (const log of persistedLogs) {
+      expect(containsLoneSurrogate(log)).toBe(false)
+    }
   })
 
   it('keeps the response frontmatter and trailing marker at a multibyte head boundary', () => {
