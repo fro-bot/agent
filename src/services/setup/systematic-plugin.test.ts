@@ -46,6 +46,49 @@ describe('installSystematicPlugin', () => {
     expect(logger.info).toHaveBeenCalledWith('Systematic plugin install complete', expect.any(Object))
   })
 
+  it('scrubs secrets from the install child, which runs untrusted npm lifecycle scripts', async () => {
+    // #given a runner environment carrying credentials alongside what an install needs
+    const logger = createLogger()
+    const exec = vi.fn<ExecAdapter['exec']>().mockResolvedValue(0)
+    const secrets = {
+      GITHUB_TOKEN: 'ghs-secret',
+      GH_TOKEN: 'gh-secret',
+      NPM_AUTH_TOKEN: 'npm-secret',
+      ANTHROPIC_API_KEY: 'sk-secret',
+      SOME_CLIENT_SECRET: 'client-secret',
+      AWS_SECRET_ACCESS_KEY: 'aws-secret',
+      'INPUT_AUTH-JSON': 'auth-json-secret',
+    }
+    const originals = new Map(Object.keys(secrets).map(key => [key, process.env[key]]))
+    Object.assign(process.env, secrets)
+
+    try {
+      // #when the plugin is installed
+      await installSystematicPlugin({
+        logger,
+        execAdapter: createExecAdapter(exec),
+        opencodePath: '/cached/opencode',
+        systematicVersion: '2.1.0',
+        timeoutMs: 100,
+      })
+
+      // #then no credential reaches the child, while install prerequisites survive
+      const childEnv = exec.mock.calls[0]?.[2]?.env ?? {}
+      for (const key of Object.keys(secrets)) {
+        expect(childEnv[key]).toBeUndefined()
+      }
+      expect(childEnv.PATH).toBe(process.env.PATH)
+    } finally {
+      for (const [key, value] of originals) {
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
   it('warns and returns when the install times out', async () => {
     // #given an OpenCode CLI that never exits
     const logger = createLogger()

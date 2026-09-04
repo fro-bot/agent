@@ -1,8 +1,18 @@
 import type {ExecAdapter, Logger} from './types.js'
 import process from 'node:process'
+import {filterAgentEnv} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 
-const DEFAULT_INSTALL_TIMEOUT_MS = 120_000
+// Sized against the failure this install exists to prevent, not against a healthy
+// install. When the npm registry is degraded, the server-side install this replaces
+// was measured at 181-370s before returning. A budget below that tail would time out
+// on precisely the slow-but-valid runs that matter, warn, continue, and then let the
+// server perform the same install unbounded -- paying the timeout AND the original
+// stall. 420s clears the observed tail with margin; exceeding it means something is
+// broken badly enough that falling back to the server's own install is the right call.
+// A healthy install finishes in seconds, so this ceiling is not a latency cost in the
+// common case -- and unlike the stall it replaces, the time is logged and attributable.
+const DEFAULT_INSTALL_TIMEOUT_MS = 420_000
 
 export interface SystematicPluginInstallOptions {
   readonly logger: Logger
@@ -31,11 +41,16 @@ export async function installSystematicPlugin(
   let timeoutId: ReturnType<typeof setTimeout> | undefined
   try {
     const args = ['--pure', 'plugin', `@fro.bot/systematic@${systematicVersion}`, '--global']
+    // Scrubbed, not inherited. This subprocess runs `npm install`, which executes
+    // lifecycle scripts from a package fetched off the network -- the same untrusted-child
+    // boundary that made issue #1147 wrap `createOpencode` in `withScrubbedEnv`. An
+    // unscrubbed spread would hand `GITHUB_TOKEN`, `*_API_KEY`, `*_SECRET`, `AWS_*`, and
+    // every `INPUT_*` to that script. `filterAgentEnv` is a deny-by-default allowlist and
+    // already passes what an install needs: PATH, HOME, TMPDIR, the proxy and CA vars, and
+    // `XDG_*` (which is how the package lands in the cache directory the server reads).
     const execOptions = {
       env: {
-        ...Object.fromEntries(
-          Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] != null),
-        ),
+        ...filterAgentEnv(process.env),
         OPENCODE_CONFIG_CONTENT: emptyConfig,
         OPENCODE_DISABLE_PROJECT_CONFIG: '1',
       },
