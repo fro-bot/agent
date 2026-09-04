@@ -71,7 +71,7 @@ Before saving, `saveCache` in `src/services/cache/save.ts` checks whether there 
 
 ## Object Store (S3 Backup)
 
-GitHub Actions cache has a 10 GB limit per repository and entries expire after 7 days of inactivity. For repositories where losing agent memory would be costly, the optional S3-compatible object store backend (RFC-019) provides durable persistence that survives cache eviction.
+GitHub Actions cache has a 10 GB limit per repository and entries expire after 7 days of inactivity. For repositories where losing agent memory would be costly, the optional S3-compatible object store backend (RFC-019) provides durable persistence that survives cache eviction — and, per the trigger constraint above, is the only path to continuity at all on `issue_comment` and `issues` runs.
 
 The implementation lives in `packages/runtime/src/object-store/` and consists of five modules:
 
