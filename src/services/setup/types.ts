@@ -143,6 +143,12 @@ export interface ToolCacheAdapter {
  */
 export interface ExecAdapter {
   readonly exec: (commandLine: string, args?: string[], options?: ExecOptions) => Promise<number>
+  readonly execWithTimeout?: (
+    commandLine: string,
+    args: string[] | undefined,
+    timeoutMs: number,
+    options?: ExecOptions,
+  ) => Promise<number | 'timed-out'>
   readonly getExecOutput: (commandLine: string, args?: string[], options?: ExecOptions) => Promise<ExecOutput>
 }
 

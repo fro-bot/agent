@@ -19,6 +19,7 @@ import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode, toolCacheVersion} from './opencode.js'
 import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
+import {installSystematicPlugin} from './systematic-plugin.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
 
 export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
@@ -282,7 +283,16 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       })
     }
 
-    if (!toolsCacheResult.hit) {
+    core.addPath(opencodeResult.path)
+
+    if (toolsCacheResult.hit === false) {
+      await installSystematicPlugin({
+        logger,
+        execAdapter,
+        opencodePath: 'opencode',
+        systematicVersion,
+      })
+
       await saveToolsCache({
         logger,
         os: runnerOS,
@@ -298,7 +308,6 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       })
     }
 
-    core.addPath(opencodeResult.path)
     core.setOutput('opencode-path', opencodeResult.path)
     core.setOutput('opencode-version', opencodeResult.version)
     logger.info('OpenCode ready', {

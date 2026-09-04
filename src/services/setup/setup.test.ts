@@ -8,6 +8,7 @@ import * as tc from '@actions/tool-cache'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as sessionToolsConfig from './session-tools-config.js'
 import {runSetup} from './setup.js'
+import * as systematicPlugin from './systematic-plugin.js'
 import * as toolsCache from './tools-cache.js'
 
 function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
@@ -127,6 +128,10 @@ vi.mock('./session-tools-config.js', () => ({
   writeSessionToolsFile: vi.fn().mockResolvedValue(undefined),
 }))
 
+vi.mock('./systematic-plugin.js', () => ({
+  installSystematicPlugin: vi.fn().mockResolvedValue({status: 'installed', duration: 1}),
+}))
+
 describe('setup', () => {
   const originalEnv = process.env
 
@@ -169,6 +174,7 @@ describe('setup', () => {
 
     // Re-apply session-tools-config mock cleared by vi.resetAllMocks() above.
     vi.mocked(sessionToolsConfig.writeSessionToolsFile).mockResolvedValue(undefined)
+    vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'installed', duration: 1})
   })
 
   afterEach(() => {
@@ -906,6 +912,26 @@ describe('setup', () => {
         expect(saveArgs?.toolCachePath).toContain('opencode')
       })
 
+      it('pre-installs the Systematic plugin after writing config and before saving a cache miss', async () => {
+        // #given a tools cache miss
+
+        // #when setup writes its config and completes installation
+        await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then OpenCode performs the plugin install before the tools cache is saved
+        expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
+          expect.objectContaining({
+            opencodePath: 'opencode',
+            systematicVersion: '2.1.0',
+          }),
+        )
+        const installOrder = vi.mocked(systematicPlugin.installSystematicPlugin).mock.invocationCallOrder[0]
+        const saveOrder = vi.mocked(toolsCache.saveToolsCache).mock.invocationCallOrder[0]
+        expect(installOrder).toBeDefined()
+        expect(saveOrder).toBeDefined()
+        expect(installOrder).toBeLessThan(saveOrder ?? Number.POSITIVE_INFINITY)
+      })
+
       it('skips installs and save on tools cache hit when binary is findable', async () => {
         // #given
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
@@ -920,6 +946,7 @@ describe('setup', () => {
         // #then
         expect(tc.downloadTool).not.toHaveBeenCalled()
         expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+        expect(systematicPlugin.installSystematicPlugin).not.toHaveBeenCalled()
         expect(result).not.toBeNull()
         expect(result?.toolsCacheStatus).toBe('hit')
       })
