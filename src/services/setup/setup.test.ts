@@ -912,7 +912,20 @@ describe('setup', () => {
         expect(saveArgs?.toolCachePath).toContain('opencode')
       })
 
-      it('pre-installs the Systematic plugin after writing config and before saving a cache miss', async () => {
+      it('continues through cache save when the plugin install times out', async () => {
+        // #given an install that exhausts its budget without completing
+        vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'timed-out', duration: 420_000})
+
+        // #when setup runs
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then setup still finishes and saves the cache: the install is an optimization,
+        // and the server retains its own install as the fallback it always was
+        expect(toolsCache.saveToolsCache).toHaveBeenCalled()
+        expect(result).not.toBeNull()
+      })
+
+      it('installs the Systematic plugin after writing config and before saving a cache miss', async () => {
         // #given a tools cache miss
 
         // #when setup writes its config and completes installation
