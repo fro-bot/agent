@@ -1,6 +1,6 @@
 ---
 type: guide
-last-updated: "2026-09-03"
+last-updated: "2026-09-04"
 updated-by: "pr-1527"
 sources:
   - action.yaml

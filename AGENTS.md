@@ -7,7 +7,7 @@ Agent-operational knowledge base for fro-bot/agent. For human-facing system desi
 
 ## OVERVIEW
 
-GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://github.com/code-yeongyu/oh-my-openagent) agents with **persistent session state** across CI runs. Includes bundled `@fro.bot/systematic` plugin injection during setup. A Bun monorepo (TypeScript, ESM-only, Node 24): the Action lives in the layered root `src/`, with `@fro-bot/gateway` (Discord daemon + operator surface), `@fro.bot/harness` (patched-OpenCode build/publish), and `@fro-bot/runtime` (shared primitives) alongside.
+GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://github.com/code-yeongyu/oh-my-openagent) agents with **persistent session state** across CI runs (cache-writable triggers, or any trigger with `s3-backup`; see NOTES). Includes bundled `@fro.bot/systematic` plugin injection during setup. A Bun monorepo (TypeScript, ESM-only, Node 24): the Action lives in the layered root `src/`, with `@fro-bot/gateway` (Discord daemon + operator surface), `@fro.bot/harness` (patched-OpenCode build/publish), and `@fro-bot/runtime` (shared primitives) alongside.
 
 ## WHERE TO LOOK
 

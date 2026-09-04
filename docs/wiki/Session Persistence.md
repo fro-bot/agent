@@ -1,6 +1,6 @@
 ---
 type: subsystem
-last-updated: "2026-09-02"
+last-updated: "2026-09-04"
 updated-by: "pr-1527"
 sources:
   - packages/runtime/src/session/storage.ts
@@ -29,7 +29,7 @@ summary: "How agent memory survives across CI runs via cache, SDK sessions, S3 o
 
 # Session Persistence
 
-The defining feature of Fro Bot is persistent memory. Unlike typical CI-based AI agents that start fresh every run, Fro Bot preserves its session history across workflow invocations. This means the agent can reference prior investigations, avoid repeating work, and build institutional knowledge of a codebase over time.
+The defining feature of Fro Bot is persistent memory. Unlike typical CI-based AI agents that start fresh every run, Fro Bot preserves its session history across workflow invocations — subject to the trigger constraint documented below. This means the agent can reference prior investigations, avoid repeating work, and build institutional knowledge of a codebase over time.
 
 ## The Persistence Stack
 
@@ -71,7 +71,7 @@ Before saving, `saveCache` in `src/services/cache/save.ts` checks whether there 
 
 ## Object Store (S3 Backup)
 
-GitHub Actions cache has a 10 GB limit per repository and entries expire after 7 days of inactivity. For repositories where losing agent memory would be costly, the optional S3-compatible object store backend (RFC-019) provides durable persistence that survives cache eviction — and, per the trigger constraint above, is the only path to continuity at all on `issue_comment` and `issues` runs.
+GitHub Actions cache has a 10 GB limit per repository and entries expire after 7 days of inactivity. For repositories where losing agent memory would be costly, the optional S3-compatible object store backend (RFC-019) provides durable persistence that survives cache eviction — and, per the trigger constraint above, is on GitHub-hosted runners the only path to continuity at all on `issue_comment` and `issues` runs.
 
 The implementation lives in `packages/runtime/src/object-store/` and consists of five modules:
 
