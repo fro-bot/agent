@@ -49,7 +49,13 @@ async function execWithTimeout(
       if (killId != null) clearTimeout(killId)
       reject(error)
     })
-    child.on('close', code => finish(code ?? 1))
+    child.on('close', code => {
+      if (killId != null) {
+        clearTimeout(killId)
+        killId = undefined
+      }
+      finish(code ?? 1)
+    })
     child.stdout.on('data', data => forwardOutput(options?.listeners?.stdout, data))
     child.stderr.on('data', data => forwardOutput(options?.listeners?.stderr, data))
 

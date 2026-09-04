@@ -147,13 +147,13 @@ The setup module maintains its own cache (separate from the session cache) for i
 Disabled-mode key:
 
 ```text
-opencode-tools-{os}-disabled-oc-{opencodeVersion}-sys-{systematicVersion}-bun-{bunVersion}
+opencode-tools-v2-{os}-disabled-oc-{opencodeVersion}-sys-{systematicVersion}-bun-{bunVersion}
 ```
 
 Enabled-mode key:
 
 ```text
-opencode-tools-{os}-enabled-oc-{opencodeVersion}-omo-{omoVersion}-sys-{systematicVersion}-bun-{bunVersion}
+opencode-tools-v2-{os}-enabled-oc-{opencodeVersion}-omo-{omoVersion}-sys-{systematicVersion}-bun-{bunVersion}
 ```
 
 The Bun version is part of both keys even in disabled mode. The project's own tooling runs on Bun, so a Bun bump must invalidate the aggregate tools cache to avoid restoring a stale runtime; baking the Bun version into the key makes that automatic.

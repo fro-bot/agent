@@ -1,4 +1,5 @@
 import type {ExecAdapter, Logger} from './types.js'
+import {Buffer} from 'node:buffer'
 import {describe, expect, it, vi} from 'vitest'
 import {installSystematicPlugin} from './systematic-plugin.js'
 
@@ -158,5 +159,33 @@ describe('installSystematicPlugin', () => {
     expect(warningCall?.[0]).toBe('Systematic plugin install failed')
     expect(warningCall?.[1]?.exitCode).toBe(17)
     expect(warningCall?.[1]?.duration).toEqual(expect.any(Number))
+  })
+
+  it('includes only the bounded stderr tail when the install exits unsuccessfully', async () => {
+    // #given an OpenCode CLI that reports failure after writing verbose stderr
+    const logger = createLogger()
+    const stderr = `${'x'.repeat(2_100)}tail of registry failure`
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockImplementation(async (_commandLine, _args, timeoutMs, options) => {
+        options?.listeners?.stderr?.(Buffer.from(stderr))
+        expect(timeoutMs).toBe(100)
+        return 17
+      })
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install runs
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodePath: '/cached/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the warning contains the final 2,000 characters of stderr
+    expect(result.status).toBe('failed')
+    const warningCall = vi.mocked(logger.warning).mock.calls[0]
+    expect(warningCall?.[1]?.stderr).toBe(stderr.slice(-2_000))
   })
 })

@@ -1,3 +1,4 @@
+import type {Buffer} from 'node:buffer'
 import type {ExecAdapter, Logger} from './types.js'
 import process from 'node:process'
 import {filterAgentEnv} from '@fro-bot/runtime'
@@ -7,6 +8,7 @@ import {toErrorMessage} from '../../shared/errors.js'
 // budget would time out on slow-but-valid installs and hand them straight back to the
 // unbounded path. Healthy installs finish in seconds.
 const DEFAULT_INSTALL_TIMEOUT_MS = 420_000
+const STDERR_TAIL_LIMIT = 2_000
 
 export interface SystematicPluginInstallOptions {
   readonly logger: Logger
@@ -33,6 +35,7 @@ export async function installSystematicPlugin(
   logger.info('Installing Systematic plugin', {systematicVersion, timeoutMs})
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined
+  let stderrTail = ''
   try {
     const args = ['--pure', 'plugin', `@fro.bot/systematic@${systematicVersion}`, '--global']
     // Scrubbed, not inherited: npm runs lifecycle scripts from a network-fetched package,
@@ -45,6 +48,11 @@ export async function installSystematicPlugin(
       },
       ignoreReturnCode: true,
       silent: true,
+      listeners: {
+        stderr: (data: Buffer) => {
+          stderrTail = `${stderrTail}${data.toString()}`.slice(-STDERR_TAIL_LIMIT)
+        },
+      },
     } as const
     const execWithTimeout = execAdapter.execWithTimeout
     const result =
@@ -68,7 +76,12 @@ export async function installSystematicPlugin(
       return {status: 'installed', duration}
     }
 
-    logger.warning('Systematic plugin install failed', {systematicVersion, exitCode: result, duration})
+    logger.warning('Systematic plugin install failed', {
+      systematicVersion,
+      exitCode: result,
+      duration,
+      stderr: stderrTail,
+    })
     return {status: 'failed', duration}
   } catch (error) {
     const duration = Date.now() - startTime

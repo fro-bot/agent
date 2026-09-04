@@ -912,16 +912,38 @@ describe('setup', () => {
         expect(saveArgs?.toolCachePath).toContain('opencode')
       })
 
-      it('continues through cache save when the plugin install times out', async () => {
+      it('does not save cache when the plugin install times out', async () => {
         // #given an install that exhausts its budget without completing
         vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'timed-out', duration: 420_000})
 
         // #when setup runs
         const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
-        // #then setup still finishes and saves the cache: the install is an optimization,
-        // and the server retains its own install as the fallback it always was
-        expect(toolsCache.saveToolsCache).toHaveBeenCalled()
+        // #then the incomplete install is not persisted in the cache
+        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+        expect(result).not.toBeNull()
+      })
+
+      it('continues setup when the plugin install times out', async () => {
+        // #given an install that exhausts its budget without completing
+        vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'timed-out', duration: 420_000})
+
+        // #when setup runs
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then setup still finishes
+        expect(result).not.toBeNull()
+      })
+
+      it('continues setup without saving cache when the plugin install fails', async () => {
+        // #given an install that exits unsuccessfully
+        vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'failed', duration: 1_000})
+
+        // #when setup runs
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then setup still finishes, but the incomplete install is not persisted in the cache
+        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
         expect(result).not.toBeNull()
       })
 
@@ -949,7 +971,7 @@ describe('setup', () => {
         // #given
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
+          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
 
@@ -968,7 +990,7 @@ describe('setup', () => {
         // #given
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5-sys-2.1.0',
+          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.299-omo-3.5.5-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('')
         vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
@@ -1006,7 +1028,7 @@ describe('setup', () => {
         // #given
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5-sys-2.1.0',
+          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.299-omo-3.5.5-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('')
         vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
@@ -1055,7 +1077,7 @@ describe('setup', () => {
         // #given
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
+          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
         })
 
         // #when

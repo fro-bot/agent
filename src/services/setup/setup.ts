@@ -286,26 +286,32 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     core.addPath(opencodeResult.path)
 
     if (toolsCacheResult.hit === false) {
-      await installSystematicPlugin({
+      const systematicPluginInstall = await installSystematicPlugin({
         logger,
         execAdapter,
         opencodePath: 'opencode',
         systematicVersion,
       })
 
-      await saveToolsCache({
-        logger,
-        os: runnerOS,
-        bunVersion: DEFAULT_BUN_VERSION,
-        opencodeVersion: version,
-        omoVersion,
-        systematicVersion,
-        cacheMode: inputs.enableOmo || inputs.enableOmoSlim ? 'enabled' : 'disabled',
-        toolCachePath,
-        bunCachePath,
-        omoConfigPath: configDir,
-        opencodeCachePath,
-      })
+      if (systematicPluginInstall.status === 'installed') {
+        await saveToolsCache({
+          logger,
+          os: runnerOS,
+          bunVersion: DEFAULT_BUN_VERSION,
+          opencodeVersion: version,
+          omoVersion,
+          systematicVersion,
+          cacheMode: inputs.enableOmo || inputs.enableOmoSlim ? 'enabled' : 'disabled',
+          toolCachePath,
+          bunCachePath,
+          omoConfigPath: configDir,
+          opencodeCachePath,
+        })
+      } else {
+        logger.warning('Skipping tools cache save because Systematic plugin install did not complete', {
+          status: systematicPluginInstall.status,
+        })
+      }
     }
 
     core.setOutput('opencode-path', opencodeResult.path)
