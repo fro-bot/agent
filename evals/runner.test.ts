@@ -942,7 +942,8 @@ describe('runScenario orchestration', () => {
       }
       const diagnosticResponse = fs.readFileSync(path.join(report.execution.diagnosticsPath, 'response.md'), 'utf8')
       expect(Buffer.byteLength(diagnosticResponse, 'utf8')).toBeLessThanOrEqual(65_536)
-      expect(diagnosticResponse).toContain('[response truncated at 65536 bytes]')
+      expect(diagnosticResponse).toContain('verdict: approve')
+      expect(diagnosticResponse.endsWith('\n\n[response truncated at 65536 bytes]\n')).toBe(true)
       expectProcessRestored(setup)
     })
   }, 30_000)
