@@ -16,13 +16,13 @@
 
 ## Overview
 
-Fro Bot Agent is a Bun monorepo that runs an [OpenCode](https://opencode.ai/) agent across several surfaces: a **GitHub Action** that responds to repository events (issues, pull requests, comments, reviews, and scheduled runs), a **Discord-first Gateway** daemon with an authenticated operator web/API surface for launching and observing runs outside of CI, a **sandboxed workspace executor** that clones and runs the agent in an isolated container, a **patched OpenCode harness** build/publish pipeline, and shared **runtime/session primitives** used across all of the above. The GitHub Action **preserves OpenCode session state across runs**, while the Gateway starts a fresh OpenCode session per run but persists coordination and run state through its S3-backed control plane.
+Fro Bot Agent is a Bun monorepo that runs an [OpenCode](https://opencode.ai/) agent across several surfaces: a **GitHub Action** that responds to repository events (issues, pull requests, comments, reviews, and scheduled runs), a **Discord-first Gateway** daemon with an authenticated operator web/API surface for launching and observing runs outside of CI, a **sandboxed workspace executor** that clones and runs the agent in an isolated container, a **patched OpenCode harness** build/publish pipeline, and shared **runtime/session primitives** used across all of the above. The GitHub Action **preserves OpenCode session state across runs** (on triggers that can write the cache, or with `s3-backup` enabled — see below), while the Gateway starts a fresh OpenCode session per run but persists coordination and run state through its S3-backed control plane.
 
-Traditional CI-based AI agents are stateless: each run starts from scratch, repeating investigations and burning tokens. The GitHub Action persists its session state across runs using GitHub Actions cache by default when S3 is disabled. When `s3-backup` is enabled, S3-compatible storage is the canonical durable backend, with Actions cache serving only as the fallback when the S3 restore is unavailable or unusable.
+Traditional CI-based AI agents are stateless: each run starts from scratch, repeating investigations and burning tokens. The GitHub Action restores session state across runs from GitHub Actions cache, but cache writes are unavailable for `issue_comment` and `issues` runs: because those triggers are initiable by an actor without repository write access, GitHub supplies a read-only runner-injected `ACTIONS_RUNTIME_TOKEN` for the whole trigger class, so a run started by a maintainer is affected too, and changing `permissions:` cannot change that token. `workflow_dispatch` and `schedule` runs are not affected; pull request triggers were not observed either way, and fork pull requests carry separate cache-scope restrictions. Enable `s3-backup` for mention-driven continuity; S3 sync is best-effort, so continuity depends on a successful upload. When `s3-backup` is enabled, S3-compatible storage is the canonical durable backend, with Actions cache serving as the fallback when the S3 restore is unavailable or unusable.
 
 ### Key Features
 
-- **Persistent memory** — session state survives workflow runs via GitHub Actions cache when S3 is disabled; with `s3-backup`, S3-compatible storage is canonical and durable while Actions cache remains the fallback.
+- **Persistent memory** — session state survives workflow runs via GitHub Actions cache on triggers that can write it; `issue_comment` and `issues` mention flows require `s3-backup` for continuity, regardless of who triggers them.
 - **Multiple triggers** — responds to comments, issues, pull requests, review threads, and scheduled or manually dispatched runs.
 - **Discord Gateway** — a daemon that runs OpenCode work from authorized `@fro-bot` mentions and exposes slash commands for setup and operator controls (e.g. adding a project, clearing the queue).
 - **Operator web surface** — an authenticated HTTP/SSE control surface for launching, observing, and approving gateway agent runs from a browser.
@@ -92,7 +92,7 @@ Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/exam
 
 ## How It Works
 
-Each run moves through a multi-phase pipeline: restore cached session state, discover relevant prior sessions, acknowledge the request, execute the OpenCode agent with full history, publish exactly one comment or review, then persist and prune session state back to the cache (and S3, if configured). Session state is cached under a branch-scoped key so branches stay isolated while continuity is preserved within a feature branch.
+Each run moves through a multi-phase pipeline: restore cached session state, discover relevant prior sessions, acknowledge the request, execute the OpenCode agent with full history, publish exactly one comment or review, then persist and prune session state back to the Actions cache when the trigger permits cache writes (and to S3, if configured). Session state is cached under a branch-scoped key so branches stay isolated while continuity is preserved within a feature branch.
 
 For the full execution model, invariants, and the three data flows, see **[ARCHITECTURE.md](ARCHITECTURE.md)** or the [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md) deep dive.
 
@@ -216,7 +216,7 @@ A few inputs most workflows touch:
 
 ### Durable object storage (S3)
 
-GitHub Actions cache is the default backend when S3 is disabled. Set `s3-backup: true` to make S3-compatible storage the canonical durable backend; Actions cache remains the fallback. Restore tries S3 first, then falls back to Actions cache when S3 misses, fails, finds sidecars without the main database, or contains a corrupt database. Saves write S3 before Actions cache; failures in either storage path are non-fatal and logged honestly.
+GitHub Actions cache is the default backend when S3 is disabled. Set `s3-backup: true` to make S3-compatible storage the canonical durable backend; Actions cache remains the fallback. Restore tries S3 first, then falls back to Actions cache when S3 misses, fails, finds sidecars without the main database, or contains a corrupt database. Saves write S3 before Actions cache; failures in either storage path are non-fatal and logged honestly. This setting is also required for session continuity on `issue_comment` and `issues` runs; see [Session Persistence](docs/wiki/Session%20Persistence.md).
 
 ```yaml
 - uses: fro-bot/agent@v0
