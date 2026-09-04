@@ -43,6 +43,9 @@ export async function installSystematicPlugin(
     const execOptions = {
       env: {
         ...filterAgentEnv(process.env),
+        // Keep the child's config load off the checked-out repository and off the CI plugin
+        // list. These do NOT protect the global config file from the patch step -- that reads
+        // the file directly and no-ops by package-name match. Not a guard; do not remove as one.
         OPENCODE_CONFIG_CONTENT: emptyConfig,
         OPENCODE_DISABLE_PROJECT_CONFIG: '1',
       },

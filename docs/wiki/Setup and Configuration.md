@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-08-30"
-updated-by: "schedule-d7190410-33338713321"
+last-updated: "2026-09-04"
+updated-by: "pr-1530"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -52,9 +52,11 @@ The `runSetup()` orchestrator follows a **mode-gated** sequence. When no orchest
 
 6. **Merge user config** — Merges the CI config on top of any user-provided `opencode-config` input. Plugin arrays are deduplicated by package name prefix. In disabled mode, `oh-my-openagent` entries are stripped from both `plugin` and legacy `plugins` keys, and a warning names any rewritten fields. Legacy `plugins` (plural) keys are also stripped — OpenCode only accepts `plugin` (singular).
 
-7. **Save tools cache** — If the tools cache missed, saves the installed binaries for future runs.
+7. **Install Systematic plugin** — On a tools-cache miss, runs the OpenCode CLI's plugin install before caching. If the install times out or fails, setup continues but skips saving the tools cache so an incomplete install is not persisted.
 
-8. **Configure authentication** — Sets up `gh` CLI auth, configures Git identity as `{bot}[bot]` for audit trails, and writes the ephemeral `auth.json` with `0o600` permissions.
+8. **Save tools cache** — If the tools cache missed and the Systematic plugin install succeeded, saves the installed binaries for future runs.
+
+9. **Configure authentication** — Sets up `gh` CLI auth, configures Git identity as `{bot}[bot]` for audit trails, and writes the ephemeral `auth.json` with `0o600` permissions.
 
 ### Plugin-Enabled Mode (`enable-omo` or `enable-omo-slim`)
 

@@ -6,7 +6,7 @@ import {createExecAdapter} from './adapters.js'
 vi.mock('node:child_process', () => ({spawn: vi.fn()}))
 
 interface FakeChild extends EventEmitter {
-  readonly stdin: {write: () => void; end: () => void}
+  readonly stdin: EventEmitter & {write: () => void; end: () => void}
   readonly stdout: EventEmitter
   readonly stderr: EventEmitter
   readonly kill: ReturnType<typeof vi.fn>
@@ -14,8 +14,9 @@ interface FakeChild extends EventEmitter {
 
 function createFakeChild(): FakeChild {
   const child = new EventEmitter() as FakeChild
+  const stdin = new EventEmitter() as FakeChild['stdin']
   Object.assign(child, {
-    stdin: {write: vi.fn(), end: vi.fn()},
+    stdin: Object.assign(stdin, {write: vi.fn(), end: vi.fn()}),
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     kill: vi.fn(),
@@ -25,6 +26,7 @@ function createFakeChild(): FakeChild {
 
 describe('execWithTimeout', () => {
   beforeEach(() => {
+    vi.mocked(childProcess.spawn).mockClear()
     vi.useFakeTimers()
   })
 
@@ -50,5 +52,23 @@ describe('execWithTimeout', () => {
     expect(result).toBe('timed-out')
     expect(child.kill).toHaveBeenCalledTimes(1)
     expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('forwards an explicit environment to the spawned child', async () => {
+    // #given a child process stub and an explicit environment
+    const child = createFakeChild()
+    vi.mocked(childProcess.spawn).mockReturnValue(child as never)
+    const execWithTimeout = createExecAdapter().execWithTimeout
+    if (execWithTimeout === undefined) throw new Error('execWithTimeout is not configured')
+    const env = {PATH: '/custom/bin', SYSTEMATIC_TEST: 'true'}
+
+    // #when the child is started
+    const resultPromise = execWithTimeout('opencode', [], 1_000, {env})
+    child.emit('close', 0)
+
+    // #then the child receives exactly the supplied environment
+    expect(await resultPromise).toBe(0)
+    const spawnOptions = vi.mocked(childProcess.spawn).mock.calls[0]?.[2]
+    expect(spawnOptions?.env).toEqual(env)
   })
 })

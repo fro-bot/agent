@@ -161,6 +161,31 @@ describe('installSystematicPlugin', () => {
     expect(warningCall?.[1]?.duration).toEqual(expect.any(Number))
   })
 
+  it('returns failed when the timeout adapter rejects while spawning', async () => {
+    // #given an execution adapter that cannot spawn the OpenCode CLI
+    const logger = createLogger()
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error('spawn opencode ENOENT'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install runs
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodePath: '/missing/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the spawn failure is converted into a failed install result
+    expect(result.status).toBe('failed')
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({error: 'spawn opencode ENOENT'}),
+    )
+  })
+
   it('includes only the bounded stderr tail when the install exits unsuccessfully', async () => {
     // #given an OpenCode CLI that reports failure after writing verbose stderr
     const logger = createLogger()

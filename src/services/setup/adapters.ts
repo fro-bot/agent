@@ -58,6 +58,7 @@ async function execWithTimeout(
     })
     child.stdout.on('data', data => forwardOutput(options?.listeners?.stdout, data))
     child.stderr.on('data', data => forwardOutput(options?.listeners?.stderr, data))
+    child.stdin.on('error', () => {})
 
     if (options?.input != null) {
       child.stdin.write(options.input)

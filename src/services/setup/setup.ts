@@ -311,6 +311,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         logger.warning('Skipping tools cache save because Systematic plugin install did not complete', {
           status: systematicPluginInstall.status,
         })
+        core.warning('Skipping tools cache save because Systematic plugin install did not complete')
       }
     }
 

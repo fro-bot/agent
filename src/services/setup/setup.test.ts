@@ -944,6 +944,9 @@ describe('setup', () => {
 
         // #then setup still finishes, but the incomplete install is not persisted in the cache
         expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+        expect(core.warning).toHaveBeenCalledWith(
+          'Skipping tools cache save because Systematic plugin install did not complete',
+        )
         expect(result).not.toBeNull()
       })
 
