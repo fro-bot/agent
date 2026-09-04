@@ -14,6 +14,10 @@
 #   pull_request               — AI code review on PR open/sync/reopen/ready/review-requested
 #   schedule                   — periodic maintenance (daily by default)
 #   workflow_dispatch          — manual prompt execution via "Run workflow" button
+# On GitHub-hosted runners, `issue_comment` and `issues` runs receive read-only
+# Actions cache tokens, so they can restore state but cannot persist new state.
+# For continuity on those mention-driven runs, configure `s3-backup` in the
+# action invocation with a bucket and credentials; do not enable it without them.
 # Trusted same-repository, non-fork PR mentions (`issue_comment` only) can broker
 # a fix commit to the PR head branch. Keep `persist-credentials: false` on
 # checkout. Brokered pushes are limited to allowlisted product, docs, and test

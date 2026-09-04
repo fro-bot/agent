@@ -6,7 +6,7 @@ This document maps the repository's directory layout and explains where code liv
 
 ```text
 fro-bot/agent/
-├── src/                        # GitHub Action logic — 4-layer architecture (~53.3k lines, 53,287 including tests)
+├── src/                        # GitHub Action logic — 4-layer architecture (~61.7k lines, 61,706 including tests)
 │   ├── shared/                 # Layer 0: pure types, utils, constants (only @bfra.me/es Result; no heavy deps)
 │   ├── services/               # Layer 1: external adapters (GitHub, cache, setup, object-store, artifact)
 │   │   ├── github/             # Octokit client, context parsing, NormalizedEvent
@@ -65,7 +65,7 @@ fro-bot/agent/
 │
 ├── RFCs/                       # 19 RFC documents (architecture specs)
 ├── docs/
-│   ├── wiki/                   # 8 Obsidian deep-dive pages
+│   ├── wiki/                   # 9 Obsidian deep-dive pages
 │   ├── plans/                  # Architecture plans and design docs
 │   ├── solutions/              # Documented solutions to past problems
 │   ├── product/                # Product requirements and feature docs
@@ -100,7 +100,7 @@ fro-bot/agent/
 - **`evals/`** — Gated agent-outcome eval corpus that runs the real execution path against disposable fixture repos; the pure gate and baseline tests run in normal CI, while live scenarios require `FRO_BOT_EVAL=1`.
 - **`.github/workflows/`** — All CI/CD automation; 12 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.
-- **`docs/wiki/`** — 8 Obsidian deep-dive pages covering architecture, execution lifecycle, prompt design, and operator surface.
+- **`docs/wiki/`** — 9 Obsidian deep-dive pages covering architecture, execution lifecycle, prompt design, and operator surface.
 - **`docs/solutions/`** — Documented solutions to past problems, organized by category with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing or debugging in a documented area.
 - **`assets/`** — Repository images and branding referenced by `README.md`.
 - **`dist/`** — Committed bundle output; CI fails if a fresh build produces a diff here.

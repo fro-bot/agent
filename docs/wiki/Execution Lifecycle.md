@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-08-24"
-updated-by: "ses_fd0b1eaf4ffeTMI146lECk0yxc"
+last-updated: "2026-09-04"
+updated-by: "pr-sync-living-docs"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -113,7 +113,7 @@ Posts visual feedback so the user knows the agent received their request. For co
 
 ## 6. Cache Restore
 
-Restores the OpenCode storage directory from GitHub Actions cache (or S3 backup if configured). The cache key is scoped by repository, branch, and OS to prevent cross-branch contamination. After restore, the module checks for corruption (unreadable directory, version mismatch) and falls back to clean state if needed. Credentials (`auth.json`) that may have leaked into cache from a prior run are deleted as a security measure.
+Restores the OpenCode storage directory from S3 backup first when configured, then falls back to GitHub Actions cache. The cache key is scoped by repository, branch, and OS to prevent cross-branch contamination. After restore, the module checks for corruption (unreadable directory, version mismatch) and falls back to clean state if needed. Credentials (`auth.json`) that may have leaked into cache from a prior run are deleted as a security measure.
 
 This phase also bootstraps the OpenCode SDK server and establishes a client connection — the server handle is reused throughout the remaining phases.
 
@@ -163,7 +163,7 @@ The whole step runs under a 120-second wall-clock ceiling enforced by a `Promise
 
 ## 11. Cleanup (Always)
 
-Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server — importantly, this triggers a SQLite WAL checkpoint that merges in-flight session data into the main database file before cache save. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]). Saves the cache and optionally uploads a prompt log artifact for observability.
+Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server. Shutdown does not itself checkpoint SQLite — it sends the child's kill signal and then waits, bounded and best-effort, for the child to stop answering, so the checkpoint that follows is not racing a writer that is still alive but idle. Merging the write-ahead log into the main database file is `checkpointDatabase`'s job, called inside `saveCache`. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]), and `saveCache` writes session state to S3 before the Actions cache. The cache save optionally uploads a prompt log artifact for observability.
 
 The cleanup phase has its own `finally` block for lock release: if a coordination lock was acquired in phase 4, it is released after all S3 sync and cache save operations complete. This ordering ensures the next surface sees a coherent state. Lock release is always attempted, even if earlier cleanup steps failed.
 

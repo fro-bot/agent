@@ -255,7 +255,7 @@ The bolded row is the double-sync bug: durable in the object store, reported as 
 
 **Approach:**
 - README currently describes persistent memory without noting that the default configuration does not deliver it for `issue_comment`. Qualify it at the claim, not in a footnote.
-- Lift the explanation from this repo's own `fro-bot.yaml` workflow comment — currently the only written record of the constraint — into user-facing docs.
+- Lift the explanation from this repo's own `fro-bot.yaml` workflow comment into user-facing docs.
 - State the mechanism (a read-only runner-injected token, unaffected by `permissions:`) so a reader does not waste time on token permissions.
 
 **Test scenarios:** Test expectation: none — documentation only. Markdown link check covers it.
