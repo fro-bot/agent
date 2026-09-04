@@ -5,8 +5,9 @@ import {redactSecrets} from '../packages/harness/src/format-error.js'
 
 const MAX_DIAGNOSTIC_SCAN_BYTES = 65_536
 const MAX_RESPONSE_DIAGNOSTIC_BYTES = 65_536
-const RESPONSE_DIAGNOSTIC_TRUNCATION_MARKER = '\n\n[response truncated at 65536 bytes]\n'
-const DIAGNOSTIC_TRUNCATION_MARKER = '\n\n[diagnostic truncated at 65536 bytes]\n'
+const RESPONSE_DIAGNOSTIC_TRUNCATION_MARKER = (maxBytes: number): string =>
+  `\n\n[response truncated at ${maxBytes} bytes]\n`
+const DIAGNOSTIC_TRUNCATION_MARKER = (maxBytes: number): string => `\n\n[diagnostic truncated at ${maxBytes} bytes]\n`
 const DIAGNOSTIC_OVERSIZED_MARKER = '[diagnostic omitted: source exceeded the safe read budget]\n'
 const MAX_DIAGNOSTIC_ENTRIES = 64
 const EXPECTED_DIAGNOSTIC_EXTENSIONS = ['.jsonl', '.log'] as const
@@ -119,7 +120,12 @@ function readSafeDiagnosticFile(filePath: string): SafeDiagnosticRead {
   }
 }
 
-function boundDiagnostic(text: string, maxBytes: number, marker: string): string {
+function boundDiagnostic(
+  text: string,
+  maxBytes: number,
+  marker: (maxBytes: number) => string,
+  keep: 'head' | 'tail',
+): string {
   if (maxBytes <= 0) {
     return ''
   }
@@ -129,16 +135,25 @@ function boundDiagnostic(text: string, maxBytes: number, marker: string): string
     return text
   }
 
-  const markerBytes = Buffer.byteLength(marker, 'utf8')
+  const truncationMarker = marker(maxBytes)
+  const markerBytes = Buffer.byteLength(truncationMarker, 'utf8')
   if (markerBytes > maxBytes) {
     return ''
   }
 
-  let suffix = bytes.subarray(bytes.length - (maxBytes - markerBytes)).toString('utf8')
-  while (Buffer.byteLength(suffix, 'utf8') + markerBytes > maxBytes) {
-    suffix = suffix.slice(1)
+  if (keep === 'tail') {
+    let suffix = bytes.subarray(bytes.length - (maxBytes - markerBytes)).toString('utf8')
+    while (Buffer.byteLength(suffix, 'utf8') + markerBytes > maxBytes) {
+      suffix = suffix.slice(1)
+    }
+    return `${truncationMarker}${suffix}`
   }
-  return `${marker}${suffix}`
+
+  let prefix = bytes.subarray(0, maxBytes - markerBytes).toString('utf8')
+  while (Buffer.byteLength(prefix, 'utf8') + markerBytes > maxBytes) {
+    prefix = prefix.slice(0, -1)
+  }
+  return `${prefix}${truncationMarker}`
 }
 
 function diagnosticContent(
@@ -153,7 +168,7 @@ function diagnosticContent(
       : diagnostic.text == null
         ? ''
         : redactDiagnosticSecrets(diagnostic.text, secretValues)
-  const content = boundDiagnostic(redacted, remainingBytes, DIAGNOSTIC_TRUNCATION_MARKER)
+  const content = boundDiagnostic(redacted, remainingBytes, DIAGNOSTIC_TRUNCATION_MARKER, 'tail')
   return {content, bytesWritten: Buffer.byteLength(content, 'utf8')}
 }
 
@@ -226,6 +241,7 @@ export function persistResponseDiagnostics(
       redactedResponse,
       MAX_RESPONSE_DIAGNOSTIC_BYTES,
       RESPONSE_DIAGNOSTIC_TRUNCATION_MARKER,
+      'head',
     )
     fs.writeFileSync(responsePath, boundedResponse, {encoding: 'utf8', mode: 0o600})
     fs.chmodSync(responsePath, 0o600)
@@ -257,6 +273,7 @@ export function readCapturedDiagnostics(diagnosticsPath: string | null, secretVa
         redactDiagnosticSecrets(sourceText, secretValues),
         remainingBytes,
         DIAGNOSTIC_TRUNCATION_MARKER,
+        'tail',
       )
       const bytesRead = Buffer.byteLength(content, 'utf8')
       if (bytesRead > 0) {

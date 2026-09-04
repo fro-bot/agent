@@ -1,3 +1,4 @@
+import {Buffer} from 'node:buffer'
 import {mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync} from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -14,6 +15,24 @@ function createTemporaryDirectory(prefix: string): string {
 
 function readPersistedFile(directory: string, fileName: string): string {
   return readFileSync(path.join(directory, fileName), 'utf8')
+}
+
+function containsLoneSurrogate(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const codeUnit = text.charCodeAt(index)
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = text.charCodeAt(index + 1)
+      if (nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) {
+        index += 1
+        continue
+      }
+      return true
+    }
+    if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true
+    }
+  }
+  return false
 }
 
 afterEach(() => {
@@ -155,5 +174,50 @@ describe('diagnostic persistence boundaries', {timeout: 30_000}, () => {
     expect(persistedBytes).toBeLessThanOrEqual(65_536)
     expect(persistedText).toContain('useful-a')
     expect(persistedText).toContain('useful-b')
+  })
+
+  it('keeps the diagnostic truncation marker at the front for multibyte log tails', () => {
+    // #given a first log that leaves a multibyte second log only part of the total budget
+    const sourceDirectory = createTemporaryDirectory('fro-bot-log-marker-source-')
+    const outputDirectory = createTemporaryDirectory('fro-bot-log-marker-output-')
+    writeFileSync(path.join(sourceDirectory, 'a.log'), 'A'.repeat(65_000), 'utf8')
+    writeFileSync(path.join(sourceDirectory, 'b.jsonl'), '😀'.repeat(1_000), 'utf8')
+
+    // #when the flat diagnostics are captured
+    const diagnosticsPath = captureDiagnostics(sourceDirectory, outputDirectory, 'marker-position', [])
+
+    // #then the tail-retained log starts with its dynamic truncation marker and remains valid UTF-16
+    expect(diagnosticsPath).not.toBeNull()
+    if (diagnosticsPath == null) {
+      throw new Error('Expected marker-position diagnostics path')
+    }
+    const persistedLog = readPersistedFile(diagnosticsPath, 'b.jsonl')
+    expect(persistedLog.startsWith('\n\n[diagnostic truncated at 536 bytes]\n')).toBe(true)
+    expect(Buffer.byteLength(persistedLog, 'utf8')).toBeLessThanOrEqual(536)
+    expect(containsLoneSurrogate(persistedLog)).toBe(false)
+  })
+
+  it('keeps the response frontmatter and trailing marker at a multibyte head boundary', () => {
+    // #given a response whose retained head ends in the middle of an emoji
+    const sourceDirectory = createTemporaryDirectory('fro-bot-response-marker-source-')
+    const frontmatter = '---\nverdict: approve\nschemaVersion: 1\n---\n'
+    const marker = '\n\n[response truncated at 65536 bytes]\n'
+    const availableBytes = 65_536 - Buffer.byteLength(marker, 'utf8')
+    const fillerBytes = availableBytes - Buffer.byteLength(frontmatter, 'utf8') - 1
+    const rawResponse = `${frontmatter}${'x'.repeat(fillerBytes)}😀${'response-tail'.repeat(10)}`
+
+    // #when the oversized response diagnostic is persisted
+    const diagnosticsPath = persistResponseDiagnostics(sourceDirectory, 'marker-position', rawResponse, [])
+
+    // #then the head-retained response keeps its frontmatter, trailing marker, byte budget, and valid UTF-16
+    expect(diagnosticsPath).not.toBeNull()
+    if (diagnosticsPath == null) {
+      throw new Error('Expected response marker-position diagnostics path')
+    }
+    const persistedResponse = readPersistedFile(diagnosticsPath, 'response.md')
+    expect(persistedResponse.startsWith(frontmatter)).toBe(true)
+    expect(persistedResponse.endsWith(marker)).toBe(true)
+    expect(Buffer.byteLength(persistedResponse, 'utf8')).toBeLessThanOrEqual(65_536)
+    expect(containsLoneSurrogate(persistedResponse)).toBe(false)
   })
 })
