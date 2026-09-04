@@ -19,6 +19,7 @@ import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode, toolCacheVersion} from './opencode.js'
 import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
+import {installSystematicPlugin} from './systematic-plugin.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
 
 export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
@@ -282,23 +283,38 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       })
     }
 
-    if (!toolsCacheResult.hit) {
-      await saveToolsCache({
+    core.addPath(opencodeResult.path)
+
+    if (toolsCacheResult.hit === false) {
+      const systematicPluginInstall = await installSystematicPlugin({
         logger,
-        os: runnerOS,
-        bunVersion: DEFAULT_BUN_VERSION,
-        opencodeVersion: version,
-        omoVersion,
+        execAdapter,
+        opencodePath: 'opencode',
         systematicVersion,
-        cacheMode: inputs.enableOmo || inputs.enableOmoSlim ? 'enabled' : 'disabled',
-        toolCachePath,
-        bunCachePath,
-        omoConfigPath: configDir,
-        opencodeCachePath,
       })
+
+      if (systematicPluginInstall.status === 'installed') {
+        await saveToolsCache({
+          logger,
+          os: runnerOS,
+          bunVersion: DEFAULT_BUN_VERSION,
+          opencodeVersion: version,
+          omoVersion,
+          systematicVersion,
+          cacheMode: inputs.enableOmo || inputs.enableOmoSlim ? 'enabled' : 'disabled',
+          toolCachePath,
+          bunCachePath,
+          omoConfigPath: configDir,
+          opencodeCachePath,
+        })
+      } else {
+        logger.warning('Skipping tools cache save because Systematic plugin install did not complete', {
+          status: systematicPluginInstall.status,
+        })
+        core.warning('Skipping tools cache save because Systematic plugin install did not complete')
+      }
     }
 
-    core.addPath(opencodeResult.path)
     core.setOutput('opencode-path', opencodeResult.path)
     core.setOutput('opencode-version', opencodeResult.version)
     logger.info('OpenCode ready', {

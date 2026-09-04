@@ -8,7 +8,7 @@ This document describes the system design, invariants, and data flows for the fr
 
 This monorepo ships three distinct deployable surfaces from one codebase:
 
-- **GitHub Action** — a CI harness that runs OpenCode agents in response to GitHub webhook events (issues, PRs, comments, reviews, scheduled runs, workflow dispatches). The Action entry points are `src/main.ts` and `src/post.ts`; the real logic lives in the 4-layer `src/` tree and `packages/runtime/`. Sessions persist across CI runs via GitHub Actions cache and an S3-compatible object store.
+- **GitHub Action** — a CI harness that runs OpenCode agents in response to GitHub webhook events (issues, PRs, comments, reviews, scheduled runs, workflow dispatches). The Action entry points are `src/main.ts` and `src/post.ts`; the real logic lives in the 4-layer `src/` tree and `packages/runtime/`. Sessions persist across CI runs via GitHub Actions cache when the trigger permits cache writes, and via an S3-compatible object store; `issue_comment` and `issues` runs cannot write the cache and depend on the object store for continuity.
 - **`@fro-bot/gateway`** (`packages/gateway/`) — a Discord-first daemon that listens for `@fro-bot` mentions in bound guild channels and runs OpenCode inside a sandboxed workspace container. Includes an operator web surface (Hono, gateway-net only), an inbound announce webhook, and an S3-backed coordination layer. The `/fro-bot dispatch` slash command is a separate, simpler path: it asks the bound repo's `fro-bot.yaml` workflow to run via the GitHub Actions API and returns the run URL — it never touches the gateway's queue, concurrency cap, or run-state.
 - **`@fro.bot/harness`** (`packages/harness/`) — a patched OpenCode binary built via an LLM-merge integration pipeline. Published to npm and GitHub Releases; consumed by the Action setup phase as the default OpenCode binary.
 
@@ -27,6 +27,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `runSetup` | Function | `src/services/setup/setup.ts` | Setup orchestration |
 | `buildCIConfig` | Function | `src/services/setup/ci-config.ts` | CI config assembly with plugin injection |
 | `writeSystematicConfig` | Function | `src/services/setup/systematic-config.ts` | Systematic plugin config writer |
+| `installSystematicPlugin` | Function | `src/services/setup/systematic-plugin.ts` | Setup-time Systematic plugin install (keeps npm install off the server's boot path) |
 | `restoreCache` | Function | `src/services/cache/restore.ts` | Restore OpenCode state |
 | `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache |
 | `checkpointDatabase` | Function | `src/services/cache/checkpoint.ts` | Merge SQLite WAL into main DB before save/restore hand-off |
@@ -59,7 +60,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
 | `bootstrapOpenCodeServer` | Function | `src/features/agent/server.ts` | Initialize SDK server lifecycle |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
-| `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.12.4`) |
+| `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.15.0`) |
 | `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness version (`1.18.21+harness.22dee0ee`) |
 
 ### `packages/gateway/`
@@ -285,3 +286,7 @@ gateway container (gateway-net)
 ### Effect / Result Boundary (Gateway)
 
 `packages/gateway/` is the only package in the monorepo that uses `effect`. The Action and `packages/runtime/` stay on hand-rolled `Result<T, E>` from `@bfra.me/es`. The boundary adapter is `packages/gateway/src/runtime-effect.ts`, which wraps every `@fro-bot/runtime` function the gateway uses. All gateway code outside that file works exclusively in `Effect.Effect<A, E, R>`.
+
+### Systematic Plugin Install (Setup-Time, Not Server-Boot)
+
+`src/services/setup/systematic-plugin.ts` (`installSystematicPlugin`) runs the OpenCode CLI's `plugin` command (`opencode --pure plugin @fro.bot/systematic@<version> --global`) during the setup phase, on a tools-cache miss, before `saveToolsCache` — moving the same `Npm.add()` install the server would otherwise perform out of the server's boot path and into the same on-disk cache directory the server reads (deriving that path independently would have created a second copy of OpenCode's layout that must silently agree with the real one forever). Left alone, the server runs `config.get()` then `plugin.init()` serially before any service init, with no timeout of its own; a degraded npm registry turns that into 181–370s of a server that reports itself listening and then answers nothing, since the harness's own readiness probe is a stdout string match (`"opencode server listening"`) satisfied long before the first request goes out — that request then inherits undici's 300s `headersTimeout` and surfaces as a bare "fetch failed". The install is bounded (SIGTERM then SIGKILL) at 420s — sized against that measured stall tail, not against a healthy install (seconds) — and is non-fatal: on timeout or failure it warns and lets the server's own install serve as the fallback it always was, and setup skips `saveToolsCache` entirely, so an incomplete install is never persisted into an immutable cache key. The child's environment is `filterAgentEnv`-scrubbed, never inherited wholesale — this subprocess runs `npm install` against a package fetched off the network, so it gets the same untrusted-child treatment `withScrubbedEnv` gives `createOpencode` (issue #1147), never `GITHUB_TOKEN`, `*_API_KEY`, `*_SECRET`, `AWS_*`, or `INPUT_*`. It runs with `--pure` (skip plugin boot on install) and `--global` (write OpenCode's own config, not the checked-out repository).

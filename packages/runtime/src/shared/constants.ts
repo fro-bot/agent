@@ -69,7 +69,7 @@ export const OMO_PROVIDERS_DISABLED = {
 // Cache key components
 export const CACHE_PREFIX = 'opencode-storage' as const
 export const DEFAULT_S3_PREFIX = 'fro-bot-state' as const
-export const TOOLS_CACHE_PREFIX = 'opencode-tools' as const
+export const TOOLS_CACHE_PREFIX = 'opencode-tools-v2' as const
 
 // Dedup execution defaults
 export const DEFAULT_DEDUP_WINDOW_MS = 600_000 // 10 minutes

@@ -143,6 +143,17 @@ export interface ToolCacheAdapter {
  */
 export interface ExecAdapter {
   readonly exec: (commandLine: string, args?: string[], options?: ExecOptions) => Promise<number>
+  /**
+   * Runs a child with a timeout and resolves with its exit code; unlike exec, it does not
+   * throw for a non-zero exit code. The silent and ignoreReturnCode options are accepted for
+   * compatibility but ignored by this adapter; output is forwarded only to attached listeners.
+   */
+  readonly execWithTimeout?: (
+    commandLine: string,
+    args: string[] | undefined,
+    timeoutMs: number,
+    options?: ExecOptions,
+  ) => Promise<number | 'timed-out'>
   readonly getExecOutput: (commandLine: string, args?: string[], options?: ExecOptions) => Promise<ExecOutput>
 }
 
