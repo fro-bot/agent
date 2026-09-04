@@ -251,7 +251,7 @@ The bolded row is the double-sync bug: durable in the object store, reported as 
 **Dependencies:** None — shippable independently
 
 **Files:**
-- Modify: `README.md`, `docs/wiki/Session Persistence.md`, `AGENTS.md`
+- Modify: `README.md`, `docs/wiki/Session Persistence.md`, `AGENTS.md`, `ARCHITECTURE.md`, `docs/wiki/Troubleshooting.md`
 
 **Approach:**
 - README currently describes persistent memory without noting that the default configuration does not deliver it for `issue_comment`. Qualify it at the claim, not in a footnote.

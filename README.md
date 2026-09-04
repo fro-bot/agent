@@ -216,7 +216,7 @@ A few inputs most workflows touch:
 
 ### Durable object storage (S3)
 
-GitHub Actions cache is the default backend when S3 is disabled. Set `s3-backup: true` to make S3-compatible storage the canonical durable backend; Actions cache remains the fallback. Restore tries S3 first, then falls back to Actions cache when S3 misses, fails, finds sidecars without the main database, or contains a corrupt database. Saves write S3 before Actions cache; failures in either storage path are non-fatal and logged honestly.
+GitHub Actions cache is the default backend when S3 is disabled. Set `s3-backup: true` to make S3-compatible storage the canonical durable backend; Actions cache remains the fallback. Restore tries S3 first, then falls back to Actions cache when S3 misses, fails, finds sidecars without the main database, or contains a corrupt database. Saves write S3 before Actions cache; failures in either storage path are non-fatal and logged honestly. This setting is also required for session continuity on `issue_comment` and `issues` runs; see [Session Persistence](docs/wiki/Session%20Persistence.md).
 
 ```yaml
 - uses: fro-bot/agent@v0

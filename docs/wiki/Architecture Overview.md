@@ -39,7 +39,7 @@ summary: "Monorepo structure, action + harness + gateway + workspace-agent packa
 
 # Architecture Overview
 
-Fro Bot Agent is a GitHub Action that runs an AI coding agent (OpenCode, optionally with Oh My OpenAgent) inside GitHub Actions workflows and preserves the agent's session state across runs. The codebase is TypeScript, ESM-only, targeting Node 24.
+Fro Bot Agent is a GitHub Action that runs an AI coding agent (OpenCode, optionally with Oh My OpenAgent) inside GitHub Actions workflows and preserves the agent's session state across CI runs when the trigger permits cache writes, and via an S3-compatible object store; `issue_comment` and `issues` runs cannot write the cache and depend on the object store for continuity. The codebase is TypeScript, ESM-only, targeting Node 24.
 
 ## Monorepo Structure
 
