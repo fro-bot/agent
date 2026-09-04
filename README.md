@@ -92,7 +92,7 @@ Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/exam
 
 ## How It Works
 
-Each run moves through a multi-phase pipeline: restore cached session state, discover relevant prior sessions, acknowledge the request, execute the OpenCode agent with full history, publish exactly one comment or review, then persist and prune session state to S3, if configured, and to the Actions cache when the trigger permits cache writes. Session state is cached under a branch-scoped key so branches stay isolated while continuity is preserved within a feature branch.
+Each run moves through a multi-phase pipeline: restore cached session state, discover relevant prior sessions, acknowledge the request, execute the OpenCode agent with full history, publish exactly one comment or review, then prune old sessions and persist session state — to S3 if configured, and to the Actions cache when the trigger permits cache writes. Session state is cached under a branch-scoped key so branches stay isolated while continuity is preserved within a feature branch.
 
 For the full execution model, invariants, and the three data flows, see **[ARCHITECTURE.md](ARCHITECTURE.md)** or the [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md) deep dive.
 

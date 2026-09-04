@@ -1,7 +1,7 @@
 ---
 type: subsystem
 last-updated: "2026-09-04"
-updated-by: "pr-sync-living-docs"
+updated-by: "pr-1534"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts

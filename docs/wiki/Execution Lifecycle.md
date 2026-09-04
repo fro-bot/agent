@@ -1,7 +1,7 @@
 ---
 type: architecture
 last-updated: "2026-09-04"
-updated-by: "pr-sync-living-docs"
+updated-by: "pr-1534"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -163,7 +163,7 @@ The whole step runs under a 120-second wall-clock ceiling enforced by a `Promise
 
 ## 11. Cleanup (Always)
 
-Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server. Shutdown does not itself checkpoint SQLite — it sends the child's kill signal and then waits, bounded and best-effort, for the child to stop answering, so the checkpoint that follows is not racing a writer that is still alive but idle. Merging the write-ahead log into the main database file is `checkpointDatabase`'s job, called inside `saveCache`. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]), and `saveCache` writes session state to S3 before the Actions cache. The cache save optionally uploads a prompt log artifact for observability.
+Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server. Shutdown does not itself checkpoint SQLite — it sends the child's kill signal and then waits, bounded and best-effort, for the child to stop answering, so the checkpoint that follows is not racing a writer that is still alive but idle. Merging the write-ahead log into the main database file is `checkpointDatabase`'s job, called inside `saveCache`. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]), and `saveCache` writes session state to S3 before the Actions cache. Saves the cache, then optionally uploads a prompt log artifact for observability.
 
 The cleanup phase has its own `finally` block for lock release: if a coordination lock was acquired in phase 4, it is released after all S3 sync and cache save operations complete. This ordering ensures the next surface sees a coherent state. Lock release is always attempted, even if earlier cleanup steps failed.
 
