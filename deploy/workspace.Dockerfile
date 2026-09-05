@@ -120,7 +120,7 @@ WORKDIR /app
 # OPENCODE_VERSION is the harness build of OpenCode (fro-bot/agent releases),
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
-ARG OPENCODE_VERSION=1.18.21+harness.22dee0ee
+ARG OPENCODE_VERSION=1.18.29+harness.88b6b5fb
 ARG SYSTEMATIC_VERSION=3.15.0
 
 # System packages:
