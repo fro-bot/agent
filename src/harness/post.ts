@@ -91,15 +91,23 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
 
   if (cacheSaved === 'durable' || cacheSaved === 'store-only' || cacheSaved === 'skipped') {
     // durable: the cache write itself already persisted -- nothing left to do.
-    // store-only: the object store already persisted the same state independently of the
-    //   cache write. The skip here is justified by durability already achieved through
-    //   that other backend, NOT by an inference that retrying the cache write would fail
-    //   again -- that futility argument is exactly the inference this plan's Key Technical
-    //   Decisions reject (see cache-save-result.ts's CacheSaveOutcome doc on cache-rejected).
-    //   Repeating the save here would only repeat the store upload, adding no durability.
-    // skipped: SKIP_CACHE=true or no cacheable content -- a deliberate no-op; retrying
-    //   would just repeat the same no-op.
-    logger.info('Skipping post-action: cache already saved by main action', {cacheSaved})
+    // store-only: the database is durable in the object store independently of the cache
+    //   write -- only opencode.db travels through the store (DB_TRANSPORTABLE_BASENAMES),
+    //   not .git/opencode or the rest of the storage dir the Actions cache carries; those
+    //   Actions-cache-only files are simply rebuilt on the next run. The skip here is
+    //   justified by that database durability, NOT by an inference that retrying the cache
+    //   write would fail again -- that futility argument is exactly the inference this
+    //   plan's Key Technical Decisions reject (see cache-save-result.ts's CacheSaveOutcome
+    //   doc on cache-rejected). Repeating the save here would only repeat the store upload,
+    //   adding no durability.
+    // skipped: SKIP_CACHE=true -- a deliberate no-op; retrying would just repeat it.
+    const skipReason =
+      cacheSaved === 'durable'
+        ? 'cache saved by main action'
+        : cacheSaved === 'store-only'
+          ? 'state persisted to the object store by main action'
+          : 'main action skipped the save'
+    logger.info(`Skipping post-action: ${skipReason}`, {cacheSaved})
   } else {
     const runId = String(getGitHubRunId())
     try {
@@ -135,7 +143,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
       // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
       // after every other step in the job, so no downstream step could ever read it even if
       // the write succeeded. The job summary is the only surface available here.
-      await writeCacheSaveResultSummary(toCacheSaveStateValue(saveResult), logger)
+      await writeCacheSaveResultSummary(toCacheSaveStateValue(saveResult), 'post-retry', logger)
 
       // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
       // its own line naming it, so a checkpoint decline is distinguishable from a

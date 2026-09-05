@@ -297,7 +297,7 @@ describe('writeCacheSaveResultSummary', () => {
   it('reports durable with no remediation text', async () => {
     // #given a save that reached durable persistence
     // #when
-    await writeCacheSaveResultSummary('durable', logger)
+    await writeCacheSaveResultSummary('durable', 'main', logger)
 
     // #then the row reports success and no remediation sentence is added
     expect(core.summary.addTable).toHaveBeenCalledWith(
@@ -307,13 +307,27 @@ describe('writeCacheSaveResultSummary', () => {
     expect(core.summary.write).toHaveBeenCalled()
   })
 
+  it('headings distinguish the main-step write from a post-action retry', async () => {
+    // #given the same result reported from each phase
+    // #when
+    await writeCacheSaveResultSummary('durable', 'main', logger)
+    await writeCacheSaveResultSummary('durable', 'post-retry', logger)
+
+    // #then the heading names which phase produced the row, since post.ts's retry has no
+    // other surface available to distinguish it from the main step's own write
+    expect(core.summary.addHeading).toHaveBeenNthCalledWith(1, 'Session Persistence', 3)
+    expect(core.summary.addHeading).toHaveBeenNthCalledWith(2, 'Session Persistence (post-action retry)', 3)
+  })
+
   it('names the cache-rejected cause and points at s3-backup when nothing persisted', async () => {
     // #given a save where nothing durable happened (cache rejected, store disabled)
     // #when
-    await writeCacheSaveResultSummary('not-persisted', logger)
+    await writeCacheSaveResultSummary('not-persisted', 'main', logger)
 
-    // #then the remediation names the actual cause and the fix, in one sentence
+    // #then the remediation names the actual causes (including a transient service
+    // failure, not just a denial or collision) and the fix, in one sentence
     expect(core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining('s3-backup'))
+    expect(core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining('transient'))
     // #then keeping R4's "one sentence, not a paragraph" bar: no blank line, and no
     // sentence-ending period until the single one that closes the remediation text
     const remediationCall = vi.mocked(core.summary).addRaw.mock.calls[0]?.[0] as string
@@ -324,7 +338,7 @@ describe('writeCacheSaveResultSummary', () => {
   it('distinguishes store-only from both full success and failure, without s3-backup advice', async () => {
     // #given the object store persisted the state but the Actions cache write did not
     // #when
-    await writeCacheSaveResultSummary('store-only', logger)
+    await writeCacheSaveResultSummary('store-only', 'main', logger)
 
     // #then the row and remediation are distinct from both durable and not-persisted
     expect(core.summary.addTable).toHaveBeenCalledWith(
@@ -337,7 +351,7 @@ describe('writeCacheSaveResultSummary', () => {
   it('does not mention s3-backup for a deliberate skip', async () => {
     // #given SKIP_CACHE or no cacheable content
     // #when
-    await writeCacheSaveResultSummary('skipped', logger)
+    await writeCacheSaveResultSummary('skipped', 'main', logger)
 
     // #then no remediation text at all -- a deliberate no-op needs none
     expect(core.summary.addRaw).not.toHaveBeenCalled()
@@ -348,7 +362,7 @@ describe('writeCacheSaveResultSummary', () => {
     vi.mocked(core.summary.write).mockRejectedValueOnce(new Error('Write failed'))
 
     // #when / #then
-    await expect(writeCacheSaveResultSummary('durable', logger)).resolves.not.toThrow()
+    await expect(writeCacheSaveResultSummary('durable', 'main', logger)).resolves.not.toThrow()
     expect(logger.warning).toHaveBeenCalledWith('Failed to write cache save result summary', {error: 'Write failed'})
     expect(core.warning).toHaveBeenCalledWith('Failed to write cache save result summary: Write failed')
   })

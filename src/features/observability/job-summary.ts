@@ -37,7 +37,7 @@ function cacheSaveResultRemediation(value: CacheSaveStateValue): string | null {
     case 'store-only':
       return 'Session state persisted to the object store; the Actions cache write did not persist it.'
     case 'not-persisted':
-      return 'Session state did not persist this run \u2014 the cache service rejected the write, which on a comment-triggered run usually means a read-only cache token (but can also be a key collision); enable `s3-backup` to persist state independent of the Actions cache.'
+      return 'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.'
     case 'durable':
     case 'skipped':
       return null
@@ -56,9 +56,14 @@ function cacheSaveResultRemediation(value: CacheSaveStateValue): string | null {
  *
  * Non-blocking: logs a warning on failure but never throws, the same as `writeJobSummary`.
  */
-export async function writeCacheSaveResultSummary(value: CacheSaveStateValue, logger: Logger): Promise<void> {
+export async function writeCacheSaveResultSummary(
+  value: CacheSaveStateValue,
+  phase: 'main' | 'post-retry',
+  logger: Logger,
+): Promise<void> {
   try {
-    core.summary.addHeading('Session Persistence', 3).addTable([
+    const heading = phase === 'main' ? 'Session Persistence' : 'Session Persistence (post-action retry)'
+    core.summary.addHeading(heading, 3).addTable([
       [
         {data: 'Field', header: true},
         {data: 'Value', header: true},

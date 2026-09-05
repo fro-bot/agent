@@ -110,7 +110,9 @@ describe('toCacheSaveStateValue', () => {
   // the failure; this table below exercises the restored, complete mapping at runtime.
   const cases: readonly {readonly result: CacheSaveResult; readonly expected: CacheSaveStateValue}[] = [
     {result: {cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'}, expected: 'skipped'},
-    {result: {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'}, expected: 'skipped'},
+    // hasCacheableContent is a point-in-time filesystem observation, not a configuration
+    // constant, so an empty save must retry rather than fold into the deliberate skip.
+    {result: {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'}, expected: 'not-persisted'},
     {result: {cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'}, expected: 'not-persisted'},
     // The case the whole plan exists for: the object store persisted independently of a
     // rejected cache write, so the state is durable through the other backend.

@@ -215,7 +215,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     // A repository owner sees this without reading logs. Written here, not in
     // finalize.ts's writeJobSummary: the main summary table is already flushed by the
     // time this outcome is known.
-    await writeCacheSaveResultSummary(cacheSaveStateValue, cacheLogger)
+    await writeCacheSaveResultSummary(cacheSaveStateValue, 'main', cacheLogger)
 
     if (isOpenCodePromptArtifactEnabled()) {
       const artifactLogger = createLogger({phase: 'artifact-upload'})

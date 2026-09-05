@@ -1051,7 +1051,7 @@ describe('saveCache', () => {
     // #then the failure sentinel is reported as an unpersisted cache
     expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
     expect(logger.warning).toHaveBeenCalledWith('Cache save did not persist', {
-      saveKey: 'opencode-storage-github-owner-repo-main-Linux-98765',
+      saveKey: 'opencode-storage-github-owner-repo-main-Linux-98765-1',
     })
   })
 
