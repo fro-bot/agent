@@ -245,7 +245,7 @@ The bolded row is the double-sync bug: durable in the object store, reported as 
 
 **Verification:** A run where the object store persists and the cache write is rejected performs exactly one store upload across both call sites.
 
-- [ ] **Unit 3: Surface the outcome**
+- [x] **Unit 3: Surface the outcome**
 
 **Goal:** A repository owner can see whether state persisted, and what to do if it did not, without reading logs.
 

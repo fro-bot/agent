@@ -3,7 +3,7 @@ import * as core from '@actions/core'
 import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createLogger} from '../../shared/logger.js'
-import {writeJobSummary} from './job-summary.js'
+import {writeCacheSaveResultSummary, writeJobSummary} from './job-summary.js'
 
 vi.mock('@actions/core', () => {
   const mockSummary = {
@@ -284,5 +284,72 @@ describe('writeJobSummary', () => {
     await expect(writeJobSummary(options, logger)).resolves.not.toThrow()
     expect(logger.warning).toHaveBeenCalledWith('Failed to write job summary', {error: 'Write failed'})
     expect(core.warning).toHaveBeenCalledWith('Failed to write job summary: Write failed')
+  })
+})
+
+describe('writeCacheSaveResultSummary', () => {
+  const logger = createLogger({phase: 'test'})
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('reports durable with no remediation text', async () => {
+    // #given a save that reached durable persistence
+    // #when
+    await writeCacheSaveResultSummary('durable', logger)
+
+    // #then the row reports success and no remediation sentence is added
+    expect(core.summary.addTable).toHaveBeenCalledWith(
+      expect.arrayContaining([['Cache Save Result', expect.stringContaining('persisted')]]),
+    )
+    expect(core.summary.addRaw).not.toHaveBeenCalled()
+    expect(core.summary.write).toHaveBeenCalled()
+  })
+
+  it('names the cache-rejected cause and points at s3-backup when nothing persisted', async () => {
+    // #given a save where nothing durable happened (cache rejected, store disabled)
+    // #when
+    await writeCacheSaveResultSummary('not-persisted', logger)
+
+    // #then the remediation names the actual cause and the fix, in one sentence
+    expect(core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining('s3-backup'))
+    // #then keeping R4's "one sentence, not a paragraph" bar: no blank line, and no
+    // sentence-ending period until the single one that closes the remediation text
+    const remediationCall = vi.mocked(core.summary).addRaw.mock.calls[0]?.[0] as string
+    expect(remediationCall).not.toContain('\n\n')
+    expect(remediationCall.trim().indexOf('.')).toBe(remediationCall.trim().length - 1)
+  })
+
+  it('distinguishes store-only from both full success and failure, without s3-backup advice', async () => {
+    // #given the object store persisted the state but the Actions cache write did not
+    // #when
+    await writeCacheSaveResultSummary('store-only', logger)
+
+    // #then the row and remediation are distinct from both durable and not-persisted
+    expect(core.summary.addTable).toHaveBeenCalledWith(
+      expect.arrayContaining([['Cache Save Result', expect.stringContaining('object store only')]]),
+    )
+    expect(core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining('object store'))
+    expect(core.summary.addRaw).not.toHaveBeenCalledWith(expect.stringContaining('s3-backup'))
+  })
+
+  it('does not mention s3-backup for a deliberate skip', async () => {
+    // #given SKIP_CACHE or no cacheable content
+    // #when
+    await writeCacheSaveResultSummary('skipped', logger)
+
+    // #then no remediation text at all -- a deliberate no-op needs none
+    expect(core.summary.addRaw).not.toHaveBeenCalled()
+  })
+
+  it('does not fail the run when the summary write throws', async () => {
+    // #given the same non-blocking observability rule writeJobSummary follows
+    vi.mocked(core.summary.write).mockRejectedValueOnce(new Error('Write failed'))
+
+    // #when / #then
+    await expect(writeCacheSaveResultSummary('durable', logger)).resolves.not.toThrow()
+    expect(logger.warning).toHaveBeenCalledWith('Failed to write cache save result summary', {error: 'Write failed'})
+    expect(core.warning).toHaveBeenCalledWith('Failed to write cache save result summary: Write failed')
   })
 })

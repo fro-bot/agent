@@ -1,8 +1,84 @@
+import type {CacheSaveStateValue} from '../../shared/cache-save-result.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CommentSummaryOptions} from './types.js'
 import * as core from '@actions/core'
 import {toErrorMessage} from '../../shared/errors.js'
 import {formatCacheStatus, formatDuration} from './run-summary.js'
+
+/**
+ * Table-cell text per `CacheSaveStateValue`, mirroring `formatCacheStatus` in
+ * `run-summary.ts` (visual indicator + short label, one line, no proof-of-durability
+ * language -- a result is reported, never a guarantee; see the cache-save-result-contract
+ * plan's R4).
+ */
+const CACHE_SAVE_RESULT_LABELS: Record<CacheSaveStateValue, string> = {
+  durable: '✅ persisted',
+  'store-only': '📦 persisted (object store only)',
+  skipped: '⏭️ skipped',
+  'not-persisted': '❌ not persisted',
+}
+
+function formatCacheSaveResult(value: CacheSaveStateValue): string {
+  return CACHE_SAVE_RESULT_LABELS[value]
+}
+
+/**
+ * One-sentence remediation text for non-durable outcomes. `null` for `durable` and
+ * `skipped` -- a deliberate skip needs no remediation, and `skipped` in particular must
+ * never suggest `s3-backup` (it did not fail; it did not run).
+ *
+ * `not-persisted`'s wording names the cause as an inference, not an observation: the
+ * cache write's `-1` sentinel does not distinguish a policy denial from a reservation
+ * collision (see `CacheSaveOutcome` in `cache-save-result.ts`), so both possibilities are
+ * named rather than picking one.
+ */
+function cacheSaveResultRemediation(value: CacheSaveStateValue): string | null {
+  switch (value) {
+    case 'store-only':
+      return 'Session state persisted to the object store; the Actions cache write did not persist it.'
+    case 'not-persisted':
+      return 'Session state did not persist this run \u2014 the cache service rejected the write, which on a comment-triggered run usually means a read-only cache token (but can also be a key collision); enable `s3-backup` to persist state independent of the Actions cache.'
+    case 'durable':
+    case 'skipped':
+      return null
+  }
+}
+
+/**
+ * Writes a standalone job-summary row reporting whether session state persisted this run.
+ * Deliberately separate from `writeJobSummary`: the outcome is only known once `saveCache`
+ * runs in `cleanup.ts`, which executes after `runFinalizeWithResult` (the caller of
+ * `writeJobSummary`) has already written and flushed the main summary table -- see the
+ * cache-save-result-contract plan's Unit 3. `post.ts` calls this same function after a
+ * retried save so a red state from a retry is visible without reading logs, even though
+ * the post hook cannot populate the `cache-save-result` output itself (see the comment at
+ * that call site).
+ *
+ * Non-blocking: logs a warning on failure but never throws, the same as `writeJobSummary`.
+ */
+export async function writeCacheSaveResultSummary(value: CacheSaveStateValue, logger: Logger): Promise<void> {
+  try {
+    core.summary.addHeading('Session Persistence', 3).addTable([
+      [
+        {data: 'Field', header: true},
+        {data: 'Value', header: true},
+      ],
+      ['Cache Save Result', formatCacheSaveResult(value)],
+    ])
+
+    const remediation = cacheSaveResultRemediation(value)
+    if (remediation != null) {
+      core.summary.addRaw(`${remediation}\n`)
+    }
+
+    await core.summary.write()
+    logger.debug('Wrote cache save result summary', {value})
+  } catch (error) {
+    const errorMsg = toErrorMessage(error)
+    logger.warning('Failed to write cache save result summary', {error: errorMsg})
+    core.warning(`Failed to write cache save result summary: ${errorMsg}`)
+  }
+}
 
 /**
  * Write comprehensive job summary to GitHub Actions UI.

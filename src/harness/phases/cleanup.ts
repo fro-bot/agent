@@ -22,6 +22,7 @@ import {
 } from '@fro-bot/runtime'
 import {completeAcknowledgment} from '../../features/agent/index.js'
 import {cleanupTempFiles} from '../../features/attachments/index.js'
+import {writeCacheSaveResultSummary} from '../../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
 import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
@@ -36,6 +37,7 @@ import {
 } from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
+import {setCacheSaveResultOutput} from '../config/outputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 
 export interface CleanupPhaseOptions {
@@ -199,7 +201,18 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     // second full object-store upload, and a second doomed cache write, even though state
     // was already durable. toCacheSaveStateValue is the single place that derives the
     // enum from the result so cleanup.ts and post.ts (which reads it back) can't drift.
-    core.saveState(STATE_KEYS.CACHE_SAVED, toCacheSaveStateValue(cacheSaveResult))
+    const cacheSaveStateValue = toCacheSaveStateValue(cacheSaveResult)
+    core.saveState(STATE_KEYS.CACHE_SAVED, cacheSaveStateValue)
+
+    // Set from cleanup, not finalize.ts's setActionOutputs call: runFinalizeWithResult runs
+    // before runCleanup (see run.ts), so the save has not happened yet when finalize writes
+    // its outputs -- this is the only call site structurally able to carry the result.
+    setCacheSaveResultOutput(cacheSaveStateValue)
+
+    // A repository owner sees this without reading logs (R3). Written here rather than in
+    // finalize.ts's writeJobSummary call for the same reason as the output above: the main
+    // summary table is already written and flushed by the time this outcome is known.
+    await writeCacheSaveResultSummary(cacheSaveStateValue, cacheLogger)
 
     if (isOpenCodePromptArtifactEnabled()) {
       const artifactLogger = createLogger({phase: 'artifact-upload'})

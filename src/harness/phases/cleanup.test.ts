@@ -6,6 +6,14 @@ import {ok} from '../../shared/types.js'
 
 vi.mock('@actions/core', () => ({
   saveState: vi.fn(),
+  setOutput: vi.fn(),
+  warning: vi.fn(),
+  summary: {
+    addHeading: vi.fn().mockReturnThis(),
+    addTable: vi.fn().mockReturnThis(),
+    addRaw: vi.fn().mockReturnThis(),
+    write: vi.fn().mockResolvedValue(undefined),
+  },
 }))
 
 vi.mock('../../features/agent/index.js', () => ({

@@ -3,9 +3,10 @@ import type {Logger} from '../shared/logger.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
 import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-bot/runtime'
+import {writeCacheSaveResultSummary} from '../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
-import {parseCacheSaveStateValue} from '../shared/cache-save-result.js'
+import {parseCacheSaveStateValue, toCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {
   getGitHubRepository,
   getGitHubRunAttempt,
@@ -130,6 +131,18 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
       }
 
       const saveResult = await saveCache(cacheSaveOptions)
+
+      // The post hook cannot set the `cache-save-result` output for this retry: GitHub
+      // Actions outputs are step-scoped, and `runs.post:` steps execute after every other
+      // step in the job has already completed (GitHub Actions docs, "metadata syntax for
+      // GitHub Actions" — runs.post; core.setOutput itself, @actions/core/lib/core.js:158,
+      // just appends a key/value line to whatever GITHUB_OUTPUT file is current for this
+      // process at call time). Even if the write itself succeeded, no downstream step
+      // could exist to read it, because any such step would have had to run before this
+      // one. The job summary is the only surface available here, so the retry's actual
+      // result -- which may be a red state the main step's own summary never saw, since
+      // that result did not exist yet when finalize.ts wrote it -- is written there instead.
+      await writeCacheSaveResultSummary(toCacheSaveStateValue(saveResult), logger)
 
       // "No cache content to save" is reserved for skipped-empty — the one outcome that
       // actually means it. Every other outcome gets its own line naming the outcome, so a

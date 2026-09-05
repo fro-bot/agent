@@ -7,6 +7,12 @@ vi.mock('@actions/core', () => ({
   warning: vi.fn(),
   info: vi.fn(),
   debug: vi.fn(),
+  summary: {
+    addHeading: vi.fn().mockReturnThis(),
+    addTable: vi.fn().mockReturnThis(),
+    addRaw: vi.fn().mockReturnThis(),
+    write: vi.fn().mockResolvedValue(undefined),
+  },
 }))
 
 vi.mock('../services/cache/index.js', async importOriginal => {
@@ -292,6 +298,29 @@ describe('post action', () => {
         'Post-action cache save failed (non-fatal)',
         expect.objectContaining({error: 'Cache save failed'}),
       )
+    })
+
+    it('writes the cache-save-result summary row with the retry outcome after retrying a declined save', async () => {
+      // #given a retry that this time succeeds
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'not-persisted'
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+      const {runPost} = await import('./post.js')
+      await runPost({logger: createMockLogger()})
+
+      // #then the summary row reflects the retry's own result -- the only surface
+      // available here, since a post-hook output would arrive after every step ran
+      expect(core.summary.addTable).toHaveBeenCalledWith(
+        expect.arrayContaining([['Cache Save Result', expect.stringContaining('persisted')]]),
+      )
+      expect(core.summary.write).toHaveBeenCalled()
     })
 
     it('should log sessionId when available', async () => {

@@ -18,9 +18,16 @@ vi.mock('@actions/core', () => ({
     mocks.stateStore.set(key, value)
   }),
   getState: vi.fn((key: string) => mocks.stateStore.get(key) ?? ''),
+  setOutput: vi.fn(),
   warning: vi.fn(),
   info: vi.fn(),
   debug: vi.fn(),
+  summary: {
+    addHeading: vi.fn().mockReturnThis(),
+    addTable: vi.fn().mockReturnThis(),
+    addRaw: vi.fn().mockReturnThis(),
+    write: vi.fn().mockResolvedValue(undefined),
+  },
 }))
 
 vi.mock('../../features/agent/index.js', () => ({
@@ -230,6 +237,32 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
 
     expect(saveCache).toHaveBeenCalledTimes(1)
     expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
+  })
+
+  it('reaches both a green (durable) and a red (not-persisted) cache-save-result output from the real cleanup path (reachable-red-state bar)', async () => {
+    // #given a rejecting cache adapter drives cleanup's own save through the real
+    // toCacheSaveStateValue -> setCacheSaveResultOutput path -- not a mock of the mapper
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {setOutput} = await import('@actions/core')
+
+    vi.mocked(saveCache).mockResolvedValueOnce({
+      cachePersisted: false,
+      storePersisted: false,
+      outcome: 'cache-rejected',
+    })
+
+    await runCleanupWith()
+
+    // #then the red state is reachable: nothing durable happened
+    expect(setOutput).toHaveBeenCalledWith('cache-save-result', 'not-persisted')
+
+    // #when the same real path runs again with a cache write that succeeds
+    vi.mocked(saveCache).mockResolvedValueOnce({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+    await runCleanupWith()
+
+    // #then the green state is reachable from the identical call site
+    expect(setOutput).toHaveBeenCalledWith('cache-save-result', 'durable')
   })
 
   it('distinguishes a checkpoint-declined retry-in-progress from a rejected cache write in its log line, and never calls either "no cache content to save"', async () => {
