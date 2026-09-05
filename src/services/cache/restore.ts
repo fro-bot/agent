@@ -7,10 +7,10 @@ import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys} from './cache-key.js'
 import {
+  buildCachePaths,
   buildDbFamilyPaths,
   buildDbShmPath,
   buildDbWalPath,
-  buildRestoreCachePaths,
   deleteAuthJson,
   isAuthPathSafe,
   isErrnoException,
@@ -269,7 +269,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
   const primaryKey = buildPrimaryCacheKey(components)
   const restoreKeys = buildRestoreKeys(components)
-  const cachePaths = await buildRestoreCachePaths(storagePath, projectIdPath, opencodeVersion)
+  const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
 
   logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 

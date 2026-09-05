@@ -8,7 +8,7 @@ import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildSaveCacheKey} from './cache-key.js'
 import {checkpointDatabase} from './checkpoint.js'
-import {buildSaveCachePaths, DB_FAMILY_BASENAMES, DB_MAIN_BASENAME, DB_WAL_BASENAME, deleteAuthJson} from './paths.js'
+import {buildCachePaths, DB_FAMILY_BASENAMES, DB_MAIN_BASENAME, DB_WAL_BASENAME, deleteAuthJson} from './paths.js'
 import {defaultCacheAdapter, type SaveCacheOptions} from './types.js'
 
 async function writeStorageVersion(storagePath: string): Promise<void> {
@@ -41,7 +41,7 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
  * runs: checkpointDatabase merges a hot write-ahead log into the main file before this
  * check ever sees it (checkpoint.test.ts pins that as 'checkpointed', not skipped as
  * 'nothing-to-checkpoint'). This matters more now than it used to: neither
- * buildSaveCachePaths (paths.ts) nor the object-store upload set
+ * buildCachePaths (paths.ts) nor the object-store upload set
  * (DB_TRANSPORTABLE_BASENAMES, packages/runtime/src/session/version.ts) includes the
  * write-ahead log at all any more, so if content were still sitting only in the WAL by
  * this point, it would be invisible here — not merely deprioritized. We still check every
@@ -49,7 +49,7 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
  * defensive property rather than a load-bearing one: today that set is just opencode.db,
  * since neither the write-ahead log nor -shm are ever included.
  *
- * opencode.db-shm is deliberately excluded: buildSaveCachePaths never includes it (it is
+ * opencode.db-shm is deliberately excluded: buildCachePaths never includes it (it is
  * machine-local and stale by construction), so it never appears in cachePaths here. A
  * workspace whose only non-empty file is -shm correctly reports no cacheable content.
  */
@@ -139,7 +139,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
     // Checkpoint before anything inspects file sizes, builds the save path list, or
     // transports bytes: this moves data out of the write-ahead log into the main database
     // file, which changes which files are non-empty for hasCacheableContent below and for
-    // the S3 sync further down. buildSaveCachePaths (paths.ts) never includes the
+    // the S3 sync further down. buildCachePaths (paths.ts) never includes the
     // write-ahead log at all any more — neither transport does (see
     // DB_TRANSPORTABLE_BASENAMES, packages/runtime/src/session/version.ts) — so ordering
     // this checkpoint first is what guarantees a healthy save's data is actually reachable
@@ -157,7 +157,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
       return false
     }
 
-    const cachePaths = await buildSaveCachePaths(storagePath, projectIdPath, opencodeVersion)
+    const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
     logger.info('Saving cache', {saveKey, paths: cachePaths})
 
     const hasContent = await hasCacheableContent(storagePath, cachePaths)
