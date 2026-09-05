@@ -291,6 +291,10 @@ concurrency:
 
 env:
   # CUSTOMIZE: Tailor these prompts to your project's conventions and tech stack.
+  # Unlike fro-bot/agent's own ci.yaml, this prompt does not forbid the agent from
+  # running lint/build/test: this workflow has a single job, so those runs are the
+  # only validation the review gets. Add that prohibition only if you have separate
+  # CI jobs for the gates.
   PR_REVIEW_PROMPT: |
     Focus your review on:
     - Correctness and edge cases
