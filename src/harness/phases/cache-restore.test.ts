@@ -195,6 +195,14 @@ describe('runCacheRestore database repair', () => {
       'Repaired restored database: checkpointed write-ahead log before bootstrap',
     )
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    // Pins the exact positional shape so passing projectIdPath (also in scope here) by
+    // mistake instead of the normalized workspace path is caught, not silently accepted.
+    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      '/workspace',
+      expect.anything(),
+    )
   })
 
   it('leaves an already-clean, usable database alone and logs nothing about repair', async () => {

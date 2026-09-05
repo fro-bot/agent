@@ -194,11 +194,52 @@ export interface OpenCodeServerHandle {
   readonly shutdown: () => Promise<ShutdownResult>
 }
 
+// Outcome of a single readiness-probe attempt. 'timeout'/'aborted' name the abort family
+// (AbortSignal.timeout() vs. the caller's own deadline) and are never retried -- both are
+// fatal, and which message they produce is decided by the caller reading `signal.aborted`
+// once, immediately after this resolves. 'transport' covers everything else (ECONNRESET, a
+// socket hangup, a synchronous throw from the client) -- a local-loopback blip, not
+// evidence the instance is stuck, so the caller retries it once before treating it as fatal.
+type ReadinessProbeOutcome =
+  | {readonly kind: 'ready'}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'aborted'}
+  | {readonly kind: 'transport'; readonly error: unknown}
+
+async function attemptReadinessProbe(
+  client: SessionClient,
+  workspacePath: string,
+  outerSignal: AbortSignal,
+  readinessTimeoutMs: number,
+  logger: Logger,
+): Promise<ReadinessProbeOutcome> {
+  try {
+    const probe = await client.session.list({
+      query: {directory: workspacePath},
+      signal: AbortSignal.any([outerSignal, AbortSignal.timeout(readinessTimeoutMs)]),
+    })
+    // A response.error here is a server answer, not a probe failure -- it proves
+    // instance bootstrap completed.
+    if (probe.error != null) {
+      logger.debug('OpenCode readiness probe answered with an error body (server is ready)', {
+        error: String(probe.error),
+      })
+    }
+    return {kind: 'ready'}
+  } catch (probeError) {
+    const name = probeError instanceof Error ? probeError.name : undefined
+    if (name === 'TimeoutError') return {kind: 'timeout'}
+    if (name === 'AbortError') return {kind: 'aborted'}
+    return {kind: 'transport', error: probeError}
+  }
+}
+
 export async function bootstrapOpenCodeServer(
   signal: AbortSignal,
   logger: Logger,
   workspacePath: string,
   timeoutMs: number = DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
+  readinessTimeoutMs: number = DEFAULT_SERVER_READINESS_TIMEOUT_MS,
 ): Promise<Result<OpenCodeServerHandle, Error>> {
   const startedAt = Date.now()
   // Time spent inside createOpencode specifically — the only window timeoutMs governs.
@@ -241,35 +282,43 @@ export async function bootstrapOpenCodeServer(
     // route answers while bootstrap is still blocked. session.list is read-only and the
     // harness issues it moments later anyway.
     const readinessStartedAt = Date.now()
-    try {
-      const probe = await client.session.list({
-        query: {directory: workspacePath},
-        signal: AbortSignal.any([signal, AbortSignal.timeout(DEFAULT_SERVER_READINESS_TIMEOUT_MS)]),
-      })
-      // A response.error here is a server answer, not a probe failure -- it proves
-      // instance bootstrap completed. Only a thrown rejection (timeout/abort/network)
-      // means the server never answered within the budget.
-      if (probe.error != null) {
-        logger.debug('OpenCode readiness probe answered with an error body (server is ready)', {
-          error: String(probe.error),
-        })
-      }
-    } catch (probeError) {
+    let outcome = await attemptReadinessProbe(client, workspacePath, signal, readinessTimeoutMs, logger)
+    if (outcome.kind === 'transport') {
+      // A transport failure against 127.0.0.1 (ECONNRESET, a socket hangup, a synchronous
+      // client throw) is a local blip, not evidence the instance is stuck -- one immediate
+      // retry before treating it as fatal.
+      logger.warning('OpenCode readiness probe failed (retrying once)', {error: toErrorMessage(outcome.error)})
+      outcome = await attemptReadinessProbe(client, workspacePath, signal, readinessTimeoutMs, logger)
+    }
+    if (outcome.kind !== 'ready') {
+      // Read once, immediately after the last attempt settles and before any cleanup --
+      // waitForServerQuiescence below can run for up to its own timeout budget, and a
+      // second read afterward could catch a deadline that fired during cleanup, mislabeling
+      // a genuine stall as a cancellation.
+      const cancelledByOuterDeadline = signal.aborted
       const probeReadinessMs = Date.now() - readinessStartedAt
-      const probeMessage = toErrorMessage(probeError)
       logger.warning('OpenCode readiness probe failed', {
-        error: probeMessage,
-        readinessTimeoutMs: DEFAULT_SERVER_READINESS_TIMEOUT_MS,
+        outcome: outcome.kind,
+        error: outcome.kind === 'transport' ? toErrorMessage(outcome.error) : undefined,
+        readinessTimeoutMs,
         readinessMs: probeReadinessMs,
-        cancelledByOuterDeadline: signal.aborted,
+        cancelledByOuterDeadline,
       })
       server.close()
       const quiesced = await waitForServerQuiescence(server.url)
       logger.debug('OpenCode server quiesced after readiness-probe failure', {quiesced: quiesced.quiesced})
+      if (outcome.kind === 'transport') {
+        return err(
+          new Error(
+            `OpenCode server is listening but the readiness request failed twice against the ` +
+              `local server: ${toErrorMessage(outcome.error)}`,
+          ),
+        )
+      }
       // The outer `signal` is the caller's execution deadline, not this function's own
       // budget. If it fired while the probe was in flight, the probe never got a real
       // chance to answer -- that is a cancelled run, not evidence of a stalled server.
-      if (signal.aborted) {
+      if (cancelledByOuterDeadline) {
         return err(
           new Error('OpenCode server bootstrap cancelled by the execution deadline during the readiness probe'),
         )
@@ -277,7 +326,7 @@ export async function bootstrapOpenCodeServer(
       return err(
         new Error(
           `OpenCode server is listening but did not answer an instance-scoped request within ` +
-            `${DEFAULT_SERVER_READINESS_TIMEOUT_MS}ms (${probeReadinessMs}ms elapsed) — instance bootstrap is blocked`,
+            `${readinessTimeoutMs}ms (${probeReadinessMs}ms elapsed) — instance bootstrap is blocked`,
         ),
       )
     }

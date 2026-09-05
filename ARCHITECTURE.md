@@ -58,7 +58,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `runPromptAttempt` | Function | `src/features/agent/retry.ts` | Execute prompt with retry logic |
 | `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion status |
 | `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
-| `bootstrapOpenCodeServer` | Function | `src/features/agent/server.ts` | Initialize SDK server lifecycle; probes instance-scoped readiness before reporting success |
+| `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | Initialize SDK server lifecycle; probes instance-scoped readiness before reporting success |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.15.0`) |
 | `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness version (`1.18.21+harness.22dee0ee`) |

@@ -15,8 +15,9 @@ export async function bootstrapOpenCodeServer(
   logger: Logger,
   workspacePath: string,
   timeoutMs?: number,
+  readinessTimeoutMs?: number,
 ) {
-  return bootstrapRuntimeOpenCodeServer(signal, logger, workspacePath, timeoutMs)
+  return bootstrapRuntimeOpenCodeServer(signal, logger, workspacePath, timeoutMs, readinessTimeoutMs)
 }
 
 export async function ensureOpenCodeAvailable(options: {

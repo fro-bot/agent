@@ -425,12 +425,45 @@ describe('bootstrapOpenCodeServer', () => {
       expect(closeSpy).toHaveBeenCalledTimes(1)
     })
 
-    it('fails the same way when the probe rejects with a generic network error', async () => {
-      // #given a probe that rejects with a plain network failure, not a timeout
+    it('retries once on a transient transport failure (e.g. ECONNRESET) and proceeds as ready if the retry resolves', async () => {
+      // #given a probe whose first attempt fails with a local transport error and whose
+      // second attempt (the retry) resolves normally
+      const logger = createMockLogger()
+      let callCount = 0
+      const mockClient = createMockClient(async () => {
+        callCount += 1
+        if (callCount === 1) throw Object.assign(new Error('read ECONNRESET'), {code: 'ECONNRESET'})
+        return {data: [], error: undefined}
+      })
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+        }
+      })
+      const controller = new AbortController()
+
+      // #when
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+      // #then a transient local blip does not fail the bootstrap -- it is retried once and
+      // the first failure is logged, not swallowed silently
+      expect(result.success).toBe(true)
+      expect(mockClient.session.list).toHaveBeenCalledTimes(2)
+      expect(logger.warning).toHaveBeenCalledWith(
+        'OpenCode readiness probe failed (retrying once)',
+        expect.objectContaining({error: expect.stringContaining('ECONNRESET') as string}),
+      )
+    })
+
+    it('fails naming a transport failure, not a stall, when both probe attempts reject with a transient error', async () => {
+      // #given a probe that rejects with a plain transport failure on every attempt -- not a
+      // TimeoutError/AbortError, so it is classified as transport, not a bootstrap stall
       const logger = createMockLogger()
       const closeSpy = vi.fn()
       const mockClient = createMockClient(async () => {
-        throw new Error('fetch failed')
+        throw Object.assign(new Error('read ECONNRESET'), {code: 'ECONNRESET'})
       })
       vi.mocked(createOpencode).mockImplementation(async options => {
         const port = (options as {port?: number}).port
@@ -444,11 +477,113 @@ describe('bootstrapOpenCodeServer', () => {
       // #when
       const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
 
-      // #then
+      // #then the message names a transport failure, never claiming the 60s stall message --
+      // a persistent ECONNRESET against localhost is not evidence of a blocked instance
+      expect(result.success).toBe(false)
+      const message = result.success ? undefined : result.error.message
+      expect(message).toContain('failed twice')
+      expect(message).not.toContain('instance bootstrap is blocked')
+      expect(mockClient.session.list).toHaveBeenCalledTimes(2)
+      expect(closeSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('pins the readiness timeout to an injected bound rather than merely passing a signal object', async () => {
+      // #given a probe that never resolves on its own and only rejects once its own signal
+      // is aborted -- if the composed signal were dropped in favor of a bare `signal` (which
+      // never fires here), this test would hang instead of failing fast
+      const logger = createMockLogger()
+      const closeSpy = vi.fn()
+      const mockClient = createMockClient(
+        async (options: unknown) =>
+          new Promise((_resolve, reject) => {
+            const {signal: probeSignal} = options as {signal: AbortSignal}
+            probeSignal.addEventListener('abort', () => {
+              reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+            })
+          }),
+      )
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
+        }
+      })
+      const controller = new AbortController()
+
+      // #when bootstrapping with a short injected readiness bound
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH, undefined, 50)
+
+      // #then the bound fires and the failure is reported well within the test's own timeout
       expect(result.success).toBe(false)
       const message = result.success ? undefined : result.error.message
       expect(message).toContain('instance bootstrap is blocked')
       expect(closeSpy).toHaveBeenCalledTimes(1)
+    }, 2000)
+
+    it('keeps the bootstrap-blocked message, not the cancellation message, when the outer signal aborts during the post-probe quiescence wait', async () => {
+      // #given a genuine TimeoutError from the probe (not caused by the outer signal), and a
+      // real listener standing in for a child that is slow to exit -- the quiescence wait
+      // stays pending for a beat, giving the outer signal room to abort mid-wait. A second
+      // read of signal.aborted after that wait would wrongly relabel this as a cancellation.
+      const logger = createMockLogger()
+      const controller = new AbortController()
+      const timeoutError = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+      const mockClient = createMockClient(async () => {
+        throw timeoutError
+      })
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port as number
+        // Bind a real listener at the exact port pickFreePort chose, standing in for the
+        // child so waitForServerQuiescence has something real to poll.
+        const listener = net.createServer()
+        await new Promise<void>(resolve => listener.listen(port, '127.0.0.1', resolve))
+        const closeSpy = vi.fn(() => {
+          // The outer signal aborts (below) before this listener actually closes --
+          // simulating a child that takes a moment to exit after the kill signal.
+          setTimeout(() => listener.close(), 80)
+        })
+        return {client: mockClient as never, server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy}}
+      })
+
+      // #when the outer signal aborts partway through the quiescence wait
+      const resultPromise = bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+      setTimeout(() => controller.abort(), 30)
+      const result = await resultPromise
+
+      // #then the message still names the genuine stall, decided at the moment the probe
+      // rejected -- not the cancellation that only happened afterward, during cleanup
+      expect(result.success).toBe(false)
+      const message = result.success ? undefined : result.error.message
+      expect(message).toContain('instance bootstrap is blocked')
+      expect(message).not.toContain('execution deadline')
+    })
+
+    it('runs the quiescence wait (not just close()) when the readiness probe ultimately fails', async () => {
+      // #given a probe that fails outright (both attempts) -- dropping the quiescence wait
+      // on this path would go unnoticed by every other test in this file
+      const logger = createMockLogger()
+      const mockClient = createMockClient(async () => {
+        throw new Error('fetch failed')
+      })
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+        }
+      })
+      const controller = new AbortController()
+
+      // #when
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+      // #then the quiescence-wait debug log only fires if waitForServerQuiescence actually ran
+      expect(result.success).toBe(false)
+      expect(logger.debug).toHaveBeenCalledWith(
+        'OpenCode server quiesced after readiness-probe failure',
+        expect.objectContaining({quiesced: expect.any(Boolean) as boolean}),
+      )
     })
   })
 

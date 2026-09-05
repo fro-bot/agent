@@ -84,7 +84,9 @@ inputs:
       server startup. Increase this on runners with high startup variance. Must be a
       positive integer, clamped to a maximum of 120000 (2 minutes) - values above that
       are clipped with a warning, since a server that has not started within two minutes
-      is not going to. Default: 5000 (matches the OpenCode SDK's own default).
+      is not going to. Default: 5000 (matches the OpenCode SDK's own default). Bounds
+      time-to-listen only; the instance readiness probe that runs after that has its own
+      fixed 60-second bound, not exposed as an input.
     required: false
     default: '5000'
   opencode-version:
