@@ -25,7 +25,7 @@ tags:
 
 ## Context
 
-In one working day, nine independent defects shared a single shape. Each was a check — a test, a documentation sentence, a watch filter, a derived count, a triage conclusion — that passed. Each was later found by a reader outside the author's frame asking a question the frame excluded. None of them was a mistake in the code being checked. Every one was a mistake in the check.
+In one working day, ten independent defects shared a single shape. Each was a check — a test, a documentation sentence, a watch filter, a derived count, a triage conclusion — that passed. Each was later found by a reader outside the author's frame asking a question the frame excluded. None of them was a mistake in the code being checked. Every one was a mistake in the check.
 
 The common structure: the verifier and the thing verified shared a premise — visit order, mock state, which behavior was intended, what counts as a page, which field name an API uses, how many callers a function has. A check built inside that premise is structurally unable to detect its violation, and it passes, which is exactly what a correct check looks like.
 
@@ -56,6 +56,8 @@ The concrete moves, each tied to the defect that taught it:
 9. **Before flipping a shared function's behavior, enumerate its callers.** Switching truncation from head-kept to tail-kept was right for the log caller. The response-file caller keeps its structured header at the top; the change deleted it. There were three callers, not one. The fix made the direction a required parameter with no default — because a default is precisely how one caller's assumption reaches another.
 
 10. **A bound must clear the tail of the thing it bounds.** A 120-second timeout on an install that was measured stalling for 181–370 seconds would have fired on every slow-but-valid run and then fallen back to the unbounded path. Check the number against the measurements you gathered, not against the healthy case.
+
+11. **A proof-of-bite proves the check detects the mutation you made — not that the check is right.** A fix deleted a write-ahead log left on a persistent runner's disk when a restored cache archive did not supply it, on the premise that such a log *predates* the restored database. The test was proven to bite: skip the deletion, the stale log survives, the assertion fails. Every word of that was true, and the premise was inverted. On a single persistent runner the leftover log is the *same* generation as the restored database and *ahead* of it — the only copy of commits made after the previous run's checkpoint. The proof verified that the code did what the author intended. It could not verify that what the author intended was correct, because the test was written inside the same premise. The fix was abandoned before it shipped; the review that caught it asked one question the frame excluded: *which of the two files is actually newer?*
 
 ## Why This Matters
 
@@ -154,4 +156,5 @@ Logs keep the tail; `response.md` keeps the head, where its verdict and schema h
 - [Verify the signal before implementing the plan](./evidence-first-scope-correction-under-incomplete-signals-2026-08-08.md) — the planning-stage cousin: prove a signal exists before designing control flow around it. Its neutralization-testing rule is the same move as item 1 above.
 - [A gate that cannot fail manufactures confidence](./non-failing-gates-are-worse-than-no-gates-2026-08-07.md) — a gate with no reachable red state; here the red state is reachable but the check is blind to it.
 - [Systematic plugin install stalls OpenCode bootstrap](../integration-issues/systematic-plugin-install-stalls-opencode-bootstrap-2026-09-04.md) — the incident whose fix produced items 4, 5, and 10.
+- [Repair before capture: the SQLite session-cache loop](../logic-errors/repair-before-capture-sqlite-session-cache-loop-2026-09-02.md) — the cache-transport design that item 11's abandoned fix was built against.
 - [#1528](https://github.com/fro-bot/agent/issues/1528) — items 2 and 8; [#1532](https://github.com/fro-bot/agent/issues/1532) — a redaction test whose fixture never truncates, so its assertion is trivially true.
