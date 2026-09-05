@@ -9,7 +9,7 @@ date: 2026-09-02
 
 ## Overview
 
-`saveCache` answers a question nobody asked. It returns one boolean across seven distinct outcomes, so its callers cannot tell a deliberate skip from a denied write, cannot avoid repeating an expensive save that already succeeded, and cannot tell an operator why the bot keeps forgetting.
+`saveCache` answers a question nobody asked. It returns one boolean across six distinct outcomes, so its callers cannot tell a deliberate skip from a denied write, cannot avoid repeating an expensive save that already succeeded, and cannot tell an operator why the bot keeps forgetting.
 
 This replaces that boolean with a structured result, gates the post-action retry on durable persistence rather than cache success, and surfaces the outcome where a repository owner will actually see it.
 
@@ -25,8 +25,8 @@ The only signal today is one `logger.warning` per run. No output, no summary lin
 
 Three defects follow from the same root, all verified against `main`:
 
-1. **Both poles of the boolean are overloaded.** `false` spans a declined checkpoint, no cacheable content, a rejected cache write, and a thrown error. `true` spans a real write, a deliberate `SKIP_CACHE`, and a benign key collision. `post.ts:123` reports every falsey outcome as `"Post-action: no cache content to save"` — a stronger and more misleading claim than the warning it replaces.
-2. **The boolean conflates two backends.** The object-store sync runs at `save.ts:171-188`, the cache write at `:190`. When the store succeeds and the cache write is rejected, the function returns `false`, `cleanup.ts:196` never sets `CACHE_SAVED`, and the post hook repeats the entire save — a second checkpoint, a **second full object-store upload**, and a second doomed cache write. State is durable; the run pays twice and reports failure.
+1. **Both poles of the boolean are overloaded.** `false` spans a declined checkpoint, no cacheable content, a rejected cache write, and a thrown error. `true` spans a real write, a deliberate `SKIP_CACHE`, and a benign key collision. `post.ts:118-124` reports every falsey outcome as `"Post-action: no cache content to save"` — a stronger and more misleading claim than the warning it replaces.
+2. **The boolean conflates two backends.** The object-store sync runs at `save.ts:171-188`, the cache write at `:190`. When the store succeeds and the cache write is rejected, the function returns `false`, `cleanup.ts:184-197` never sets `CACHE_SAVED`, and the post hook repeats the entire save — a second checkpoint, a **second full object-store upload**, and a second doomed cache write. State is durable; the run pays twice and reports failure.
 3. **No queryable signal.** The existing output and job-summary machinery already carries `cache-status` for the restore side. Nothing carries the save side.
 
 ## Requirements Trace
@@ -53,12 +53,17 @@ Three defects follow from the same root, all verified against `main`:
 
 ### Relevant Code and Patterns
 
-- `src/services/cache/save.ts` — `saveCache`, all seven return paths.
+- `src/services/cache/save.ts` — `saveCache`, all six return paths.
 - `src/services/cache/checkpoint.ts` — `CheckpointOutcome`, a three-state discriminated union added in #1519. **The closest existing convention** and the one to mirror: it exists precisely so a successful no-op is not collapsed into failure.
 - `src/services/cache/restore.ts` — `CacheResult` (`hit`, `key`, `restoredPath`, `corrupted`, `source`). The restore-side shape a save-side result should rhyme with.
 - `src/harness/config/outputs.ts` — `setActionOutputs`, the single seam from `ActionOutputs` to `core.setOutput`. `action.yaml` declares seven outputs today, including `cache-status`.
 - `src/features/observability/job-summary.ts` — `writeJobSummary` builds a fixed table via `core.summary.addTable`, already formatting cache status. Adding a row is isolated to this writer.
-- `src/harness/phases/cleanup.ts:196` and `src/harness/post.ts:86` — the two call sites, communicating only through the `CACHE_SAVED` state key.
+- `src/harness/phases/cleanup.ts:184-197` and `src/harness/post.ts:118-124` — the two call sites, communicating only through the `CACHE_SAVED` state key.
+- `src/services/cache/integrity.ts` — `verifyDatabaseUsable`, the restore-side structural-corruption precedent that already classifies a positive outcome with a discriminated return.
+- `src/services/cache/sqlite-errors.ts` — shared SQLite error classification for retryable vs structural failures, the same "infer only what the boundary can prove" seam this plan needs.
+- `src/services/cache/paths.ts` — `buildCachePaths`, the unified save/restore path builder added after #1519 to keep the cache version hash stable.
+- `packages/runtime/src/agent/server.ts` — `ReadinessProbeOutcome`, a newer discriminated-outcome precedent for lifecycle probes.
+- `src/features/delegated/brokered-push.ts` — `BrokeredPushFailureClass`, the shared discriminant pattern for cross-layer state.
 
 ### Institutional Learnings
 
@@ -68,6 +73,8 @@ Three defects follow from the same root, all verified against `main`:
 - [`checks-report-clean-for-what-they-cannot-observe`](../solutions/workflow-issues/checks-report-clean-for-what-they-cannot-observe-2026-08-10.md) — **Constraint:** do not let summary text imply coverage that does not exist.
 - [`repair-before-capture-sqlite-session-cache-loop`](../solutions/logic-errors/repair-before-capture-sqlite-session-cache-loop-2026-09-02.md) — the checkpoint-decline path is one of the outcomes being named here. **Constraint:** judge by external effect, not reported status.
 
+Re-baselined on 2026-09-05 after #1519, #1521, and #1546 landed in scope; the drift audit found no invalidated assumptions.
+
 ## Prior-Art Survey
 
 ```json
@@ -76,11 +83,12 @@ Three defects follow from the same root, all verified against `main`:
   "verdict": "extend",
   "scope": "src/services/cache, src/harness, src/features/observability",
   "freshness": {
-    "vcs_reference": "main"
+    "vcs_reference": "096faf1ea023264ecfe5bfadbbb6c95dc6508c96",
+    "scope_baseline": "src/services/cache=1bfff4c9221949fee0ed19aa6f9f9a98ac6286f1;src/harness=d38c67da6ad7799c96ac286179608e1f86b1e33f;src/features/observability=3d10c39800ae71f08771480823dc88821e230fad"
   },
   "budget": {
-    "max_search_passes": 1,
-    "max_candidate_inspections": 3,
+    "max_search_passes": 3,
+    "max_candidate_inspections": 10,
     "exhausted": false
   },
   "candidates": [
@@ -97,6 +105,31 @@ Three defects follow from the same root, all verified against `main`:
     {
       "path_or_symbol": "src/harness/config/outputs.ts::setActionOutputs",
       "description": "Declared output seam moving runtime state into GitHub Actions outputs, including cache-status.",
+      "disposition": "extend"
+    },
+    {
+      "path_or_symbol": "src/services/cache/integrity.ts::verifyDatabaseUsable",
+      "description": "Restore-side discriminated probe result that classifies structural corruption positively and leaves everything else usable.",
+      "disposition": "extend"
+    },
+    {
+      "path_or_symbol": "src/services/cache/sqlite-errors.ts",
+      "description": "Shared SQLite error classification for retryable versus structural failures, keeping inference limited to what SQLite actually says.",
+      "disposition": "extend"
+    },
+    {
+      "path_or_symbol": "src/services/cache/paths.ts::buildCachePaths",
+      "description": "Unified save/restore path builder that keeps cache version hashing aligned across both sides of persistence.",
+      "disposition": "extend"
+    },
+    {
+      "path_or_symbol": "packages/runtime/src/agent/server.ts::ReadinessProbeOutcome",
+      "description": "Lifecycle probe precedent that models ready, timeout, aborted, and transport as explicit outcomes instead of a boolean.",
+      "disposition": "extend"
+    },
+    {
+      "path_or_symbol": "src/features/delegated/brokered-push.ts::BrokeredPushFailureClass",
+      "description": "Shared cross-layer discriminant precedent for classifying failure state in the shared layer.",
       "disposition": "extend"
     }
   ]
@@ -165,7 +198,7 @@ The bolded row is the double-sync bug: durable in the object store, reported as 
 **Approach:**
 - `{cachePersisted: boolean, storePersisted: boolean, outcome: <union>}`. Outcome names the terminal condition; the booleans carry the axes independently.
 - One outcome per real condition: skipped-by-configuration, skipped-empty, checkpoint-declined, cache-rejected, cache-error, persisted. **`cache-rejected` covers both denial and collision and must be documented at the type as an inference.**
-- Every one of the seven existing return paths maps to exactly one result. No path may be left returning a bare boolean.
+- Every one of the six existing return paths maps to exactly one result. No path may be left returning a bare boolean.
 
 **Patterns to follow:** `CheckpointOutcome` in `src/services/cache/checkpoint.ts`; `CacheResult` in `src/services/cache/restore.ts`.
 
