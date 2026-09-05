@@ -50,7 +50,9 @@ export function buildRestoreKeys(components: CacheKeyComponents): readonly strin
  * first attempt's -- a collision folds into 'persisted' via the caught "already exists"
  * error, silently discarding the retry attempt's own state. buildRestoreKeys' prefixes
  * (ref-scoped and repo-scoped, both stop before any run ID) are unaffected: they still
- * match every save key regardless of run ID or run attempt.
+ * match every save key regardless of run ID or run attempt. Each attempt therefore creates
+ * its own entry against the repo's cache budget rather than reusing one -- LRU eviction
+ * handles the resulting growth, an accepted cost against losing a re-run's session state.
  */
 export function buildSaveCacheKey(components: CacheKeyComponents, runId: number, runAttempt: number): string {
   return `${buildPrimaryCacheKey(components)}-${runId}-${runAttempt}`

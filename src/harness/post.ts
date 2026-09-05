@@ -6,7 +6,7 @@ import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-b
 import {writeCacheSaveResultSummary} from '../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
-import {parseCacheSaveStateValue, toCacheSaveStateValue} from '../shared/cache-save-result.js'
+import {parseCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {
   getGitHubRepository,
   getGitHubRunAttempt,
@@ -143,7 +143,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
       // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
       // after every other step in the job, so no downstream step could ever read it even if
       // the write succeeded. The job summary is the only surface available here.
-      await writeCacheSaveResultSummary(toCacheSaveStateValue(saveResult), 'post-retry', logger)
+      await writeCacheSaveResultSummary(saveResult, 'post-retry', logger)
 
       // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
       // its own line naming it, so a checkpoint decline is distinguishable from a

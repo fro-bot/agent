@@ -70,7 +70,8 @@ export interface CacheSaveResult {
  *   fail toward doing the work, never toward skipping it, because the post hook is the
  *   last chance to persist state. `skipped-empty` is included here (not folded into
  *   `skipped`) because `hasCacheableContent` is a point-in-time filesystem observation,
- *   not a configuration constant — a repeated no-op is cheap, a missed save is not.
+ *   not a configuration constant — a repeated attempt re-runs the checkpoint before
+ *   re-checking content, a small cost against losing a session.
  */
 export type CacheSaveStateValue = 'durable' | 'store-only' | 'skipped' | 'not-persisted'
 

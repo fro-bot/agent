@@ -1,7 +1,8 @@
-import type {CacheSaveStateValue} from '../../shared/cache-save-result.js'
+import type {CacheSaveOutcome, CacheSaveResult, CacheSaveStateValue} from '../../shared/cache-save-result.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CommentSummaryOptions} from './types.js'
 import * as core from '@actions/core'
+import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {formatCacheStatus, formatDuration} from './run-summary.js'
 
@@ -23,25 +24,45 @@ function formatCacheSaveResult(value: CacheSaveStateValue): string {
 }
 
 /**
- * One-sentence remediation text for non-durable outcomes. `null` for `durable` and
- * `skipped` -- a deliberate skip needs no remediation, and `skipped` in particular must
- * never suggest `s3-backup` (it did not fail; it did not run).
+ * One-sentence remediation text per `CacheSaveOutcome`, pinned by
+ * `satisfies Record<CacheSaveOutcome, ...>` so a new outcome without a case here fails
+ * `check-types` instead of silently reporting nothing. `undefined` for `persisted` and
+ * `skipped-by-configuration` -- neither needs remediation, and a deliberate skip in
+ * particular must never suggest `s3-backup` (it did not fail; it did not run).
  *
- * `not-persisted`'s wording names the cause as an inference, not an observation: the
- * cache write's `-1` sentinel does not distinguish a policy denial from a reservation
- * collision (see `CacheSaveOutcome` in `cache-save-result.ts`), so both possibilities are
- * named rather than picking one.
+ * `cache-rejected`/`cache-error`'s wording names the cause as an inference, not an
+ * observation: the cache write's `-1` sentinel (or a thrown error) does not distinguish a
+ * policy denial from a reservation collision (see `CacheSaveOutcome` in
+ * `cache-save-result.ts`), so both possibilities are named rather than picking one.
+ * `checkpoint-declined` and `skipped-empty` each get their own sentence rather than
+ * reusing the rejected-write one: neither is a rejected write, and `s3-backup` would not
+ * help either -- a declined checkpoint means no write was attempted at all, and an empty
+ * observation means there was nothing to write in the first place.
  */
-function cacheSaveResultRemediation(value: CacheSaveStateValue): string | null {
-  switch (value) {
-    case 'store-only':
-      return 'Session state persisted to the object store; the Actions cache write did not persist it.'
-    case 'not-persisted':
-      return 'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.'
-    case 'durable':
-    case 'skipped':
-      return null
+const OUTCOME_TO_REMEDIATION = {
+  'skipped-by-configuration': undefined,
+  'skipped-empty':
+    'No session state was found to save; the post-action step retries in case the database was still being written.',
+  'checkpoint-declined':
+    'Session state did not persist this run \u2014 the database could not be checkpointed, so no write was attempted; the post-action step retries.',
+  'cache-rejected':
+    'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.',
+  'cache-error':
+    'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.',
+  persisted: undefined,
+} as const satisfies Record<CacheSaveOutcome, string | undefined>
+
+function cacheSaveResultRemediation(result: CacheSaveResult): string | undefined {
+  // store-only is a state-value distinction, not a separate CacheSaveOutcome (it only
+  // arises from cache-rejected/cache-error plus storePersisted -- see
+  // OUTCOME_TO_STATE_VALUE in cache-save-result.ts) -- so it is handled ahead of the
+  // outcome table, which would otherwise report the rejected-write sentence (and its
+  // s3-backup suggestion) even though the object store already durably persisted the
+  // state through that same backend.
+  if (toCacheSaveStateValue(result) === 'store-only') {
+    return 'Session state persisted to the object store; the Actions cache write did not persist it.'
   }
+  return OUTCOME_TO_REMEDIATION[result.outcome]
 }
 
 /**
@@ -57,11 +78,12 @@ function cacheSaveResultRemediation(value: CacheSaveStateValue): string | null {
  * Non-blocking: logs a warning on failure but never throws, the same as `writeJobSummary`.
  */
 export async function writeCacheSaveResultSummary(
-  value: CacheSaveStateValue,
+  result: CacheSaveResult,
   phase: 'main' | 'post-retry',
   logger: Logger,
 ): Promise<void> {
   try {
+    const value = toCacheSaveStateValue(result)
     const heading = phase === 'main' ? 'Session Persistence' : 'Session Persistence (post-action retry)'
     core.summary.addHeading(heading, 3).addTable([
       [
@@ -71,7 +93,7 @@ export async function writeCacheSaveResultSummary(
       ['Cache Save Result', formatCacheSaveResult(value)],
     ])
 
-    const remediation = cacheSaveResultRemediation(value)
+    const remediation = cacheSaveResultRemediation(result)
     if (remediation != null) {
       core.summary.addRaw(`${remediation}\n`)
     }

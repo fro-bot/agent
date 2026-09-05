@@ -1025,6 +1025,44 @@ describe('saveCache', () => {
     expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
   })
 
+  it('reads GITHUB_RUN_ATTEMPT and folds it into the save key, not a hardcoded 1', async () => {
+    // #given storage with content and a run attempt beyond the first (a re-run)
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const originalRunAttempt = process.env.GITHUB_RUN_ATTEMPT
+    process.env.GITHUB_RUN_ATTEMPT = '2'
+
+    const saveCacheMock = vi.fn(async () => 12345)
+    const adapter: CacheAdapter = {
+      restoreCache: async () => undefined,
+      saveCache: saveCacheMock,
+    }
+
+    try {
+      // #when saving cache on run attempt 2
+      const result = await saveCache({
+        components: testComponents,
+        runId: 98765,
+        logger: createTestLogger(),
+        storagePath,
+        authPath,
+        cacheAdapter: adapter,
+      })
+
+      // #then the save key carries the actual run attempt, not a stale/hardcoded 1 --
+      // otherwise a re-run's save key would collide with the first attempt's
+      expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+      expect(saveCacheMock).toHaveBeenCalledWith(expect.any(Array), expect.stringMatching(/-98765-2$/))
+    } finally {
+      if (originalRunAttempt == null) {
+        delete process.env.GITHUB_RUN_ATTEMPT
+      } else {
+        process.env.GITHUB_RUN_ATTEMPT = originalRunAttempt
+      }
+    }
+  })
+
   it('returns false and warns when save returns the failure sentinel', async () => {
     // #given storage with content and an adapter that reports an unsuccessful save
     await fs.mkdir(storagePath, {recursive: true})
