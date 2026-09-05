@@ -14,6 +14,16 @@ export const STATE_KEYS = {
   CACHE_SAVED: 'cacheSaved',
   /** Whether main action already uploaded log artifacts */
   ARTIFACT_UPLOADED: 'artifactUploaded',
+  /**
+   * Whether cleanup.ts already wrote the rich run metadata (token usage, timing, session
+   * ids, PRs/commits, errors) to the object store this run. Distinguishes "cleanup ran and
+   * its metadata upload succeeded" from "cleanup never ran at all" -- CACHE_SAVED's
+   * `not-persisted` value is ambiguous between those two cases, since run.ts seeds that
+   * same value before cleanup ever executes. Set unconditionally (independent of
+   * CACHE_SAVED) so post.ts can skip re-writing metadata with its thin
+   * `cleanupSkipped: true` placeholder and clobbering the rich payload.
+   */
+  CLEANUP_METADATA_WRITTEN: 'cleanupMetadataWritten',
   /** OpenCode version detected during main action (for post-action cache path calculation) */
   OPENCODE_VERSION: 'opencodeVersion',
   S3_ENABLED: 'storeConfig.enabled',

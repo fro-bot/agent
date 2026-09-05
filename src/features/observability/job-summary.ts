@@ -38,21 +38,35 @@ function formatCacheSaveResult(value: CacheSaveStateValue): string {
  * reusing the rejected-write one: neither is a rejected write, and `s3-backup` would not
  * help either -- a declined checkpoint means no write was attempted at all, and an empty
  * observation means there was nothing to write in the first place.
+ *
+ * `skipped-empty` and `checkpoint-declined` are the only two entries with a trailing
+ * "the post-action step retries" clause, and that clause is true only when this sentence
+ * is rendered from `cleanup.ts`'s `phase: 'main'` write -- a post-action retry genuinely
+ * follows. `post.ts` renders the same outcome from its own retry (`phase: 'post-retry'`),
+ * which IS that retry; claiming it "retries" again would be false. So each entry carries
+ * its base `sentence` plus an optional `retryDetail` suffix (appended after "the
+ * post-action step retries"), and `cacheSaveResultRemediation` below only appends the
+ * whole retry clause for `phase === 'main'`.
  */
 const OUTCOME_TO_REMEDIATION = {
   'skipped-by-configuration': undefined,
-  'skipped-empty':
-    'No session state was found to save; the post-action step retries in case the database was still being written.',
-  'checkpoint-declined':
-    'Session state did not persist this run \u2014 the database could not be checkpointed, so no write was attempted; the post-action step retries.',
+  'skipped-empty': {
+    sentence: 'No session state was found to save',
+    retryDetail: 'in case the database was still being written',
+  },
+  'checkpoint-declined': {
+    sentence:
+      'Session state did not persist this run \u2014 the database could not be checkpointed, so no write was attempted',
+    retryDetail: undefined,
+  },
   'cache-rejected':
     'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.',
   'cache-error':
     'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.',
   persisted: undefined,
-} as const satisfies Record<CacheSaveOutcome, string | undefined>
+} as const satisfies Record<CacheSaveOutcome, string | undefined | {sentence: string; retryDetail: string | undefined}>
 
-function cacheSaveResultRemediation(result: CacheSaveResult): string | undefined {
+function cacheSaveResultRemediation(result: CacheSaveResult, phase: 'main' | 'post-retry'): string | undefined {
   // store-only is a state-value distinction, not a separate CacheSaveOutcome (it only
   // arises from cache-rejected/cache-error plus storePersisted -- see
   // OUTCOME_TO_STATE_VALUE in cache-save-result.ts) -- so it is handled ahead of the
@@ -62,7 +76,23 @@ function cacheSaveResultRemediation(result: CacheSaveResult): string | undefined
   if (toCacheSaveStateValue(result) === 'store-only') {
     return 'Session state persisted to the object store; the Actions cache write did not persist it.'
   }
-  return OUTCOME_TO_REMEDIATION[result.outcome]
+
+  const entry = OUTCOME_TO_REMEDIATION[result.outcome]
+  if (entry == null) {
+    return undefined
+  }
+  if (typeof entry === 'string') {
+    return entry
+  }
+
+  // Only the main-phase write is followed by an actual post-action retry -- this call
+  // (phase === 'post-retry') IS that retry, so the trailing clause naming it is dropped.
+  if (phase !== 'main') {
+    return `${entry.sentence}.`
+  }
+  const retryClause =
+    entry.retryDetail == null ? 'the post-action step retries' : `the post-action step retries ${entry.retryDetail}`
+  return `${entry.sentence}; ${retryClause}.`
 }
 
 /**
@@ -93,7 +123,7 @@ export async function writeCacheSaveResultSummary(
       ['Cache Save Result', formatCacheSaveResult(value)],
     ])
 
-    const remediation = cacheSaveResultRemediation(result)
+    const remediation = cacheSaveResultRemediation(result, phase)
     if (remediation != null) {
       core.summary.addRaw(`${remediation}\n`)
     }

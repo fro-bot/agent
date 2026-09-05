@@ -170,20 +170,27 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
         const adapter = createS3Adapter(storeConfig, objectStoreLogger)
         const repo = getGitHubRepository()
         const runAttempt = getGitHubRunAttempt()
-        await syncMetadataToStore(
-          adapter,
-          storeConfig,
-          'github',
-          repo,
-          runId,
-          {
+        // CLEANUP_METADATA_WRITTEN distinguishes "cleanup ran and already uploaded the rich
+        // payload" from "cleanup never ran" -- CACHE_SAVED alone can't: run.ts seeds
+        // 'not-persisted' before cleanup ever executes, so that value is also what a crash
+        // before cleanup would leave behind. Skipping here avoids clobbering cleanup's
+        // token usage/timing/session/PR/commit/error payload with this thin placeholder.
+        if (core.getState(STATE_KEYS.CLEANUP_METADATA_WRITTEN) !== 'true') {
+          await syncMetadataToStore(
+            adapter,
+            storeConfig,
+            'github',
+            repo,
             runId,
-            timestamp: new Date().toISOString(),
-            cleanupSkipped: true,
-            runAttempt,
-          },
-          objectStoreLogger,
-        )
+            {
+              runId,
+              timestamp: new Date().toISOString(),
+              cleanupSkipped: true,
+              runAttempt,
+            },
+            objectStoreLogger,
+          )
+        }
         await syncArtifactsToStore(adapter, storeConfig, 'github', repo, runId, getOpenCodeLogPath(), objectStoreLogger)
       } catch (error) {
         logger.warning('Post-action object store sync failed (non-fatal)', {

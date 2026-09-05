@@ -172,7 +172,20 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
           errors: snapshot.errors,
           artifactUpload: artifactResult,
         }
-        await syncMetadataToStore(adapter, storeConfig, agentIdentity, repo, runId, metadata, objectStoreLogger)
+        const metadataResult = await syncMetadataToStore(
+          adapter,
+          storeConfig,
+          agentIdentity,
+          repo,
+          runId,
+          metadata,
+          objectStoreLogger,
+        )
+        if (metadataResult.success) {
+          // Marks that the rich payload above landed, so post.ts's retry branch (if it
+          // ever runs) knows not to overwrite it with a thin cleanupSkipped placeholder.
+          core.saveState(STATE_KEYS.CLEANUP_METADATA_WRITTEN, 'true')
+        }
       } catch (error) {
         objectStoreLogger.warning('Object store artifact or metadata sync failed (non-fatal)', {
           error: error instanceof Error ? error.message : String(error),

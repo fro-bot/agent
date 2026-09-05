@@ -494,5 +494,81 @@ describe('post action', () => {
         expect.any(Object),
       )
     })
+
+    it('skips the metadata write when cleanup already uploaded the rich payload', async () => {
+      // #given cleanup.ts ran and its metadata upload succeeded -- CLEANUP_METADATA_WRITTEN
+      // is 'true', distinguishing this from the genuine cleanup-never-ran case that
+      // 'not-persisted' alone can't rule out (run.ts seeds that same value before cleanup
+      // ever executes)
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'not-persisted'
+        if (key === 'cleanupMetadataWritten') return 'true'
+        if (key === 'storeConfig.enabled') return 'true'
+        if (key === 'storeConfig.bucket') return 'test-bucket'
+        if (key === 'storeConfig.region') return 'us-east-1'
+        if (key === 'storeConfig.prefix') return 'fro-bot-state'
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+      const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
+      vi.mocked(createS3Adapter).mockReturnValue({
+        upload: async () => ok(undefined),
+        download: async () => ok(undefined),
+        list: async () => ok([]),
+      })
+
+      const {runPost} = await import('./post.js')
+      await runPost({logger: createMockLogger()})
+
+      // #then the rich payload cleanup already uploaded is left untouched -- the cache
+      // save retry still runs regardless
+      expect(syncMetadataToStore).not.toHaveBeenCalled()
+      expect(syncArtifactsToStore).toHaveBeenCalled()
+      expect(saveCache).toHaveBeenCalled()
+    })
+
+    it('writes the metadata placeholder when cleanup never ran', async () => {
+      // #given CLEANUP_METADATA_WRITTEN is absent -- the genuine cleanup-never-ran case,
+      // where the thin cleanupSkipped placeholder is the only record available
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'not-persisted'
+        if (key === 'storeConfig.enabled') return 'true'
+        if (key === 'storeConfig.bucket') return 'test-bucket'
+        if (key === 'storeConfig.region') return 'us-east-1'
+        if (key === 'storeConfig.prefix') return 'fro-bot-state'
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+      const {createS3Adapter, syncMetadataToStore} = await import('@fro-bot/runtime')
+      vi.mocked(createS3Adapter).mockReturnValue({
+        upload: async () => ok(undefined),
+        download: async () => ok(undefined),
+        list: async () => ok([]),
+      })
+
+      const {runPost} = await import('./post.js')
+      await runPost({logger: createMockLogger()})
+
+      // #then
+      expect(syncMetadataToStore).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({enabled: true}),
+        'github',
+        'test-owner/test-repo',
+        '12345',
+        expect.objectContaining({cleanupSkipped: true}),
+        expect.any(Object),
+      )
+    })
   })
 })
