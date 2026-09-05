@@ -285,11 +285,14 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
 
     core.addPath(opencodeResult.path)
 
-    if (toolsCacheResult.hit === false) {
+    // Gate on the resolved OpenCode binary, not the aggregate cache result: a cache hit whose
+    // binary went missing falls through to a fresh install (cached: false) above, and that fresh
+    // install still needs the Systematic plugin installed and the cache re-saved.
+    if (opencodeResult.cached !== true) {
       const systematicPluginInstall = await installSystematicPlugin({
         logger,
         execAdapter,
-        opencodePath: 'opencode',
+        opencodePath: opencodeResult.path,
         systematicVersion,
       })
 
@@ -308,10 +311,20 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
           opencodeCachePath,
         })
       } else {
-        logger.warning('Skipping tools cache save because Systematic plugin install did not complete', {
+        // Name the likely cause when the parent env had NPM_CONFIG_* set: the install child
+        // (systematic-plugin.ts) deliberately does not inherit NPM_CONFIG_* so a network-fetched
+        // package's lifecycle scripts can't see registry/proxy overrides. List key NAMES only —
+        // never values — and never propose allowlisting; that would defeat the scrub.
+        const npmConfigKeys = Object.keys(process.env).filter(key => key.startsWith('NPM_CONFIG_'))
+        const npmConfigNote =
+          npmConfigKeys.length > 0
+            ? ` The install child does not inherit NPM_CONFIG_* environment variables (present in the parent env: ${npmConfigKeys.join(', ')}), which may explain the failure.`
+            : ''
+        const warningMessage = `Skipping tools cache save because Systematic plugin install did not complete${npmConfigNote}`
+        logger.warning(warningMessage, {
           status: systematicPluginInstall.status,
         })
-        core.warning('Skipping tools cache save because Systematic plugin install did not complete')
+        core.warning(warningMessage)
       }
     }
 
