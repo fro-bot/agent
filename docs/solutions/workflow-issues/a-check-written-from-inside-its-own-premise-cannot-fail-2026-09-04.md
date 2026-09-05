@@ -1,6 +1,7 @@
 ---
 title: A check written from inside its own premise cannot fail
 date: 2026-09-04
+last_updated: 2026-09-05
 category: workflow-issues
 module: development-workflow
 problem_type: workflow_issue
@@ -12,6 +13,7 @@ applies_when:
   - Correcting a derived fact such as a count, version, or line reference
   - Writing a filter, watch, or poll against an API whose field shape you have not confirmed
   - Changing a shared function's semantics, or triaging a failure from one branch's history
+  - Deleting a "stale" sidecar at a restore or startup boundary, where which artifact is newer depends on topology the code cannot observe
 tags:
   - self-referential-check
   - shared-premise
@@ -25,7 +27,7 @@ tags:
 
 ## Context
 
-In one working day, ten independent defects shared a single shape. Each was a check — a test, a documentation sentence, a watch filter, a derived count, a triage conclusion — that passed. Each was later found by a reader outside the author's frame asking a question the frame excluded. None of them was a mistake in the code being checked. Every one was a mistake in the check.
+In one working day, ten independent defects shared a single shape (one of them taught two of the moves below, so the list runs to eleven). Each was a check — a test, a documentation sentence, a watch filter, a derived count, a triage conclusion — that passed. Each was later found by a reader outside the author's frame asking a question the frame excluded. None of them was a mistake in the code being checked. Every one was a mistake in the check.
 
 The common structure: the verifier and the thing verified shared a premise — visit order, mock state, which behavior was intended, what counts as a page, which field name an API uses, how many callers a function has. A check built inside that premise is structurally unable to detect its violation, and it passes, which is exactly what a correct check looks like.
 
@@ -74,6 +76,7 @@ The shape recurs because writing a check and writing its subject happen in the s
 - Triaging an intermittent failure — before writing "flaky," check the default branch.
 - Changing the semantics of a function with more than one caller.
 - Choosing a timeout, cap, or budget for a failure mode you have measured.
+- Proposing to delete a "stale" file at a restore or startup boundary. Establish which artifact is newer first; if that depends on topology the code cannot observe, the deletion is wrong.
 
 ## Examples
 
