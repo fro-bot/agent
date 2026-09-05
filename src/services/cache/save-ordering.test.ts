@@ -100,7 +100,7 @@ describe('saveCache checkpoint-then-paths ordering', () => {
     // #then the save is declined, and — the property this test exists to pin —
     // buildCachePaths is never reached, because the checkpoint's failure returns
     // before the path-building and content-inspection block below it ever runs
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'})
     expect(mocks.buildCachePaths).not.toHaveBeenCalled()
 
     holder.exec('COMMIT')
@@ -128,7 +128,7 @@ describe('saveCache checkpoint-then-paths ordering', () => {
     // #then the save proceeds and buildCachePaths is reached — confirming the mock
     // above would have caught a missing call in the failed-checkpoint case, rather than
     // silently passing because it is never exercised at all
-    expect(result).toBe(true)
+    expect(result).toMatchObject({cachePersisted: true, outcome: 'persisted'})
     expect(mocks.buildCachePaths).toHaveBeenCalledTimes(1)
   })
 })

@@ -202,13 +202,14 @@ A few inputs most workflows touch:
 
 **Outputs**
 
-| Output                    | Description                                                   |
-| ------------------------- | ------------------------------------------------------------- |
-| `session-id`              | OpenCode session ID used for this run                         |
-| `resolved-output-mode`    | Resolved delivery mode (`working-dir`, `branch-pr`, or empty) |
-| `brokered-push-allowlist` | JSON effective brokered-push allowlist                        |
-| `cache-status`            | Cache restore status (`hit`, `miss`, `corrupted`)             |
-| `duration`                | Run duration in milliseconds                                  |
+| Output | Description |
+| --- | --- |
+| `session-id` | OpenCode session ID used for this run |
+| `resolved-output-mode` | Resolved delivery mode (`working-dir`, `branch-pr`, or empty) |
+| `brokered-push-allowlist` | JSON effective brokered-push allowlist |
+| `cache-status` | Cache restore status (`hit`, `miss`, `corrupted`) |
+| `cache-save-result` | Cache save outcome for the main step (`durable`, `store-only`, `skipped`, `not-persisted`); set from the main step only — the post-action retry reports its outcome to the job summary, never to this output |
+| `duration` | Run duration in milliseconds |
 
 `brokered-push-allowlist` is empty (`''`) when a run exits before finalize; treat empty or absent as “not resolved,” never as an empty allowlist. In `defaultPaths`, `*` means exactly one path segment (matching enforcement’s `[^/]+`), not unbounded depth for consumer glob libraries.
 

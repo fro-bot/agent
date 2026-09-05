@@ -1,8 +1,11 @@
 import type {ActionOutputs} from '../../shared/types.js'
+import {readFileSync} from 'node:fs'
+import {join} from 'node:path'
 import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-
-import {setActionOutputs} from './outputs.js'
+import {parse} from 'yaml'
+import {CACHE_SAVE_STATE_VALUES} from '../../shared/cache-save-result.js'
+import {setActionOutputs, setCacheSaveResultOutput} from './outputs.js'
 
 // Mock @actions/core
 vi.mock('@actions/core', () => ({
@@ -166,5 +169,41 @@ describe('setActionOutputs', () => {
 
     expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', '')
     expect(mockSetOutput).toHaveBeenCalledWith('output-mode-migration', JSON.stringify(outputModeMigration))
+  })
+})
+
+describe('setCacheSaveResultOutput', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it.each(CACHE_SAVE_STATE_VALUES)('sets cache-save-result to %s', value => {
+    const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
+
+    setCacheSaveResultOutput(value)
+
+    expect(mockSetOutput).toHaveBeenCalledWith('cache-save-result', value)
+  })
+})
+
+describe('outputs written by this module are declared in action.yaml', () => {
+  // A drift here means an output some caller relies on silently stops existing in the
+  // metadata GitHub Actions actually reads (or a typo diverges the two), and nothing else
+  // catches it: every existing test here mocks core.setOutput and never touches action.yaml.
+  it('every core.setOutput key in outputs.ts has a matching action.yaml output', () => {
+    const outputsSource = readFileSync(join(import.meta.dirname, 'outputs.ts'), 'utf8')
+    const declaredKeys = [...outputsSource.matchAll(/core\.setOutput\(\s*'([^']+)'/g)]
+      .map(match => match[1])
+      .filter((key): key is string => key != null)
+    expect(declaredKeys.length).toBeGreaterThan(0)
+
+    const actionYaml = parse(readFileSync(join(import.meta.dirname, '..', '..', '..', 'action.yaml'), 'utf8')) as {
+      outputs?: Record<string, unknown>
+    }
+    expect(actionYaml.outputs).toBeDefined()
+
+    for (const key of new Set(declaredKeys)) {
+      expect(actionYaml.outputs).toHaveProperty(key)
+    }
   })
 })
