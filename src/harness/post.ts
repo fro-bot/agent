@@ -3,8 +3,10 @@ import type {Logger} from '../shared/logger.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
 import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-bot/runtime'
+import {writeCacheSaveResultSummary} from '../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
+import {parseCacheSaveStateValue, toCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {
   getGitHubRepository,
   getGitHubRunAttempt,
@@ -65,7 +67,11 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
   const logger = options.logger ?? createLogger({phase: 'post'})
 
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
-  const cacheSaved = core.getState(STATE_KEYS.CACHE_SAVED)
+  // parseCacheSaveStateValue treats an absent key (main step crashed before cleanup ran)
+  // or an unrecognized value (e.g. 'true' from an older action version, or corrupted
+  // state) as 'not-persisted' -- fail toward retrying the save, never toward skipping it,
+  // since this post hook is the last chance to persist state for the run.
+  const cacheSaved = parseCacheSaveStateValue(core.getState(STATE_KEYS.CACHE_SAVED))
   const sessionId = core.getState(STATE_KEYS.SESSION_ID) || null
   const opencodeVersion = core.getState(STATE_KEYS.OPENCODE_VERSION) || null
   const storeConfig = reconstructStoreConfigFromState()
@@ -83,7 +89,16 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
     return
   }
 
-  if (cacheSaved === 'true') {
+  if (cacheSaved === 'durable' || cacheSaved === 'store-only' || cacheSaved === 'skipped') {
+    // durable: the cache write itself already persisted -- nothing left to do.
+    // store-only: the object store already persisted the same state independently of the
+    //   cache write. The skip here is justified by durability already achieved through
+    //   that other backend, NOT by an inference that retrying the cache write would fail
+    //   again -- that futility argument is exactly the inference this plan's Key Technical
+    //   Decisions reject (see cache-save-result.ts's CacheSaveOutcome doc on cache-rejected).
+    //   Repeating the save here would only repeat the store upload, adding no durability.
+    // skipped: SKIP_CACHE=true or no cacheable content -- a deliberate no-op; retrying
+    //   would just repeat the same no-op.
     logger.info('Skipping post-action: cache already saved by main action', {cacheSaved})
   } else {
     const runId = String(getGitHubRunId())
@@ -115,12 +130,25 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
         ...(storeConfig == null ? {} : {storeConfig}),
       }
 
-      const saved = await saveCache(cacheSaveOptions)
+      const saveResult = await saveCache(cacheSaveOptions)
 
-      if (saved) {
+      // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
+      // after every other step in the job, so no downstream step could ever read it even if
+      // the write succeeded. The job summary is the only surface available here.
+      await writeCacheSaveResultSummary(toCacheSaveStateValue(saveResult), logger)
+
+      // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
+      // its own line naming it, so a checkpoint decline is distinguishable from a
+      // rejected/errored cache write.
+      if (saveResult.cachePersisted === true) {
         logger.info('Post-action cache saved', {sessionId})
-      } else {
+      } else if (saveResult.outcome === 'skipped-empty') {
         logger.info('Post-action: no cache content to save', {sessionId})
+      } else {
+        logger.info(`Post-action cache save did not persist (${saveResult.outcome})`, {
+          sessionId,
+          storePersisted: saveResult.storePersisted,
+        })
       }
     } catch (error) {
       logger.warning('Post-action cache save failed (non-fatal)', {

@@ -1,3 +1,4 @@
+import type {CacheSaveResult} from '../../shared/cache-save-result.js'
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -114,7 +115,7 @@ async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Pr
   }
 }
 
-export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
+export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveResult> {
   const {
     components,
     runId,
@@ -128,10 +129,15 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
 
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache save (SKIP_CACHE=true)')
-    return true
+    return {cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'}
   }
 
   const saveKey = buildSaveCacheKey(components, runId)
+  // Tracked across the try block (and visible to the catch below) because the store sync
+  // and the cache write are independent backends: a thrown error from the cache write
+  // (including the caught "already exists" collision) must not erase whatever the object
+  // store already durably persisted earlier in the same attempt.
+  let storePersisted = false
 
   try {
     await deleteAuthJson(authPath, storagePath, logger)
@@ -154,7 +160,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
         reason: checkpointOutcome.reason,
       })
       await writeCheckpointDeclineSummary(checkpointOutcome.reason, logger)
-      return false
+      return {cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'}
     }
 
     const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
@@ -163,7 +169,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
     const hasContent = await hasCacheableContent(storagePath, cachePaths)
     if (hasContent === false) {
       logger.info('No storage content to cache')
-      return false
+      return {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'}
     }
 
     await writeStorageVersion(storagePath)
@@ -180,6 +186,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
           logger,
         )
         logger.info('Object store session sync completed', syncResult)
+        storePersisted = syncResult.uploaded > 0 && syncResult.failed === 0
       } catch (error) {
         logger.warning('Object store session sync failed (non-fatal)', {
           error: toErrorMessage(error),
@@ -189,23 +196,29 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
 
     const cacheId = await cacheAdapter.saveCache(cachePaths, saveKey)
     // @actions/cache returns -1 for both write failures and reservation collisions. The
-    // adapter exposes no reason, so report the save as unpersisted rather than claiming success.
+    // adapter exposes no reason, so report the save as unpersisted (cache-rejected) rather
+    // than claiming success — see the CacheSaveOutcome doc comment for why this is one
+    // outcome rather than two.
     if (cacheId === -1) {
       logger.warning('Cache save did not persist', {saveKey})
-      return false
+      return {cachePersisted: false, storePersisted, outcome: 'cache-rejected'}
     }
 
     logger.info('Cache saved', {saveKey})
-    return true
+    return {cachePersisted: true, storePersisted, outcome: 'persisted'}
   } catch (error) {
     if (error instanceof Error && error.message.includes('already exists')) {
       logger.info('Cache key already exists, skipping save')
-      return true
+      // Fold-in, not a separate outcome: a "key already exists" collision means some
+      // concurrent job's save already committed this key, so the state is durably present
+      // under it regardless of which run wrote it. Distinguishing it from a normal
+      // success would not change what a caller should do with the result.
+      return {cachePersisted: true, storePersisted, outcome: 'persisted'}
     }
 
     logger.warning('Cache save failed', {
       error: toErrorMessage(error),
     })
-    return false
+    return {cachePersisted: false, storePersisted, outcome: 'cache-error'}
   }
 }

@@ -1,3 +1,4 @@
+export type {CacheSaveOutcome, CacheSaveResult} from '../../shared/cache-save-result.js'
 export {buildCacheKeyComponents, buildPrimaryCacheKey, buildRestoreKeys, buildSaveCacheKey} from './cache-key.js'
 export type {CacheKeyComponents} from './cache-key.js'
 export {checkpointDatabase} from './checkpoint.js'

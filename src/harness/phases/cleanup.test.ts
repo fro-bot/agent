@@ -6,6 +6,14 @@ import {ok} from '../../shared/types.js'
 
 vi.mock('@actions/core', () => ({
   saveState: vi.fn(),
+  setOutput: vi.fn(),
+  warning: vi.fn(),
+  summary: {
+    addHeading: vi.fn().mockReturnThis(),
+    addTable: vi.fn().mockReturnThis(),
+    addRaw: vi.fn().mockReturnThis(),
+    write: vi.fn().mockResolvedValue(undefined),
+  },
 }))
 
 vi.mock('../../features/agent/index.js', () => ({
@@ -25,7 +33,7 @@ vi.mock('../../services/cache/index.js', async importOriginal => {
   return {
     ...original,
     buildCacheKeyComponents: vi.fn(() => ({agentIdentity: 'github'})),
-    saveCache: vi.fn(async () => true),
+    saveCache: vi.fn(async () => ({cachePersisted: true, storePersisted: false, outcome: 'persisted'})),
   }
 })
 
@@ -352,6 +360,51 @@ describe('runCleanup', () => {
       'OpenCode server did not confirm shutdown within the quiescence window; the checkpoint that follows may race a still-live writer',
     )
     expect(logger.warning).not.toHaveBeenCalledWith('Server shutdown failed (non-fatal)', expect.any(Object))
+  })
+
+  it('continues past a throwing cache-save-result output write to still upload artifacts and save state', async () => {
+    // #given core.setOutput throws (e.g. no GITHUB_OUTPUT file available) -- this must not
+    // short-circuit the summary write, artifact upload, or the CACHE_SAVED state handoff
+    // the post hook depends on
+    const {saveState, setOutput, warning} = await import('@actions/core')
+    vi.mocked(setOutput).mockImplementationOnce(() => {
+      throw new Error('no GITHUB_OUTPUT file')
+    })
+    process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+    const {uploadLogArtifact} = await import('../../services/artifact/index.js')
+    vi.mocked(uploadLogArtifact).mockResolvedValueOnce(true)
+
+    const logger = createMockLogger()
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs and the output write throws
+    await expect(
+      runCleanup({
+        bootstrapLogger: logger,
+        reactionCtx: null,
+        githubClient: null,
+        agentSuccess: true,
+        attachmentResult: null,
+        serverHandle: null,
+        sessionRetention: null,
+        detectedOpencodeVersion: '1.0.0',
+        storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+        metrics: createMetricsCollector(),
+        agentIdentity: 'github',
+        repo: 'owner/repo',
+        runId: 'run-123',
+        lockEtag: null,
+      }),
+    ).resolves.toBeUndefined()
+
+    // #then the throw is caught and logged via cacheLogger (core.warning), not left to
+    // crash cleanup
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('Failed to set cache-save-result output (non-fatal)'))
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('no GITHUB_OUTPUT file'))
+    // #and CACHE_SAVED state was still saved for the post hook to read back
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'durable')
+    // #and the artifact upload still ran afterward
+    expect(uploadLogArtifact).toHaveBeenCalled()
   })
 
   it('skips pruning when there is no live server handle', async () => {

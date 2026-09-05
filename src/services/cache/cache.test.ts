@@ -1022,7 +1022,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then returns success
-    expect(result).toBe(true)
+    expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
   })
 
   it('returns false and warns when save returns the failure sentinel', async () => {
@@ -1049,10 +1049,45 @@ describe('saveCache', () => {
     })
 
     // #then the failure sentinel is reported as an unpersisted cache
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
     expect(logger.warning).toHaveBeenCalledWith('Cache save did not persist', {
       saveKey: 'opencode-storage-github-owner-repo-main-Linux-98765',
     })
+  })
+
+  it('treats a partially-failed sync as not persisted, even with uploads > 0', async () => {
+    // #given storage with content, a sync that uploaded some files but failed others, and
+    // a cache write that also fails -- the headline case: neither backend fully landed
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    vi.resetModules()
+    vi.doMock('@fro-bot/runtime', async () => {
+      const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
+      return {...actual, syncSessionsToStore: vi.fn(async () => ({uploaded: 2, failed: 1}))}
+    })
+
+    const {saveCache: saveCacheWithPartialSync} = await import('./index.js')
+    const adapter = createMockCacheAdapter({saveResult: -1})
+
+    // #when saving cache
+    const result = await saveCacheWithPartialSync({
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter(),
+    })
+
+    // #then storePersisted is false despite uploaded > 0 -- a partial sync is not durable --
+    // and cache-rejected drives the post hook to retry rather than skip
+    expect(result).toEqual({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
+
+    vi.doUnmock('@fro-bot/runtime')
+    vi.resetModules()
   })
 
   it('writes to object store and cache when configured', async () => {
@@ -1093,7 +1128,7 @@ describe('saveCache', () => {
     // #then only the main db is uploaded — the write-ahead log never crosses the object-
     // store boundary, even though the test's own connection keeps it present (truncated
     // to zero bytes by the checkpoint, not unlinked, since the connection stays open)
-    expect(result).toBe(true)
+    expect(result).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
     expect(upload).toHaveBeenCalledTimes(1)
     expect(upload.mock.calls[0]?.[0]).toBe('fro-bot-state/github/owner/repo/sessions/opencode.db')
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
@@ -1122,7 +1157,7 @@ describe('saveCache', () => {
       storeAdapter,
     })
 
-    expect(result).toBe(true)
+    expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
     expect(storeAdapter.upload).not.toHaveBeenCalled()
   })
@@ -1159,9 +1194,93 @@ describe('saveCache', () => {
       }),
     })
 
-    expect(result).toBe(true)
+    expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
     expect(logger.warning).toHaveBeenCalled()
+  })
+
+  it('reports cache-rejected but durable via the store when the object store persists and the cache write returns -1 (the case this plan exists for)', async () => {
+    // #given storage with content, a real hot-WAL database so the pre-save checkpoint
+    // succeeds, an object store that persists successfully, and a cache adapter that
+    // returns the -1 failure sentinel
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const dbDir = path.dirname(storagePath)
+    const db = new DatabaseSync(path.join(dbDir, 'opencode.db'))
+    db.exec('PRAGMA journal_mode=WAL')
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
+    const saveCacheSpy = vi.fn(async () => -1)
+
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.3.13',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter({upload}),
+    })
+
+    // #then the object store durably persisted the session even though the cache write was
+    // rejected — exactly the double-sync bug this result type exists to make visible
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: true, outcome: 'cache-rejected'})
+    expect(upload).toHaveBeenCalledTimes(1)
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+
+    db.close()
+  })
+
+  it('skips both backends without attempting a checkpoint or upload when SKIP_CACHE=true', async () => {
+    // #given storage with content, an object store configured, and SKIP_CACHE set
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
+    const saveCacheSpy = vi.fn(async () => 1)
+    const previousSkipCache = process.env.SKIP_CACHE
+    process.env.SKIP_CACHE = 'true'
+
+    try {
+      // #when saving cache
+      const result = await saveCache({
+        components: testComponents,
+        runId: 98765,
+        logger: createTestLogger(),
+        storagePath,
+        authPath,
+        cacheAdapter: {
+          restoreCache: async () => undefined,
+          saveCache: saveCacheSpy,
+        },
+        storeConfig: testStoreConfig,
+        storeAdapter: createMockStoreAdapter({upload}),
+      })
+
+      // #then the save is a deliberate no-op and neither backend is ever attempted —
+      // not merely skipped after a checkpoint or content check ran
+      expect(result).toMatchObject({
+        cachePersisted: false,
+        storePersisted: false,
+        outcome: 'skipped-by-configuration',
+      })
+      expect(saveCacheSpy).not.toHaveBeenCalled()
+      expect(upload).not.toHaveBeenCalled()
+    } finally {
+      if (previousSkipCache === undefined) {
+        delete process.env.SKIP_CACHE
+      } else {
+        process.env.SKIP_CACHE = previousSkipCache
+      }
+    }
   })
 
   it('returns false when storage has no content', async () => {
@@ -1182,7 +1301,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then returns false (nothing to save)
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'})
   })
 
   it('returns false when storage does not exist', async () => {
@@ -1201,7 +1320,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then returns false
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'})
   })
 
   // --- SQLite-backend regression tests (OpenCode 1.17.x) ---
@@ -1233,7 +1352,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then save proceeds (DB content is sufficient) and cacheAdapter.saveCache is called
-    expect(result).toBe(true)
+    expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
     const capturedPaths = saveCacheSpy.mock.calls[0]?.[0]
     expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db'))
@@ -1283,7 +1402,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then returns false — no content from either source; adapter never called
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'})
     expect(saveCacheSpy).not.toHaveBeenCalled()
   })
 
@@ -1311,7 +1430,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then returns false — zero-size DB is not real content; adapter never called
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'})
     expect(saveCacheSpy).not.toHaveBeenCalled()
   })
 
@@ -1351,7 +1470,7 @@ describe('saveCache', () => {
 
     // #then no cacheable content is reported and the adapter is never called — the WAL
     // content is real but unreachable through the save boundary
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'})
     expect(saveCacheSpy).not.toHaveBeenCalled()
   })
 
@@ -1382,7 +1501,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then no cacheable content is reported and the adapter is never called
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'})
     expect(saveCacheSpy).not.toHaveBeenCalled()
   })
 
@@ -1411,7 +1530,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then returns false — no non-empty DB-family file; adapter never called
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'})
     expect(saveCacheSpy).not.toHaveBeenCalled()
   })
 
@@ -1437,7 +1556,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then save proceeds as before
-    expect(result).toBe(true)
+    expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
   })
 
@@ -1464,7 +1583,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then returns true (treated as success)
-    expect(result).toBe(true)
+    expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
   })
 
   it('returns false on other save errors', async () => {
@@ -1488,7 +1607,7 @@ describe('saveCache', () => {
     const result = await saveCache(options)
 
     // #then returns false
-    expect(result).toBe(false)
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'cache-error'})
   })
 
   it('deletes auth.json inside storage before save', async () => {
