@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-09-04"
-updated-by: "pr-1530"
+last-updated: "2026-09-05"
+updated-by: "pr-1545"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -95,19 +95,19 @@ These can be overridden per-run via action inputs (`opencode-version`, `omo-vers
 
 Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
 
-The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.21+harness.22dee0ee`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.29+harness.88b6b5fb`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.18.21`) published by the `anomalyco/opencode` project. A _harness_ version carries a `harness.<sha>` suffix (for example `1.18.21+harness.22dee0ee`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries twelve such refs on top of the `1.18.21` base, spanning provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, and several memory-leak and stability patches; as the base advanced up the `1.18.x` line to `1.18.21`, superseded and low-value carries were retired so the set stays lean. The exact carry set is defined in the `integrationRefs` list of `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.18.29`) published by the `anomalyco/opencode` project. A _harness_ version carries a `harness.<sha>` suffix (for example `1.18.29+harness.88b6b5fb`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The current build carries thirteen such refs on top of the `1.18.29` base, spanning provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, several memory-leak and stability patches, and a bound on the plugin npm install; as the base advanced up the `1.18.x` line to `1.18.29`, superseded and low-value carries were retired so the set stays lean. The exact carry set is defined in the `integrationRefs` list of `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
 ### Two Spellings of the Same Build
 
 A harness build has one identity but two written forms, and understanding why they differ explains most of the surrounding machinery.
 
-The **build-metadata form** — `1.18.21+harness.22dee0ee` — is what the binary self-reports and what the version pin in `packages/runtime/src/shared/constants.ts` records. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
+The **build-metadata form** — `1.18.29+harness.88b6b5fb` — is what the binary self-reports and what the version pin in `packages/runtime/src/shared/constants.ts` records. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
 
-The **prerelease form** — `1.18.21-harness.22dee0ee` — is the published GitHub release tag, the npm package version, and the tool-cache key.
+The **prerelease form** — `1.18.29-harness.88b6b5fb` — is the published GitHub release tag, the npm package version, and the tool-cache key.
 
 The prerelease form is not cosmetic. Harness releases live in the same tag namespace as the action's own `v0.x` product releases, and that namespace has two adversarial readers. Semantic-release scans tags matching `^v(.+)` to compute the next product version, so harness tags dropped the `v` prefix in mid-2026 to stay invisible to it. But bare-semver tags with build metadata created a second problem: because SemVer strips build metadata for precedence, Renovate's `github-tags` datasource — which discovers candidates from git tags, not release objects — read `1.18.21+harness.22dee0ee` as a _stable_ `1.18.21` that outranked the real `v0.x` action line, quietly breaking grouped update branches in consuming repositories. Marking the GitHub release object as a prerelease does not help, because candidate discovery never looks at release objects.
 
