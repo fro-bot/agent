@@ -78,7 +78,7 @@ The root cause was one defect wearing two masks: `shutdown()` signalled the Open
 
 **Stop transporting the log** — from _both_ `DB_TRANSPORTABLE_BASENAMES` (object store) and `buildSaveCachePaths` (Actions cache), which are independent producers of the same rule.
 
-**Handle legacy state per source**, because the two transports differ in kind. An Actions cache entry is one atomic archive, so a legacy database+log pair genuinely came from the same save and its log may hold real committed transactions — it is checkpointed, never discarded. An object-store prefix has no generation marker across independently-overwritten keys, so its log is untrusted and deleted before anything opens the database.
+**Handle legacy state per source**, because the two transports differ in kind. An Actions cache entry is one atomic archive, so a legacy database+log pair genuinely came from the same save and its log may hold real committed transactions — it is checkpointed, never discarded. (Since the second regression below was fixed, such an archive carries a version the restore can no longer match, so this path is never reached in production — the code and its test remain, the entries do not.) An object-store prefix has no generation marker across independently-overwritten keys, so its log is untrusted and deleted before anything opens the database.
 
 ## Why This Works
 
@@ -126,9 +126,8 @@ The same change removed `opencode.db-wal` and `-shm` from the save-side path lis
 ## Related
 
 - Issue [#1407](https://github.com/fro-bot/agent/issues/1407), PR [#1519](https://github.com/fro-bot/agent/pull/1519)
-- [A read-only Actions cache token broke session continuity](../integration-issues/read-only-actions-cache-token-broke-session-continuity-2026-08-11.md) — same subsystem, different cause: there the save genuinely failed and reported success; here the save genuinely succeeded and persisted the wrong thing.
+- [A read-only Actions cache token broke session continuity](../integration-issues/read-only-actions-cache-token-broke-session-continuity-2026-08-11.md) — same subsystem, two earlier silent losses of continuity with opposite mechanisms: there a save was denied and reported as success; here a save succeeded and, after the second regression below, was unrestorable.
 - [S3 restore needs ListBucket and prefix scope](../security-issues/s3-restore-needs-listbucket-and-prefix-scope-2026-08-12.md) — restore capability cannot be inferred from the save path. The same asymmetry appears here as the source-specific legacy split.
 - [A present signal is not evidence of the effect it implies](../workflow-issues/verify-behavior-not-signal-2026-08-23.md) — the general form of the checkpoint-count and construction-probe traps above.
 - [Terminal outcomes must survive deadline cleanup](terminal-outcomes-must-survive-deadline-cleanup-2026-07-24.md) — adjacent: teardown semantics deciding what a run is allowed to record.
 - [A check written from inside its own premise cannot fail](../workflow-issues/a-check-written-from-inside-its-own-premise-cannot-fail-2026-09-04.md) — the parity test that compared one function's output to itself is item 12 there.
-- [A read-only Actions cache token broke session continuity](../integration-issues/read-only-actions-cache-token-broke-session-continuity-2026-08-11.md) — the previous silent loss of continuity; there a save was denied and reported as success, here a save succeeded and was unrestorable.
