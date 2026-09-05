@@ -213,10 +213,17 @@ async function attemptReadinessProbe(
   readinessTimeoutMs: number,
   logger: Logger,
 ): Promise<ReadinessProbeOutcome> {
+  // Classified by which signal actually fired, not by the rejection's name/type: a fetch
+  // implementation's abort surface is not a stable contract (undici's streaming teardown
+  // can wrap an abort as a TypeError with the real signal on `.cause`), and name-sniffing
+  // that misreads an abort as a transport fault burns a full retry budget before failing
+  // anyway -- the same mislabeling this classification exists to prevent, running the
+  // other direction. Held locally so the catch can check both without re-deriving them.
+  const timeoutSignal = AbortSignal.timeout(readinessTimeoutMs)
   try {
     const probe = await client.session.list({
       query: {directory: workspacePath},
-      signal: AbortSignal.any([outerSignal, AbortSignal.timeout(readinessTimeoutMs)]),
+      signal: AbortSignal.any([outerSignal, timeoutSignal]),
     })
     // A response.error here is a server answer, not a probe failure -- it proves
     // instance bootstrap completed.
@@ -227,9 +234,10 @@ async function attemptReadinessProbe(
     }
     return {kind: 'ready'}
   } catch (probeError) {
-    const name = probeError instanceof Error ? probeError.name : undefined
-    if (name === 'TimeoutError') return {kind: 'timeout'}
-    if (name === 'AbortError') return {kind: 'aborted'}
+    // Checked in this order because if both fired, the outer deadline is the cause that
+    // matters to the caller -- a cancelled run, not a stall this instance is responsible for.
+    if (outerSignal.aborted) return {kind: 'aborted'}
+    if (timeoutSignal.aborted) return {kind: 'timeout'}
     return {kind: 'transport', error: probeError}
   }
 }
@@ -326,7 +334,7 @@ export async function bootstrapOpenCodeServer(
       return err(
         new Error(
           `OpenCode server is listening but did not answer an instance-scoped request within ` +
-            `${readinessTimeoutMs}ms (${probeReadinessMs}ms elapsed) — instance bootstrap is blocked`,
+            `${readinessTimeoutMs}ms per attempt (${probeReadinessMs}ms total probe time) — instance bootstrap is blocked`,
         ),
       )
     }

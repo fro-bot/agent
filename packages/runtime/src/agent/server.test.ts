@@ -364,14 +364,15 @@ describe('bootstrapOpenCodeServer', () => {
       expect(loggedFields?.readinessMs).toBeLessThanOrEqual(loggedFields?.elapsedMs ?? -1)
     })
 
-    it('fails with a named instance-bootstrap error and closes the server when the probe rejects with a timeout/abort error', async () => {
-      // #given a probe that rejects the way AbortSignal.timeout() would once its budget
-      // elapses — the server never answered an instance-scoped request
+    it('fails with a named instance-bootstrap error and closes the server when the readiness timeout genuinely elapses', async () => {
+      // #given a probe that outlasts its own composed signal's timeout -- classified by
+      // signal state (timeoutSignal.aborted), not by the shape of whatever it rejects with,
+      // so the rejection here is deliberately generic
       const logger = createMockLogger()
       const closeSpy = vi.fn()
-      const abortError = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
       const mockClient = createMockClient(async () => {
-        throw abortError
+        await new Promise(resolve => setTimeout(resolve, 60))
+        throw new Error('probe never answered before the readiness timeout fired')
       })
       vi.mocked(createOpencode).mockImplementation(async options => {
         const port = (options as {port?: number}).port
@@ -382,16 +383,16 @@ describe('bootstrapOpenCodeServer', () => {
       })
       const controller = new AbortController()
 
-      // #when
-      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+      // #when a short injected readiness bound elapses well before the probe rejects
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH, undefined, 30)
 
       // #then
       expect(result.success).toBe(false)
       const message = result.success ? undefined : result.error.message
       expect(message).toContain('instance bootstrap is blocked')
-      expect(message).toContain('60000ms')
+      expect(message).toContain('30ms per attempt')
       expect(closeSpy).toHaveBeenCalledTimes(1)
-    })
+    }, 2000)
 
     it('reports cancellation, not a server stall, when the outer signal aborts while the probe is pending', async () => {
       // #given a probe whose rejection is caused by the caller's own execution deadline
@@ -455,6 +456,36 @@ describe('bootstrapOpenCodeServer', () => {
         'OpenCode readiness probe failed (retrying once)',
         expect.objectContaining({error: expect.stringContaining('ECONNRESET') as string}),
       )
+    })
+
+    it('gives the retry a fresh, not-yet-aborted signal (a fresh readiness budget per attempt)', async () => {
+      // #given a first attempt that fails transiently, and a second attempt (the retry) that
+      // captures the signal it was actually called with
+      const logger = createMockLogger()
+      let callCount = 0
+      let secondAttemptSignal: AbortSignal | undefined
+      const mockClient = createMockClient(async (options: unknown) => {
+        callCount += 1
+        if (callCount === 1) throw Object.assign(new Error('read ECONNRESET'), {code: 'ECONNRESET'})
+        secondAttemptSignal = (options as {signal: AbortSignal}).signal
+        return {data: [], error: undefined}
+      })
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+        }
+      })
+      const controller = new AbortController()
+
+      // #when
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+      // #then the retry gets its own fresh timeout window, not one already burned by the
+      // first attempt's own AbortSignal.timeout() -- pinning the retry's one behavioral cost
+      expect(result.success).toBe(true)
+      expect(secondAttemptSignal?.aborted).toBe(false)
     })
 
     it('fails naming a transport failure, not a stall, when both probe attempts reject with a transient error', async () => {
@@ -522,15 +553,16 @@ describe('bootstrapOpenCodeServer', () => {
     }, 2000)
 
     it('keeps the bootstrap-blocked message, not the cancellation message, when the outer signal aborts during the post-probe quiescence wait', async () => {
-      // #given a genuine TimeoutError from the probe (not caused by the outer signal), and a
-      // real listener standing in for a child that is slow to exit -- the quiescence wait
-      // stays pending for a beat, giving the outer signal room to abort mid-wait. A second
-      // read of signal.aborted after that wait would wrongly relabel this as a cancellation.
+      // #given a probe that outlasts its own readiness timeout (classified 'timeout' by
+      // signal state, before the outer signal ever aborts), and a real listener standing in
+      // for a child that is slow to exit -- the quiescence wait stays pending for a beat,
+      // giving the outer signal room to abort mid-wait. A second read of signal.aborted after
+      // that wait would wrongly relabel this already-decided timeout as a cancellation.
       const logger = createMockLogger()
       const controller = new AbortController()
-      const timeoutError = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
       const mockClient = createMockClient(async () => {
-        throw timeoutError
+        await new Promise(resolve => setTimeout(resolve, 60))
+        throw new Error('probe never answered before the readiness timeout fired')
       })
       vi.mocked(createOpencode).mockImplementation(async options => {
         const port = (options as {port?: number}).port as number
@@ -541,14 +573,16 @@ describe('bootstrapOpenCodeServer', () => {
         const closeSpy = vi.fn(() => {
           // The outer signal aborts (below) before this listener actually closes --
           // simulating a child that takes a moment to exit after the kill signal.
-          setTimeout(() => listener.close(), 80)
+          setTimeout(() => listener.close(), 150)
         })
         return {client: mockClient as never, server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy}}
       })
 
-      // #when the outer signal aborts partway through the quiescence wait
-      const resultPromise = bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
-      setTimeout(() => controller.abort(), 30)
+      // #when a short readiness bound elapses at ~30ms (probe rejects at ~60ms, already
+      // classified 'timeout'), then the outer signal aborts at ~100ms -- during the
+      // quiescence wait, well after the classification already happened
+      const resultPromise = bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH, undefined, 30)
+      setTimeout(() => controller.abort(), 100)
       const result = await resultPromise
 
       // #then the message still names the genuine stall, decided at the moment the probe
