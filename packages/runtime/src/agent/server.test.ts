@@ -19,6 +19,21 @@ function createMockLogger(): Logger {
   }
 }
 
+const WORKSPACE_PATH = '/workspace/repo'
+
+// Default readiness-probe stand-in: resolves as a healthy server answering the
+// instance-scoped session.list probe bootstrapOpenCodeServer now issues before
+// reporting success. Individual tests override this via the sessionList param to
+// exercise the error-body-is-still-ready and rejection-is-not-ready paths.
+function createMockClient(
+  sessionList: (options: unknown) => Promise<unknown> = async () => ({
+    data: [],
+    error: undefined,
+  }),
+) {
+  return {session: {list: vi.fn(sessionList)}}
+}
+
 describe('bootstrapOpenCodeServer', () => {
   let envSnapshot: NodeJS.ProcessEnv
 
@@ -46,14 +61,14 @@ describe('bootstrapOpenCodeServer', () => {
       capturedEnvUrl = process.env.FRO_BOT_OPENCODE_URL
       const port = (options as {port?: number}).port
       return {
-        client: {} as never,
+        client: createMockClient() as never,
         server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
       }
     })
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
 
     // #then
     expect(result.success).toBe(true)
@@ -75,14 +90,14 @@ describe('bootstrapOpenCodeServer', () => {
       capturedPinnedUrlAtSpawn = process.env.FRO_BOT_OPENCODE_URL
       const port = (options as {port?: number}).port
       return {
-        client: {} as never,
+        client: createMockClient() as never,
         server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
       }
     })
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
 
     // #then
     expect(result.success).toBe(true)
@@ -98,14 +113,14 @@ describe('bootstrapOpenCodeServer', () => {
     vi.mocked(createOpencode).mockImplementation(async options => {
       const port = (options as {port?: number}).port
       return {
-        client: {} as never,
+        client: createMockClient() as never,
         server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
       }
     })
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
 
     // #then
     expect(result.success).toBe(true)
@@ -118,13 +133,13 @@ describe('bootstrapOpenCodeServer', () => {
     const logger = createMockLogger()
     const closeSpy = vi.fn()
     vi.mocked(createOpencode).mockResolvedValue({
-      client: {} as never,
+      client: createMockClient() as never,
       server: {url: 'http://127.0.0.1:9999', close: closeSpy},
     })
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
 
     // #then
     expect(result.success).toBe(false)
@@ -140,7 +155,7 @@ describe('bootstrapOpenCodeServer', () => {
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
 
     // #then
     expect(result.success).toBe(false)
@@ -154,14 +169,14 @@ describe('bootstrapOpenCodeServer', () => {
     vi.mocked(createOpencode).mockImplementation(async options => {
       const port = (options as {port?: number}).port
       return {
-        client: {} as never,
+        client: createMockClient() as never,
         server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
       }
     })
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
 
     // #then
     expect(result.success).toBe(true)
@@ -175,14 +190,14 @@ describe('bootstrapOpenCodeServer', () => {
     vi.mocked(createOpencode).mockImplementation(async options => {
       const port = (options as {port?: number}).port
       return {
-        client: {} as never,
+        client: createMockClient() as never,
         server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
       }
     })
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger, 12_000)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH, 12_000)
 
     // #then
     expect(result.success).toBe(true)
@@ -196,20 +211,24 @@ describe('bootstrapOpenCodeServer', () => {
     vi.mocked(createOpencode).mockImplementation(async options => {
       const port = (options as {port?: number}).port
       return {
-        client: {} as never,
+        client: createMockClient() as never,
         server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
       }
     })
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger, 7_500)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH, 7_500)
 
     // #then
     expect(result.success).toBe(true)
     expect(logger.debug).toHaveBeenCalledWith(
       'OpenCode server bootstrapped',
-      expect.objectContaining({timeoutMs: 7_500, elapsedMs: expect.any(Number) as number}),
+      expect.objectContaining({
+        timeoutMs: 7_500,
+        readinessMs: expect.any(Number) as number,
+        elapsedMs: expect.any(Number) as number,
+      }),
     )
   })
 
@@ -220,7 +239,7 @@ describe('bootstrapOpenCodeServer', () => {
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger, 7_500)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH, 7_500)
 
     // #then
     expect(result.success).toBe(false)
@@ -243,14 +262,14 @@ describe('bootstrapOpenCodeServer', () => {
     vi.mocked(createOpencode).mockImplementation(async options => {
       const port = (options as {port?: number}).port
       return {
-        client: {} as never,
+        client: createMockClient() as never,
         server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
       }
     })
     const controller = new AbortController()
 
     // #when
-    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
 
     // #then
     expect(result.success).toBe(false)
@@ -272,16 +291,124 @@ describe('bootstrapOpenCodeServer', () => {
     vi.mocked(createOpencode).mockImplementation(async options => {
       const port = (options as {port?: number}).port
       return {
-        client: {} as never,
+        client: createMockClient() as never,
         server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
       }
     })
     const controller = new AbortController()
 
     // #when / #then — the promise must resolve, not reject
-    const result = await bootstrapOpenCodeServer(controller.signal, logger)
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
     expect(result.success).toBe(false)
     expect(closeSpy).toHaveBeenCalledTimes(1)
+  })
+
+  describe('readiness probe', () => {
+    it('probes session.list scoped to workspacePath, with a signal, before reporting success', async () => {
+      // #given a mock client whose session.list resolves normally
+      const logger = createMockLogger()
+      const mockClient = createMockClient()
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+        }
+      })
+      const controller = new AbortController()
+
+      // #when
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+      // #then the probe is scoped to this workspace and carries an abortable signal — pinned
+      // exactly so a future refactor that drops `directory` (silently turning it into a
+      // non-instance-scoped probe) fails this test
+      expect(result.success).toBe(true)
+      expect(mockClient.session.list).toHaveBeenCalledExactlyOnceWith({
+        query: {directory: WORKSPACE_PATH},
+        signal: expect.any(AbortSignal) as AbortSignal,
+      })
+    })
+
+    it('reports success and logs readinessMs when the probe resolves with a response.error (the server answered)', async () => {
+      // #given a probe that resolves with an error body — a server answer, not a probe
+      // failure, since bootstrap must have completed for the server to respond at all
+      const logger = createMockLogger()
+      const mockClient = createMockClient(async () => ({data: undefined, error: 'not found'}))
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+        }
+      })
+      const controller = new AbortController()
+
+      // #when
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(logger.debug).toHaveBeenCalledWith(
+        'OpenCode server bootstrapped',
+        expect.objectContaining({readinessMs: expect.any(Number) as number}),
+      )
+    })
+
+    it('fails with a named instance-bootstrap error and closes the server when the probe rejects with a timeout/abort error', async () => {
+      // #given a probe that rejects the way AbortSignal.timeout() would once its budget
+      // elapses — the server never answered an instance-scoped request
+      const logger = createMockLogger()
+      const closeSpy = vi.fn()
+      const abortError = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+      const mockClient = createMockClient(async () => {
+        throw abortError
+      })
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
+        }
+      })
+      const controller = new AbortController()
+
+      // #when
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+      // #then
+      expect(result.success).toBe(false)
+      const message = result.success ? undefined : result.error.message
+      expect(message).toContain('instance bootstrap is blocked')
+      expect(message).toContain('60000ms')
+      expect(closeSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('fails the same way when the probe rejects with a generic network error', async () => {
+      // #given a probe that rejects with a plain network failure, not a timeout
+      const logger = createMockLogger()
+      const closeSpy = vi.fn()
+      const mockClient = createMockClient(async () => {
+        throw new Error('fetch failed')
+      })
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
+        }
+      })
+      const controller = new AbortController()
+
+      // #when
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+      // #then
+      expect(result.success).toBe(false)
+      const message = result.success ? undefined : result.error.message
+      expect(message).toContain('instance bootstrap is blocked')
+      expect(closeSpy).toHaveBeenCalledTimes(1)
+    })
   })
 
   describe('shutdown() quiescence', () => {
@@ -294,12 +421,12 @@ describe('bootstrapOpenCodeServer', () => {
       vi.mocked(createOpencode).mockImplementation(async options => {
         const port = (options as {port?: number}).port
         return {
-          client: {} as never,
+          client: createMockClient() as never,
           server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
         }
       })
       const controller = new AbortController()
-      const bootstrapResult = await bootstrapOpenCodeServer(controller.signal, logger)
+      const bootstrapResult = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
       expect(bootstrapResult.success).toBe(true)
       if (!bootstrapResult.success) return
 

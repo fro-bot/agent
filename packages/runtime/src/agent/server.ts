@@ -8,6 +8,7 @@ import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
 import {
   DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
+  DEFAULT_SERVER_READINESS_TIMEOUT_MS,
   DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS,
   DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
 } from '../shared/constants.js'
@@ -195,6 +196,7 @@ export interface OpenCodeServerHandle {
 export async function bootstrapOpenCodeServer(
   signal: AbortSignal,
   logger: Logger,
+  workspacePath: string,
   timeoutMs: number = DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
 ): Promise<Result<OpenCodeServerHandle, Error>> {
   const startedAt = Date.now()
@@ -232,8 +234,48 @@ export async function bootstrapOpenCodeServer(
       server.close()
       return err(new Error(`OpenCode server URL mismatch: pinned ${pinnedUrl} but server bound to ${server.url}`))
     }
+    // createOpencode resolving means the HTTP listener bound (a stdout string match in
+    // the SDK), not that this instance is ready to answer. Per-directory instance
+    // bootstrap (config.get() -> plugin.init() -> service init) is lazy and serial in the
+    // server, so the first instance-scoped request pays for it. Forcing that here, with an
+    // explicit bound, moves the first blocked request to where its failure can be named
+    // instead of surfacing five minutes later as a bare "fetch failed" on the harness's own
+    // first real call. session.list is read-only and the harness issues this exact call
+    // moments later anyway, so this adds no new load -- it just names who pays for it.
+    // There is no health route to probe instead: /global/event is the only /global/ route,
+    // and any global route would report ready while instance bootstrap is still blocked --
+    // the same false-ready signal as the stdout match, one layer up.
+    const readinessStartedAt = Date.now()
+    try {
+      const probe = await client.session.list({
+        query: {directory: workspacePath},
+        signal: AbortSignal.timeout(DEFAULT_SERVER_READINESS_TIMEOUT_MS),
+      })
+      // A response.error here is a server answer, not a probe failure -- it proves
+      // instance bootstrap completed. Only a thrown rejection (timeout/abort/network)
+      // means the server never answered within the budget.
+      if (probe.error != null) {
+        logger.debug('OpenCode readiness probe answered with an error body (server is ready)', {
+          error: String(probe.error),
+        })
+      }
+    } catch (probeError) {
+      const probeMessage = probeError instanceof Error ? probeError.message : String(probeError)
+      logger.warning('OpenCode readiness probe failed', {
+        error: probeMessage,
+        readinessTimeoutMs: DEFAULT_SERVER_READINESS_TIMEOUT_MS,
+      })
+      server.close()
+      return err(
+        new Error(
+          `OpenCode server is listening but did not answer an instance-scoped request within ` +
+            `${DEFAULT_SERVER_READINESS_TIMEOUT_MS}ms — instance bootstrap is blocked`,
+        ),
+      )
+    }
+    const readinessMs = Date.now() - readinessStartedAt
     const elapsedMs = Date.now() - startedAt
-    logger.debug('OpenCode server bootstrapped', {url: server.url, timeoutMs, budgetedMs, elapsedMs})
+    logger.debug('OpenCode server bootstrapped', {url: server.url, timeoutMs, budgetedMs, readinessMs, elapsedMs})
     return ok({
       client,
       server,

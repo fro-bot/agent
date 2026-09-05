@@ -139,6 +139,7 @@ export async function runCacheRestore(
   const bootstrapResult = await bootstrapOpenCodeServer(
     abortController.signal,
     serverLogger,
+    workspacePath,
     bootstrap.inputs.serverBootstrapTimeoutMs,
   )
 

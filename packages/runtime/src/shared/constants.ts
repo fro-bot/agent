@@ -18,6 +18,20 @@ export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 // byte-for-byte identical to today while making the budget observable/adjustable.
 export const DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS = 5000
 
+// Bound on how long bootstrapOpenCodeServer waits for one instance-scoped readiness
+// probe (client.session.list({query: {directory}})) to answer after createOpencode
+// resolves. createOpencode resolving only means the HTTP listener bound -- it is a
+// stdout string match in the SDK, printed before per-directory instance bootstrap
+// (config.get() -> plugin.init() -> service init) has run. That bootstrap is lazy and
+// serial, so the first instance-scoped request pays for it; without this probe, that
+// request was the harness's own first real call, with no bound of its own beyond
+// undici's 300s default. This is a different phase than DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS
+// (which only bounds time-to-listen) and deliberately not the same constant: 60s is sized
+// to catch a multi-minute bootstrap stall in a fifth of the time while sitting far above
+// any healthy instance bootstrap (config load + local plugin resolve + LSP/vcs init, no
+// network involved post-#1530). Not operator-tunable via an action input yet.
+export const DEFAULT_SERVER_READINESS_TIMEOUT_MS = 60_000
+
 // Bound on how long shutdown() waits for the OpenCode child to actually go away before
 // returning control to the caller (src/harness/phases/cleanup.ts, immediately ahead of
 // the SQLite checkpoint). The SDK (@opencode-ai/sdk dist/server.js) exposes only
