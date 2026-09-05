@@ -1,7 +1,7 @@
 ---
 type: subsystem
 last-updated: "2026-09-05"
-updated-by: "pr-1514-cache-save-result"
+updated-by: "pr-1555"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
