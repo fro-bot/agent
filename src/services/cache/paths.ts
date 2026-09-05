@@ -100,6 +100,12 @@ export function buildDbWalPath(storagePath: string): string {
  * The single path list passed to both `@actions/cache`'s restoreCache and saveCache.
  * Called identically by restore.ts and save.ts — see the comment above for why a second,
  * merely-equivalent definition is not an acceptable alternative.
+ *
+ * Only pure when `opencodeVersion` is a string: a `null` version makes `isSqliteBackend`
+ * probe whether the global `opencode.db` exists on disk at call time (see
+ * `packages/runtime/src/session/version.ts`), so the result depends on filesystem state,
+ * not just these arguments — restore and save must be given the same version for the
+ * shared-hash guarantee above to hold.
  */
 export async function buildCachePaths(
   storagePath: string,
