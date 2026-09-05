@@ -181,7 +181,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
 
     const cacheLogger = createLogger({phase: 'cache-save'})
     const finalProjectIdPath = path.join(finalWorkspace, '.git', 'opencode')
-    const cacheSaved = await saveCache({
+    const cacheSaveResult = await saveCache({
       components: cacheComponents,
       runId: getGitHubRunId(),
       logger: cacheLogger,
@@ -192,7 +192,12 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
       storeConfig,
     })
 
-    if (cacheSaved) {
+    // Minimal adaptation to the structured result (Unit 1 of the cache-save-result-contract
+    // plan): reads .cachePersisted where this used to read the bare boolean. CACHE_SAVED
+    // stays a boolean here and does not yet distinguish store-only persistence or a
+    // deliberate skip — that widening to an enum, and the retry-gating logic it enables,
+    // is Unit 2's job.
+    if (cacheSaveResult.cachePersisted) {
       core.saveState(STATE_KEYS.CACHE_SAVED, 'true')
     }
 

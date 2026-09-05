@@ -25,7 +25,7 @@ vi.mock('../../services/cache/index.js', async importOriginal => {
   return {
     ...original,
     buildCacheKeyComponents: vi.fn(() => ({agentIdentity: 'github'})),
-    saveCache: vi.fn(async () => true),
+    saveCache: vi.fn(async () => ({cachePersisted: true, storePersisted: false, outcome: 'persisted'})),
   }
 })
 

@@ -182,7 +182,7 @@ The bolded row is the double-sync bug: durable in the object store, reported as 
 
 ## Implementation Units
 
-- [ ] **Unit 1: Structured save result**
+- [x] **Unit 1: Structured save result**
 
 **Goal:** `saveCache` reports which backends persisted and why it stopped.
 

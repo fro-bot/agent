@@ -100,7 +100,7 @@ describe('post action', () => {
       })
 
       const {saveCache} = await import('../services/cache/index.js')
-      vi.mocked(saveCache).mockResolvedValue(true)
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
 
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
@@ -124,7 +124,7 @@ describe('post action', () => {
       })
 
       const {saveCache} = await import('../services/cache/index.js')
-      vi.mocked(saveCache).mockResolvedValue(true)
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
 
       const {runPost} = await import('./post.js')
       await runPost({logger: createMockLogger()})
@@ -156,7 +156,7 @@ describe('post action', () => {
       })
 
       const {saveCache} = await import('../services/cache/index.js')
-      vi.mocked(saveCache).mockResolvedValue(true)
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
 
       const {runPost} = await import('./post.js')
       await runPost({logger: createMockLogger()})
@@ -189,7 +189,7 @@ describe('post action', () => {
       })
 
       const {saveCache} = await import('../services/cache/index.js')
-      vi.mocked(saveCache).mockResolvedValue(true)
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
 
       const {runPost} = await import('./post.js')
       await runPost({logger: createMockLogger()})
@@ -209,7 +209,7 @@ describe('post action', () => {
       })
 
       const {saveCache} = await import('../services/cache/index.js')
-      vi.mocked(saveCache).mockResolvedValue(false)
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'})
 
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
@@ -255,7 +255,7 @@ describe('post action', () => {
       })
 
       const {saveCache} = await import('../services/cache/index.js')
-      vi.mocked(saveCache).mockResolvedValue(true)
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
 
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
@@ -365,7 +365,7 @@ describe('post action', () => {
       })
 
       const {saveCache} = await import('../services/cache/index.js')
-      vi.mocked(saveCache).mockResolvedValue(true)
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
 
       const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
       vi.mocked(createS3Adapter).mockReturnValue({

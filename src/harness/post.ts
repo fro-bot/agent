@@ -115,9 +115,14 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
         ...(storeConfig == null ? {} : {storeConfig}),
       }
 
-      const saved = await saveCache(cacheSaveOptions)
+      const saveResult = await saveCache(cacheSaveOptions)
 
-      if (saved) {
+      // Minimal adaptation to the structured result (Unit 1 of the cache-save-result-
+      // contract plan): reads .cachePersisted where this used to read the bare boolean.
+      // This still reports every non-cache-persisted outcome (including store-only
+      // persistence) as "no cache content to save" — correcting that message and gating
+      // the retry on durability rather than cache success is Unit 2's job.
+      if (saveResult.cachePersisted) {
         logger.info('Post-action cache saved', {sessionId})
       } else {
         logger.info('Post-action: no cache content to save', {sessionId})

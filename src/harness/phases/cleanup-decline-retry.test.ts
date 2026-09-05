@@ -72,7 +72,11 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
     // #given cleanup's own checkpoint-and-save declines (e.g. the OpenCode child was still
     // shutting down when cleanup ran)
     const {saveCache} = await import('../../services/cache/index.js')
-    vi.mocked(saveCache).mockResolvedValueOnce(false)
+    vi.mocked(saveCache).mockResolvedValueOnce({
+      cachePersisted: false,
+      storePersisted: false,
+      outcome: 'checkpoint-declined',
+    })
 
     const {runCleanup} = await import('./cleanup.js')
     await runCleanup({
@@ -102,7 +106,7 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
     // ended — routing.ts sets shouldSaveCache during the run, before cleanup or post ever
     // look at it, so this mirrors real handoff state rather than cleanup's own concern
     mocks.stateStore.set('shouldSaveCache', 'true')
-    vi.mocked(saveCache).mockResolvedValueOnce(true)
+    vi.mocked(saveCache).mockResolvedValueOnce({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
 
     const {runPost} = await import('../post.js')
     const logger = createMockLogger()
@@ -117,7 +121,7 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
   it('skips the retry when cleanup already saved successfully', async () => {
     // #given cleanup's save succeeds
     const {saveCache} = await import('../../services/cache/index.js')
-    vi.mocked(saveCache).mockResolvedValueOnce(true)
+    vi.mocked(saveCache).mockResolvedValueOnce({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
 
     const {runCleanup} = await import('./cleanup.js')
     await runCleanup({
