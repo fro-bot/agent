@@ -131,6 +131,46 @@ describe('runCleanup', () => {
       }),
       expect.any(Object),
     )
+
+    // #then the marker is saved after the metadata upload succeeds -- this is what lets
+    // post.ts's retry branch tell "cleanup ran and uploaded the rich payload" apart from
+    // "cleanup never ran", where CACHE_SAVED's not-persisted value alone is ambiguous
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cleanupMetadataWritten', 'true')
+  })
+
+  it('does not mark cleanup metadata written when the upload fails', async () => {
+    // #given the metadata upload itself fails -- the rich payload never landed, so post.ts
+    // must still be free to write its own placeholder rather than silently skipping
+    const {createS3Adapter, syncMetadataToStore} = await import('@fro-bot/runtime')
+    vi.mocked(createS3Adapter).mockReturnValue({
+      upload: async () => ok(undefined),
+      download: async () => ok(undefined),
+      list: async () => ok([]),
+    })
+    vi.mocked(syncMetadataToStore).mockResolvedValueOnce({success: false})
+
+    const {runCleanup} = await import('./cleanup.js')
+    await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      agentSuccess: true,
+      attachmentResult: null,
+      serverHandle: null,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then
+    const {saveState} = await import('@actions/core')
+    expect(saveState).not.toHaveBeenCalledWith('cleanupMetadataWritten', 'true')
   })
 
   it('skips artifact and metadata uploads when storeConfig is disabled', async () => {

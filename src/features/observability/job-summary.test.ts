@@ -408,6 +408,19 @@ describe('writeCacheSaveResultSummary', () => {
     expect(remediationText).not.toContain('s3-backup')
   })
 
+  it('drops the post-action-retries clause for skipped-empty when reported from the post-retry phase itself', async () => {
+    // #given writeCacheSaveResultSummary(result, 'post-retry', logger) -- the post hook's
+    // own retry, which the retries clause would otherwise falsely describe as still
+    // pending
+    // #when
+    await writeCacheSaveResultSummary(skippedEmptyResult, 'post-retry', logger)
+
+    // #then the cause is still named, but nothing claims a retry will follow
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('No session state was found to save')
+    expect(remediationText).not.toContain('post-action step retries')
+  })
+
   it('reports a declined checkpoint distinctly from a rejected write, without s3-backup advice', async () => {
     // #given the SQLite WAL could not be checkpointed, so no write was even attempted
     // #when
@@ -421,6 +434,19 @@ describe('writeCacheSaveResultSummary', () => {
     expect(remediationText).toContain('post-action step retries')
     expect(remediationText).not.toContain('did not accept the write')
     expect(remediationText).not.toContain('s3-backup')
+  })
+
+  it('drops the post-action-retries clause for checkpoint-declined when reported from the post-retry phase itself', async () => {
+    // #given writeCacheSaveResultSummary(result, 'post-retry', logger) -- rendering this
+    // sentence from post.ts's own retry, which the clause would otherwise falsely
+    // describe as still pending
+    // #when
+    await writeCacheSaveResultSummary(checkpointDeclinedResult, 'post-retry', logger)
+
+    // #then the cause is still named, but nothing claims a retry will follow
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('could not be checkpointed')
+    expect(remediationText).not.toContain('post-action step retries')
   })
 
   it('does not fail the run when the summary write throws', async () => {
