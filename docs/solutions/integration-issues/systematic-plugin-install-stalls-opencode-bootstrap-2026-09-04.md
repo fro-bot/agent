@@ -96,7 +96,7 @@ Five decisions carry the fix, and each one closed a defect found in review:
 
 2. **Bounded at 420 seconds, sized against the failure, not against a healthy install.** The first draft used 120 seconds — below the 181–370 second stall it was fixing. A slow-but-valid install would have timed out, warned, continued, and then let the server perform the same install unbounded: paying the timeout *and* the original stall. A healthy install takes seconds, so the ceiling costs nothing in the common case.
 
-3. **Environment scrubbed with `filterAgentEnv`, never inherited.** The child runs `npm install` against a package fetched off the network, so it gets the same untrusted-child treatment `withScrubbedEnv` gives `createOpencode` — never `GITHUB_TOKEN`, `*_API_KEY`, `*_SECRET`, `AWS_*`, or `INPUT_*`. The first draft inherited `process.env` wholesale.
+3. **Environment scrubbed with `filterAgentEnv`, never inherited.** The child runs `npm install` against a package fetched off the network, so it gets the same untrusted-child treatment `withScrubbedEnv` gives `createOpencode`. The filter is deny-by-default: a key survives only if it matches an exact allowlist or one of a few operational prefixes, and the deny-set (`GITHUB_TOKEN`, `*_API_KEY`, `*_SECRET`, `AWS_*`, `INPUT_*`) is a backstop on top of that, not the primary guard — a new secret is dropped because it is not allowlisted, not because its name matches a pattern. The first draft inherited `process.env` wholesale.
 
 4. **The tools cache is saved only when the install completed** (`src/services/setup/setup.ts`):
 
@@ -122,7 +122,7 @@ Two harness defects made the stall invisible, and neither is fixed by this chang
 - **Readiness is a stdout string match.** `@opencode-ai/sdk`'s `createOpencodeServer` resolves when the child prints `opencode server listening` (`dist/server.js:33`). The listener binds before bootstrap runs, so `DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS` bounds only "time until that string appears." A server that binds, prints, and then blocks for five minutes satisfies the budget in two seconds.
 - **The first session call has no timeout.** It inherits undici's default `headersTimeout` of 300,000ms (`undici/lib/dispatcher/client.js:316`). That is why the failures land at 300.77 seconds and surface as a bare `fetch failed` rather than a bootstrap error with a name.
 
-Both are tracked as follow-ups: a real readiness probe inside the existing budget, and an explicit bound on the first request.
+Both are tracked in [#1536](https://github.com/fro-bot/agent/issues/1536): a real readiness probe inside the existing budget, and an explicit bound on the first request.
 
 ## Prevention
 

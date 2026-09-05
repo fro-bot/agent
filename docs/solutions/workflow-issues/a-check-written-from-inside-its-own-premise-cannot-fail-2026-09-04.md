@@ -84,12 +84,12 @@ const persisted = await readFile(path.join(target, 'b.jsonl'), 'utf8')
 expect(persisted.startsWith(DIAGNOSTIC_TRUNCATION_MARKER)).toBe(true)
 ```
 
-After — symmetric fixtures, and the assertion finds whichever file was truncated:
+After — symmetric fixtures, and the assertion finds whichever file was truncated (`evals/diagnostics.test.ts`):
 
 ```ts
-const logs = await Promise.all([readFile(aPath, 'utf8'), readFile(bPath, 'utf8')])
-const truncated = logs.find(log => log.startsWith(marker))
-expect(truncated).toBeDefined()
+const persistedLogs = ['a.log', 'b.jsonl'].map(fileName => readPersistedFile(diagnosticsPath, fileName))
+const truncatedLog = persistedLogs.find(log => log.startsWith(expectedMarker))
+expect(truncatedLog).toBeDefined()
 ```
 
 Verified by the reviewer on the Linux runner: traversal order there was `b.jsonl, a.log` — the reverse of what the first version assumed.
@@ -137,7 +137,12 @@ function boundDiagnostic(content: string, maxBytes: number): string
 After — every caller states which end it needs, with no default (`evals/diagnostics.ts`):
 
 ```ts
-function boundDiagnostic(content: string, maxBytes: number, keep: 'head' | 'tail'): string
+function boundDiagnostic(
+  text: string,
+  maxBytes: number,
+  marker: (maxBytes: number) => string,
+  keep: 'head' | 'tail',
+): string
 ```
 
 Logs keep the tail; `response.md` keeps the head, where its verdict and schema header live. A third caller, `readCapturedDiagnostics`, surfaced only when the parameter became required.
