@@ -166,7 +166,11 @@ describe('runCacheRestore database repair', () => {
       ref: 'main',
       os: 'Linux',
     })
-    mocks.getGitHubWorkspace.mockReturnValue('/workspace')
+    // Deliberately non-normalized (path.resolve collapses the '..' segment) so a test that
+    // asserts bootstrapOpenCodeServer receives the *normalized* form actually proves
+    // normalizeWorkspacePath ran, rather than passing vacuously because the raw and
+    // normalized forms happened to be byte-identical.
+    mocks.getGitHubWorkspace.mockReturnValue('/tmp/../workspace')
     mocks.getOpenCodeAuthPath.mockReturnValue('/xdg/opencode/auth.json')
     mocks.getOpenCodeStoragePath.mockReturnValue(testStoragePath)
     mocks.ensureProjectId.mockResolvedValue({projectId: 'a'.repeat(40), source: 'cached'})
@@ -195,6 +199,16 @@ describe('runCacheRestore database repair', () => {
       'Repaired restored database: checkpointed write-ahead log before bootstrap',
     )
     expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    // Pins the exact positional shape so passing projectIdPath (also in scope here) by
+    // mistake instead of the normalized workspace path is caught, not silently accepted.
+    // The raw mocked workspace ('/tmp/../workspace') and the normalized form ('/workspace')
+    // deliberately differ, so this assertion only passes if normalizeWorkspacePath actually ran.
+    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      '/workspace',
+      expect.anything(),
+    )
   })
 
   it('leaves an already-clean, usable database alone and logs nothing about repair', async () => {
