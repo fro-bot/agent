@@ -90,8 +90,28 @@ describe('post action', () => {
 
       const {saveCache} = await import('../services/cache/index.js')
       expect(saveCache).not.toHaveBeenCalled()
+      expect(logger.info).toHaveBeenCalledWith('Skipping post-action: cache saved by main action', expect.any(Object))
+    })
+
+    it('should skip cache save when cache was already saved to the object store only', async () => {
+      // #given the object store already persisted the session independently of the Actions
+      // cache write -- repeating the save here would only repeat that upload
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'store-only'
+        return ''
+      })
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      await runPost({logger})
+
+      const {saveCache} = await import('../services/cache/index.js')
+      expect(saveCache).not.toHaveBeenCalled()
       expect(logger.info).toHaveBeenCalledWith(
-        'Skipping post-action: cache already saved by main action',
+        'Skipping post-action: state persisted to the object store by main action',
         expect.any(Object),
       )
     })

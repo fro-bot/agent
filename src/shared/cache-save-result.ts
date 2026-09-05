@@ -11,12 +11,16 @@
  * - `cache-rejected`: the Actions cache write returned its `-1` failure sentinel. `@actions/cache@6.2.0`
  *   distinguishes a policy denial (`CacheWriteDeniedError`) from a reservation collision
  *   (`ReserveCacheError`) internally, but neither survives the `saveCache()` call
- *   boundary — both return `-1` with no further detail. **This is an inference, not an
- *   observation**: `cache-rejected` covers both causes because the boundary cannot
- *   distinguish them, not because they were determined to be one or the other. Do not
- *   infer which one occurred from the trigger type, runner configuration, or any other
- *   signal outside this call — a self-hosted runner or customized environment can hold a
- *   writable token even on a comment trigger.
+ *   boundary — both return `-1` with no further detail, as does a `FinalizeCacheError`, a
+ *   5xx server error, or an upload/archive failure (verified in `@actions/cache`'s
+ *   `saveCacheV2`: `cacheId` is only ever assigned on the success path, so every one of
+ *   these throws falls through to the same `-1` return). **This is an inference, not an
+ *   observation**: `cache-rejected` covers all of these causes because the boundary cannot
+ *   distinguish them, not because one was determined over the others. Do not infer which
+ *   one occurred from the trigger type, runner configuration, or any other signal outside
+ *   this call — a self-hosted runner or customized environment can hold a writable token
+ *   even on a comment trigger, and a transient service failure can happen regardless of
+ *   token permissions.
  * - `cache-error`: the save threw an error other than a caught "already exists" collision
  *   (see below). Distinct from `cache-rejected`: this is a thrown exception, not the `-1`
  *   sentinel.
@@ -58,12 +62,16 @@ export interface CacheSaveResult {
  *   here would only repeat the store upload, not add durability. See the branch in
  *   `post.ts` for why this is not the futility inference the plan's Key Technical
  *   Decisions reject.
- * - `skipped`: `SKIP_CACHE=true` or no cacheable content existed. Deliberate; retry would
- *   just repeat the same no-op.
- * - `not-persisted`: nothing durable happened (checkpoint declined, cache rejected/errored
- *   with no store persistence) — or the state value was absent or unrecognized. The post
- *   hook must retry here: an absent/garbled value must fail toward doing the work, never
- *   toward skipping it, because the post hook is the last chance to persist state.
+ * - `skipped`: `SKIP_CACHE=true`. A deliberate configuration opt-out; retry would just
+ *   repeat the same no-op.
+ * - `not-persisted`: nothing durable happened (checkpoint declined, no cacheable content
+ *   existed, cache rejected/errored with no store persistence) — or the state value was
+ *   absent or unrecognized. The post hook must retry here: an absent/garbled value must
+ *   fail toward doing the work, never toward skipping it, because the post hook is the
+ *   last chance to persist state. `skipped-empty` is included here (not folded into
+ *   `skipped`) because `hasCacheableContent` is a point-in-time filesystem observation,
+ *   not a configuration constant — a repeated attempt re-runs the checkpoint before
+ *   re-checking content, a small cost against losing a session.
  */
 export type CacheSaveStateValue = 'durable' | 'store-only' | 'skipped' | 'not-persisted'
 
@@ -84,7 +92,9 @@ type CacheSaveStateMapper = (result: CacheSaveResult) => CacheSaveStateValue
  */
 const OUTCOME_TO_STATE_VALUE = {
   'skipped-by-configuration': () => 'skipped',
-  'skipped-empty': () => 'skipped',
+  // Not folded into 'skipped': hasCacheableContent is a point-in-time filesystem
+  // observation, not a configuration constant, so this must retry rather than skip.
+  'skipped-empty': () => 'not-persisted',
   'checkpoint-declined': () => 'not-persisted',
   // A rejected or errored cache write is not-persisted UNLESS the object store already
   // achieved durability independently — the double-sync bug this plan exists to fix.

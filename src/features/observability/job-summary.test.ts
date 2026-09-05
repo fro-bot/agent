@@ -1,3 +1,4 @@
+import type {CacheSaveResult} from '../../shared/cache-save-result.js'
 import type {CommentSummaryOptions, RunMetrics} from './types.js'
 import * as core from '@actions/core'
 import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
@@ -290,6 +291,25 @@ describe('writeJobSummary', () => {
 describe('writeCacheSaveResultSummary', () => {
   const logger = createLogger({phase: 'test'})
 
+  const persistedResult: CacheSaveResult = {cachePersisted: true, storePersisted: false, outcome: 'persisted'}
+  const cacheRejectedResult: CacheSaveResult = {
+    cachePersisted: false,
+    storePersisted: false,
+    outcome: 'cache-rejected',
+  }
+  const storeOnlyResult: CacheSaveResult = {cachePersisted: false, storePersisted: true, outcome: 'cache-rejected'}
+  const skippedResult: CacheSaveResult = {
+    cachePersisted: false,
+    storePersisted: false,
+    outcome: 'skipped-by-configuration',
+  }
+  const skippedEmptyResult: CacheSaveResult = {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'}
+  const checkpointDeclinedResult: CacheSaveResult = {
+    cachePersisted: false,
+    storePersisted: false,
+    outcome: 'checkpoint-declined',
+  }
+
   beforeEach(() => {
     vi.clearAllMocks()
   })
@@ -297,7 +317,7 @@ describe('writeCacheSaveResultSummary', () => {
   it('reports durable with no remediation text', async () => {
     // #given a save that reached durable persistence
     // #when
-    await writeCacheSaveResultSummary('durable', logger)
+    await writeCacheSaveResultSummary(persistedResult, 'main', logger)
 
     // #then the row reports success and no remediation sentence is added
     expect(core.summary.addTable).toHaveBeenCalledWith(
@@ -305,26 +325,50 @@ describe('writeCacheSaveResultSummary', () => {
     )
     expect(core.summary.addRaw).not.toHaveBeenCalled()
     expect(core.summary.write).toHaveBeenCalled()
+
+    // #then no remediation text at all means no s3-backup mention either
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).not.toContain('s3-backup')
+  })
+
+  it('headings distinguish the main-step write from a post-action retry', async () => {
+    // #given the same result reported from each phase
+    // #when
+    await writeCacheSaveResultSummary(persistedResult, 'main', logger)
+    await writeCacheSaveResultSummary(persistedResult, 'post-retry', logger)
+
+    // #then the heading names which phase produced the row, since post.ts's retry has no
+    // other surface available to distinguish it from the main step's own write
+    expect(core.summary.addHeading).toHaveBeenNthCalledWith(1, 'Session Persistence', 3)
+    expect(core.summary.addHeading).toHaveBeenNthCalledWith(2, 'Session Persistence (post-action retry)', 3)
   })
 
   it('names the cache-rejected cause and points at s3-backup when nothing persisted', async () => {
     // #given a save where nothing durable happened (cache rejected, store disabled)
     // #when
-    await writeCacheSaveResultSummary('not-persisted', logger)
+    await writeCacheSaveResultSummary(cacheRejectedResult, 'main', logger)
 
-    // #then the remediation names the actual cause and the fix, in one sentence
-    expect(core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining('s3-backup'))
+    // #then the remediation names every actual cause -- a read-only token, a key
+    // collision, and a transient failure -- not just one of them, plus the fix, all in
+    // one sentence. Capture every addRaw call (not just the first) so the assertion
+    // holds regardless of how the remediation text is split across calls.
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('did not accept the write')
+    expect(remediationText).toContain('read-only cache token')
+    expect(remediationText).toContain('key collision')
+    expect(remediationText).toContain('transient')
+    expect(remediationText).toContain('s3-backup')
+
     // #then keeping R4's "one sentence, not a paragraph" bar: no blank line, and no
     // sentence-ending period until the single one that closes the remediation text
-    const remediationCall = vi.mocked(core.summary).addRaw.mock.calls[0]?.[0] as string
-    expect(remediationCall).not.toContain('\n\n')
-    expect(remediationCall.trim().indexOf('.')).toBe(remediationCall.trim().length - 1)
+    expect(remediationText).not.toContain('\n\n')
+    expect(remediationText.trim().indexOf('.')).toBe(remediationText.trim().length - 1)
   })
 
   it('distinguishes store-only from both full success and failure, without s3-backup advice', async () => {
     // #given the object store persisted the state but the Actions cache write did not
     // #when
-    await writeCacheSaveResultSummary('store-only', logger)
+    await writeCacheSaveResultSummary(storeOnlyResult, 'main', logger)
 
     // #then the row and remediation are distinct from both durable and not-persisted
     expect(core.summary.addTable).toHaveBeenCalledWith(
@@ -335,12 +379,48 @@ describe('writeCacheSaveResultSummary', () => {
   })
 
   it('does not mention s3-backup for a deliberate skip', async () => {
-    // #given SKIP_CACHE or no cacheable content
+    // #given SKIP_CACHE
     // #when
-    await writeCacheSaveResultSummary('skipped', logger)
+    await writeCacheSaveResultSummary(skippedResult, 'main', logger)
 
     // #then no remediation text at all -- a deliberate no-op needs none
     expect(core.summary.addRaw).not.toHaveBeenCalled()
+
+    // #then no remediation text at all means no s3-backup mention either
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).not.toContain('s3-backup')
+  })
+
+  it('reports no cacheable content was found for skipped-empty, without s3-backup advice or rejected-write framing', async () => {
+    // #given hasCacheableContent found nothing to save -- distinct from a rejected write
+    // #when
+    await writeCacheSaveResultSummary(skippedEmptyResult, 'main', logger)
+
+    // #then the cell still reads not-persisted (the state-value icon), but the sentence
+    // names the actual cause and does not suggest s3-backup -- it would not have helped
+    expect(core.summary.addTable).toHaveBeenCalledWith(
+      expect.arrayContaining([['Cache Save Result', expect.stringContaining('not persisted')]]),
+    )
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('No session state was found to save')
+    expect(remediationText).toContain('post-action step retries')
+    expect(remediationText).not.toContain('did not accept the write')
+    expect(remediationText).not.toContain('s3-backup')
+  })
+
+  it('reports a declined checkpoint distinctly from a rejected write, without s3-backup advice', async () => {
+    // #given the SQLite WAL could not be checkpointed, so no write was even attempted
+    // #when
+    await writeCacheSaveResultSummary(checkpointDeclinedResult, 'main', logger)
+
+    // #then the sentence names the checkpoint failure, not a rejected write, and does not
+    // suggest s3-backup -- a declined checkpoint means no write was attempted at all
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('could not be checkpointed')
+    expect(remediationText).toContain('no write was attempted')
+    expect(remediationText).toContain('post-action step retries')
+    expect(remediationText).not.toContain('did not accept the write')
+    expect(remediationText).not.toContain('s3-backup')
   })
 
   it('does not fail the run when the summary write throws', async () => {
@@ -348,7 +428,7 @@ describe('writeCacheSaveResultSummary', () => {
     vi.mocked(core.summary.write).mockRejectedValueOnce(new Error('Write failed'))
 
     // #when / #then
-    await expect(writeCacheSaveResultSummary('durable', logger)).resolves.not.toThrow()
+    await expect(writeCacheSaveResultSummary(persistedResult, 'main', logger)).resolves.not.toThrow()
     expect(logger.warning).toHaveBeenCalledWith('Failed to write cache save result summary', {error: 'Write failed'})
     expect(core.warning).toHaveBeenCalledWith('Failed to write cache save result summary: Write failed')
   })

@@ -6,6 +6,7 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import {createS3Adapter, syncSessionsToStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
+import {getGitHubRunAttempt} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildSaveCacheKey} from './cache-key.js'
 import {checkpointDatabase} from './checkpoint.js'
@@ -36,9 +37,9 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
  * real run, skipping the cache save and breaking session continuity.
  *
  * WAL mode note: this function is only reached after checkpointDatabase has already run
- * and resolved to 'checkpointed' or 'nothing-to-checkpoint' — a 'failed' outcome makes
- * saveCache return false before this is ever called (see the checkpoint block above). A
- * healthy run therefore has all its data already merged into opencode.db by the time this
+ * and resolved to 'checkpointed' or 'nothing-to-checkpoint' — a 'failed' outcome returns a
+ * checkpoint-declined CacheSaveResult before this is ever called (see the checkpoint block
+ * above). A healthy run therefore has all its data already merged into opencode.db by the time this
  * runs: checkpointDatabase merges a hot write-ahead log into the main file before this
  * check ever sees it (checkpoint.test.ts pins that as 'checkpointed', not skipped as
  * 'nothing-to-checkpoint'). This matters more now than it used to: neither
@@ -87,12 +88,10 @@ async function hasCacheableContent(storagePath: string, cachePaths: readonly str
  * paths, neither of which carries the full `RunMetrics` that `writeJobSummary` expects.
  * Non-blocking: logs a warning on failure but never throws.
  *
- * A decline here rarely costs a run its session work: `runCleanup` only marks
- * `CACHE_SAVED` when this call returns `true`, so a decline at cleanup time leaves
- * `runPost` (src/harness/post.ts) to retry the save later — by which point the main step
- * has ended and the OpenCode child has almost certainly exited, making the retry's
- * checkpoint succeed. A future refactor that sets `CACHE_SAVED` on decline (to avoid
- * apparently-duplicate work) would silently remove that safety net.
+ * A decline here rarely costs a run its session work: `runCleanup` sets `CACHE_SAVED` to
+ * `not-persisted` on decline (via `toCacheSaveStateValue`), so `runPost` (post.ts) retries
+ * the save later — by which point the main step has ended and the OpenCode child has
+ * almost certainly exited, making the retry's checkpoint succeed.
  */
 async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Promise<void> {
   try {
@@ -132,7 +131,10 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
     return {cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'}
   }
 
-  const saveKey = buildSaveCacheKey(components, runId)
+  // Sourced independently of options, the same way runId's caller derives it, rather than
+  // widening SaveCacheOptions -- runAttempt is a process-wide runner fact, not per-call
+  // configuration.
+  const saveKey = buildSaveCacheKey(components, runId, getGitHubRunAttempt())
   // Tracked across the try block (and visible to the catch below) because the store sync
   // and the cache write are independent backends: a thrown error from the cache write
   // (including the caught "already exists" collision) must not erase whatever the object
@@ -209,10 +211,12 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
   } catch (error) {
     if (error instanceof Error && error.message.includes('already exists')) {
       logger.info('Cache key already exists, skipping save')
-      // Fold-in, not a separate outcome: a "key already exists" collision means some
-      // concurrent job's save already committed this key, so the state is durably present
-      // under it regardless of which run wrote it. Distinguishing it from a normal
-      // success would not change what a caller should do with the result.
+      // Fold-in, not a separate outcome: the save key now includes both run ID and run
+      // attempt, so a "key already exists" collision is confined to a genuine duplicate
+      // save within the same attempt (e.g. a concurrent job) -- some other save already
+      // committed this key, so the state is durably present under it regardless of which
+      // one wrote it. Distinguishing it from a normal success would not change what a
+      // caller should do with the result.
       return {cachePersisted: true, storePersisted, outcome: 'persisted'}
     }
 

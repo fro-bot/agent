@@ -133,6 +133,38 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
     expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
   })
 
+  it('records not-persisted when cleanup finds no cacheable content, so the post hook retries rather than skipping', async () => {
+    // #given hasCacheableContent is a point-in-time filesystem observation, not a
+    // configuration constant like SKIP_CACHE -- a false reading here must not be trusted
+    // to hold true a second time when the post hook checks later
+    const {saveCache} = await import('../../services/cache/index.js')
+    vi.mocked(saveCache).mockResolvedValueOnce({
+      cachePersisted: false,
+      storePersisted: false,
+      outcome: 'skipped-empty',
+    })
+
+    await runCleanupWith()
+
+    // #then cleanup found nothing to save and recorded not-persisted, not skipped -- the
+    // distinction this item exists for
+    expect(saveCache).toHaveBeenCalledTimes(1)
+    expect(mocks.stateStore.get('cacheSaved')).toBe('not-persisted')
+
+    // #when the post hook runs later
+    mocks.stateStore.set('shouldSaveCache', 'true')
+    vi.mocked(saveCache).mockResolvedValueOnce({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+    const {runPost} = await import('../post.js')
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    // #then the post hook retries -- proof it bites: a cheap repeated no-op is far better
+    // than treating an empty-at-the-time observation as a permanent, unretryable skip
+    expect(saveCache).toHaveBeenCalledTimes(2)
+    expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
+  })
+
   it('skips the retry when cleanup already achieved durable persistence', async () => {
     // #given cleanup's save succeeds
     const {saveCache} = await import('../../services/cache/index.js')
@@ -152,10 +184,7 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
 
     // #then the post hook sees the durable save and never retries it
     expect(saveCache).toHaveBeenCalledTimes(1)
-    expect(logger.info).toHaveBeenCalledWith(
-      'Skipping post-action: cache already saved by main action',
-      expect.any(Object),
-    )
+    expect(logger.info).toHaveBeenCalledWith('Skipping post-action: cache saved by main action', expect.any(Object))
   })
 
   it('does not repeat the save (and its object-store upload) when the store persisted but the cache write was rejected', async () => {
@@ -188,7 +217,7 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
     // inside save.ts), so a call count of 1 here is direct proof the upload was not repeated.
     expect(saveCache).toHaveBeenCalledTimes(1)
     expect(logger.info).toHaveBeenCalledWith(
-      'Skipping post-action: cache already saved by main action',
+      'Skipping post-action: state persisted to the object store by main action',
       expect.any(Object),
     )
   })
@@ -215,10 +244,7 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
     // #then the post hook never attempts a save for a deliberate skip — retrying would
     // just repeat the same no-op the operator asked for
     expect(saveCache).toHaveBeenCalledTimes(1)
-    expect(logger.info).toHaveBeenCalledWith(
-      'Skipping post-action: cache already saved by main action',
-      expect.any(Object),
-    )
+    expect(logger.info).toHaveBeenCalledWith('Skipping post-action: main action skipped the save', expect.any(Object))
   })
 
   it('retries when the state key holds an unrecognized value (e.g. the boolean "true" from an older action version)', async () => {
@@ -263,6 +289,25 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
 
     // #then the green state is reachable from the identical call site
     expect(setOutput).toHaveBeenCalledWith('cache-save-result', 'durable')
+  })
+
+  it('maps a real skipped-empty cleanup to the not-persisted output, not a rejected-write label', async () => {
+    // #given no cacheable content existed -- distinct from a rejected write, but the
+    // cache-save-result output collapses both into not-persisted (the job summary is what
+    // names which actually happened)
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {setOutput} = await import('@actions/core')
+
+    vi.mocked(saveCache).mockResolvedValueOnce({
+      cachePersisted: false,
+      storePersisted: false,
+      outcome: 'skipped-empty',
+    })
+
+    await runCleanupWith()
+
+    // #then the output is not-persisted, exactly like a rejected write would produce
+    expect(setOutput).toHaveBeenCalledWith('cache-save-result', 'not-persisted')
   })
 
   it('distinguishes a checkpoint-declined retry-in-progress from a rejected cache write in its log line, and never calls either "no cache content to save"', async () => {
