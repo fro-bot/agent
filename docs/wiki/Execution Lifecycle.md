@@ -1,7 +1,7 @@
 ---
 type: architecture
 last-updated: "2026-09-04"
-updated-by: "pr-1534"
+updated-by: "pr-1536"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -115,7 +115,7 @@ Posts visual feedback so the user knows the agent received their request. For co
 
 Restores the OpenCode storage directory from S3 backup first when configured, then falls back to GitHub Actions cache. The cache key is scoped by repository, branch, and OS to prevent cross-branch contamination. After restore, the module checks for corruption (unreadable directory, version mismatch) and falls back to clean state if needed. Credentials (`auth.json`) that may have leaked into cache from a prior run are deleted as a security measure.
 
-This phase also bootstraps the OpenCode SDK server and establishes a client connection — the server handle is reused throughout the remaining phases.
+This phase also bootstraps the OpenCode SDK server and establishes a client connection — the server handle is reused throughout the remaining phases. Bootstrap does not report success on the SDK's own signal alone (a stdout string match satisfied once the HTTP listener binds, before this instance's lazy config/plugin/service init has run); it issues one bounded, instance-scoped `session.list` probe first, so a blocked instance bootstrap fails here, by name, instead of surfacing later as an unexplained request failure.
 
 ## 7. Session Prep
 

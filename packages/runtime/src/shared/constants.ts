@@ -18,6 +18,11 @@ export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 // byte-for-byte identical to today while making the budget observable/adjustable.
 export const DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS = 5000
 
+// Bound on bootstrapOpenCodeServer's instance-scoped readiness probe -- time-to-first-
+// answer, distinct from DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS's time-to-listen budget above.
+// Not operator-tunable via an action input.
+export const DEFAULT_SERVER_READINESS_TIMEOUT_MS = 60_000
+
 // Bound on how long shutdown() waits for the OpenCode child to actually go away before
 // returning control to the caller (src/harness/phases/cleanup.ts, immediately ahead of
 // the SQLite checkpoint). The SDK (@opencode-ai/sdk dist/server.js) exposes only

@@ -8,9 +8,11 @@ import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
 import {
   DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
+  DEFAULT_SERVER_READINESS_TIMEOUT_MS,
   DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS,
   DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
 } from '../shared/constants.js'
+import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {withScrubbedEnv} from './with-scrubbed-env.js'
 
@@ -192,10 +194,60 @@ export interface OpenCodeServerHandle {
   readonly shutdown: () => Promise<ShutdownResult>
 }
 
+// Outcome of a single readiness-probe attempt. 'timeout'/'aborted' name the abort family
+// (AbortSignal.timeout() vs. the caller's own deadline) and are never retried -- both are
+// fatal, and which message they produce is decided by the caller reading `signal.aborted`
+// once, immediately after this resolves. 'transport' covers everything else (ECONNRESET, a
+// socket hangup, a synchronous throw from the client) -- a local-loopback blip, not
+// evidence the instance is stuck, so the caller retries it once before treating it as fatal.
+type ReadinessProbeOutcome =
+  | {readonly kind: 'ready'}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'aborted'}
+  | {readonly kind: 'transport'; readonly error: unknown}
+
+async function attemptReadinessProbe(
+  client: SessionClient,
+  workspacePath: string,
+  outerSignal: AbortSignal,
+  readinessTimeoutMs: number,
+  logger: Logger,
+): Promise<ReadinessProbeOutcome> {
+  // Classified by which signal actually fired, not by the rejection's name/type: a fetch
+  // implementation's abort surface is not a stable contract (undici's streaming teardown
+  // can wrap an abort as a TypeError with the real signal on `.cause`), and name-sniffing
+  // that misreads an abort as a transport fault burns a full retry budget before failing
+  // anyway -- the same mislabeling this classification exists to prevent, running the
+  // other direction. Held locally so the catch can check both without re-deriving them.
+  const timeoutSignal = AbortSignal.timeout(readinessTimeoutMs)
+  try {
+    const probe = await client.session.list({
+      query: {directory: workspacePath},
+      signal: AbortSignal.any([outerSignal, timeoutSignal]),
+    })
+    // A response.error here is a server answer, not a probe failure -- it proves
+    // instance bootstrap completed.
+    if (probe.error != null) {
+      logger.debug('OpenCode readiness probe answered with an error body (server is ready)', {
+        error: String(probe.error),
+      })
+    }
+    return {kind: 'ready'}
+  } catch (probeError) {
+    // Checked in this order because if both fired, the outer deadline is the cause that
+    // matters to the caller -- a cancelled run, not a stall this instance is responsible for.
+    if (outerSignal.aborted) return {kind: 'aborted'}
+    if (timeoutSignal.aborted) return {kind: 'timeout'}
+    return {kind: 'transport', error: probeError}
+  }
+}
+
 export async function bootstrapOpenCodeServer(
   signal: AbortSignal,
   logger: Logger,
+  workspacePath: string,
   timeoutMs: number = DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
+  readinessTimeoutMs: number = DEFAULT_SERVER_READINESS_TIMEOUT_MS,
 ): Promise<Result<OpenCodeServerHandle, Error>> {
   const startedAt = Date.now()
   // Time spent inside createOpencode specifically — the only window timeoutMs governs.
@@ -232,8 +284,63 @@ export async function bootstrapOpenCodeServer(
       server.close()
       return err(new Error(`OpenCode server URL mismatch: pinned ${pinnedUrl} but server bound to ${server.url}`))
     }
+    // createOpencode resolving means the listener bound, not that per-directory instance
+    // bootstrap finished. Force it here with a bound so a blocked instance fails by name
+    // instead of on the harness's first real request. Must be instance-scoped: a global
+    // route answers while bootstrap is still blocked. session.list is read-only and the
+    // harness issues it moments later anyway.
+    const readinessStartedAt = Date.now()
+    let outcome = await attemptReadinessProbe(client, workspacePath, signal, readinessTimeoutMs, logger)
+    if (outcome.kind === 'transport') {
+      // A transport failure against 127.0.0.1 (ECONNRESET, a socket hangup, a synchronous
+      // client throw) is a local blip, not evidence the instance is stuck -- one immediate
+      // retry before treating it as fatal.
+      logger.warning('OpenCode readiness probe failed (retrying once)', {error: toErrorMessage(outcome.error)})
+      outcome = await attemptReadinessProbe(client, workspacePath, signal, readinessTimeoutMs, logger)
+    }
+    if (outcome.kind !== 'ready') {
+      // Read once, immediately after the last attempt settles and before any cleanup --
+      // waitForServerQuiescence below can run for up to its own timeout budget, and a
+      // second read afterward could catch a deadline that fired during cleanup, mislabeling
+      // a genuine stall as a cancellation.
+      const cancelledByOuterDeadline = signal.aborted
+      const probeReadinessMs = Date.now() - readinessStartedAt
+      logger.warning('OpenCode readiness probe failed', {
+        outcome: outcome.kind,
+        error: outcome.kind === 'transport' ? toErrorMessage(outcome.error) : undefined,
+        readinessTimeoutMs,
+        readinessMs: probeReadinessMs,
+        cancelledByOuterDeadline,
+      })
+      server.close()
+      const quiesced = await waitForServerQuiescence(server.url)
+      logger.debug('OpenCode server quiesced after readiness-probe failure', {quiesced: quiesced.quiesced})
+      if (outcome.kind === 'transport') {
+        return err(
+          new Error(
+            `OpenCode server is listening but the readiness request failed twice against the ` +
+              `local server: ${toErrorMessage(outcome.error)}`,
+          ),
+        )
+      }
+      // The outer `signal` is the caller's execution deadline, not this function's own
+      // budget. If it fired while the probe was in flight, the probe never got a real
+      // chance to answer -- that is a cancelled run, not evidence of a stalled server.
+      if (cancelledByOuterDeadline) {
+        return err(
+          new Error('OpenCode server bootstrap cancelled by the execution deadline during the readiness probe'),
+        )
+      }
+      return err(
+        new Error(
+          `OpenCode server is listening but did not answer an instance-scoped request within ` +
+            `${readinessTimeoutMs}ms per attempt (${probeReadinessMs}ms total probe time) — instance bootstrap is blocked`,
+        ),
+      )
+    }
+    const readinessMs = Date.now() - readinessStartedAt
     const elapsedMs = Date.now() - startedAt
-    logger.debug('OpenCode server bootstrapped', {url: server.url, timeoutMs, budgetedMs, elapsedMs})
+    logger.debug('OpenCode server bootstrapped', {url: server.url, timeoutMs, budgetedMs, readinessMs, elapsedMs})
     return ok({
       client,
       server,
@@ -248,7 +355,7 @@ export async function bootstrapOpenCodeServer(
     })
   } catch (error) {
     const elapsedMs = Date.now() - startedAt
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     // budgetedMs is null when the failure happened before or inside the spawn; a null
     // here with elapsedMs at roughly timeoutMs is the signature of a budget timeout,
     // while a null with a much smaller elapsedMs points at port acquisition instead.
