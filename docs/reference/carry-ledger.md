@@ -1,5 +1,5 @@
 ---
-verifiedAgainstBaseVersion: "1.18.21"
+verifiedAgainstBaseVersion: "1.18.29"
 ---
 
 # Harness carry ledger
@@ -26,7 +26,7 @@ No carry has an in-repo record of the upstream version that would contain it, so
 
 - **Capability:** Populates `session.summary.diffs` at the session level. Stock builds compute per-message summaries but never fold them into the session-level row.
 - **Surface:** Both, and load-bearing for headed/local consumers.
-- **Upstream status:** Open. Verified absent from stock through 1.18.21.
+- **Upstream status:** Open. Verified absent from stock through 1.18.29.
 - **Evidence it is still needed:** A downstream consumer (Space Bus) reads the aggregate summary as its preferred tier. Without this carry it falls back to fetching every message and aggregating per-turn diffs client-side.
 - **Removal condition:** Stock exposes the aggregate fold — not merely a `summary.diffs` field in the schema, which stock already has while leaving it unpopulated. Verify the value is written, not just typed.
 
@@ -121,6 +121,14 @@ No carry has an in-repo record of the upstream version that would contain it, so
 - **Upstream status:** Open.
 - **Evidence it is still needed:** **Unestablished in-repo, and the weakest of the set.** No test, consumer, or surface attribution.
 - **Removal condition:** Stock surfaces or handles those background failures. This is the first carry to re-examine on the next bump.
+
+### #47430 — bounded npm install
+
+- **Capability:** Bounds `Npm.reify()` with `OPENCODE_NPM_INSTALL_TIMEOUT` (default 300000 ms); a timeout surfaces as `InstallFailedError` instead of hanging instance bootstrap.
+- **Surface:** `plugin.init()` during per-directory instance bootstrap — runs ahead of every service and ahead of the first request being answered, while the HTTP listener is already bound.
+- **Upstream status:** Open. Port of #41936 (v2) to the v1 line; our PR.
+- **Evidence it is still needed:** Measured 181–370 s stalls on the first instance-scoped request across ~60 headless runs in four repositories (2026-09-04); stock 1.18.29 `packages/core/src/npm.ts` still awaits `reify()` with no bound. The Action defends itself with a setup-time install (`installSystematicPlugin`) and a bounded readiness probe; this carry bounds the server-side install those sit in front of.
+- **Removal condition:** Stock bounds `Npm.reify()` or `plugin.init()` — #47430 or #41936 merges, or an equivalent lands.
 
 ## Scope and authority
 
