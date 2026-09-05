@@ -305,6 +305,10 @@ describe('writeCacheSaveResultSummary', () => {
     )
     expect(core.summary.addRaw).not.toHaveBeenCalled()
     expect(core.summary.write).toHaveBeenCalled()
+
+    // #then no remediation text at all means no s3-backup mention either
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).not.toContain('s3-backup')
   })
 
   it('headings distinguish the main-step write from a post-action retry', async () => {
@@ -324,15 +328,21 @@ describe('writeCacheSaveResultSummary', () => {
     // #when
     await writeCacheSaveResultSummary('not-persisted', 'main', logger)
 
-    // #then the remediation names the actual causes (including a transient service
-    // failure, not just a denial or collision) and the fix, in one sentence
-    expect(core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining('s3-backup'))
-    expect(core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining('transient'))
+    // #then the remediation names every actual cause -- a read-only token, a key
+    // collision, and a transient failure -- not just one of them, plus the fix, all in
+    // one sentence. Capture every addRaw call (not just the first) so the assertion
+    // holds regardless of how the remediation text is split across calls.
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('did not accept the write')
+    expect(remediationText).toContain('read-only cache token')
+    expect(remediationText).toContain('key collision')
+    expect(remediationText).toContain('transient')
+    expect(remediationText).toContain('s3-backup')
+
     // #then keeping R4's "one sentence, not a paragraph" bar: no blank line, and no
     // sentence-ending period until the single one that closes the remediation text
-    const remediationCall = vi.mocked(core.summary).addRaw.mock.calls[0]?.[0] as string
-    expect(remediationCall).not.toContain('\n\n')
-    expect(remediationCall.trim().indexOf('.')).toBe(remediationCall.trim().length - 1)
+    expect(remediationText).not.toContain('\n\n')
+    expect(remediationText.trim().indexOf('.')).toBe(remediationText.trim().length - 1)
   })
 
   it('distinguishes store-only from both full success and failure, without s3-backup advice', async () => {
@@ -355,6 +365,10 @@ describe('writeCacheSaveResultSummary', () => {
 
     // #then no remediation text at all -- a deliberate no-op needs none
     expect(core.summary.addRaw).not.toHaveBeenCalled()
+
+    // #then no remediation text at all means no s3-backup mention either
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).not.toContain('s3-backup')
   })
 
   it('does not fail the run when the summary write throws', async () => {

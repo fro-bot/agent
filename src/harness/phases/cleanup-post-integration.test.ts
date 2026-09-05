@@ -216,6 +216,11 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
     mocks.stateStore.set('storeConfig.bucket', 'bucket')
     mocks.stateStore.set('storeConfig.prefix', 'fro-bot-state')
 
+    // #then immediately before the post hook runs, the boundary is still untouched a
+    // second time -- the retry below is what causes the second upload, not something
+    // runCleanup already did
+    expect(storeAdapter.upload).toHaveBeenCalledTimes(1)
+
     // #when the post hook runs later
     const logger = await runPostPhase()
 
@@ -224,5 +229,11 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
     // boundary is touched exactly once total
     expect(storeAdapter.upload).toHaveBeenCalledTimes(2)
     expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
+
+    // #then the second upload is attributable to the post hook's retry of the *same*
+    // session database -- same key and local path as cleanup's own upload -- not some
+    // unrelated upload the post phase happened to trigger
+    const uploadMock = vi.mocked(storeAdapter.upload)
+    expect(uploadMock.mock.calls[1]).toEqual(uploadMock.mock.calls[0])
   })
 })

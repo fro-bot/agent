@@ -231,7 +231,7 @@ describe('buildSaveCacheKey', () => {
     // attempt, since neither prefix includes either
     expect(refScoped).toBeDefined()
     expect(repoScoped).toBeDefined()
-    expect(saveKey.startsWith(refScoped ?? '')).toBe(true)
-    expect(saveKey.startsWith(repoScoped ?? '')).toBe(true)
+    expect(saveKey.startsWith(refScoped as string)).toBe(true)
+    expect(saveKey.startsWith(repoScoped as string)).toBe(true)
   })
 })
