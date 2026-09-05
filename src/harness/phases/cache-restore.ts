@@ -16,6 +16,7 @@ import {DB_MAIN_BASENAME, DB_WAL_BASENAME} from '../../services/cache/paths.js'
 import {ensureProjectId} from '../../services/setup/project-id.js'
 import {getGitHubWorkspace, getOpenCodeAuthPath, getOpenCodeStoragePath} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
+import {normalizeWorkspacePath} from '../../shared/paths.js'
 
 export interface CacheRestorePhaseResult {
   readonly cacheResult: CacheResult
@@ -136,9 +137,13 @@ export async function runCacheRestore(
 
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const abortController = new AbortController()
+  // Normalized to match what the harness's own session-scoped calls use
+  // (session-prep.ts, cleanup.ts) -- the probe must warm the same instance the harness
+  // will actually address, or a divergence here silently defeats the readiness check.
   const bootstrapResult = await bootstrapOpenCodeServer(
     abortController.signal,
     serverLogger,
+    normalizeWorkspacePath(workspacePath),
     bootstrap.inputs.serverBootstrapTimeoutMs,
   )
 
