@@ -117,10 +117,10 @@ No carry has an in-repo record of the upstream version that would contain it, so
 ### #36361 — surfaced background task failures
 
 - **Capability:** Stops background summary/prune failures from being swallowed silently.
-- **Surface:** Not clearly separated; likely the headless runtime session cleanup path.
+- **Surface:** `packages/opencode/src/session/prompt.ts` — the forked `summary.summarize(...)` and `compaction.prune(...)` calls after a turn, both `Effect.ignore`d in stock. The carry replaces the ignore with `Effect.logWarning` for non-interruption causes; failures are logged, not rethrown or written to session state.
 - **Upstream status:** Open.
-- **Evidence it is still needed:** **Unestablished in-repo, and the weakest of the set.** No test, consumer, or surface attribution.
-- **Removal condition:** Stock surfaces or handles those background failures. This is the first carry to re-examine on the next bump.
+- **Evidence it is still needed:** Re-examined against 1.18.29 (2026-09-05): stock still swallows both (`prompt.ts:1252`, `:1338`); no upstream change in the bump range touches either path. **Nothing in this repository consumes what the carry surfaces** — no code matches the warning strings or reads a summary/prune failure state; the harness runs its own `pruneSessions` and logs its own failures. The value is operator log visibility only.
+- **Removal condition:** Stock surfaces or handles those background failures — or, on value grounds, the set is trimmed toward the 1–3 target and this is the first to go: it has no consumer here and the weakest evidence of the set.
 
 ### #47430 — bounded npm install
 
