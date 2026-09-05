@@ -172,6 +172,15 @@ outputs:
       extraPrefixes are normalized without trailing slashes and never contain globs
   cache-status:
     description: Cache restore status (hit/miss/corrupted)
+  cache-save-result:
+    description: >-
+      Session persistence outcome for this run: durable (the Actions cache write
+      persisted), store-only (the object store persisted the state but the Actions
+      cache write did not), skipped (SKIP_CACHE was set), or not-persisted (nothing
+      durable happened -- a rejected write, a declined checkpoint, or no cacheable
+      content found; the job summary names which). Reports a result, not proof
+      of durability. Only set from the main step; a value set from the post-action hook
+      would arrive after every other step already ran, so it is not attempted there.
   duration:
     description: Run duration in milliseconds
 
