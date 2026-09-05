@@ -1,6 +1,7 @@
 ---
 title: "Adding a Config-Declared Plugin to the Versioned Tool Pattern"
 date: 2026-03-29
+last_updated: 2026-09-04
 category: best-practices
 module: setup
 problem_type: best_practice
@@ -36,6 +37,8 @@ The initial instinct was to model Systematic after oMo's installer pattern (`bun
 1. Systematic has no `install` CLI subcommand — it's an OpenCode plugin, not a standalone CLI tool
 2. OpenCode resolves plugins declared in its config at startup; no separate install step is needed
 3. Creating a `systematic.ts` installer file would have been dead code
+
+Points 2 and 3 were true when written and are no longer the whole story. Letting the server resolve the plugin at startup means it performs a network npm install *after* its HTTP listener is already accepting connections, with no timeout of its own; under registry latency that stalled production runs for minutes. A setup-time installer (`src/services/setup/systematic-plugin.ts`) now exists, and it is not dead code — it runs OpenCode's own `plugin` CLI so the package lands in the directory the server reads, and the server's startup resolution becomes a local no-op. The config-declaration pipeline described below is unchanged; the install just no longer happens inside the server. See [Systematic plugin install stalls OpenCode bootstrap](../integration-issues/systematic-plugin-install-stalls-opencode-bootstrap-2026-09-04.md).
 
 The versioned-tool skill itself warns: _"Do not copy installer structure blindly between tools. Copy the version-source pattern; verify the install mechanics per tool."_
 
@@ -123,7 +126,7 @@ systematic-version:
 
 ## Why This Works
 
-OpenCode reads `OPENCODE_CONFIG_CONTENT` as its highest-precedence config. By adding `plugins: ["@fro.bot/systematic@2.1.0"]` to this env var during setup, OpenCode resolves and installs the plugin at startup. The version is pinned via the same constant pattern used by all other tools, with Renovate automating npm version bumps through the `customManagers` regex.
+OpenCode reads `OPENCODE_CONFIG_CONTENT` as its highest-precedence config. By adding `plugins: ["@fro.bot/systematic@2.1.0"]` to this env var during setup, OpenCode resolves the plugin at startup — and, since the setup-time install landed, finds it already present rather than fetching it. The version is pinned via the same constant pattern used by all other tools, with Renovate automating npm version bumps through the `customManagers` regex.
 
 ## Prevention
 
