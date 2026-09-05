@@ -170,9 +170,14 @@ describe('restore/save cache-version parity (adapter boundary)', () => {
       cacheAdapter: {restoreCache: async () => undefined, saveCache: saveCacheFn},
     })
 
-    // #when reading the exact path lists each real call site handed its adapter
+    // #when reading the exact path lists each real call site handed its adapter -- both
+    // sides must actually have reached it, or an early return on either (SKIP_CACHE, a
+    // declined save) would leave this comparing two fallbacks and passing for nothing
+    expect(restoreCacheFn).toHaveBeenCalledTimes(1)
+    expect(saveCacheFn).toHaveBeenCalledTimes(1)
     const restorePaths = restoreCacheFn.mock.calls[0]?.[0] ?? []
     const savePaths = saveCacheFn.mock.calls[0]?.[0] ?? []
+    expect(restorePaths.length).toBeGreaterThan(0)
 
     // #then the two lists are identical, and hashing them the way @actions/cache does
     // internally to decide whether a save is restorable produces the same version
