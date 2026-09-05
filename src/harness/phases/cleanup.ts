@@ -22,8 +22,10 @@ import {
 } from '@fro-bot/runtime'
 import {completeAcknowledgment} from '../../features/agent/index.js'
 import {cleanupTempFiles} from '../../features/attachments/index.js'
+import {writeCacheSaveResultSummary} from '../../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
+import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
 import {
   getGitHubRunAttempt,
   getGitHubRunId,
@@ -35,6 +37,7 @@ import {
 } from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
+import {setCacheSaveResultOutput} from '../config/outputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 
 export interface CleanupPhaseOptions {
@@ -169,7 +172,20 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
           errors: snapshot.errors,
           artifactUpload: artifactResult,
         }
-        await syncMetadataToStore(adapter, storeConfig, agentIdentity, repo, runId, metadata, objectStoreLogger)
+        const metadataResult = await syncMetadataToStore(
+          adapter,
+          storeConfig,
+          agentIdentity,
+          repo,
+          runId,
+          metadata,
+          objectStoreLogger,
+        )
+        if (metadataResult.success) {
+          // Marks that the rich payload above landed, so post.ts's retry branch (if it
+          // ever runs) knows not to overwrite it with a thin cleanupSkipped placeholder.
+          core.saveState(STATE_KEYS.CLEANUP_METADATA_WRITTEN, 'true')
+        }
       } catch (error) {
         objectStoreLogger.warning('Object store artifact or metadata sync failed (non-fatal)', {
           error: error instanceof Error ? error.message : String(error),
@@ -181,7 +197,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
 
     const cacheLogger = createLogger({phase: 'cache-save'})
     const finalProjectIdPath = path.join(finalWorkspace, '.git', 'opencode')
-    const cacheSaved = await saveCache({
+    const cacheSaveResult = await saveCache({
       components: cacheComponents,
       runId: getGitHubRunId(),
       logger: cacheLogger,
@@ -192,9 +208,27 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
       storeConfig,
     })
 
-    if (cacheSaved) {
-      core.saveState(STATE_KEYS.CACHE_SAVED, 'true')
+    // Written on every path a result exists, not just success: a boolean-only-on-success
+    // write left store-only persistence unrecorded, so the post hook saw an unset
+    // CACHE_SAVED and repeated the entire save even though state was already durable.
+    const cacheSaveStateValue = toCacheSaveStateValue(cacheSaveResult)
+    core.saveState(STATE_KEYS.CACHE_SAVED, cacheSaveStateValue)
+
+    // Set from cleanup, not finalize.ts: the save has not happened yet when finalize
+    // writes its outputs. A throw here (e.g. no GITHUB_OUTPUT file) must not skip the
+    // summary write or artifact upload below.
+    try {
+      setCacheSaveResultOutput(cacheSaveStateValue)
+    } catch (outputError) {
+      cacheLogger.warning('Failed to set cache-save-result output (non-fatal)', {
+        error: outputError instanceof Error ? outputError.message : String(outputError),
+      })
     }
+
+    // A repository owner sees this without reading logs. Written here, not in
+    // finalize.ts's writeJobSummary: the main summary table is already flushed by the
+    // time this outcome is known.
+    await writeCacheSaveResultSummary(cacheSaveResult, 'main', cacheLogger)
 
     if (isOpenCodePromptArtifactEnabled()) {
       const artifactLogger = createLogger({phase: 'artifact-upload'})

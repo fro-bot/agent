@@ -20,6 +20,8 @@ tags:
   - absorbing-loop
   - fail-closed
   - object-store
+  - actions-cache
+  - cache-version
 ---
 
 # Repair on restore must precede capture on save, or a transient failure becomes permanent
@@ -76,9 +78,7 @@ The root cause was one defect wearing two masks: `shutdown()` signalled the Open
 
 **Stop transporting the log** — from _both_ `DB_TRANSPORTABLE_BASENAMES` (object store) and `buildSaveCachePaths` (Actions cache), which are independent producers of the same rule.
 
-**Handle legacy state per source**, because the two transports differ in kind. An Actions cache entry is one atomic archive, so a legacy database+log pair genuinely came from the same save and its log may hold real committed transactions — it is checkpointed, never discarded. An object-store prefix has no generation marker across independently-overwritten keys, so its log is untrusted and deleted before anything opens the database.
-
-**Correction (2026-09-05):** this no longer applies to the Actions-cache path. Restore and save were unified onto one `buildCachePaths` (`src/services/cache/paths.ts`) after discovering the two had drifted since #1519 — save dropped the log/shm sidecars from its path list while restore kept them, so `@actions/cache`'s version hash (computed from that exact list) silently stopped matching and every save became permanently unrestorable. A legacy database+log archive, built from the old five-path list, now has a version that cannot match either, so it is never restored at all, not checkpointed in place.
+**Handle legacy state per source**, because the two transports differ in kind. An Actions cache entry is one atomic archive, so a legacy database+log pair genuinely came from the same save and its log may hold real committed transactions — it is checkpointed, never discarded. (Since the second regression below was fixed, such an archive carries a version the restore can no longer match, so this path is never reached in production — the code and its test remain, the entries do not.) An object-store prefix has no generation marker across independently-overwritten keys, so its log is untrusted and deleted before anything opens the database.
 
 That split covers what each transport *delivers*. It also settles what to do about a log that was already on disk before restore, which only a persistent runner can have — and on the Actions-cache path the answer is the same: leave it. (The object-store path deletes whatever is at that filename either way — `deleteDownloadedObjectStoreWal` runs from a `finally` and cannot tell a downloaded log from a pre-existing one — so a persistent runner with the object store enabled is already outside this rule.) A fix that deleted such a log when the archive did not supply it was built, reviewed, and abandoned on 2026-09-04, because its premise was inverted for the common case. On one persistent runner, run N checkpoints and saves the database, the server commits more after the quiescence poll gives up, and run N+1 restores *that same database*; the leftover log is the same generation and **ahead** of it, holding the only copy of those commits. The log is behind the database only when the database came from a different runner's later save — a pool sharing one cache. Nothing at open time can tell those apart: SQLite validates write-ahead frames against the log's own header salt, not against the database file, which is why the silent-replay reproduction above is possible at all. A stat fingerprint cannot tell either — `@actions/cache` extracts with a bare `tar -xf`, so an in-place overwrite keeps the inode. The object-store deletion is the right trade *there* because that log is never trustworthy; transplanting it to this path trades a rare cross-runner hazard for common single-runner data loss. When a cleanup proposes to delete a "stale" sidecar at a restore boundary, the first question is which artifact is newer, and if the answer depends on topology the code cannot observe, the cleanup is wrong. See item 11 of [A check written from inside its own premise cannot fail](../workflow-issues/a-check-written-from-inside-its-own-premise-cannot-fail-2026-09-04.md) for how the abandoned fix's own proof-of-bite passed.
 
@@ -105,6 +105,14 @@ Which one occurs depends on whether SQLite's WAL header salt matches. The silent
 
 This is fixed, not outstanding. The pairing is unreachable by construction now: the log is gone from both transports (see Solution), and any log arriving from an object store is deleted before anything opens the database (see the source-specific split).
 
+## The Second Regression: Every Save Became Unrestorable
+
+The same change removed `opencode.db-wal` and `-shm` from the save-side path list and left them in the restore-side list. That read as a file-level asymmetry — a leftover log on a persistent runner pairing with a fresh database — and was examined twice on those terms. It was a key-level one. `@actions/cache` hashes the `paths` list into the cache entry's **version** (`node_modules/@actions/cache/lib/internal/cacheUtils.js`, `getCacheVersion`: sha256 over the paths plus compression method and a salt), and the service matches an entry on key prefix *and* version. From 2026-09-02T06:20Z, every save wrote a three-path version that no five-path restore could match. Restore walked its key ladder — PR scope, branch, repo-wide — and landed every time on the newest entry with the old version: one `main` snapshot from 09-01T18:49. Every run in every consumer "resumed" that snapshot, found no session for its PR, and reviewed from scratch. No log line was false: the restore was a hit, the save succeeded, the entries accumulated unread.
+
+**The signature that found it.** `gh cache list --json key,createdAt,lastAccessedAt`: 46 PR-scoped entries saved since 09-01, all with `lastAccessedAt == createdAt` — never read once — and one entry with `lastAccessedAt` = now. In a consumer, the read-chain visibly stops: each `main` entry read by the next run through 09-02T10:01, then that entry read by everything after and all 21 later entries unread. That table is the diagnostic; the logs cannot show it.
+
+**The fix (#1546, v0.108.1).** One `buildCachePaths` for both sides; the two old functions deleted, not aliased, so the version is identical by construction rather than by two definitions agreeing. The parity test drives the real `restoreCache` and `saveCache` through a spy adapter, asserts both adapters were reached exactly once, asserts the captured path lists are equal, and then asserts the real `getCacheVersion` hashes match. Two earlier shapes of that test could not fail: `getCacheVersion(buildCachePaths(x)) === getCacheVersion(buildCachePaths(x))`, and a version that defaulted both captured lists to `[]` so a double short-circuit compared two fallbacks. Verified in the field: the first consumer run after the release resumed its PR's prior session.
+
 ## Prevention
 
 - **Judge an operation by its external effect, not its reported status.** The pragma's `checkpointed` count says `0` on a fully successful truncation; the log's size on disk is the truth.
@@ -113,11 +121,15 @@ This is fixed, not outstanding. The pairing is unreachable by construction now: 
 - **When a value has multiple producers, changing one is not changing the rule.** The write-ahead log had to be removed from two independent lists.
 - **Verify what a construction actually validates.** `new DatabaseSync(path)` against a file of plain text does _not_ throw; only the schema read surfaces the corruption. A construction-only probe would have passed its own tests and detected nothing.
 - **Ask what a change stops producing, not just what it starts producing.** The orphaned object arose entirely because a file that used to always exist stopped existing, on a transport that only ever uploads what it finds.
+- When a keyed store takes a list on both the write and read side, find out what the store hashes before letting the two lists differ. A "tolerated on extraction" argument says nothing about matching.
+- `lastAccessedAt == createdAt` across every recent entry means restore is not seeing saves, whatever the logs report. Check the cache table, not the run log.
+- A parity test must reach both real call sites through one boundary and assert it reached them. `f(x) === f(x)` and `?? []` on both sides are the two ways it goes vacuous.
 
 ## Related
 
 - Issue [#1407](https://github.com/fro-bot/agent/issues/1407), PR [#1519](https://github.com/fro-bot/agent/pull/1519)
-- [A read-only Actions cache token broke session continuity](../integration-issues/read-only-actions-cache-token-broke-session-continuity-2026-08-11.md) — same subsystem, different cause: there the save genuinely failed and reported success; here the save genuinely succeeded and persisted the wrong thing.
+- [A read-only Actions cache token broke session continuity](../integration-issues/read-only-actions-cache-token-broke-session-continuity-2026-08-11.md) — same subsystem, two earlier silent losses of continuity with opposite mechanisms: there a save was denied and reported as success; here a save succeeded and, after the second regression below, was unrestorable.
 - [S3 restore needs ListBucket and prefix scope](../security-issues/s3-restore-needs-listbucket-and-prefix-scope-2026-08-12.md) — restore capability cannot be inferred from the save path. The same asymmetry appears here as the source-specific legacy split.
 - [A present signal is not evidence of the effect it implies](../workflow-issues/verify-behavior-not-signal-2026-08-23.md) — the general form of the checkpoint-count and construction-probe traps above.
 - [Terminal outcomes must survive deadline cleanup](terminal-outcomes-must-survive-deadline-cleanup-2026-07-24.md) — adjacent: teardown semantics deciding what a run is allowed to record.
+- [A check written from inside its own premise cannot fail](../workflow-issues/a-check-written-from-inside-its-own-premise-cannot-fail-2026-09-04.md) — the parity test that compared one function's output to itself is item 12 there.

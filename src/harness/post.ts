@@ -3,8 +3,10 @@ import type {Logger} from '../shared/logger.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
 import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-bot/runtime'
+import {writeCacheSaveResultSummary} from '../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
+import {parseCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {
   getGitHubRepository,
   getGitHubRunAttempt,
@@ -65,7 +67,11 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
   const logger = options.logger ?? createLogger({phase: 'post'})
 
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
-  const cacheSaved = core.getState(STATE_KEYS.CACHE_SAVED)
+  // parseCacheSaveStateValue treats an absent key (main step crashed before cleanup ran)
+  // or an unrecognized value (e.g. 'true' from an older action version, or corrupted
+  // state) as 'not-persisted' -- fail toward retrying the save, never toward skipping it,
+  // since this post hook is the last chance to persist state for the run.
+  const cacheSaved = parseCacheSaveStateValue(core.getState(STATE_KEYS.CACHE_SAVED))
   const sessionId = core.getState(STATE_KEYS.SESSION_ID) || null
   const opencodeVersion = core.getState(STATE_KEYS.OPENCODE_VERSION) || null
   const storeConfig = reconstructStoreConfigFromState()
@@ -83,8 +89,25 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
     return
   }
 
-  if (cacheSaved === 'true') {
-    logger.info('Skipping post-action: cache already saved by main action', {cacheSaved})
+  if (cacheSaved === 'durable' || cacheSaved === 'store-only' || cacheSaved === 'skipped') {
+    // durable: the cache write itself already persisted -- nothing left to do.
+    // store-only: the database is durable in the object store independently of the cache
+    //   write -- only opencode.db travels through the store (DB_TRANSPORTABLE_BASENAMES),
+    //   not .git/opencode or the rest of the storage dir the Actions cache carries; those
+    //   Actions-cache-only files are simply rebuilt on the next run. The skip here is
+    //   justified by that database durability, NOT by an inference that retrying the cache
+    //   write would fail again -- that futility argument is exactly the inference this
+    //   plan's Key Technical Decisions reject (see cache-save-result.ts's CacheSaveOutcome
+    //   doc on cache-rejected). Repeating the save here would only repeat the store upload,
+    //   adding no durability.
+    // skipped: SKIP_CACHE=true -- a deliberate no-op; retrying would just repeat it.
+    const skipReason =
+      cacheSaved === 'durable'
+        ? 'cache saved by main action'
+        : cacheSaved === 'store-only'
+          ? 'state persisted to the object store by main action'
+          : 'main action skipped the save'
+    logger.info(`Skipping post-action: ${skipReason}`, {cacheSaved})
   } else {
     const runId = String(getGitHubRunId())
     try {
@@ -115,12 +138,25 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
         ...(storeConfig == null ? {} : {storeConfig}),
       }
 
-      const saved = await saveCache(cacheSaveOptions)
+      const saveResult = await saveCache(cacheSaveOptions)
 
-      if (saved) {
+      // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
+      // after every other step in the job, so no downstream step could ever read it even if
+      // the write succeeded. The job summary is the only surface available here.
+      await writeCacheSaveResultSummary(saveResult, 'post-retry', logger)
+
+      // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
+      // its own line naming it, so a checkpoint decline is distinguishable from a
+      // rejected/errored cache write.
+      if (saveResult.cachePersisted === true) {
         logger.info('Post-action cache saved', {sessionId})
-      } else {
+      } else if (saveResult.outcome === 'skipped-empty') {
         logger.info('Post-action: no cache content to save', {sessionId})
+      } else {
+        logger.info(`Post-action cache save did not persist (${saveResult.outcome})`, {
+          sessionId,
+          storePersisted: saveResult.storePersisted,
+        })
       }
     } catch (error) {
       logger.warning('Post-action cache save failed (non-fatal)', {
@@ -134,20 +170,27 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
         const adapter = createS3Adapter(storeConfig, objectStoreLogger)
         const repo = getGitHubRepository()
         const runAttempt = getGitHubRunAttempt()
-        await syncMetadataToStore(
-          adapter,
-          storeConfig,
-          'github',
-          repo,
-          runId,
-          {
+        // CLEANUP_METADATA_WRITTEN distinguishes "cleanup ran and already uploaded the rich
+        // payload" from "cleanup never ran" -- CACHE_SAVED alone can't: run.ts seeds
+        // 'not-persisted' before cleanup ever executes, so that value is also what a crash
+        // before cleanup would leave behind. Skipping here avoids clobbering cleanup's
+        // token usage/timing/session/PR/commit/error payload with this thin placeholder.
+        if (core.getState(STATE_KEYS.CLEANUP_METADATA_WRITTEN) !== 'true') {
+          await syncMetadataToStore(
+            adapter,
+            storeConfig,
+            'github',
+            repo,
             runId,
-            timestamp: new Date().toISOString(),
-            cleanupSkipped: true,
-            runAttempt,
-          },
-          objectStoreLogger,
-        )
+            {
+              runId,
+              timestamp: new Date().toISOString(),
+              cleanupSkipped: true,
+              runAttempt,
+            },
+            objectStoreLogger,
+          )
+        }
         await syncArtifactsToStore(adapter, storeConfig, 'github', repo, runId, getOpenCodeLogPath(), objectStoreLogger)
       } catch (error) {
         logger.warning('Post-action object store sync failed (non-fatal)', {

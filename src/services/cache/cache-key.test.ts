@@ -138,8 +138,8 @@ describe('buildRestoreKeys', () => {
 })
 
 describe('buildSaveCacheKey', () => {
-  it('appends run ID to primary key', () => {
-    // #given components and a run ID
+  it('appends run ID and run attempt to primary key', () => {
+    // #given components, a run ID, and a run attempt
     const components: CacheKeyComponents = {
       agentIdentity: 'github',
       repo: 'owner/repo',
@@ -147,12 +147,13 @@ describe('buildSaveCacheKey', () => {
       os: 'Linux',
     }
     const runId = 12345678
+    const runAttempt = 1
 
     // #when building save cache key
-    const key = buildSaveCacheKey(components, runId)
+    const key = buildSaveCacheKey(components, runId, runAttempt)
 
-    // #then run ID is appended to primary key
-    expect(key).toBe('opencode-storage-github-owner-repo-main-Linux-12345678')
+    // #then run ID and run attempt are appended to primary key, in that order
+    expect(key).toBe('opencode-storage-github-owner-repo-main-Linux-12345678-1')
   })
 
   it('handles large run IDs', () => {
@@ -166,9 +167,71 @@ describe('buildSaveCacheKey', () => {
     const runId = 9876543210
 
     // #when building save cache key
-    const key = buildSaveCacheKey(components, runId)
+    const key = buildSaveCacheKey(components, runId, 1)
 
     // #then key includes full run ID
     expect(key).toContain('9876543210')
+  })
+
+  it('produces distinct keys for two attempts of the same run, so a re-run attempt does not collide with attempt 1', () => {
+    // #given the same run ID (GITHUB_RUN_ID does not change across a re-run attempt) but
+    // two different run attempts
+    const components: CacheKeyComponents = {
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      ref: 'main',
+      os: 'Linux',
+    }
+    const runId = 12345678
+
+    // #when building the save key for attempt 1 and attempt 2 of the same run
+    const attempt1Key = buildSaveCacheKey(components, runId, 1)
+    const attempt2Key = buildSaveCacheKey(components, runId, 2)
+
+    // #then the keys are distinct -- without this, attempt 2's save would collide with
+    // attempt 1's entry, throw "already exists", fold into 'persisted', and the post hook
+    // would skip the retry, silently losing attempt 2's session state
+    expect(attempt1Key).not.toBe(attempt2Key)
+    expect(attempt1Key).toBe('opencode-storage-github-owner-repo-main-Linux-12345678-1')
+    expect(attempt2Key).toBe('opencode-storage-github-owner-repo-main-Linux-12345678-2')
+  })
+
+  it('an unset run attempt (the getGitHubRunAttempt default) produces a key ending in -1', () => {
+    // #given the default run attempt when GITHUB_RUN_ATTEMPT is unset or invalid
+    // (getGitHubRunAttempt, src/shared/env.ts, mirrors getGitHubRunId's own
+    // parse-or-default pattern and defaults to 1)
+    const components: CacheKeyComponents = {
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      ref: 'main',
+      os: 'Linux',
+    }
+
+    // #when building the save key with that default
+    const key = buildSaveCacheKey(components, 12345678, 1)
+
+    // #then the key ends in the literal suffix produced by the default attempt value
+    expect(key.endsWith('-1')).toBe(true)
+  })
+
+  it('restore keys remain unaffected by the run-attempt suffix: they are prefixes that stop before any run ID or run attempt', () => {
+    // #given the same components used to build a save key with a specific run attempt
+    const components: CacheKeyComponents = {
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      ref: 'main',
+      os: 'Linux',
+    }
+    const saveKey = buildSaveCacheKey(components, 12345678, 2)
+
+    // #when building the restore keys for the same components
+    const [refScoped, repoScoped] = buildRestoreKeys(components)
+
+    // #then both restore-key prefixes still match the save key regardless of run ID or run
+    // attempt, since neither prefix includes either
+    expect(refScoped).toBeDefined()
+    expect(repoScoped).toBeDefined()
+    expect(saveKey.startsWith(refScoped as string)).toBe(true)
+    expect(saveKey.startsWith(repoScoped as string)).toBe(true)
   })
 })

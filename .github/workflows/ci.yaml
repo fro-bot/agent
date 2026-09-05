@@ -167,6 +167,15 @@ jobs:
         - Test coverage for new/changed behavior
         Skip style nits — the linter handles those.
 
+        Do NOT run build, lint, or type-check commands at any scope, or repository-wide
+        or directory-wide test commands in any form; dedicated CI jobs own those gates
+        for this PR. This includes aliases such as `bun test`, `bun run test:scripts`,
+        `bunx vitest run <directory>`, `bunx eslint`, and `bunx tsc --noEmit`, even if
+        repository instructions list them. Inspect the diff, relevant code, and test files;
+        derive `### Missing tests` from that evidence, not by running a suite. You may run
+        one named test file or a minimal empirical probe only to validate a concrete finding,
+        not merely to show tests pass. State the command and the claim it tested.
+
         Use inline comments for file-specific issues. Reserve the review
         body for the structured summary below.
 

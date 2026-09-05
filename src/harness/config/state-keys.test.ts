@@ -24,6 +24,10 @@ describe('state-keys', () => {
       expect(STATE_KEYS.ARTIFACT_UPLOADED).toBe('artifactUploaded')
     })
 
+    it('contains cleanupMetadataWritten key', () => {
+      expect(STATE_KEYS.CLEANUP_METADATA_WRITTEN).toBe('cleanupMetadataWritten')
+    })
+
     it('contains object store config state keys', () => {
       expect(STATE_KEYS.S3_ENABLED).toBe('storeConfig.enabled')
       expect(STATE_KEYS.S3_BUCKET).toBe('storeConfig.bucket')
@@ -37,7 +41,7 @@ describe('state-keys', () => {
     })
 
     it('has correct number of keys', () => {
-      expect(Object.keys(STATE_KEYS)).toHaveLength(14)
+      expect(Object.keys(STATE_KEYS)).toHaveLength(15)
     })
 
     it('values are string type compatible', () => {

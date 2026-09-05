@@ -1,8 +1,141 @@
+import type {CacheSaveOutcome, CacheSaveResult, CacheSaveStateValue} from '../../shared/cache-save-result.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CommentSummaryOptions} from './types.js'
 import * as core from '@actions/core'
+import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {formatCacheStatus, formatDuration} from './run-summary.js'
+
+/**
+ * Table-cell text per `CacheSaveStateValue`, mirroring `formatCacheStatus` in
+ * `run-summary.ts` (visual indicator + short label, one line, no proof-of-durability
+ * language -- a result is reported, never a guarantee; see the cache-save-result-contract
+ * plan's R4).
+ */
+const CACHE_SAVE_RESULT_LABELS: Record<CacheSaveStateValue, string> = {
+  durable: '✅ persisted',
+  'store-only': '📦 persisted (object store only)',
+  skipped: '⏭️ skipped',
+  'not-persisted': '❌ not persisted',
+}
+
+function formatCacheSaveResult(value: CacheSaveStateValue): string {
+  return CACHE_SAVE_RESULT_LABELS[value]
+}
+
+/**
+ * One-sentence remediation text per `CacheSaveOutcome`, pinned by
+ * `satisfies Record<CacheSaveOutcome, ...>` so a new outcome without a case here fails
+ * `check-types` instead of silently reporting nothing. `undefined` for `persisted` and
+ * `skipped-by-configuration` -- neither needs remediation, and a deliberate skip in
+ * particular must never suggest `s3-backup` (it did not fail; it did not run).
+ *
+ * `cache-rejected`/`cache-error`'s wording names the cause as an inference, not an
+ * observation: the cache write's `-1` sentinel (or a thrown error) does not distinguish a
+ * policy denial from a reservation collision (see `CacheSaveOutcome` in
+ * `cache-save-result.ts`), so both possibilities are named rather than picking one.
+ * `checkpoint-declined` and `skipped-empty` each get their own sentence rather than
+ * reusing the rejected-write one: neither is a rejected write, and `s3-backup` would not
+ * help either -- a declined checkpoint means no write was attempted at all, and an empty
+ * observation means there was nothing to write in the first place.
+ *
+ * `skipped-empty` and `checkpoint-declined` are the only two entries with a trailing
+ * "the post-action step retries" clause, and that clause is true only when this sentence
+ * is rendered from `cleanup.ts`'s `phase: 'main'` write -- a post-action retry genuinely
+ * follows. `post.ts` renders the same outcome from its own retry (`phase: 'post-retry'`),
+ * which IS that retry; claiming it "retries" again would be false. So each entry carries
+ * its base `sentence` plus an optional `retryDetail` suffix (appended after "the
+ * post-action step retries"), and `cacheSaveResultRemediation` below only appends the
+ * whole retry clause for `phase === 'main'`.
+ */
+const OUTCOME_TO_REMEDIATION = {
+  'skipped-by-configuration': undefined,
+  'skipped-empty': {
+    sentence: 'No session state was found to save',
+    retryDetail: 'in case the database was still being written',
+  },
+  'checkpoint-declined': {
+    sentence:
+      'Session state did not persist this run \u2014 the database could not be checkpointed, so no write was attempted',
+    retryDetail: undefined,
+  },
+  'cache-rejected':
+    'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.',
+  'cache-error':
+    'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.',
+  persisted: undefined,
+} as const satisfies Record<CacheSaveOutcome, string | undefined | {sentence: string; retryDetail: string | undefined}>
+
+function cacheSaveResultRemediation(result: CacheSaveResult, phase: 'main' | 'post-retry'): string | undefined {
+  // store-only is a state-value distinction, not a separate CacheSaveOutcome (it only
+  // arises from cache-rejected/cache-error plus storePersisted -- see
+  // OUTCOME_TO_STATE_VALUE in cache-save-result.ts) -- so it is handled ahead of the
+  // outcome table, which would otherwise report the rejected-write sentence (and its
+  // s3-backup suggestion) even though the object store already durably persisted the
+  // state through that same backend.
+  if (toCacheSaveStateValue(result) === 'store-only') {
+    return 'Session state persisted to the object store; the Actions cache write did not persist it.'
+  }
+
+  const entry = OUTCOME_TO_REMEDIATION[result.outcome]
+  if (entry == null) {
+    return undefined
+  }
+  if (typeof entry === 'string') {
+    return entry
+  }
+
+  // Only the main-phase write is followed by an actual post-action retry -- this call
+  // (phase === 'post-retry') IS that retry, so the trailing clause naming it is dropped.
+  if (phase !== 'main') {
+    return `${entry.sentence}.`
+  }
+  const retryClause =
+    entry.retryDetail == null ? 'the post-action step retries' : `the post-action step retries ${entry.retryDetail}`
+  return `${entry.sentence}; ${retryClause}.`
+}
+
+/**
+ * Writes a standalone job-summary row reporting whether session state persisted this run.
+ * Deliberately separate from `writeJobSummary`: the outcome is only known once `saveCache`
+ * runs in `cleanup.ts`, which executes after `runFinalizeWithResult` (the caller of
+ * `writeJobSummary`) has already written and flushed the main summary table -- see the
+ * cache-save-result-contract plan's Unit 3. `post.ts` calls this same function after a
+ * retried save so a red state from a retry is visible without reading logs, even though
+ * the post hook cannot populate the `cache-save-result` output itself (see the comment at
+ * that call site).
+ *
+ * Non-blocking: logs a warning on failure but never throws, the same as `writeJobSummary`.
+ */
+export async function writeCacheSaveResultSummary(
+  result: CacheSaveResult,
+  phase: 'main' | 'post-retry',
+  logger: Logger,
+): Promise<void> {
+  try {
+    const value = toCacheSaveStateValue(result)
+    const heading = phase === 'main' ? 'Session Persistence' : 'Session Persistence (post-action retry)'
+    core.summary.addHeading(heading, 3).addTable([
+      [
+        {data: 'Field', header: true},
+        {data: 'Value', header: true},
+      ],
+      ['Cache Save Result', formatCacheSaveResult(value)],
+    ])
+
+    const remediation = cacheSaveResultRemediation(result, phase)
+    if (remediation != null) {
+      core.summary.addRaw(`${remediation}\n`)
+    }
+
+    await core.summary.write()
+    logger.debug('Wrote cache save result summary', {value})
+  } catch (error) {
+    const errorMsg = toErrorMessage(error)
+    logger.warning('Failed to write cache save result summary', {error: errorMsg})
+    core.warning(`Failed to write cache save result summary: ${errorMsg}`)
+  }
+}
 
 /**
  * Write comprehensive job summary to GitHub Actions UI.
