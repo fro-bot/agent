@@ -558,7 +558,7 @@ describe('restoreCache', () => {
     expect(result.corrupted).toBe(true)
   })
 
-  it('still includes -shm in the restore path set for backward compatibility with older caches', async () => {
+  it('excludes -wal and -shm from the restore path set (restore and save share one list, by construction)', async () => {
     // #given a cache adapter that records the paths requested for restore
     const restoreCacheSpy = vi.fn<CacheAdapter['restoreCache']>(async () => undefined)
 
@@ -574,9 +574,14 @@ describe('restoreCache', () => {
     // #when restoring cache
     await restoreCache(options)
 
-    // #then the restore-side path set still includes -shm so older cache archives extract cleanly
+    // #then the restore-side path set matches the save-side one exactly: neither sidecar
+    // is present. Restore and save now call the same buildCachePaths, so a version that
+    // included -shm here (as a prior revision of this test asserted) would make every
+    // save's @actions/cache version hash disagree with what restore requests, and no entry
+    // written since would ever be found.
     const requestedPaths = restoreCacheSpy.mock.calls[0]?.[0]
-    expect(requestedPaths).toContain(path.join(path.dirname(storagePath), 'opencode.db-shm'))
+    expect(requestedPaths).not.toContain(path.join(path.dirname(storagePath), 'opencode.db-shm'))
+    expect(requestedPaths).not.toContain(path.join(path.dirname(storagePath), 'opencode.db-wal'))
   })
 
   it('deletes a restored opencode.db-shm before returning a hit', async () => {
@@ -1313,10 +1318,10 @@ describe('saveCache', () => {
   it('reports no cacheable content when the main db is zero-size, even if opencode.db-wal has data (WAL never crosses the save boundary)', async () => {
     // #given storagePath is empty, opencode.db is 0 bytes, and opencode.db-wal has data.
     // Before the write-ahead log was removed from the save boundary, this combination
-    // proceeded with save because buildSaveCachePaths captured a non-empty wal directly.
-    // It no longer can: the log is never selected for transport on save (see
+    // proceeded with save because a save-only path builder captured a non-empty wal
+    // directly. It no longer can: the log is never selected for transport on save (see
     // DB_TRANSPORTABLE_BASENAMES in packages/runtime/src/session/version.ts and
-    // buildSaveCachePaths in paths.ts), so its content is invisible to hasCacheableContent
+    // buildCachePaths in paths.ts), so its content is invisible to hasCacheableContent
     // regardless of size. In practice this exact shape — a genuinely zero-byte main db
     // with real committed data sitting only in its write-ahead log — does not occur for a
     // real SQLite database that has ever been opened for writing (checkpoint.ts's own
@@ -1352,7 +1357,7 @@ describe('saveCache', () => {
 
   it('reports no cacheable content when only opencode.db-shm is non-empty (SHM-only)', async () => {
     // #given storagePath is empty, opencode.db is 0 bytes, and only opencode.db-shm has data
-    // -shm never crosses the save boundary (buildSaveCachePaths excludes it), so a
+    // -shm never crosses the save boundary (buildCachePaths excludes it), so a
     // workspace whose only non-empty file is -shm has nothing real to cache.
     const dbDir = path.dirname(storagePath)
     await fs.mkdir(dbDir, {recursive: true})
