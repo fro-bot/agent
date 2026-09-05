@@ -24,6 +24,7 @@ import {completeAcknowledgment} from '../../features/agent/index.js'
 import {cleanupTempFiles} from '../../features/attachments/index.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
+import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
 import {
   getGitHubRunAttempt,
   getGitHubRunId,
@@ -192,14 +193,13 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
       storeConfig,
     })
 
-    // Minimal adaptation to the structured result (Unit 1 of the cache-save-result-contract
-    // plan): reads .cachePersisted where this used to read the bare boolean. CACHE_SAVED
-    // stays a boolean here and does not yet distinguish store-only persistence or a
-    // deliberate skip — that widening to an enum, and the retry-gating logic it enables,
-    // is Unit 2's job.
-    if (cacheSaveResult.cachePersisted) {
-      core.saveState(STATE_KEYS.CACHE_SAVED, 'true')
-    }
+    // Written on every path a result exists (not just the successful one): the previous
+    // boolean-only-on-success write left store-only persistence unrecorded, so the post
+    // hook saw an unset CACHE_SAVED and repeated the entire save — a second checkpoint, a
+    // second full object-store upload, and a second doomed cache write, even though state
+    // was already durable. toCacheSaveStateValue is the single place that derives the
+    // enum from the result so cleanup.ts and post.ts (which reads it back) can't drift.
+    core.saveState(STATE_KEYS.CACHE_SAVED, toCacheSaveStateValue(cacheSaveResult))
 
     if (isOpenCodePromptArtifactEnabled()) {
       const artifactLogger = createLogger({phase: 'artifact-upload'})

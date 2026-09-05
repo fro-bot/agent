@@ -5,6 +5,7 @@ import * as core from '@actions/core'
 import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-bot/runtime'
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
+import {parseCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {
   getGitHubRepository,
   getGitHubRunAttempt,
@@ -65,7 +66,11 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
   const logger = options.logger ?? createLogger({phase: 'post'})
 
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
-  const cacheSaved = core.getState(STATE_KEYS.CACHE_SAVED)
+  // parseCacheSaveStateValue treats an absent key (main step crashed before cleanup ran)
+  // or an unrecognized value (e.g. 'true' from an older action version, or corrupted
+  // state) as 'not-persisted' -- fail toward retrying the save, never toward skipping it,
+  // since this post hook is the last chance to persist state for the run.
+  const cacheSaved = parseCacheSaveStateValue(core.getState(STATE_KEYS.CACHE_SAVED))
   const sessionId = core.getState(STATE_KEYS.SESSION_ID) || null
   const opencodeVersion = core.getState(STATE_KEYS.OPENCODE_VERSION) || null
   const storeConfig = reconstructStoreConfigFromState()
@@ -83,7 +88,16 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
     return
   }
 
-  if (cacheSaved === 'true') {
+  if (cacheSaved === 'durable' || cacheSaved === 'store-only' || cacheSaved === 'skipped') {
+    // durable: the cache write itself already persisted -- nothing left to do.
+    // store-only: the object store already persisted the same state independently of the
+    //   cache write. The skip here is justified by durability already achieved through
+    //   that other backend, NOT by an inference that retrying the cache write would fail
+    //   again -- that futility argument is exactly the inference this plan's Key Technical
+    //   Decisions reject (see cache-save-result.ts's CacheSaveOutcome doc on cache-rejected).
+    //   Repeating the save here would only repeat the store upload, adding no durability.
+    // skipped: SKIP_CACHE=true or no cacheable content -- a deliberate no-op; retrying
+    //   would just repeat the same no-op.
     logger.info('Skipping post-action: cache already saved by main action', {cacheSaved})
   } else {
     const runId = String(getGitHubRunId())
@@ -117,15 +131,20 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
 
       const saveResult = await saveCache(cacheSaveOptions)
 
-      // Minimal adaptation to the structured result (Unit 1 of the cache-save-result-
-      // contract plan): reads .cachePersisted where this used to read the bare boolean.
-      // This still reports every non-cache-persisted outcome (including store-only
-      // persistence) as "no cache content to save" — correcting that message and gating
-      // the retry on durability rather than cache success is Unit 2's job.
+      // "No cache content to save" is reserved for skipped-empty — the one outcome that
+      // actually means it. Every other outcome gets its own line naming the outcome, so a
+      // checkpoint decline (retryable, the existing #1519 guarantee) is distinguishable
+      // in the log from a rejected/errored cache write, rather than both being reported as
+      // the same misleadingly specific "no content" claim.
       if (saveResult.cachePersisted) {
         logger.info('Post-action cache saved', {sessionId})
-      } else {
+      } else if (saveResult.outcome === 'skipped-empty') {
         logger.info('Post-action: no cache content to save', {sessionId})
+      } else {
+        logger.info(`Post-action cache save did not persist (${saveResult.outcome})`, {
+          sessionId,
+          storePersisted: saveResult.storePersisted,
+        })
       }
     } catch (error) {
       logger.warning('Post-action cache save failed (non-fatal)', {

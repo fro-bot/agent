@@ -40,3 +40,80 @@ export interface CacheSaveResult {
   readonly storePersisted: boolean
   readonly outcome: CacheSaveOutcome
 }
+
+/**
+ * The `CACHE_SAVED` state-key value the harness layer (`cleanup.ts`, `post.ts`) hands off
+ * across the main step/post-hook process boundary. Widened from a boolean to this
+ * four-value enum so the post hook can gate its retry on durability actually achieved
+ * (`durable`, `store-only`) rather than on cache-write success alone — the boolean
+ * conflated a store-only save with total failure and caused a redundant object-store
+ * upload (see the cache-save-result-contract plan).
+ *
+ * - `durable`: the cache write itself persisted (`persisted` outcome). Retry is futile
+ *   and unnecessary — skip.
+ * - `store-only`: the cache write was rejected or errored, but the object store already
+ *   persisted the same state. Skip is justified by **durability already achieved through
+ *   the other backend**, not by predicting a cache retry would fail — repeating the save
+ *   here would only repeat the store upload, not add durability. See the branch in
+ *   `post.ts` for why this is not the futility inference the plan's Key Technical
+ *   Decisions reject.
+ * - `skipped`: `SKIP_CACHE=true` or no cacheable content existed. Deliberate; retry would
+ *   just repeat the same no-op.
+ * - `not-persisted`: nothing durable happened (checkpoint declined, cache rejected/errored
+ *   with no store persistence) — or the state value was absent or unrecognized. The post
+ *   hook must retry here: an absent/garbled value must fail toward doing the work, never
+ *   toward skipping it, because the post hook is the last chance to persist state.
+ */
+export type CacheSaveStateValue = 'durable' | 'store-only' | 'skipped' | 'not-persisted'
+
+/** Every valid `CacheSaveStateValue`, used to validate a state string read back from `core.getState`. */
+export const CACHE_SAVE_STATE_VALUES: readonly CacheSaveStateValue[] = [
+  'durable',
+  'store-only',
+  'skipped',
+  'not-persisted',
+]
+
+type CacheSaveStateMapper = (result: CacheSaveResult) => CacheSaveStateValue
+
+/**
+ * One mapper per `CacheSaveOutcome`, pinned by `satisfies Record<CacheSaveOutcome, ...>` the
+ * same way `RESPONSE_SURFACE_POLICIES` (`packages/runtime/src/agent/prompt.ts`) pins response
+ * surfaces: adding a new outcome to the union without adding a case here fails `check-types`,
+ * rather than the new outcome silently mapping to nothing (or falling through to a wrong
+ * default) in `cleanup.ts`.
+ */
+const OUTCOME_TO_STATE_VALUE = {
+  'skipped-by-configuration': () => 'skipped',
+  'skipped-empty': () => 'skipped',
+  'checkpoint-declined': () => 'not-persisted',
+  // A rejected or errored cache write is not-persisted UNLESS the object store already
+  // achieved durability independently — the double-sync bug this plan exists to fix.
+  'cache-rejected': result => (result.storePersisted ? 'store-only' : 'not-persisted'),
+  'cache-error': result => (result.storePersisted ? 'store-only' : 'not-persisted'),
+  // `persisted` always has cachePersisted: true (see the type doc above), so it is always
+  // durable regardless of storePersisted.
+  persisted: () => 'durable',
+} as const satisfies Record<CacheSaveOutcome, CacheSaveStateMapper>
+
+/**
+ * Derives the `CACHE_SAVED` state value to hand off to the post hook from a `CacheSaveResult`.
+ * The single place this mapping happens — `cleanup.ts` calls this rather than re-deriving the
+ * enum from the result's fields itself, so there is exactly one spot to update if a new
+ * outcome or persistence rule is added.
+ */
+export function toCacheSaveStateValue(result: CacheSaveResult): CacheSaveStateValue {
+  return OUTCOME_TO_STATE_VALUE[result.outcome](result)
+}
+
+/**
+ * Parses a `CACHE_SAVED` state string read back via `core.getState`. Anything absent (`''`,
+ * the value `core.getState` returns for an unset key) or unrecognized (e.g. `'true'` from an
+ * older action version, or corrupted state) maps to `not-persisted` — fail toward retrying
+ * the save, never toward skipping it, since the post hook is the last chance to persist.
+ */
+export function parseCacheSaveStateValue(value: string): CacheSaveStateValue {
+  return (CACHE_SAVE_STATE_VALUES as readonly string[]).includes(value)
+    ? (value as CacheSaveStateValue)
+    : 'not-persisted'
+}

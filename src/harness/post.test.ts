@@ -73,7 +73,7 @@ describe('post action', () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
         if (key === 'shouldSaveCache') return 'true'
-        if (key === 'cacheSaved') return 'true'
+        if (key === 'cacheSaved') return 'durable'
         return ''
       })
 
@@ -96,6 +96,55 @@ describe('post action', () => {
         if (key === 'shouldSaveCache') return 'true'
         if (key === 'cacheSaved') return 'false'
         if (key === 'sessionId') return 'ses_123'
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      await runPost({logger})
+
+      expect(saveCache).toHaveBeenCalled()
+      expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
+    })
+
+    it('attempts the save when the cacheSaved state key is entirely absent (main step crashed before cleanup ran)', async () => {
+      // #given the main step crashed before cleanup.ts ever ran, so CACHE_SAVED was never
+      // written at all -- core.getState returns '' for a key that was never saved, which
+      // parseCacheSaveStateValue must treat the same as any other unrecognized value:
+      // fail toward retrying, never toward skipping, since this is the last chance to
+      // persist the run's session state
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        // cacheSaved intentionally omitted -- returns '' via the catch-all below
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      await runPost({logger})
+
+      expect(saveCache).toHaveBeenCalled()
+      expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
+    })
+
+    it('still attempts the save when the agent step itself failed but a save was requested, so a failed run does not also lose its session', async () => {
+      // #given routing.ts sets shouldSaveCache independent of whether the agent step
+      // succeeded -- runPost has no agentSuccess parameter at all and must not need one:
+      // the only gate here is whether a save was requested and whether one already
+      // achieved durability, never whether the run's own work succeeded
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'not-persisted'
         return ''
       })
 
@@ -273,7 +322,7 @@ describe('post action', () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
         if (key === 'shouldSaveCache') return 'true'
-        if (key === 'cacheSaved') return 'true'
+        if (key === 'cacheSaved') return 'durable'
         if (key === 'artifactUploaded') return ''
         return ''
       })
@@ -294,7 +343,7 @@ describe('post action', () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
         if (key === 'shouldSaveCache') return 'true'
-        if (key === 'cacheSaved') return 'true'
+        if (key === 'cacheSaved') return 'durable'
         if (key === 'artifactUploaded') return 'true'
         return ''
       })
@@ -314,7 +363,7 @@ describe('post action', () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
         if (key === 'shouldSaveCache') return 'true'
-        if (key === 'cacheSaved') return 'true'
+        if (key === 'cacheSaved') return 'durable'
         return ''
       })
 
@@ -333,7 +382,7 @@ describe('post action', () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
         if (key === 'shouldSaveCache') return 'true'
-        if (key === 'cacheSaved') return 'true'
+        if (key === 'cacheSaved') return 'durable'
         if (key === 'artifactUploaded') return ''
         return ''
       })

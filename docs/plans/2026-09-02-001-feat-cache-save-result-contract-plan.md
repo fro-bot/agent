@@ -215,7 +215,7 @@ The bolded row is the double-sync bug: durable in the object store, reported as 
 
 **Verification:** Every return path in `save.ts` produces a distinct, asserted result. No caller can reach a state where durability is unknowable from the return value alone.
 
-- [ ] **Unit 2: Call sites consume the result**
+- [x] **Unit 2: Call sites consume the result**
 
 **Goal:** The post hook stops repeating saves that already persisted, and stops reporting every failure as "no cache content".
 

@@ -1,5 +1,6 @@
-import type {CacheSaveOutcome, CacheSaveResult} from './cache-save-result.js'
+import type {CacheSaveOutcome, CacheSaveResult, CacheSaveStateValue} from './cache-save-result.js'
 import {describe, expect, it} from 'vitest'
+import {parseCacheSaveStateValue, toCacheSaveStateValue} from './cache-save-result.js'
 
 interface OutcomeExpectation {
   readonly description: string
@@ -95,5 +96,53 @@ describe('CacheSaveResult', () => {
     const errored: CacheSaveResult = {cachePersisted: false, storePersisted: false, outcome: 'cache-error'}
 
     expect(rejected.outcome).not.toBe(errored.outcome)
+  })
+})
+
+describe('toCacheSaveStateValue', () => {
+  // Exhaustiveness is pinned at compile time by `OUTCOME_TO_STATE_VALUE`'s
+  // `satisfies Record<CacheSaveOutcome, CacheSaveStateMapper>` in cache-save-result.ts --
+  // mirroring the OUTCOME_EXPECTATIONS table above. Verified by temporarily deleting the
+  // 'cache-error' case from that table during implementation: `bun run check-types` then
+  // fails with "Property 'cache-error' is missing in type ... but required in type
+  // 'Record<CacheSaveOutcome, CacheSaveStateMapper>'", proving a new/removed outcome
+  // cannot silently map to nothing. The case was restored immediately after confirming
+  // the failure; this table below exercises the restored, complete mapping at runtime.
+  const cases: readonly {readonly result: CacheSaveResult; readonly expected: CacheSaveStateValue}[] = [
+    {result: {cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'}, expected: 'skipped'},
+    {result: {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'}, expected: 'skipped'},
+    {result: {cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'}, expected: 'not-persisted'},
+    // The case the whole plan exists for: the object store persisted independently of a
+    // rejected cache write, so the state is durable through the other backend.
+    {result: {cachePersisted: false, storePersisted: true, outcome: 'cache-rejected'}, expected: 'store-only'},
+    {result: {cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'}, expected: 'not-persisted'},
+    {result: {cachePersisted: false, storePersisted: true, outcome: 'cache-error'}, expected: 'store-only'},
+    {result: {cachePersisted: false, storePersisted: false, outcome: 'cache-error'}, expected: 'not-persisted'},
+    {result: {cachePersisted: true, storePersisted: false, outcome: 'persisted'}, expected: 'durable'},
+    {result: {cachePersisted: true, storePersisted: true, outcome: 'persisted'}, expected: 'durable'},
+  ]
+
+  for (const {result, expected} of cases) {
+    it(`maps ${result.outcome} (storePersisted: ${result.storePersisted}) to ${expected}`, () => {
+      expect(toCacheSaveStateValue(result)).toBe(expected)
+    })
+  }
+})
+
+describe('parseCacheSaveStateValue', () => {
+  it('round-trips every valid CacheSaveStateValue', () => {
+    const values: readonly CacheSaveStateValue[] = ['durable', 'store-only', 'skipped', 'not-persisted']
+    for (const value of values) {
+      expect(parseCacheSaveStateValue(value)).toBe(value)
+    }
+  })
+
+  it('treats an absent state value (empty string, what core.getState returns for an unset key) as not-persisted', () => {
+    expect(parseCacheSaveStateValue('')).toBe('not-persisted')
+  })
+
+  it('treats an unrecognized value (e.g. the old boolean "true", or corrupted state) as not-persisted -- fail toward retrying, never toward skipping', () => {
+    expect(parseCacheSaveStateValue('true')).toBe('not-persisted')
+    expect(parseCacheSaveStateValue('banana')).toBe('not-persisted')
   })
 })
