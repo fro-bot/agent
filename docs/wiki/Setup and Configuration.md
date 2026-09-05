@@ -1,7 +1,7 @@
 ---
 type: subsystem
 last-updated: "2026-09-05"
-updated-by: "pr-1545"
+updated-by: "pr-1514-cache-save-result"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -199,3 +199,12 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 - `s3-backup` / `s3-bucket` / `aws-region` / `s3-endpoint` / `s3-prefix` / `s3-expected-bucket-owner` / `s3-allow-insecure-endpoint` / `s3-sse-encryption` / `s3-sse-kms-key-id` enable and configure the durable S3-compatible object store (see [[Session Persistence]]). Input validation rejects SSRF-vulnerable endpoints (metadata services, private IPs) and enforces HTTPS unless explicitly overridden.
 - `session-retention` controls how many sessions to keep before pruning (default: 50).
 - `dedup-window` configures the deduplication window in milliseconds (default: 10 minutes).
+
+## Action Outputs
+
+| Output | Description |
+| --- | --- |
+| `cache-status` | Cache restore status (`hit`, `miss`, `corrupted`) |
+| `cache-save-result` | Cache save outcome (`durable`, `store-only`, `skipped`, `not-persisted`); set from the main step — the post-action retry reports only to the job summary |
+
+See the full outputs table in the repository [README](../../README.md#outputs).

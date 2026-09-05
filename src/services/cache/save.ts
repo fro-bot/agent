@@ -186,7 +186,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
           logger,
         )
         logger.info('Object store session sync completed', syncResult)
-        storePersisted = syncResult.uploaded > 0
+        storePersisted = syncResult.uploaded > 0 && syncResult.failed === 0
       } catch (error) {
         logger.warning('Object store session sync failed (non-fatal)', {
           error: toErrorMessage(error),

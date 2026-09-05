@@ -195,23 +195,26 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
       storeConfig,
     })
 
-    // Written on every path a result exists (not just the successful one): the previous
-    // boolean-only-on-success write left store-only persistence unrecorded, so the post
-    // hook saw an unset CACHE_SAVED and repeated the entire save — a second checkpoint, a
-    // second full object-store upload, and a second doomed cache write, even though state
-    // was already durable. toCacheSaveStateValue is the single place that derives the
-    // enum from the result so cleanup.ts and post.ts (which reads it back) can't drift.
+    // Written on every path a result exists, not just success: a boolean-only-on-success
+    // write left store-only persistence unrecorded, so the post hook saw an unset
+    // CACHE_SAVED and repeated the entire save even though state was already durable.
     const cacheSaveStateValue = toCacheSaveStateValue(cacheSaveResult)
     core.saveState(STATE_KEYS.CACHE_SAVED, cacheSaveStateValue)
 
-    // Set from cleanup, not finalize.ts's setActionOutputs call: runFinalizeWithResult runs
-    // before runCleanup (see run.ts), so the save has not happened yet when finalize writes
-    // its outputs -- this is the only call site structurally able to carry the result.
-    setCacheSaveResultOutput(cacheSaveStateValue)
+    // Set from cleanup, not finalize.ts: the save has not happened yet when finalize
+    // writes its outputs. A throw here (e.g. no GITHUB_OUTPUT file) must not skip the
+    // summary write or artifact upload below.
+    try {
+      setCacheSaveResultOutput(cacheSaveStateValue)
+    } catch (outputError) {
+      cacheLogger.warning('Failed to set cache-save-result output (non-fatal)', {
+        error: outputError instanceof Error ? outputError.message : String(outputError),
+      })
+    }
 
-    // A repository owner sees this without reading logs (R3). Written here rather than in
-    // finalize.ts's writeJobSummary call for the same reason as the output above: the main
-    // summary table is already written and flushed by the time this outcome is known.
+    // A repository owner sees this without reading logs. Written here, not in
+    // finalize.ts's writeJobSummary: the main summary table is already flushed by the
+    // time this outcome is known.
     await writeCacheSaveResultSummary(cacheSaveStateValue, cacheLogger)
 
     if (isOpenCodePromptArtifactEnabled()) {

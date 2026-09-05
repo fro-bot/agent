@@ -1055,6 +1055,41 @@ describe('saveCache', () => {
     })
   })
 
+  it('treats a partially-failed sync as not persisted, even with uploads > 0', async () => {
+    // #given storage with content, a sync that uploaded some files but failed others, and
+    // a cache write that also fails -- the headline case: neither backend fully landed
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    vi.resetModules()
+    vi.doMock('@fro-bot/runtime', async () => {
+      const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
+      return {...actual, syncSessionsToStore: vi.fn(async () => ({uploaded: 2, failed: 1}))}
+    })
+
+    const {saveCache: saveCacheWithPartialSync} = await import('./index.js')
+    const adapter = createMockCacheAdapter({saveResult: -1})
+
+    // #when saving cache
+    const result = await saveCacheWithPartialSync({
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter(),
+    })
+
+    // #then storePersisted is false despite uploaded > 0 -- a partial sync is not durable --
+    // and cache-rejected drives the post hook to retry rather than skip
+    expect(result).toEqual({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
+
+    vi.doUnmock('@fro-bot/runtime')
+    vi.resetModules()
+  })
+
   it('writes to object store and cache when configured', async () => {
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')

@@ -132,24 +132,15 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
 
       const saveResult = await saveCache(cacheSaveOptions)
 
-      // The post hook cannot set the `cache-save-result` output for this retry: GitHub
-      // Actions outputs are step-scoped, and `runs.post:` steps execute after every other
-      // step in the job has already completed (GitHub Actions docs, "metadata syntax for
-      // GitHub Actions" — runs.post; core.setOutput itself, @actions/core/lib/core.js:158,
-      // just appends a key/value line to whatever GITHUB_OUTPUT file is current for this
-      // process at call time). Even if the write itself succeeded, no downstream step
-      // could exist to read it, because any such step would have had to run before this
-      // one. The job summary is the only surface available here, so the retry's actual
-      // result -- which may be a red state the main step's own summary never saw, since
-      // that result did not exist yet when finalize.ts wrote it -- is written there instead.
+      // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
+      // after every other step in the job, so no downstream step could ever read it even if
+      // the write succeeded. The job summary is the only surface available here.
       await writeCacheSaveResultSummary(toCacheSaveStateValue(saveResult), logger)
 
-      // "No cache content to save" is reserved for skipped-empty — the one outcome that
-      // actually means it. Every other outcome gets its own line naming the outcome, so a
-      // checkpoint decline (retryable, the existing #1519 guarantee) is distinguishable
-      // in the log from a rejected/errored cache write, rather than both being reported as
-      // the same misleadingly specific "no content" claim.
-      if (saveResult.cachePersisted) {
+      // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
+      // its own line naming it, so a checkpoint decline is distinguishable from a
+      // rejected/errored cache write.
+      if (saveResult.cachePersisted === true) {
         logger.info('Post-action cache saved', {sessionId})
       } else if (saveResult.outcome === 'skipped-empty') {
         logger.info('Post-action: no cache content to save', {sessionId})

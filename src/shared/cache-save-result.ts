@@ -37,6 +37,7 @@ export type CacheSaveOutcome =
  */
 export interface CacheSaveResult {
   readonly cachePersisted: boolean
+  /** True only when the object-store sync fully landed: at least one file uploaded and none failed. */
   readonly storePersisted: boolean
   readonly outcome: CacheSaveOutcome
 }
@@ -77,11 +78,9 @@ export const CACHE_SAVE_STATE_VALUES: readonly CacheSaveStateValue[] = [
 type CacheSaveStateMapper = (result: CacheSaveResult) => CacheSaveStateValue
 
 /**
- * One mapper per `CacheSaveOutcome`, pinned by `satisfies Record<CacheSaveOutcome, ...>` the
- * same way `RESPONSE_SURFACE_POLICIES` (`packages/runtime/src/agent/prompt.ts`) pins response
- * surfaces: adding a new outcome to the union without adding a case here fails `check-types`,
- * rather than the new outcome silently mapping to nothing (or falling through to a wrong
- * default) in `cleanup.ts`.
+ * One mapper per `CacheSaveOutcome`, pinned by `satisfies Record<CacheSaveOutcome, ...>` so
+ * adding a new outcome without a case here fails `check-types` instead of silently mapping
+ * to nothing.
  */
 const OUTCOME_TO_STATE_VALUE = {
   'skipped-by-configuration': () => 'skipped',
@@ -98,8 +97,7 @@ const OUTCOME_TO_STATE_VALUE = {
 
 /**
  * Derives the `CACHE_SAVED` state value to hand off to the post hook from a `CacheSaveResult`.
- * The single place this mapping happens — `cleanup.ts` calls this rather than re-deriving the
- * enum from the result's fields itself, so there is exactly one spot to update if a new
+ * The single place this mapping happens, so there is exactly one spot to update if a new
  * outcome or persistence rule is added.
  */
 export function toCacheSaveStateValue(result: CacheSaveResult): CacheSaveStateValue {
@@ -107,10 +105,9 @@ export function toCacheSaveStateValue(result: CacheSaveResult): CacheSaveStateVa
 }
 
 /**
- * Parses a `CACHE_SAVED` state string read back via `core.getState`. Anything absent (`''`,
- * the value `core.getState` returns for an unset key) or unrecognized (e.g. `'true'` from an
- * older action version, or corrupted state) maps to `not-persisted` — fail toward retrying
- * the save, never toward skipping it, since the post hook is the last chance to persist.
+ * Parses a `CACHE_SAVED` state string read back via `core.getState`. Absent (unset key) or
+ * unrecognized (e.g. `'true'` from an older action version) values map to `not-persisted` —
+ * fail toward retrying, never toward skipping, since the post hook is the last chance.
  */
 export function parseCacheSaveStateValue(value: string): CacheSaveStateValue {
   return (CACHE_SAVE_STATE_VALUES as readonly string[]).includes(value)
