@@ -31,7 +31,7 @@ In one working day, eleven independent defects shared a single shape (one of the
 
 The common structure: the verifier and the thing verified shared a premise — visit order, mock state, which behavior was intended, what counts as a page, which field name an API uses, how many callers a function has. A check built inside that premise is structurally unable to detect its violation, and it passes, which is exactly what a correct check looks like.
 
-This is distinct from two neighboring lessons. [A present signal is not evidence of the effect it implies](./verify-behavior-not-signal-2026-08-23.md) is about reading the wrong *property* of something fully observed. [A check reports clean for the part of the world it cannot observe](./checks-report-clean-for-what-they-cannot-observe-2026-08-10.md) is about a check whose *population* is narrower than believed. Here the check sees the right thing and the right property — but was authored from the same assumption it exists to challenge, so the failure it was written to catch is the one failure it cannot see.
+This is distinct from two neighboring lessons. [A present signal is not evidence of the effect it implies](./verify-behavior-not-signal-2026-08-23.md) is about reading the wrong _property_ of something fully observed. [A check reports clean for the part of the world it cannot observe](./checks-report-clean-for-what-they-cannot-observe-2026-08-10.md) is about a check whose _population_ is narrower than believed. Here the check sees the right thing and the right property — but was authored from the same assumption it exists to challenge, so the failure it was written to catch is the one failure it cannot see.
 
 ## Guidance
 
@@ -43,11 +43,11 @@ The concrete moves, each tied to the defect that taught it:
 
 2. **For fixtures read in unsorted order, make the files symmetric or assert on "whichever."** A test that names `b.jsonl` and assumes `a.log` was visited first is correct on APFS and inverted on Linux. Either make every file byte-identical so order cannot matter, or find the file that carries the marker rather than naming it.
 
-3. **Clear mocks between tests, or read `lastCall`.** Under a file-level `vi.mock`, `mock.calls[0]` is the *first* call in the file — the previous test's. A test asserting on it measures a different invocation than the one it made.
+3. **Clear mocks between tests, or read `lastCall`.** Under a file-level `vi.mock`, `mock.calls[0]` is the _first_ call in the file — the previous test's. A test asserting on it measures a different invocation than the one it made.
 
 4. **When a change alters behavior, grep the change's own diff for prose describing the old behavior.** A PR that adds a sentence and then removes the behavior it describes has contradicted itself, and the document it contradicted may be the one the repository designates as authoritative.
 
-5. **A two-part guarantee needs two tests.** "Setup continues on install timeout *and* saves the cache" pinned both halves as one property. Continuing was correct. Saving was the regression. One assertion cannot be half right.
+5. **A two-part guarantee needs two tests.** "Setup continues on install timeout _and_ saves the cache" pinned both halves as one property. Continuing was correct. Saving was the regression. One assertion cannot be half right.
 
 6. **Derive a count against its label, not against a directory listing.** `ls docs/wiki/*.md | wc -l` returns 9. The label says "deep-dive pages." `index.md` is not one. The correction introduced the drift the label had been avoiding.
 
@@ -59,12 +59,13 @@ The concrete moves, each tied to the defect that taught it:
 
 10. **A bound must clear the tail of the thing it bounds.** A 120-second timeout on an install that was measured stalling for 181–370 seconds would have fired on every slow-but-valid run and then fallen back to the unbounded path. Check the number against the measurements you gathered, not against the healthy case.
 
-11. **A proof-of-bite proves the check detects the mutation you made — not that the check is right.** A fix deleted a write-ahead log left on a persistent runner's disk when a restored cache archive did not supply it, on the premise that such a log *predates* the restored database. The test was proven to bite: skip the deletion, the stale log survives, the assertion fails. Every word of that was true, and the premise was inverted. On a single persistent runner the leftover log is the *same* generation as the restored database and *ahead* of it — the only copy of commits made after the previous run's checkpoint. The proof verified that the code did what the author intended. It could not verify that what the author intended was correct, because the test was written inside the same premise. The fix was abandoned before it shipped; the review that caught it asked one question the frame excluded: *which of the two files is actually newer?*
+11. **A proof-of-bite proves the check detects the mutation you made — not that the check is right.** A fix deleted a write-ahead log left on a persistent runner's disk when a restored cache archive did not supply it, on the premise that such a log _predates_ the restored database. The test was proven to bite: skip the deletion, the stale log survives, the assertion fails. Every word of that was true, and the premise was inverted. On a single persistent runner the leftover log is the _same_ generation as the restored database and _ahead_ of it — the only copy of commits made after the previous run's checkpoint. The proof verified that the code did what the author intended. It could not verify that what the author intended was correct, because the test was written inside the same premise. The fix was abandoned before it shipped; the review that caught it asked one question the frame excluded: _which of the two files is actually newer?_
+
 12. **A parity test must reach both sides through the boundary that matters, and prove it did.** The first test for "restore and save must hash to the same cache version" computed `getCacheVersion(buildCachePaths(x))` twice and compared the results — one function's output to itself, unable to fail under any re-split. The second drove both real call sites but defaulted each captured argument list to `[]`, so if both sides short-circuited it compared two fallbacks and passed. The one that holds asserts each adapter was called exactly once, that the list is non-empty, and only then that the two lists and their hashes match. A proof-of-bite run against a throwaway reconstruction is not a proof about the committed test; mutate the committed code path and watch the committed assertion fail.
 
 ## Why This Matters
 
-A passing check is the strongest false signal available, because it is indistinguishable from correctness. Every instance above reached a pull request with green tests, and several reached a review that approved them. The cost is not the bug — it is the *confidence*: a check that passes for the wrong reason converts "unknown" into "verified," and everything downstream inherits that.
+A passing check is the strongest false signal available, because it is indistinguishable from correctness. Every instance above reached a pull request with green tests, and several reached a review that approved them. The cost is not the bug — it is the _confidence_: a check that passes for the wrong reason converts "unknown" into "verified," and everything downstream inherits that.
 
 The shape recurs because writing a check and writing its subject happen in the same head, in the same frame, with the same assumptions loaded. The author cannot see the premise from inside it. What broke each of these was something external: a Linux runner, a reviewer asking "what does run N+1 see," a `git ls-tree` at the commit that last wrote the number, a mutation that unexpectedly stayed green.
 
@@ -86,14 +87,14 @@ The shape recurs because writing a check and writing its subject happen in the s
 Before — names the file and assumes visit order:
 
 ```ts
-const persisted = await readFile(path.join(target, 'b.jsonl'), 'utf8')
+const persisted = await readFile(path.join(target, "b.jsonl"), "utf8")
 expect(persisted.startsWith(DIAGNOSTIC_TRUNCATION_MARKER)).toBe(true)
 ```
 
 After — symmetric fixtures, and the assertion finds whichever file was truncated (`evals/diagnostics.test.ts`):
 
 ```ts
-const persistedLogs = ['a.log', 'b.jsonl'].map(fileName => readPersistedFile(diagnosticsPath, fileName))
+const persistedLogs = ["a.log", "b.jsonl"].map(fileName => readPersistedFile(diagnosticsPath, fileName))
 const truncatedLog = persistedLogs.find(log => log.startsWith(expectedMarker))
 expect(truncatedLog).toBeDefined()
 ```
@@ -106,7 +107,7 @@ Before — under a file-level mock, index 0 is not this test's call:
 
 ```ts
 const spawnOptions = vi.mocked(childProcess.spawn).mock.calls[0]?.[2]
-expect(spawnOptions?.env).toEqual(env)   // received 156 keys: the prior test's inherited env
+expect(spawnOptions?.env).toEqual(env) // received 156 keys: the prior test's inherited env
 ```
 
 After — the mock is cleared before each test (`src/services/setup/adapters-timeout.test.ts`):
@@ -147,7 +148,7 @@ function boundDiagnostic(
   text: string,
   maxBytes: number,
   marker: (maxBytes: number) => string,
-  keep: 'head' | 'tail',
+  keep: "head" | "tail",
 ): string
 ```
 
@@ -160,5 +161,5 @@ Logs keep the tail; `response.md` keeps the head, where its verdict and schema h
 - [Verify the signal before implementing the plan](./evidence-first-scope-correction-under-incomplete-signals-2026-08-08.md) — the planning-stage cousin: prove a signal exists before designing control flow around it. Its neutralization-testing rule is the same move as item 1 above.
 - [A gate that cannot fail manufactures confidence](./non-failing-gates-are-worse-than-no-gates-2026-08-07.md) — a gate with no reachable red state; here the red state is reachable but the check is blind to it.
 - [Systematic plugin install stalls OpenCode bootstrap](../integration-issues/systematic-plugin-install-stalls-opencode-bootstrap-2026-09-04.md) — the incident whose fix produced items 4, 5, and 10.
-- [Repair before capture: the SQLite session-cache loop](../logic-errors/repair-before-capture-sqlite-session-cache-loop-2026-09-02.md) — the cache-transport design that item 11's abandoned fix was built against; item 12's test guards the second regression recorded there.
+- [Repair before capture: the SQLite session-cache loop](../logic-errors/repair-before-capture-sqlite-session-cache-loop-2026-09-02.md) — item 11's reasoning lives there beside the rule it explains; item 12's test guards the second regression recorded there.
 - [#1528](https://github.com/fro-bot/agent/issues/1528) — items 2 and 8; [#1532](https://github.com/fro-bot/agent/issues/1532) — a redaction test whose fixture never truncates, so its assertion is trivially true.
