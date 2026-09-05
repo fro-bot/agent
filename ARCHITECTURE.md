@@ -61,7 +61,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | Initialize SDK server lifecycle; probes instance-scoped readiness before reporting success |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.15.0`) |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness version (`1.18.21+harness.22dee0ee`) |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness version (`1.18.29+harness.88b6b5fb`) |
 
 ### `packages/gateway/`
 

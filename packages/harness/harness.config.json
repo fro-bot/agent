@@ -1,7 +1,7 @@
 {
   "release_repo": "anomalyco/opencode",
   "source_repo": "https://github.com/anomalyco/opencode.git",
-  "base_version": "1.18.21",
+  "base_version": "1.18.29",
   "integrationRefs": [
     "https://github.com/anomalyco/opencode/pull/19961",
     "https://github.com/anomalyco/opencode/pull/31859",
@@ -14,7 +14,8 @@
     "https://github.com/anomalyco/opencode/pull/34977",
     "https://github.com/anomalyco/opencode/pull/33713",
     "https://github.com/anomalyco/opencode/pull/36045",
-    "https://github.com/anomalyco/opencode/pull/36361"
+    "https://github.com/anomalyco/opencode/pull/36361",
+    "https://github.com/anomalyco/opencode/pull/47430"
   ],
   "agent": "build",
   "model": "anthropic/claude-sonnet-5",
