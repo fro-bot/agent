@@ -8,6 +8,8 @@ vi.mock('node:child_process', () => ({spawn: vi.fn()}))
 
 interface FakeChild extends EventEmitter {
   readonly pid?: number
+  exitCode?: number | null
+  signalCode?: NodeJS.Signals | null
   readonly stdin: EventEmitter & {write: () => void; end: () => void}
   readonly stdout: EventEmitter
   readonly stderr: EventEmitter
@@ -138,6 +140,74 @@ describe('execWithTimeout', () => {
       expect(result).toBe('timed-out')
       expect(killSpy).toHaveBeenCalledWith(-4321, 'SIGTERM')
       expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+    } finally {
+      killSpy.mockRestore()
+    }
+  })
+
+  it('does not signal a recycled pid when the child exits before the escalation timer fires', async () => {
+    // #given a child with a pid that has already exited (exit fires before close), but the
+    // `close` event hasn't arrived yet
+    const child = createFakeChild(4321)
+    vi.mocked(childProcess.spawn).mockReturnValue(child as never)
+    const killSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+    const execWithTimeout = createExecAdapter().execWithTimeout
+    if (execWithTimeout === undefined) throw new Error('execWithTimeout is not configured')
+
+    try {
+      // #when the child's exitCode flips before the timeout callback runs
+      const resultPromise = execWithTimeout('opencode', [], 10)
+      child.exitCode = 0
+      await vi.advanceTimersByTimeAsync(10)
+
+      // #then no signal is sent to the (possibly-recycled) pid or the child directly
+      expect(killSpy).not.toHaveBeenCalledWith(-4321, expect.anything())
+      expect(child.kill).not.toHaveBeenCalled()
+
+      // #when close finally arrives
+      child.emit('close', 0)
+      const result = await resultPromise
+
+      // #then it resolves as a normal completion, not 'timed-out' — the child finished on its own
+      expect(result).toBe(0)
+    } finally {
+      killSpy.mockRestore()
+    }
+  })
+
+  it('kills the child process group and re-raises the signal when the parent is terminated', async () => {
+    // #given a running child and a parent that is about to receive SIGTERM
+    const child = createFakeChild(4321)
+    vi.mocked(childProcess.spawn).mockReturnValue(child as never)
+    const baselineSigtermListeners = process.listenerCount('SIGTERM')
+    const baselineExitListeners = process.listenerCount('exit')
+    const killSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+    const execWithTimeout = createExecAdapter().execWithTimeout
+    if (execWithTimeout === undefined) throw new Error('execWithTimeout is not configured')
+
+    try {
+      const resultPromise = execWithTimeout('opencode', [], 10_000)
+
+      // #when the parent process receives SIGTERM (process.kill is stubbed so the test process
+      // itself does not exit)
+      process.emit('SIGTERM')
+
+      // #then the child's process group is killed first, then the signal is re-raised against
+      // the parent itself so Node's default terminate-on-signal behavior still applies
+      expect(killSpy.mock.calls[0]).toEqual([-4321, 'SIGKILL'])
+      expect(killSpy.mock.calls[1]).toEqual([process.pid, 'SIGTERM'])
+      expect(child.kill).not.toHaveBeenCalled()
+
+      // #and our SIGTERM listener has already been removed (it fires via `once`)
+      expect(process.listenerCount('SIGTERM')).toBe(baselineSigtermListeners)
+
+      // #when the child later closes
+      child.emit('close', 143)
+      await resultPromise
+
+      // #then the remaining `exit` listener is removed too, so long-lived processes don't
+      // accumulate listeners across repeated calls
+      expect(process.listenerCount('exit')).toBe(baselineExitListeners)
     } finally {
       killSpy.mockRestore()
     }
