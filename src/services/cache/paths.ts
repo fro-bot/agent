@@ -55,22 +55,17 @@ export async function deleteAuthJson(authPath: string, storagePath: string, logg
   }
 }
 
-// Restore mode always includes -wal and -shm even if absent: @actions/cache tolerates
-// missing paths in the archive, and accepting both sidecars on restore preserves
-// compatibility with caches written before either was dropped from the save set (see
-// buildSaveCachePaths below). Save mode pushes storagePath and opencode.db
-// unconditionally, whether or not they exist yet, and never includes -wal or -shm at all,
-// regardless of whether either exists on disk. This is safe: @actions/cache's saveCache
-// resolves every given path via glob and only throws "Path(s) ... do(es) not exist" when
-// that resolution comes back empty for all of them, not when some of them are individually
-// missing, and storagePath plus opencode.db are the two paths that make that failure
-// unreachable in practice. -shm is a machine-local wal-index that SQLite never syncs, so a
-// copy transported from another runner is stale by construction. -wal is excluded for a
-// different reason: saveCache checkpoints before this function ever runs, so a healthy
-// save's write-ahead log is already empty or absent by the time paths are built here, and
-// deliberately not re-checking for a nonempty one keeps the invariant unconditional rather
-// than incidental -- a save can never re-introduce the hot-WAL cache entries this repair
-// was built to break out of, even if some future change altered checkpoint ordering.
+// @actions/cache derives a cache entry's *version* (a hash it uses alongside the key to
+// decide whether a save is restorable) from this exact path list — see getCacheVersion in
+// @actions/cache's cacheUtils.js. Restore and save must therefore build the list the same
+// way, from the same function, or a save's version silently stops matching what restore
+// asks for and every entry it writes becomes permanently unrestorable (this happened once
+// already: #1519 dropped the -wal/-shm sidecars from a save-only helper and broke restores
+// repo-wide for days before anyone noticed, because a version mismatch looks exactly like
+// a cold cache, not an error). -shm is never included: it's a machine-local wal-index
+// SQLite never syncs, so a copy from another runner is stale by construction. -wal is
+// never included either: callers checkpoint before calling this, so a healthy save's
+// write-ahead log is already empty or absent by the time paths are built.
 
 /**
  * Re-exported, not redefined. `@fro-bot/runtime` owns these names because the object-store
@@ -101,22 +96,12 @@ export function buildDbWalPath(storagePath: string): string {
   return path.join(path.dirname(storagePath), DB_WAL_BASENAME)
 }
 
-export async function buildRestoreCachePaths(
-  storagePath: string,
-  projectIdPath: string | undefined,
-  opencodeVersion: string | null | undefined,
-): Promise<string[]> {
-  const paths = [storagePath]
-  if (projectIdPath != null) {
-    paths.push(projectIdPath)
-  }
-  if (await isSqliteBackend(opencodeVersion ?? null)) {
-    paths.push(...buildDbFamilyPaths(storagePath))
-  }
-  return paths
-}
-
-export async function buildSaveCachePaths(
+/**
+ * The single path list passed to both `@actions/cache`'s restoreCache and saveCache.
+ * Called identically by restore.ts and save.ts — see the comment above for why a second,
+ * merely-equivalent definition is not an acceptable alternative.
+ */
+export async function buildCachePaths(
   storagePath: string,
   projectIdPath: string | undefined,
   opencodeVersion: string | null | undefined,

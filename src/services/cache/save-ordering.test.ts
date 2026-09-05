@@ -9,20 +9,20 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 // This suite pins the control-flow ordering save.ts's hasCacheableContent doc comment
 // depends on: a 'failed' checkpoint outcome must make saveCache return before
-// buildSaveCachePaths is ever called, which is what makes it safe for that comment to
+// buildCachePaths is ever called, which is what makes it safe for that comment to
 // say the write-ahead log can no longer be the sole holder of unmerged content by the
 // time hasCacheableContent runs. A future change that reintroduced a decline-then-inspect
 // path (checkpoint fails, but path-building and content inspection still proceed) would
 // fail this test without needing to know anything about save.ts's internals.
 const mocks = vi.hoisted(() => ({
-  buildSaveCachePaths: vi.fn(),
+  buildCachePaths: vi.fn(),
 }))
 
 vi.mock('./paths.js', async importOriginal => {
   const original = await importOriginal<typeof import('./paths.js')>()
   return {
     ...original,
-    buildSaveCachePaths: mocks.buildSaveCachePaths.mockImplementation(original.buildSaveCachePaths),
+    buildCachePaths: mocks.buildCachePaths.mockImplementation(original.buildCachePaths),
   }
 })
 
@@ -71,7 +71,7 @@ describe('saveCache checkpoint-then-paths ordering', () => {
     await fs.rm(tempDir, {recursive: true, force: true})
   })
 
-  it('returns false without ever calling buildSaveCachePaths when the checkpoint fails', async () => {
+  it('returns false without ever calling buildCachePaths when the checkpoint fails', async () => {
     // #given a database held under an exclusive lock by an in-progress transaction on
     // another connection, guaranteeing a real 'failed' checkpoint outcome — the harness's
     // only signal that a writer is still alive, since serverHandle.shutdown() cannot
@@ -98,16 +98,16 @@ describe('saveCache checkpoint-then-paths ordering', () => {
     })
 
     // #then the save is declined, and — the property this test exists to pin —
-    // buildSaveCachePaths is never reached, because the checkpoint's failure returns
+    // buildCachePaths is never reached, because the checkpoint's failure returns
     // before the path-building and content-inspection block below it ever runs
     expect(result).toBe(false)
-    expect(mocks.buildSaveCachePaths).not.toHaveBeenCalled()
+    expect(mocks.buildCachePaths).not.toHaveBeenCalled()
 
     holder.exec('COMMIT')
     holder.close()
   })
 
-  it('does call buildSaveCachePaths once the checkpoint resolves (control case, proves the mock is wired correctly)', async () => {
+  it('does call buildCachePaths once the checkpoint resolves (control case, proves the mock is wired correctly)', async () => {
     // #given a healthy workspace with no database at all — checkpointDatabase resolves
     // 'nothing-to-checkpoint' rather than 'failed'
     await fs.writeFile(path.join(storagePath, 'session.json'), '{"session":"created"}', 'utf8')
@@ -125,10 +125,10 @@ describe('saveCache checkpoint-then-paths ordering', () => {
       cacheAdapter: createStubCacheAdapter(),
     })
 
-    // #then the save proceeds and buildSaveCachePaths is reached — confirming the mock
+    // #then the save proceeds and buildCachePaths is reached — confirming the mock
     // above would have caught a missing call in the failed-checkpoint case, rather than
     // silently passing because it is never exercised at all
     expect(result).toBe(true)
-    expect(mocks.buildSaveCachePaths).toHaveBeenCalledTimes(1)
+    expect(mocks.buildCachePaths).toHaveBeenCalledTimes(1)
   })
 })
