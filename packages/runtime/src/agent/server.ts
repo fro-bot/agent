@@ -12,6 +12,7 @@ import {
   DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS,
   DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
 } from '../shared/constants.js'
+import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {withScrubbedEnv} from './with-scrubbed-env.js'
 
@@ -234,22 +235,16 @@ export async function bootstrapOpenCodeServer(
       server.close()
       return err(new Error(`OpenCode server URL mismatch: pinned ${pinnedUrl} but server bound to ${server.url}`))
     }
-    // createOpencode resolving means the HTTP listener bound (a stdout string match in
-    // the SDK), not that this instance is ready to answer. Per-directory instance
-    // bootstrap (config.get() -> plugin.init() -> service init) is lazy and serial in the
-    // server, so the first instance-scoped request pays for it. Forcing that here, with an
-    // explicit bound, moves the first blocked request to where its failure can be named
-    // instead of surfacing five minutes later as a bare "fetch failed" on the harness's own
-    // first real call. session.list is read-only and the harness issues this exact call
-    // moments later anyway, so this adds no new load -- it just names who pays for it.
-    // There is no health route to probe instead: /global/event is the only /global/ route,
-    // and any global route would report ready while instance bootstrap is still blocked --
-    // the same false-ready signal as the stdout match, one layer up.
+    // createOpencode resolving means the listener bound, not that per-directory instance
+    // bootstrap finished. Force it here with a bound so a blocked instance fails by name
+    // instead of on the harness's first real request. Must be instance-scoped: a global
+    // route answers while bootstrap is still blocked. session.list is read-only and the
+    // harness issues it moments later anyway.
     const readinessStartedAt = Date.now()
     try {
       const probe = await client.session.list({
         query: {directory: workspacePath},
-        signal: AbortSignal.timeout(DEFAULT_SERVER_READINESS_TIMEOUT_MS),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(DEFAULT_SERVER_READINESS_TIMEOUT_MS)]),
       })
       // A response.error here is a server answer, not a probe failure -- it proves
       // instance bootstrap completed. Only a thrown rejection (timeout/abort/network)
@@ -260,16 +255,29 @@ export async function bootstrapOpenCodeServer(
         })
       }
     } catch (probeError) {
-      const probeMessage = probeError instanceof Error ? probeError.message : String(probeError)
+      const probeReadinessMs = Date.now() - readinessStartedAt
+      const probeMessage = toErrorMessage(probeError)
       logger.warning('OpenCode readiness probe failed', {
         error: probeMessage,
         readinessTimeoutMs: DEFAULT_SERVER_READINESS_TIMEOUT_MS,
+        readinessMs: probeReadinessMs,
+        cancelledByOuterDeadline: signal.aborted,
       })
       server.close()
+      const quiesced = await waitForServerQuiescence(server.url)
+      logger.debug('OpenCode server quiesced after readiness-probe failure', {quiesced: quiesced.quiesced})
+      // The outer `signal` is the caller's execution deadline, not this function's own
+      // budget. If it fired while the probe was in flight, the probe never got a real
+      // chance to answer -- that is a cancelled run, not evidence of a stalled server.
+      if (signal.aborted) {
+        return err(
+          new Error('OpenCode server bootstrap cancelled by the execution deadline during the readiness probe'),
+        )
+      }
       return err(
         new Error(
           `OpenCode server is listening but did not answer an instance-scoped request within ` +
-            `${DEFAULT_SERVER_READINESS_TIMEOUT_MS}ms — instance bootstrap is blocked`,
+            `${DEFAULT_SERVER_READINESS_TIMEOUT_MS}ms (${probeReadinessMs}ms elapsed) — instance bootstrap is blocked`,
         ),
       )
     }
@@ -290,7 +298,7 @@ export async function bootstrapOpenCodeServer(
     })
   } catch (error) {
     const elapsedMs = Date.now() - startedAt
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     // budgetedMs is null when the failure happened before or inside the spawn; a null
     // here with elapsedMs at roughly timeoutMs is the signature of a budget timeout,
     // while a null with a much smaller elapsedMs points at port acquisition instead.

@@ -132,8 +132,9 @@ describe('bootstrapOpenCodeServer', () => {
     // #given
     const logger = createMockLogger()
     const closeSpy = vi.fn()
+    const mockClient = createMockClient()
     vi.mocked(createOpencode).mockResolvedValue({
-      client: createMockClient() as never,
+      client: mockClient as never,
       server: {url: 'http://127.0.0.1:9999', close: closeSpy},
     })
     const controller = new AbortController()
@@ -146,6 +147,9 @@ describe('bootstrapOpenCodeServer', () => {
     const message = result.success ? undefined : result.error.message
     expect(message).toContain('http://127.0.0.1:9999')
     expect(closeSpy).toHaveBeenCalledTimes(1)
+    // The URL mismatch is checked before the readiness probe would ever run — the probe
+    // must never fire against a server whose bootstrap already failed a prior check.
+    expect(mockClient.session.list).not.toHaveBeenCalled()
   })
 
   it('returns an error result when createOpencode fails', async () => {
@@ -349,10 +353,15 @@ describe('bootstrapOpenCodeServer', () => {
 
       // #then
       expect(result.success).toBe(true)
-      expect(logger.debug).toHaveBeenCalledWith(
-        'OpenCode server bootstrapped',
-        expect.objectContaining({readinessMs: expect.any(Number) as number}),
-      )
+      const bootstrappedCall = vi
+        .mocked(logger.debug)
+        .mock.calls.find(call => call[0] === 'OpenCode server bootstrapped')
+      expect(bootstrappedCall).toBeDefined()
+      const loggedFields = bootstrappedCall?.[1] as {readinessMs: number; elapsedMs: number} | undefined
+      // Prove readinessMs is actually the probe window, not just "some number": it must be
+      // non-negative and cannot exceed the total elapsedMs measured from the same call.
+      expect(loggedFields?.readinessMs).toBeGreaterThanOrEqual(0)
+      expect(loggedFields?.readinessMs).toBeLessThanOrEqual(loggedFields?.elapsedMs ?? -1)
     })
 
     it('fails with a named instance-bootstrap error and closes the server when the probe rejects with a timeout/abort error', async () => {
@@ -381,6 +390,38 @@ describe('bootstrapOpenCodeServer', () => {
       const message = result.success ? undefined : result.error.message
       expect(message).toContain('instance bootstrap is blocked')
       expect(message).toContain('60000ms')
+      expect(closeSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('reports cancellation, not a server stall, when the outer signal aborts while the probe is pending', async () => {
+      // #given a probe whose rejection is caused by the caller's own execution deadline
+      // firing mid-probe — simulated by aborting the shared controller from inside the
+      // mock itself, then rejecting the way an aborted fetch would
+      const logger = createMockLogger()
+      const closeSpy = vi.fn()
+      const controller = new AbortController()
+      const mockClient = createMockClient(async () => {
+        controller.abort()
+        throw new DOMException('This operation was aborted', 'AbortError')
+      })
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: closeSpy},
+        }
+      })
+
+      // #when
+      const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+      // #then the message names the deadline/cancellation, not a server stall, and never
+      // claims "instance bootstrap is blocked" — that would send someone chasing a server
+      // problem that never happened
+      expect(result.success).toBe(false)
+      const message = result.success ? undefined : result.error.message
+      expect(message).toContain('execution deadline')
+      expect(message).not.toContain('instance bootstrap is blocked')
       expect(closeSpy).toHaveBeenCalledTimes(1)
     })
 
