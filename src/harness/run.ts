@@ -64,7 +64,11 @@ export async function run(): Promise<number> {
   }
 
   core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
-  core.saveState(STATE_KEYS.CACHE_SAVED, 'false')
+  // Not the boolean 'false' -- CACHE_SAVED is a CacheSaveStateValue (see
+  // src/shared/cache-save-result.ts). 'not-persisted' is what "nothing has saved yet"
+  // is called now, and it is also what post.ts falls back to for an absent/unrecognized
+  // value, so this initial value and that fallback agree by construction.
+  core.saveState(STATE_KEYS.CACHE_SAVED, 'not-persisted')
 
   try {
     bootstrapLogger.info('Starting Fro Bot Agent')

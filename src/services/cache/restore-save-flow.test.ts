@@ -182,7 +182,7 @@ describe('restore/save object-store integration flow', () => {
     const saveResult = await saveCache(saveOptions)
 
     // #then object store and cache both receive the save
-    expect(saveResult).toBe(true)
+    expect(saveResult).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
     expect(store.objects.get('fro-bot-state/github/owner/repo/sessions/opencode.db')?.toString('utf8')).toBe(
       'first-run-db',
     )
@@ -272,7 +272,7 @@ describe('restore/save object-store integration flow', () => {
     const saveResult = await saveCache(saveOptions)
 
     // #then both object store and cache receive the authoritative session database
-    expect(saveResult).toBe(true)
+    expect(saveResult).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
     expect(store.objects.get('fro-bot-state/github/owner/repo/sessions/opencode.db')?.toString('utf8')).toBe(
       'fresh-store-db',
     )
@@ -337,7 +337,7 @@ describe('restore/save object-store integration flow', () => {
     const saveResult = await saveCache(saveOptions)
 
     // #then cache save still succeeds
-    expect(saveResult).toBe(true)
+    expect(saveResult).toMatchObject({cachePersisted: true, outcome: 'persisted'})
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
   })
 
@@ -386,7 +386,7 @@ describe('restore/save object-store integration flow', () => {
 
     // #then the object store receives only the main db — neither sidecar ever crosses the
     // boundary — and the cache adapter agrees
-    expect(saveResult).toBe(true)
+    expect(saveResult).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
     expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db')).toBe(true)
     expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-wal')).toBe(false)
     expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-shm')).toBe(false)
@@ -470,7 +470,7 @@ describe('restore/save object-store integration flow', () => {
     // bucket exactly as it was, so a subsequent successful save is what overwrites it
     // rather than this run shipping a half-checkpointed database -- and the decline is
     // surfaced via the job summary
-    expect(saveResult).toBe(false)
+    expect(saveResult).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'})
     expect(cache.saveCache).not.toHaveBeenCalled()
     expect(store.upload).not.toHaveBeenCalled()
     expect(store.objects.size).toBe(0)

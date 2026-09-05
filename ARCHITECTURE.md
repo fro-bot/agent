@@ -29,7 +29,8 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `writeSystematicConfig` | Function | `src/services/setup/systematic-config.ts` | Systematic plugin config writer |
 | `installSystematicPlugin` | Function | `src/services/setup/systematic-plugin.ts` | Setup-time Systematic plugin install (keeps npm install off the server's boot path) |
 | `restoreCache` | Function | `src/services/cache/restore.ts` | Restore OpenCode state |
-| `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache |
+| `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache; returns a `CacheSaveResult` (two independent persistence axes + a named outcome), not a boolean |
+| `toCacheSaveStateValue` | Function | `src/shared/cache-save-result.ts` | Exhaustiveness-pinned mapper from `CacheSaveResult` to the `CACHE_SAVED` state handoff value |
 | `checkpointDatabase` | Function | `src/services/cache/checkpoint.ts` | Merge SQLite WAL into main DB before save/restore hand-off |
 | `verifyDatabaseUsable` | Function | `src/services/cache/integrity.ts` | Restore-side probe for structurally corrupt SQLite files |
 | `isStructuralCorruptionError` | Function | `src/services/cache/sqlite-errors.ts` | Positive-allowlist classifier for SQLite corruption vs. transient errors |
@@ -143,11 +144,14 @@ main.ts
         └─→ cleanup phase
               prune sessions → shutdown server → sync artifacts and metadata
               → saveCache (checkpoints the WAL before capturing files; S3 before Actions cache)
+                → toCacheSaveStateValue derives CACHE_SAVED state + cache-save-result output + job-summary row
               → release lock in finally
 
 post.ts (separate Action step)
   └─→ harness/post.ts (runPost)
-        └─→ saveCache (durable persistence, runs even on failure)
+        └─→ saveCache retry — skipped when CACHE_SAVED already reports durable/store-only/skipped;
+              an absent or unrecognized state retries (not-persisted). Writes its own job-summary
+              row on retry (no cache-save-result output: post: steps run after every other step)
 ```
 
 > See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md)
@@ -266,6 +270,14 @@ The write-ahead log itself no longer crosses either transport on save: `DB_TRANS
 `src/services/cache/integrity.ts` (`verifyDatabaseUsable`) closes the gap a hot WAL would otherwise mask: a structurally corrupt database with no pending write-ahead data reports `nothing-to-checkpoint` and would sail through unprobed, later getting re-persisted under a fresh key. It runs only on the restore path (`SELECT count(*) FROM sqlite_master`, a schema-page read, not a full `PRAGMA integrity_check`) and only when `checkpointDatabase` itself reports `nothing-to-checkpoint`.
 
 `src/services/cache/sqlite-errors.ts` (`isStructuralCorruptionError`) is a positive allowlist — matching only SQLite's own wording for "file is not a database" and "database disk image is malformed" — never a catch-all. Deleting a repository's session history (`cleanStorage`) is the most destructive action either module takes, so any unrecognized failure (permission denied, disk full, I/O error, a missing parent directory, a merely non-writable-but-readable database) defaults to `structural: false` / `usable: true` and is left alone rather than wiped. Only a positive corruption classification routes into `cleanStorage`, the same clean-slate path `restoreCache` already uses for cache-corruption and storage-version mismatches.
+
+### Cache Save Result Contract
+
+`saveCache` (`src/services/cache/save.ts`) returns a `CacheSaveResult` (`src/shared/cache-save-result.ts`), not a boolean: `cachePersisted` and `storePersisted` are independent axes (either, both, or neither backend may have durably persisted state in one save), plus a named `CacheSaveOutcome` (`skipped-by-configuration`, `skipped-empty`, `checkpoint-declined`, `cache-rejected`, `cache-error`, `persisted`) naming the terminal condition that produced them. `cache-rejected` is documented at the type as an inference, not an observation: `@actions/cache`'s `-1` write-failure sentinel does not distinguish a policy denial (read-only `ACTIONS_RUNTIME_TOKEN` on `issue_comment`/`issues`) from a reservation collision, and nothing downstream may infer which one occurred from trigger type or runner config.
+
+`toCacheSaveStateValue` (`src/shared/cache-save-result.ts`) maps that result to one of four `CacheSaveStateValue`s (`durable`, `store-only`, `skipped`, `not-persisted`) via `OUTCOME_TO_STATE_VALUE`, a `satisfies Record<CacheSaveOutcome, ...>`-pinned table (the same exhaustiveness pattern as `RESPONSE_SURFACE_POLICIES` in `packages/runtime/src/agent/prompt.ts`): a new outcome added to the union without a case here fails `check-types` rather than silently mapping to nothing. `cache-rejected`/`cache-error` map to `store-only` when `storePersisted` is true, `not-persisted` otherwise — a store-only save is durable through the other backend, never inferred as a retry-worthy failure.
+
+`src/harness/phases/cleanup.ts` writes that value on every path a result exists (not just the successful one) to three places: `core.saveState(STATE_KEYS.CACHE_SAVED, ...)` for the post hook, `setCacheSaveResultOutput` (`src/harness/config/outputs.ts`) for the `cache-save-result` Action output (declared in `action.yaml`), and `writeCacheSaveResultSummary` (`src/features/observability/job-summary.ts`) for a standalone "Session Persistence" job-summary row — written separately from `writeJobSummary` because the save happens in cleanup, after `runFinalizeWithResult` has already written and flushed the main summary table. `src/harness/post.ts` reads `CACHE_SAVED` back via `parseCacheSaveStateValue` (absent or unrecognized values, e.g. from an older action version, fail toward `not-persisted` — retry, never skip) and skips its retry on `durable`/`store-only`/`skipped`, retrying only on `not-persisted`. The post hook cannot set the `cache-save-result` output for its own retry: `runs.post:` steps execute after every other step in the job, so no step could exist to read a value set there; it writes its own job-summary row instead, since that may report a red state the main step's summary never saw.
 
 ### S3 Conditional-Write Lock (Action + Gateway)
 
