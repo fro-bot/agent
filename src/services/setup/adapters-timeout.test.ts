@@ -60,6 +60,46 @@ describe('execWithTimeout', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGTERM')
   })
 
+  it('reports a timeout when the escalation runs to the grace expiry without a close', async () => {
+    // #given a child that never emits close, so only the grace timer can settle the promise
+    const child = createFakeChild()
+    vi.mocked(childProcess.spawn).mockReturnValue(child as never)
+    const execWithTimeout = createExecAdapter().execWithTimeout
+    if (execWithTimeout === undefined) throw new Error('execWithTimeout is not configured')
+
+    // #when the timeout, the SIGKILL escalation, and the reap grace all expire
+    const resultPromise = execWithTimeout('opencode', [], 10)
+    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then both signals went out and the grace path reports the timeout
+    expect(await resultPromise).toBe('timed-out')
+    expect(child.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    expect(child.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+  })
+
+  it('resolves the grace path as a normal completion when both escalation stages found the child gone', async () => {
+    // #given a child that has already exited by the time the timeout fires, and never emits close
+    const child = createFakeChild(4242)
+    vi.mocked(childProcess.spawn).mockReturnValue(child as never)
+    const execWithTimeout = createExecAdapter().execWithTimeout
+    if (execWithTimeout === undefined) throw new Error('execWithTimeout is not configured')
+
+    // #when the child's exit state is already set before the timeout, and the whole escalation
+    // chain runs to the grace expiry
+    const resultPromise = execWithTimeout('opencode', [], 10)
+    child.exitCode = 0
+    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then nothing was signalled and the grace path reports the child's own exit code, not a
+    // timeout the caller would use to skip the tools cache save
+    expect(await resultPromise).toBe(0)
+    expect(child.kill).not.toHaveBeenCalled()
+  })
+
   it('forwards an explicit environment to the spawned child', async () => {
     // #given a child process stub and an explicit environment
     const child = createFakeChild()

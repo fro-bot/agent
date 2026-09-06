@@ -161,7 +161,9 @@ async function execWithTimeout(
       killId = setTimeout(() => {
         if (finished) return
         if (killChildProcessGroup(child, 'SIGKILL')) timedOut = true
-        graceId = setTimeout(() => finish('timed-out'), SIGKILL_REAP_GRACE_MS)
+        // Only report a timeout if a signal actually went out. When both escalation stages found
+        // the child already exited, this is a normal completion whose `close` merely hasn't fired.
+        graceId = setTimeout(() => finish(timedOut ? 'timed-out' : (child.exitCode ?? 1)), SIGKILL_REAP_GRACE_MS)
       }, 5_000)
     }, timeoutMs)
   })

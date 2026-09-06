@@ -145,10 +145,12 @@ describe('setup', () => {
     process.env.XDG_DATA_HOME = '/tmp/test-data'
     process.env.RUNNER_TOOL_CACHE = '/opt/hostedtoolcache'
 
-    // Scrub ambient NPM_CONFIG_* (e.g. bun/npm test runners set NPM_CONFIG_USERCONFIG) so tests
-    // that assert on their presence/absence in the warning message control it explicitly.
+    // Scrub ambient NPM_CONFIG_* (bun/npm test runners set NPM_CONFIG_USERCONFIG and lowercase
+    // npm_config_*) so tests that assert on their presence/absence in the warning message control
+    // it explicitly. Case-insensitive, matching the diagnostic itself. The whole env is a fresh
+    // copy per test and the original object is restored in afterEach, so this never leaks.
     for (const key of Object.keys(process.env)) {
-      if (key.startsWith('NPM_CONFIG_')) delete process.env[key]
+      if (key.toUpperCase().startsWith('NPM_CONFIG_')) delete process.env[key]
     }
 
     // Default mock implementations
@@ -1090,6 +1092,26 @@ describe('setup', () => {
           expect.objectContaining({opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64'}),
         )
         expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
+      })
+
+      it('still installs and saves on a tools cache miss when the tool cache already holds the binary', async () => {
+        // #given the tools cache key missed (e.g. a bumped systematicVersion, or an earlier
+        // invocation whose save was skipped) but RUNNER_TOOL_CACHE still resolves the binary, so
+        // installOpenCode reports cached: true without the Actions tools cache being involved
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then the plugin install and the cache save both still run — gating on the binary alone
+        // would skip both here and leave the config pointing at a plugin version never installed
+        expect(tc.downloadTool).not.toHaveBeenCalled()
+        expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
+          expect.objectContaining({opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64'}),
+        )
+        expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
+        expect(result?.toolsCacheStatus).toBe('miss')
       })
 
       it('never adds raw toolCachePath directory to PATH', async () => {

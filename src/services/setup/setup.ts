@@ -285,10 +285,12 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
 
     core.addPath(opencodeResult.path)
 
-    // Gate on the resolved OpenCode binary, not the aggregate cache result: a cache hit whose
-    // binary went missing falls through to a fresh install (cached: false) above, and that fresh
-    // install still needs the Systematic plugin installed and the cache re-saved.
-    if (opencodeResult.cached !== true) {
+    // Both disjuncts are needed — the two flags are independent, not nested. A tools-cache hit
+    // whose binary went missing falls through to a fresh install (cached: false), which still needs
+    // the plugin installed and the cache re-saved; and `installOpenCode` reports cached: true from
+    // RUNNER_TOOL_CACHE alone, so a tools-cache key miss (bumped systematicVersion, or an earlier
+    // invocation that skipped its save) must still install and save even on a warm tool cache.
+    if (opencodeResult.cached !== true || toolsCacheResult.hit === false) {
       const systematicPluginInstall = await installSystematicPlugin({
         logger,
         execAdapter,
@@ -315,7 +317,9 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         // (systematic-plugin.ts) deliberately does not inherit NPM_CONFIG_* so a network-fetched
         // package's lifecycle scripts can't see registry/proxy overrides. List key NAMES only —
         // never values — and never propose allowlisting; that would defeat the scrub.
-        const npmConfigKeys = Object.keys(process.env).filter(key => key.startsWith('NPM_CONFIG_'))
+        // Case-insensitive: filterAgentEnv is deny-by-default, so lowercase `npm_config_*` (what
+        // npm itself exports) is dropped from the child too.
+        const npmConfigKeys = Object.keys(process.env).filter(key => key.toUpperCase().startsWith('NPM_CONFIG_'))
         const npmConfigNote =
           npmConfigKeys.length > 0
             ? ` The install child does not inherit NPM_CONFIG_* environment variables (present in the parent env: ${npmConfigKeys.join(', ')}), which may explain the failure.`
