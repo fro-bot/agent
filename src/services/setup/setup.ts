@@ -294,7 +294,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       const systematicPluginInstall = await installSystematicPlugin({
         logger,
         execAdapter,
-        opencodePath: opencodeBinaryPath(opencodeResult.path),
+        opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path),
         systematicVersion,
       })
 

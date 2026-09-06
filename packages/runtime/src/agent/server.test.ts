@@ -744,6 +744,27 @@ describe('ensureOpenCodeAvailable', () => {
     expect(result.didSetup).toBe(true)
   })
 
+  it('honours a pre-set OPENCODE_PATH and skips setup entirely', async () => {
+    // #given a caller-supplied override naming an executable, and a binary that answers --version
+    const logger = createMockLogger()
+    process.env.OPENCODE_PATH = '/usr/local/bin/my-opencode'
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: '1.18.29+harness.88b6b5fb'})),
+      runSetup: vi.fn(async () => null),
+      addToPath: vi.fn(),
+    }
+
+    // #when availability is checked
+    const result = await ensureOpenCodeAvailable(createEnsureOptions(logger), setupAdapter)
+
+    // #then the override is passed through untouched and setup never runs
+    expect(setupAdapter.verifyOpenCodeAvailable).toHaveBeenCalledWith('/usr/local/bin/my-opencode', logger)
+    expect(setupAdapter.runSetup).not.toHaveBeenCalled()
+    expect(setupAdapter.addToPath).not.toHaveBeenCalled()
+    expect(result.path).toBe('/usr/local/bin/my-opencode')
+    expect(result.didSetup).toBe(false)
+  })
+
   it('round-trips its own OPENCODE_PATH back through the availability check', async () => {
     // #given a first run that completed setup and exported OPENCODE_PATH
     const logger = createMockLogger()

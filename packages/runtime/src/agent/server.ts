@@ -434,6 +434,12 @@ export async function ensureOpenCodeAvailable(
   // allows the OPENCODE_ prefix through). Assigning the directory here made all three exec it.
   setupAdapter.addToPath(setupResult.opencodePath)
   process.env.OPENCODE_PATH = setupResult.opencodeBinaryPath
-  logger.info('Auto-setup completed', {version: setupResult.opencodeVersion, path: setupResult.opencodePath})
+  // Log both halves: the whole failure mode here is "which of these two strings got exported",
+  // so a recurrence should be diagnosable from the run log alone.
+  logger.info('Auto-setup completed', {
+    version: setupResult.opencodeVersion,
+    path: setupResult.opencodePath,
+    binaryPath: setupResult.opencodeBinaryPath,
+  })
   return {path: setupResult.opencodeBinaryPath, version: setupResult.opencodeVersion, didSetup: true}
 }

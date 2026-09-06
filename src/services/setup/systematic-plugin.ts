@@ -13,7 +13,8 @@ const STDERR_TAIL_LIMIT = 2_000
 export interface SystematicPluginInstallOptions {
   readonly logger: Logger
   readonly execAdapter: ExecAdapter
-  readonly opencodePath: string
+  /** The OpenCode executable, not its install directory — this value is spawned directly. */
+  readonly opencodeBinaryPath: string
   readonly systematicVersion: string
   readonly timeoutMs?: number
 }
@@ -28,11 +29,11 @@ const emptyConfig = JSON.stringify({plugin: []})
 export async function installSystematicPlugin(
   options: SystematicPluginInstallOptions,
 ): Promise<SystematicPluginInstallResult> {
-  const {logger, execAdapter, opencodePath, systematicVersion} = options
+  const {logger, execAdapter, opencodeBinaryPath, systematicVersion} = options
   const timeoutMs = options.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS
   const startTime = Date.now()
 
-  logger.info('Installing Systematic plugin', {systematicVersion, timeoutMs})
+  logger.info('Installing Systematic plugin', {systematicVersion, timeoutMs, opencodeBinaryPath})
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined
   let stderrTail = ''
@@ -61,12 +62,12 @@ export async function installSystematicPlugin(
     const result =
       execWithTimeout === undefined
         ? await Promise.race<number | 'timed-out'>([
-            execAdapter.exec(opencodePath, args, execOptions),
+            execAdapter.exec(opencodeBinaryPath, args, execOptions),
             new Promise<'timed-out'>(resolve => {
               timeoutId = setTimeout(() => resolve('timed-out'), timeoutMs)
             }),
           ])
-        : await execWithTimeout(opencodePath, args, timeoutMs, execOptions)
+        : await execWithTimeout(opencodeBinaryPath, args, timeoutMs, execOptions)
 
     const duration = Date.now() - startTime
     if (result === 'timed-out') {
