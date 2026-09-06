@@ -281,6 +281,45 @@ describe('installSystematicPlugin', () => {
     },
   )
 
+  it.skipIf(permissionsApply === false)(
+    'does not claim a missing target when the symlink itself resolves but its directory is locked',
+    async () => {
+      // #given a symlink whose target exists — but the directory holding that target is 0o000, so
+      // stat (which follows the link) rejects EACCES while lstat on the link itself still succeeds
+      const logger = createLogger()
+      const restrictedDir = await makeTempDir()
+      const targetPath = join(restrictedDir, 'opencode')
+      await writeFile(targetPath, '#!/bin/sh\n', {mode: 0o755})
+      await chmod(restrictedDir, 0o000)
+      const linkDir = await makeTempDir()
+      const linkPath = join(linkDir, 'opencode')
+      await symlink(targetPath, linkPath)
+      const execWithTimeout = vi
+        .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+        .mockRejectedValue(new Error(`spawn ${linkPath} EACCES`))
+      const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+      // #when
+      try {
+        await installSystematicPlugin({
+          logger,
+          execAdapter,
+          opencodeBinaryPath: linkPath,
+          systematicVersion: '2.1.0',
+          timeoutMs: 100,
+        })
+      } finally {
+        await chmod(restrictedDir, 0o755)
+      }
+
+      // #then the diagnosis declines to answer rather than claiming the target is gone
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Systematic plugin install failed',
+        expect.objectContaining({pathDiagnosis: 'path could not be examined (EACCES)'}),
+      )
+    },
+  )
+
   it('names a dangling symlink instead of listing the entry it just called missing', async () => {
     // #given a symlink whose target does not exist — stat follows links, so this reaches the
     // same branch as a genuinely absent path

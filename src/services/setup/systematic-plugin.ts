@@ -59,8 +59,15 @@ export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
     }
 
     if (stats === null) {
+      // Only ENOENT means absent. Every other stat failure -- including a symlink whose target
+      // exists but sits behind an unsearchable directory -- leaves existence unknown, and
+      // everything below this line assumes the path is gone.
+      if (statError !== 'ENOENT') {
+        return `path could not be examined (${statError ?? 'unknown error'})`
+      }
+
       // stat follows symlinks, so a dangling link lands here despite the entry existing. Probe
-      // with lstat first, or the message reports the path missing and then lists it among the
+      // with lstat, or the message reports the path missing and then lists it among the
       // parent's contents -- a diagnosis that argues with itself is worse than none.
       let linkStats = null
       try {
@@ -71,13 +78,6 @@ export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
 
       if (linkStats !== null && linkStats.isSymbolicLink()) {
         return 'path is a symbolic link whose target does not exist'
-      }
-
-      // Only ENOENT means absent. Every other stat failure -- a parent that is readable but not
-      // searchable being the reachable one -- leaves existence unknown, and everything below
-      // this line assumes the path is gone.
-      if (statError !== 'ENOENT') {
-        return `path could not be examined (${statError ?? 'unknown error'})`
       }
 
       const parentDir = dirname(binaryPath)
