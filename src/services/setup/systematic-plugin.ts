@@ -50,11 +50,12 @@ function errorCode(error: unknown): string | undefined {
 // original error.
 export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
   try {
-    let stats
+    let stats = null
+    let statError
     try {
       stats = await stat(binaryPath)
-    } catch {
-      stats = null
+    } catch (error) {
+      statError = errorCode(error)
     }
 
     if (stats === null) {
@@ -72,6 +73,13 @@ export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
         return 'path is a symbolic link whose target does not exist'
       }
 
+      // Only ENOENT means absent. Every other stat failure -- a parent that is readable but not
+      // searchable being the reachable one -- leaves existence unknown, and everything below
+      // this line assumes the path is gone.
+      if (statError !== 'ENOENT') {
+        return `path could not be examined (${statError ?? 'unknown error'})`
+      }
+
       const parentDir = dirname(binaryPath)
       try {
         const entries = await readdir(parentDir)
@@ -79,13 +87,12 @@ export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
         const truncated = entries.length > MAX_LISTED_ENTRIES ? ` (truncated, ${entries.length} total)` : ''
         return `path does not exist; parent directory ${parentDir} contains: ${shown.join(', ')}${truncated}`
       } catch (error) {
-        // Only ENOENT proves absence. A parent we cannot read leaves the path's existence
-        // unknown, so claiming it is missing would be the same false certainty the lstat probe
-        // above exists to avoid.
+        // Absence is already established above, so both arms state it. Reachable with a
+        // searchable-but-unreadable parent, which answers stat and refuses readdir.
         const code = errorCode(error)
         return code === 'ENOENT'
           ? `path does not exist; parent directory ${parentDir} does not exist either`
-          : `path could not be examined; parent directory ${parentDir} is not readable (${code ?? 'unknown error'})`
+          : `path does not exist; parent directory ${parentDir} is not readable (${code ?? 'unknown error'})`
       }
     }
 

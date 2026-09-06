@@ -201,36 +201,85 @@ describe('installSystematicPlugin', () => {
     )
   })
 
-  it('does not claim absence when the parent directory cannot be read', async () => {
-    // #given a parent directory with no permissions — stat, lstat and readdir all reject EACCES,
-    // so nothing here can establish whether the path exists
-    const logger = createLogger()
-    const parent = await makeTempDir()
-    const binaryPath = join(parent, 'opencode')
-    await chmod(parent, 0o000)
-    const execWithTimeout = vi
-      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
-      .mockRejectedValue(new Error(`spawn ${binaryPath} EACCES`))
-    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+  // Root bypasses directory permission checks, so a restrictive parent still answers for it, and
+  // chmod is a no-op on Windows. Both invert these fixtures rather than failing them honestly.
+  const permissionsApply = process.platform !== 'win32' && process.getuid?.() !== 0
 
-    // #when
-    await installSystematicPlugin({
-      logger,
-      execAdapter,
-      opencodeBinaryPath: binaryPath,
-      systematicVersion: '2.1.0',
-      timeoutMs: 100,
-    })
-    await chmod(parent, 0o755)
+  it.skipIf(permissionsApply === false)(
+    'does not claim absence when the parent is readable but not searchable',
+    async () => {
+      // #given a parent at 0o444 — stat and lstat reject EACCES while readdir succeeds, so the
+      // absence branch would otherwise list the very file it called missing
+      const logger = createLogger()
+      const parent = await makeTempDir()
+      const binaryPath = join(parent, 'opencode')
+      await writeFile(binaryPath, '#!/bin/sh\n')
+      await chmod(parent, 0o444)
+      const execWithTimeout = vi
+        .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+        .mockRejectedValue(new Error(`spawn ${binaryPath} EACCES`))
+      const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
 
-    // #then the permission problem is named, and the message does not assert the path is missing
-    expect(logger.warning).toHaveBeenCalledWith(
-      'Systematic plugin install failed',
-      expect.objectContaining({
-        pathDiagnosis: `path could not be examined; parent directory ${parent} is not readable (EACCES)`,
-      }),
-    )
-  })
+      // #when
+      try {
+        await installSystematicPlugin({
+          logger,
+          execAdapter,
+          opencodeBinaryPath: binaryPath,
+          systematicVersion: '2.1.0',
+          timeoutMs: 100,
+        })
+      } finally {
+        await chmod(parent, 0o755)
+      }
+
+      // #then the diagnosis declines to answer rather than contradicting itself
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Systematic plugin install failed',
+        expect.objectContaining({pathDiagnosis: 'path could not be examined (EACCES)'}),
+      )
+    },
+  )
+
+  it.skipIf(permissionsApply === false)(
+    'reports a confirmed-absent path even when the parent will not list',
+    async () => {
+      // #given a parent at 0o111 — searchable, so stat answers ENOENT for a genuinely absent path,
+      // but unreadable, so the listing that would normally accompany that answer is refused
+      const logger = createLogger()
+      const parent = await makeTempDir()
+      const binaryPath = join(parent, 'opencode')
+      await chmod(parent, 0o111)
+      const execWithTimeout = vi
+        .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+        .mockRejectedValue(new Error(`spawn ${binaryPath} EACCES`))
+      const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+      // #when
+      try {
+        await installSystematicPlugin({
+          logger,
+          execAdapter,
+          opencodeBinaryPath: binaryPath,
+          systematicVersion: '2.1.0',
+          timeoutMs: 100,
+        })
+      } finally {
+        // In a finally so the fixture is restored even if the install ever starts throwing --
+        // otherwise a 0o000 directory survives into afterEach and takes unrelated tests with it.
+        await chmod(parent, 0o755)
+      }
+
+      // #then absence is stated, because stat established it — but the listing is replaced by why
+      // it could not be produced, rather than claiming the parent is gone too
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Systematic plugin install failed',
+        expect.objectContaining({
+          pathDiagnosis: `path does not exist; parent directory ${parent} is not readable (EACCES)`,
+        }),
+      )
+    },
+  )
 
   it('names a dangling symlink instead of listing the entry it just called missing', async () => {
     // #given a symlink whose target does not exist — stat follows links, so this reaches the
