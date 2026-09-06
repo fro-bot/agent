@@ -1,6 +1,7 @@
 import type {SetupInputs} from './types.js'
 
 import * as fs from 'node:fs/promises'
+import {join} from 'node:path'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import * as github from '@actions/github'
@@ -462,8 +463,9 @@ describe('setup', () => {
       // #when
       await runSetup(createSetupInputs(), 'ghs_test_token')
 
-      // #then
-      expect(core.setOutput).toHaveBeenCalledWith('opencode-path', expect.any(String))
+      // #then the opencode-path output is the install DIRECTORY, matching what goes on PATH and
+      // what RFC-011 documents. It is deliberately not the executable — consumers add it to PATH.
+      expect(core.setOutput).toHaveBeenCalledWith('opencode-path', '/cached/opencode/1.0.300')
       expect(core.setOutput).toHaveBeenCalledWith('auth-json-path', expect.stringContaining('auth.json'))
     })
 
@@ -1022,7 +1024,7 @@ describe('setup', () => {
         // directory — spawning that fails EACCES)
         expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
           expect.objectContaining({
-            opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64/opencode',
+            opencodeBinaryPath: join('/opt/hostedtoolcache/opencode/1.0.300/x64', 'opencode'),
             systematicVersion: '2.1.0',
           }),
         )
@@ -1090,7 +1092,7 @@ describe('setup', () => {
         expect(result).not.toBeNull()
         expect(core.addPath).toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/1.0.300/x64')
         expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
-          expect.objectContaining({opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64/opencode'}),
+          expect.objectContaining({opencodeBinaryPath: join('/opt/hostedtoolcache/opencode/1.0.300/x64', 'opencode')}),
         )
         expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
       })
@@ -1099,7 +1101,7 @@ describe('setup', () => {
         // #given a normal install — `OpenCodeInstallResult.path` is the tool-cache DIRECTORY
 
         // #when setup runs
-        await runSetup(createSetupInputs(), 'ghs_test_token')
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then the two consumers of that directory must not receive the same string: core.addPath
         // takes the directory, while the install child is spawned directly and must get the binary
@@ -1108,8 +1110,15 @@ describe('setup', () => {
         const addedPath = vi.mocked(core.addPath).mock.calls.at(0)?.[0]
         const installArgs = vi.mocked(systematicPlugin.installSystematicPlugin).mock.calls.at(0)?.[0]
         expect(addedPath).toBe('/opt/hostedtoolcache/opencode/1.0.300/x64')
-        expect(installArgs?.opencodePath).not.toBe(addedPath)
-        expect(installArgs?.opencodePath).toBe(`${addedPath}/opencode`)
+        expect(installArgs?.opencodeBinaryPath).not.toBe(addedPath)
+        expect(installArgs?.opencodeBinaryPath).toBe(join(addedPath ?? '', 'opencode'))
+
+        // #and the returned result carries both halves under names that say which is which. These
+        // are adjacent fields of one object literal differing by a single call, so without this
+        // the split is enforced only by that call and a comment.
+        expect(result?.opencodePath).toBe(addedPath)
+        expect(result?.opencodeBinaryPath).toBe(join(addedPath ?? '', 'opencode'))
+        expect(result?.opencodeBinaryPath).not.toBe(result?.opencodePath)
       })
 
       it('still installs and saves on a tools cache miss when the tool cache already holds the binary', async () => {
@@ -1126,7 +1135,7 @@ describe('setup', () => {
         // would skip both here and leave the config pointing at a plugin version never installed
         expect(tc.downloadTool).not.toHaveBeenCalled()
         expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
-          expect.objectContaining({opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64/opencode'}),
+          expect.objectContaining({opencodeBinaryPath: join('/opt/hostedtoolcache/opencode/1.0.300/x64', 'opencode')}),
         )
         expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
         expect(result?.toolsCacheStatus).toBe('miss')

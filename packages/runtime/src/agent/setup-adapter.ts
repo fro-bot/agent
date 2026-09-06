@@ -33,7 +33,10 @@ export interface SetupAdapter {
     inputs: SetupInputs,
     githubToken: string,
   ) => Promise<{
+    /** Install DIRECTORY — what goes on PATH. Spawning it fails EACCES. */
     readonly opencodePath: string
+    /** The executable inside `opencodePath`. Use this for anything that runs OpenCode. */
+    readonly opencodeBinaryPath: string
     readonly opencodeVersion: string
   } | null>
   readonly addToPath: (toolPath: string) => void
