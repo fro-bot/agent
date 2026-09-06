@@ -1,12 +1,17 @@
 ---
 type: subsystem
-last-updated: "2026-09-05"
-updated-by: "pr-1555"
+last-updated: "2026-09-07"
+updated-by: "schedule-d7190410-34062354146"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
   - src/services/setup/systematic-config.ts
+  - src/services/setup/systematic-plugin.ts
+  - src/services/setup/adapters.ts
   - src/services/setup/opencode.ts
+  - src/services/setup/types.ts
+  - packages/runtime/src/agent/server.ts
+  - packages/harness/src/platform.ts
   - src/services/setup/bun.ts
   - src/services/setup/omo.ts
   - src/services/setup/gh-auth.ts
@@ -46,15 +51,15 @@ The `runSetup()` orchestrator follows a **mode-gated** sequence. When no orchest
 
 3. **Restore tools cache** — Checks for a cached bundle of previously installed tools, keyed by version, OS, and mode. A cache hit skips download steps entirely. The disabled-mode cache excludes Bun and `~/.config/opencode` paths to prevent stale oMo config from being restored.
 
-4. **Install OpenCode CLI** — Downloads the platform-appropriate release binary, extracts it, verifies it (`--version`), and registers it in the GitHub Actions tool cache. The platform mapping handles Linux x64/arm64 and macOS x64/arm64. The download source depends on whether the target is a stock OpenCode release or a [harness build](#harness-builds) — harness builds are fetched from `fro-bot/agent` releases and verified against a published `SHA256SUMS` manifest.
+4. **Install OpenCode CLI** — Downloads the platform-appropriate release binary, extracts it, verifies it (`--version`), and registers it in the GitHub Actions tool cache. The supported matrix is Linux and macOS on x64 or arm64; anything else is rejected by name before a URL is built (see [Platform Support](#platform-support)). The download source depends on whether the target is a stock OpenCode release or a [harness build](#harness-builds) — harness builds are fetched from `fro-bot/agent` releases and verified against a published `SHA256SUMS` manifest.
 
 5. **Build CI config** — Assembles the `OPENCODE_CONFIG_CONTENT` environment variable, which configures OpenCode for CI operation. This includes disabling auto-updates, injecting the Systematic plugin, and pinning `default_agent` to `"build"`.
 
 6. **Merge user config** — Merges the CI config on top of any user-provided `opencode-config` input. Plugin arrays are deduplicated by package name prefix. In disabled mode, `oh-my-openagent` entries are stripped from both `plugin` and legacy `plugins` keys, and a warning names any rewritten fields. Legacy `plugins` (plural) keys are also stripped — OpenCode only accepts `plugin` (singular).
 
-7. **Install Systematic plugin** — On a tools-cache miss, runs the OpenCode CLI's plugin install before caching. If the install times out or fails, setup continues but skips saving the tools cache so an incomplete install is not persisted.
+7. **Install Systematic plugin** — Runs the OpenCode CLI's plugin install before caching, gated on either a fresh OpenCode install _or_ a tools-cache miss (see [When the Plugin Install Runs](#when-the-plugin-install-runs)). If the install times out or fails, setup continues but skips saving the tools cache so an incomplete install is not persisted.
 
-8. **Save tools cache** — If the tools cache missed and the Systematic plugin install succeeded, saves the installed binaries for future runs.
+8. **Save tools cache** — If the plugin install ran and succeeded, saves the installed binaries for future runs.
 
 9. **Configure authentication** — Sets up `gh` CLI auth, configures Git identity as `{bot}[bot]` for audit trails, and writes the ephemeral `auth.json` with `0o600` permissions.
 
@@ -126,6 +131,28 @@ Moving the tag to a genuine SemVer prerelease identifier fixes it at the level o
 If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`, currently `1.18.29`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
 
 Because the tag shape is now load-bearing for two external tools and is derived in more than one place — the release workflow, the npm version builder, and the setup module — the test suite carries drift guards that read the repository's source text and fail if one producer is changed without the others. These guards exist because an earlier mirrored copy of the harness-version predicate asserted the opposite of production behavior and still passed, testing its own copy rather than the module.
+
+## Platform Support
+
+The action runs on Linux and macOS, on x64 or arm64 — four combinations, and no others. `getPlatformInfo()` in `src/services/setup/opencode.ts` now asserts that matrix up front and throws a message naming the offending `platform/arch` pair, rather than mapping unknown values onto plausible-looking defaults.
+
+The earlier shape used lookup tables with fallbacks: an unrecognized platform silently became `linux`, an unrecognized architecture silently became `x64`. That was survivable while the default OpenCode version was a stock upstream release, because upstream publishes a broader asset matrix. It stopped being survivable once the default became a [harness build](#harness-builds), which publishes only `linux`/`darwin` × `x64`/`arm64` (`packages/harness/src/platform.ts`). On Windows the fallback produced a request for an asset that is never published, and the run failed several layers down with a 404 that said nothing about the platform. On an unsupported architecture the failure was worse than opaque — the arch fallback resolved to the x64 asset, so the download _succeeded_ and the binary failed to execute later, at a point far removed from the cause.
+
+Gating both halves in one place means the error names the real problem at the moment it is knowable. It also removed the Windows-shaped branches that existed downstream: archive-extension selection no longer special-cases `.zip` for Windows, and download validation no longer skips the `file(1)` check on a platform that can no longer be reached.
+
+## The Install Directory and the Executable
+
+Two different strings describe an OpenCode install, and conflating them caused a cluster of `EACCES` failures worth understanding as one story.
+
+`installOpenCode()` returns a **directory** — that is what `@actions/tool-cache`'s `cacheDir`/`find` return, and it is what `core.addPath()` expects to receive. But several consumers need an **executable path** to hand to a child process: the Systematic plugin install spawns OpenCode directly, `@fro.bot/harness`'s `resolveBinary()` reads `OPENCODE_PATH` as a binary, and every child that inherits the environment sees `OPENCODE_PATH` too (the deny-by-default env filter lets the `OPENCODE_` prefix through). Passing the directory to any of those spawns it, which fails with `EACCES` because a directory is not executable.
+
+The fix is a single helper, `opencodeBinaryPath()`, that owns the on-disk layout and is the only place allowed to turn an install directory into an executable path. `SetupResult` now carries both values as separately documented fields — `opencodePath` (the directory, consumed by `addPath` and reported as the `opencode-path` output) and `opencodeBinaryPath` (the executable, used by anything that spawns). `ensureOpenCodeAvailable()` in `packages/runtime/src/agent/server.ts` deliberately takes different halves for different purposes and logs both, on the reasoning that the entire failure mode was "which of these two strings got exported", so a recurrence should be diagnosable from the run log alone.
+
+## When the Plugin Install Runs
+
+The Systematic plugin install is gated on **either** a fresh OpenCode install **or** a tools-cache miss. The two conditions are independent, not nested, and the earlier code that checked only the tools-cache flag left two real gaps: a tools-cache hit whose binary had gone missing falls through to a fresh OpenCode install that still needs its plugin installed and its cache re-saved; and `installOpenCode()` reports a cache hit from the runner's own tool cache alone, so a tools-cache key miss — from a bumped Systematic version, or an earlier invocation that skipped its save — must still install and save even on a warm tool cache.
+
+When the install fails, two diagnostics now accompany the warning. If the parent environment carries `NPM_CONFIG_*` variables, the warning names those keys (names only, never values) and notes that the install child deliberately does not inherit them — the scrub exists so a network-fetched package's lifecycle scripts cannot see registry or proxy overrides, and naming the likely cause is preferable to either silently failing or proposing an allowlist that would defeat the scrub. Separately, when the failure is a spawn error (`ENOENT` or `EACCES`), `diagnoseBinaryPath()` inspects the path and reports what it actually found: absent, a dangling symlink, a directory rather than an executable, present but not executable by the current user, or a parent directory listing when the path itself is gone. That routine runs inside a catch block, so every filesystem call it makes is individually guarded — a failed diagnosis degrades to a short fallback string rather than masking the original error.
 
 ## Configuration Assembly
 

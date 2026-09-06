@@ -1,8 +1,10 @@
 ---
 type: subsystem
-last-updated: "2026-09-04"
-updated-by: "pr-1534"
+last-updated: "2026-09-07"
+updated-by: "schedule-d7190410-34062354146"
 sources:
+  - src/services/cache/cache-key.ts
+  - src/shared/cache-save-result.ts
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
   - packages/runtime/src/session/prune.ts
@@ -49,6 +51,8 @@ opencode-storage-{repo}-{branch}-{os}
 
 Branch scoping prevents one branch's session history from leaking into another. The OS component handles the rare case of cross-platform runners.
 
+Restore and save use that key differently. Restore matches on two prefixes — branch-scoped first, then repo-scoped — while the key a run _writes_ appends its run ID and run attempt (`buildSaveCacheKey` in `src/services/cache/cache-key.ts`). The run-attempt component was added because Actions cache entries are immutable: a re-run keeps the same `GITHUB_RUN_ID`, so without the attempt suffix the second attempt's save collided with the first attempt's entry, and that collision was folded into the "already exists" success path — the retry's own session state was silently discarded while the save reported success. Each attempt now writes its own entry. Both restore prefixes stop before the run ID, so they continue to match every save key regardless of run or attempt; the cost is that re-runs consume additional entries against the repository's cache budget, which LRU eviction absorbs. Losing a re-run's session state was judged the worse outcome.
+
 On restore, the cache module performs several safety checks:
 
 - **Corruption detection** — Verifies the storage path is a readable directory. If not, cleans and continues with empty state.
@@ -65,7 +69,17 @@ This mapping from event to cache scope is attributed to a platform policy change
 
 The result is that a run can restore prior state successfully while its cache write is rejected. Mention-driven runs therefore read session state but may be unable to write their new state. This is a GitHub platform constraint, not a Fro Bot configuration bug. `s3-backup` defaults to `false`; enabling it with a configured bucket makes the object store the durable path for session state, and restore consults it before the Actions cache. Object-store sync is best-effort and non-fatal, so continuity depends on the upload succeeding. If the upload fails, the run still falls through to the Actions cache write, which may also be denied.
 
-`@actions/cache` hides both write denials and reservation collisions behind a `-1` sentinel instead of throwing, so the save path cannot distinguish those causes at that boundary. The cache write is therefore reported as not persisted rather than as a confident diagnosis. The post-action hook remains the retry path when the main-step save did not persist.
+`@actions/cache` hides both write denials and reservation collisions behind a `-1` sentinel instead of throwing, so the save path cannot distinguish those causes at that boundary. The cache write is therefore reported as not persisted rather than as a confident diagnosis. The post-action hook remains the retry path when the main-step save did not persist. What "did not persist" means precisely is the subject of the next section.
+
+### What a Save Reports
+
+`saveCache` returns a structured `CacheSaveResult` (`src/shared/cache-save-result.ts`) rather than a boolean. The shape has two independent persistence axes — `cachePersisted` and `storePersisted` — plus a named `outcome` describing the terminal condition that produced them. Durability overall is the disjunction of the two axes, never either one alone.
+
+The reason for the shape is that a boolean collapsed three genuinely different situations into the same value: a deliberate opt-out (`SKIP_CACHE`), a denied write, and a successful write. Naming them separately makes the run's actual persistence story legible in the job summary and in the `cache-save-result` action output. The outcomes are `skipped-by-configuration`, `skipped-empty`, `checkpoint-declined`, `cache-rejected`, `cache-error`, and `persisted`.
+
+`cache-rejected` deserves a note about what it does _not_ claim. `@actions/cache` distinguishes a policy denial, a reservation collision, a finalize error, a 5xx, and an upload failure internally, but none of those survive the `saveCache()` call boundary — every one returns the same `-1`. `cache-rejected` therefore covers all of them because the boundary cannot tell them apart, not because one was determined over the others. The source comments are explicit that this is an inference and that the cause must not be guessed from the trigger type or runner configuration: a self-hosted runner can hold a writable token on a comment trigger, and a transient service failure can happen regardless of token permissions.
+
+The `persisted` outcome absorbs one case that looks like a failure. When the cache adapter throws an "already exists" error, the key is durably written either way — some concurrent job committed it first — so the state is present under that key regardless of which run wrote it. That is folded into `persisted` rather than given its own outcome.
 
 Before saving, `saveCache` in `src/services/cache/save.ts` checks whether there is anything worth caching — but this check is subtler than "is the storage directory non-empty." Recent OpenCode versions persist sessions in an `opencode.db` SQLite file in the _parent_ of the storage directory, not inside it, so a naive empty-directory check would skip the save on every real run. The save path checkpoints SQLite before building the transport paths, and today's cache and object-store save sets include `opencode.db` but not `opencode.db-wal` or `opencode.db-shm`. A non-empty `opencode.db` is therefore the DB-side signal; WAL-only data is expected to have been merged before the save check.
 
