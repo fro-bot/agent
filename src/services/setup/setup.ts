@@ -16,7 +16,7 @@ import {buildCIConfig, isOmoSlimVersionVerified, pluginPrefix} from './ci-config
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {installOmoSlim} from './omo-slim.js'
 import {installOmo} from './omo.js'
-import {FALLBACK_VERSION, getLatestVersion, installOpenCode, toolCacheVersion} from './opencode.js'
+import {FALLBACK_VERSION, getLatestVersion, installOpenCode, opencodeBinaryPath, toolCacheVersion} from './opencode.js'
 import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
 import {installSystematicPlugin} from './systematic-plugin.js'
@@ -294,7 +294,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       const systematicPluginInstall = await installSystematicPlugin({
         logger,
         execAdapter,
-        opencodePath: opencodeResult.path,
+        opencodePath: opencodeBinaryPath(opencodeResult.path),
         systematicVersion,
       })
 

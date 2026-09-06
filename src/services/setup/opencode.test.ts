@@ -13,6 +13,7 @@ import {
   getPlatformInfo,
   installOpenCode,
   isHarnessVersion,
+  opencodeBinaryPath,
   toHarnessReleaseTag,
   toolCacheVersion,
 } from './opencode.js'
@@ -105,6 +106,21 @@ describe('opencode', () => {
     fsState.readFileSyncImpl = null
     fsState.createReadStreamImpl = null
     vi.restoreAllMocks()
+  })
+
+  describe('opencodeBinaryPath', () => {
+    it('resolves the executable inside an install directory', () => {
+      // #given the tool-cache directory installOpenCode returns
+      const installDir = '/opt/hostedtoolcache/opencode/1.18.29-harness.88b6b5fb/x64'
+
+      // #when the executable is resolved
+      const binary = opencodeBinaryPath(installDir)
+
+      // #then it names a file inside that directory, never the directory itself — spawning the
+      // directory fails EACCES
+      expect(binary).toBe(`${installDir}/opencode`)
+      expect(binary).not.toBe(installDir)
+    })
   })
 
   describe('getPlatformInfo', () => {
