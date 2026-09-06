@@ -472,7 +472,10 @@ describe('setup', () => {
       // load-bearing: the variable is read back as an executable by verifyOpenCodeAvailable and by
       // @fro.bot/harness's resolveBinary(), while this action's own value here is the directory.
       // Exporting it would put a directory somewhere three consumers spawn.
-      expect(core.exportVariable).not.toHaveBeenCalledWith('OPENCODE_PATH', expect.anything())
+      // Asserted on the call arguments rather than with `not.toHaveBeenCalledWith(..., anything())`:
+      // expect.anything() does not match undefined, so an export wired to an optional field --
+      // exactly the shape a regression would take -- would slip past that form.
+      expect(vi.mocked(core.exportVariable).mock.calls.map(call => call[0])).not.toContain('OPENCODE_PATH')
     })
 
     it('calls setFailed on unrecoverable error', async () => {

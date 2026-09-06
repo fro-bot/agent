@@ -1,7 +1,7 @@
 import type {Buffer} from 'node:buffer'
 import type {ExecAdapter, Logger} from './types.js'
 import {constants} from 'node:fs'
-import {access, readdir, stat} from 'node:fs/promises'
+import {access, lstat, readdir, stat} from 'node:fs/promises'
 import {dirname} from 'node:path'
 import process from 'node:process'
 import {filterAgentEnv} from '@fro-bot/runtime'
@@ -50,6 +50,20 @@ export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
     }
 
     if (stats === null) {
+      // stat follows symlinks, so a dangling link lands here despite the entry existing. Probe
+      // with lstat first, or the message reports the path missing and then lists it among the
+      // parent's contents -- a diagnosis that argues with itself is worse than none.
+      let linkStats = null
+      try {
+        linkStats = await lstat(binaryPath)
+      } catch {
+        linkStats = null
+      }
+
+      if (linkStats !== null && linkStats.isSymbolicLink()) {
+        return 'path is a symbolic link whose target does not exist'
+      }
+
       const parentDir = dirname(binaryPath)
       try {
         const entries = await readdir(parentDir)
@@ -145,6 +159,10 @@ export async function installSystematicPlugin(
       systematicVersion,
       error: message,
       duration,
+      // A rejection can arrive after the child has already written output -- the adapter's
+      // 'error' handler fires independently of what was streamed. The exit-code branch reports
+      // the tail; dropping it here would discard the one thing the diagnosis cannot explain.
+      ...(stderrTail.length > 0 ? {stderr: stderrTail} : {}),
       ...(pathDiagnosis === undefined ? {} : {pathDiagnosis}),
     })
     return {status: 'failed', duration}

@@ -1,6 +1,6 @@
 import type {ExecAdapter, Logger} from './types.js'
 import {Buffer} from 'node:buffer'
-import {chmod, mkdtemp, rm, writeFile} from 'node:fs/promises'
+import {chmod, mkdtemp, rm, symlink, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {afterEach, describe, expect, it, vi} from 'vitest'
@@ -198,6 +198,62 @@ describe('installSystematicPlugin', () => {
     expect(logger.warning).toHaveBeenCalledWith(
       'Systematic plugin install failed',
       expect.objectContaining({error: 'spawn opencode ENOENT'}),
+    )
+  })
+
+  it('names a dangling symlink instead of listing the entry it just called missing', async () => {
+    // #given a symlink whose target does not exist — stat follows links, so this reaches the
+    // same branch as a genuinely absent path
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    const linkPath = join(dir, 'opencode')
+    await symlink(join(dir, 'no-such-target'), linkPath)
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error(`spawn ${linkPath} ENOENT`))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the install fails against it
+    await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: linkPath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the link is named — reporting the path absent would contradict the parent listing,
+    // which contains the link itself
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({pathDiagnosis: 'path is a symbolic link whose target does not exist'}),
+    )
+  })
+
+  it('carries the stderr tail when the spawn rejects after the child wrote output', async () => {
+    // #given a child that writes to stderr and then rejects — the adapter's error handler fires
+    // independently of what was already streamed
+    const logger = createLogger()
+    const execWithTimeout = vi.fn<NonNullable<ExecAdapter['execWithTimeout']>>().mockImplementation(async (...args) => {
+      const options = args[3]
+      options?.listeners?.stderr?.(Buffer.from('npm ERR! code E401'))
+      throw new Error('spawn /missing/opencode ENOENT')
+    })
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when
+    await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: '/missing/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the tail survives — it is the one thing the path diagnosis cannot explain
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({stderr: 'npm ERR! code E401'}),
     )
   })
 
