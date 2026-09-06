@@ -2,6 +2,7 @@ import type {ExecAdapter, Logger, PlatformInfo, ToolCacheAdapter} from './types.
 import {Buffer} from 'node:buffer'
 import {createHash} from 'node:crypto'
 import {EventEmitter} from 'node:events'
+import path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {DEFAULT_OPENCODE_VERSION} from '../../shared/constants.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -118,8 +119,20 @@ describe('opencode', () => {
 
       // #then it names a file inside that directory, never the directory itself — spawning the
       // directory fails EACCES
-      expect(binary).toBe(`${installDir}/opencode`)
+      expect(binary).toBe(path.join(installDir, 'opencode'))
       expect(binary).not.toBe(installDir)
+    })
+
+    it('carries the .exe extension on Windows', () => {
+      // #given a win32 host — getPlatformInfo still maps win32 and builds windows archive URLs
+      Object.defineProperty(process, 'platform', {value: 'win32'})
+
+      // #when the executable is resolved
+      const binary = opencodeBinaryPath('/hostedtoolcache/opencode/1.18.29/x64')
+
+      // #then the extension is included — this helper is the single place that knows the layout,
+      // so encoding only the POSIX name would hand the next caller a path that does not exist
+      expect(binary.endsWith('opencode.exe')).toBe(true)
     })
   })
 

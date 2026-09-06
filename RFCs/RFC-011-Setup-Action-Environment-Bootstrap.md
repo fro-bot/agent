@@ -101,7 +101,7 @@ inputs:
 
 outputs:
   opencode-path:
-    description: "Path to installed OpenCode binary"
+    description: "Directory containing the installed OpenCode binary (added to PATH)"
   opencode-version:
     description: "Installed OpenCode version"
   gh-authenticated:

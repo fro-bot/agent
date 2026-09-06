@@ -25,9 +25,14 @@ export const FALLBACK_VERSION = '1.18.29'
  * `OpenCodeInstallResult.path` is the tool-cache DIRECTORY — what `tc.cacheDir`/`tc.find` return
  * and what `core.addPath` expects. Spawning it directly fails with EACCES. Callers that need an
  * executable must go through here rather than passing the directory to a child process.
+ *
+ * This is the single place that knows the on-disk layout, so it carries the Windows extension
+ * too — `getPlatformInfo` still maps `win32`, and a helper that encoded only the POSIX half
+ * would quietly hand the next caller a path that does not exist.
  */
 export function opencodeBinaryPath(installDir: string): string {
-  return path.join(installDir, TOOL_NAME)
+  const basename = os.platform() === 'win32' ? `${TOOL_NAME}.exe` : TOOL_NAME
+  return path.join(installDir, basename)
 }
 
 /**
