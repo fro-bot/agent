@@ -201,6 +201,37 @@ describe('installSystematicPlugin', () => {
     )
   })
 
+  it('does not claim absence when the parent directory cannot be read', async () => {
+    // #given a parent directory with no permissions — stat, lstat and readdir all reject EACCES,
+    // so nothing here can establish whether the path exists
+    const logger = createLogger()
+    const parent = await makeTempDir()
+    const binaryPath = join(parent, 'opencode')
+    await chmod(parent, 0o000)
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error(`spawn ${binaryPath} EACCES`))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when
+    await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: binaryPath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+    await chmod(parent, 0o755)
+
+    // #then the permission problem is named, and the message does not assert the path is missing
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({
+        pathDiagnosis: `path could not be examined; parent directory ${parent} is not readable (EACCES)`,
+      }),
+    )
+  })
+
   it('names a dangling symlink instead of listing the entry it just called missing', async () => {
     // #given a symlink whose target does not exist — stat follows links, so this reaches the
     // same branch as a genuinely absent path

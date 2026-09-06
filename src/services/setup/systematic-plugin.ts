@@ -37,6 +37,14 @@ function isSpawnPathError(message: string): boolean {
   return message.includes('ENOENT') || message.includes('EACCES')
 }
 
+// Narrowed rather than asserted: a rejected fs call carries `code`, but the caught value is
+// `unknown` and this runs where a wrong assumption would throw inside a catch.
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+    ? error.code
+    : undefined
+}
+
 // Runs inside a catch block for a spawn failure -- must never throw. Every filesystem call is
 // wrapped so a diagnosis failure degrades to a short fallback string instead of masking the
 // original error.
@@ -70,8 +78,14 @@ export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
         const shown = entries.slice(0, MAX_LISTED_ENTRIES)
         const truncated = entries.length > MAX_LISTED_ENTRIES ? ` (truncated, ${entries.length} total)` : ''
         return `path does not exist; parent directory ${parentDir} contains: ${shown.join(', ')}${truncated}`
-      } catch {
-        return `path does not exist; parent directory ${parentDir} does not exist either`
+      } catch (error) {
+        // Only ENOENT proves absence. A parent we cannot read leaves the path's existence
+        // unknown, so claiming it is missing would be the same false certainty the lstat probe
+        // above exists to avoid.
+        const code = errorCode(error)
+        return code === 'ENOENT'
+          ? `path does not exist; parent directory ${parentDir} does not exist either`
+          : `path could not be examined; parent directory ${parentDir} is not readable (${code ?? 'unknown error'})`
       }
     }
 
