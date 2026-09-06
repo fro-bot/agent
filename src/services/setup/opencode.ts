@@ -3,6 +3,7 @@ import type {ExecAdapter, Logger, OpenCodeInstallResult, PlatformInfo, ToolCache
 import {createHash} from 'node:crypto'
 import {createReadStream, readFileSync} from 'node:fs'
 import os from 'node:os'
+import path from 'node:path'
 import process from 'node:process'
 
 import {toErrorMessage} from '../../shared/errors.js'
@@ -17,6 +18,17 @@ const HARNESS_MARKER = '+harness.'
  * This is a plain anomalyco/opencode release — not a harness build.
  */
 export const FALLBACK_VERSION = '1.18.29'
+
+/**
+ * Resolves the OpenCode executable inside an install directory.
+ *
+ * `OpenCodeInstallResult.path` is the tool-cache DIRECTORY — what `tc.cacheDir`/`tc.find` return
+ * and what `core.addPath` expects. Spawning it directly fails with EACCES. Callers that need an
+ * executable must go through here rather than passing the directory to a child process.
+ */
+export function opencodeBinaryPath(installDir: string): string {
+  return path.join(installDir, TOOL_NAME)
+}
 
 /**
  * Semver-ish pattern for version validation (defense-in-depth, path-traversal guard).
