@@ -1,5 +1,8 @@
 import type {Buffer} from 'node:buffer'
 import type {ExecAdapter, Logger} from './types.js'
+import {constants} from 'node:fs'
+import {access, lstat, readdir, stat} from 'node:fs/promises'
+import {dirname} from 'node:path'
 import process from 'node:process'
 import {filterAgentEnv} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
@@ -25,6 +28,88 @@ export interface SystematicPluginInstallResult {
 }
 
 const emptyConfig = JSON.stringify({plugin: []})
+const MAX_LISTED_ENTRIES = 10
+
+// Matched on the error message, not a type assertion on the caught value -- spawn failures
+// from both @actions/exec and a plain Node ENOENT/EACCES rejection carry the code in the
+// message text (e.g. "spawn opencode ENOENT").
+function isSpawnPathError(message: string): boolean {
+  return message.includes('ENOENT') || message.includes('EACCES')
+}
+
+// Narrowed rather than asserted: a rejected fs call carries `code`, but the caught value is
+// `unknown` and this runs where a wrong assumption would throw inside a catch.
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+    ? error.code
+    : undefined
+}
+
+// Runs inside a catch block for a spawn failure -- must never throw. Every filesystem call is
+// wrapped so a diagnosis failure degrades to a short fallback string instead of masking the
+// original error.
+export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
+  try {
+    let stats = null
+    let statError
+    try {
+      stats = await stat(binaryPath)
+    } catch (error) {
+      statError = errorCode(error)
+    }
+
+    if (stats === null) {
+      // Only ENOENT means absent. Every other stat failure -- including a symlink whose target
+      // exists but sits behind an unsearchable directory -- leaves existence unknown, and
+      // everything below this line assumes the path is gone.
+      if (statError !== 'ENOENT') {
+        return `path could not be examined (${statError ?? 'unknown error'})`
+      }
+
+      // stat follows symlinks, so a dangling link lands here despite the entry existing. Probe
+      // with lstat, or the message reports the path missing and then lists it among the
+      // parent's contents -- a diagnosis that argues with itself is worse than none.
+      let linkStats = null
+      try {
+        linkStats = await lstat(binaryPath)
+      } catch {
+        linkStats = null
+      }
+
+      if (linkStats !== null && linkStats.isSymbolicLink()) {
+        return 'path is a symbolic link whose target does not exist'
+      }
+
+      const parentDir = dirname(binaryPath)
+      try {
+        const entries = await readdir(parentDir)
+        const shown = entries.slice(0, MAX_LISTED_ENTRIES)
+        const truncated = entries.length > MAX_LISTED_ENTRIES ? ` (truncated, ${entries.length} total)` : ''
+        return `path does not exist; parent directory ${parentDir} contains: ${shown.join(', ')}${truncated}`
+      } catch (error) {
+        // Absence is already established above, so both arms state it. Reachable with a
+        // searchable-but-unreadable parent, which answers stat and refuses readdir.
+        const code = errorCode(error)
+        return code === 'ENOENT'
+          ? `path does not exist; parent directory ${parentDir} does not exist either`
+          : `path does not exist; parent directory ${parentDir} is not readable (${code ?? 'unknown error'})`
+      }
+    }
+
+    if (stats.isDirectory()) {
+      return 'resolved path is a directory, not an executable'
+    }
+
+    try {
+      await access(binaryPath, constants.X_OK)
+      return 'path exists and is an executable file'
+    } catch {
+      return 'path exists but is not executable by the current user'
+    }
+  } catch {
+    return 'diagnosis unavailable'
+  }
+}
 
 export async function installSystematicPlugin(
   options: SystematicPluginInstallOptions,
@@ -89,10 +174,17 @@ export async function installSystematicPlugin(
     return {status: 'failed', duration}
   } catch (error) {
     const duration = Date.now() - startTime
+    const message = toErrorMessage(error)
+    const pathDiagnosis = isSpawnPathError(message) ? await diagnoseBinaryPath(opencodeBinaryPath) : undefined
     logger.warning('Systematic plugin install failed', {
       systematicVersion,
-      error: toErrorMessage(error),
+      error: message,
       duration,
+      // A rejection can arrive after the child has already written output -- the adapter's
+      // 'error' handler fires independently of what was streamed. The exit-code branch reports
+      // the tail; dropping it here would discard the one thing the diagnosis cannot explain.
+      ...(stderrTail.length > 0 ? {stderr: stderrTail} : {}),
+      ...(pathDiagnosis === undefined ? {} : {pathDiagnosis}),
     })
     return {status: 'failed', duration}
   } finally {
