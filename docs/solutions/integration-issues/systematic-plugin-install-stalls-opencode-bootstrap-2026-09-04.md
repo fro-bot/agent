@@ -87,7 +87,7 @@ const execOptions = {
   },
   // ...
 }
-const exitCode = await exec.execWithTimeout(opencodePath, args, timeoutMs, execOptions)
+const exitCode = await execWithTimeout(opencodeBinaryPath, args, timeoutMs, execOptions)
 ```
 
 Five decisions carry the fix, and each one closed a defect found in review:
@@ -117,12 +117,12 @@ Five decisions carry the fix, and each one closed a defect found in review:
 
 The stall was a network install sitting on the server's request-serving path. Moving it to setup removes the network from that path entirely: the server's `plugin.init()` becomes a local resolution that completes in milliseconds. A slow registry now shows up as a slow, logged, bounded setup step with a real duration attached — instead of a server that reports itself listening and then says nothing.
 
-Two harness defects made the stall invisible, and neither is fixed by this change:
+Two harness defects made the stall invisible. Neither was fixed by this change, and both have since been closed by [#1536](https://github.com/fro-bot/agent/issues/1536):
 
-- **Readiness is a stdout string match.** `@opencode-ai/sdk`'s `createOpencodeServer` resolves when the child prints `opencode server listening` (`dist/server.js:33`). The listener binds before bootstrap runs, so `DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS` bounds only "time until that string appears." A server that binds, prints, and then blocks for five minutes satisfies the budget in two seconds.
-- **The first session call has no timeout.** It inherits undici's default `headersTimeout` of 300,000ms (`undici/lib/dispatcher/client.js:316`). That is why the failures land at 300.77 seconds and surface as a bare `fetch failed` rather than a bootstrap error with a name.
+- **Readiness was a stdout string match.** `@opencode-ai/sdk`'s `createOpencodeServer` resolves when the child prints `opencode server listening` (`dist/server.js:33`). The listener binds before bootstrap runs, so `DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS` bounded only "time until that string appears." A server that binds, prints, and then blocks for five minutes satisfied the budget in two seconds.
+- **The first session call had no timeout.** It inherited undici's default `headersTimeout` of 300,000ms (`undici/lib/dispatcher/client.js:316`). That is why the failures landed at 300.77 seconds and surfaced as a bare `fetch failed` rather than a bootstrap error with a name.
 
-Both are tracked in [#1536](https://github.com/fro-bot/agent/issues/1536): a real readiness probe inside the existing budget, and an explicit bound on the first request.
+`bootstrapOpenCodeServer` now runs an instance-scoped readiness probe after `createOpencode` resolves — a bounded `client.session.list({query: {directory}})` carrying its own `AbortSignal.timeout(readinessTimeoutMs)` (`packages/runtime/src/agent/server.ts`, `attemptReadinessProbe`). It closes both defects at once: the budget now bounds a completed request rather than a printed line, and the first call is explicitly bounded rather than inheriting undici's default. A probe that answers with an error *body* still counts as ready — that is a server answering, which is the thing being measured.
 
 ## Prevention
 
@@ -141,3 +141,4 @@ Both are tracked in [#1536](https://github.com/fro-bot/agent/issues/1536): a rea
 - [Fail fast on structured provider authentication failures](./provider-auth-failure-hangs-to-timeout-2026-07-25.md) — the same "actionable failure decays into a generic deadline" shape on a different path.
 - [A check reports clean for the part of the world it cannot observe](../workflow-issues/checks-report-clean-for-what-they-cannot-observe-2026-08-10.md) — the readiness string match is a check whose observed population is one stdout line.
 - [Oversized session cache traps bootstrap](https://github.com/fro-bot/agent/issues/1407) — the neighboring bootstrap-time failure with the same immutable-cache-key persistence hazard.
+- [A tool-cache install directory was spawned where an executable was expected](./tool-cache-directory-spawned-as-executable-2026-09-06.md) — the install call shown above later received the tool-cache directory instead of the binary, failing `EACCES` and skipping the very cache save gated in decision 4. That defect disabled this fix entirely.
