@@ -1,6 +1,9 @@
 import type {ExecAdapter, Logger} from './types.js'
 import {Buffer} from 'node:buffer'
-import {describe, expect, it, vi} from 'vitest'
+import {chmod, mkdtemp, rm, symlink, writeFile} from 'node:fs/promises'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 import {installSystematicPlugin} from './systematic-plugin.js'
 
 function createLogger(): Logger {
@@ -17,6 +20,18 @@ function createExecAdapter(exec: ExecAdapter['exec']): ExecAdapter {
     exec,
     getExecOutput: vi.fn(),
   }
+}
+
+const tempDirs: string[] = []
+
+afterEach(async () => {
+  await Promise.all(tempDirs.splice(0).map(async dir => rm(dir, {recursive: true, force: true})))
+})
+
+async function makeTempDir(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'systematic-plugin-test-'))
+  tempDirs.push(dir)
+  return dir
 }
 
 describe('installSystematicPlugin', () => {
@@ -184,6 +199,369 @@ describe('installSystematicPlugin', () => {
       'Systematic plugin install failed',
       expect.objectContaining({error: 'spawn opencode ENOENT'}),
     )
+  })
+
+  // Root bypasses directory permission checks, so a restrictive parent still answers for it, and
+  // chmod is a no-op on Windows. Both invert these fixtures rather than failing them honestly.
+  const permissionsApply = process.platform !== 'win32' && process.getuid?.() !== 0
+
+  it.skipIf(permissionsApply === false)(
+    'does not claim absence when the parent is readable but not searchable',
+    async () => {
+      // #given a parent at 0o444 — stat and lstat reject EACCES while readdir succeeds, so the
+      // absence branch would otherwise list the very file it called missing
+      const logger = createLogger()
+      const parent = await makeTempDir()
+      const binaryPath = join(parent, 'opencode')
+      await writeFile(binaryPath, '#!/bin/sh\n')
+      await chmod(parent, 0o444)
+      const execWithTimeout = vi
+        .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+        .mockRejectedValue(new Error(`spawn ${binaryPath} EACCES`))
+      const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+      // #when
+      try {
+        await installSystematicPlugin({
+          logger,
+          execAdapter,
+          opencodeBinaryPath: binaryPath,
+          systematicVersion: '2.1.0',
+          timeoutMs: 100,
+        })
+      } finally {
+        await chmod(parent, 0o755)
+      }
+
+      // #then the diagnosis declines to answer rather than contradicting itself
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Systematic plugin install failed',
+        expect.objectContaining({pathDiagnosis: 'path could not be examined (EACCES)'}),
+      )
+    },
+  )
+
+  it.skipIf(permissionsApply === false)(
+    'reports a confirmed-absent path even when the parent will not list',
+    async () => {
+      // #given a parent at 0o111 — searchable, so stat answers ENOENT for a genuinely absent path,
+      // but unreadable, so the listing that would normally accompany that answer is refused
+      const logger = createLogger()
+      const parent = await makeTempDir()
+      const binaryPath = join(parent, 'opencode')
+      await chmod(parent, 0o111)
+      const execWithTimeout = vi
+        .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+        .mockRejectedValue(new Error(`spawn ${binaryPath} EACCES`))
+      const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+      // #when
+      try {
+        await installSystematicPlugin({
+          logger,
+          execAdapter,
+          opencodeBinaryPath: binaryPath,
+          systematicVersion: '2.1.0',
+          timeoutMs: 100,
+        })
+      } finally {
+        // In a finally so the fixture is restored even if the install ever starts throwing --
+        // otherwise a 0o000 directory survives into afterEach and takes unrelated tests with it.
+        await chmod(parent, 0o755)
+      }
+
+      // #then absence is stated, because stat established it — but the listing is replaced by why
+      // it could not be produced, rather than claiming the parent is gone too
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Systematic plugin install failed',
+        expect.objectContaining({
+          pathDiagnosis: `path does not exist; parent directory ${parent} is not readable (EACCES)`,
+        }),
+      )
+    },
+  )
+
+  it.skipIf(permissionsApply === false)(
+    'does not claim a missing target when the symlink itself resolves but its directory is locked',
+    async () => {
+      // #given a symlink whose target exists — but the directory holding that target is 0o000, so
+      // stat (which follows the link) rejects EACCES while lstat on the link itself still succeeds
+      const logger = createLogger()
+      const restrictedDir = await makeTempDir()
+      const targetPath = join(restrictedDir, 'opencode')
+      await writeFile(targetPath, '#!/bin/sh\n', {mode: 0o755})
+      await chmod(restrictedDir, 0o000)
+      const linkDir = await makeTempDir()
+      const linkPath = join(linkDir, 'opencode')
+      await symlink(targetPath, linkPath)
+      const execWithTimeout = vi
+        .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+        .mockRejectedValue(new Error(`spawn ${linkPath} EACCES`))
+      const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+      // #when
+      try {
+        await installSystematicPlugin({
+          logger,
+          execAdapter,
+          opencodeBinaryPath: linkPath,
+          systematicVersion: '2.1.0',
+          timeoutMs: 100,
+        })
+      } finally {
+        await chmod(restrictedDir, 0o755)
+      }
+
+      // #then the diagnosis declines to answer rather than claiming the target is gone
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Systematic plugin install failed',
+        expect.objectContaining({pathDiagnosis: 'path could not be examined (EACCES)'}),
+      )
+    },
+  )
+
+  it('names a dangling symlink instead of listing the entry it just called missing', async () => {
+    // #given a symlink whose target does not exist — stat follows links, so this reaches the
+    // same branch as a genuinely absent path
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    const linkPath = join(dir, 'opencode')
+    await symlink(join(dir, 'no-such-target'), linkPath)
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error(`spawn ${linkPath} ENOENT`))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the install fails against it
+    await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: linkPath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the link is named — reporting the path absent would contradict the parent listing,
+    // which contains the link itself
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({pathDiagnosis: 'path is a symbolic link whose target does not exist'}),
+    )
+  })
+
+  it('carries the stderr tail when the spawn rejects after the child wrote output', async () => {
+    // #given a child that writes to stderr and then rejects — the adapter's error handler fires
+    // independently of what was already streamed
+    const logger = createLogger()
+    const execWithTimeout = vi.fn<NonNullable<ExecAdapter['execWithTimeout']>>().mockImplementation(async (...args) => {
+      const options = args[3]
+      options?.listeners?.stderr?.(Buffer.from('npm ERR! code E401'))
+      throw new Error('spawn /missing/opencode ENOENT')
+    })
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when
+    await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: '/missing/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the tail survives — it is the one thing the path diagnosis cannot explain
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({stderr: 'npm ERR! code E401'}),
+    )
+  })
+
+  it('diagnoses a real directory as the cause when the spawn target is a directory', async () => {
+    // #given a real directory standing in for the OpenCode binary path (the regression)
+    const logger = createLogger()
+    const directoryPath = await makeTempDir()
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error(`spawn ${directoryPath} EACCES`))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install spawns the directory instead of the binary inside it
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: directoryPath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the warning identifies the path as a directory, not an executable
+    expect(result.status).toBe('failed')
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({pathDiagnosis: 'resolved path is a directory, not an executable'}),
+    )
+  })
+
+  it('diagnoses a real file that is not executable by the current user', async () => {
+    // #given a real file without execute permission
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    const filePath = join(dir, 'opencode')
+    await writeFile(filePath, '#!/bin/sh\n')
+    await chmod(filePath, 0o644)
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error('spawn opencode EACCES'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install spawns the non-executable file
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: filePath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the warning identifies the missing execute permission
+    expect(result.status).toBe('failed')
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({pathDiagnosis: 'path exists but is not executable by the current user'}),
+    )
+  })
+
+  it('diagnoses a real executable file as looking fine', async () => {
+    // #given a real, executable file (the failure must have some other cause)
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    const filePath = join(dir, 'opencode')
+    await writeFile(filePath, '#!/bin/sh\n')
+    await chmod(filePath, 0o755)
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error('spawn opencode EACCES'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install spawns the executable file and still fails
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: filePath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the warning notes the path looks fine, pointing elsewhere for the cause
+    expect(result.status).toBe('failed')
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({pathDiagnosis: 'path exists and is an executable file'}),
+    )
+  })
+
+  it('diagnoses a missing path by listing the parent directory contents', async () => {
+    // #given a parent directory that exists but does not contain the binary
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    await writeFile(join(dir, 'other-tool'), '')
+    const missingPath = join(dir, 'opencode')
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error('spawn opencode ENOENT'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install spawns the missing path
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: missingPath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the warning names the parent directory's actual contents
+    expect(result.status).toBe('failed')
+    const warningCall = vi.mocked(logger.warning).mock.calls[0]
+    const pathDiagnosis = warningCall?.[1]?.pathDiagnosis
+    expect(pathDiagnosis).toContain('path does not exist')
+    expect(pathDiagnosis).toContain('other-tool')
+  })
+
+  it('truncates the parent directory listing beyond ten entries', async () => {
+    // #given a parent directory with more entries than the bounded listing allows
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    await Promise.all(Array.from({length: 12}, async (_unused, index) => writeFile(join(dir, `entry-${index}`), '')))
+    const missingPath = join(dir, 'opencode')
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error('spawn opencode ENOENT'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install spawns the missing path
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: missingPath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the warning caps the listing and notes the truncation
+    expect(result.status).toBe('failed')
+    const warningCall = vi.mocked(logger.warning).mock.calls[0]
+    const pathDiagnosis = warningCall?.[1]?.pathDiagnosis as string
+    expect(pathDiagnosis).toContain('truncated')
+    expect(pathDiagnosis).toContain('12 total')
+  })
+
+  it('reports the parent directory as missing too when neither exists', async () => {
+    // #given a path whose parent directory also does not exist
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    const missingPath = join(dir, 'ghost-parent', 'opencode')
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error('spawn opencode ENOENT'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install spawns the doubly-missing path
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: missingPath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the warning says the parent directory does not exist either
+    expect(result.status).toBe('failed')
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({pathDiagnosis: expect.stringContaining('does not exist either') as string}),
+    )
+  })
+
+  it('does not add a pathDiagnosis field for a non-spawn error', async () => {
+    // #given a rejection that is not a spawn/path failure
+    const logger = createLogger()
+    const execWithTimeout = vi.fn<NonNullable<ExecAdapter['execWithTimeout']>>().mockRejectedValue(new Error('boom'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install fails for an unrelated reason
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: '/cached/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the enrichment stays scoped to spawn/path failures
+    expect(result.status).toBe('failed')
+    const warningCall = vi.mocked(logger.warning).mock.calls[0]
+    expect(warningCall?.[1]).not.toHaveProperty('pathDiagnosis')
   })
 
   it('includes only the bounded stderr tail when the install exits unsuccessfully', async () => {
