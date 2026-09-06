@@ -467,6 +467,12 @@ describe('setup', () => {
       // what RFC-011 documents. It is deliberately not the executable — consumers add it to PATH.
       expect(core.setOutput).toHaveBeenCalledWith('opencode-path', '/cached/opencode/1.0.300')
       expect(core.setOutput).toHaveBeenCalledWith('auth-json-path', expect.stringContaining('auth.json'))
+
+      // #and the setup action does not export OPENCODE_PATH. RFC-012 says so, and that claim is
+      // load-bearing: the variable is read back as an executable by verifyOpenCodeAvailable and by
+      // @fro.bot/harness's resolveBinary(), while this action's own value here is the directory.
+      // Exporting it would put a directory somewhere three consumers spawn.
+      expect(core.exportVariable).not.toHaveBeenCalledWith('OPENCODE_PATH', expect.anything())
     })
 
     it('calls setFailed on unrecoverable error', async () => {
