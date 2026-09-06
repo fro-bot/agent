@@ -1,5 +1,8 @@
 import type {Buffer} from 'node:buffer'
 import type {ExecAdapter, Logger} from './types.js'
+import {constants} from 'node:fs'
+import {access, readdir, stat} from 'node:fs/promises'
+import {dirname} from 'node:path'
 import process from 'node:process'
 import {filterAgentEnv} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
@@ -25,6 +28,53 @@ export interface SystematicPluginInstallResult {
 }
 
 const emptyConfig = JSON.stringify({plugin: []})
+const MAX_LISTED_ENTRIES = 10
+
+// Matched on the error message, not a type assertion on the caught value -- spawn failures
+// from both @actions/exec and a plain Node ENOENT/EACCES rejection carry the code in the
+// message text (e.g. "spawn opencode ENOENT").
+function isSpawnPathError(message: string): boolean {
+  return message.includes('ENOENT') || message.includes('EACCES')
+}
+
+// Runs inside a catch block for a spawn failure -- must never throw. Every filesystem call is
+// wrapped so a diagnosis failure degrades to a short fallback string instead of masking the
+// original error.
+export async function diagnoseBinaryPath(binaryPath: string): Promise<string> {
+  try {
+    let stats
+    try {
+      stats = await stat(binaryPath)
+    } catch {
+      stats = null
+    }
+
+    if (stats === null) {
+      const parentDir = dirname(binaryPath)
+      try {
+        const entries = await readdir(parentDir)
+        const shown = entries.slice(0, MAX_LISTED_ENTRIES)
+        const truncated = entries.length > MAX_LISTED_ENTRIES ? ` (truncated, ${entries.length} total)` : ''
+        return `path does not exist; parent directory ${parentDir} contains: ${shown.join(', ')}${truncated}`
+      } catch {
+        return `path does not exist; parent directory ${parentDir} does not exist either`
+      }
+    }
+
+    if (stats.isDirectory()) {
+      return 'resolved path is a directory, not an executable'
+    }
+
+    try {
+      await access(binaryPath, constants.X_OK)
+      return 'path exists and is an executable file'
+    } catch {
+      return 'path exists but is not executable by the current user'
+    }
+  } catch {
+    return 'diagnosis unavailable'
+  }
+}
 
 export async function installSystematicPlugin(
   options: SystematicPluginInstallOptions,
@@ -89,10 +139,13 @@ export async function installSystematicPlugin(
     return {status: 'failed', duration}
   } catch (error) {
     const duration = Date.now() - startTime
+    const message = toErrorMessage(error)
+    const pathDiagnosis = isSpawnPathError(message) ? await diagnoseBinaryPath(opencodeBinaryPath) : undefined
     logger.warning('Systematic plugin install failed', {
       systematicVersion,
-      error: toErrorMessage(error),
+      error: message,
       duration,
+      ...(pathDiagnosis === undefined ? {} : {pathDiagnosis}),
     })
     return {status: 'failed', duration}
   } finally {
