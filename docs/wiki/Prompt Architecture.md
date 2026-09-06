@@ -1,9 +1,10 @@
 ---
 type: subsystem
-last-updated: "2026-08-30"
-updated-by: "schedule-d7190410-33338713321"
+last-updated: "2026-09-07"
+updated-by: "schedule-d7190410-34062354146"
 sources:
   - packages/runtime/src/agent/prompt.ts
+  - packages/runtime/src/agent/response-file.ts
   - packages/runtime/src/agent/prompt-thread.ts
   - src/features/agent/prompt-sender.ts
   - packages/runtime/src/agent/output-mode.ts
@@ -94,6 +95,18 @@ How the agent is told to deliver its answer is decided in bootstrap by `resolveR
 - **`none`** — used when the `response-mode: none` input suppresses all GitHub writes. The agent is told the run log itself is the response surface and to post nothing.
 
 Keeping this branch in the prompt builder (rather than in a separate agent instruction file) means the response protocol the model sees always matches what the harness will actually do with its output, so the two can never drift.
+
+## Response Surfaces
+
+Delivery mode answers "how does the answer get posted." A second, orthogonal axis answers "what kind of artifact is this run allowed to produce," and it is carried by `ResponseSurface` (`packages/runtime/src/agent/response-file.ts`). Four surfaces exist: `issue-comment`, `pr-comment`, `pr-review`, and `pr-review-permitted`.
+
+The interesting one is `pr-review-permitted`, which exists because an authorized `@fro-bot` mention on a pull request does not fit either of the two states that preceded it. A `pr-review` run must produce a verdict — that is what the trigger asked for. A `pr-comment` run must not. A mention on a PR is legitimately either: the human may be asking for a review, or may be asking a question that deserves a prose answer. The two-state surface forced a choice between rejecting every mention verdict and demanding one from every PR mention. On the permitted surface a verdict is accepted and submits a real review through the existing fork and head-SHA guards, and its absence is equally valid and posts a comment.
+
+Surface is derived once at the trusted boundary and threaded into prompt building as a required field, so no caller can re-derive it differently. That matters because the surface is what makes the response protocol section coherent: an earlier version instructed every file-convention run to emit a verdict regardless of surface, which meant an issue-surface run was explicitly told to do the one thing its own validator would reject.
+
+The policy for each surface lives in one total table (`RESPONSE_SURFACE_POLICIES`), giving each surface a `target`, and three independent booleans: `verdictRequired`, `verdictPermitted`, and `reviewCapable`. The table is pinned with `satisfies Record<ResponseSurface, ResponseSurfacePolicy>` because widening the union alone does not make the type checker enumerate its consumers — before the table, each consumer branched with equality checks, so a newly added surface would compile cleanly and silently fall through to comment delivery. This is the same exhaustiveness discipline described in [[Conventions and Patterns]].
+
+Mismatches degrade asymmetrically, in the direction that preserves work. A verdict arriving on a comment surface drops the frontmatter and posts the prose with a warning rather than discarding the turn; a missing verdict where one is genuinely required still fails closed.
 
 ## Prompt Sender
 

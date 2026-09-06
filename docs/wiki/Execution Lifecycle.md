@@ -1,8 +1,11 @@
 ---
 type: architecture
-last-updated: "2026-09-04"
-updated-by: "pr-1536"
+last-updated: "2026-09-07"
+updated-by: "schedule-d7190410-34062354146"
 sources:
+  - src/harness/config/state-keys.ts
+  - src/shared/cache-save-result.ts
+  - src/features/observability/job-summary.ts
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
   - src/harness/phases/routing.ts
@@ -169,7 +172,17 @@ The cleanup phase has its own `finally` block for lock release: if a coordinatio
 
 ## Post-Action Hook
 
-`post.ts` runs after the main step completes — even if the main step was cancelled or failed. It exists because GitHub Actions may kill the main step's `finally` block after a brief grace period, which could interrupt the cache save. The post-action hook provides a second, durable opportunity to persist state. It reads flags from action state to determine whether the main step already saved successfully, avoiding redundant work.
+`post.ts` runs after the main step completes — even if the main step was cancelled or failed. It exists because GitHub Actions may kill the main step's `finally` block after a brief grace period, which could interrupt the cache save. The post-action hook provides a second, durable opportunity to persist state. It reads state written by cleanup to decide what still needs doing.
+
+### The Cleanup-to-Post Handoff
+
+Two state keys cross the process boundary between the main step and the post hook (`src/harness/config/state-keys.ts`), and they answer different questions.
+
+`CACHE_SAVED` carries a four-value enum rather than a boolean — `durable`, `store-only`, `skipped`, or `not-persisted` — derived from cleanup's `CacheSaveResult` (see [[Session Persistence]]). The boolean it replaced conflated a store-only save with total failure, so the post hook re-ran a save whose object-store upload had already landed, uploading the same content twice. The enum lets the hook gate on durability actually achieved rather than on cache-write success alone. `durable` and `store-only` skip; `skipped` skips because the operator opted out. Everything else retries — including a state value that is absent or unrecognized, which is deliberately mapped to `not-persisted` on the reasoning that the post hook is the last chance to persist and a garbled value must fail toward doing the work.
+
+`skipped-empty` is worth calling out as the case that does _not_ fold into `skipped`. "No cacheable content existed" is a point-in-time filesystem observation, not a configuration constant, so the post hook retries it: the retry re-runs the SQLite checkpoint before re-checking for content, a small cost weighed against losing a session.
+
+`CLEANUP_METADATA_WRITTEN` answers a question `CACHE_SAVED` structurally cannot. Cleanup uploads a rich run-metadata payload — token usage, timing, session IDs, PRs and commits, errors — to the object store, and the post hook has only a thin `cleanupSkipped: true` placeholder to write. But `run.ts` seeds `CACHE_SAVED` with `not-persisted` before cleanup ever executes, so that value is equally consistent with "cleanup ran and its cache write was denied" and "cleanup never ran at all." Using it to gate the metadata write meant the placeholder could clobber the real payload. The dedicated key is set unconditionally by cleanup, independent of the cache outcome, and the post hook writes its placeholder only when the key is absent.
 
 ## Event Types
 
