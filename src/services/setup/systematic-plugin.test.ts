@@ -29,7 +29,7 @@ describe('installSystematicPlugin', () => {
     const result = await installSystematicPlugin({
       logger,
       execAdapter: createExecAdapter(exec),
-      opencodePath: '/cached/opencode',
+      opencodeBinaryPath: '/cached/opencode',
       systematicVersion: '2.1.0',
       timeoutMs: 100,
     })
@@ -68,7 +68,7 @@ describe('installSystematicPlugin', () => {
       await installSystematicPlugin({
         logger,
         execAdapter: createExecAdapter(exec),
-        opencodePath: '/cached/opencode',
+        opencodeBinaryPath: '/cached/opencode',
         systematicVersion: '2.1.0',
         timeoutMs: 100,
       })
@@ -99,7 +99,7 @@ describe('installSystematicPlugin', () => {
     const result = await installSystematicPlugin({
       logger,
       execAdapter: createExecAdapter(exec),
-      opencodePath: '/cached/opencode',
+      opencodeBinaryPath: '/cached/opencode',
       systematicVersion: '2.1.0',
       timeoutMs: 1,
     })
@@ -123,7 +123,7 @@ describe('installSystematicPlugin', () => {
     const result = await installSystematicPlugin({
       logger,
       execAdapter,
-      opencodePath: '/cached/opencode',
+      opencodeBinaryPath: '/cached/opencode',
       systematicVersion: '2.1.0',
       timeoutMs: 1,
     })
@@ -148,7 +148,7 @@ describe('installSystematicPlugin', () => {
     const result = await installSystematicPlugin({
       logger,
       execAdapter: createExecAdapter(exec),
-      opencodePath: '/cached/opencode',
+      opencodeBinaryPath: '/cached/opencode',
       systematicVersion: '2.1.0',
       timeoutMs: 100,
     })
@@ -173,7 +173,7 @@ describe('installSystematicPlugin', () => {
     const result = await installSystematicPlugin({
       logger,
       execAdapter,
-      opencodePath: '/missing/opencode',
+      opencodeBinaryPath: '/missing/opencode',
       systematicVersion: '2.1.0',
       timeoutMs: 100,
     })
@@ -203,7 +203,7 @@ describe('installSystematicPlugin', () => {
     const result = await installSystematicPlugin({
       logger,
       execAdapter,
-      opencodePath: '/cached/opencode',
+      opencodeBinaryPath: '/cached/opencode',
       systematicVersion: '2.1.0',
       timeoutMs: 100,
     })

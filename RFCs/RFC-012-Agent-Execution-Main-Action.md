@@ -1139,7 +1139,7 @@ Real-time streaming is a UX improvement, not a functional requirement. The actio
 | GITHUB_REF        | GitHub Actions | Branch/ref context              |
 | GITHUB_ACTOR      | GitHub Actions | Triggering user                 |
 | GITHUB_RUN_ID     | GitHub Actions | Run identification              |
-| OPENCODE_PATH     | Setup Action   | Path to OpenCode binary         |
+| OPENCODE_PATH     | Caller / main action | Optional override naming the OpenCode executable. The setup action does not export it — it puts the install directory on `PATH` instead. The main action's in-process auto-setup sets it for its own children. |
 | BOT_LOGIN         | Setup Action   | Authenticated bot username      |
 | GH_TOKEN          | Setup Action   | GitHub CLI authentication token |
 
