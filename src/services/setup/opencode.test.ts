@@ -122,18 +122,6 @@ describe('opencode', () => {
       expect(binary).toBe(path.join(installDir, 'opencode'))
       expect(binary).not.toBe(installDir)
     })
-
-    it('carries the .exe extension on Windows', () => {
-      // #given a win32 host — getPlatformInfo still maps win32 and builds windows archive URLs
-      Object.defineProperty(process, 'platform', {value: 'win32'})
-
-      // #when the executable is resolved
-      const binary = opencodeBinaryPath('/hostedtoolcache/opencode/1.18.29/x64')
-
-      // #then the extension is included — this helper is the single place that knows the layout,
-      // so encoding only the POSIX name would hand the next caller a path that does not exist
-      expect(binary.endsWith('opencode.exe')).toBe(true)
-    })
   })
 
   describe('getPlatformInfo', () => {
@@ -165,31 +153,32 @@ describe('opencode', () => {
       expect(info.ext).toBe('.zip')
     })
 
-    it('returns correct info for Windows x64', () => {
-      // #given
+    it('rejects Windows by name rather than 404ing three layers down', () => {
+      // #given a win32 host
       Object.defineProperty(process, 'platform', {value: 'win32'})
       Object.defineProperty(process, 'arch', {value: 'x64'})
 
-      // #when
-      const info = getPlatformInfo()
-
-      // #then
-      expect(info.os).toBe('windows')
-      expect(info.arch).toBe('x64')
-      expect(info.ext).toBe('.zip')
+      // #then the platform is named as the problem here, not surfaced later as a download failure
+      // for an asset the harness never publishes
+      expect(() => getPlatformInfo()).toThrow(/Unsupported platform: win32\/x64/)
     })
 
-    it('defaults to linux x64 for unknown platform', () => {
+    it('rejects any other unsupported platform', () => {
       // #given
       Object.defineProperty(process, 'platform', {value: 'freebsd'})
       Object.defineProperty(process, 'arch', {value: 'mips'})
 
-      // #when
-      const info = getPlatformInfo()
+      // #then — previously this silently became linux/x64 and downloaded a binary that could not run
+      expect(() => getPlatformInfo()).toThrow(/Unsupported platform: freebsd\/mips/)
+    })
 
-      // #then
-      expect(info.os).toBe('linux')
-      expect(info.arch).toBe('x64')
+    it('still defaults an unknown arch on a supported platform', () => {
+      // #given a supported OS with an arch outside the map
+      Object.defineProperty(process, 'platform', {value: 'linux'})
+      Object.defineProperty(process, 'arch', {value: 'mips'})
+
+      // #then the arch default is unchanged — only the OS gate is new
+      expect(getPlatformInfo()).toEqual({os: 'linux', arch: 'x64', ext: '.tar.gz'})
     })
   })
 
@@ -214,17 +203,6 @@ describe('opencode', () => {
 
       // #then
       expect(url).toBe('https://github.com/anomalyco/opencode/releases/download/v1.1.0/opencode-darwin-arm64.zip')
-    })
-
-    it('builds correct URL for Windows', () => {
-      // #given
-      const info: PlatformInfo = {os: 'windows', arch: 'x64', ext: '.zip'}
-
-      // #when
-      const url = buildDownloadUrl('1.1.1', info)
-
-      // #then
-      expect(url).toBe('https://github.com/anomalyco/opencode/releases/download/v1.1.1/opencode-windows-x64.zip')
     })
 
     it('handles version with v prefix', () => {
@@ -520,16 +498,20 @@ describe('opencode', () => {
       expect(mockToolCache.cacheDir).toHaveBeenCalled()
     })
 
-    it('uses extractZip for Windows', async () => {
+    it('uses extractZip for macOS', async () => {
       // #given
-      Object.defineProperty(process, 'platform', {value: 'win32'})
+      Object.defineProperty(process, 'platform', {value: 'darwin'})
       Object.defineProperty(process, 'arch', {value: 'x64'})
 
       const mockToolCache = createMockToolCache({
         find: vi.fn().mockReturnValue(''),
         extractZip: vi.fn().mockResolvedValue('/tmp/extracted'),
       })
-      const mockExec = createMockExecAdapter()
+      // `file` must report a zip: validateDownload no longer has a platform escape hatch, so a
+      // .zip archive is magic-byte checked on every supported platform
+      const mockExec = createMockExecAdapter({
+        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'Zip archive data', stderr: ''}),
+      })
 
       // #when
       await installOpenCode('1.0.0', mockLogger, mockToolCache, mockExec)

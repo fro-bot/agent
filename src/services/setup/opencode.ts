@@ -4,7 +4,6 @@ import {createHash} from 'node:crypto'
 import {createReadStream, readFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import process from 'node:process'
 
 import {toErrorMessage} from '../../shared/errors.js'
 
@@ -26,13 +25,11 @@ export const FALLBACK_VERSION = '1.18.29'
  * and what `core.addPath` expects. Spawning it directly fails with EACCES. Callers that need an
  * executable must go through here rather than passing the directory to a child process.
  *
- * This is the single place that knows the on-disk layout, so it carries the Windows extension
- * too — `getPlatformInfo` still maps `win32`, and a helper that encoded only the POSIX half
- * would quietly hand the next caller a path that does not exist.
+ * No Windows extension: `getPlatformInfo` rejects `win32` before any install runs, matching
+ * `@fro.bot/harness`'s own supported matrix.
  */
 export function opencodeBinaryPath(installDir: string): string {
-  const basename = os.platform() === 'win32' ? `${TOOL_NAME}.exe` : TOOL_NAME
-  return path.join(installDir, basename)
+  return path.join(installDir, TOOL_NAME)
 }
 
 /**
@@ -92,10 +89,15 @@ export function getPlatformInfo(): PlatformInfo {
   const platform = os.platform()
   const arch = os.arch()
 
-  const osMap: Partial<Record<NodeJS.Platform, string>> = {
-    darwin: 'darwin',
-    linux: 'linux',
-    win32: 'windows',
+  // Fail here rather than three layers down. The harness publishes linux/darwin only
+  // (`packages/harness/src/platform.ts`), and the default OpenCode version is a harness build, so
+  // on Windows `buildDownloadUrl` would name an asset that is never published and the harness
+  // branch of `installOpenCode` deliberately refuses the stock fallback — surfacing as a download
+  // 404 with no indication that the platform was the problem.
+  if (platform !== 'darwin' && platform !== 'linux') {
+    throw new Error(
+      `Unsupported platform: ${platform}/${arch}. This action supports linux/darwin × x64/arm64 only (no windows).`,
+    )
   }
 
   const archMap: Partial<Record<NodeJS.Architecture, string>> = {
@@ -103,11 +105,11 @@ export function getPlatformInfo(): PlatformInfo {
     arm64: 'arm64',
   }
 
-  // macOS and Windows use .zip, Linux uses .tar.gz
-  const ext = platform === 'win32' || platform === 'darwin' ? '.zip' : '.tar.gz'
+  // macOS uses .zip, Linux uses .tar.gz
+  const ext = platform === 'darwin' ? '.zip' : '.tar.gz'
 
   return {
-    os: osMap[platform] ?? 'linux',
+    os: platform,
     arch: archMap[arch] ?? 'x64',
     ext,
   }
@@ -269,11 +271,6 @@ async function validateDownload(
   logger: Logger,
   execAdapter: ExecAdapter,
 ): Promise<boolean> {
-  // Skip validation on Windows - trust HTTP response
-  if (process.platform === 'win32') {
-    return true
-  }
-
   try {
     const {stdout} = await execAdapter.getExecOutput('file', [downloadPath], {silent: true})
 
