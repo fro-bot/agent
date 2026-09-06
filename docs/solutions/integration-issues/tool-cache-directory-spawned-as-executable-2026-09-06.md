@@ -88,8 +88,8 @@ One value was serving two distinct roles under one name. `tc.cacheDir` / `tc.fin
 
 The second manifestation shows why this class of bug hides. `ensureOpenCodeAvailable` assigned the directory to `process.env.OPENCODE_PATH`, which is read back as an executable in three places:
 
-- its own `verifyOpenCodeAvailable` call eleven lines earlier (`src/services/setup/runtime-setup-adapter.ts:10` spawns it with `--version`)
-- `@fro.bot/harness`'s `resolveBinary()` (`packages/harness/src/resolve-binary.ts:118-120`), whose result the wrapper CLI execs — and which the package documents as *"an explicit binary path"*, a published npm contract
+- its own `verifyOpenCodeAvailable` call eleven lines earlier — `src/services/setup/runtime-setup-adapter.ts:13` spawns it with `--version`
+- `@fro.bot/harness`'s `resolveBinary()`, which returns the override verbatim as `path` (`packages/harness/src/resolve-binary.ts:118-120`) for the wrapper CLI to exec — and which the package's own remediation text calls *"an explicit binary path"* (`resolve-binary.ts:143`), a published npm contract
 - every scrubbed child process, since `filterAgentEnv`'s `ALLOW_PREFIXES` includes `OPENCODE_` (`packages/runtime/src/agent/filter-env.ts:61`)
 
 That produced no CI symptom for one reason: the tool-cache install unpacks the harness release tarball, which carries the binary at archive root, straight onto `PATH`. The real binary never reads `OPENCODE_PATH`. Only the npm wrapper does — so the failure was reserved for mise installs, local runs, and the gateway workspace container.
@@ -130,4 +130,12 @@ Reintroducing either defect fails these; a path-string assertion passes.
 - [`../performance-issues/tool-binary-caching-ephemeral-runners.md`](../performance-issues/tool-binary-caching-ephemeral-runners.md) — the tools-cache design whose save step was being skipped.
 - [`../best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md`](../best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md) — the config-declared plugin provisioning pattern this install path implements.
 - PRs #1561 (introduced), #1563 (resolver), #1565 (`OPENCODE_PATH` split, naming, tests).
-- Released state: broken in `v0.109.1` only (02:40:25 → 03:24:53 UTC), fixed in `v0.109.2`, fully split in `v0.109.3`. Verified from the tagged bundles: `v0.109.0` emitted ``opencodePath:`opencode` ``, `v0.109.1` `opencodePath:b.path`, `v0.109.2` `opencodePath:ao(b.path)`.
+
+The release record below is the one claim here that cannot be re-derived from the working tree — it was read out of the committed `dist/` bundle at each tag, so reproducing it means checking out the tag. Broken in `v0.109.1` only (02:40:25 → 03:24:53 UTC), fixed in `v0.109.2`, fully split in `v0.109.3`:
+
+| Tag | Emitted install call | State |
+| --- | --- | --- |
+| `v0.109.0` | ``opencodePath:`opencode` `` | bare command name, resolved via `PATH` — worked |
+| `v0.109.1` | `opencodePath:b.path` | the directory — broken |
+| `v0.109.2` | `opencodePath:ao(b.path)` | resolver |
+| `v0.109.3` | `opencodeBinaryPath:ao(b.path)` plus `env.OPENCODE_PATH=s.opencodeBinaryPath` | both halves split |
