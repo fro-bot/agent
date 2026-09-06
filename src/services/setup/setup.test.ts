@@ -1018,10 +1018,11 @@ describe('setup', () => {
         await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then OpenCode performs the plugin install before the tools cache is saved, using the
-        // resolved binary path (not the bare 'opencode' command name)
+        // resolved binary path (not the bare 'opencode' command name, and not the install
+        // directory — spawning that fails EACCES)
         expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
           expect.objectContaining({
-            opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64',
+            opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64/opencode',
             systematicVersion: '2.1.0',
           }),
         )
@@ -1089,9 +1090,26 @@ describe('setup', () => {
         expect(result).not.toBeNull()
         expect(core.addPath).toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/1.0.300/x64')
         expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
-          expect.objectContaining({opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64'}),
+          expect.objectContaining({opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64/opencode'}),
         )
         expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
+      })
+
+      it('hands the plugin installer an executable, never the directory it puts on PATH', async () => {
+        // #given a normal install — `OpenCodeInstallResult.path` is the tool-cache DIRECTORY
+
+        // #when setup runs
+        await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then the two consumers of that directory must not receive the same string: core.addPath
+        // takes the directory, while the install child is spawned directly and must get the binary
+        // inside it. Collapsing these spawns a directory and fails EACCES in milliseconds, which
+        // is fail-soft — the tools cache save is skipped and never warms again.
+        const addedPath = vi.mocked(core.addPath).mock.calls.at(0)?.[0]
+        const installArgs = vi.mocked(systematicPlugin.installSystematicPlugin).mock.calls.at(0)?.[0]
+        expect(addedPath).toBe('/opt/hostedtoolcache/opencode/1.0.300/x64')
+        expect(installArgs?.opencodePath).not.toBe(addedPath)
+        expect(installArgs?.opencodePath).toBe(`${addedPath}/opencode`)
       })
 
       it('still installs and saves on a tools cache miss when the tool cache already holds the binary', async () => {
@@ -1108,7 +1126,7 @@ describe('setup', () => {
         // would skip both here and leave the config pointing at a plugin version never installed
         expect(tc.downloadTool).not.toHaveBeenCalled()
         expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
-          expect.objectContaining({opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64'}),
+          expect.objectContaining({opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64/opencode'}),
         )
         expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
         expect(result?.toolsCacheStatus).toBe('miss')
