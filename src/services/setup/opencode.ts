@@ -89,20 +89,16 @@ export function getPlatformInfo(): PlatformInfo {
   const platform = os.platform()
   const arch = os.arch()
 
-  // Fail here rather than three layers down. The harness publishes linux/darwin only
-  // (`packages/harness/src/platform.ts`), and the default OpenCode version is a harness build, so
-  // on Windows `buildDownloadUrl` would name an asset that is never published and the harness
-  // branch of `installOpenCode` deliberately refuses the stock fallback — surfacing as a download
-  // 404 with no indication that the platform was the problem.
-  if (platform !== 'darwin' && platform !== 'linux') {
+  // Fail here rather than three layers down, and gate both halves — the message promises both.
+  // The harness publishes linux/darwin × x64/arm64 only (`packages/harness/src/platform.ts`), and
+  // the default OpenCode version is a harness build, so an unsupported platform would otherwise
+  // name an asset that is never published, and an unsupported arch would silently resolve to the
+  // x64 asset and download a binary that cannot execute. Both surfaced with no indication that
+  // the platform was the problem.
+  if ((platform !== 'darwin' && platform !== 'linux') || (arch !== 'x64' && arch !== 'arm64')) {
     throw new Error(
       `Unsupported platform: ${platform}/${arch}. This action supports linux/darwin × x64/arm64 only (no windows).`,
     )
-  }
-
-  const archMap: Partial<Record<NodeJS.Architecture, string>> = {
-    x64: 'x64',
-    arm64: 'arm64',
   }
 
   // macOS uses .zip, Linux uses .tar.gz
@@ -110,7 +106,7 @@ export function getPlatformInfo(): PlatformInfo {
 
   return {
     os: platform,
-    arch: archMap[arch] ?? 'x64',
+    arch,
     ext,
   }
 }

@@ -39,7 +39,7 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 ## PATTERNS
 
 - **Tool Cache**: `tc.downloadTool` → `tc.extract` → `tc.cacheDir`.
-- **Platform Map**: `getPlatformInfo()` maps OS/Arch to release assets.
+- **Platform Gate**: `getPlatformInfo()` maps OS/Arch to release assets, and rejects anything outside linux/darwin × x64/arm64 by name. It is the first thing `installOpenCode` calls, before the tool-cache lookup and outside the stock-fallback `try`, so an unsupported platform fails as itself rather than as a download 404 or a binary that cannot execute.
 - **Graceful Fail**: Optional components (oMo, Bun) warn on error, don't crash.
 - **Dynamic Version**: Resolves 'latest' via GitHub Releases API.
 - **Verification**: Validates binaries (`--version`) BEFORE caching.

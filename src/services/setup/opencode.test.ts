@@ -172,13 +172,14 @@ describe('opencode', () => {
       expect(() => getPlatformInfo()).toThrow(/Unsupported platform: freebsd\/mips/)
     })
 
-    it('still defaults an unknown arch on a supported platform', () => {
-      // #given a supported OS with an arch outside the map
+    it('rejects an unsupported arch on a supported platform', () => {
+      // #given a supported OS with an arch the harness does not publish
       Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'mips'})
+      Object.defineProperty(process, 'arch', {value: 'arm'})
 
-      // #then the arch default is unchanged — only the OS gate is new
-      expect(getPlatformInfo()).toEqual({os: 'linux', arch: 'x64', ext: '.tar.gz'})
+      // #then — this previously resolved to the x64 asset and downloaded a binary that could not
+      // execute. The error message promises x64/arm64, so the code has to enforce it.
+      expect(() => getPlatformInfo()).toThrow(/Unsupported platform: linux\/arm\./)
     })
   })
 
@@ -496,6 +497,41 @@ describe('opencode', () => {
       expect(mockToolCache.downloadTool).toHaveBeenCalled()
       expect(mockToolCache.extractTar).toHaveBeenCalled()
       expect(mockToolCache.cacheDir).toHaveBeenCalled()
+    })
+
+    it('rejects an unsupported platform before touching the cache or the network', async () => {
+      // #given a win32 host
+      Object.defineProperty(process, 'platform', {value: 'win32'})
+      Object.defineProperty(process, 'arch', {value: 'x64'})
+      const mockToolCache = createMockToolCache({find: vi.fn().mockReturnValue('')})
+      const mockExec = createMockExecAdapter()
+
+      // #when/#then the rejection propagates rather than being swallowed. Placement is the whole
+      // mechanism: the gate runs before the tool-cache lookup and OUTSIDE the stock-fallback
+      // `try`, so moving the call inside it would silently turn a hard platform failure back into
+      // a fallback download attempt with every other test still green.
+      await expect(installOpenCode('1.0.0', mockLogger, mockToolCache, mockExec)).rejects.toThrow(
+        /Unsupported platform: win32\/x64/,
+      )
+      expect(mockToolCache.find).not.toHaveBeenCalled()
+      expect(mockToolCache.downloadTool).not.toHaveBeenCalled()
+    })
+
+    it('fails the install when the downloaded archive is not the expected type', async () => {
+      // #given a darwin host and a `file` that reports something other than a zip — reachable now
+      // that validateDownload has no platform escape hatch
+      Object.defineProperty(process, 'platform', {value: 'darwin'})
+      Object.defineProperty(process, 'arch', {value: 'arm64'})
+      const mockToolCache = createMockToolCache({find: vi.fn().mockReturnValue('')})
+      const mockExec = createMockExecAdapter({
+        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'HTML document text', stderr: ''}),
+      })
+
+      // #when/#then the magic-byte check rejects instead of caching a bad artifact
+      await expect(installOpenCode('1.0.0', mockLogger, mockToolCache, mockExec)).rejects.toThrow(
+        /Downloaded archive appears corrupted/,
+      )
+      expect(mockToolCache.cacheDir).not.toHaveBeenCalled()
     })
 
     it('uses extractZip for macOS', async () => {
