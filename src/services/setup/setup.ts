@@ -368,6 +368,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
 
     const result: SetupResult = {
       opencodePath: opencodeResult.path,
+      opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path),
       opencodeVersion: opencodeResult.version,
       ghAuthenticated: ghResult.authenticated,
       omoStatus,

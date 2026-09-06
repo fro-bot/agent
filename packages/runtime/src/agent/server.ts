@@ -428,8 +428,12 @@ export async function ensureOpenCodeAvailable(
     throw new Error('Auto-setup failed: runSetup returned null')
   }
 
+  // These take different halves of the same install on purpose. `addToPath` wants the directory;
+  // OPENCODE_PATH is read back as an executable — by `verifyOpenCodeAvailable` above, by
+  // @fro.bot/harness's `resolveBinary()`, and by every child that inherits it (filterAgentEnv
+  // allows the OPENCODE_ prefix through). Assigning the directory here made all three exec it.
   setupAdapter.addToPath(setupResult.opencodePath)
-  process.env.OPENCODE_PATH = setupResult.opencodePath
+  process.env.OPENCODE_PATH = setupResult.opencodeBinaryPath
   logger.info('Auto-setup completed', {version: setupResult.opencodeVersion, path: setupResult.opencodePath})
-  return {path: setupResult.opencodePath, version: setupResult.opencodeVersion, didSetup: true}
+  return {path: setupResult.opencodeBinaryPath, version: setupResult.opencodeVersion, didSetup: true}
 }

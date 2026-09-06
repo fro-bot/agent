@@ -4,7 +4,7 @@ import net from 'node:net'
 import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {bootstrapOpenCodeServer, isPortOpen, waitForServerQuiescence} from './server.js'
+import {bootstrapOpenCodeServer, ensureOpenCodeAvailable, isPortOpen, waitForServerQuiescence} from './server.js'
 
 vi.mock('@opencode-ai/sdk', () => ({
   createOpencode: vi.fn(),
@@ -20,6 +20,36 @@ function createMockLogger(): Logger {
 }
 
 const WORKSPACE_PATH = '/workspace/repo'
+
+const INSTALL_DIR = '/opt/hostedtoolcache/opencode/1.18.29-harness.88b6b5fb/x64'
+const INSTALL_BINARY = `${INSTALL_DIR}/opencode`
+
+function createEnsureOptions(logger: Logger) {
+  return {
+    logger,
+    opencodeVersion: '1.18.29+harness.88b6b5fb',
+    githubToken: 'ghs_test',
+    authJson: '{}',
+    enableOmo: false,
+    omoVersion: '4.19.4',
+    systematicVersion: '3.16.3',
+    omoProviders: {
+      claude: 'no',
+      copilot: 'no',
+      gemini: 'no',
+      openai: 'no',
+      opencodeZen: 'no',
+      zaiCodingPlan: 'no',
+      kimiForCoding: 'no',
+    },
+    opencodeConfig: null,
+    systematicConfig: null,
+    enableOmoSlim: false,
+    omoSlimVersion: '1.1.1',
+    omoSlimPreset: 'openai',
+    credential: 'provision',
+  } as const
+}
 
 // Default readiness-probe stand-in: resolves as a healthy server answering the
 // instance-scoped session.list probe bootstrapOpenCodeServer now issues before
@@ -668,6 +698,82 @@ async function listenOnEphemeralPort(): Promise<{server: net.Server; url: string
 async function closeServer(server: net.Server): Promise<void> {
   return new Promise(resolve => server.close(() => resolve()))
 }
+
+describe('ensureOpenCodeAvailable', () => {
+  let envSnapshot: NodeJS.ProcessEnv
+
+  beforeEach(() => {
+    envSnapshot = {...process.env}
+    delete process.env.OPENCODE_PATH
+  })
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in envSnapshot)) delete process.env[key]
+    }
+    for (const [key, value] of Object.entries(envSnapshot)) {
+      process.env[key] = value
+    }
+    vi.clearAllMocks()
+  })
+
+  it('exports OPENCODE_PATH as an executable while PATH gets the directory', async () => {
+    // #given a completed setup, which yields the install directory and the binary inside it
+    const logger = createMockLogger()
+    const addToPath = vi.fn()
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: false, version: null})),
+      runSetup: vi.fn(async () => ({
+        opencodePath: INSTALL_DIR,
+        opencodeBinaryPath: INSTALL_BINARY,
+        opencodeVersion: '1.18.29+harness.88b6b5fb',
+      })),
+      addToPath,
+    }
+
+    // #when setup runs
+    const result = await ensureOpenCodeAvailable(createEnsureOptions(logger), setupAdapter)
+
+    // #then the two consumers get different halves. OPENCODE_PATH is read back as an executable
+    // by verifyOpenCodeAvailable here, by @fro.bot/harness's resolveBinary(), and by every child
+    // that inherits it — assigning the directory made all three exec a directory.
+    expect(addToPath).toHaveBeenCalledWith(INSTALL_DIR)
+    expect(process.env.OPENCODE_PATH).toBe(INSTALL_BINARY)
+    expect(process.env.OPENCODE_PATH).not.toBe(INSTALL_DIR)
+    expect(result.path).toBe(INSTALL_BINARY)
+    expect(result.didSetup).toBe(true)
+  })
+
+  it('round-trips its own OPENCODE_PATH back through the availability check', async () => {
+    // #given a first run that completed setup and exported OPENCODE_PATH
+    const logger = createMockLogger()
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: false, version: null})),
+      runSetup: vi.fn(async () => ({
+        opencodePath: INSTALL_DIR,
+        opencodeBinaryPath: INSTALL_BINARY,
+        opencodeVersion: '1.18.29+harness.88b6b5fb',
+      })),
+      addToPath: vi.fn(),
+    }
+    await ensureOpenCodeAvailable(createEnsureOptions(logger), setupAdapter)
+
+    // #when a second call sees that exported value and the binary now answers --version
+    const secondAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: '1.18.29+harness.88b6b5fb'})),
+      runSetup: vi.fn(async () => null),
+      addToPath: vi.fn(),
+    }
+    const result = await ensureOpenCodeAvailable(createEnsureOptions(logger), secondAdapter)
+
+    // #then the value handed to the check is spawnable, so setup is correctly skipped rather
+    // than re-run against a directory that could never report a version
+    expect(secondAdapter.verifyOpenCodeAvailable).toHaveBeenCalledWith(INSTALL_BINARY, logger)
+    expect(secondAdapter.runSetup).not.toHaveBeenCalled()
+    expect(result.path).toBe(INSTALL_BINARY)
+    expect(result.didSetup).toBe(false)
+  })
+})
 
 describe('waitForServerQuiescence', () => {
   it('resolves quiesced: true almost immediately when nothing is listening on the port', async () => {

@@ -36,7 +36,10 @@ export interface SetupInputs {
  * Setup action result summary
  */
 export interface SetupResult {
+  /** Install DIRECTORY — what `core.addPath` consumes and the `opencode-path` output reports. */
   readonly opencodePath: string
+  /** The executable inside `opencodePath`. Use this for anything that spawns OpenCode. */
+  readonly opencodeBinaryPath: string
   readonly opencodeVersion: string
   readonly ghAuthenticated: boolean
   readonly omoStatus: 'installed' | 'failed' | 'skipped'
