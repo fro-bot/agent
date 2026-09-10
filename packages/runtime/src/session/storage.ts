@@ -11,11 +11,24 @@ export async function listSessionsForProject(
 ): Promise<readonly SessionInfo[]> {
   const response = await client.session.list({query: {directory: workspacePath}})
   if (response.error == null && response.data != null) {
-    if (!Array.isArray(response.data)) return []
+    if (!Array.isArray(response.data)) {
+      // Same silent-exit shape as discovery.ts's listProjectsViaSDK: a successful response with a
+      // structurally unexpected payload must not look identical to "no sessions". Never the
+      // payload itself — its contents aren't known to be safe to emit.
+      // `source` names the calling function. It appears only on warnings whose message text is
+      // shared with another call site (this one and findLatestSession both list sessions and log
+      // the same two messages); warnings with a unique message text deliberately omit it.
+      logger.warning('SDK session list returned a non-array payload', {
+        source: 'listSessionsForProject',
+        type: typeof response.data,
+        constructor: (response.data as object).constructor?.name,
+      })
+      return []
+    }
     return response.data.map(mapSdkSessionToSessionInfo)
   }
 
-  logger.warning('SDK session list failed', {error: String(response.error)})
+  logger.warning('SDK session list failed', {source: 'listSessionsForProject', error: String(response.error)})
   return []
 }
 
@@ -57,6 +70,16 @@ export async function getSessionTodos(
   }
   const response = await sessionClient.todos({path: {id: sessionID}})
   if (response.error == null && response.data != null) {
+    if (!Array.isArray(response.data)) {
+      // Hoisted from mapSdkTodos's own guard: a logger is in scope here, not in storage-mappers.ts
+      // (a pure-mapping module with no I/O concerns), so this is where the structurally-unexpected
+      // case can be made visible instead of looking identical to "no todos".
+      logger.warning('SDK session todos returned a non-array payload', {
+        type: typeof response.data,
+        constructor: response.data.constructor?.name,
+      })
+      return []
+    }
     return mapSdkTodos(response.data)
   }
 
@@ -74,17 +97,26 @@ export async function findLatestSession(
     query: {directory: workspacePath, start: afterTimestamp, roots: true, limit: 10} as Record<string, unknown>,
   })
   if (response.error != null || response.data == null) {
-    logger.warning('SDK session list failed', {error: String(response.error)})
+    logger.warning('SDK session list failed', {source: 'findLatestSession', error: String(response.error)})
     return null
   }
-  if (!Array.isArray(response.data) || response.data.length === 0) {
+  if (!Array.isArray(response.data)) {
+    // A structurally unexpected payload must not collapse into the same `null` as a genuinely
+    // empty result ("no sessions since this timestamp") — that ambiguity is exactly what this
+    // module's logging exists to remove. An empty array, by contrast, is normal operation and
+    // stays quiet below.
+    logger.warning('SDK session list returned a non-array payload', {
+      source: 'findLatestSession',
+      type: typeof response.data,
+      constructor: (response.data as object).constructor?.name,
+    })
+    return null
+  }
+  if (response.data.length === 0) {
     return null
   }
 
   const sessions = response.data.map(mapSdkSessionToSessionInfo)
-  if (sessions.length === 0) {
-    return null
-  }
 
   const latest = sessions.reduce((max, session) => (session.time.created > max.time.created ? session : max))
   return {projectID: latest.projectID, session: latest}
