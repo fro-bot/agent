@@ -51,6 +51,12 @@ function createMockSdkClient(options?: {
   }
 }
 
+// A JSON object can shadow constructor with payload-owned text.
+const CONSTRUCTOR_SENTINEL = 'private transcript sentinel'
+function sentinelPayload(): unknown {
+  return JSON.parse(`{"constructor":{"name":"${CONSTRUCTOR_SENTINEL}"}}`)
+}
+
 describe('listProjectsViaSDK', () => {
   it('maps project list results using the real v1 SDK `Project` shape (no `path`, no `time.updated`)', async () => {
     // #given: typed as `@opencode-ai/sdk`'s v1 `Project` — the type re-exported from the package
@@ -102,8 +108,22 @@ describe('listProjectsViaSDK', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list returned a non-array payload', {
       type: 'object',
-      constructor: 'Object',
     })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({projectListResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list returned a non-array payload', {
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
   })
 
   it('filters malformed project records (missing/non-string id or worktree)', async () => {
@@ -268,8 +288,23 @@ describe('listSessionsForProject', () => {
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
       source: 'listSessionsForProject',
       type: 'object',
-      constructor: 'Object',
     })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({sessionListResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await listSessionsForProject(client as unknown as SessionClient, '/workspace', mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
+      source: 'listSessionsForProject',
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
   })
 })
 
@@ -377,7 +412,6 @@ describe('getSessionMessages', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
       type: 'object',
-      constructor: 'Object',
     })
   })
 
@@ -391,6 +425,64 @@ describe('getSessionMessages', () => {
     // #then: an empty result is normal operation — it must not start emitting warnings
     expect(result).toEqual([])
     expect(mockLogger.warning).not.toHaveBeenCalled()
+  })
+
+  it('returns empty array and warns when the payload is a string', async () => {
+    // #given
+    const client = createMockSdkClient({sessionMessagesResponse: {data: 'not-an-array'}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'string',
+    })
+  })
+
+  it('returns empty array and warns when the payload is a number', async () => {
+    // #given
+    const client = createMockSdkClient({sessionMessagesResponse: {data: 42}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'number',
+    })
+  })
+
+  it('returns empty array and warns when the payload is a null-prototype object', async () => {
+    // #given a non-array object without inherited properties
+    const payload: unknown = Object.create(null) as Record<string, never>
+    const client = createMockSdkClient({sessionMessagesResponse: {data: payload}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'object',
+    })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({sessionMessagesResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
   })
 })
 
@@ -439,8 +531,22 @@ describe('getSessionTodos', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos returned a non-array payload', {
       type: 'object',
-      constructor: 'Object',
     })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({sessionTodosResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await getSessionTodos(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos returned a non-array payload', {
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
   })
 })
 
@@ -481,8 +587,23 @@ describe('findLatestSession', () => {
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
       source: 'findLatestSession',
       type: 'object',
-      constructor: 'Object',
     })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({sessionListResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await findLatestSession(client as unknown as SessionClient, '/workspace', 4000, mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toBeNull()
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
+      source: 'findLatestSession',
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
   })
 
   it('returns null and does NOT warn when the array is genuinely empty', async () => {

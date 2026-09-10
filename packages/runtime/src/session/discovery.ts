@@ -28,13 +28,10 @@ export async function listProjectsViaSDK(
     return []
   }
   if (!Array.isArray(response.data)) {
-    // Same silent-exit shape the rest of this module's logging was added to prevent: the server
-    // responded successfully but with a payload that isn't the array shape we expect. Not the
-    // payload itself — its contents aren't known to be safe to emit — but enough to diagnose that
-    // this branch fired and what kind of value showed up instead.
+    // Successful response, unexpected shape; do not log the payload itself.
+    // Log only intrinsic types; payloads can supply their own constructor.name.
     logger.warning('SDK project list returned a non-array payload', {
       type: typeof response.data,
-      constructor: (response.data as object).constructor?.name,
     })
     return []
   }
