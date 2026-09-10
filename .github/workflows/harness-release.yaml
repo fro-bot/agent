@@ -1158,7 +1158,19 @@ jobs:
       - name: Checkout harness repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          # Deliberately NOT pinned to github.sha, unlike the build/integrate/
+          # publish jobs — those must reproduce the dispatched commit exactly.
+          # This job opens a follow-up PR against main and rebuilds dist/, so it
+          # must track main. A ~40-minute release lets main move underneath a
+          # pinned checkout, and strict status checks make a behind-base PR a
+          # hard merge block. base_version and integration_commit come from
+          # needs.*.outputs, so nothing here reads the dispatch SHA.
+          # Inverted failure mode: this job is continue-on-error, so a broken
+          # main now means the sync PR silently never opens instead of opening
+          # behind-base. Check main's build first when a sync PR is missing.
+          ref: main
           token: ${{ steps.get-app-token.outputs.token }}
+          persist-credentials: false
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
