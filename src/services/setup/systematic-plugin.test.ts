@@ -1,8 +1,8 @@
 import type {ExecAdapter, Logger} from './types.js'
 import {Buffer} from 'node:buffer'
-import {chmod, mkdtemp, rm, symlink, writeFile} from 'node:fs/promises'
+import {chmod, mkdtemp, rm, stat, symlink, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
-import {join} from 'node:path'
+import {dirname, join} from 'node:path'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {installSystematicPlugin} from './systematic-plugin.js'
 
@@ -60,6 +60,71 @@ describe('installSystematicPlugin', () => {
     expect(call?.[2]?.env?.OPENCODE_DISABLE_PROJECT_CONFIG).toBe('1')
     expect(logger.warning).not.toHaveBeenCalled()
     expect(logger.info).toHaveBeenCalledWith('Systematic plugin install complete', expect.any(Object))
+  })
+
+  it('points the install child at an isolated database, not the real session store', async () => {
+    // #given an OpenCode CLI that exits successfully
+    const logger = createLogger()
+    const exec = vi.fn<ExecAdapter['exec']>().mockResolvedValue(0)
+
+    // #when the plugin is installed
+    await installSystematicPlugin({
+      logger,
+      execAdapter: createExecAdapter(exec),
+      opencodeBinaryPath: '/cached/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the child receives an OPENCODE_DB that is not the real session database, so booting
+    // OpenCode for this install can never leave a WAL beside the restored session store
+    const childEnv = exec.mock.calls[0]?.[2]?.env ?? {}
+    const dbPath = childEnv.OPENCODE_DB
+    expect(dbPath).toBeTruthy()
+    expect(dbPath).not.toContain('.local/share/opencode/opencode.db')
+    expect(dbPath?.endsWith('opencode.db')).toBe(true)
+  })
+
+  it('cleans up the temporary database directory after a successful install', async () => {
+    // #given an OpenCode CLI that exits successfully
+    const logger = createLogger()
+    const exec = vi.fn<ExecAdapter['exec']>().mockResolvedValue(0)
+
+    // #when the plugin is installed
+    await installSystematicPlugin({
+      logger,
+      execAdapter: createExecAdapter(exec),
+      opencodeBinaryPath: '/cached/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the isolated database directory no longer exists on disk
+    const dbPath = exec.mock.calls[0]?.[2]?.env?.OPENCODE_DB
+    expect(dbPath).toBeTruthy()
+    const tempDir = dirname(dbPath as string)
+    await expect(stat(tempDir)).rejects.toMatchObject({code: 'ENOENT'})
+  })
+
+  it('cleans up the temporary database directory even when the install fails', async () => {
+    // #given an OpenCode CLI that reports failure
+    const logger = createLogger()
+    const exec = vi.fn<ExecAdapter['exec']>().mockResolvedValue(17)
+
+    // #when the plugin install runs
+    await installSystematicPlugin({
+      logger,
+      execAdapter: createExecAdapter(exec),
+      opencodeBinaryPath: '/cached/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the isolated database directory is still removed
+    const dbPath = exec.mock.calls[0]?.[2]?.env?.OPENCODE_DB
+    expect(dbPath).toBeTruthy()
+    const tempDir = dirname(dbPath as string)
+    await expect(stat(tempDir)).rejects.toMatchObject({code: 'ENOENT'})
   })
 
   it('scrubs secrets from the install child, which runs untrusted npm lifecycle scripts', async () => {
