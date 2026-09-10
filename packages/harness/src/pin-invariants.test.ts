@@ -1,6 +1,11 @@
 import {readFileSync} from 'node:fs'
 import {describe, expect, it} from 'vitest'
 
+// Deep relative import, deliberately not the `@fro-bot/runtime` package specifier: a barrel
+// import through packages/runtime/src/index.ts would pull in zod and @opencode-ai/sdk for two
+// string constants, and runtime's `exports` map has no subpath for shared/constants alone.
+import {DEFAULT_OPENCODE_VERSION, DEFAULT_SYSTEMATIC_VERSION} from '../../runtime/src/shared/constants.js'
+
 interface HarnessConfig {
   readonly source_repo: string
   readonly base_version: string
@@ -20,8 +25,10 @@ interface CloneDepsManifest {
 const config = JSON.parse(readFileSync(new URL('../harness.config.json', import.meta.url), 'utf8')) as HarnessConfig
 const cloneDepsPath = new URL('../../../.slim/clonedeps.json', import.meta.url)
 const renovatePath = new URL('../../../.github/renovate.json5', import.meta.url)
+const architecturePath = new URL('../../../ARCHITECTURE.md', import.meta.url)
 const cloneDeps = JSON.parse(readFileSync(cloneDepsPath, 'utf8')) as CloneDepsManifest
 const renovateText = readFileSync(renovatePath, 'utf8')
+const architectureText = readFileSync(architecturePath, 'utf8')
 
 // ---------------------------------------------------------------------------
 // Version comparison
@@ -177,5 +184,121 @@ describe('compareDottedVersions', () => {
     expect(compareDottedVersions('1.18.30', '1.18.9')).toBeGreaterThan(0)
     expect(compareDottedVersions('1.18.9', '1.18.30')).toBeLessThan(0)
     expect(compareDottedVersions('1.18.30', '1.18.30')).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ARCHITECTURE.md — documented version pins vs packages/runtime/src/shared/constants.ts
+//
+// ARCHITECTURE.md's code-map table documents DEFAULT_SYSTEMATIC_VERSION and
+// DEFAULT_OPENCODE_VERSION as parenthesized, backtick-quoted values in each
+// row's rightmost ("Role") cell. That documentation has already drifted twice
+// within the lifetime of a single PR (#1589) — once because it was already
+// stale when the PR opened, once because a version bump landed on main
+// underneath it — so this binds the doc to the real exported constants
+// instead of trusting someone to keep them in sync by hand.
+//
+// The row pattern anchors on the constant name in the row's *first* cell
+// (`| \`CONSTANT_NAME\` |`), not a bare substring match — the renovate
+// extractor above shows what goes wrong with a looser anchor (it matched a
+// comment elsewhere in the file and was only correct by file-ordering
+// accident). extractDocumentedVersion throws unless exactly one row matches,
+// so both an unanchored regex catching extra rows and a typo'd constant name
+// matching zero rows fail loudly instead of comparing undefined to undefined.
+//
+// The first cell tolerates arbitrary padding (`\s*` on both sides of the
+// name) rather than demanding exactly one space, because column-aligned
+// markdown tables are common and nothing in this repo's lint/fix formats
+// them — a table formatter would otherwise turn a present, correct row into
+// a false "row not found". The value capture is non-greedy up to the first
+// parenthesized backtick group so a Role cell with more than one such group
+// (e.g. a version plus an unrelated aside) extracts the one immediately
+// after the name, not whichever one happens to be last. The capture itself
+// is `[^\`]*` (allows empty), not `[^\`]+`: an empty backtick pair like
+// (``) must reach the "no value" branch below and report that specific
+// diagnosis, rather than the pattern failing to match at all and reporting
+// the misleading "row not found".
+// ---------------------------------------------------------------------------
+
+function extractDocumentedVersion(text: string, constantName: string): string {
+  const rowPattern = new RegExp(String.raw`^\|\s*\`${constantName}\`\s*\|.*?\(\`([^\`]*)\`\)`, 'gm')
+  const matches = [...text.matchAll(rowPattern)]
+
+  if (matches.length !== 1) {
+    throw new Error(`ARCHITECTURE.md: expected exactly one table row for \`${constantName}\`, found ${matches.length}`)
+  }
+
+  // matches.length === 1 above guarantees matches[0] exists; the `?.` here is
+  // only to satisfy noUncheckedIndexedAccess, not a real fallibility branch.
+  const value = matches[0]?.[1] ?? ''
+
+  if (value.length === 0) {
+    throw new Error(`ARCHITECTURE.md: row for \`${constantName}\` has no parenthesized backtick-quoted value`)
+  }
+
+  return value
+}
+
+describe('ARCHITECTURE.md documented version pins match packages/runtime/src/shared/constants.ts', () => {
+  it.each([
+    ['DEFAULT_SYSTEMATIC_VERSION', DEFAULT_SYSTEMATIC_VERSION],
+    ['DEFAULT_OPENCODE_VERSION', DEFAULT_OPENCODE_VERSION],
+  ] as const)('%s documented value matches the exported constant', (constantName, actualValue) => {
+    // #given the ARCHITECTURE.md table row documenting this constant
+    const documentedValue = extractDocumentedVersion(architectureText, constantName)
+
+    // #when / #then the documented value must match the real constant, or CI catches the drift
+    expect(
+      documentedValue,
+      `ARCHITECTURE.md documents ${constantName} as "${documentedValue}" but packages/runtime/src/shared/constants.ts exports "${actualValue}" — update ARCHITECTURE.md to match`,
+    ).toBe(actualValue)
+  })
+
+  it('fails rather than passing vacuously when no row matches the constant name', () => {
+    // #given a constant name with no corresponding ARCHITECTURE.md table row
+    // #when / #then extraction must throw, not silently compare undefined to undefined
+    expect(() => extractDocumentedVersion(architectureText, 'DEFAULT_NONEXISTENT_VERSION')).toThrow(
+      /expected exactly one table row for `DEFAULT_NONEXISTENT_VERSION`, found 0/,
+    )
+  })
+
+  it('throws when the constant name appears in more than one row', () => {
+    // #given two rows both claiming the same constant — the exact shape of the
+    // earlier Renovate two-packageRules near-miss this file's design rationale cites
+    const text = [
+      '| `DEFAULT_OPENCODE_VERSION` | Constant | `a` | Pinned (`1.0.0`) |',
+      '| `DEFAULT_OPENCODE_VERSION` | Constant | `b` | Pinned (`2.0.0`) |',
+    ].join('\n')
+
+    // #when / #then extraction must throw naming both the constant and the count, not pick one silently
+    expect(() => extractDocumentedVersion(text, 'DEFAULT_OPENCODE_VERSION')).toThrow(
+      /expected exactly one table row for `DEFAULT_OPENCODE_VERSION`, found 2/,
+    )
+  })
+
+  it('extracts the value from a column-aligned row with extra padding around the constant name', () => {
+    // #given a row padded for column alignment — the shape a markdown table formatter produces
+    const text = '| `DEFAULT_OPENCODE_VERSION`   | Constant | `x` | Pinned (`1.18.30+harness.7c479429`) |'
+
+    // #when / #then padding around the first-cell name must not defeat the match
+    expect(extractDocumentedVersion(text, 'DEFAULT_OPENCODE_VERSION')).toBe('1.18.30+harness.7c479429')
+  })
+
+  it('extracts the first parenthesized backtick group when the row cell contains two', () => {
+    // #given a Role cell with a version and an unrelated aside, both parenthesized and backtick-quoted
+    const text = '| `DEFAULT_OPENCODE_VERSION` | Constant | `x` | Pinned (`3.16.3`) see also (`note`) |'
+
+    // #when / #then the first group wins, not whichever the greedy match reaches last
+    expect(extractDocumentedVersion(text, 'DEFAULT_OPENCODE_VERSION')).toBe('3.16.3')
+  })
+
+  it('reports a real "no value" diagnosis for an empty parenthesized backtick pair', () => {
+    // #given a row whose Role cell has an empty backtick-quoted parenthetical
+    const text = '| `DEFAULT_OPENCODE_VERSION` | Constant | `x` | Pinned (``) |'
+
+    // #when / #then this must reach the "no value" branch, not the misleading "row not found" branch
+    expect(() => extractDocumentedVersion(text, 'DEFAULT_OPENCODE_VERSION')).toThrow(
+      /row for `DEFAULT_OPENCODE_VERSION` has no parenthesized backtick-quoted value/,
+    )
   })
 })
