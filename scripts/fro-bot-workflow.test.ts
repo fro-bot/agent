@@ -637,4 +637,34 @@ describe('harness integration workflow wiring', () => {
     expect(String(fetch.run)).toContain('refs/harness-integrate/${' + 'BASE_VERSION}')
     expect(String(fetch.run)).toContain('integration_commit=${' + 'INTEGRATION_COMMIT}')
   })
+
+  it('cuts sync-default-version from current main, not the dispatch SHA', () => {
+    // #given the sync-default-version job's checkout step
+    const steps = stepsFor(releasePath, 'sync-default-version')
+    const checkout = steps.find(step => String(step.uses ?? '').startsWith('actions/checkout@'))
+    if (checkout === undefined) throw new TypeError('sync-default-version checkout step is missing')
+    const checkoutWith = checkout.with as Record<string, unknown>
+
+    // #then it must track main, not github.sha, or the sync PR opens behind-base
+    expect(checkoutWith.ref, 'sync-default-version checkout must set ref: main').toBe('main')
+  })
+
+  it('keeps prepare-integrate, build, and publish pinned to the dispatch SHA (no ref override)', () => {
+    // #given the jobs that must reproduce the dispatched commit exactly
+    const pinnedJobs = ['prepare-integrate', 'build', 'publish']
+
+    for (const jobName of pinnedJobs) {
+      const steps = stepsFor(releasePath, jobName)
+      const checkout = steps.find(step => String(step.uses ?? '').startsWith('actions/checkout@'))
+      if (checkout === undefined) throw new TypeError(`${jobName} checkout step is missing`)
+      const checkoutWith = (checkout.with ?? {}) as Record<string, unknown>
+
+      // #then no ref key: these jobs must build/publish the exact dispatched commit,
+      // not whatever main has drifted to. A stray ref: main here would silently
+      // break release reproducibility.
+      expect('ref' in checkoutWith, `${jobName} checkout must not set a ref (would break dispatch-SHA pinning)`).toBe(
+        false,
+      )
+    }
+  })
 })

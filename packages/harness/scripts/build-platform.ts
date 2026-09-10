@@ -309,7 +309,7 @@ export function resolveTargetDirSuffix(abi: 'musl' | null, baseline: boolean): s
 
 /**
  * The exact baseline+abi+return-true block from upstream build.ts (lines 122-133).
- * Verified against anomalyco/opencode v1.17.3's singleFlag filter block.
+ * Verified against anomalyco/opencode v1.18.30's singleFlag filter block.
  * Must be re-diffed if clonedeps is bumped to a new upstream version.
  *
  * @see .slim/clonedeps/repos/anomalyco__opencode/packages/opencode/script/build.ts
