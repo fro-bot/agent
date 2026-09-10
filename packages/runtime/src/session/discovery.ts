@@ -2,6 +2,7 @@ import type {SessionClient} from './backend.js'
 import type {Logger, ProjectInfo} from './types.js'
 import path from 'node:path'
 
+import {toErrorMessage} from '../shared/errors.js'
 import {isRecord, readString} from './storage-mappers.js'
 
 function normalizeWorkspacePath(workspacePath: string): string {
@@ -24,17 +25,14 @@ export async function listProjectsViaSDK(
   // matching against `worktree` results below, not for what the server expects on this query.
   const response = await client.project.list({query: {directory: workspacePath}})
   if (response.error != null || response.data == null) {
-    logger.warning('SDK project list failed', {error: String(response.error)})
+    logger.warning('SDK project list failed', {error: toErrorMessage(response.error)})
     return []
   }
   if (!Array.isArray(response.data)) {
-    // Same silent-exit shape the rest of this module's logging was added to prevent: the server
-    // responded successfully but with a payload that isn't the array shape we expect. Not the
-    // payload itself — its contents aren't known to be safe to emit — but enough to diagnose that
-    // this branch fired and what kind of value showed up instead.
+    // Successful response, unexpected shape; do not log the payload itself.
+    // Log only intrinsic types; payloads can supply their own constructor.name.
     logger.warning('SDK project list returned a non-array payload', {
       type: typeof response.data,
-      constructor: (response.data as object).constructor?.name,
     })
     return []
   }

@@ -31,6 +31,7 @@ import {
   listSessions,
   searchSessions,
 } from '../session/index.js'
+import {toErrorMessage} from '../shared/errors.js'
 
 const UNAVAILABLE_PREFIX = 'session store unavailable'
 
@@ -44,10 +45,6 @@ const silentLogger = {
 
 function unavailable(reason: string): string {
   return `${UNAVAILABLE_PREFIX}: ${reason}`
-}
-
-function toErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
 }
 
 function formatTimestamp(ms: number): string {

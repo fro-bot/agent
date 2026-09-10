@@ -30,6 +30,12 @@ vi.mock('@opencode-ai/sdk', () => ({
 
 const FAKE_BASE_URL = 'http://127.0.0.1:4096'
 
+// A JSON-parsed error whose own `toString` is not callable makes `String(error)` throw instead of
+// coercing -- this must resolve to the fallback message, never reject execute().
+function unprintableError(): unknown {
+  return JSON.parse('{"toString":"x"}')
+}
+
 beforeEach(() => {
   vi.resetAllMocks()
   mockCreateOpencodeClient.mockReturnValue(SENTINEL_CLIENT)
@@ -529,5 +535,47 @@ describe('createSessionTools — info', () => {
 
     // #then
     expect(result).toBe('session store unavailable: network down')
+  })
+})
+
+describe('createSessionTools — unprintable SDK errors never escape execute()', () => {
+  it.each([
+    {
+      name: 'list',
+      setup: () => mockListSessions.mockRejectedValue(unprintableError()),
+      execute: async () => createSessionTools(() => FAKE_BASE_URL).list.execute({}),
+    },
+    {
+      name: 'read (getSessionMessages, transcript)',
+      setup: () => {
+        mockGetSession.mockResolvedValue({
+          id: 'ses_1',
+          version: '1',
+          projectID: 'p1',
+          directory: '/w',
+          title: 'T',
+          time: {created: 1, updated: 2},
+        })
+        mockGetSessionMessages.mockRejectedValue(unprintableError())
+      },
+      execute: async () =>
+        createSessionTools(() => FAKE_BASE_URL).read.execute({session_id: 'ses_1', include_transcript: true}),
+    },
+    {
+      name: 'search',
+      setup: () => mockSearchSessions.mockRejectedValue(unprintableError()),
+      execute: async () => createSessionTools(() => FAKE_BASE_URL).search.execute({query: 'q'}),
+    },
+    {
+      name: 'info',
+      setup: () => mockGetSessionInfo.mockRejectedValue(unprintableError()),
+      execute: async () => createSessionTools(() => FAKE_BASE_URL).info.execute({session_id: 'ses_1'}),
+    },
+  ])('$name resolves to the unprintable fallback instead of rejecting', async ({setup, execute}) => {
+    // #given
+    setup()
+
+    // #when / #then: must resolve, never reject
+    await expect(execute()).resolves.toBe('session store unavailable: [unprintable error]')
   })
 })
