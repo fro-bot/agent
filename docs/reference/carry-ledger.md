@@ -130,6 +130,22 @@ No carry has an in-repo record of the upstream version that would contain it, so
 - **Evidence it is still needed:** Measured 181–370 s stalls on the first instance-scoped request across ~60 headless runs in four repositories (2026-09-04); stock 1.18.30 `packages/core/src/npm.ts` still awaits `reify()` with no bound. The Action defends itself with a setup-time install (`installSystematicPlugin`) and a bounded readiness probe; this carry bounds the server-side install those sit in front of.
 - **Removal condition:** Stock bounds `Npm.reify()` or `plugin.init()` — #47430 or #41936 merges, or an equivalent lands.
 
+### #48267 — OpenAI explicit cache anchor
+
+- **Capability:** Places an explicit prompt cache breakpoint (`promptCacheBreakpoint: { mode: "explicit" }`) on the trailing messages `applyCaching()` already targets, and sets `promptCacheOptions: { mode: "explicit" }` in `options()` so implicit breakpoint selection stops overriding it. Stock applies explicit breakpoints to Anthropic-family models only; everything else runs on implicit prefix caching with no advancing anchor.
+- **Surface:** Both. Any run on an `@ai-sdk/openai` model, plus `@ai-sdk/amazon-bedrock/mantle`, which shares the path because `sdkKey()` maps it onto `openai`.
+- **Upstream status:** Open. Our PR. Absent from stock through 1.18.30.
+- **Evidence it is still needed:** Measured over 10 days: ~32,000 Anthropic-family turns hold 100.0% cache reuse with essentially zero collapse, while `gpt-6-astra` sits at 92.1% with 8.5% of turns collapsed — roughly 39M tokens re-sent — and `gpt-5.6-sol` at 64.9%. The gate at `transform.ts:471-484` admits Anthropic-family models only, so no OpenAI-native model reaches `applyCaching()` at all.
+- **Removal condition:** Stock gives the OpenAI-native path an advancing cache anchor — either by widening the `applyCaching()` gate with an OpenAI-shaped marker, or by emitting `prompt_cache_breakpoint` some other way. Verify that reuse tracks a growing prompt across a compaction rather than pinning at a fixed offset; a `promptCacheKey` alone is not this, and stock already sets one.
+
+### #48268 — dotless GPT major version parsing
+
+- **Capability:** Parses a model's GPT major version without requiring a dotted minor, so `gpt-6-astra` satisfies the version gate in `transform.ts`. Restores `reasoningEffort`, `reasoningSummary`, the encrypted-reasoning include, and `textVerbosity: "low"` for GPT-6 models, and corrects the Azure completion-URL early return for them.
+- **Surface:** Both. Any run on a GPT-6 model.
+- **Upstream status:** Open. Our PR. Absent from stock through 1.18.30.
+- **Evidence it is still needed:** At 1.18.30 two files disagree about the same model: `session/system.ts:36` routes `gpt-6` ids to a dedicated Astra prompt, while `transform.ts:1331` matches `/gpt-(\d+)\.(\d+)/` and cannot parse a dotless id at all. Evaluated against stock across `gpt-6-astra`, `gpt-5.6-luna`, `gpt-5.3-codex-spark`, `gpt-5-pro`, and `gpt-5-chat`, `gpt-6-astra` is the only id that fails both transform gates while being singled out by `system.ts`. The gate's own comment says it exists because versions above 5.4 do not support `reasoningEffort` — a GPT-6 evaluating false defeats that purpose. Fro Bot runs Astra.
+- **Removal condition:** Stock parses a dotless major — the regex gains an optional minor group, or the family gate stops using a substring test. Check the parse itself, not the presence of a `gpt-6` branch elsewhere: `session/system.ts` has had one since 1.18.30 while `transform.ts` still does not.
+
 ## Scope and authority
 
 This ledger is documentation. It is **not** enforcement, and it is explicitly non-authoritative for authentication, delivery, and retry policy. An entry never justifies weakening a guard, and removing a carry still goes through the normal review path. The colocated static test at `packages/harness/src/carry-ledger.test.ts` checks that carry identities match `integrationRefs` in `packages/harness/harness.config.json` in both directions, that `verifiedAgainstBaseVersion` matches `base_version`, and that every entry has non-empty evidence and removal-condition fields. It performs no network checks.

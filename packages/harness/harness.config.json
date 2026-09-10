@@ -15,7 +15,9 @@
     "https://github.com/anomalyco/opencode/pull/33713",
     "https://github.com/anomalyco/opencode/pull/36045",
     "https://github.com/anomalyco/opencode/pull/36361",
-    "https://github.com/anomalyco/opencode/pull/47430"
+    "https://github.com/anomalyco/opencode/pull/47430",
+    "https://github.com/anomalyco/opencode/pull/48267",
+    "https://github.com/anomalyco/opencode/pull/48268"
   ],
   "agent": "build",
   "model": "anthropic/claude-sonnet-5",
