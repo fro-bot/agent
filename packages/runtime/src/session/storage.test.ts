@@ -1,3 +1,5 @@
+import type {Project} from '@opencode-ai/sdk'
+
 import type {SessionClient} from './backend.js'
 import type {Logger} from './types.js'
 
@@ -43,25 +45,27 @@ function createMockSdkClient(options?: {
 }
 
 describe('listProjectsViaSDK', () => {
-  it('maps project list results from SDK', async () => {
-    // #given
-    const client = createMockSdkClient({
-      projectListResponse: {
-        data: [
-          {id: 'proj_1', worktree: '/repo', path: '/repo', extra: 'ignored'},
-          {id: 'proj_2', worktree: '/repo-two', path: '/repo-two'},
-        ],
-      },
-    })
+  it('maps project list results using the real v1 SDK `Project` shape (no `path`, no `time.updated`)', async () => {
+    // #given: typed as `@opencode-ai/sdk`'s v1 `Project` — the type re-exported from the package
+    // root (dist/gen/types.gen.d.ts), which is what backend.ts's `createOpencode` import resolves
+    // to. id, worktree, optional vcs, required `time.created` (no `time.updated` — that's only on
+    // the separate v2 client's type, which nothing in this runtime path imports). Upstream never
+    // sends `path`. Typing the fixtures against the real type means a future SDK shape change
+    // fails typecheck here instead of drifting silently.
+    const projects: Project[] = [
+      {id: 'proj_1', worktree: '/repo', vcs: 'git', time: {created: 1000}},
+      {id: 'proj_2', worktree: '/repo-two', time: {created: 3000}},
+    ]
+    const client = createMockSdkClient({projectListResponse: {data: projects}})
 
     // #when
-    const result = await listProjectsViaSDK(client as unknown as SessionClient, mockLogger)
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
 
-    // #then
-    expect(client.project.list).toHaveBeenCalledWith()
+    // #then: routes to the instance for this workspace, matching listSessionsForProject's pattern
+    expect(client.project.list).toHaveBeenCalledWith({query: {directory: '/repo'}})
     expect(result).toEqual([
-      {id: 'proj_1', worktree: '/repo', path: '/repo', vcs: 'git', time: {created: 0, updated: 0}},
-      {id: 'proj_2', worktree: '/repo-two', path: '/repo-two', vcs: 'git', time: {created: 0, updated: 0}},
+      {id: 'proj_1', worktree: '/repo'},
+      {id: 'proj_2', worktree: '/repo-two'},
     ])
   })
 
@@ -70,50 +74,110 @@ describe('listProjectsViaSDK', () => {
     const client = createMockSdkClient({projectListResponse: {error: 'boom', data: null}})
 
     // #when
-    const result = await listProjectsViaSDK(client as unknown as SessionClient, mockLogger)
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
 
     // #then
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list failed', expect.any(Object))
   })
 
-  it('filters malformed project records', async () => {
+  it('filters malformed project records (missing/non-string id or worktree)', async () => {
     // #given
     const client = createMockSdkClient({
       projectListResponse: {
         data: [
-          {id: 'proj', worktree: '/repo'},
-          {id: 123, worktree: '/repo', path: '/repo'},
+          {worktree: '/repo'}, // missing id
+          {id: 123, worktree: '/repo'}, // id not a string
         ],
       },
     })
 
     // #when
-    const result = await listProjectsViaSDK(client as unknown as SessionClient, mockLogger)
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
 
     // #then
     expect(result).toEqual([])
+  })
+
+  it('retains a project regardless of `time` shape — `time` is not read and must not gate inclusion', async () => {
+    // #given: these payloads intentionally diverge from the real `Project` type (which requires
+    // `time.created`) to prove discovery doesn't gate on `time` at all once `id`/`worktree` are
+    // present — not even to distinguish a genuine `0` from a missing value.
+    const client = createMockSdkClient({
+      projectListResponse: {
+        data: [
+          {id: 'proj_partial', worktree: '/repo-partial', time: {created: 1000}}, // no `updated`
+          {id: 'proj_no_time', worktree: '/repo-no-time'}, // `time` absent entirely
+          {id: 'proj_zero', worktree: '/repo-zero', time: {created: 0, updated: 0}}, // zeros, not missing
+        ],
+      },
+    })
+
+    // #when
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
+
+    // #then
+    expect(result).toEqual([
+      {id: 'proj_partial', worktree: '/repo-partial'},
+      {id: 'proj_no_time', worktree: '/repo-no-time'},
+      {id: 'proj_zero', worktree: '/repo-zero'},
+    ])
+  })
+
+  it('retains a project when `vcs` is not a string', async () => {
+    // #given
+    const client = createMockSdkClient({
+      projectListResponse: {data: [{id: 'proj_1', worktree: '/repo', vcs: 123}]},
+    })
+
+    // #when
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
+
+    // #then
+    expect(result).toEqual([{id: 'proj_1', worktree: '/repo'}])
+  })
+
+  it('logs skipped and total counts after mapping', async () => {
+    // #given
+    const client = createMockSdkClient({
+      projectListResponse: {
+        data: [{id: 'proj_1', worktree: '/repo'}, {worktree: '/missing-id'}],
+      },
+    })
+
+    // #when
+    await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Discovered projects via SDK', {
+      total: 2,
+      skipped: 1,
+      retained: 1,
+    })
   })
 })
 
 describe('findProjectByWorkspace', () => {
   it('returns project matching normalized workspace path', async () => {
-    // #given
+    // #given: real SDK shape — worktree is the only location field upstream provides
     const client = createMockSdkClient({
-      projectListResponse: {data: [{id: 'proj_1', worktree: '/repo', path: '/repo'}]},
+      projectListResponse: {
+        data: [{id: 'proj_1', worktree: '/repo', vcs: 'git', time: {created: 1000}} satisfies Project],
+      },
     })
 
     // #when
     const result = await findProjectByWorkspace(client as unknown as SessionClient, '/repo/', mockLogger)
 
-    // #then
-    expect(result).toEqual({id: 'proj_1', worktree: '/repo', path: '/repo', vcs: 'git', time: {created: 0, updated: 0}})
+    // #then: passes the raw (unnormalized) workspacePath through to the routing query
+    expect(client.project.list).toHaveBeenCalledWith({query: {directory: '/repo/'}})
+    expect(result).toEqual({id: 'proj_1', worktree: '/repo'})
   })
 
   it('returns null when no project matches', async () => {
     // #given
     const client = createMockSdkClient({
-      projectListResponse: {data: [{id: 'proj_1', worktree: '/repo', path: '/repo'}]},
+      projectListResponse: {data: [{id: 'proj_1', worktree: '/repo', time: {created: 1000}} satisfies Project]},
     })
 
     // #when
