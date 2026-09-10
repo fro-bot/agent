@@ -81,12 +81,7 @@ describe('pruneSessions', () => {
     // #given
     const {findProjectByWorkspace} = await import('./discovery.js')
     const {listSessionsForProject} = await import('./storage.js')
-    vi.mocked(findProjectByWorkspace).mockResolvedValue({
-      id: 'proj1',
-      worktree: '/repo',
-      vcs: 'git',
-      time: {created: 1000, updated: 2000},
-    })
+    vi.mocked(findProjectByWorkspace).mockResolvedValue({id: 'proj1', worktree: '/repo'})
     vi.mocked(listSessionsForProject).mockResolvedValue([])
     const client = createMockSdkClient()
 
@@ -115,12 +110,7 @@ describe('pruneSessions', () => {
       createMockSession('ses_5', oldTime + 4000),
     ]
 
-    vi.mocked(findProjectByWorkspace).mockResolvedValue({
-      id: 'proj1',
-      worktree: '/repo',
-      vcs: 'git',
-      time: {created: 1000, updated: 2000},
-    })
+    vi.mocked(findProjectByWorkspace).mockResolvedValue({id: 'proj1', worktree: '/repo'})
     vi.mocked(listSessionsForProject).mockResolvedValue(sessions)
     vi.mocked(deleteSession).mockResolvedValue(undefined)
     const client = createMockSdkClient()
@@ -149,12 +139,7 @@ describe('pruneSessions', () => {
       createMockSession('ses_5', now - 5 * 24 * 60 * 60 * 1000),
     ]
 
-    vi.mocked(findProjectByWorkspace).mockResolvedValue({
-      id: 'proj1',
-      worktree: '/repo',
-      vcs: 'git',
-      time: {created: 1000, updated: 2000},
-    })
+    vi.mocked(findProjectByWorkspace).mockResolvedValue({id: 'proj1', worktree: '/repo'})
     vi.mocked(listSessionsForProject).mockResolvedValue(sessions)
     const client = createMockSdkClient()
 
@@ -180,12 +165,7 @@ describe('pruneSessions', () => {
       createMockSession('ses_recent', now - 1000),
     ]
 
-    vi.mocked(findProjectByWorkspace).mockResolvedValue({
-      id: 'proj1',
-      worktree: '/repo',
-      vcs: 'git',
-      time: {created: 1000, updated: 2000},
-    })
+    vi.mocked(findProjectByWorkspace).mockResolvedValue({id: 'proj1', worktree: '/repo'})
     vi.mocked(listSessionsForProject).mockResolvedValue(sessions)
     vi.mocked(deleteSession).mockResolvedValue(undefined)
     const client = createMockSdkClient()
@@ -210,12 +190,7 @@ describe('pruneSessions', () => {
 
     const sessions = [createMockSession('ses_old', oldTime), createMockSession('ses_recent', now - 1000)]
 
-    vi.mocked(findProjectByWorkspace).mockResolvedValue({
-      id: 'proj1',
-      worktree: '/repo',
-      vcs: 'git',
-      time: {created: 1000, updated: 2000},
-    })
+    vi.mocked(findProjectByWorkspace).mockResolvedValue({id: 'proj1', worktree: '/repo'})
     vi.mocked(listSessionsForProject).mockResolvedValue(sessions)
     vi.mocked(deleteSession).mockRejectedValue(new Error('SDK delete failed'))
     const client = createMockSdkClient()
@@ -241,12 +216,7 @@ describe('pruneSessions', () => {
 
     const sessions = [createMockSession('ses_old', oldTime), createMockSession('ses_recent', now - 1000)]
 
-    vi.mocked(findProjectByWorkspace).mockResolvedValue({
-      id: 'proj1',
-      worktree: '/repo',
-      vcs: 'git',
-      time: {created: 1000, updated: 2000},
-    })
+    vi.mocked(findProjectByWorkspace).mockResolvedValue({id: 'proj1', worktree: '/repo'})
     vi.mocked(listSessionsForProject).mockResolvedValue(sessions)
     vi.mocked(deleteSession).mockResolvedValue(undefined)
     const client = createMockSdkClient()

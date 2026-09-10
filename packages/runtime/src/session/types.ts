@@ -192,18 +192,20 @@ export interface StepFinishPart extends PartBase {
 export type Part = TextPart | ToolPart | ReasoningPart | StepFinishPart
 
 /**
- * OpenCode Project metadata
+ * OpenCode Project metadata.
+ *
+ * Only `id` and `worktree` are declared: they're the only fields any consumer
+ * (`findProjectByWorkspace`, `pruneSessions`) actually reads. The upstream SDK's `Project` type
+ * also carries `vcs`/`vcsDir`/`time`, but declaring unread fields here as required is what let
+ * this go wrong twice — first requiring a `path` field upstream never sent, then requiring
+ * `time.updated`, which isn't even part of the v1 `Project` type this runtime's client uses
+ * (see `@opencode-ai/sdk`'s root-exported `Project` in `dist/gen/types.gen.d.ts`). Add fields
+ * back here only when something starts reading them, and keep them optional so a shape change
+ * degrades gracefully instead of silently discarding every project again.
  */
 export interface ProjectInfo {
   readonly id: string
   readonly worktree: string
-  readonly path?: string
-  readonly vcs: string
-  readonly time: {
-    readonly created: number
-    readonly updated: number
-    readonly initialized?: number
-  }
 }
 
 /**

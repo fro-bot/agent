@@ -1,8 +1,9 @@
 import type {Buffer} from 'node:buffer'
 import type {ExecAdapter, Logger} from './types.js'
 import {constants} from 'node:fs'
-import {access, lstat, readdir, stat} from 'node:fs/promises'
-import {dirname} from 'node:path'
+import {access, lstat, mkdtemp, readdir, rm, stat} from 'node:fs/promises'
+import {tmpdir} from 'node:os'
+import {dirname, join} from 'node:path'
 import process from 'node:process'
 import {filterAgentEnv} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
@@ -122,8 +123,19 @@ export async function installSystematicPlugin(
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined
   let stderrTail = ''
+  let tempDbDir: string | undefined
   try {
     const args = ['--pure', 'plugin', `@fro.bot/systematic@${systematicVersion}`, '--global']
+    // Booting OpenCode initializes the session database (~/.local/share/opencode/opencode.db),
+    // enables WAL mode, and leaves an `opencode.db-wal` sidecar beside it. The Actions-cache
+    // restore that runs later in the job only transports the main database file, not its WAL --
+    // so a WAL this install creates survives next to a database it was never opened against, and
+    // the next checkpoint silently merges it in, wiping whatever the restore just wrote. Pointing
+    // this subprocess at a throwaway database file (OPENCODE_DB relocates the `-wal`/`-shm`
+    // sidecars too, since SQLite derives them from the main file's path) keeps the install from
+    // ever touching real session state, instead of trying to clean up after it.
+    const isolatedDbDir = await mkdtemp(join(tmpdir(), 'fro-bot-plugin-install-db-'))
+    tempDbDir = isolatedDbDir
     // Scrubbed, not inherited: npm runs lifecycle scripts from a network-fetched package,
     // so the child must not see tokens, API keys, secrets, AWS_*, or INPUT_*.
     const execOptions = {
@@ -134,6 +146,7 @@ export async function installSystematicPlugin(
         // the file directly and no-ops by package-name match. Not a guard; do not remove as one.
         OPENCODE_CONFIG_CONTENT: emptyConfig,
         OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+        OPENCODE_DB: join(isolatedDbDir, 'opencode.db'),
       },
       ignoreReturnCode: true,
       silent: true,
@@ -190,6 +203,18 @@ export async function installSystematicPlugin(
   } finally {
     if (timeoutId != null) {
       clearTimeout(timeoutId)
+    }
+    if (tempDbDir !== undefined) {
+      // Best-effort: a cleanup failure must not turn a successful (or already-failed) install
+      // into a reported failure.
+      try {
+        await rm(tempDbDir, {recursive: true, force: true})
+      } catch (cleanupError) {
+        logger.debug('Failed to remove temporary plugin-install database directory', {
+          tempDbDir,
+          error: toErrorMessage(cleanupError),
+        })
+      }
     }
   }
 }
