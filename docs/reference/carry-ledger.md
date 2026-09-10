@@ -1,5 +1,5 @@
 ---
-verifiedAgainstBaseVersion: "1.18.29"
+verifiedAgainstBaseVersion: "1.18.30"
 ---
 
 # Harness carry ledger
@@ -7,6 +7,10 @@ verifiedAgainstBaseVersion: "1.18.29"
 The harness build merges a set of upstream OpenCode pull requests into a pinned base version. Those patches are listed in [`packages/harness/harness.config.json`](../../packages/harness/harness.config.json), which is the authoritative set — this document explains the entries, it does not define them.
 
 The pinned version is not the liability. Carrying a patch whose justification exists only in someone's memory is. Without a written reason, every base bump re-derives it from source, and a carry that is still load-bearing can look droppable to a reader who was not there. That has already happened: `#33444` has been proposed for removal in two consecutive audits and kept both times, each round costing a source-level re-litigation of the same question.
+
+## Carry count
+
+This set currently holds fifteen carries. `packages/harness/AGENTS.md` states a target of 1–3 carried refs max. The set has grown five times past that target by deliberate deferral, not oversight: each entry below still meets at least one criterion of the carry policy in that same file, and no bump cycle has yet forced the trim. This is not a claim that fifteen is fine — it isn't, against the stated target — only a record that no one has done the work of cutting it back. `#36361` already names itself as the weakest-evidence entry and the first candidate if and when that trim happens.
 
 ## How to read an entry
 
@@ -26,7 +30,7 @@ No carry has an in-repo record of the upstream version that would contain it, so
 
 - **Capability:** Populates `session.summary.diffs` at the session level. Stock builds compute per-message summaries but never fold them into the session-level row.
 - **Surface:** Both, and load-bearing for headed/local consumers.
-- **Upstream status:** Open. Verified absent from stock through 1.18.29.
+- **Upstream status:** Open. Verified absent from stock through 1.18.30.
 - **Evidence it is still needed:** A downstream consumer (Space Bus) reads the aggregate summary as its preferred tier. Without this carry it falls back to fetching every message and aggregating per-turn diffs client-side.
 - **Removal condition:** Stock exposes the aggregate fold — not merely a `summary.diffs` field in the schema, which stock already has while leaving it unpopulated. Verify the value is written, not just typed.
 
@@ -119,7 +123,7 @@ No carry has an in-repo record of the upstream version that would contain it, so
 - **Capability:** Stops background summary/prune failures from being swallowed silently.
 - **Surface:** `packages/opencode/src/session/prompt.ts` — the forked `summary.summarize(...)` and `compaction.prune(...)` calls after a turn, both `Effect.ignore`d in stock. The carry replaces the ignore with `Effect.logWarning` for non-interruption causes; failures are logged, not rethrown or written to session state.
 - **Upstream status:** Open.
-- **Evidence it is still needed:** Re-examined against 1.18.29 (2026-09-05): stock still swallows both (`prompt.ts:1252`, `:1338`); no upstream change in the bump range touches either path. **Nothing in this repository consumes what the carry surfaces** — no code matches the warning strings or reads a summary/prune failure state; the harness runs its own `pruneSessions` and logs its own failures. The value is operator log visibility only.
+- **Evidence it is still needed:** Re-examined against 1.18.30 (2026-09-10): stock still swallows both (`prompt.ts:1253`, `:1338`); no upstream change in the bump range touches either path. **Nothing in this repository consumes what the carry surfaces** — no code matches the warning strings or reads a summary/prune failure state; the harness runs its own `pruneSessions` and logs its own failures. The value is operator log visibility only.
 - **Removal condition:** Stock surfaces or handles those background failures — or, on value grounds, the set is trimmed toward the 1–3 target and this is the first to go: it has no consumer here and the weakest evidence of the set.
 
 ### #47430 — bounded npm install
@@ -127,8 +131,25 @@ No carry has an in-repo record of the upstream version that would contain it, so
 - **Capability:** Bounds `Npm.reify()` with `OPENCODE_NPM_INSTALL_TIMEOUT` (default 300000 ms); a timeout surfaces as `InstallFailedError` instead of hanging instance bootstrap.
 - **Surface:** `plugin.init()` during per-directory instance bootstrap — runs ahead of every service and ahead of the first request being answered, while the HTTP listener is already bound.
 - **Upstream status:** Open. Port of #41936 (v2) to the v1 line; our PR.
-- **Evidence it is still needed:** Measured 181–370 s stalls on the first instance-scoped request across ~60 headless runs in four repositories (2026-09-04); stock 1.18.29 `packages/core/src/npm.ts` still awaits `reify()` with no bound. The Action defends itself with a setup-time install (`installSystematicPlugin`) and a bounded readiness probe; this carry bounds the server-side install those sit in front of.
+- **Evidence it is still needed:** Measured 181–370 s stalls on the first instance-scoped request across ~60 headless runs in four repositories (2026-09-04); stock 1.18.30 `packages/core/src/npm.ts` still awaits `reify()` with no bound. The Action defends itself with a setup-time install (`installSystematicPlugin`) and a bounded readiness probe; this carry bounds the server-side install those sit in front of.
 - **Removal condition:** Stock bounds `Npm.reify()` or `plugin.init()` — #47430 or #41936 merges, or an equivalent lands.
+
+### #48267 — OpenAI explicit cache anchor
+
+- **Capability:** Places an explicit prompt cache breakpoint (`promptCacheBreakpoint: { mode: "explicit" }`) on the last text part of the trailing messages `applyCaching()` already targets, and sets `promptCacheOptions: { mode: "explicit" }` in `options()` so implicit breakpoint selection stops overriding it. Stock applies explicit breakpoints to Anthropic-family models only; everything else runs on implicit prefix caching with no advancing anchor.
+- **Surface:** Both, but narrowly: `@ai-sdk/openai` models at **GPT-5.6 or later** only. `@ai-sdk/openai@3.0.88`'s own documentation scopes explicit breakpoints to 5.6+ and states that in explicit mode "a request without any explicit breakpoint does not use prompt caching" — so forcing explicit mode on an older model would turn caching off rather than improve it. The version predicate also excludes `@ai-sdk/amazon-bedrock/mantle` in practice, whose ids carry no `gpt-N` version; nothing has established that endpoint accepts OpenAI-shaped body fields, and `prompt_cache_breakpoint` is forwarded verbatim into the request body rather than filtered.
+- **Known limit:** For array content the marker only reaches the wire on a text part — Chat Completions reads it exclusively from text parts, and the Responses API's `output_text` serialization never emits it at all, so assistant turns contribute no anchor on that path. Placement targets the last text part for that reason, and falls back to message-level `providerOptions` for the system message, which is the one role both transports read it from. That fallback is what makes forcing explicit mode safe: measured across ~4,300 real turns from a local session store, 43% of applicable OpenAI-native turns have no text part in the last two non-system messages, and a request in explicit mode with no marker gets no caching at all. Anchoring the system prompt guarantees one marker per request regardless.
+- **Upstream status:** Open. Our PR. Absent from stock through 1.18.30.
+- **Evidence it is still needed:** Measured over 10 days: ~32,000 Anthropic-family turns hold 100.0% cache reuse with essentially zero collapse, while `gpt-6-astra` sits at 92.1% with 8.5% of turns collapsed — roughly 39M tokens re-sent — and `gpt-5.6-sol` at 64.9%. The gate at `transform.ts:471-484` admits Anthropic-family models only, so no OpenAI-native model reaches `applyCaching()` at all.
+- **Removal condition:** Stock gives the OpenAI-native path an advancing cache anchor — either by widening the `applyCaching()` gate with an OpenAI-shaped marker, or by emitting `prompt_cache_breakpoint` some other way. Verify that reuse tracks a growing prompt across a compaction rather than pinning at a fixed offset; a `promptCacheKey` alone is not this, and stock already sets one.
+
+### #48268 — dotless GPT major version parsing
+
+- **Capability:** Parses a model's GPT major version without requiring a dotted minor, so `gpt-6-astra` satisfies the version gate in `transform.ts`. Restores `reasoningEffort`, `reasoningSummary`, the encrypted-reasoning include, and `textVerbosity: "low"` for GPT-6 models, and corrects the Azure completion-URL early return for them.
+- **Surface:** Both. Any run on a GPT-6 model.
+- **Upstream status:** Open. Our PR. Absent from stock through 1.18.30.
+- **Evidence it is still needed:** At 1.18.30 two files disagree about the same model: `session/system.ts:36` routes `gpt-6` ids to a dedicated Astra prompt, while `transform.ts:1331` matches `/gpt-(\d+)\.(\d+)/` and cannot parse a dotless id at all. Evaluated against stock across `gpt-6-astra`, `gpt-5.6-luna`, `gpt-5.3-codex-spark`, `gpt-5-pro`, and `gpt-5-chat`, `gpt-6-astra` is the only id that fails both transform gates while being singled out by `system.ts`. The gate's own comment says it exists because versions above 5.4 do not support `reasoningEffort` — a GPT-6 evaluating false defeats that purpose. Fro Bot runs Astra.
+- **Removal condition:** Stock parses a dotless major — the regex gains an optional minor group, or the family gate stops using a substring test. Check the parse itself, not the presence of a `gpt-6` branch elsewhere: `session/system.ts` has had one since 1.18.30 while `transform.ts` still does not.
 
 ## Scope and authority
 
