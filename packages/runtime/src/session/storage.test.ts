@@ -3,7 +3,7 @@ import type {Project} from '@opencode-ai/sdk'
 import type {SessionClient} from './backend.js'
 import type {Logger} from './types.js'
 
-import {describe, expect, it, vi} from 'vitest'
+import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {findProjectByWorkspace, listProjectsViaSDK} from './discovery.js'
 import {
@@ -21,6 +21,13 @@ const mockLogger: Logger = {
   warning: vi.fn(),
   error: vi.fn(),
 }
+
+// `mockLogger` is shared module-wide (not recreated per test), so call history persists across
+// tests unless cleared. Reset structurally rather than per-test so this is the default going
+// forward, not something every new test author has to remember.
+beforeEach(() => {
+  vi.clearAllMocks()
+})
 
 function createMockSdkClient(options?: {
   sessionListResponse?: {data?: unknown; error?: unknown}
@@ -79,6 +86,24 @@ describe('listProjectsViaSDK', () => {
     // #then
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list failed', expect.any(Object))
+  })
+
+  it('returns empty array and warns when the payload is not an array', async () => {
+    // #given: a structurally unexpected but non-error, non-null response — the one early-return
+    // shape in this function that previously exited with no logging at all. `data` here is
+    // deliberately untyped against `Project[]` (the mock helper's `data?: unknown` already covers
+    // that) since this exercises the pre-array-narrowing branch, not a malformed array element.
+    const client = createMockSdkClient({projectListResponse: {data: {not: 'an array'}}})
+
+    // #when
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list returned a non-array payload', {
+      type: 'object',
+      constructor: 'Object',
+    })
   })
 
   it('filters malformed project records (missing/non-string id or worktree)', async () => {
@@ -229,6 +254,23 @@ describe('listSessionsForProject', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list failed', expect.any(Object))
   })
+
+  it('returns empty list and warns when the payload is not an array', async () => {
+    // #given: same structurally-unexpected-but-not-an-error shape covered in listProjectsViaSDK
+    // above — `data` here is deliberately untyped against the mapper's expected array shape.
+    const client = createMockSdkClient({sessionListResponse: {data: {not: 'an array'}}})
+
+    // #when
+    const result = await listSessionsForProject(client as unknown as SessionClient, '/workspace', mockLogger)
+
+    // #then: `source` distinguishes this call site from findLatestSession's identical message text
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
+      source: 'listSessionsForProject',
+      type: 'object',
+      constructor: 'Object',
+    })
+  })
 })
 
 describe('getSession', () => {
@@ -355,6 +397,23 @@ describe('getSessionTodos', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos failed', expect.any(Object))
   })
+
+  it('returns empty array and warns when the payload is not an array', async () => {
+    // #given: same structurally-unexpected-but-not-an-error shape as the other call sites in this
+    // file — the guard is hoisted here (from mapSdkTodos's own defensive check) since a logger is
+    // in scope in storage.ts but not in the pure-mapping storage-mappers.ts module.
+    const client = createMockSdkClient({sessionTodosResponse: {data: {not: 'an array'}}})
+
+    // #when
+    const result = await getSessionTodos(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos returned a non-array payload', {
+      type: 'object',
+      constructor: 'Object',
+    })
+  })
 })
 
 describe('findLatestSession', () => {
@@ -378,6 +437,36 @@ describe('findLatestSession', () => {
       query: {directory: '/workspace', start: 4000, roots: true, limit: 10},
     })
     expect(result?.session.id).toBe('ses_latest')
+  })
+
+  it('returns null and warns when the payload is not an array', async () => {
+    // #given: the previously-unlogged branch — collapsed with the genuinely-empty case before
+    // this fix, so a malformed payload here looked identical in CI to "no sessions since this
+    // timestamp".
+    const client = createMockSdkClient({sessionListResponse: {data: {not: 'an array'}}})
+
+    // #when
+    const result = await findLatestSession(client as unknown as SessionClient, '/workspace', 4000, mockLogger)
+
+    // #then: `source` distinguishes this call site from listSessionsForProject's identical message
+    expect(result).toBeNull()
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
+      source: 'findLatestSession',
+      type: 'object',
+      constructor: 'Object',
+    })
+  })
+
+  it('returns null and does NOT warn when the array is genuinely empty', async () => {
+    // #given
+    const client = createMockSdkClient({sessionListResponse: {data: []}})
+
+    // #when
+    const result = await findLatestSession(client as unknown as SessionClient, '/workspace', 4000, mockLogger)
+
+    // #then: an empty result is normal operation — it must not start emitting warnings
+    expect(result).toBeNull()
+    expect(mockLogger.warning).not.toHaveBeenCalled()
   })
 })
 

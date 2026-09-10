@@ -27,7 +27,17 @@ export async function listProjectsViaSDK(
     logger.warning('SDK project list failed', {error: String(response.error)})
     return []
   }
-  if (!Array.isArray(response.data)) return []
+  if (!Array.isArray(response.data)) {
+    // Same silent-exit shape the rest of this module's logging was added to prevent: the server
+    // responded successfully but with a payload that isn't the array shape we expect. Not the
+    // payload itself — its contents aren't known to be safe to emit — but enough to diagnose that
+    // this branch fired and what kind of value showed up instead.
+    logger.warning('SDK project list returned a non-array payload', {
+      type: typeof response.data,
+      constructor: (response.data as object).constructor?.name,
+    })
+    return []
+  }
 
   // `id` and `worktree` are the only fields this module (or any consumer) reads, so they're the
   // only fields allowed to gate inclusion. `time` and `vcs` are neither read nor asserted here —
@@ -35,7 +45,7 @@ export async function listProjectsViaSDK(
   // pruning for six months.
   let skipped = 0
   const projects: ProjectInfo[] = []
-  for (const project of response.data as unknown[]) {
+  for (const project of response.data) {
     if (!isRecord(project)) {
       skipped += 1
       continue
