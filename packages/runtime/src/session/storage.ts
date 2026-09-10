@@ -53,6 +53,13 @@ export async function getSessionMessages(
 ): Promise<readonly Message[]> {
   const response = await client.session.messages({path: {id: sessionID}})
   if (response.error == null && response.data != null) {
+    if (!Array.isArray(response.data)) {
+      logger.warning('SDK session messages returned a non-array payload', {
+        type: typeof response.data,
+        constructor: (response.data as object).constructor?.name,
+      })
+      return []
+    }
     return mapSdkMessages(response.data)
   }
 

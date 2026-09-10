@@ -364,6 +364,34 @@ describe('getSessionMessages', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages failed', expect.any(Object))
   })
+
+  it('returns empty array and warns when the payload is not an array', async () => {
+    // #given: a structurally unexpected but non-error, non-null response — mapSdkMessages
+    // unconditionally maps its input, so a non-array payload previously reached it and threw.
+    const client = createMockSdkClient({sessionMessagesResponse: {data: {not: 'an array'}}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'object',
+      constructor: 'Object',
+    })
+  })
+
+  it('does NOT warn when messages are genuinely empty', async () => {
+    // #given
+    const client = createMockSdkClient({sessionMessagesResponse: {data: []}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then: an empty result is normal operation — it must not start emitting warnings
+    expect(result).toEqual([])
+    expect(mockLogger.warning).not.toHaveBeenCalled()
+  })
 })
 
 describe('getSessionTodos', () => {
