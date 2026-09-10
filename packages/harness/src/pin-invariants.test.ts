@@ -59,10 +59,18 @@ function compareDottedVersions(left: string, right: string): number {
 // .slim/clonedeps.json — read-only upstream source clone pin
 // ---------------------------------------------------------------------------
 
+// Shared by both cases below so the "ignores unrelated entries" case exercises
+// the real filter rather than a copy inlined inside its own fixture — a copy
+// cannot fail when the real filter is broken. See
+// docs/solutions/workflow-issues/a-check-written-from-inside-its-own-premise-cannot-fail-2026-09-04.md
+function filterUpstreamEntries(entries: readonly CloneDepsEntry[]): readonly CloneDepsEntry[] {
+  return entries.filter(entry => entry.repoUrl === config.source_repo)
+}
+
 describe('clonedeps pin matches the harness base version', () => {
   it('every OpenCode upstream entry has resolvedVersion and ref matching base_version', () => {
     // #given the harness base version and the clonedeps entries that point at the OpenCode upstream repo
-    const upstreamEntries = cloneDeps.dependencies.filter(entry => entry.repoUrl === config.source_repo)
+    const upstreamEntries = filterUpstreamEntries(cloneDeps.dependencies)
     const expectedRef = `v${config.base_version}`
 
     // #when / #then every upstream entry must be pinned to the current base version
@@ -98,8 +106,8 @@ describe('clonedeps pin matches the harness base version', () => {
       ],
     }
 
-    // #when filtering to the OpenCode upstream repo
-    const upstreamEntries = manifest.dependencies.filter(entry => entry.repoUrl === config.source_repo)
+    // #when filtering to the OpenCode upstream repo, through the same helper the real check uses
+    const upstreamEntries = filterUpstreamEntries(manifest.dependencies)
 
     // #then the unrelated entry is excluded rather than failing the pin check
     expect(upstreamEntries).toEqual([])
@@ -111,11 +119,19 @@ describe('clonedeps pin matches the harness base version', () => {
 // ---------------------------------------------------------------------------
 
 function extractOpencodeAllowedVersionsBound(text: string): string {
-  // Scoped to the single packageRules object that both matches
-  // "anomalyco/opencode" and declares "allowedVersions" — packageRules entries
-  // are flat objects (arrays use [] not {}), so `[^{}]*` cannot cross into a
-  // neighboring object.
-  const blockMatch = /\{[^{}]*anomalyco\/opencode[^{}]*allowedVersions:\s*'([^']+)'[^{}]*\}/.exec(text)
+  // Scoped to the single packageRules object whose matchPackageNames array
+  // contains the quoted 'anomalyco/opencode' entry and which declares
+  // allowedVersions — packageRules entries are flat objects (arrays use []
+  // not {}), so `[^{}]*` cannot cross into a neighboring object. Anchoring on
+  // the matchPackageNames array (not a bare literal-text match) is
+  // deliberate: a *comment* mentioning "anomalyco/opencode" elsewhere in the
+  // same file (e.g. the Bun cap block's comment) must not satisfy this and
+  // did under the previous bare-substring version — the match was correct
+  // only because the OpenCode block happened to precede the Bun block.
+  const blockMatch =
+    /\{[^{}]*matchPackageNames:\s*\[[^\]]*'anomalyco\/opencode'[^\]]*\][^{}]*allowedVersions:\s*'([^']+)'[^{}]*\}/.exec(
+      text,
+    )
 
   if (blockMatch?.[1] === undefined) {
     throw new Error(
