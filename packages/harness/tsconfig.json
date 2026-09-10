@@ -8,6 +8,6 @@
     "declarationMap": true,
     "outDir": "./dist"
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  "include": ["src/**/*.ts", "scripts/**/*.ts", "../runtime/src/**/*.ts"],
   "exclude": ["dist", "node_modules"]
 }
