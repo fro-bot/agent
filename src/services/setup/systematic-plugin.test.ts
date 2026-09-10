@@ -6,6 +6,23 @@ import {dirname, join} from 'node:path'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {installSystematicPlugin} from './systematic-plugin.js'
 
+const statDelayState = vi.hoisted(() => ({delayMs: 0}))
+
+type FsPromisesModule = typeof import('node:fs/promises')
+
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<FsPromisesModule>()
+  return {
+    ...actual,
+    stat: async (...args: Parameters<typeof actual.stat>) => {
+      if (statDelayState.delayMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, statDelayState.delayMs))
+      }
+      return actual.stat(...args)
+    },
+  }
+})
+
 function createLogger(): Logger {
   return {
     debug: vi.fn(),
@@ -127,6 +144,55 @@ describe('installSystematicPlugin', () => {
     await expect(stat(tempDir)).rejects.toMatchObject({code: 'ENOENT'})
   })
 
+  it('cleans up the temporary database directory when the install times out', async () => {
+    // #given an execution adapter whose timeout resolves before the child ever exits -- the one
+    // path where the child could still hold the database file open when cleanup runs
+    const logger = createLogger()
+    const execWithTimeout = vi.fn<NonNullable<ExecAdapter['execWithTimeout']>>().mockResolvedValue('timed-out')
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the bounded install times out
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: '/cached/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 1,
+    })
+
+    // #then the isolated database directory is removed despite the timeout
+    expect(result.status).toBe('timed-out')
+    const dbPath = execWithTimeout.mock.calls[0]?.[3]?.env?.OPENCODE_DB
+    expect(dbPath).toBeTruthy()
+    const tempDir = dirname(dbPath as string)
+    await expect(stat(tempDir)).rejects.toMatchObject({code: 'ENOENT'})
+  })
+
+  it('cleans up the temporary database directory when the spawn rejects', async () => {
+    // #given an execution adapter that rejects instead of returning an exit code
+    const logger = createLogger()
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error('spawn opencode ENOENT'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install fails to spawn
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: '/cached/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the isolated database directory is still removed
+    expect(result.status).toBe('failed')
+    const dbPath = execWithTimeout.mock.calls[0]?.[3]?.env?.OPENCODE_DB
+    expect(dbPath).toBeTruthy()
+    const tempDir = dirname(dbPath as string)
+    await expect(stat(tempDir)).rejects.toMatchObject({code: 'ENOENT'})
+  })
+
   it('scrubs secrets from the install child, which runs untrusted npm lifecycle scripts', async () => {
     // #given a runner environment carrying credentials alongside what an install needs
     const logger = createLogger()
@@ -217,6 +283,31 @@ describe('installSystematicPlugin', () => {
       expect.objectContaining({silent: true}),
     )
     expect(exec).not.toHaveBeenCalled()
+  })
+
+  it('populates a path diagnosis when the Promise.race fallback rejects', async () => {
+    // #given an adapter with no execWithTimeout, forcing the Promise.race fallback, whose exec
+    // rejects with a spawn path error
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    const missingPath = join(dir, 'opencode')
+    const exec = vi.fn<ExecAdapter['exec']>().mockRejectedValue(new Error(`spawn ${missingPath} ENOENT`))
+    const execAdapter = createExecAdapter(exec)
+
+    // #when the plugin install runs through the fallback race
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: missingPath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the rejection propagates through Promise.race into a populated diagnosis
+    expect(result.status).toBe('failed')
+    const warningCall = vi.mocked(logger.warning).mock.calls[0]
+    const pathDiagnosis = warningCall?.[1]?.pathDiagnosis
+    expect(pathDiagnosis).toContain('path does not exist')
   })
 
   it('warns and returns when the install exits unsuccessfully', async () => {
@@ -525,6 +616,36 @@ describe('installSystematicPlugin', () => {
     )
   })
 
+  it('diagnoses a real executable file as looking fine when the spawn fails with ENOENT', async () => {
+    // #given a real, executable file -- the ENOENT variant of a healthy-executable spawn failure,
+    // e.g. a script whose interpreter is missing while the script itself is present and executable
+    const logger = createLogger()
+    const dir = await makeTempDir()
+    const filePath = join(dir, 'opencode')
+    await writeFile(filePath, '#!/bin/sh\n')
+    await chmod(filePath, 0o755)
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error(`spawn ${filePath} ENOENT`))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    // #when the plugin install spawns the executable file and still fails with ENOENT
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: filePath,
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
+
+    // #then the warning notes the path looks fine, pointing elsewhere for the cause
+    expect(result.status).toBe('failed')
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Systematic plugin install failed',
+      expect.objectContaining({pathDiagnosis: 'path exists and is an executable file'}),
+    )
+  })
+
   it('diagnoses a missing path by listing the parent directory contents', async () => {
     // #given a parent directory that exists but does not contain the binary
     const logger = createLogger()
@@ -655,5 +776,36 @@ describe('installSystematicPlugin', () => {
     expect(result.status).toBe('failed')
     const warningCall = vi.mocked(logger.warning).mock.calls[0]
     expect(warningCall?.[1]?.stderr).toBe(stderr.slice(-2_000))
+  })
+
+  it('excludes the binary-path diagnosis time from the reported duration', async () => {
+    // #given a diagnosis whose filesystem work is made observably slow -- if `duration` were
+    // captured after awaiting diagnoseBinaryPath instead of before it, this delay would leak
+    // straight into the reported install duration
+    const logger = createLogger()
+    const DIAGNOSIS_DELAY_MS = 150
+    statDelayState.delayMs = DIAGNOSIS_DELAY_MS
+    const execWithTimeout = vi
+      .fn<NonNullable<ExecAdapter['execWithTimeout']>>()
+      .mockRejectedValue(new Error('spawn /cached/opencode ENOENT'))
+    const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
+
+    try {
+      // #when the install fails and the (slow) diagnosis runs
+      const result = await installSystematicPlugin({
+        logger,
+        execAdapter,
+        opencodeBinaryPath: '/cached/opencode',
+        systematicVersion: '2.1.0',
+        timeoutMs: 100,
+      })
+
+      // #then the reported duration stays far below the diagnosis delay, proving `duration` was
+      // captured before awaiting diagnoseBinaryPath rather than after it
+      expect(result.status).toBe('failed')
+      expect(result.duration).toBeLessThan(DIAGNOSIS_DELAY_MS / 2)
+    } finally {
+      statDelayState.delayMs = 0
+    }
   })
 })
