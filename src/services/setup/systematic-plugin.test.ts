@@ -42,6 +42,7 @@ function createExecAdapter(exec: ExecAdapter['exec']): ExecAdapter {
 const tempDirs: string[] = []
 
 afterEach(async () => {
+  statDelayState.delayMs = 0
   await Promise.all(tempDirs.splice(0).map(async dir => rm(dir, {recursive: true, force: true})))
 })
 
@@ -237,7 +238,10 @@ describe('installSystematicPlugin', () => {
   })
 
   it('warns and returns when the install times out', async () => {
-    // #given an OpenCode CLI that never exits
+    // #given an OpenCode CLI that never exits -- the Promise.race fallback, where the losing
+    // branch (the child) is abandoned rather than killed, per
+    // docs/solutions/best-practices/promise-race-bounds-await-not-subprocess-2026-07-30.md. A
+    // live child may still hold the isolated database file open when cleanup runs below.
     const logger = createLogger()
     const exec = vi.fn<ExecAdapter['exec']>().mockImplementation(async () => new Promise<number>(() => {}))
 
@@ -256,6 +260,14 @@ describe('installSystematicPlugin', () => {
     expect(warningCall?.[0]).toBe('Systematic plugin install timed out')
     expect(warningCall?.[1]?.timeoutMs).toBe(1)
     expect(warningCall?.[1]?.duration).toEqual(expect.any(Number))
+
+    // #then the isolated database directory is still removed even though the abandoned child may
+    // still be running -- the variant the existing execWithTimeout-based timeout test cannot
+    // exercise, since that adapter kills its child before cleanup runs
+    const dbPath = exec.mock.calls[0]?.[2]?.env?.OPENCODE_DB
+    expect(dbPath).toBeTruthy()
+    const tempDir = dirname(dbPath as string)
+    await expect(stat(tempDir)).rejects.toMatchObject({code: 'ENOENT'})
   })
 
   it('uses the adapter timeout when the execution adapter can terminate children', async () => {
@@ -303,11 +315,17 @@ describe('installSystematicPlugin', () => {
       timeoutMs: 100,
     })
 
-    // #then the rejection propagates through Promise.race into a populated diagnosis
+    // #then exec was actually invoked -- pins that this test exercises the Promise.race fallback
+    // and not the execWithTimeout branch, which would silently take over if createExecAdapter
+    // ever grew one
+    expect(exec).toHaveBeenCalled()
+
+    // #then the rejection propagates through Promise.race into a populated diagnosis. makeTempDir
+    // guarantees an existing-but-empty parent, so the full "lists contents" message is asserted
+    // rather than a substring that would also match the "parent does not exist either" branch
     expect(result.status).toBe('failed')
     const warningCall = vi.mocked(logger.warning).mock.calls[0]
-    const pathDiagnosis = warningCall?.[1]?.pathDiagnosis
-    expect(pathDiagnosis).toContain('path does not exist')
+    expect(warningCall?.[1]?.pathDiagnosis).toBe(`path does not exist; parent directory ${dir} contains: `)
   })
 
   it('warns and returns when the install exits unsuccessfully', async () => {
@@ -790,22 +808,24 @@ describe('installSystematicPlugin', () => {
       .mockRejectedValue(new Error('spawn /cached/opencode ENOENT'))
     const execAdapter = {exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()} satisfies ExecAdapter
 
-    try {
-      // #when the install fails and the (slow) diagnosis runs
-      const result = await installSystematicPlugin({
-        logger,
-        execAdapter,
-        opencodeBinaryPath: '/cached/opencode',
-        systematicVersion: '2.1.0',
-        timeoutMs: 100,
-      })
+    // #when the install fails and the (slow) diagnosis runs
+    const result = await installSystematicPlugin({
+      logger,
+      execAdapter,
+      opencodeBinaryPath: '/cached/opencode',
+      systematicVersion: '2.1.0',
+      timeoutMs: 100,
+    })
 
-      // #then the reported duration stays far below the diagnosis delay, proving `duration` was
-      // captured before awaiting diagnoseBinaryPath rather than after it
-      expect(result.status).toBe('failed')
-      expect(result.duration).toBeLessThan(DIAGNOSIS_DELAY_MS / 2)
-    } finally {
-      statDelayState.delayMs = 0
-    }
+    // #then the diagnosis actually ran -- without this, deleting the enrichment entirely (no
+    // stat call, no delay) would still satisfy the duration threshold below and the test would
+    // prove nothing about the timing it claims to pin
+    expect(result.status).toBe('failed')
+    const warningCall = vi.mocked(logger.warning).mock.calls[0]
+    expect(warningCall?.[1]?.pathDiagnosis).toBeDefined()
+
+    // #then the reported duration stays far below the diagnosis delay, proving `duration` was
+    // captured before awaiting diagnoseBinaryPath rather than after it
+    expect(result.duration).toBeLessThan(DIAGNOSIS_DELAY_MS / 2)
   })
 })
