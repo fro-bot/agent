@@ -67,6 +67,52 @@ describe('toErrorMessage', () => {
     // #then
     expect(result).toBe('[object Object]')
   })
+
+  it.each([
+    ['a JSON-parsed object whose own toString is not callable', JSON.parse('{"toString":"x"}') as unknown],
+    ['a null-prototype object with no coercion methods at all', Object.create(null) as unknown],
+    [
+      'an object whose toString throws during coercion',
+      {
+        toString() {
+          throw new Error('boom')
+        },
+      },
+    ],
+  ])('returns the fallback instead of throwing for %s', (_label, error) => {
+    // #when
+    const result = toErrorMessage(error)
+
+    // #then
+    expect(result).toBe('[unprintable error]')
+  })
+
+  it('preserves a custom toString instead of falling back', () => {
+    // #given: a valid custom coercion, not a broken one -- the fallback must not fire here
+    const error = {toString: () => 'custom'}
+
+    // #when
+    const result = toErrorMessage(error)
+
+    // #then
+    expect(result).toBe('custom')
+  })
+
+  it('returns the fallback when reading Error.message throws', () => {
+    // #given
+    const error = new Error('base')
+    Object.defineProperty(error, 'message', {
+      get() {
+        throw new Error('message getter boom')
+      },
+    })
+
+    // #when
+    const result = toErrorMessage(error)
+
+    // #then
+    expect(result).toBe('[unprintable error]')
+  })
 })
 
 describe('toError', () => {
@@ -103,5 +149,17 @@ describe('toError', () => {
     // #then
     expect(result).toBeInstanceOf(Error)
     expect(result.message).toBe('500')
+  })
+
+  it('wraps an unprintable non-Error value using the hardened fallback', () => {
+    // #given a payload whose own toString is not callable
+    const error: unknown = JSON.parse('{"toString":"x"}')
+
+    // #when
+    const result = toError(error)
+
+    // #then
+    expect(result).toBeInstanceOf(Error)
+    expect(result.message).toBe('[unprintable error]')
   })
 })

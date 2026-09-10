@@ -51,6 +51,18 @@ function createMockSdkClient(options?: {
   }
 }
 
+// A JSON object can shadow constructor with payload-owned text.
+const CONSTRUCTOR_SENTINEL = 'private transcript sentinel'
+function sentinelPayload(): unknown {
+  return JSON.parse(`{"constructor":{"name":"${CONSTRUCTOR_SENTINEL}"}}`)
+}
+
+// A JSON object with a non-callable own `toString` makes `String(error)` throw instead of
+// coercing (exhausts both ToPrimitive methods without producing a primitive).
+function unprintableErrorPayload(): unknown {
+  return JSON.parse('{"toString":"x"}')
+}
+
 describe('listProjectsViaSDK', () => {
   it('maps project list results using the real v1 SDK `Project` shape (no `path`, no `time.updated`)', async () => {
     // #given: typed as `@opencode-ai/sdk`'s v1 `Project` — the type re-exported from the package
@@ -88,6 +100,18 @@ describe('listProjectsViaSDK', () => {
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list failed', expect.any(Object))
   })
 
+  it('does not throw when the failure payload cannot be coerced to a string', async () => {
+    // #given a payload whose own toString is not callable
+    const client = createMockSdkClient({projectListResponse: {error: unprintableErrorPayload(), data: null}})
+
+    // #when
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
+
+    // #then no throw, fallback message logged
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list failed', {error: '[unprintable error]'})
+  })
+
   it('returns empty array and warns when the payload is not an array', async () => {
     // #given: a structurally unexpected but non-error, non-null response — the one early-return
     // shape in this function that previously exited with no logging at all. `data` here is
@@ -102,8 +126,22 @@ describe('listProjectsViaSDK', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list returned a non-array payload', {
       type: 'object',
-      constructor: 'Object',
     })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({projectListResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await listProjectsViaSDK(client as unknown as SessionClient, '/repo', mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK project list returned a non-array payload', {
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
   })
 
   it('filters malformed project records (missing/non-string id or worktree)', async () => {
@@ -255,6 +293,21 @@ describe('listSessionsForProject', () => {
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list failed', expect.any(Object))
   })
 
+  it('does not throw when the failure payload cannot be coerced to a string', async () => {
+    // #given a payload whose own toString is not callable
+    const client = createMockSdkClient({sessionListResponse: {error: unprintableErrorPayload(), data: null}})
+
+    // #when
+    const result = await listSessionsForProject(client as unknown as SessionClient, '/workspace', mockLogger)
+
+    // #then no throw, fallback message logged
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list failed', {
+      source: 'listSessionsForProject',
+      error: '[unprintable error]',
+    })
+  })
+
   it('returns empty list and warns when the payload is not an array', async () => {
     // #given: same structurally-unexpected-but-not-an-error shape covered in listProjectsViaSDK
     // above — `data` here is deliberately untyped against the mapper's expected array shape.
@@ -268,8 +321,23 @@ describe('listSessionsForProject', () => {
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
       source: 'listSessionsForProject',
       type: 'object',
-      constructor: 'Object',
     })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({sessionListResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await listSessionsForProject(client as unknown as SessionClient, '/workspace', mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
+      source: 'listSessionsForProject',
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
   })
 })
 
@@ -311,6 +379,18 @@ describe('getSession', () => {
     // #then
     expect(result).toBeNull()
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session get failed', expect.any(Object))
+  })
+
+  it('does not throw when the failure payload cannot be coerced to a string', async () => {
+    // #given a payload whose own toString is not callable
+    const client = createMockSdkClient({sessionGetResponse: {error: unprintableErrorPayload(), data: null}})
+
+    // #when
+    const result = await getSession(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then no throw, fallback message logged
+    expect(result).toBeNull()
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session get failed', {error: '[unprintable error]'})
   })
 })
 
@@ -364,6 +444,103 @@ describe('getSessionMessages', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages failed', expect.any(Object))
   })
+
+  it('does not throw when the failure payload cannot be coerced to a string', async () => {
+    // #given a payload whose own toString is not callable
+    const client = createMockSdkClient({sessionMessagesResponse: {error: unprintableErrorPayload(), data: null}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then no throw, fallback message logged
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages failed', {error: '[unprintable error]'})
+  })
+
+  it('returns empty array and warns when the payload is not an array', async () => {
+    // #given: a structurally unexpected but non-error, non-null response — mapSdkMessages
+    // unconditionally maps its input, so a non-array payload previously reached it and threw.
+    const client = createMockSdkClient({sessionMessagesResponse: {data: {not: 'an array'}}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'object',
+    })
+  })
+
+  it('does NOT warn when messages are genuinely empty', async () => {
+    // #given
+    const client = createMockSdkClient({sessionMessagesResponse: {data: []}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then: an empty result is normal operation — it must not start emitting warnings
+    expect(result).toEqual([])
+    expect(mockLogger.warning).not.toHaveBeenCalled()
+  })
+
+  it('returns empty array and warns when the payload is a string', async () => {
+    // #given
+    const client = createMockSdkClient({sessionMessagesResponse: {data: 'not-an-array'}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'string',
+    })
+  })
+
+  it('returns empty array and warns when the payload is a number', async () => {
+    // #given
+    const client = createMockSdkClient({sessionMessagesResponse: {data: 42}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'number',
+    })
+  })
+
+  it('returns empty array and warns when the payload is a null-prototype object', async () => {
+    // #given a non-array object without inherited properties
+    const payload: unknown = Object.create(null) as Record<string, never>
+    const client = createMockSdkClient({sessionMessagesResponse: {data: payload}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'object',
+    })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({sessionMessagesResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await getSessionMessages(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages returned a non-array payload', {
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
+  })
 })
 
 describe('getSessionTodos', () => {
@@ -398,6 +575,18 @@ describe('getSessionTodos', () => {
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos failed', expect.any(Object))
   })
 
+  it('does not throw when the failure payload cannot be coerced to a string', async () => {
+    // #given a payload whose own toString is not callable
+    const client = createMockSdkClient({sessionTodosResponse: {error: unprintableErrorPayload(), data: null}})
+
+    // #when
+    const result = await getSessionTodos(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then no throw, fallback message logged
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos failed', {error: '[unprintable error]'})
+  })
+
   it('returns empty array and warns when the payload is not an array', async () => {
     // #given: same structurally-unexpected-but-not-an-error shape as the other call sites in this
     // file — the guard is hoisted here (from mapSdkTodos's own defensive check) since a logger is
@@ -411,8 +600,22 @@ describe('getSessionTodos', () => {
     expect(result).toEqual([])
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos returned a non-array payload', {
       type: 'object',
-      constructor: 'Object',
     })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({sessionTodosResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await getSessionTodos(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos returned a non-array payload', {
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
   })
 })
 
@@ -453,7 +656,37 @@ describe('findLatestSession', () => {
     expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
       source: 'findLatestSession',
       type: 'object',
-      constructor: 'Object',
+    })
+  })
+
+  it('does not leak a payload-owned constructor name into the warning', async () => {
+    // #given a payload-owned constructor key
+    const client = createMockSdkClient({sessionListResponse: {data: sentinelPayload()}})
+
+    // #when
+    const result = await findLatestSession(client as unknown as SessionClient, '/workspace', 4000, mockLogger)
+
+    // #then intrinsic type only
+    expect(result).toBeNull()
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list returned a non-array payload', {
+      source: 'findLatestSession',
+      type: 'object',
+    })
+    expect(JSON.stringify(vi.mocked(mockLogger.warning).mock.calls)).not.toContain(CONSTRUCTOR_SENTINEL)
+  })
+
+  it('does not throw when the failure payload cannot be coerced to a string', async () => {
+    // #given a payload whose own toString is not callable
+    const client = createMockSdkClient({sessionListResponse: {error: unprintableErrorPayload(), data: null}})
+
+    // #when
+    const result = await findLatestSession(client as unknown as SessionClient, '/workspace', 4000, mockLogger)
+
+    // #then no throw, fallback message logged
+    expect(result).toBeNull()
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list failed', {
+      source: 'findLatestSession',
+      error: '[unprintable error]',
     })
   })
 
@@ -498,5 +731,19 @@ describe('deleteSession', () => {
       'SDK session delete failed',
       expect.objectContaining({sessionID: 'ses_missing'}),
     )
+  })
+
+  it('does not throw when the failure payload cannot be coerced to a string', async () => {
+    // #given a payload whose own toString is not callable
+    const client = createMockSdkClient({sessionDeleteResponse: {error: unprintableErrorPayload()}})
+
+    // #when
+    await expect(deleteSession(client as unknown as SessionClient, 'ses_sdk', mockLogger)).resolves.toBeUndefined()
+
+    // #then no throw, fallback message logged
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session delete failed', {
+      sessionID: 'ses_sdk',
+      error: '[unprintable error]',
+    })
   })
 })
