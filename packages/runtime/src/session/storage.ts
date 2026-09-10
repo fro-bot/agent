@@ -1,6 +1,7 @@
 import type {SessionClient} from './backend.js'
 import type {Logger, Message, SessionInfo, TodoItem} from './types.js'
 
+import {toErrorMessage} from '../shared/errors.js'
 import {mapSdkSessionToSessionInfo, mapSdkTodos} from './storage-mappers.js'
 import {mapSdkMessages} from './storage-message-mappers.js'
 
@@ -24,7 +25,7 @@ export async function listSessionsForProject(
     return response.data.map(mapSdkSessionToSessionInfo)
   }
 
-  logger.warning('SDK session list failed', {source: 'listSessionsForProject', error: String(response.error)})
+  logger.warning('SDK session list failed', {source: 'listSessionsForProject', error: toErrorMessage(response.error)})
   return []
 }
 
@@ -35,7 +36,7 @@ export async function getSession(
 ): Promise<SessionInfo | null> {
   const response = await client.session.get({path: {id: sessionID}})
   if (response.error != null || response.data == null) {
-    logger.warning('SDK session get failed', {error: String(response.error)})
+    logger.warning('SDK session get failed', {error: toErrorMessage(response.error)})
     return null
   }
 
@@ -58,7 +59,7 @@ export async function getSessionMessages(
     return mapSdkMessages(response.data)
   }
 
-  logger.warning('SDK session messages failed', {error: String(response.error)})
+  logger.warning('SDK session messages failed', {error: toErrorMessage(response.error)})
   return []
 }
 
@@ -82,7 +83,7 @@ export async function getSessionTodos(
     return mapSdkTodos(response.data)
   }
 
-  logger.warning('SDK session todos failed', {error: String(response.error)})
+  logger.warning('SDK session todos failed', {error: toErrorMessage(response.error)})
   return []
 }
 
@@ -96,7 +97,7 @@ export async function findLatestSession(
     query: {directory: workspacePath, start: afterTimestamp, roots: true, limit: 10} as Record<string, unknown>,
   })
   if (response.error != null || response.data == null) {
-    logger.warning('SDK session list failed', {source: 'findLatestSession', error: String(response.error)})
+    logger.warning('SDK session list failed', {source: 'findLatestSession', error: toErrorMessage(response.error)})
     return null
   }
   if (!Array.isArray(response.data)) {
@@ -120,7 +121,7 @@ export async function findLatestSession(
 export async function deleteSession(client: SessionClient, sessionID: string, logger: Logger): Promise<void> {
   const response = await client.session.delete({path: {id: sessionID}})
   if (response.error != null) {
-    logger.warning('SDK session delete failed', {sessionID, error: String(response.error)})
+    logger.warning('SDK session delete failed', {sessionID, error: toErrorMessage(response.error)})
     return
   }
 

@@ -2,6 +2,7 @@ import type {SessionClient} from './backend.js'
 import type {Logger, ProjectInfo} from './types.js'
 import path from 'node:path'
 
+import {toErrorMessage} from '../shared/errors.js'
 import {isRecord, readString} from './storage-mappers.js'
 
 function normalizeWorkspacePath(workspacePath: string): string {
@@ -24,7 +25,7 @@ export async function listProjectsViaSDK(
   // matching against `worktree` results below, not for what the server expects on this query.
   const response = await client.project.list({query: {directory: workspacePath}})
   if (response.error != null || response.data == null) {
-    logger.warning('SDK project list failed', {error: String(response.error)})
+    logger.warning('SDK project list failed', {error: toErrorMessage(response.error)})
     return []
   }
   if (!Array.isArray(response.data)) {
