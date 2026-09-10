@@ -86,6 +86,33 @@ describe('toErrorMessage', () => {
     // #then
     expect(result).toBe('[unprintable error]')
   })
+
+  it('preserves a custom toString instead of falling back', () => {
+    // #given: a valid custom coercion, not a broken one -- the fallback must not fire here
+    const error = {toString: () => 'custom'}
+
+    // #when
+    const result = toErrorMessage(error)
+
+    // #then
+    expect(result).toBe('custom')
+  })
+
+  it('returns the fallback when reading Error.message throws', () => {
+    // #given
+    const error = new Error('base')
+    Object.defineProperty(error, 'message', {
+      get() {
+        throw new Error('message getter boom')
+      },
+    })
+
+    // #when
+    const result = toErrorMessage(error)
+
+    // #then
+    expect(result).toBe('[unprintable error]')
+  })
 })
 
 describe('toError', () => {
