@@ -2,8 +2,10 @@ import type {ActionInputs} from '../../shared/types.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import process from 'node:process'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
+import {err, ok} from '../../shared/types.js'
 
 const mocks = vi.hoisted(() => ({
   setFailed: vi.fn(),
@@ -12,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   parseActionInputs: vi.fn(),
   ensureOpenCodeAvailable: vi.fn(),
   randomUUID: vi.fn(),
+  assertNoPersistedGitCredentials: vi.fn(),
 }))
 
 vi.mock('@actions/core', () => ({
@@ -37,6 +40,13 @@ vi.mock('../config/inputs.js', () => ({
 
 vi.mock('../../features/agent/index.js', () => ({
   ensureOpenCodeAvailable: mocks.ensureOpenCodeAvailable,
+}))
+
+// The real preflight shells out to git; these response-delivery wiring tests don't exercise it —
+// its own real-git behavior is covered exhaustively by git-credential-check.integration.test.ts.
+// Mocked here only, not globally: other suites still exercise the real function.
+vi.mock('../../services/setup/git-credential-check.js', () => ({
+  assertNoPersistedGitCredentials: mocks.assertNoPersistedGitCredentials,
 }))
 
 vi.mock('../../shared/logger.js', () => ({
@@ -104,6 +114,7 @@ describe('runBootstrap response-delivery wiring', () => {
       didSetup: false,
       version: '1.0.0',
     })
+    mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
   })
 
   afterEach(async () => {
@@ -371,5 +382,120 @@ describe('runBootstrap response-delivery wiring', () => {
       path.join(workspaceDir, 'fro-bot-response', '555-2', 'absent-parent-nonce.md'),
     ])
     await expect(fs.stat(workspaceDir)).rejects.toMatchObject({code: 'ENOENT'})
+  })
+})
+
+describe('runBootstrap git-credential-check wiring', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    runnerTempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-bootstrap-test-'))
+    vi.stubEnv('RUNNER_TEMP', runnerTempDir)
+    vi.stubEnv('GITHUB_RUN_ID', '555')
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '2')
+    mocks.randomUUID.mockReturnValue('test-nonce')
+
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs()})
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({
+      didSetup: false,
+      version: '1.0.0',
+    })
+    mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
+  })
+
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+    await fs.rm(runnerTempDir, {recursive: true, force: true})
+  })
+
+  it('calls the real-boundary credential check with the resolved workspace and phase logger for an affected withhold trigger (issues)', async () => {
+    // #given an affected trigger (credential withheld regardless of responseMode) with an explicit workspace
+    mocks.githubContext.eventName = 'issues'
+    const workspaceDir = path.join(runnerTempDir, 'repo')
+    vi.stubEnv('GITHUB_WORKSPACE', workspaceDir)
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    const result = await runBootstrap(createMockLogger())
+
+    // #then the mocked boundary was called once with an exec-adapter-shaped object, the resolved
+    // workspace, and the exact phase logger instance bootstrap returns
+    expect(result).not.toBeNull()
+    expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledTimes(1)
+    expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledWith(
+      expect.objectContaining({exec: expect.any(Function) as unknown, getExecOutput: expect.any(Function) as unknown}),
+      workspaceDir,
+      result?.logger,
+    )
+  })
+
+  it('passes process.cwd() as the workspace when GITHUB_WORKSPACE is unset', async () => {
+    // #given an affected trigger with no GITHUB_WORKSPACE in the environment
+    mocks.githubContext.eventName = 'issues'
+    vi.stubEnv('GITHUB_WORKSPACE', undefined)
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+    const expectedCwd = process.cwd()
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    const result = await runBootstrap(createMockLogger())
+
+    // #then the production `?? process.cwd()` fallback is exercised, not a nonexistent path
+    expect(result).not.toBeNull()
+    expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledWith(
+      expect.anything(),
+      expectedCwd,
+      expect.anything(),
+    )
+  })
+
+  it('fails closed, sets core.setFailed, and never calls ensureOpenCodeAvailable when the credential check denies', async () => {
+    // #given the credential check reports a static denial
+    mocks.githubContext.eventName = 'issues'
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+    mocks.assertNoPersistedGitCredentials.mockResolvedValue(err('static denial reason'))
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    const result = await runBootstrap(createMockLogger())
+
+    // #then bootstrap aborts before ever reaching OpenCode setup
+    expect(result).toBeNull()
+    expect(mocks.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining('Refusing to proceed with credential withheld: static denial reason') as string,
+    )
+    expect(mocks.ensureOpenCodeAvailable).not.toHaveBeenCalled()
+  })
+
+  it('skips the credential check entirely for a provisioned (autonomous) trigger', async () => {
+    // #given workflow_dispatch, which provisions the credential rather than withholding it
+    mocks.githubContext.eventName = 'workflow_dispatch'
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    const result = await runBootstrap(createMockLogger())
+
+    // #then the boundary is never invoked when nothing needs withholding
+    expect(result).not.toBeNull()
+    expect(mocks.assertNoPersistedGitCredentials).not.toHaveBeenCalled()
+  })
+
+  it('still runs the credential check for an affected trigger even when responseMode is none', async () => {
+    // #given an affected trigger with responseMode none — delivery is 'none' but credential stays withheld
+    mocks.githubContext.eventName = 'issues'
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'none'})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    const result = await runBootstrap(createMockLogger())
+
+    // #then delivery is none, but the withhold-driven credential check still ran
+    expect(result).not.toBeNull()
+    expect(result?.delivery).toBe('none')
+    expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledTimes(1)
   })
 })

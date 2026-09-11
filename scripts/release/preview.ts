@@ -45,8 +45,24 @@ function parseConventionalCommit(message: string): ParsedCommit | null {
 }
 
 function resolveReleaseTypeForParsedCommit(parsed: ParsedCommit): ReleaseType {
+  // Explicit suppressions win over the breaking marker. This mirrors .releaserc.yaml's
+  // analyzeCommits.releaseRules: `breaking: true` is listed first, but the scoped `build(dev)`
+  // and `skip` suppression rules are evaluated after it and win on a match (confirmed against the
+  // real @semantic-release/commit-analyzer -- see scripts/release/release-policy.test.ts).
+  if (parsed.type === 'build' && parsed.scope === 'dev') {
+    return 'none'
+  }
+
+  if (parsed.type === 'skip') {
+    return 'none'
+  }
+
+  // Project policy: this project stays 0.x, so a breaking change is a minor bump, never major
+  // (0.110.x -> 0.111.0, not 1.0.0). BREAKING CHANGE notes are unaffected by this -- they come
+  // from @semantic-release/release-notes-generator, which reads commit notes independently of
+  // analyzeCommits.releaseRules.
   if (parsed.isBreakingHeader || BREAKING_CHANGE_PATTERN.test(parsed.body)) {
-    return 'major'
+    return 'minor'
   }
 
   if (parsed.type === 'feat' || parsed.type === 'features') {
@@ -58,7 +74,7 @@ function resolveReleaseTypeForParsedCommit(parsed: ParsedCommit): ReleaseType {
   }
 
   if (parsed.type === 'build') {
-    return parsed.scope === 'dev' ? 'none' : 'patch'
+    return 'patch'
   }
 
   if (parsed.type === 'docs') {
@@ -70,8 +86,7 @@ function resolveReleaseTypeForParsedCommit(parsed: ParsedCommit): ReleaseType {
     parsed.type === 'ci' ||
     parsed.type === 'style' ||
     parsed.type === 'refactor' ||
-    parsed.type === 'test' ||
-    parsed.type === 'skip'
+    parsed.type === 'test'
   ) {
     return 'none'
   }

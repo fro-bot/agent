@@ -22,6 +22,12 @@ plugins:
 
 analyzeCommits:
   releaseRules:
+    # This project stays 0.x: a breaking change is a minor bump, never major (0.110.x -> 0.111.0,
+    # not 1.0.0). Listed first so the scoped suppression rules below still win when a breaking
+    # commit also matches one of them (confirmed against @semantic-release/commit-analyzer's
+    # actual rule-matching order in scripts/release/release-policy.test.ts).
+    - breaking: true
+      release: minor
     - type: build
       release: patch
     - type: build
