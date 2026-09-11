@@ -24,7 +24,7 @@ describe('analyzeReleaseType', () => {
     expect(result).toBe('minor')
   })
 
-  it('returns major for bang marker', () => {
+  it('returns minor for bang marker (project stays 0.x: breaking means minor, not major)', () => {
     // #given
     const messages = ['feat!: breaking']
 
@@ -32,10 +32,10 @@ describe('analyzeReleaseType', () => {
     const result = analyzeReleaseType(messages)
 
     // #then
-    expect(result).toBe('major')
+    expect(result).toBe('minor')
   })
 
-  it('returns major for BREAKING CHANGE footer', () => {
+  it('returns minor for BREAKING CHANGE footer (project stays 0.x: breaking means minor, not major)', () => {
     // #given
     const messages = ['fix: one\n\nBREAKING CHANGE: details']
 
@@ -43,7 +43,51 @@ describe('analyzeReleaseType', () => {
     const result = analyzeReleaseType(messages)
 
     // #then
-    expect(result).toBe('major')
+    expect(result).toBe('minor')
+  })
+
+  it('returns minor for a breaking build(deps) commit', () => {
+    // #given
+    const messages = ['build(deps)!: bump breaking dep\n\nBREAKING CHANGE: dep breaks']
+
+    // #when
+    const result = analyzeReleaseType(messages)
+
+    // #then
+    expect(result).toBe('minor')
+  })
+
+  it('returns minor for a breaking docs(readme) commit', () => {
+    // #given
+    const messages = ['docs(readme)!: breaking readme change\n\nBREAKING CHANGE: readme breaks']
+
+    // #when
+    const result = analyzeReleaseType(messages)
+
+    // #then
+    expect(result).toBe('minor')
+  })
+
+  it('returns none for a breaking build(dev) commit (explicit suppression outranks the breaking marker)', () => {
+    // #given
+    const messages = ['build(dev)!: breaking dev tooling\n\nBREAKING CHANGE: dev breaks']
+
+    // #when
+    const result = analyzeReleaseType(messages)
+
+    // #then
+    expect(result).toBe('none')
+  })
+
+  it('returns none for a breaking skip commit (explicit suppression outranks the breaking marker)', () => {
+    // #given
+    const messages = ['skip!: breaking skip\n\nBREAKING CHANGE: skip breaks']
+
+    // #when
+    const result = analyzeReleaseType(messages)
+
+    // #then
+    expect(result).toBe('none')
   })
 
   it('returns none for chore commits', () => {
@@ -152,12 +196,23 @@ describe('computeNextVersion', () => {
     expect(result).toBe('0.31.0')
   })
 
-  it("bumps major for computeNextVersion('0.30.10', 'major')", () => {
-    // #given / #when
+  it("bumps to 1.0.0 for computeNextVersion('0.30.10', 'major') as ordinary semver arithmetic", () => {
+    // #given: resolveReleaseTypeForParsedCommit never selects 'major' for a 0.x breaking commit
+    // (see analyzeReleaseType tests above) -- this only exercises computeNextVersion's own
+    // arithmetic for a 'major' input directly, matching the real semver increment.
+    // #when
     const result = computeNextVersion('0.30.10', 'major')
 
     // #then
     expect(result).toBe('1.0.0')
+  })
+
+  it("still bumps a real major for computeNextVersion('1.2.3', 'major') once past 0.x", () => {
+    // #given / #when
+    const result = computeNextVersion('1.2.3', 'major')
+
+    // #then
+    expect(result).toBe('2.0.0')
   })
 
   it("returns null for computeNextVersion('0.30.10', 'none')", () => {
