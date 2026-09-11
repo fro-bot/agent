@@ -201,6 +201,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || '' }}
           token: ${{ secrets.FRO_BOT_PAT }}
+          persist-credentials: ${{ github.event_name != 'pull_request' }}
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup

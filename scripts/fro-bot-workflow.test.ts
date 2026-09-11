@@ -42,6 +42,7 @@ type ExpressionValue = boolean | string
 
 const WORKFLOW_PATH = process.env.FRO_BOT_WORKFLOW_TEST_PATH ?? '.github/workflows/fro-bot.yaml'
 const HARNESS_INTEGRATE_WORKFLOW_PATH = '.github/workflows/harness-integrate.yaml'
+const CI_WORKFLOW_PATH = '.github/workflows/ci.yaml'
 const REPOSITORY = 'fro-bot/agent'
 const DIRECT_REF = 'refs/heads/main'
 const DIRECT_WORKFLOW_REF = `${REPOSITORY}/.github/workflows/fro-bot.yaml@${DIRECT_REF}`
@@ -666,5 +667,43 @@ describe('harness integration workflow wiring', () => {
         false,
       )
     }
+  })
+})
+
+// Bounded to this one known expression form; not a general GHA expression evaluator.
+function parseNotEqualsEventName(expression: string): string {
+  const match = /^github\.event_name != '([^']*)'$/.exec(expression)
+  if (match === null) {
+    throw new TypeError(`unsupported persist-credentials expression: ${expression}`)
+  }
+  return match[1] ?? ''
+}
+
+describe('CI workflow: Test GitHub Action checkout', () => {
+  it('disables persisted checkout credentials only for pull_request, preserving other triggers', () => {
+    // #given the checkout step in the test-action job's own PAT-authenticated checkout
+    const steps = stepsFor(CI_WORKFLOW_PATH, 'test-action')
+    const checkout = steps.find(step => step.name === 'Checkout repository')
+    if (checkout === undefined) throw new TypeError('test-action Checkout repository step is missing')
+    const checkoutWith = checkout.with as Record<string, unknown>
+    const persistCredentialsExpression = expressionFrom(
+      checkoutWith['persist-credentials'],
+      'test-action persist-credentials',
+    )
+
+    // #then the expression withholds persistence for exactly one event
+    const excludedEvent = parseNotEqualsEventName(persistCredentialsExpression)
+    expect(excludedEvent).toBe('pull_request')
+
+    // #then the CI trigger set: pull_request is withheld, every other trigger is preserved
+    const ciTriggers = ['pull_request', 'merge_group', 'push', 'workflow_dispatch']
+    for (const eventName of ciTriggers) {
+      const persists = eventName !== excludedEvent
+      expect(persists, `persist-credentials for ${eventName}`).toBe(eventName !== 'pull_request')
+    }
+
+    // #then the existing ref/token wiring for this checkout is unchanged
+    expect(checkoutWith.token).toBe('${' + '{ secrets.FRO_BOT_PAT }}')
+    expect(checkoutWith.ref).toBe('${' + "{ github.event.pull_request.head.sha || '' }}")
   })
 })
