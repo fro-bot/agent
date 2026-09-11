@@ -16,20 +16,32 @@ const ERR_HEADER_FOUND =
   'for other host-level config that injects an HTTP auth header'
 
 const ERR_CONFIG_VERIFICATION_FAILED =
-  'Unable to verify the effective git config carries no persisted credential header on a withhold run — set ' +
-  'persist-credentials: false on actions/checkout'
+  'Git config verification could not complete on a withhold run — fix the git config error in the checkout ' +
+  '(e.g. a malformed config file) before retrying'
 
 const ERR_REPO_CONTEXT_VERIFICATION_FAILED =
-  'Unable to verify the git repository context for a persisted-credential check on a withhold run — set ' +
-  'persist-credentials: false on actions/checkout'
+  'Git repository context verification could not complete on a withhold run — fix the git repository state ' +
+  '(e.g. an invalid GIT_DIR, or an unsafe/unreadable repository) before retrying'
 
 const ERR_ORIGIN_EMBEDDED_CREDENTIAL =
   'Persisted git credential found embedded in the origin remote URL on a withhold run — ' +
   'set persist-credentials: false on actions/checkout'
 
 const ERR_ORIGIN_VERIFICATION_FAILED =
-  'Unable to verify the origin remote for a persisted-credential check on a withhold run — ' +
-  'set persist-credentials: false on actions/checkout'
+  'Git origin remote verification could not complete on a withhold run — fix the git remote configuration ' +
+  'before retrying'
+
+/**
+ * True only when exactly one `fatal:`-prefixed line is present and it is the canonical
+ * no-repository message, matched at line start (not `.includes` across the whole blob, which an
+ * unrelated line could contain as an inline substring). Lines are split on LF/CRLF so a benign
+ * warning line preceding the real fatal (e.g. an advice/hint line) doesn't defeat the match. More
+ * than one `fatal:` line is ambiguous and fails closed rather than picking one.
+ */
+function isCanonicalNonRepositoryStderr(stderr: string): boolean {
+  const [fatalLine, ...otherFatalLines] = stderr.split(/\r\n|\n/).filter(line => line.startsWith('fatal:'))
+  return fatalLine !== undefined && otherFatalLines.length === 0 && fatalLine.startsWith(NOT_A_REPOSITORY_STDERR_PREFIX)
+}
 
 /**
  * True for the one infrastructure state where this check cannot run at all: git itself is not
@@ -75,6 +87,9 @@ export async function assertNoPersistedGitCredentials(
   workspaceDir: string,
   logger: Logger,
 ): Promise<Result<void, string>> {
+  // Config before repo probe: host-level (global/system) headers apply even outside a repository,
+  // so that scope is worth checking first. The repo probe then catches unsafe/unreadable repo
+  // states a config query alone can silently report as a plain "no match" for.
   let configResult
   try {
     configResult = await execAdapter.getExecOutput(
@@ -97,7 +112,9 @@ export async function assertNoPersistedGitCredentials(
     return err(ERR_HEADER_FOUND)
   }
   if (configResult.exitCode !== 1 || configResult.stdout.trim().length > 0) {
-    logger.warning('git-credential-check: effective config check returned an unexpected result, denying')
+    logger.warning('git-credential-check: effective config check returned an unexpected result, denying', {
+      exitCode: configResult.exitCode,
+    })
     return err(ERR_CONFIG_VERIFICATION_FAILED)
   }
 
@@ -114,14 +131,16 @@ export async function assertNoPersistedGitCredentials(
     return err(ERR_REPO_CONTEXT_VERIFICATION_FAILED)
   }
 
-  if (repoContextResult.exitCode === 128 && repoContextResult.stderr.startsWith(NOT_A_REPOSITORY_STDERR_PREFIX)) {
+  if (repoContextResult.exitCode === 128 && isCanonicalNonRepositoryStderr(repoContextResult.stderr)) {
     logger.warning(
       'git-credential-check: workspace is not a git repository — origin check skipped (effective config check already ran and found no header)',
     )
     return ok(undefined)
   }
   if (repoContextResult.exitCode !== 0 || repoContextResult.stdout.trim().length === 0) {
-    logger.warning('git-credential-check: repository context check returned an unexpected result, denying')
+    logger.warning('git-credential-check: repository context check returned an unexpected result, denying', {
+      exitCode: repoContextResult.exitCode,
+    })
     return err(ERR_REPO_CONTEXT_VERIFICATION_FAILED)
   }
 
@@ -144,7 +163,9 @@ export async function assertNoPersistedGitCredentials(
     return hasEmbeddedCredential(remoteResult.stdout.trim()) ? err(ERR_ORIGIN_EMBEDDED_CREDENTIAL) : ok(undefined)
   }
 
-  logger.warning('git-credential-check: origin remote check returned an unexpected result, denying')
+  logger.warning('git-credential-check: origin remote check returned an unexpected result, denying', {
+    exitCode: remoteResult.exitCode,
+  })
   return err(ERR_ORIGIN_VERIFICATION_FAILED)
 }
 

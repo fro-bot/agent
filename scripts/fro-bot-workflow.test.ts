@@ -2,6 +2,8 @@ import {readFileSync} from 'node:fs'
 import {describe, expect, it} from 'vitest'
 import {parse} from 'yaml'
 
+import {resolveResponseDelivery} from '../packages/runtime/src/agent/response-delivery.js'
+
 interface WorkflowStep {
   readonly id?: string
   readonly name?: string
@@ -679,6 +681,16 @@ function parseNotEqualsEventName(expression: string): string {
   return match[1] ?? ''
 }
 
+// The oracle for which triggers this workflow can actually fire under is the workflow's own
+// declared `on:` map, never a list re-typed by hand here (which would silently drift from it).
+function declaredTriggers(workflowPath: string): readonly string[] {
+  const on = loadRawWorkflow(workflowPath).on
+  if (on === null || typeof on !== 'object' || Array.isArray(on)) {
+    throw new TypeError(`${workflowPath} 'on' triggers must be a mapping`)
+  }
+  return Object.keys(on)
+}
+
 describe('CI workflow: Test GitHub Action checkout', () => {
   it('disables persisted checkout credentials only for pull_request, preserving other triggers', () => {
     // #given the checkout step in the test-action job's own PAT-authenticated checkout
@@ -695,11 +707,15 @@ describe('CI workflow: Test GitHub Action checkout', () => {
     const excludedEvent = parseNotEqualsEventName(persistCredentialsExpression)
     expect(excludedEvent).toBe('pull_request')
 
-    // #then the CI trigger set: pull_request is withheld, every other trigger is preserved
-    const ciTriggers = ['pull_request', 'merge_group', 'push', 'workflow_dispatch']
-    for (const eventName of ciTriggers) {
-      const persists = eventName !== excludedEvent
-      expect(persists, `persist-credentials for ${eventName}`).toBe(eventName !== 'pull_request')
+    // #then for every trigger this workflow actually declares, the YAML expression's persist
+    // decision must match the real credential policy in response-delivery.ts -- not a literal
+    // re-assertion of the same expression, and not a hand-maintained trigger list as the oracle.
+    for (const eventName of declaredTriggers(CI_WORKFLOW_PATH)) {
+      const yamlPersists = eventName !== excludedEvent
+      const policyProvisions = resolveResponseDelivery(eventName, 'github').credential === 'provision'
+      expect(yamlPersists, `persist-credentials for ${eventName} must match the response-delivery policy`).toBe(
+        policyProvisions,
+      )
     }
 
     // #then the existing ref/token wiring for this checkout is unchanged

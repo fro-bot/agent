@@ -143,6 +143,36 @@ describe('assertNoPersistedGitCredentials', () => {
     expect(result.success === false && result.error).not.toContain('does not exist')
   })
 
+  it('denies when the first config check throws a non-Error string, without treating it as the trusted missing-git shape', async () => {
+    // #given a thrown value that is not an `Error` instance at all
+    const execAdapter: ExecAdapter = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockRejectedValue('boom'),
+    }
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
+
+    // #then non-Error throws are denied, never reflected
+    expect(result.success).toBe(false)
+    expect(result.success === false && result.error).not.toContain('boom')
+  })
+
+  it('denies when the first config check throws a plain object mimicking a missing-git Error (message/code but not instanceof Error)', async () => {
+    // #given an object shaped like the trusted missing-git error but not an actual `Error`
+    const impostor = {message: 'Unable to locate executable file: git.', code: 'ENOENT'}
+    const execAdapter: ExecAdapter = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockRejectedValue(impostor),
+    }
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
+
+    // #then only a real `Error` instance qualifies for the fail-open exemption — an impostor denies
+    expect(result.success).toBe(false)
+  })
+
   it('denies when the config check returns an unexpected exit code (verification failed, not proof of absence)', async () => {
     // #given a malformed config produces exit 128, neither the match(0) nor no-match(1) case
     const {execAdapter} = createRoutedExecAdapter({
@@ -152,9 +182,12 @@ describe('assertNoPersistedGitCredentials', () => {
     // #when
     const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
 
-    // #then never fail open on an unexpected result
+    // #then never fail open on an unexpected result, and never misdiagnose as a found credential
     expect(result.success).toBe(false)
     expect(result.success === false && result.error).not.toContain('.git/config')
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
+    expect(result.success === false && result.error).not.toContain('found')
+    expect(mockLogger.warning).toHaveBeenCalledWith(expect.any(String), {exitCode: 128})
   })
 
   it('denies when exit code 0 unexpectedly has empty stdout', async () => {
@@ -166,8 +199,11 @@ describe('assertNoPersistedGitCredentials', () => {
     // #when
     const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
 
-    // #then
+    // #then a numeric, non-sensitive exit code is attached; the wording never claims a credential was found
     expect(result.success).toBe(false)
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
+    expect(result.success === false && result.error).not.toContain('found')
+    expect(mockLogger.warning).toHaveBeenCalledWith(expect.any(String), {exitCode: 0})
   })
 
   it('allows with a warning for the canonical non-repository workspace exception', async () => {
@@ -198,9 +234,13 @@ describe('assertNoPersistedGitCredentials', () => {
     // #when
     const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
 
-    // #then fail closed — this is a real repo-context problem, not proven absence
+    // #then fail closed — this is a real repo-context problem, not proven absence, and the
+    // remediation must not claim a credential was found
     expect(result.success).toBe(false)
     expect(result.success === false && result.error).not.toContain('/bad/gitdir')
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
+    expect(result.success === false && result.error).not.toContain('found')
+    expect(mockLogger.warning).toHaveBeenCalledWith(expect.any(String), {exitCode: 128})
   })
 
   it('denies for an unknown 128 exit or dubious-ownership style failure at the repo-context stage', async () => {
@@ -213,6 +253,101 @@ describe('assertNoPersistedGitCredentials', () => {
     const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
 
     // #then
+    expect(result.success).toBe(false)
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
+    expect(mockLogger.warning).toHaveBeenCalledWith(expect.any(String), {exitCode: 128})
+  })
+
+  it('allows with a warning for the canonical non-repository fatal even when a benign warning line precedes it (LF)', async () => {
+    // #given a leading advice/warning line before the real fatal — the whole blob does not start
+    // with the canonical prefix, but the fatal line itself does
+    const {execAdapter} = createRoutedExecAdapter({
+      revParse: {
+        exitCode: 128,
+        stdout: '',
+        stderr: 'hint: something unrelated\nfatal: not a git repository (or any of the parent directories): .git\n',
+      },
+    })
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(mockLogger.warning).toHaveBeenCalled()
+  })
+
+  it('allows with a warning for the canonical non-repository fatal even when a benign warning line precedes it (CRLF)', async () => {
+    // #given the same shape with CRLF line endings
+    const {execAdapter} = createRoutedExecAdapter({
+      revParse: {
+        exitCode: 128,
+        stdout: '',
+        stderr: 'hint: something unrelated\r\nfatal: not a git repository (or any of the parent directories): .git\r\n',
+      },
+    })
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+
+  it('denies when an inline impostor of the canonical phrase (not at line start) precedes a genuinely different invalid-GIT_DIR fatal', async () => {
+    // #given a non-fatal line that happens to contain the canonical phrase mid-line, followed by a
+    // real, different fatal — must not be treated as "broad substring anywhere in stderr"
+    const {execAdapter} = createRoutedExecAdapter({
+      revParse: {
+        exitCode: 128,
+        stdout: '',
+        stderr:
+          'note: unrelated text mentioning fatal: not a git repository (or any of the parent directories) inline\n' +
+          'fatal: not a git repository: /bad/gitdir\n',
+      },
+    })
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
+
+    // #then fail closed — the real fatal line is not the canonical message
+    expect(result.success).toBe(false)
+  })
+
+  it('denies when an inline impostor of the canonical phrase precedes a dubious-ownership fatal', async () => {
+    // #given
+    const {execAdapter} = createRoutedExecAdapter({
+      revParse: {
+        exitCode: 128,
+        stdout: '',
+        stderr:
+          'note: unrelated text mentioning fatal: not a git repository (or any of the parent directories) inline\n' +
+          'fatal: detected dubious ownership in repository at /workspace\n',
+      },
+    })
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
+
+    // #then
+    expect(result.success).toBe(false)
+  })
+
+  it('denies when two real fatal lines are present, even though one of them is the canonical message (ambiguous, fails closed)', async () => {
+    // #given a contradictory pair of genuine `fatal:`-prefixed lines
+    const {execAdapter} = createRoutedExecAdapter({
+      revParse: {
+        exitCode: 128,
+        stdout: '',
+        stderr:
+          'fatal: not a git repository (or any of the parent directories): .git\n' + 'fatal: something else entirely\n',
+      },
+    })
+
+    // #when
+    const result = await assertNoPersistedGitCredentials(execAdapter, '/workspace', mockLogger)
+
+    // #then more than one fatal line is treated as ambiguous, not as proof of absence
     expect(result.success).toBe(false)
   })
 
@@ -285,6 +420,8 @@ describe('assertNoPersistedGitCredentials', () => {
 
     // #then
     expect(result.success).toBe(false)
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
+    expect(mockLogger.warning).toHaveBeenCalledWith(expect.any(String), {exitCode: 1})
   })
 
   it('denies for an unexpected empty-success result from the origin check', async () => {
@@ -298,6 +435,8 @@ describe('assertNoPersistedGitCredentials', () => {
 
     // #then
     expect(result.success).toBe(false)
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
+    expect(mockLogger.warning).toHaveBeenCalledWith(expect.any(String), {exitCode: 0})
   })
 
   it('denies when the origin check throws', async () => {

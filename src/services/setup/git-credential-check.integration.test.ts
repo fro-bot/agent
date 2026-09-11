@@ -21,8 +21,8 @@ import {assertNoPersistedGitCredentials} from './git-credential-check.js'
 
 const HEADER_FOUND_REASON = 'found in the effective git config'
 const ORIGIN_EMBEDDED_REASON = 'embedded in the origin remote URL'
-const CONFIG_VERIFICATION_REASON = 'verify the effective git config'
-const REPO_CONTEXT_VERIFICATION_REASON = 'verify the git repository context'
+const CONFIG_VERIFICATION_REASON = 'Git config verification could not complete'
+const REPO_CONTEXT_VERIFICATION_REASON = 'Git repository context verification could not complete'
 
 /** Deep-equality assertion: fails loudly (not silently) if `result.success` is unexpectedly `true`. */
 function expectDenied(result: Result<void, string>, reasonSubstring: string): void {
@@ -408,8 +408,9 @@ describe('assertNoPersistedGitCredentials (real git)', () => {
     // #when
     const result = await assertNoPersistedGitCredentials(createIsolatedRealGitAdapter(env), repoDir, createMockLogger())
 
-    // #then
+    // #then a verification failure is not misdiagnosed as a found credential
     expectDenied(result, CONFIG_VERIFICATION_REASON)
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
   })
 
   it('denies a matched but malformed includeIf target file (parse error inside the include)', async () => {
@@ -430,8 +431,9 @@ describe('assertNoPersistedGitCredentials (real git)', () => {
     // #when
     const result = await assertNoPersistedGitCredentials(createIsolatedRealGitAdapter(env), repoDir, createMockLogger())
 
-    // #then
+    // #then a verification failure is not misdiagnosed as a found credential
     expectDenied(result, CONFIG_VERIFICATION_REASON)
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
   })
 
   it('denies a repository subdirectory with a header, for the header reason (proves discovery is not a naive workspace/.git check)', async () => {
@@ -500,7 +502,43 @@ describe('assertNoPersistedGitCredentials (real git)', () => {
     const result = await assertNoPersistedGitCredentials(createIsolatedRealGitAdapter(env), workDir, createMockLogger())
 
     // #then fail closed at the repo-context stage specifically — this is a real error, not the
-    // canonical "not a git repository" exception
+    // canonical "not a git repository" exception, and never misdiagnosed as a found credential
     expectDenied(result, REPO_CONTEXT_VERIFICATION_REASON)
+    expect(result.success === false && result.error).not.toContain('persist-credentials: false')
+  })
+
+  it('allows a clean parent repo with an unrelated header-carrying child repo nested inside it (documents the non-recursive bound)', async () => {
+    // #given a clean parent repo, and a fully independent nested child repo (its own `.git`) with
+    // a header — nested/submodule-style discovery is explicitly out of scope for this check
+    const homeDir = await mkTempDir('git-cred-check-home-')
+    const xdgDir = await mkTempDir('git-cred-check-xdg-')
+    const env = isolatedEnv(homeDir, xdgDir)
+    const parentRepoDir = await initRepo(env)
+    const childRepoDir = path.join(parentRepoDir, 'nested', 'child')
+    await fs.mkdir(childRepoDir, {recursive: true})
+    await run('git', ['init', '-q'], childRepoDir, env)
+    await run(
+      'git',
+      ['config', '--local', 'http.https://github.test/.extraheader', 'AUTHORIZATION: basic Y2hpbGQ='],
+      childRepoDir,
+      env,
+    )
+
+    // #when checked independently
+    const parentResult = await assertNoPersistedGitCredentials(
+      createIsolatedRealGitAdapter(env),
+      parentRepoDir,
+      createMockLogger(),
+    )
+    const childResult = await assertNoPersistedGitCredentials(
+      createIsolatedRealGitAdapter(env),
+      childRepoDir,
+      createMockLogger(),
+    )
+
+    // #then the parent check never descends into the nested child repo's config; the child check,
+    // run against its own workspace, independently finds its own header
+    expect(parentResult.success).toBe(true)
+    expectDenied(childResult, HEADER_FOUND_REASON)
   })
 })
