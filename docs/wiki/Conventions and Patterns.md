@@ -1,9 +1,11 @@
 ---
 type: convention
-last-updated: "2026-08-30"
-updated-by: "schedule-d7190410-33338713321"
+last-updated: "2026-09-07"
+updated-by: "schedule-d7190410-34062354146"
 sources:
   - AGENTS.md
+  - src/shared/cache-save-result.ts
+  - src/services/cache/checkpoint.ts
   - scripts/module-taxonomy.test.ts
   - scripts/harness-tag-derivation.test.ts
   - packages/runtime/src/shared/logger.ts
@@ -64,6 +66,16 @@ The `!` operator is only allowed on actual `boolean` types. This eliminates an e
 Recoverable errors use `Result<T, E>` from `@bfra.me/es` rather than exceptions. This makes error handling explicit at the type level — callers must check the result before accessing the value.
 
 Exceptions are reserved for truly unexpected failures (programmer errors, system failures). SDK operations in the session module take this further: they return empty arrays or `null` on failure, never throwing.
+
+## Named Outcomes Over Booleans
+
+A related habit runs through the operations-facing parts of the codebase: when an operation can end several materially different ways, it returns a named terminal condition rather than a boolean. `CheckpointOutcome` in `src/services/cache/checkpoint.ts` and `CacheSaveResult` in `src/shared/cache-save-result.ts` are the reference examples.
+
+The motivation is consistent. A boolean forces "deliberately skipped", "denied by the platform", and "succeeded" onto two poles, which destroys the distinction exactly where an operator most needs it — in a job summary or an action output, after the fact, with no way to re-observe the run. The replacement typically pairs one or more structural axes with a named outcome: `CacheSaveResult` carries `cachePersisted` and `storePersisted` as independent facts, plus an `outcome` naming the condition that produced them.
+
+Two supporting practices travel with the pattern. Mappings from an outcome union to some other representation are pinned with `satisfies Record<Outcome, ...>`, so adding a new outcome without handling it fails `check-types` rather than silently mapping to nothing. And where a value crosses a process boundary and is read back as a string — the action-state handoff between the main step and the post hook — parsing is defensive in a stated direction: an absent or unrecognized value maps to the outcome that causes the work to be retried, never the one that causes it to be skipped, because the reader is the last chance to do the work.
+
+Comments in these modules also distinguish inference from observation. `cache-save-result.ts` states explicitly that `cache-rejected` covers several causes because the API boundary cannot tell them apart, not because one was determined over the others — and warns against inferring the cause from surrounding signals. Documenting the limits of what a value proves is treated as part of defining it.
 
 ## NormalizedEvent
 
