@@ -1,44 +1,128 @@
 import type {Result} from '../../shared/types.js'
 import type {ExecAdapter, Logger} from './types.js'
 
+import process from 'node:process'
 import {err, ok} from '../../shared/types.js'
 
+/** Matches `http.<url-subsection>.extraheader`, with or without a URL subsection. */
+const EXTRAHEADER_REGEXP = String.raw`^http\.(.*\.)?extraheader$`
+
+/** Canonical (English-locale) prefix `rev-parse` writes when the workspace has no repository. */
+const NOT_A_REPOSITORY_STDERR_PREFIX = 'fatal: not a git repository (or any'
+
+const ERR_HEADER_FOUND =
+  'Persisted git credential found in the effective git config (local, global, system, worktree-scoped, or an ' +
+  'includeIf/include target) on a withhold run — set persist-credentials: false on actions/checkout, and check ' +
+  'for other host-level config that injects an HTTP auth header'
+
+const ERR_CONFIG_VERIFICATION_FAILED =
+  'Unable to verify the effective git config carries no persisted credential header on a withhold run — set ' +
+  'persist-credentials: false on actions/checkout'
+
+const ERR_REPO_CONTEXT_VERIFICATION_FAILED =
+  'Unable to verify the git repository context for a persisted-credential check on a withhold run — set ' +
+  'persist-credentials: false on actions/checkout'
+
+const ERR_ORIGIN_EMBEDDED_CREDENTIAL =
+  'Persisted git credential found embedded in the origin remote URL on a withhold run — ' +
+  'set persist-credentials: false on actions/checkout'
+
+const ERR_ORIGIN_VERIFICATION_FAILED =
+  'Unable to verify the origin remote for a persisted-credential check on a withhold run — ' +
+  'set persist-credentials: false on actions/checkout'
+
 /**
- * Preflight assertion for withhold runs: the checkout must carry no
- * persisted git credentials before the model starts. Two vectors are
- * checked — a credential helper header (`http.<url>.extraheader`, the form
- * `actions/checkout` writes when `persist-credentials` is left at its
- * default `true`) and an embedded token in the `origin` remote URL.
+ * True for the one infrastructure state where this check cannot run at all: git itself is not
+ * installed. This is a compatibility exemption, not evidence no credential is persisted — it only
+ * means there is no git binary available to look. Matches both the plain `Error` `@actions/io`'s
+ * `which` throws when it cannot resolve the binary on PATH, and an `ENOENT`-coded spawn failure.
+ */
+function isMissingGitError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
+  return error.message.startsWith('Unable to locate executable file: git.')
+}
+
+/**
+ * `process.env` filtered to defined string values, plus a forced `LC_ALL=C` so `rev-parse`'s
+ * stderr wording is locale-stable and safe to prefix-match. Spreads the full environment (not
+ * just `LC_ALL` alone) so the repo-context probe still sees whatever effective git environment
+ * the run already has (`GIT_DIR`, `GIT_CONFIG_*`, etc.) rather than a stripped one.
+ */
+function inheritedEnvWithCLocale(): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[key] = value
+  }
+  env.LC_ALL = 'C'
+  return env
+}
+
+/**
+ * Preflight assertion for withhold runs: the checkout must carry no persisted git credential
+ * before the model starts. Inspects the workspace's *effective* git configuration — local,
+ * global, system, worktree-scoped, and anything pulled in via `include`/`includeIf` — for a
+ * `http.*.extraheader` header, plus the `origin` remote URL for an embedded credential. Does not
+ * enumerate every credential vector (helpers, askpass, netrc, nested/submodule checkouts).
  *
- * Fail-closed on either vector, fail-open on infrastructure absence: no git
- * binary, no repo, or a command error means there is nothing to leak, so
- * that resolves `ok`.
+ * Fails closed on any config error, unreadable repository context, or verification failure. The
+ * only two exceptions — an absent git binary and a genuinely non-repository workspace — are
+ * compatibility exemptions, not proof a credential is absent: they mean part of this check could
+ * not run, and are logged as warnings rather than silently allowed.
  */
 export async function assertNoPersistedGitCredentials(
   execAdapter: ExecAdapter,
   workspaceDir: string,
   logger: Logger,
 ): Promise<Result<void, string>> {
-  let extraheaderResult
+  let configResult
   try {
-    extraheaderResult = await execAdapter.getExecOutput(
+    configResult = await execAdapter.getExecOutput(
       'git',
-      ['config', '--local', '--get-regexp', String.raw`^http\..*\.extraheader$`],
+      ['config', '--includes', '--name-only', '--get-regexp', EXTRAHEADER_REGEXP],
       {cwd: workspaceDir, ignoreReturnCode: true, silent: true},
     )
   } catch (error) {
-    logger.debug('git-credential-check: git unavailable or not a repo, treating as no persisted credentials', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return ok(undefined)
+    if (isMissingGitError(error)) {
+      logger.warning(
+        'git-credential-check: git binary not found — verification skipped, not evidence a credential is absent',
+      )
+      return ok(undefined)
+    }
+    logger.warning('git-credential-check: effective config check threw unexpectedly, denying')
+    return err(ERR_CONFIG_VERIFICATION_FAILED)
   }
 
-  if (extraheaderResult.exitCode === 0 && extraheaderResult.stdout.trim().length > 0) {
-    const matchedKey = extraheaderResult.stdout.trim().split('\n')[0]?.split(' ')[0] ?? 'http.*.extraheader'
-    return err(
-      `Persisted git credential found in local config (${matchedKey}) on a withhold run — ` +
-        `set persist-credentials: false on actions/checkout`,
+  if (configResult.exitCode === 0 && configResult.stdout.trim().length > 0) {
+    return err(ERR_HEADER_FOUND)
+  }
+  if (configResult.exitCode !== 1 || configResult.stdout.trim().length > 0) {
+    logger.warning('git-credential-check: effective config check returned an unexpected result, denying')
+    return err(ERR_CONFIG_VERIFICATION_FAILED)
+  }
+
+  let repoContextResult
+  try {
+    repoContextResult = await execAdapter.getExecOutput('git', ['rev-parse', '--absolute-git-dir'], {
+      cwd: workspaceDir,
+      ignoreReturnCode: true,
+      silent: true,
+      env: inheritedEnvWithCLocale(),
+    })
+  } catch {
+    logger.warning('git-credential-check: repository context check threw unexpectedly, denying')
+    return err(ERR_REPO_CONTEXT_VERIFICATION_FAILED)
+  }
+
+  if (repoContextResult.exitCode === 128 && repoContextResult.stderr.startsWith(NOT_A_REPOSITORY_STDERR_PREFIX)) {
+    logger.warning(
+      'git-credential-check: workspace is not a git repository — origin check skipped (effective config check already ran and found no header)',
     )
+    return ok(undefined)
+  }
+  if (repoContextResult.exitCode !== 0 || repoContextResult.stdout.trim().length === 0) {
+    logger.warning('git-credential-check: repository context check returned an unexpected result, denying')
+    return err(ERR_REPO_CONTEXT_VERIFICATION_FAILED)
   }
 
   let remoteResult
@@ -48,24 +132,20 @@ export async function assertNoPersistedGitCredentials(
       ignoreReturnCode: true,
       silent: true,
     })
-  } catch (error) {
-    logger.debug('git-credential-check: could not read origin remote, treating as no persisted credentials', {
-      error: error instanceof Error ? error.message : String(error),
-    })
+  } catch {
+    logger.warning('git-credential-check: origin remote check threw unexpectedly, denying')
+    return err(ERR_ORIGIN_VERIFICATION_FAILED)
+  }
+
+  if (remoteResult.exitCode === 2) {
     return ok(undefined)
   }
-
-  if (remoteResult.exitCode === 0) {
-    const remoteUrl = remoteResult.stdout.trim()
-    if (hasEmbeddedCredential(remoteUrl)) {
-      return err(
-        'Persisted git credential found embedded in the origin remote URL on a withhold run — ' +
-          'set persist-credentials: false on actions/checkout',
-      )
-    }
+  if (remoteResult.exitCode === 0 && remoteResult.stdout.trim().length > 0) {
+    return hasEmbeddedCredential(remoteResult.stdout.trim()) ? err(ERR_ORIGIN_EMBEDDED_CREDENTIAL) : ok(undefined)
   }
 
-  return ok(undefined)
+  logger.warning('git-credential-check: origin remote check returned an unexpected result, denying')
+  return err(ERR_ORIGIN_VERIFICATION_FAILED)
 }
 
 /**
