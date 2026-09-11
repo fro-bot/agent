@@ -1,6 +1,7 @@
 import type {SessionClient} from './backend.js'
 import type {Logger, Message, SessionInfo, TodoItem} from './types.js'
 
+import {toErrorMessage} from '../shared/errors.js'
 import {mapSdkSessionToSessionInfo, mapSdkTodos} from './storage-mappers.js'
 import {mapSdkMessages} from './storage-message-mappers.js'
 
@@ -11,11 +12,20 @@ export async function listSessionsForProject(
 ): Promise<readonly SessionInfo[]> {
   const response = await client.session.list({query: {directory: workspacePath}})
   if (response.error == null && response.data != null) {
-    if (!Array.isArray(response.data)) return []
+    if (!Array.isArray(response.data)) {
+      // Not the same as "no sessions"; do not log the payload itself.
+      // Log only intrinsic types; payloads can supply their own constructor.name.
+      // Add source only when warning text is shared by multiple functions.
+      logger.warning('SDK session list returned a non-array payload', {
+        source: 'listSessionsForProject',
+        type: typeof response.data,
+      })
+      return []
+    }
     return response.data.map(mapSdkSessionToSessionInfo)
   }
 
-  logger.warning('SDK session list failed', {error: String(response.error)})
+  logger.warning('SDK session list failed', {source: 'listSessionsForProject', error: toErrorMessage(response.error)})
   return []
 }
 
@@ -26,7 +36,7 @@ export async function getSession(
 ): Promise<SessionInfo | null> {
   const response = await client.session.get({path: {id: sessionID}})
   if (response.error != null || response.data == null) {
-    logger.warning('SDK session get failed', {error: String(response.error)})
+    logger.warning('SDK session get failed', {error: toErrorMessage(response.error)})
     return null
   }
 
@@ -40,10 +50,16 @@ export async function getSessionMessages(
 ): Promise<readonly Message[]> {
   const response = await client.session.messages({path: {id: sessionID}})
   if (response.error == null && response.data != null) {
+    if (!Array.isArray(response.data)) {
+      logger.warning('SDK session messages returned a non-array payload', {
+        type: typeof response.data,
+      })
+      return []
+    }
     return mapSdkMessages(response.data)
   }
 
-  logger.warning('SDK session messages failed', {error: String(response.error)})
+  logger.warning('SDK session messages failed', {error: toErrorMessage(response.error)})
   return []
 }
 
@@ -57,10 +73,17 @@ export async function getSessionTodos(
   }
   const response = await sessionClient.todos({path: {id: sessionID}})
   if (response.error == null && response.data != null) {
+    if (!Array.isArray(response.data)) {
+      // Hoisted here since storage-mappers.ts (a pure module) has no logger.
+      logger.warning('SDK session todos returned a non-array payload', {
+        type: typeof response.data,
+      })
+      return []
+    }
     return mapSdkTodos(response.data)
   }
 
-  logger.warning('SDK session todos failed', {error: String(response.error)})
+  logger.warning('SDK session todos failed', {error: toErrorMessage(response.error)})
   return []
 }
 
@@ -74,17 +97,22 @@ export async function findLatestSession(
     query: {directory: workspacePath, start: afterTimestamp, roots: true, limit: 10} as Record<string, unknown>,
   })
   if (response.error != null || response.data == null) {
-    logger.warning('SDK session list failed', {error: String(response.error)})
+    logger.warning('SDK session list failed', {source: 'findLatestSession', error: toErrorMessage(response.error)})
     return null
   }
-  if (!Array.isArray(response.data) || response.data.length === 0) {
+  if (!Array.isArray(response.data)) {
+    // Distinct from a genuinely empty result, which stays quiet below.
+    logger.warning('SDK session list returned a non-array payload', {
+      source: 'findLatestSession',
+      type: typeof response.data,
+    })
+    return null
+  }
+  if (response.data.length === 0) {
     return null
   }
 
   const sessions = response.data.map(mapSdkSessionToSessionInfo)
-  if (sessions.length === 0) {
-    return null
-  }
 
   const latest = sessions.reduce((max, session) => (session.time.created > max.time.created ? session : max))
   return {projectID: latest.projectID, session: latest}
@@ -93,7 +121,7 @@ export async function findLatestSession(
 export async function deleteSession(client: SessionClient, sessionID: string, logger: Logger): Promise<void> {
   const response = await client.session.delete({path: {id: sessionID}})
   if (response.error != null) {
-    logger.warning('SDK session delete failed', {sessionID, error: String(response.error)})
+    logger.warning('SDK session delete failed', {sessionID, error: toErrorMessage(response.error)})
     return
   }
 
