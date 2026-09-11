@@ -1,16 +1,20 @@
 ---
 type: guide
-last-updated: "2026-09-04"
-updated-by: "pr-1527"
+last-updated: "2026-09-07"
+updated-by: "schedule-d7190410-34062354146"
 sources:
   - action.yaml
   - src/services/cache/save.ts
+  - src/shared/cache-save-result.ts
+  - src/services/cache/cache-key.ts
+  - src/services/setup/opencode.ts
+  - src/services/setup/systematic-plugin.ts
   - src/shared/brokered-push-paths.ts
   - src/features/delegated/brokered-push.ts
   - src/features/delegated/brokered-push-validation.ts
   - packages/gateway/src/web/operator-route.ts
   - docs/solutions/test-failures/gateway-operator-route-health-timeout-flake-2026-07-30.md
-summary: "Diagnosing common Fro Bot Agent failures — no response, cache persistence, timeouts, brokered push, and a known gateway test flake"
+summary: "Diagnosing common Fro Bot Agent failures — no response, cache persistence, setup and install errors, timeouts, brokered push, and a known gateway test flake"
 ---
 
 # Troubleshooting
@@ -37,7 +41,21 @@ If sessions are not persisting between runs:
 4. Verify `skip-cache` is not set to `true`.
 5. Review run logs for cache-corruption warnings — a corrupted restore falls back to S3 when configured.
 
+Before guessing, read what the run actually reported. The `cache-save-result` output and the job summary name the persistence outcome directly: `durable` (the Actions cache write landed), `store-only` (the object store landed but the cache write did not), `skipped` (`skip-cache` was set), or `not-persisted` (nothing durable happened). A `store-only` result on a mention trigger is the expected, healthy shape once `s3-backup` is enabled — not a failure. A `not-persisted` result is the one worth investigating, and the job summary distinguishes its causes: a rejected write, a declined SQLite checkpoint, or no cacheable content found.
+
+Note what `not-persisted` cannot tell you. A rejected write surfaces as a single `-1` from `@actions/cache` with no detail, so the action cannot distinguish a policy denial from a reservation collision, a server error, or an upload failure. Do not infer the cause from the trigger type — the mapping is a strong prior, not a fact about the individual run.
+
+Re-runs are a separate case. Each run attempt writes its own cache entry, keyed by run ID _and_ run attempt, so a re-run no longer collides with the first attempt's entry and silently discards its own state.
+
 See [[Session Persistence]] for how memory survives across runs.
+
+## Setup and Install Failures
+
+If the run fails during setup rather than during agent execution:
+
+- **`Unsupported platform: <platform>/<arch>`** — the action supports Linux and macOS on x64 or arm64 only. This is now rejected by name before any download is attempted. Windows runners are not supported, and neither is an architecture outside that matrix; the harness build the action defaults to publishes assets for those four combinations and no others. See [[Setup and Configuration]].
+- **`EACCES` when spawning OpenCode** — historically caused by handing a consumer the install _directory_ where an executable path was required. If this recurs, the auto-setup log line records both the directory and the resolved binary path, which is enough to tell which one was exported as `OPENCODE_PATH`.
+- **`Skipping tools cache save because Systematic plugin install did not complete`** — setup continues without the plugin rather than failing the run, so this is a warning, not a fatal error. Two hints accompany it. If the parent environment carries `NPM_CONFIG_*` variables, the warning names them and notes that the install child deliberately does not inherit them; that scrub is intentional and should not be worked around by allowlisting those keys. If the failure was a spawn error, the warning carries a path diagnosis stating what was actually found at the binary path — absent, a dangling symlink, a directory, or present-but-not-executable — along with the tail of the child's stderr.
 
 ## Timeout Errors
 

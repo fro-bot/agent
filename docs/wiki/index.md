@@ -1,6 +1,6 @@
 ---
 type: index
-last-updated: "2026-08-30"
+last-updated: "2026-09-07"
 summary: "Navigable entry point for the Fro Bot Agent project wiki"
 ---
 
@@ -38,7 +38,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 | Page | Type | Summary |
 | --- | --- | --- |
-| [Troubleshooting](Troubleshooting.md) | guide | Diagnosing common Action failures — no response, cache persistence, timeouts, brokered push, and a known gateway test flake |
+| [Troubleshooting](Troubleshooting.md) | guide | Diagnosing common Fro Bot Agent failures — no response, cache persistence, setup and install errors, timeouts, brokered push, and a known gateway test flake |
 
 ## About This Wiki
 
