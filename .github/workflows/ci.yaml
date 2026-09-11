@@ -201,6 +201,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || '' }}
           token: ${{ secrets.FRO_BOT_PAT }}
+          # Withheld triggers must match response-delivery.ts's classifyEvent (credential: 'withhold').
+          persist-credentials: ${{ github.event_name != 'pull_request' }}
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
