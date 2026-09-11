@@ -36,3 +36,7 @@ export interface ReleaseNotesPluginConfig {
 }
 
 export type GenerateNotesFn = (pluginConfig: ReleaseNotesPluginConfig, context: ReleaseNotesContext) => Promise<string>
+
+// `semantic-release`'s own installed `semver` dependency, resolved through the same host require
+// context, used as the real-arithmetic oracle for computeNextVersion parity checks.
+export type SemverIncFn = (version: string, releaseType: 'patch' | 'minor' | 'major') => string | null

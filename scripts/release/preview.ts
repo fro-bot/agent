@@ -138,13 +138,5 @@ export function computeNextVersion(currentVersion: string, releaseType: ReleaseT
     return `${major}.${minor + 1}.0`
   }
 
-  // releaseType === 'major'. resolveReleaseTypeForParsedCommit no longer produces 'major' for
-  // breaking commits, but this is a defensive project-policy guard for any other caller: while
-  // the project stays pre-1.0, a 'major' release type must clamp to a minor bump instead of
-  // silently crossing to 1.0.0.
-  if (major === 0) {
-    return `${major}.${minor + 1}.0`
-  }
-
   return `${major + 1}.0.0`
 }

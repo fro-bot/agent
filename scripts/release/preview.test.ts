@@ -196,15 +196,15 @@ describe('computeNextVersion', () => {
     expect(result).toBe('0.31.0')
   })
 
-  it("clamps to a minor bump for computeNextVersion('0.30.10', 'major') while the project stays 0.x", () => {
-    // #given: project policy -- resolveReleaseTypeForParsedCommit no longer produces 'major' for
-    // breaking commits, but this guard covers any caller that passes 'major' in directly while the
-    // project is still pre-1.0, so a stray 'major' can never silently cross to 1.0.0.
+  it("bumps to 1.0.0 for computeNextVersion('0.30.10', 'major') as ordinary semver arithmetic", () => {
+    // #given: resolveReleaseTypeForParsedCommit never selects 'major' for a 0.x breaking commit
+    // (see analyzeReleaseType tests above) -- this only exercises computeNextVersion's own
+    // arithmetic for a 'major' input directly, matching the real semver increment.
     // #when
     const result = computeNextVersion('0.30.10', 'major')
 
     // #then
-    expect(result).toBe('0.31.0')
+    expect(result).toBe('1.0.0')
   })
 
   it("still bumps a real major for computeNextVersion('1.2.3', 'major') once past 0.x", () => {
