@@ -10,12 +10,14 @@ import {
   DAILY_SCHEDULE_CRON,
   determineCollectorStatus,
   extractActionReferences,
+  FORK_PULL_REQUEST_REJECTION_REASON,
   isPrivateClosureSatisfied,
   isQualifiableActionReference,
   isSchemaV1Envelope,
   LIMITS,
   MINIMUM_RELEASE,
   MINIMUM_RELEASE_PUBLISHED_AT,
+  parseActionReferences,
   parsePrivateInventory,
   parseResolvedActionSha,
   PRIVATE_INVENTORY_TOTAL,
@@ -32,6 +34,7 @@ import {
   type RunLogsResult,
   type RunPageResult,
   type WorkflowContentResult,
+  type WorkflowPathsResult,
   type WorkflowRun,
 } from './collect-dmr-runtime-verification.js'
 
@@ -78,6 +81,7 @@ function run(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     createdAt: '2026-09-11T20:00:00Z',
     conclusion: 'success',
     htmlUrl: 'https://github.com/example/widget/actions/runs/1001',
+    headRepositoryFullName: 'example/widget',
     ...overrides,
   }
 }
@@ -93,6 +97,9 @@ function workflowContent(ref = V0_SHA): string {
 interface FakeAdapterConfig {
   readonly repository?: (entry: InventoryEntry) => RepositoryResult | Promise<RepositoryResult>
   readonly runPages?: (entry: InventoryEntry, page: number) => RunPageResult | Promise<RunPageResult>
+  readonly workflowPaths?: (
+    entry: InventoryEntry,
+  ) => readonly string[] | WorkflowPathsResult | Promise<readonly string[] | WorkflowPathsResult>
   readonly workflowContent?: (
     entry: InventoryEntry,
     path: string,
@@ -109,17 +116,25 @@ function makeAdapters(config: FakeAdapterConfig = {}): CollectorAdapters {
     config.repository ??
     ((entry: InventoryEntry): RepositoryResult =>
       entry.owner === PUBLIC_ENTRY.owner
-        ? {ok: true, archived: false, defaultBranch: 'main', private: false}
-        : {ok: true, archived: true, defaultBranch: 'main', private: false})
+        ? {ok: true, fullName: `${entry.owner}/${entry.repo}`, archived: false, defaultBranch: 'main', private: false}
+        : {ok: true, fullName: `${entry.owner}/${entry.repo}`, archived: true, defaultBranch: 'main', private: true})
   return {
     getRepository: async entry => repository(entry),
     listRunPage: async (entry, page) => config.runPages?.(entry, page) ?? {ok: true, runs: [], nextPage: null},
+    listWorkflowPaths: async entry => {
+      const paths = await (config.workflowPaths?.(entry) ?? entry.workflowPaths)
+      return isWorkflowPathsResult(paths) ? paths : {ok: true, paths}
+    },
     getWorkflowContent: async (entry, path, ref) =>
       config.workflowContent?.(entry, path, ref) ?? {ok: true, content: workflowContent()},
     getRunLogs: async (entry, runId, attempt) =>
       config.logs?.(entry, runId, attempt) ?? {ok: true, text: resolvedLine(V0_SHA)},
     isDescendantOfPreflight: async sha => config.ancestry?.(sha) ?? {ok: true, descendant: true},
   }
+}
+
+function isWorkflowPathsResult(value: readonly string[] | WorkflowPathsResult): value is WorkflowPathsResult {
+  return typeof value === 'object' && value !== null && 'ok' in value
 }
 
 async function collect(overrides: Partial<CollectInput> & {readonly adapters: CollectorAdapters}) {
@@ -235,10 +250,14 @@ describe('extractActionReferences', () => {
   it('returns every distinct reference and ignores prose mentions', () => {
     // #given
     const content = [
-      'Fro Bot version: compare `fro-bot/agent@` SHA if present.',
+      '# Fro Bot version: compare `fro-bot/agent@` SHA if present.',
+      'jobs:',
+      '  build:',
+      '    steps:',
       '      - uses: fro-bot/agent@v0',
       `      - uses: fro-bot/agent@${OLD_V0_SHA}`,
       "      - uses: 'fro-bot/agent@v0'",
+      '      - run: "prose fro-bot/agent@not-a-reference"',
     ].join('\n')
 
     // #when
@@ -251,6 +270,27 @@ describe('extractActionReferences', () => {
   it('returns an empty list when the action is absent', () => {
     // #given / #when / #then
     expect(extractActionReferences('jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n')).toEqual([])
+  })
+
+  it('ignores commented, inert, and run-string mentions', () => {
+    // #given
+    const content = [
+      '# - uses: fro-bot/agent@v0',
+      'jobs:',
+      '  build:',
+      '    steps:',
+      '      - run: "uses: fro-bot/agent@v0"',
+      '      - name: inert prose',
+      '        run: echo "fro-bot/agent@v0"',
+    ].join('\n')
+
+    // #when / #then
+    expect(extractActionReferences(content)).toEqual([])
+  })
+
+  it('reports malformed YAML instead of treating text as executable evidence', () => {
+    // #given / #when / #then
+    expect(parseActionReferences('jobs:\n  build:\n    steps: [\n')).toEqual({ok: false, fetchStatusClass: 'malformed'})
   })
 })
 
@@ -444,10 +484,68 @@ describe('collectRuntimeVerification', () => {
     expect(publicRecord(artifact.public).actionRef).toBe('v0')
   })
 
+  it('rejects a fork pull request even when logs contain a forged download line', async () => {
+    // #given
+    let logsRequested = false
+    const adapters = makeAdapters({
+      runPages: () => ({
+        ok: true,
+        runs: [run({event: 'pull_request', headRepositoryFullName: 'attacker/widget'})],
+        nextPage: null,
+      }),
+      logs: () => {
+        logsRequested = true
+        return {ok: true, text: resolvedLine(V0_SHA)}
+      },
+    })
+
+    // #when
+    const artifact = await collect({adapters})
+
+    // #then
+    const record = publicRecord(artifact.public)
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe(FORK_PULL_REQUEST_REJECTION_REASON)
+    expect(logsRequested).toBe(false)
+  })
+
+  it('requires every executable Fro Bot reference to be qualifiable', async () => {
+    // #given
+    const mixedReferences = [
+      'jobs:',
+      '  build:',
+      '    steps:',
+      '      - uses: fro-bot/agent@v0',
+      '      - uses: fro-bot/agent@v0.93.1',
+    ].join('\n')
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      workflowContent: () => ({ok: true, content: mixedReferences}),
+    })
+
+    // #when / #then
+    const record = publicRecord((await collect({adapters})).public)
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('non-qualifiable-action-reference')
+  })
+
+  it('fails closed on malformed workflow YAML', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      workflowContent: () => ({ok: true, content: 'jobs:\n  build:\n    steps: [\n'}),
+    })
+
+    // #when / #then
+    const record = publicRecord((await collect({adapters})).public)
+    expect(record.disposition).toBe('unavailable')
+    expect(record.fetchStatusClass).toBe('malformed')
+  })
+
   it('resolves an archived repository as no-longer-applicable', async () => {
     // #given
     const adapters = makeAdapters({
-      repository: () => ({ok: true, archived: true, defaultBranch: 'main', private: false}),
+      repository: () => ({ok: true, fullName: 'example/widget', archived: true, defaultBranch: 'main', private: false}),
     })
 
     // #when
@@ -472,6 +570,37 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
+    expect(record.disposition).toBe('no-longer-applicable')
+    expect(record.rejectionReason).toBe('workflow-removed')
+  })
+
+  it('does not infer workflow removal from configured paths when another current workflow consumes Fro Bot', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [], nextPage: null}),
+      workflowPaths: () => ['.github/workflows/renamed.yaml'],
+      workflowContent: (_entry, path) =>
+        path === '.github/workflows/renamed.yaml'
+          ? {ok: true, content: workflowContent('v0')}
+          : {ok: true, content: 'jobs: {}'},
+    })
+
+    // #when / #then
+    const record = publicRecord((await collect({adapters})).public)
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('no-qualifying-run')
+  })
+
+  it('permits workflow removal only after full current-workflow enumeration succeeds', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [], nextPage: null}),
+      workflowPaths: () => ['.github/workflows/ci.yaml', '.github/workflows/release.yaml'],
+      workflowContent: () => ({ok: true, content: 'jobs: {}'}),
+    })
+
+    // #when / #then
+    const record = publicRecord((await collect({adapters})).public)
     expect(record.disposition).toBe('no-longer-applicable')
     expect(record.rejectionReason).toBe('workflow-removed')
   })
@@ -741,12 +870,12 @@ describe('collectRuntimeVerification', () => {
     expect(record.rejectionReason).toBe('candidate-log-bound-exhausted')
   })
 
-  it('never infers no-longer-applicable from a private 403 or 404', async () => {
+  it('keeps private 403 and 404 unavailable', async () => {
     // #given
     const adapters = makeAdapters({
       repository: entry =>
         entry.owner === PUBLIC_ENTRY.owner
-          ? {ok: true, archived: true, defaultBranch: 'main', private: false}
+          ? {ok: true, fullName: 'example/widget', archived: false, defaultBranch: 'main', private: false}
           : {ok: false, fetchStatusClass: 'not-found'},
     })
 
@@ -754,9 +883,57 @@ describe('collectRuntimeVerification', () => {
     const artifact = await collect({adapters})
 
     // #then
-    expect(publicRecord(artifact.public).disposition).toBe('no-longer-applicable')
+    expect(publicRecord(artifact.public).disposition).toBe('unresolved')
     expect(artifact.private).toEqual({total: 3, resolved: 0, unresolved: 0, unavailable: 3})
     expect(artifact.collectorStatus).toBe('partial')
+  })
+
+  it('keeps a public repository 404 unavailable rather than classifying deletion', async () => {
+    // #given
+    const adapters = makeAdapters({repository: () => ({ok: false, fetchStatusClass: 'not-found'})})
+
+    // #when / #then
+    const record = publicRecord((await collect({adapters})).public)
+    expect(record.disposition).toBe('unavailable')
+    expect(record.rejectionReason).toBe('repository-unavailable')
+    expect(record.fetchStatusClass).toBe('not-found')
+  })
+
+  it('rejects canonical identity and visibility mismatches before collecting runs', async () => {
+    // #given
+    let runsRequested = false
+    const identityMismatch = makeAdapters({
+      repository: () => ({
+        ok: true,
+        fullName: 'redirected/elsewhere',
+        archived: false,
+        defaultBranch: 'main',
+        private: false,
+      }),
+      runPages: () => {
+        runsRequested = true
+        return {ok: true, runs: [], nextPage: null}
+      },
+    })
+
+    // #when / #then
+    const identityRecord = publicRecord((await collect({adapters: identityMismatch})).public)
+    expect(identityRecord.disposition).toBe('unavailable')
+    expect(identityRecord.rejectionReason).toBe('repository-identity-mismatch')
+    expect(runsRequested).toBe(false)
+
+    const visibilityMismatch = makeAdapters({
+      repository: () => ({ok: true, fullName: 'example/widget', archived: false, defaultBranch: 'main', private: true}),
+      runPages: () => {
+        throw new Error('run collection must not start')
+      },
+    })
+    const visibilityRecord = publicRecord((await collect({adapters: visibilityMismatch})).public)
+    expect(visibilityRecord.disposition).toBe('unavailable')
+    expect(visibilityRecord.rejectionReason).toBe('repository-visibility-mismatch')
+    expect(visibilityRecord.runId).toBeNull()
+    expect(visibilityRecord.runUrl).toBeNull()
+    expect(serializeArtifact(await collect({adapters: visibilityMismatch})).includes('/actions/runs/')).toBe(false)
   })
 
   it('reports adapter failures as unavailable for public repositories', async () => {
@@ -792,7 +969,7 @@ describe('collectRuntimeVerification', () => {
   it('never serializes private names, URLs, or per-repository state', async () => {
     // #given
     const adapters = makeAdapters({
-      repository: () => ({ok: true, archived: false, defaultBranch: 'main', private: true}),
+      repository: () => ({ok: true, fullName: 'example/widget', archived: false, defaultBranch: 'main', private: true}),
       runPages: () => ({ok: true, runs: [run()], nextPage: null}),
     })
 
@@ -882,6 +1059,37 @@ describe('collectRuntimeVerification', () => {
 // ---------------------------------------------------------------------------
 
 describe('createGitHubAdapters', () => {
+  it('returns the validated canonical repository identity and visibility fields', async () => {
+    // #given
+    const adapters = createGitHubAdapters({
+      token: 'fixture-token',
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({full_name: 'Example/Widget', private: false, archived: false, default_branch: 'trunk'}),
+          {status: 200},
+        ),
+    })
+
+    // #when / #then
+    await expect(adapters.getRepository(PUBLIC_ENTRY)).resolves.toEqual({
+      ok: true,
+      fullName: 'Example/Widget',
+      private: false,
+      archived: false,
+      defaultBranch: 'trunk',
+    })
+  })
+
+  it('fails closed on a redirected repository response', async () => {
+    // #given
+    const response = new Response('{}', {status: 200})
+    Object.defineProperty(response, 'redirected', {value: true})
+    const adapters = createGitHubAdapters({token: 'fixture-token', fetchImpl: async () => response})
+
+    // #when / #then
+    await expect(adapters.getRepository(PUBLIC_ENTRY)).resolves.toEqual({ok: false, fetchStatusClass: 'redirect'})
+  })
+
   it('bounds response size before parsing', async () => {
     // #given
     const adapters = createGitHubAdapters({

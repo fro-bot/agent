@@ -2,6 +2,7 @@ import {readFileSync} from 'node:fs'
 import {describe, expect, it} from 'vitest'
 import {parse} from 'yaml'
 
+import {filterAgentEnv} from '../packages/runtime/src/agent/filter-env.js'
 import {resolveResponseDelivery} from '../packages/runtime/src/agent/response-delivery.js'
 
 interface WorkflowStep {
@@ -999,11 +1000,13 @@ describe('fro-bot workflow — temporary #1598 runtime-verification prompt proto
   it('validates schema, producer identity, baseline, and cardinality before any mutation', () => {
     // #given the daily schedule prompt
     const prompt = schedulePrompt()
+    const normalizedPrompt = prompt.replaceAll(/\s+/g, ' ')
 
     // #then every required identity/baseline check is explicit
     expect(prompt).toContain('schema version is 1')
-    expect(prompt).toContain('GITHUB_RUN_ID')
-    expect(prompt).toContain('GITHUB_RUN_ATTEMPT')
+    expect(normalizedPrompt).toContain(
+      'producer run ID and run attempt equal the trusted GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT',
+    )
     expect(prompt).toContain('30 15 * * *')
     expect(prompt).toContain('minimum release tag is v0.111.0')
     expect(prompt).toContain('required ancestor commit is 9d971b4cc5d1e47cbbb4ea5cb60e2d703ceabf97')
@@ -1079,14 +1082,32 @@ describe('fro-bot workflow — temporary #1598 runtime-verification prompt proto
   it('requires monotonic progress and the canonical 24+3 closure rule', () => {
     // #given the daily schedule prompt
     const prompt = schedulePrompt()
+    const normalizedPrompt = prompt.replaceAll(/\s+/g, ' ')
 
     // #then public progress unions upward and closure needs current private terminal evidence
     expect(prompt).toContain('union newly resolved public dispositions')
     expect(prompt).toContain('never demote an existing resolution')
     expect(prompt).toContain('all 24 public entries resolve')
-    expect(prompt).toContain('all 3 private')
-    expect(prompt).toContain('positively terminal')
-    expect(prompt).toContain('operator-backed')
+    expect(normalizedPrompt).toContain('CURRENT VALIDATED ARTIFACT positively resolves all 3 private entries')
+    expect(normalizedPrompt).toContain(
+      'Historical aggregate progress, displayed private counts, or editable issue text alone',
+    )
+    expect(prompt).not.toContain('operator-backed')
+    expect(prompt).not.toContain('covered by aggregate')
+  })
+
+  it('checks rerun producer identity against the trusted attempt exposed to the child', () => {
+    // #given the daily schedule prompt and the child environment contract
+    const prompt = schedulePrompt()
+    const childEnv = filterAgentEnv({
+      GITHUB_RUN_ATTEMPT: '2',
+      GITHUB_RUN_ATTEMPT_TOKEN: 'secret',
+      GITHUB_RUN_ATTEMPT_NOTE: 'unrecognized',
+    })
+
+    // #then a rerun must match the trusted attempt and that exact variable reaches the child
+    expect(prompt).toContain('GITHUB_RUN_ATTEMPT')
+    expect(childEnv).toEqual({GITHUB_RUN_ATTEMPT: '2'})
   })
 
   it('writes the final managed block before closing and posts no comment', () => {

@@ -138,7 +138,8 @@ env:
     Validate before use; if any check fails, make NO #1598 mutation and record
     "data unavailable" or an operator-review warning in the DMR:
     - schema version is 1;
-    - producer run ID and run attempt equal GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT;
+    - producer run ID and run attempt equal the trusted GITHUB_RUN_ID and
+      GITHUB_RUN_ATTEMPT;
     - producer schedule is the exact daily cron 30 15 * * *;
     - generatedAt parses as UTC, is not later than current time, and falls between
       the current run's created_at (read with GITHUB_RUN_ID) and current time; if
@@ -162,8 +163,8 @@ env:
 
     Progress: union newly resolved public dispositions into the existing managed
     block and never demote an existing resolution. Public evidence links are
-    allowed. Preserve the displayed private aggregate floor for reporting, but a
-    historical aggregate alone never authorizes closure.
+    allowed. Preserve the displayed private aggregate floor for reporting; it is never
+    closure evidence.
 
     Material change only: edit #1598 at most once, and only when a public
     repository newly resolves, the aggregate private resolved count increases, an
@@ -175,9 +176,10 @@ env:
     the markers changed; rebuild from the final body. Never overwrite human content
     outside the markers.
 
-    Closure: close #1598 only when all 24 public entries resolve and all 3 private
-    entries are positively terminal in the current artifact or covered by aggregate
-    operator-backed dispositions already recorded in the managed block.
+    Closure: close #1598 only when all 24 public entries resolve and the CURRENT
+    VALIDATED ARTIFACT positively resolves all 3 private entries. Historical
+    aggregate progress, displayed private counts, or editable issue text alone
+    can never satisfy private closure.
     Write the final managed block first, then close with no comment.
 
     If #1598 is already closed: do not use the artifact or update #1598; the

@@ -23,6 +23,7 @@ import {execFileSync} from 'node:child_process'
 import {writeFileSync} from 'node:fs'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
+import {parse} from 'yaml'
 
 // ---------------------------------------------------------------------------
 // Inventory and baseline constants
@@ -48,6 +49,8 @@ export const AFFECTED_EVENTS: readonly string[] = ['pull_request', 'issue_commen
 export const LIMITS = {
   maxRunPages: 3,
   runsPerPage: 100,
+  maxWorkflowPages: 3,
+  workflowsPerPage: 100,
   maxCandidateLogs: 5,
   maxResponseBytes: 1_000_000,
   maxLogBytes: 8_000_000,
@@ -107,7 +110,7 @@ export const PUBLIC_INVENTORY: readonly InventoryEntry[] = [
 export type Disposition = 'qualified' | 'no-longer-applicable' | 'unresolved' | 'preflight-failed' | 'unavailable'
 
 export type FetchStatusClass =
-  'success' | 'not-found' | 'forbidden' | 'rate-limited' | 'timeout' | 'oversized' | 'malformed' | 'error'
+  'success' | 'not-found' | 'forbidden' | 'rate-limited' | 'timeout' | 'oversized' | 'malformed' | 'redirect' | 'error'
 
 export type CollectorStatus = 'ready' | 'partial' | 'unavailable'
 
@@ -170,6 +173,7 @@ export interface WorkflowRun {
   readonly createdAt: string
   readonly conclusion: string | null
   readonly htmlUrl: string
+  readonly headRepositoryFullName: string | null
 }
 
 export type RunPageResult =
@@ -177,11 +181,21 @@ export type RunPageResult =
   | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
 
 export type RepositoryResult =
-  | {readonly ok: true; readonly archived: boolean; readonly defaultBranch: string; readonly private: boolean}
+  | {
+      readonly ok: true
+      readonly fullName: string
+      readonly archived: boolean
+      readonly defaultBranch: string
+      readonly private: boolean
+    }
   | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
 
 export type WorkflowContentResult =
   {readonly ok: true; readonly content: string} | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
+
+export type WorkflowPathsResult =
+  | {readonly ok: true; readonly paths: readonly string[]}
+  | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
 
 export type RunLogsResult =
   {readonly ok: true; readonly text: string} | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
@@ -192,6 +206,7 @@ export type AncestryResult =
 export interface CollectorAdapters {
   readonly getRepository: (entry: InventoryEntry) => Promise<RepositoryResult>
   readonly listRunPage: (entry: InventoryEntry, page: number) => Promise<RunPageResult>
+  readonly listWorkflowPaths: (entry: InventoryEntry) => Promise<WorkflowPathsResult>
   readonly getWorkflowContent: (entry: InventoryEntry, path: string, ref: string) => Promise<WorkflowContentResult>
   readonly getRunLogs: (entry: InventoryEntry, runId: number, runAttempt: number) => Promise<RunLogsResult>
   readonly isDescendantOfPreflight: (sha: string) => Promise<AncestryResult>
@@ -223,31 +238,70 @@ export type ParsePrivateInventoryResult =
 export type ResolvedActionShaResult =
   {readonly ok: true; readonly sha: string} | {readonly ok: false; readonly reason: 'missing' | 'ambiguous'}
 
+export type ActionReferencesResult =
+  | {readonly ok: true; readonly references: readonly string[]}
+  | {readonly ok: false; readonly fetchStatusClass: 'malformed'}
+
+export const FORK_PULL_REQUEST_REJECTION_REASON = 'fork-pull-request'
+
 // ---------------------------------------------------------------------------
 // Pure parsers, classifiers, and sanitizers
 // ---------------------------------------------------------------------------
 
-const ACTION_USE_PATTERN = /uses:\s*['"]?fro-bot\/agent@([\w.-]+)/g
 const RESOLVED_ACTION_PATTERN = /Download action repository 'fro-bot\/agent@([^']+)' \(SHA:([0-9a-f]{40})\)/g
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/
+const ACTION_REFERENCE_PATTERN = /^fro-bot\/agent@(.+)$/
 
 function isFullSha(value: string): boolean {
   return FULL_SHA_PATTERN.test(value)
 }
 
-/**
- * Distinct `fro-bot/agent@<ref>` references in workflow content, in document order. Requires the
- * `uses:` keyword so prose such as ``compare `fro-bot/agent@` SHA`` is ignored.
- */
-export function extractActionReferences(workflowContent: string): readonly string[] {
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && Array.isArray(value) === false
+}
+
+/** Parse executable `jobs.*.steps[].uses` values from a workflow document. */
+export function parseActionReferences(workflowContent: string): ActionReferencesResult {
+  let document: unknown
+  try {
+    document = parse(workflowContent)
+  } catch {
+    return {ok: false, fetchStatusClass: 'malformed'}
+  }
+
+  if (isObject(document) === false || isObject(document.jobs) === false) {
+    return {ok: true, references: []}
+  }
+
   const references: string[] = []
-  for (const match of workflowContent.matchAll(ACTION_USE_PATTERN)) {
-    const reference = match[1]
-    if (reference !== undefined && references.includes(reference) === false) {
-      references.push(reference)
+  for (const job of Object.values(document.jobs)) {
+    if (isObject(job) === false || Array.isArray(job.steps) === false) {
+      continue
+    }
+    for (const step of job.steps) {
+      if (isObject(step) === false || typeof step.uses !== 'string') {
+        continue
+      }
+      const match = ACTION_REFERENCE_PATTERN.exec(step.uses)
+      if (match?.[1] !== undefined) {
+        references.push(match[1])
+      }
     }
   }
-  return references
+  return {ok: true, references}
+}
+
+/**
+ * Distinct `fro-bot/agent@<ref>` references in executable workflow steps, in document order.
+ * Malformed YAML is represented as an empty list for this compatibility helper; collection paths
+ * use `parseActionReferences` so malformed content remains unavailable.
+ */
+export function extractActionReferences(workflowContent: string): readonly string[] {
+  const result = parseActionReferences(workflowContent)
+  if (result.ok === false) {
+    return []
+  }
+  return [...new Set(result.references)]
 }
 
 /**
@@ -461,6 +515,14 @@ async function evaluateRun(
   run: WorkflowRun,
   adapters: CollectorAdapters,
 ): Promise<PublicDisposition> {
+  if (
+    run.event === 'pull_request' &&
+    (run.headRepositoryFullName === null ||
+      run.headRepositoryFullName.toLowerCase() !== `${entry.owner}/${entry.repo}`.toLowerCase())
+  ) {
+    return withRun(base, run, {disposition: 'unresolved', rejectionReason: FORK_PULL_REQUEST_REJECTION_REASON})
+  }
+
   const logs = await adapters.getRunLogs(entry, run.id, run.runAttempt)
   if (logs.ok === false) {
     return withRun(base, run, {
@@ -483,18 +545,29 @@ async function evaluateRun(
       fetchStatusClass: content.fetchStatusClass,
     })
   }
-  const references = extractActionReferences(content.content)
+  const parsedReferences = parseActionReferences(content.content)
+  if (parsedReferences.ok === false) {
+    return withRun(base, run, {
+      disposition: 'unavailable',
+      rejectionReason: 'workflow-content-unavailable',
+      fetchStatusClass: parsedReferences.fetchStatusClass,
+    })
+  }
+  const references = parsedReferences.references
   if (references.length === 0) {
     return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'missing-action-reference'})
   }
-  const accepted = references.filter(isQualifiableActionReference)
-  if (accepted.length === 0) {
+  if (references.some(reference => isQualifiableActionReference(reference) === false)) {
     return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'non-qualifiable-action-reference'})
   }
-  if (accepted.length > 1) {
+  const distinctReferences = [...new Set(references)]
+  if (distinctReferences.length > 1) {
     return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'ambiguous-action-reference'})
   }
-  const actionRef = accepted[0] as string
+  const actionRef = distinctReferences[0]
+  if (actionRef === undefined) {
+    return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'missing-action-reference'})
+  }
   const resolved = parseResolvedActionSha(logs.text, actionRef)
   if (resolved.ok === false) {
     const rejectionReason =
@@ -535,20 +608,34 @@ async function classifyDefaultBranch(
   adapters: CollectorAdapters,
   defaultBranch: string,
 ): Promise<Pick<PublicDisposition, 'disposition' | 'rejectionReason' | 'fetchStatusClass'>> {
+  const workflowPaths = await adapters.listWorkflowPaths(entry)
+  if (workflowPaths.ok === false) {
+    return {
+      disposition: 'unavailable',
+      rejectionReason: 'workflow-list-unavailable',
+      fetchStatusClass: workflowPaths.fetchStatusClass,
+    }
+  }
+
   let sawReference = false
-  for (const path of entry.workflowPaths) {
+  for (const path of workflowPaths.paths) {
     const result = await adapters.getWorkflowContent(entry, path, defaultBranch)
     if (result.ok === false) {
-      if (result.fetchStatusClass === 'not-found') {
-        continue
-      }
       return {
         disposition: 'unavailable',
         rejectionReason: 'workflow-read-unavailable',
         fetchStatusClass: result.fetchStatusClass,
       }
     }
-    if (extractActionReferences(result.content).length > 0) {
+    const parsedReferences = parseActionReferences(result.content)
+    if (parsedReferences.ok === false) {
+      return {
+        disposition: 'unavailable',
+        rejectionReason: 'workflow-read-unavailable',
+        fetchStatusClass: parsedReferences.fetchStatusClass,
+      }
+    }
+    if (parsedReferences.references.length > 0) {
       sawReference = true
     }
   }
@@ -567,11 +654,19 @@ async function collectEntry(
 
   const repository = await adapters.getRepository(entry)
   if (repository.ok === false) {
-    // A public 404 confirms deletion; a private 403/404 is never deletion proof.
-    const disposition: Disposition =
-      isPrivate === false && repository.fetchStatusClass === 'not-found' ? 'no-longer-applicable' : 'unavailable'
-    const rejectionReason = disposition === 'no-longer-applicable' ? 'repository-deleted' : 'repository-unavailable'
-    return {...base, disposition, rejectionReason, fetchStatusClass: repository.fetchStatusClass}
+    return {
+      ...base,
+      disposition: 'unavailable',
+      rejectionReason: 'repository-unavailable',
+      fetchStatusClass: repository.fetchStatusClass,
+    }
+  }
+  const expectedFullName = `${entry.owner}/${entry.repo}`
+  if (repository.fullName.toLowerCase() !== expectedFullName.toLowerCase()) {
+    return {...base, disposition: 'unavailable', rejectionReason: 'repository-identity-mismatch'}
+  }
+  if (repository.private !== isPrivate) {
+    return {...base, disposition: 'unavailable', rejectionReason: 'repository-visibility-mismatch'}
   }
   if (repository.archived === true) {
     return {...base, disposition: 'no-longer-applicable', rejectionReason: 'repository-archived'}
@@ -776,6 +871,7 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
     try {
       const response = await fetchImpl(`${GITHUB_API}${path}`, {
         method: 'GET',
+        redirect: 'error',
         headers: {
           Authorization: `Bearer ${options.token}`,
           Accept: accept,
@@ -783,6 +879,9 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
         },
         signal: AbortSignal.timeout(timeoutMs),
       })
+      if (response.redirected) {
+        return {ok: false, fetchStatusClass: 'redirect'}
+      }
       if (response.ok === false) {
         return {ok: false, fetchStatusClass: failureClass(response.status)}
       }
@@ -812,11 +911,22 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
         return {ok: false, fetchStatusClass: 'malformed'}
       }
       const record = value as Record<string, unknown>
+      if (
+        typeof record.full_name !== 'string' ||
+        record.full_name.length === 0 ||
+        typeof record.archived !== 'boolean' ||
+        typeof record.default_branch !== 'string' ||
+        record.default_branch.length === 0 ||
+        typeof record.private !== 'boolean'
+      ) {
+        return {ok: false, fetchStatusClass: 'malformed'}
+      }
       return {
         ok: true,
-        archived: record.archived === true,
-        defaultBranch: typeof record.default_branch === 'string' ? record.default_branch : 'main',
-        private: record.private === true,
+        fullName: record.full_name,
+        archived: record.archived,
+        defaultBranch: record.default_branch,
+        private: record.private,
       }
     },
     listRunPage: async (entry, page) => {
@@ -846,6 +956,40 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
         runs.push(parsedRun)
       }
       return {ok: true, runs, nextPage: runs.length === LIMITS.runsPerPage ? page + 1 : null}
+    },
+    listWorkflowPaths: async entry => {
+      const paths: string[] = []
+      let page = 1
+      while (true) {
+        const response = await request(
+          `/repos/${entry.owner}/${entry.repo}/actions/workflows?per_page=${LIMITS.workflowsPerPage}&page=${page}`,
+          'application/vnd.github+json',
+        )
+        if (response.ok === false) {
+          return response
+        }
+        const parsed = safeJson(response.text)
+        if (
+          parsed.ok === false ||
+          isObject(parsed.value) === false ||
+          Array.isArray(parsed.value.workflows) === false
+        ) {
+          return {ok: false, fetchStatusClass: 'malformed'}
+        }
+        for (const workflow of parsed.value.workflows) {
+          if (isObject(workflow) === false || typeof workflow.path !== 'string' || workflow.path.length === 0) {
+            return {ok: false, fetchStatusClass: 'malformed'}
+          }
+          paths.push(workflow.path)
+        }
+        if (parsed.value.workflows.length < LIMITS.workflowsPerPage) {
+          return {ok: true, paths}
+        }
+        if (page >= LIMITS.maxWorkflowPages) {
+          return {ok: false, fetchStatusClass: 'error'}
+        }
+        page += 1
+      }
     },
     getWorkflowContent: async (entry, path, ref) => {
       const encodedPath = path
@@ -896,6 +1040,7 @@ function toWorkflowRun(value: unknown): WorkflowRun | null {
   const createdAt = record.created_at
   const htmlUrl = record.html_url
   const conclusion = record.conclusion
+  const headRepository = record.head_repository
   if (typeof id !== 'number') return null
   if (typeof runAttempt !== 'number') return null
   if (typeof event !== 'string') return null
@@ -904,7 +1049,9 @@ function toWorkflowRun(value: unknown): WorkflowRun | null {
   if (typeof createdAt !== 'string') return null
   if (typeof htmlUrl !== 'string') return null
   if (conclusion !== null && typeof conclusion !== 'string') return null
-  return {id, runAttempt, event, path, headSha, createdAt, conclusion, htmlUrl}
+  const headRepositoryFullName =
+    isObject(headRepository) && typeof headRepository.full_name === 'string' ? headRepository.full_name : null
+  return {id, runAttempt, event, path, headSha, createdAt, conclusion, htmlUrl, headRepositoryFullName}
 }
 
 // ---------------------------------------------------------------------------
