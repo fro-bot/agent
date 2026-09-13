@@ -18,17 +18,22 @@ import {Buffer} from 'node:buffer'
 import {writeFile} from 'node:fs/promises'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
+import {parse} from 'yaml'
 
 export const PREFLIGHT_COMMIT = '9d971b4cc5d1e47cbbb4ea5cb60e2d703ceabf97'
 
 const QUALIFYING_EVENTS = new Set(['pull_request', 'issue_comment', 'issues'])
-const PIN_RE = /fro-bot\/agent@([0-9a-f]{40})/
+const FRO_BOT_AGENT_REF_RE = /^fro-bot\/agent@(.+)$/
+const SHA_RE = /^[0-9a-f]{40}$/
 // The repository component may begin with a dot -- `bfra-me/.github`, `fro-bot/.github`,
 // and `marcusrbrown/.dotfiles` are all in the roster, and dropping them silently
 // undercounts the sweep.
 const REPO_SLUG_RE = /\b(\w(?:[\w.-]*\w)?\/\.?\w(?:[\w.-]*\w)?)\b/
 const TARGET_HEADINGS = new Set(['checkout posture verified', 'migration merged'])
 const MAX_RESPONSE_BYTES = 2_000_000
+// GitHub secondary rate limits trigger on concurrency, not just request volume;
+// bounding the sweep keeps a 403 from making the whole run flaky.
+const SWEEP_CONCURRENCY = 5
 
 export interface WorkflowRunSummary {
   readonly id: number
@@ -44,6 +49,7 @@ export interface GithubClient {
   readonly getWorkflowFileAtSha: (repository: string, sha: string) => Promise<string>
   readonly compareCommits: (base: string, head: string) => Promise<number>
   readonly getIssueBody: (owner: string, repo: string, issueNumber: number) => Promise<string>
+  readonly resolveRef: (ref: string) => Promise<string>
 }
 
 export type SweepStatus = 'verified' | 'not-verified' | 'no-qualifying-run' | 'unavailable'
@@ -63,6 +69,7 @@ export interface RepositoryResult {
 export interface SweepResult {
   readonly generatedAt: string
   readonly preflightCommit: string
+  readonly repositoryCount: number
   readonly repositories: readonly RepositoryResult[]
 }
 
@@ -95,6 +102,103 @@ export function parseRepositoriesFromIssueBody(body: string): readonly string[] 
   }
 
   return [...repositories]
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function pushUsesValue(step: unknown, values: string[]): void {
+  if (isRecord(step) && typeof step.uses === 'string') {
+    values.push(step.uses)
+  }
+}
+
+/**
+ * Collects every `uses:` value that GitHub Actions would actually execute:
+ * job steps, reusable-workflow job invocations, and composite-action manifest
+ * steps. Anything outside a `uses:` position -- comments, prose, other keys --
+ * is structurally unreachable because it was never part of the parsed
+ * document in the first place.
+ */
+function collectUsesValues(document: unknown): readonly string[] {
+  const values: string[] = []
+  if (!isRecord(document)) {
+    return values
+  }
+
+  if (isRecord(document.jobs)) {
+    for (const job of Object.values(document.jobs)) {
+      if (!isRecord(job)) {
+        continue
+      }
+      if (typeof job.uses === 'string') {
+        values.push(job.uses)
+      }
+      if (Array.isArray(job.steps)) {
+        for (const step of job.steps) {
+          pushUsesValue(step, values)
+        }
+      }
+    }
+  }
+
+  if (isRecord(document.runs) && Array.isArray(document.runs.steps)) {
+    for (const step of document.runs.steps) {
+      pushUsesValue(step, values)
+    }
+  }
+
+  return values
+}
+
+/**
+ * Parses a workflow file and returns every `fro-bot/agent@<ref>` reference in
+ * an executable `uses:` position. Returns `null` when the file does not parse
+ * as YAML at all -- that is `unavailable`, never a verification signal.
+ */
+export function extractFroBotAgentRefs(workflowFile: string): readonly string[] | null {
+  let document: unknown
+  try {
+    document = parse(workflowFile)
+  } catch {
+    return null
+  }
+
+  const refs: string[] = []
+  for (const usesValue of collectUsesValues(document)) {
+    const match = FRO_BOT_AGENT_REF_RE.exec(usesValue)
+    if (match?.[1] !== undefined) {
+      refs.push(match[1])
+    }
+  }
+  return refs
+}
+
+/** Runs `fn` over `items` with at most `concurrency` calls in flight at once. */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = Array.from({length: items.length})
+  let nextIndex = 0
+
+  async function worker(): Promise<void> {
+    for (;;) {
+      const index = nextIndex
+      nextIndex += 1
+      if (index >= items.length) {
+        return
+      }
+      const item = items[index] as T
+      results[index] = await fn(item)
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length)
+  await Promise.all(Array.from({length: workerCount}, async () => worker()))
+  return results
 }
 
 function buildResult(
@@ -157,29 +261,52 @@ export async function sweepRepository(client: GithubClient, repository: string):
     return buildResult(repository, 'unavailable', describeError(error), observed)
   }
 
-  const pinMatch = workflowFile.match(PIN_RE)
-  if (pinMatch?.[1] === undefined) {
-    return buildResult(repository, 'not-verified', 'pin-not-resolvable', observed)
+  const refs = extractFroBotAgentRefs(workflowFile)
+  if (refs === null) {
+    return buildResult(repository, 'unavailable', 'workflow-unparseable', observed)
   }
-  const pin = pinMatch[1]
+  if (refs.length === 0) {
+    return buildResult(repository, 'not-verified', 'no-executable-references', observed)
+  }
 
-  let behindBy: number
-  try {
-    behindBy = await client.compareCommits(PREFLIGHT_COMMIT, pin)
-  } catch (error) {
-    return buildResult(repository, 'unavailable', describeError(error), {...observed, pin})
+  let worstBehindBy = 0
+  let worstPin: string | null = null
+
+  for (const ref of refs) {
+    let sha: string
+    if (SHA_RE.test(ref)) {
+      sha = ref
+    } else {
+      try {
+        sha = await client.resolveRef(ref)
+      } catch (error) {
+        return buildResult(repository, 'unavailable', describeError(error), observed)
+      }
+    }
+
+    let behindBy: number
+    try {
+      behindBy = await client.compareCommits(PREFLIGHT_COMMIT, sha)
+    } catch (error) {
+      return buildResult(repository, 'unavailable', describeError(error), {...observed, pin: sha})
+    }
+
+    if (worstPin === null || behindBy > worstBehindBy) {
+      worstBehindBy = behindBy
+      worstPin = sha
+    }
   }
 
   return {
     repository,
-    status: behindBy === 0 ? 'verified' : 'not-verified',
+    status: worstBehindBy === 0 ? 'verified' : 'not-verified',
     runId: latest.id,
     runUrl: latest.htmlUrl,
     event: latest.event,
     observedAt: latest.updatedAt,
-    pin,
-    behindBy,
-    detail: behindBy === 0 ? null : 'behind-preflight',
+    pin: worstPin,
+    behindBy: worstBehindBy,
+    detail: worstBehindBy === 0 ? null : 'behind-preflight',
   }
 }
 
@@ -187,11 +314,17 @@ export async function sweepRepository(client: GithubClient, repository: string):
 export async function runSweep(client: GithubClient, now: () => Date = () => new Date()): Promise<SweepResult> {
   const issueBody = await client.getIssueBody('fro-bot', 'agent', 1598)
   const repositories = parseRepositoriesFromIssueBody(issueBody)
-  const repositoryResults = await Promise.all(repositories.map(async repository => sweepRepository(client, repository)))
+  if (repositories.length === 0) {
+    throw new Error('parsed roster is empty -- issue #1598 headings may have been renamed')
+  }
+  const repositoryResults = await mapWithConcurrency(repositories, SWEEP_CONCURRENCY, async repository =>
+    sweepRepository(client, repository),
+  )
 
   return {
     generatedAt: now().toISOString(),
     preflightCommit: PREFLIGHT_COMMIT,
+    repositoryCount: repositories.length,
     repositories: repositoryResults,
   }
 }
@@ -280,6 +413,14 @@ export function createGithubClient(token: string): GithubClient {
         throw new TypeError('malformed-issue-response')
       }
       return issueBody
+    },
+    async resolveRef(ref) {
+      const body = await getJson(`https://api.github.com/repos/fro-bot/agent/commits/${ref}`)
+      const sha = (body as {sha?: unknown} | null)?.sha
+      if (typeof sha !== 'string') {
+        throw new TypeError('malformed-commit-response')
+      }
+      return sha
     },
   }
 }

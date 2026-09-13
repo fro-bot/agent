@@ -11,6 +11,12 @@ import {
 const PIN_VERIFIED = '620a314e00000000000000000000000000000000'
 const PIN_BEHIND = 'b799b64d00000000000000000000000000000000'
 
+/** Builds a minimal workflow YAML with one job whose steps use the given fro-bot/agent refs. */
+function workflowYaml(...refs: string[]): string {
+  const steps = refs.map(ref => `      - uses: fro-bot/agent@${ref}`).join('\n')
+  return `jobs:\n  run:\n    steps:\n${steps}\n`
+}
+
 function run(overrides: Partial<WorkflowRunSummary> = {}): WorkflowRunSummary {
   return {
     id: 1,
@@ -33,6 +39,7 @@ function makeClient(overrides: Partial<GithubClient>): GithubClient {
     getWorkflowFileAtSha: unimplemented('getWorkflowFileAtSha'),
     compareCommits: unimplemented('compareCommits'),
     getIssueBody: unimplemented('getIssueBody'),
+    resolveRef: unimplemented('resolveRef'),
     ...overrides,
   }
 }
@@ -89,7 +96,7 @@ describe('sweepRepository', () => {
     // #given a successful issues run whose pin resolves with behind_by 0
     const client = makeClient({
       listWorkflowRuns: async () => [run({headSha: 'sha1'})],
-      getWorkflowFileAtSha: async () => `uses: fro-bot/agent@${PIN_VERIFIED}`,
+      getWorkflowFileAtSha: async () => workflowYaml(PIN_VERIFIED),
       compareCommits: async () => 0,
     })
 
@@ -106,7 +113,7 @@ describe('sweepRepository', () => {
     // #given a pin that resolves but is behind the preflight commit
     const client = makeClient({
       listWorkflowRuns: async () => [run({headSha: 'sha2'})],
-      getWorkflowFileAtSha: async () => `uses: fro-bot/agent@${PIN_BEHIND}`,
+      getWorkflowFileAtSha: async () => workflowYaml(PIN_BEHIND),
       compareCommits: async () => 14,
     })
 
@@ -128,7 +135,7 @@ describe('sweepRepository', () => {
       ],
       getWorkflowFileAtSha: async (_repo, sha) => {
         expect(sha).toBe('newest')
-        return `uses: fro-bot/agent@${PIN_VERIFIED}`
+        return workflowYaml(PIN_VERIFIED)
       },
       compareCommits: async () => 0,
     })
@@ -188,20 +195,131 @@ describe('sweepRepository', () => {
     expect(result.detail).toBe('http-404')
   })
 
-  it('yields not-verified with pin-not-resolvable for a floating (non-40-hex) ref', async () => {
-    // #given a workflow file pinned to a branch name instead of a full SHA
+  it('resolves a floating tag ref via the client and verifies once resolved at behind_by 0', async () => {
+    // #given a workflow file pinned to a tag rather than a full SHA
     const client = makeClient({
       listWorkflowRuns: async () => [run()],
-      getWorkflowFileAtSha: async () => 'uses: fro-bot/agent@main',
+      getWorkflowFileAtSha: async () => workflowYaml('v0'),
+      resolveRef: async ref => {
+        expect(ref).toBe('v0')
+        return PIN_VERIFIED
+      },
+      compareCommits: async () => 0,
     })
 
     // #when
     const result = await sweepRepository(client, 'o/r')
 
     // #then
+    expect(result.status).toBe('verified')
+    expect(result.pin).toBe(PIN_VERIFIED)
+  })
+
+  it('yields unavailable, never not-verified, when a floating ref cannot be resolved', async () => {
+    // #given a workflow file pinned to a tag the resolve call fails on
+    const client = makeClient({
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => workflowYaml('v0'),
+      resolveRef: async () => {
+        throw Object.assign(new Error('http-404'), {httpStatus: 404})
+      },
+    })
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then an unresolved pin is never reported as a negative (not-verified) claim
+    expect(result.status).toBe('unavailable')
+    expect(result.detail).toBe('http-404')
+  })
+
+  it('does not verify on a commented-out SHA positioned above the executing uses: pin', async () => {
+    // #given a workflow whose comment mentions a newer SHA above the pin that actually executes
+    const workflowFile = [
+      'jobs:',
+      '  run:',
+      '    steps:',
+      `      # see fro-bot/agent@${PIN_VERIFIED} for the latest`,
+      `      - uses: fro-bot/agent@${PIN_BEHIND}`,
+    ].join('\n')
+    const client = makeClient({
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => workflowFile,
+      compareCommits: async (_base, head) => {
+        expect(head).toBe(PIN_BEHIND)
+        return 14
+      },
+    })
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then the commented SHA is structurally unreachable -- only the executing pin is evaluated
     expect(result.status).toBe('not-verified')
-    expect(result.detail).toBe('pin-not-resolvable')
-    expect(result.pin).toBeNull()
+    expect(result.pin).toBe(PIN_BEHIND)
+  })
+
+  it('does not verify when one of two invocations is behind and the other is ahead', async () => {
+    // #given two fro-bot/agent steps at different pins
+    const workflowFile = workflowYaml(PIN_VERIFIED, PIN_BEHIND)
+    const client = makeClient({
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => workflowFile,
+      compareCommits: async (_base, head) => (head === PIN_VERIFIED ? 0 : 14),
+    })
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then a single behind invocation blocks verification even though another is current
+    expect(result.status).toBe('not-verified')
+  })
+
+  it('verifies when two invocations are both at or ahead of the preflight commit', async () => {
+    // #given two fro-bot/agent steps, both resolved at behind_by 0
+    const workflowFile = workflowYaml(PIN_VERIFIED, PIN_BEHIND)
+    const client = makeClient({
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => workflowFile,
+      compareCommits: async () => 0,
+    })
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then
+    expect(result.status).toBe('verified')
+    expect(result.behindBy).toBe(0)
+  })
+
+  it('yields unavailable, never verified, when the workflow file does not parse as YAML', async () => {
+    // #given a workflow file that is not valid YAML
+    const client = makeClient({
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => 'jobs: [\n',
+    })
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then an unparseable file is never a removal claim
+    expect(result.status).toBe('unavailable')
+    expect(result.detail).toBe('workflow-unparseable')
+  })
+
+  it('does not verify when zero executable fro-bot/agent references are present', async () => {
+    // #given a well-formed workflow with no fro-bot/agent uses
+    const client = makeClient({
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => ['jobs:', '  run:', '    steps:', '      - run: echo hi'].join('\n'),
+    })
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then zero references found is not verification either
+    expect(result.status).toBe('not-verified')
+    expect(result.detail).toBe('no-executable-references')
   })
 })
 
@@ -225,5 +343,15 @@ describe('runSweep', () => {
     expect(sweep.preflightCommit).toBe(PREFLIGHT_COMMIT)
     expect(sweep.repositories).toHaveLength(1)
     expect(sweep.repositories[0]?.status).toBe('unavailable')
+  })
+
+  it('throws when the parsed roster is empty rather than reporting a clean sweep', async () => {
+    // #given an issue body with no entries under either target heading
+    const client = makeClient({
+      getIssueBody: async () => '### Some Other Heading\n- [x] o/r',
+    })
+
+    // #when / #then an empty roster means the parser broke, not that the sweep found nothing
+    await expect(runSweep(client, () => new Date('2026-01-01T00:00:00Z'))).rejects.toThrow(/empty/)
   })
 })
