@@ -10,7 +10,7 @@
 //   3. Qualification requires an affected-event run after the v0.111.0 boundary, a run-revision
 //      workflow that consumes a v0-line `fro-bot/agent` action, an unambiguous resolved action
 //      SHA in the full run logs, ancestry from #1597's merge commit, and terminal success.
-//   4. Every recoverable path emits a schema-v1 sanitized artifact. Private output is
+//   4. Every recoverable path emits a schema-v2 sanitized artifact. Private output is
 //      aggregate-only: names, URLs, per-repository states, API bodies, and error strings never
 //      reach a serialized surface. Every externally visible message is a constant class.
 //
@@ -19,7 +19,7 @@
 // `main()` is only invoked by the direct-execution guard at the bottom, mirroring
 // scripts/harness/mint-app-token.ts, so the module stays import-safe under Vitest.
 
-import {execFileSync} from 'node:child_process'
+import type {ReadableStreamDefaultReader} from 'node:stream/web'
 import {writeFileSync} from 'node:fs'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
@@ -29,7 +29,7 @@ import {parse} from 'yaml'
 // Inventory and baseline constants
 // ---------------------------------------------------------------------------
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
 /** Exact daily DMR cron from .github/workflows/fro-bot.yaml. */
 export const DAILY_SCHEDULE_CRON = '30 15 * * *'
@@ -38,9 +38,6 @@ export const MINIMUM_RELEASE = 'v0.111.0'
 export const MINIMUM_RELEASE_PUBLISHED_AT = '2026-09-11T19:28:19Z'
 /** Merge commit of #1597 (`fix(setup)!: check effective Git credentials on withheld runs`). */
 export const CREDENTIAL_PREFLIGHT_COMMIT = '9d971b4cc5d1e47cbbb4ea5cb60e2d703ceabf97'
-
-/** Marker emitted by the credential preflight when a withheld run is refused. */
-export const CREDENTIAL_REFUSAL_MARKER = 'Refusing to proceed with credential withheld'
 
 export const PRIVATE_INVENTORY_TOTAL = 3
 
@@ -54,11 +51,8 @@ export const LIMITS = {
   maxJobPages: 2,
   jobsPerPage: 100,
   maxCandidateLogs: 5,
-  maxIndirectionDepth: 3,
   maxResponseBytes: 1_000_000,
-  maxLogBytes: 8_000_000,
   requestTimeoutMs: 15_000,
-  logTimeoutMs: 30_000,
 } as const
 
 export interface InventoryEntry {
@@ -111,12 +105,12 @@ export const PUBLIC_INVENTORY: readonly InventoryEntry[] = [
 // Types
 // ---------------------------------------------------------------------------
 
-export type Disposition = 'qualified' | 'no-longer-applicable' | 'unresolved' | 'preflight-failed' | 'unavailable'
+export type Disposition = 'unresolved' | 'preflight-failed' | 'unavailable'
 
 export type FetchStatusClass =
   'success' | 'not-found' | 'forbidden' | 'rate-limited' | 'timeout' | 'oversized' | 'malformed' | 'redirect' | 'error'
 
-export type CollectorStatus = 'ready' | 'partial' | 'unavailable'
+export type CollectorStatus = 'partial' | 'unavailable'
 
 export interface ProducerIdentity {
   readonly runId: string
@@ -137,24 +131,26 @@ export const BASELINE: Baseline = {
   credentialPreflightCommit: CREDENTIAL_PREFLIGHT_COMMIT,
 }
 
-export interface PublicDisposition {
+export interface PublicObservation {
   readonly repository: string
-  readonly disposition: Disposition
+  readonly state: Disposition
   readonly observedAt: string
   readonly fetchStatusClass: FetchStatusClass
-  readonly rejectionReason: string | null
+  readonly observation: string | null
   readonly event: string | null
   readonly runId: number | null
   readonly runAttempt: number | null
   readonly runUrl: string | null
   readonly workflowPath: string | null
-  readonly actionRef: string | null
+  readonly declaredActionRef: string | null
   readonly resolvedActionSha: string | null
+  readonly reportedJobs: readonly RunJobEvidence[] | null
+  readonly ancestryFromPreflight: boolean | null
 }
 
 export interface PrivateAggregate {
   readonly total: number
-  readonly resolved: number
+  readonly observed: number
   readonly unresolved: number
   readonly unavailable: number
 }
@@ -164,7 +160,7 @@ export interface ArtifactEnvelope {
   readonly producer: ProducerIdentity
   readonly baseline: Baseline
   readonly collectorStatus: CollectorStatus
-  readonly public: readonly PublicDisposition[]
+  readonly public: readonly PublicObservation[]
   readonly private: PrivateAggregate
 }
 
@@ -201,15 +197,15 @@ export type WorkflowPathsResult =
   | {readonly ok: true; readonly paths: readonly string[]}
   | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
 
-export type RunLogsResult =
-  {readonly ok: true; readonly text: string} | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
-
 export interface RunStepEvidence {
+  readonly name: string
+  readonly number: number | null
   readonly status: string
   readonly conclusion: string | null
 }
 
 export interface RunJobEvidence {
+  readonly name: string
   readonly status: string
   readonly conclusion: string | null
   readonly steps: readonly RunStepEvidence[]
@@ -227,7 +223,6 @@ export interface CollectorAdapters {
   readonly listRunPage: (entry: InventoryEntry, page: number) => Promise<RunPageResult>
   readonly listWorkflowPaths: (entry: InventoryEntry) => Promise<WorkflowPathsResult>
   readonly getWorkflowContent: (entry: InventoryEntry, path: string, ref: string) => Promise<WorkflowContentResult>
-  readonly getRunLogs: (entry: InventoryEntry, runId: number, runAttempt: number) => Promise<RunLogsResult>
   readonly getRunJobs: (entry: InventoryEntry, runId: number, runAttempt: number) => Promise<RunJobsResult>
   readonly isDescendantOfPreflight: (sha: string) => Promise<AncestryResult>
 }
@@ -244,7 +239,7 @@ export interface BuildArtifactInput {
   readonly producer: ProducerIdentity
   readonly baseline: Baseline
   readonly collectorStatus: CollectorStatus
-  readonly publicDispositions: readonly PublicDisposition[]
+  readonly publicObservations: readonly PublicObservation[]
   readonly privateAggregate: PrivateAggregate
 }
 
@@ -255,49 +250,16 @@ export type ParsePrivateInventoryResult =
       readonly reason: 'missing' | 'malformed-json' | 'not-array' | 'wrong-count' | 'invalid-entry' | 'duplicate-entry'
     }
 
-export type ResolvedActionShaResult =
-  {readonly ok: true; readonly sha: string} | {readonly ok: false; readonly reason: 'missing' | 'ambiguous'}
-
 export type ActionReferencesResult =
   | {readonly ok: true; readonly references: readonly string[]}
   | {readonly ok: false; readonly fetchStatusClass: 'malformed'}
 
-export interface WorkflowIndirections {
-  readonly directReferences: readonly string[]
-  readonly localWorkflowPaths: readonly string[]
-  readonly localActionPaths: readonly string[]
-  readonly externalJobWrappers: readonly string[]
-}
-
-export type WorkflowIndirectionsResult =
-  {readonly ok: true; readonly value: WorkflowIndirections} | {readonly ok: false; readonly reason: 'malformed'}
-
-export const FORK_PULL_REQUEST_REJECTION_REASON = 'fork-pull-request'
+export const FORK_PULL_REQUEST_OBSERVATION = 'fork-pull-request'
 
 // ---------------------------------------------------------------------------
 // Pure parsers, classifiers, and sanitizers
 // ---------------------------------------------------------------------------
 
-/**
- * `gh run view --log` attributes runner job-setup lines to this sentinel step name, which is where
- * the runner's own `Download action repository` records appear. Anchoring provenance to it keeps an
- * ordinary step that merely echoes that phrase from qualifying, since `gh` prefixes every log line
- * — forged or genuine — with `<job>\t<step>\t<timestamp>`.
- *
- * This is a `gh` implementation detail rather than a runner contract: if a future `gh` renames the
- * sentinel, every repository degrades to `missing-action-resolution` (unresolved) instead of
- * qualifying falsely. That is the safe direction, but it stalls progress silently, so a sweep that
- * reports no resolutions across the whole inventory should be checked against this constant first.
- */
-export const SETUP_STEP_NAME = 'UNKNOWN STEP'
-
-// A downloaded `gh run view --log` line is `job\tstep\ttimestamp message`. The runner emits the
-// `Download action repository` record during job setup, which gh attributes to the setup sentinel
-// step; a repository-controlled step echoing the phrase appears under its own step name.
-const RESOLVED_ACTION_PATTERN = new RegExp(
-  String.raw`(?:^|\n)[^\t\n]*\t${SETUP_STEP_NAME}\t\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z Download action repository 'fro-bot/agent@([^']+)' \(SHA:([0-9a-f]{40})\)`,
-  'g',
-)
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/
 const ACTION_REFERENCE_PATTERN = /^fro-bot\/agent@(.+)$/
 
@@ -307,12 +269,6 @@ function isFullSha(value: string): boolean {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && Array.isArray(value) === false
-}
-
-/** Normalize a `uses: ./...` reference to a repository-relative path (`./` normalizes to the root). */
-function normalizeLocalPath(uses: string): string {
-  const raw = uses.slice(2).replace(/\/+$/, '')
-  return raw === '.' ? '' : raw
 }
 
 /** Parse executable `jobs.*.steps[].uses` values from a workflow document. */
@@ -360,102 +316,12 @@ export function extractActionReferences(workflowContent: string): readonly strin
 }
 
 /**
- * Parse a workflow or composite-action manifest into the direct Fro Bot references plus every
- * indirection that must be resolved before a repository can be declared free of Fro Bot:
- * local reusable workflows (`jobs.*.uses: ./.github/workflows/<file>`), local action directories
- * (`steps[].uses: ./<path>`), and non-local (external) job-level reusable workflows that could
- * themselves invoke Fro Bot. Malformed YAML fails closed.
- */
-export function parseWorkflowIndirections(workflowContent: string): WorkflowIndirectionsResult {
-  let document: unknown
-  try {
-    document = parse(workflowContent)
-  } catch {
-    return {ok: false, reason: 'malformed'}
-  }
-
-  const directReferences: string[] = []
-  const localWorkflowPaths: string[] = []
-  const localActionPaths: string[] = []
-  const externalJobWrappers: string[] = []
-
-  const collectStep = (step: unknown): void => {
-    if (isObject(step) === false || typeof step.uses !== 'string') {
-      return
-    }
-    const uses = step.uses
-    const match = ACTION_REFERENCE_PATTERN.exec(uses)
-    if (match?.[1] !== undefined) {
-      directReferences.push(match[1])
-      return
-    }
-    if (uses.startsWith('./')) {
-      localActionPaths.push(normalizeLocalPath(uses))
-    }
-  }
-
-  if (isObject(document)) {
-    const jobs = document.jobs
-    if (isObject(jobs)) {
-      for (const job of Object.values(jobs)) {
-        if (isObject(job) === false) {
-          continue
-        }
-        if (typeof job.uses === 'string' && job.uses.length > 0) {
-          if (job.uses.startsWith('./')) {
-            localWorkflowPaths.push(normalizeLocalPath(job.uses))
-          } else {
-            externalJobWrappers.push(job.uses)
-          }
-        }
-        if (Array.isArray(job.steps)) {
-          for (const step of job.steps) {
-            collectStep(step)
-          }
-        }
-      }
-    }
-    const runs = document.runs
-    if (isObject(runs) && Array.isArray(runs.steps)) {
-      for (const step of runs.steps) {
-        collectStep(step)
-      }
-    }
-  }
-
-  return {ok: true, value: {directReferences, localWorkflowPaths, localActionPaths, externalJobWrappers}}
-}
-
-/**
  * A qualifiable action reference is either the floating `v0` branch or a pinned full 40-hex commit
  * SHA. The migrated inventory pins SHAs and one stale workflow uses `v0.93.1`; any version tag,
  * other mutable branch, or short SHA is rejected.
  */
 export function isQualifiableActionReference(reference: string): boolean {
   return reference === 'v0' || isFullSha(reference)
-}
-
-/**
- * Search the complete run log text for the runner's `Download action repository` record for the
- * expected action ref. Duplicated lines are fine; disagreement is ambiguous; a missing or
- * truncated record fails closed.
- */
-export function parseResolvedActionSha(logText: string, actionRef: string): ResolvedActionShaResult {
-  const shas = new Set<string>()
-  for (const match of logText.matchAll(RESOLVED_ACTION_PATTERN)) {
-    const matchedRef = match[1]
-    const matchedSha = match[2]
-    if (matchedRef === actionRef && matchedSha !== undefined) {
-      shas.add(matchedSha)
-    }
-  }
-  if (shas.size === 0) {
-    return {ok: false, reason: 'missing'}
-  }
-  if (shas.size > 1) {
-    return {ok: false, reason: 'ambiguous'}
-  }
-  return {ok: true, sha: [...shas][0] as string}
 }
 
 /**
@@ -505,57 +371,21 @@ export function parsePrivateInventory(raw: string | undefined): ParsePrivateInve
   return {ok: true, entries}
 }
 
-/**
- * Bound the authenticated per-job evidence to a fail-closed rule that rejects only genuinely bad
- * terminal outcomes (`failure`, `cancelled`, `timed_out`, `action_required`, `stale`) at both job and
- * step level. `success`, `skipped`, and `neutral` are accepted: an `if:`-guarded step concluding
- * `skipped` is normal, and a skipped Fro Bot job or step is already fail-closed by provenance, since
- * the action download record would be absent. Jobs that are not yet `completed` are always rejected.
- */
-export function areRunJobsSuccessful(jobs: readonly RunJobEvidence[]): boolean {
-  if (jobs.length === 0) {
-    return false
-  }
-  return jobs.every(
-    job =>
-      isAcceptableCompletion(job.status, job.conclusion) &&
-      job.steps.every(step => isAcceptableCompletion(step.status, step.conclusion)),
-  )
-}
-
-const ACCEPTED_COMPLETION_CONCLUSIONS: readonly string[] = ['success', 'skipped', 'neutral']
-
-function isAcceptableCompletion(status: string, conclusion: string | null): boolean {
-  return status === 'completed' && conclusion !== null && ACCEPTED_COMPLETION_CONCLUSIONS.includes(conclusion)
-}
-
+// No disposition the collector can now produce is positively terminal, so `observed` is always 0.
+// The field stays in the schema shape; only its meaning changed (a later pass redesigns the
+// envelope). `isPrivateClosureSatisfied` was deleted: it required `observed === PRIVATE_INVENTORY_TOTAL`,
+// which nothing in this collector can ever produce anymore.
 export function aggregatePrivate(dispositions: readonly Disposition[]): PrivateAggregate {
-  let resolved = 0
   let unresolved = 0
   let unavailable = 0
   for (const disposition of dispositions) {
-    if (disposition === 'qualified' || disposition === 'no-longer-applicable') {
-      resolved += 1
-    } else if (disposition === 'unavailable') {
+    if (disposition === 'unavailable') {
       unavailable += 1
     } else {
       unresolved += 1
     }
   }
-  return {total: dispositions.length, resolved, unresolved, unavailable}
-}
-
-/**
- * The canonical private closure rule: all three private entries positively terminal in the
- * current collector artifact. Historical aggregate progress alone never satisfies this.
- */
-export function isPrivateClosureSatisfied(aggregate: PrivateAggregate): boolean {
-  return (
-    aggregate.total === PRIVATE_INVENTORY_TOTAL &&
-    aggregate.resolved === PRIVATE_INVENTORY_TOTAL &&
-    aggregate.unresolved === 0 &&
-    aggregate.unavailable === 0
-  )
+  return {total: dispositions.length, observed: 0, unresolved, unavailable}
 }
 
 export function determineCollectorStatus(dispositions: readonly Disposition[]): CollectorStatus {
@@ -564,9 +394,6 @@ export function determineCollectorStatus(dispositions: readonly Disposition[]): 
   }
   if (dispositions.every(disposition => disposition === 'unavailable')) {
     return 'unavailable'
-  }
-  if (dispositions.every(disposition => disposition === 'qualified' || disposition === 'no-longer-applicable')) {
-    return 'ready'
   }
   return 'partial'
 }
@@ -577,7 +404,7 @@ export function buildArtifact(input: BuildArtifactInput): ArtifactEnvelope {
     producer: input.producer,
     baseline: input.baseline,
     collectorStatus: input.collectorStatus,
-    public: input.publicDispositions,
+    public: input.publicObservations,
     private: input.privateAggregate,
   }
 }
@@ -598,13 +425,7 @@ function hasNumberFields(value: Record<string, unknown>, fields: readonly string
   return fields.every(field => typeof value[field] === 'number')
 }
 
-const DISPOSITION_VALUES: readonly Disposition[] = [
-  'qualified',
-  'no-longer-applicable',
-  'unresolved',
-  'preflight-failed',
-  'unavailable',
-]
+const DISPOSITION_VALUES: readonly Disposition[] = ['unresolved', 'preflight-failed', 'unavailable']
 
 const FETCH_STATUS_CLASS_VALUES: readonly FetchStatusClass[] = [
   'success',
@@ -626,33 +447,33 @@ function isNullableNumber(value: unknown): boolean {
   return value === null || typeof value === 'number'
 }
 
-function isPublicDispositionRecord(value: unknown): boolean {
+function isPublicObservationRecord(value: unknown): boolean {
   if (isRecord(value) === false) return false
   return (
     typeof value.repository === 'string' &&
     value.repository.length > 0 &&
-    typeof value.disposition === 'string' &&
-    DISPOSITION_VALUES.includes(value.disposition as Disposition) &&
+    typeof value.state === 'string' &&
+    DISPOSITION_VALUES.includes(value.state as Disposition) &&
     typeof value.observedAt === 'string' &&
     typeof value.fetchStatusClass === 'string' &&
     FETCH_STATUS_CLASS_VALUES.includes(value.fetchStatusClass as FetchStatusClass) &&
-    isNullableString(value.rejectionReason) &&
+    isNullableString(value.observation) &&
     isNullableString(value.event) &&
     isNullableNumber(value.runId) &&
     isNullableNumber(value.runAttempt) &&
     isNullableString(value.runUrl) &&
     isNullableString(value.workflowPath) &&
-    isNullableString(value.actionRef) &&
+    isNullableString(value.declaredActionRef) &&
     isNullableString(value.resolvedActionSha)
   )
 }
 
 /**
- * Structural validation of the version-1 envelope. `main()` runs this before writing the artifact
+ * Structural validation of the version-2 envelope. `main()` runs this before writing the artifact
  * so a future shape regression fails closed with a constant-class message instead of publishing it.
  * Each public entry's required fields and types are validated, not merely the container shape.
  */
-export function isSchemaV1Envelope(value: unknown): value is ArtifactEnvelope {
+export function isSchemaV2Envelope(value: unknown): value is ArtifactEnvelope {
   if (isRecord(value) === false) return false
   const {schemaVersion, producer, baseline, collectorStatus, public: publicRecords, private: privateAggregate} = value
   return (
@@ -661,11 +482,11 @@ export function isSchemaV1Envelope(value: unknown): value is ArtifactEnvelope {
     hasStringFields(producer, ['runId', 'runAttempt', 'schedule', 'generatedAt']) &&
     isRecord(baseline) &&
     hasStringFields(baseline, ['minimumRelease', 'minimumReleasePublishedAt', 'credentialPreflightCommit']) &&
-    (collectorStatus === 'ready' || collectorStatus === 'partial' || collectorStatus === 'unavailable') &&
+    (collectorStatus === 'partial' || collectorStatus === 'unavailable') &&
     Array.isArray(publicRecords) &&
-    publicRecords.every(isPublicDispositionRecord) &&
+    publicRecords.every(isPublicObservationRecord) &&
     isRecord(privateAggregate) &&
-    hasNumberFields(privateAggregate, ['total', 'resolved', 'unresolved', 'unavailable'])
+    hasNumberFields(privateAggregate, ['total', 'observed', 'unresolved', 'unavailable'])
   )
 }
 
@@ -673,24 +494,26 @@ export function isSchemaV1Envelope(value: unknown): value is ArtifactEnvelope {
 // Orchestration (pure control flow over injected adapters)
 // ---------------------------------------------------------------------------
 
-function baseRecord(entry: InventoryEntry, observedAt: string): PublicDisposition {
+function baseRecord(entry: InventoryEntry, observedAt: string): PublicObservation {
   return {
     repository: `${entry.owner}/${entry.repo}`,
-    disposition: 'unresolved',
+    state: 'unresolved',
     observedAt,
     fetchStatusClass: 'success',
-    rejectionReason: null,
+    observation: null,
     event: null,
     runId: null,
     runAttempt: null,
     runUrl: null,
     workflowPath: null,
-    actionRef: null,
+    declaredActionRef: null,
     resolvedActionSha: null,
+    reportedJobs: null,
+    ancestryFromPreflight: null,
   }
 }
 
-function withRun(base: PublicDisposition, run: WorkflowRun, overrides: Partial<PublicDisposition>): PublicDisposition {
+function withRun(base: PublicObservation, run: WorkflowRun, overrides: Partial<PublicObservation>): PublicObservation {
   return {
     ...base,
     event: run.event,
@@ -703,313 +526,127 @@ function withRun(base: PublicDisposition, run: WorkflowRun, overrides: Partial<P
 }
 
 /**
- * Evaluate one candidate run against the full provenance chain. Every branch returns a complete
- * public disposition so the caller only inspects `disposition`.
+ * Evaluate one candidate run and record what was directly observed. This collector has no
+ * forgery-resistant way to authenticate a Fro Bot invocation (that required log-scraping and
+ * recursive external-wrapper traversal, both removed as unfixable trust-boundary defects), so
+ * every branch is deliberately non-terminal: `unresolved` for inconclusive evidence, `unavailable`
+ * for evidence that could not be read, `preflight-failed` only for direct step-level detection.
  */
 async function evaluateRun(
-  base: PublicDisposition,
+  base: PublicObservation,
   entry: InventoryEntry,
   run: WorkflowRun,
   adapters: CollectorAdapters,
-): Promise<PublicDisposition> {
+): Promise<PublicObservation> {
   if (
     run.event === 'pull_request' &&
     (run.headRepositoryFullName === null ||
       run.headRepositoryFullName.toLowerCase() !== `${entry.owner}/${entry.repo}`.toLowerCase())
   ) {
-    return withRun(base, run, {disposition: 'unresolved', rejectionReason: FORK_PULL_REQUEST_REJECTION_REASON})
-  }
-
-  const logs = await adapters.getRunLogs(entry, run.id, run.runAttempt)
-  if (logs.ok === false) {
-    return withRun(base, run, {
-      disposition: 'unavailable',
-      rejectionReason: 'run-logs-unavailable',
-      fetchStatusClass: logs.fetchStatusClass,
-    })
-  }
-  if (logs.text.includes(CREDENTIAL_REFUSAL_MARKER)) {
-    // Evaluated before any success-based qualification: a downstream continue-on-error step can
-    // refuse credentials while the overall run still concludes success.
-    return withRun(base, run, {disposition: 'preflight-failed', rejectionReason: 'credential-preflight-refused'})
+    return withRun(base, run, {state: 'unresolved', observation: FORK_PULL_REQUEST_OBSERVATION})
   }
   if (run.conclusion !== 'success') {
-    return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'terminal-run-failed'})
+    return withRun(base, run, {state: 'unresolved', observation: 'run-concluded-unsuccessful'})
   }
   const content = await adapters.getWorkflowContent(entry, run.path, run.headSha)
   if (content.ok === false) {
     return withRun(base, run, {
-      disposition: 'unavailable',
-      rejectionReason: 'workflow-content-unavailable',
+      state: 'unavailable',
+      observation: 'workflow-content-unavailable',
       fetchStatusClass: content.fetchStatusClass,
     })
   }
   const parsedReferences = parseActionReferences(content.content)
   if (parsedReferences.ok === false) {
     return withRun(base, run, {
-      disposition: 'unavailable',
-      rejectionReason: 'workflow-content-unavailable',
+      state: 'unavailable',
+      observation: 'workflow-content-unavailable',
       fetchStatusClass: parsedReferences.fetchStatusClass,
     })
   }
   const references = parsedReferences.references
   if (references.length === 0) {
-    return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'missing-action-reference'})
+    return withRun(base, run, {state: 'unresolved', observation: 'no-action-reference-in-workflow'})
   }
   if (references.some(reference => isQualifiableActionReference(reference) === false)) {
-    return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'non-qualifiable-action-reference'})
+    return withRun(base, run, {state: 'unresolved', observation: 'ineligible-action-reference'})
   }
   const distinctReferences = [...new Set(references)]
   if (distinctReferences.length > 1) {
-    return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'ambiguous-action-reference'})
+    return withRun(base, run, {state: 'unresolved', observation: 'multiple-distinct-action-references'})
   }
-  const actionRef = distinctReferences[0]
-  if (actionRef === undefined) {
-    return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'missing-action-reference'})
+  const declaredActionRef = distinctReferences[0]
+  if (declaredActionRef === undefined) {
+    return withRun(base, run, {state: 'unresolved', observation: 'no-action-reference-in-workflow'})
   }
-  const resolved = parseResolvedActionSha(logs.text, actionRef)
-  if (resolved.ok === false) {
-    const rejectionReason =
-      resolved.reason === 'ambiguous' ? 'ambiguous-action-resolution' : 'missing-action-resolution'
-    return withRun(base, run, {disposition: 'unresolved', rejectionReason, actionRef})
+  // A direct, qualifiable action reference was observed in the workflow content the run itself
+  // executed. That is evidence, not proof: without an authenticated resolution to a commit SHA and
+  // an independently confirmed invocation outcome, this stops short of any terminal disposition.
+  const jobsResult = await adapters.getRunJobs(entry, run.id, run.runAttempt)
+  const reportedJobs = jobsResult.ok === true ? jobsResult.jobs : null
+  // A floating reference (e.g. `v0`) must never be resolved to a SHA here and attributed to this
+  // run's evidence: today's floating-ref content is not proof of what any given run executed.
+  let resolvedActionSha: string | null = null
+  let ancestryFromPreflight: boolean | null = null
+  if (isFullSha(declaredActionRef)) {
+    resolvedActionSha = declaredActionRef
+    const ancestryResult = await adapters.isDescendantOfPreflight(declaredActionRef)
+    ancestryFromPreflight = ancestryResult.ok === true ? ancestryResult.descendant : null
   }
-  if (isFullSha(actionRef) && resolved.sha !== actionRef) {
-    return withRun(base, run, {
-      disposition: 'unresolved',
-      rejectionReason: 'action-resolution-mismatch',
-      actionRef,
-      resolvedActionSha: resolved.sha,
-    })
-  }
-  const ancestry = await adapters.isDescendantOfPreflight(resolved.sha)
-  if (ancestry.ok === false) {
-    return withRun(base, run, {
-      disposition: 'unavailable',
-      rejectionReason: 'ancestry-check-unavailable',
-      fetchStatusClass: ancestry.fetchStatusClass,
-      actionRef,
-      resolvedActionSha: resolved.sha,
-    })
-  }
-  if (ancestry.descendant === false) {
-    return withRun(base, run, {
-      disposition: 'unresolved',
-      rejectionReason: 'non-descendant-action-sha',
-      actionRef,
-      resolvedActionSha: resolved.sha,
-    })
-  }
-  // Provenance is satisfied; only now is the bounded per-job evidence fetch worth spending.
-  const jobs = await adapters.getRunJobs(entry, run.id, run.runAttempt)
-  if (jobs.ok === false) {
-    return withRun(base, run, {
-      disposition: 'unavailable',
-      rejectionReason: 'run-jobs-unavailable',
-      fetchStatusClass: jobs.fetchStatusClass,
-    })
-  }
-  if (areRunJobsSuccessful(jobs.jobs) === false) {
-    // Overall run success is not proof the Fro Bot invocation itself succeeded.
-    return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'run-jobs-not-successful'})
-  }
-  return withRun(base, run, {disposition: 'qualified', actionRef, resolvedActionSha: resolved.sha})
-}
-
-type WorkflowInspectionResult =
-  | {readonly ok: true; readonly sawReference: boolean}
-  | {readonly ok: false; readonly rejectionReason: string; readonly fetchStatusClass: FetchStatusClass}
-
-interface ExternalWorkflowTarget {
-  readonly owner: string
-  readonly repo: string
-  readonly path: string
-  readonly ref: string
-}
-
-/** Parse `owner/repo/path@ref` job-level reusable-workflow `uses` values; anything else is unresolvable. */
-const EXTERNAL_WORKFLOW_PATTERN = /^([^/@\s]+)\/([^/@\s]+)\/([^@\s]+)@(\S+)$/
-
-function parseExternalWorkflowReference(uses: string): ExternalWorkflowTarget | null {
-  const match = EXTERNAL_WORKFLOW_PATTERN.exec(uses)
-  if (match === null) {
-    return null
-  }
-  const owner = match[1]
-  const repo = match[2]
-  const path = match[3]
-  const ref = match[4]
-  if (owner === undefined || repo === undefined || path === undefined || ref === undefined) {
-    return null
-  }
-  if (path.length === 0 || ref.length === 0) {
-    return null
-  }
-  return {owner, repo, path, ref}
+  return withRun(base, run, {
+    state: 'unresolved',
+    observation: 'direct-reference-observed',
+    declaredActionRef,
+    resolvedActionSha,
+    reportedJobs,
+    ancestryFromPreflight,
+  })
 }
 
 /**
- * Resolve an external reusable workflow from its own repository at the referenced ref and inspect it
- * within the same depth and visited-set bounds as local wrappers. An unresolvable fetch fails closed.
+ * Inspect only the direct `uses:` references in workflow content fetched from the inventoried
+ * repository at its default branch. No traversal into local or external wrappers: that required
+ * following `uses:` targets to arbitrary `owner/repo/path@ref` destinations and fetching them with
+ * a private-capable credential, which is the recursive-traversal trust-boundary defect this
+ * collector no longer has. Absence of a discovered direct reference is `unresolved`, never proof
+ * of removal.
  */
-async function inspectExternalWorkflow(
-  target: ExternalWorkflowTarget,
-  adapters: CollectorAdapters,
-  visited: Set<string>,
-  depth: number,
-): Promise<WorkflowInspectionResult> {
-  const visitKey = `workflow:${target.owner}/${target.repo}@${target.ref}:${target.path}`
-  if (visited.has(visitKey)) {
-    return {ok: true, sawReference: false}
-  }
-  visited.add(visitKey)
-  if (depth + 1 > LIMITS.maxIndirectionDepth) {
-    return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'success'}
-  }
-  const externalEntry: InventoryEntry = {owner: target.owner, repo: target.repo, workflowPaths: []}
-  const result = await adapters.getWorkflowContent(externalEntry, target.path, target.ref)
-  if (result.ok === false) {
-    return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: result.fetchStatusClass}
-  }
-  return inspectManifestContent(externalEntry, adapters, target.ref, result.content, visited, depth + 1)
-}
-
-async function inspectManifestContent(
-  entry: InventoryEntry,
-  adapters: CollectorAdapters,
-  ref: string,
-  content: string,
-  visited: Set<string>,
-  depth: number,
-): Promise<WorkflowInspectionResult> {
-  const parsed = parseWorkflowIndirections(content)
-  if (parsed.ok === false) {
-    return {ok: false, rejectionReason: 'workflow-read-unavailable', fetchStatusClass: 'malformed'}
-  }
-  const indirections = parsed.value
-  if (indirections.directReferences.length > 0) {
-    return {ok: true, sawReference: true}
-  }
-  for (const wrapper of indirections.externalJobWrappers) {
-    // A non-local wrapper could itself invoke Fro Bot; resolve and inspect it, or fail closed.
-    const target = parseExternalWorkflowReference(wrapper)
-    if (target === null) {
-      return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'success'}
-    }
-    const nested = await inspectExternalWorkflow(target, adapters, visited, depth)
-    if (nested.ok === false) {
-      return nested
-    }
-    if (nested.sawReference) {
-      return {ok: true, sawReference: true}
-    }
-  }
-  for (const localPath of indirections.localWorkflowPaths) {
-    const nested = await inspectWorkflow(entry, adapters, ref, localPath, visited, depth + 1)
-    if (nested.ok === false) {
-      return nested
-    }
-    if (nested.sawReference) {
-      return {ok: true, sawReference: true}
-    }
-  }
-  for (const actionDir of indirections.localActionPaths) {
-    const nested = await inspectLocalAction(entry, adapters, ref, actionDir, visited, depth + 1)
-    if (nested.ok === false) {
-      return nested
-    }
-    if (nested.sawReference) {
-      return {ok: true, sawReference: true}
-    }
-  }
-  return {ok: true, sawReference: false}
-}
-
-async function inspectWorkflow(
-  entry: InventoryEntry,
-  adapters: CollectorAdapters,
-  ref: string,
-  path: string,
-  visited: Set<string>,
-  depth: number,
-): Promise<WorkflowInspectionResult> {
-  const visitKey = `workflow:${entry.owner}/${entry.repo}@${ref}:${path}`
-  if (visited.has(visitKey)) {
-    return {ok: true, sawReference: false}
-  }
-  visited.add(visitKey)
-  if (depth > LIMITS.maxIndirectionDepth) {
-    return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'success'}
-  }
-  const result = await adapters.getWorkflowContent(entry, path, ref)
-  if (result.ok === false) {
-    return {ok: false, rejectionReason: 'workflow-read-unavailable', fetchStatusClass: result.fetchStatusClass}
-  }
-  return inspectManifestContent(entry, adapters, ref, result.content, visited, depth)
-}
-
-async function inspectLocalAction(
-  entry: InventoryEntry,
-  adapters: CollectorAdapters,
-  ref: string,
-  actionDir: string,
-  visited: Set<string>,
-  depth: number,
-): Promise<WorkflowInspectionResult> {
-  const visitKey = `action:${entry.owner}/${entry.repo}@${ref}:${actionDir}`
-  if (visited.has(visitKey)) {
-    return {ok: true, sawReference: false}
-  }
-  visited.add(visitKey)
-  if (depth > LIMITS.maxIndirectionDepth) {
-    return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'success'}
-  }
-  const candidates =
-    actionDir === '' ? ['action.yml', 'action.yaml'] : [`${actionDir}/action.yml`, `${actionDir}/action.yaml`]
-  for (const candidate of candidates) {
-    const result = await adapters.getWorkflowContent(entry, candidate, ref)
-    if (result.ok === true) {
-      return inspectManifestContent(entry, adapters, ref, result.content, visited, depth)
-    }
-    if (result.fetchStatusClass !== 'not-found') {
-      return {ok: false, rejectionReason: 'indirect-wrapper-unavailable', fetchStatusClass: result.fetchStatusClass}
-    }
-  }
-  // A local `uses: ./<path>` target with no action manifest cannot be resolved; fail closed.
-  return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'not-found'}
-}
-
 async function classifyDefaultBranch(
   entry: InventoryEntry,
   adapters: CollectorAdapters,
   defaultBranch: string,
-): Promise<Pick<PublicDisposition, 'disposition' | 'rejectionReason' | 'fetchStatusClass'>> {
+): Promise<Pick<PublicObservation, 'state' | 'observation' | 'fetchStatusClass'>> {
   const workflowPaths = await adapters.listWorkflowPaths(entry)
   if (workflowPaths.ok === false) {
     return {
-      disposition: 'unavailable',
-      rejectionReason: 'workflow-list-unavailable',
+      state: 'unavailable',
+      observation: 'workflow-list-unavailable',
       fetchStatusClass: workflowPaths.fetchStatusClass,
     }
   }
 
-  const visited = new Set<string>()
-  let sawReference = false
   for (const path of workflowPaths.paths) {
-    const inspected = await inspectWorkflow(entry, adapters, defaultBranch, path, visited, 0)
-    if (inspected.ok === false) {
+    const content = await adapters.getWorkflowContent(entry, path, defaultBranch)
+    if (content.ok === false) {
       return {
-        disposition: 'unavailable',
-        rejectionReason: inspected.rejectionReason,
-        fetchStatusClass: inspected.fetchStatusClass,
+        state: 'unavailable',
+        observation: 'workflow-read-unavailable',
+        fetchStatusClass: content.fetchStatusClass,
       }
     }
-    if (inspected.sawReference) {
-      sawReference = true
+    const parsedReferences = parseActionReferences(content.content)
+    if (parsedReferences.ok === false) {
+      return {
+        state: 'unavailable',
+        observation: 'workflow-read-unavailable',
+        fetchStatusClass: parsedReferences.fetchStatusClass,
+      }
+    }
+    if (parsedReferences.references.length > 0) {
+      return {state: 'unresolved', observation: 'direct-reference-observed', fetchStatusClass: 'success'}
     }
   }
-  return sawReference
-    ? {disposition: 'unresolved', rejectionReason: 'no-qualifying-run', fetchStatusClass: 'success'}
-    : {disposition: 'no-longer-applicable', rejectionReason: 'workflow-removed', fetchStatusClass: 'success'}
+  return {state: 'unresolved', observation: 'no-direct-reference-observed', fetchStatusClass: 'success'}
 }
 
 async function collectEntry(
@@ -1017,27 +654,29 @@ async function collectEntry(
   adapters: CollectorAdapters,
   isPrivate: boolean,
   observedAt: string,
-): Promise<PublicDisposition> {
+): Promise<PublicObservation> {
   const base = baseRecord(entry, observedAt)
 
   const repository = await adapters.getRepository(entry)
   if (repository.ok === false) {
     return {
       ...base,
-      disposition: 'unavailable',
-      rejectionReason: 'repository-unavailable',
+      state: 'unavailable',
+      observation: 'repository-unavailable',
       fetchStatusClass: repository.fetchStatusClass,
     }
   }
   const expectedFullName = `${entry.owner}/${entry.repo}`
   if (repository.fullName.toLowerCase() !== expectedFullName.toLowerCase()) {
-    return {...base, disposition: 'unavailable', rejectionReason: 'repository-identity-mismatch'}
+    return {...base, state: 'unavailable', observation: 'repository-identity-mismatch'}
   }
   if (repository.private !== isPrivate) {
-    return {...base, disposition: 'unavailable', rejectionReason: 'repository-visibility-mismatch'}
+    return {...base, state: 'unavailable', observation: 'repository-visibility-mismatch'}
   }
   if (repository.archived === true) {
-    return {...base, disposition: 'no-longer-applicable', rejectionReason: 'repository-archived'}
+    // Archive status is recorded information, not a terminal conclusion: an archived repository
+    // could still hold a run that had already executed before archival.
+    return {...base, state: 'unresolved', observation: 'repository-archived'}
   }
 
   // Workflow-path filtering happens per page, before the release boundary and every
@@ -1051,8 +690,8 @@ async function collectEntry(
     if (result.ok === false) {
       return {
         ...base,
-        disposition: 'unavailable',
-        rejectionReason: 'run-list-unavailable',
+        state: 'unavailable',
+        observation: 'run-list-unavailable',
         fetchStatusClass: result.fetchStatusClass,
       }
     }
@@ -1075,8 +714,8 @@ async function collectEntry(
   if (reachedEnd === false) {
     return {
       ...base,
-      disposition: 'unavailable',
-      rejectionReason: 'pagination-bound-exhausted',
+      state: 'unavailable',
+      observation: 'pagination-bound-exhausted',
       fetchStatusClass: 'success',
     }
   }
@@ -1091,39 +730,39 @@ async function collectEntry(
     })
 
   let evaluations = 0
-  let best: PublicDisposition | null = null
-  let unavailableFallback: PublicDisposition | null = null
+  let best: PublicObservation | null = null
+  let unavailableFallback: PublicObservation | null = null
   for (const run of filtered) {
     if (evaluations >= LIMITS.maxCandidateLogs) {
       return {
         ...base,
-        disposition: 'unavailable',
-        rejectionReason: 'candidate-log-bound-exhausted',
+        state: 'unavailable',
+        observation: 'candidate-log-bound-exhausted',
         fetchStatusClass: 'success',
       }
     }
     evaluations += 1
     const evaluation = await evaluateRun(base, entry, run, adapters)
-    if (evaluation.disposition === 'qualified') {
-      return evaluation
-    }
-    if (evaluation.disposition === 'unavailable') {
-      // Do not let one unavailable candidate mask a later in-budget candidate that qualifies;
-      // surface unavailable only if nothing better is found.
+    if (evaluation.state === 'unavailable') {
+      // An unavailable candidate may have been the qualifying one; that uncertainty must not be
+      // silently discarded in favor of another candidate's more definitive-looking observation.
       if (unavailableFallback === null) {
         unavailableFallback = evaluation
       }
       continue
     }
-    if (best === null || (best.disposition !== 'preflight-failed' && evaluation.disposition === 'preflight-failed')) {
+    if (best === null || (best.state !== 'preflight-failed' && evaluation.state === 'preflight-failed')) {
       best = evaluation
     }
   }
-  if (best !== null) {
-    return best
-  }
+  // Any in-budget unavailable candidate keeps the entry's result unavailable, even when another
+  // candidate produced a more definitive-looking observation: the unavailable one may have been
+  // the qualifying run, and that uncertainty must be surfaced rather than overridden.
   if (unavailableFallback !== null) {
     return unavailableFallback
+  }
+  if (best !== null) {
+    return best
   }
 
   const branch = await classifyDefaultBranch(entry, adapters, repository.defaultBranch)
@@ -1132,9 +771,9 @@ async function collectEntry(
 
 export async function collectRuntimeVerification(input: CollectInput): Promise<ArtifactEnvelope> {
   const observedAt = input.now().toISOString()
-  const publicDispositions: PublicDisposition[] = []
+  const publicObservations: PublicObservation[] = []
   for (const entry of input.publicInventory) {
-    publicDispositions.push(await collectEntry(entry, input.adapters, false, observedAt))
+    publicObservations.push(await collectEntry(entry, input.adapters, false, observedAt))
   }
 
   const privateInventory = input.privateInventory
@@ -1143,27 +782,27 @@ export async function collectRuntimeVerification(input: CollectInput): Promise<A
   let privateAggregate: PrivateAggregate
   if (privateInventory !== null && privateIsValid) {
     for (const entry of privateInventory) {
-      privateDispositions.push((await collectEntry(entry, input.adapters, true, observedAt)).disposition)
+      privateDispositions.push((await collectEntry(entry, input.adapters, true, observedAt)).state)
     }
     privateAggregate = aggregatePrivate(privateDispositions)
   } else {
     privateAggregate = {
       total: PRIVATE_INVENTORY_TOTAL,
-      resolved: 0,
+      observed: 0,
       unresolved: 0,
       unavailable: PRIVATE_INVENTORY_TOTAL,
     }
   }
 
   const collectorStatus = privateIsValid
-    ? determineCollectorStatus([...publicDispositions.map(record => record.disposition), ...privateDispositions])
+    ? determineCollectorStatus([...publicObservations.map(record => record.state), ...privateDispositions])
     : 'unavailable'
 
   return buildArtifact({
     producer: input.producer,
     baseline: BASELINE,
     collectorStatus,
-    publicDispositions,
+    publicObservations,
     privateAggregate,
   })
 }
@@ -1194,65 +833,45 @@ function failureClass(status: number): FetchStatusClass {
   return 'error'
 }
 
-type GhLogRunner = (entry: InventoryEntry, runId: number, runAttempt: number) => RunLogsResult
-
 export interface GitHubAdapterOptions {
   readonly token: string
+  /** Trusted public target inventory; combined with `privateInventory` to confine outgoing requests. */
+  readonly publicInventory: readonly InventoryEntry[]
+  /** Trusted private target inventory, or `null` when the private secret failed to parse. */
+  readonly privateInventory: readonly InventoryEntry[] | null
   readonly fetchImpl?: typeof fetch
-  readonly runGh?: GhLogRunner
   readonly timeoutMs?: number
   readonly maxResponseBytes?: number
-  readonly maxLogBytes?: number
-  readonly logTimeoutMs?: number
-  readonly logKillSignal?: NodeJS.Signals
 }
 
 /**
- * Classify a `gh run view --log` subprocess failure as a constant fetch-status class. A timeout is
- * classified distinctly from other failures so one stalled log retrieval cannot consume the job.
+ * Read a response body as a bounded byte stream, aborting as soon as the byte limit is exceeded
+ * instead of buffering the full body first. A response with no body (or a runtime that never
+ * exposes one) is treated as an empty body.
  */
-export function classifyGhFailure(error: unknown): FetchStatusClass {
-  const shape = error as {readonly code?: unknown; readonly status?: unknown; readonly signal?: unknown}
-  if (shape.code === 'ENOBUFS') {
-    return 'oversized'
+async function readBoundedBody(response: Response, maxResponseBytes: number): Promise<FetchTextResult> {
+  const body = response.body
+  if (body === null) {
+    return {ok: true, text: ''}
   }
-  if (shape.code === 'ETIMEDOUT' || shape.signal === 'SIGTERM' || shape.signal === 'SIGKILL') {
-    return 'timeout'
-  }
-  if (typeof shape.status === 'number') {
-    return failureClass(shape.status)
-  }
-  return 'error'
-}
-
-function defaultRunGh(token: string, maxBytes: number, timeoutMs: number, killSignal: NodeJS.Signals): GhLogRunner {
-  return (entry, runId, runAttempt) => {
-    try {
-      const text = execFileSync(
-        'gh',
-        [
-          'run',
-          'view',
-          String(runId),
-          '--repo',
-          `${entry.owner}/${entry.repo}`,
-          '--log',
-          '--attempt',
-          String(runAttempt),
-        ],
-        {
-          encoding: 'utf8',
-          maxBuffer: maxBytes,
-          timeout: timeoutMs,
-          killSignal,
-          env: {...process.env, GH_TOKEN: token},
-          stdio: ['ignore', 'pipe', 'pipe'],
-        },
-      )
+  // `Response.body`'s upstream type parameter defaults to `any`; assert the concrete byte type
+  // this stream actually produces so downstream reads stay type-checked.
+  const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>
+  const decoder = new TextDecoder('utf-8')
+  let text = ''
+  let totalBytes = 0
+  while (true) {
+    const {done, value} = await reader.read()
+    if (done) {
+      text += decoder.decode()
       return {ok: true, text}
-    } catch (error: unknown) {
-      return {ok: false, fetchStatusClass: classifyGhFailure(error)}
     }
+    totalBytes += value.byteLength
+    if (totalBytes > maxResponseBytes) {
+      await reader.cancel('response-body-oversized').catch(() => undefined)
+      return {ok: false, fetchStatusClass: 'oversized'}
+    }
+    text += decoder.decode(value, {stream: true})
   }
 }
 
@@ -1260,14 +879,17 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? LIMITS.requestTimeoutMs
   const maxResponseBytes = options.maxResponseBytes ?? LIMITS.maxResponseBytes
-  const getRunLogs =
-    options.runGh ??
-    defaultRunGh(
-      options.token,
-      options.maxLogBytes ?? LIMITS.maxLogBytes,
-      options.logTimeoutMs ?? LIMITS.logTimeoutMs,
-      options.logKillSignal ?? 'SIGKILL',
-    )
+
+  // The adapter layer must independently confine every outgoing request target to the trusted
+  // inventories, rather than relying on callers never constructing an out-of-inventory entry.
+  // Targets are normalized (lowercase owner/repo) before membership is checked.
+  const allowedTargets = new Set<string>(
+    [...options.publicInventory, ...(options.privateInventory ?? [])].map(
+      entry => `${entry.owner.toLowerCase()}/${entry.repo.toLowerCase()}`,
+    ),
+  )
+  const isAllowedEntry = (entry: InventoryEntry): boolean =>
+    allowedTargets.has(`${entry.owner.toLowerCase()}/${entry.repo.toLowerCase()}`)
 
   const request = async (path: string, accept: string): Promise<FetchTextResult> => {
     try {
@@ -1287,11 +909,7 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
       if (response.ok === false) {
         return {ok: false, fetchStatusClass: failureClass(response.status)}
       }
-      const text = await response.text()
-      if (text.length > maxResponseBytes) {
-        return {ok: false, fetchStatusClass: 'oversized'}
-      }
-      return {ok: true, text}
+      return await readBoundedBody(response, maxResponseBytes)
     } catch (error: unknown) {
       const timedOut = error instanceof Error && error.name === 'TimeoutError'
       return {ok: false, fetchStatusClass: timedOut ? 'timeout' : 'error'}
@@ -1300,6 +918,9 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
 
   return {
     getRepository: async entry => {
+      if (isAllowedEntry(entry) === false) {
+        return {ok: false, fetchStatusClass: 'forbidden'}
+      }
       const response = await request(`/repos/${entry.owner}/${entry.repo}`, 'application/vnd.github+json')
       if (response.ok === false) {
         return response
@@ -1332,6 +953,9 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
       }
     },
     listRunPage: async (entry, page) => {
+      if (isAllowedEntry(entry) === false) {
+        return {ok: false, fetchStatusClass: 'forbidden'}
+      }
       const path = `/repos/${entry.owner}/${entry.repo}/actions/runs?per_page=${LIMITS.runsPerPage}&page=${page}`
       const response = await request(path, 'application/vnd.github+json')
       if (response.ok === false) {
@@ -1360,6 +984,9 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
       return {ok: true, runs, nextPage: runs.length === LIMITS.runsPerPage ? page + 1 : null}
     },
     listWorkflowPaths: async entry => {
+      if (isAllowedEntry(entry) === false) {
+        return {ok: false, fetchStatusClass: 'forbidden'}
+      }
       const paths: string[] = []
       let page = 1
       while (true) {
@@ -1394,6 +1021,9 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
       }
     },
     getWorkflowContent: async (entry, path, ref) => {
+      if (isAllowedEntry(entry) === false) {
+        return {ok: false, fetchStatusClass: 'forbidden'}
+      }
       const encodedPath = path
         .split('/')
         .map(segment => encodeURIComponent(segment))
@@ -1407,8 +1037,10 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
       }
       return {ok: true, content: response.text}
     },
-    getRunLogs: async (entry, runId, runAttempt) => getRunLogs(entry, runId, runAttempt),
     getRunJobs: async (entry, runId, runAttempt) => {
+      if (isAllowedEntry(entry) === false) {
+        return {ok: false, fetchStatusClass: 'forbidden'}
+      }
       const jobs: RunJobEvidence[] = []
       let page = 1
       while (true) {
@@ -1464,24 +1096,30 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
 
 function toRunJobEvidence(value: unknown): RunJobEvidence | null {
   if (isObject(value) === false) return null
+  const name = value.name
   const status = value.status
   const conclusion = value.conclusion
+  if (typeof name !== 'string') return null
   if (typeof status !== 'string') return null
   if (conclusion !== null && typeof conclusion !== 'string') return null
+  // Missing per-step evidence is unknown/malformed, not an empty-and-successful step set: a jobs
+  // response with no `steps` property must never be treated as a clean, evidence-free job.
   const rawSteps = value.steps
-  if (rawSteps !== undefined && Array.isArray(rawSteps) === false) return null
+  if (Array.isArray(rawSteps) === false) return null
   const steps: RunStepEvidence[] = []
-  if (Array.isArray(rawSteps)) {
-    for (const step of rawSteps) {
-      if (isObject(step) === false) return null
-      const stepStatus = step.status
-      const stepConclusion = step.conclusion
-      if (typeof stepStatus !== 'string') return null
-      if (stepConclusion !== null && typeof stepConclusion !== 'string') return null
-      steps.push({status: stepStatus, conclusion: stepConclusion})
-    }
+  for (const step of rawSteps) {
+    if (isObject(step) === false) return null
+    const stepName = step.name
+    const stepNumber = step.number
+    const stepStatus = step.status
+    const stepConclusion = step.conclusion
+    if (typeof stepName !== 'string') return null
+    if (stepNumber !== null && typeof stepNumber !== 'number') return null
+    if (typeof stepStatus !== 'string') return null
+    if (stepConclusion !== null && typeof stepConclusion !== 'string') return null
+    steps.push({name: stepName, number: stepNumber ?? null, status: stepStatus, conclusion: stepConclusion})
   }
-  return {status, conclusion, steps}
+  return {name, status, conclusion, steps}
 }
 
 function toWorkflowRun(value: unknown): WorkflowRun | null {
@@ -1522,7 +1160,11 @@ export async function main(): Promise<void> {
       generatedAt: new Date().toISOString(),
     }
     const parsed = parsePrivateInventory(process.env.DMR_RUNTIME_VERIFICATION_PRIVATE_INVENTORY)
-    const adapters = createGitHubAdapters({token: process.env.GH_TOKEN ?? ''})
+    const adapters = createGitHubAdapters({
+      token: process.env.GH_TOKEN ?? '',
+      publicInventory: PUBLIC_INVENTORY,
+      privateInventory: parsed.ok ? parsed.entries : null,
+    })
     const artifact = await collectRuntimeVerification({
       producer,
       publicInventory: PUBLIC_INVENTORY,
@@ -1530,7 +1172,7 @@ export async function main(): Promise<void> {
       adapters,
       now: () => new Date(),
     })
-    if (isSchemaV1Envelope(artifact) === false) {
+    if (isSchemaV2Envelope(artifact) === false) {
       throw new Error('artifact-schema-invalid')
     }
     const outputPath =

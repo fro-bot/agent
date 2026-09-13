@@ -1,0 +1,48 @@
+# Operator disposition record for the temporary #1598 runtime-verification sweep.
+#
+# The collector (scripts/collect-dmr-runtime-verification.ts) can observe but never
+# resolve: GitHub Actions exposes no forge-resistant way to prove an action executed
+# in a downstream workflow run, so every collector observation is non-terminal by
+# construction. An operator reviews collector observations and records a terminal
+# disposition here after manual verification. The collector can never write to this
+# file. This file — not issue #1598, which the bot itself can edit — is the sole
+# authority for terminal resolution: it is changed only through a reviewed pull
+# request under branch protection.
+#
+# #1598 may be closed only when every public entry below is dispositioned (non-null)
+# and private.dispositioned equals private.total.
+
+# Allowed values per public entry: `migrated` (repository has moved off this action),
+# `exempt` (repository is permanently excluded from migration), or `null` (not yet
+# dispositioned).
+public:
+  bfra-me/ha-addon-repository: null
+  bfra-me/works: null
+  fro-bot/dashboard: null
+  marcusrbrown/cortexkit_anthropic-auth: null
+  marcusrbrown/dev-like: null
+  marcusrbrown/infra: null
+  marcusrbrown/marcusrbrown: null
+  marcusrbrown/marcusrbrown.com: null
+  marcusrbrown/marcusrbrown.github.io: null
+  marcusrbrown/mothership: null
+  marcusrbrown/renovate-config: null
+  marcusrbrown/sparkle: null
+  marcusrbrown/systematic: null
+  marcusrbrown/tokentoilet: null
+  marcusrbrown/vbs: null
+  thejustinwalsh/three-flatland: null
+  bfra-me/.github: null
+  bfra-me/renovate-action: null
+  fro-bot/.github: null
+  fro-bot/space-bus: null
+  marcusrbrown/.dotfiles: null
+  marcusrbrown/containers: null
+  marcusrbrown/gpt: null
+  marcusrbrown/opencode-copilot-delegate: null
+
+# Private entries are recorded as an aggregate count only. No private repository
+# identity may ever appear in this file.
+private:
+  total: 3
+  dispositioned: 0

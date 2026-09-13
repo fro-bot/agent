@@ -1003,7 +1003,7 @@ describe('fro-bot workflow — temporary #1598 runtime-verification prompt proto
     const normalizedPrompt = prompt.replaceAll(/\s+/g, ' ')
 
     // #then every required identity/baseline check is explicit
-    expect(prompt).toContain('schema version is 1')
+    expect(prompt).toContain('schema version is 2')
     expect(normalizedPrompt).toContain(
       'producer run ID and run attempt equal the trusted GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT',
     )
@@ -1012,7 +1012,17 @@ describe('fro-bot workflow — temporary #1598 runtime-verification prompt proto
     expect(prompt).toContain('required ancestor commit is 9d971b4cc5d1e47cbbb4ea5cb60e2d703ceabf97')
     expect(prompt).not.toContain('v0.111.0 at commit')
     expect(prompt).toContain('public entries are 24')
-    expect(prompt).toContain('private total is 3')
+    expect(prompt).toContain('private.total is 3')
+  })
+
+  it('states every observation is non-terminal and forbids treating absence of a reference as removal proof', () => {
+    // #given the daily schedule prompt
+    const prompt = schedulePrompt()
+
+    // #then no collector evidence can prove migration or removal
+    expect(prompt).toContain('Non-terminal by construction')
+    expect(prompt).toContain('No combination of collector evidence proves a repository has')
+    expect(prompt).toContain('no-direct-reference-observed is NOT evidence of')
   })
 
   it('self-gates the temporary protocol to the exact daily schedule and otherwise skips silently', () => {
@@ -1084,16 +1094,17 @@ describe('fro-bot workflow — temporary #1598 runtime-verification prompt proto
     const prompt = schedulePrompt()
     const normalizedPrompt = prompt.replaceAll(/\s+/g, ' ')
 
-    // #then public progress unions upward and closure needs current private terminal evidence
-    expect(prompt).toContain('union newly resolved public dispositions')
-    expect(prompt).toContain('never demote an existing resolution')
-    expect(prompt).toContain('all 24 public entries resolve')
-    expect(normalizedPrompt).toContain('CURRENT VALIDATED ARTIFACT positively resolves all 3 private entries')
+    // #then public progress unions upward and closure requires the operator dispositions file
+    expect(prompt).toContain('Union newly observed public entries')
+    expect(prompt).toContain('never demote an existing operator disposition')
+    expect(prompt).toContain('.github/dmr-runtime-verification-dispositions.yaml')
+    expect(prompt).toContain('all 24 public entries')
+    expect(prompt).toContain('dispositioned (non-null)')
+    expect(prompt).toContain('private.dispositioned equals private.total')
     expect(normalizedPrompt).toContain(
-      'Historical aggregate progress, displayed private counts, or editable issue text alone',
+      'Collector evidence, artifact contents, displayed counts, and issue text can never satisfy closure on their own',
     )
-    expect(prompt).not.toContain('operator-backed')
-    expect(prompt).not.toContain('covered by aggregate')
+    expect(prompt).not.toContain('CURRENT VALIDATED ARTIFACT')
   })
 
   it('checks rerun producer identity against the trusted attempt exposed to the child', () => {

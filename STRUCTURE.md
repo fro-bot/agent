@@ -96,7 +96,7 @@ fro-bot/agent/
 - **`packages/runtime/`** — Shared runtime primitives consumed by both `src/` and `packages/gateway/`; owns the authoritative version-pin constants.
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
 - **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations; uses `node --test`, not Vitest.
-- **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch, and the temporary `collect-dmr-runtime-verification.ts` collector used by the trusted daily maintenance path.
+- **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch, and the temporary `collect-dmr-runtime-verification.ts` collector, which gathers bounded runtime-verification observations for the trusted daily maintenance path (terminal resolution is recorded separately in `.github/dmr-runtime-verification-dispositions.yaml`).
 - **`evals/`** — Gated agent-outcome eval corpus that runs the real execution path against disposable fixture repos; the pure gate and baseline tests run in normal CI, while live scenarios require `FRO_BOT_EVAL=1`.
 - **`.github/workflows/`** — All CI/CD automation; 12 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.

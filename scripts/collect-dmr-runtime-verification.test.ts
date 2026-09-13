@@ -2,42 +2,33 @@ import {describe, expect, it} from 'vitest'
 import {
   AFFECTED_EVENTS,
   aggregatePrivate,
-  areRunJobsSuccessful,
   buildArtifact,
-  classifyGhFailure,
   collectRuntimeVerification,
   createGitHubAdapters,
   CREDENTIAL_PREFLIGHT_COMMIT,
-  CREDENTIAL_REFUSAL_MARKER,
   DAILY_SCHEDULE_CRON,
   determineCollectorStatus,
   extractActionReferences,
-  FORK_PULL_REQUEST_REJECTION_REASON,
-  isPrivateClosureSatisfied,
+  FORK_PULL_REQUEST_OBSERVATION,
   isQualifiableActionReference,
-  isSchemaV1Envelope,
+  isSchemaV2Envelope,
   LIMITS,
   MINIMUM_RELEASE,
   MINIMUM_RELEASE_PUBLISHED_AT,
   parseActionReferences,
   parsePrivateInventory,
-  parseResolvedActionSha,
-  parseWorkflowIndirections,
   PRIVATE_INVENTORY_TOTAL,
   PUBLIC_INVENTORY,
   SCHEMA_VERSION,
   serializeArtifact,
-  SETUP_STEP_NAME,
   type AncestryResult,
   type CollectInput,
   type CollectorAdapters,
   type InventoryEntry,
   type ProducerIdentity,
-  type PublicDisposition,
+  type PublicObservation,
   type RepositoryResult,
-  type RunJobEvidence,
   type RunJobsResult,
-  type RunLogsResult,
   type RunPageResult,
   type WorkflowContentResult,
   type WorkflowPathsResult,
@@ -50,7 +41,6 @@ import {
 
 const V0_SHA = '620a314e241ec2f4a72167eb1ad2c5a3a909cc86'
 const OLD_V0_SHA = 'a31e0ad13a77e4f815b73c25dbcb214e82796728'
-const OTHER_SHA = '11bd71901bbe5b1630ceea73d27597364c9af683'
 const PREFLIGHT_SHA = CREDENTIAL_PREFLIGHT_COMMIT
 
 const PUBLIC_ENTRY: InventoryEntry = {
@@ -58,6 +48,8 @@ const PUBLIC_ENTRY: InventoryEntry = {
   repo: 'widget',
   workflowPaths: ['.github/workflows/fro-bot.yaml'],
 }
+
+const ADAPTER_INVENTORY = {publicInventory: [PUBLIC_ENTRY], privateInventory: null} as const
 
 const PRIVATE_OWNER = 'private-canary-owner'
 const PRIVATE_REPO_PREFIX = 'private-canary-repo'
@@ -92,18 +84,6 @@ function run(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   }
 }
 
-function resolvedLine(sha: string, ref = V0_SHA): string {
-  // Mirrors a genuine `gh run view --log` line: the runner emits the download record during job
-  // setup and gh attributes it to its sentinel setup step, so that step field is the anchor.
-  return `fro-bot\t${SETUP_STEP_NAME}\t2026-09-11T20:00:00.0000000Z Download action repository 'fro-bot/agent@${ref}' (SHA:${sha})\n`
-}
-
-function forgedLine(sha: string, ref = V0_SHA): string {
-  // A repository-controlled step can print this text, and `gh run view --log` prefixes EVERY line
-  // with `job\tstep\ttimestamp` — so a forged line carries a full prefix under an ordinary step name.
-  return `Fro Bot\tRun echo\t2026-09-11T20:00:00.0000000Z Download action repository 'fro-bot/agent@${ref}' (SHA:${sha})\n`
-}
-
 function workflowContent(ref = V0_SHA): string {
   return ['jobs:', '  fro-bot:', '    steps:', `      - uses: fro-bot/agent@${ref} # v0.111.0`, ''].join('\n')
 }
@@ -119,13 +99,12 @@ interface FakeAdapterConfig {
     path: string,
     ref: string,
   ) => WorkflowContentResult | Promise<WorkflowContentResult>
-  readonly logs?: (entry: InventoryEntry, runId: number, attempt: number) => RunLogsResult | Promise<RunLogsResult>
-  readonly jobs?: (entry: InventoryEntry, runId: number, attempt: number) => RunJobsResult | Promise<RunJobsResult>
-  readonly ancestry?: (sha: string) => AncestryResult | Promise<AncestryResult>
-}
-
-function successfulJob(): RunJobEvidence {
-  return {status: 'completed', conclusion: 'success', steps: [{status: 'completed', conclusion: 'success'}]}
+  readonly runJobs?: (
+    entry: InventoryEntry,
+    runId: number,
+    runAttempt: number,
+  ) => RunJobsResult | Promise<RunJobsResult>
+  readonly descendantOfPreflight?: (sha: string) => AncestryResult | Promise<AncestryResult>
 }
 
 const UNRELATED_WORKFLOW_PATH = '.github/workflows/unrelated.yaml'
@@ -146,11 +125,8 @@ function makeAdapters(config: FakeAdapterConfig = {}): CollectorAdapters {
     },
     getWorkflowContent: async (entry, path, ref) =>
       config.workflowContent?.(entry, path, ref) ?? {ok: true, content: workflowContent()},
-    getRunLogs: async (entry, runId, attempt) =>
-      config.logs?.(entry, runId, attempt) ?? {ok: true, text: resolvedLine(V0_SHA)},
-    getRunJobs: async (entry, runId, attempt) =>
-      config.jobs?.(entry, runId, attempt) ?? {ok: true, jobs: [successfulJob()]},
-    isDescendantOfPreflight: async sha => config.ancestry?.(sha) ?? {ok: true, descendant: true},
+    getRunJobs: async (entry, runId, runAttempt) => config.runJobs?.(entry, runId, runAttempt) ?? {ok: true, jobs: []},
+    isDescendantOfPreflight: async sha => config.descendantOfPreflight?.(sha) ?? {ok: true, descendant: true},
   }
 }
 
@@ -168,10 +144,10 @@ async function collect(overrides: Partial<CollectInput> & {readonly adapters: Co
   })
 }
 
-function publicRecord(records: readonly PublicDisposition[]): PublicDisposition {
+function publicRecord(records: readonly PublicObservation[]): PublicObservation {
   const record = records.find(candidate => candidate.repository === 'example/widget')
   if (record === undefined) {
-    throw new Error('expected a public disposition for example/widget')
+    throw new Error('expected a public observation for example/widget')
   }
   return record
 }
@@ -201,7 +177,7 @@ describe('PUBLIC_INVENTORY', () => {
   it('pins the three-private-entry total and the release baseline', () => {
     // #given / #when / #then
     expect(PRIVATE_INVENTORY_TOTAL).toBe(3)
-    expect(SCHEMA_VERSION).toBe(1)
+    expect(SCHEMA_VERSION).toBe(2)
     expect(MINIMUM_RELEASE).toBe('v0.111.0')
     expect(MINIMUM_RELEASE_PUBLISHED_AT).toBe('2026-09-11T19:28:19Z')
     expect(PREFLIGHT_SHA).toMatch(/^[0-9a-f]{40}$/)
@@ -332,62 +308,6 @@ describe('extractActionReferences', () => {
   })
 })
 
-describe('parseWorkflowIndirections', () => {
-  it('separates direct references from local and external indirections', () => {
-    // #given
-    const content = [
-      'jobs:',
-      '  bot:',
-      '    uses: ./.github/workflows/fro-bot.yaml',
-      '  remote:',
-      '    uses: some-org/wrappers/.github/workflows/fro-bot.yaml@v1',
-      '  build:',
-      '    steps:',
-      '      - uses: ./local-action',
-      '      - uses: fro-bot/agent@v0',
-      '',
-    ].join('\n')
-
-    // #when
-    const result = parseWorkflowIndirections(content)
-
-    // #then
-    expect(result.ok).toBe(true)
-    const value = result.ok ? result.value : undefined
-    expect(value?.directReferences).toEqual(['v0'])
-    expect(value?.localWorkflowPaths).toEqual(['.github/workflows/fro-bot.yaml'])
-    expect(value?.localActionPaths).toEqual(['local-action'])
-    expect(value?.externalJobWrappers).toEqual(['some-org/wrappers/.github/workflows/fro-bot.yaml@v1'])
-  })
-
-  it('finds direct references inside a composite action runs.steps manifest', () => {
-    // #given
-    const content = ['runs:', '  using: composite', '  steps:', '    - uses: fro-bot/agent@v0', ''].join('\n')
-
-    // #when
-    const result = parseWorkflowIndirections(content)
-
-    // #then
-    expect(result.ok ? result.value.directReferences : []).toEqual(['v0'])
-  })
-
-  it('normalizes a repository-root local reference instead of ignoring it', () => {
-    // #given
-    const content = ['jobs:', '  build:', '    steps:', '      - uses: ./', ''].join('\n')
-
-    // #when
-    const result = parseWorkflowIndirections(content)
-
-    // #then
-    expect(result.ok ? result.value.localActionPaths : []).toEqual([''])
-  })
-
-  it('fails closed on malformed YAML', () => {
-    // #given / #when / #then
-    expect(parseWorkflowIndirections('jobs:\n  build:\n    steps: [\n')).toEqual({ok: false, reason: 'malformed'})
-  })
-})
-
 describe('isQualifiableActionReference', () => {
   it('accepts v0 and full commit SHAs but rejects tags, branches, and short SHAs', () => {
     // #given / #when / #then
@@ -399,174 +319,37 @@ describe('isQualifiableActionReference', () => {
   })
 })
 
-describe('parseResolvedActionSha', () => {
-  it('resolves a single unambiguous action download line', () => {
-    // #given
-    const logs = `Run started\n${resolvedLine(V0_SHA, 'v0')}`
-
-    // #when
-    const result = parseResolvedActionSha(logs, 'v0')
-
-    // #then
-    expect(result).toEqual({ok: true, sha: V0_SHA})
-  })
-
-  it('tolerates duplicated and reordered lines plus unrelated actions', () => {
-    // #given
-    const logs = [
-      "Download action repository 'actions/checkout@v4' (SHA:11bd71901bbe5b1630ceea73d27597364c9af683)",
-      resolvedLine(V0_SHA, 'v0').trim(),
-      'some interleaved output',
-      resolvedLine(V0_SHA, 'v0').trim(),
-    ].join('\n')
-
-    // #when
-    const result = parseResolvedActionSha(logs, 'v0')
-
-    // #then
-    expect(result).toEqual({ok: true, sha: V0_SHA})
-  })
-
-  it('rejects a forged line whose full prefix names an ordinary step', () => {
-    // #given: a repository step echoes the phrase; gh prefixes it with that step's own name.
-    const logs = forgedLine(V0_SHA, 'v0')
-
-    // #when
-    const result = parseResolvedActionSha(logs, 'v0')
-
-    // #then
-    expect(result).toEqual({ok: false, reason: 'missing'})
-  })
-
-  it('rejects a timestamped download line attributed to a named step', () => {
-    // #given: a valid timestamp is not enough; the step field must be the runner setup sentinel.
-    const logs = `fro-bot\tBuild\t2026-09-11T20:00:00.0000000Z Download action repository 'fro-bot/agent@v0' (SHA:${V0_SHA})\n`
-
-    // #when / #then
-    expect(parseResolvedActionSha(logs, 'v0')).toEqual({ok: false, reason: 'missing'})
-  })
-
-  it('fails closed on a truncated line or when no line exists', () => {
-    // #given / #when / #then
-    expect(parseResolvedActionSha(`Download action repository 'fro-bot/agent@v0' (SHA:${V0_SHA}`, 'v0')).toEqual({
-      ok: false,
-      reason: 'missing',
-    })
-    expect(parseResolvedActionSha('no provenance here', 'v0')).toEqual({ok: false, reason: 'missing'})
-  })
-
-  it('fails closed when multiple candidate SHAs disagree', () => {
-    // #given
-    const logs = `${resolvedLine(V0_SHA, 'v0')}${resolvedLine(OTHER_SHA, 'v0')}`
-
-    // #when
-    const result = parseResolvedActionSha(logs, 'v0')
-
-    // #then
-    expect(result).toEqual({ok: false, reason: 'ambiguous'})
-  })
-})
-
 // ---------------------------------------------------------------------------
 // Aggregation and closure
 // ---------------------------------------------------------------------------
 
 describe('aggregatePrivate', () => {
-  it('buckets dispositions into aggregate-only counts', () => {
+  it('buckets dispositions into unresolved/unavailable counts with observed always zero', () => {
     // #given / #when
-    const aggregate = aggregatePrivate(['qualified', 'no-longer-applicable', 'unavailable'])
+    const aggregate = aggregatePrivate(['unresolved', 'preflight-failed', 'unavailable'])
 
-    // #then
-    expect(aggregate).toEqual({total: 3, resolved: 2, unresolved: 0, unavailable: 1})
+    // #then: this collector has no path to a terminal disposition, so `observed` can never move.
+    expect(aggregate).toEqual({total: 3, observed: 0, unresolved: 2, unavailable: 1})
   })
 
   it('counts preflight failures as unresolved', () => {
     // #given / #when
-    const aggregate = aggregatePrivate(['qualified', 'preflight-failed', 'unresolved'])
+    const aggregate = aggregatePrivate(['preflight-failed', 'preflight-failed', 'unresolved'])
 
     // #then
-    expect(aggregate).toEqual({total: 3, resolved: 1, unresolved: 2, unavailable: 0})
-  })
-})
-
-describe('areRunJobsSuccessful', () => {
-  it('accepts completed success, skipped, and neutral jobs and steps', () => {
-    // #given / #when / #then
-    expect(areRunJobsSuccessful([successfulJob()])).toBe(true)
-    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'skipped', steps: []}])).toBe(true)
-    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'neutral', steps: []}])).toBe(true)
-    expect(
-      areRunJobsSuccessful([
-        {
-          status: 'completed',
-          conclusion: 'success',
-          steps: [
-            {status: 'completed', conclusion: 'success'},
-            {status: 'completed', conclusion: 'skipped'},
-            {status: 'completed', conclusion: 'neutral'},
-          ],
-        },
-      ]),
-    ).toBe(true)
-  })
-
-  it('rejects bad terminal conclusions and jobs that are not yet completed', () => {
-    // #given / #when / #then
-    expect(areRunJobsSuccessful([])).toBe(false)
-    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'failure', steps: []}])).toBe(false)
-    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'cancelled', steps: []}])).toBe(false)
-    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'timed_out', steps: []}])).toBe(false)
-    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'action_required', steps: []}])).toBe(false)
-    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'stale', steps: []}])).toBe(false)
-    expect(areRunJobsSuccessful([{status: 'in_progress', conclusion: null, steps: []}])).toBe(false)
-  })
-
-  it('requires every step of an accepted job to be acceptable', () => {
-    // #given / #when / #then
-    expect(
-      areRunJobsSuccessful([
-        {
-          status: 'completed',
-          conclusion: 'success',
-          steps: [
-            {status: 'completed', conclusion: 'success'},
-            {status: 'completed', conclusion: 'failure'},
-          ],
-        },
-      ]),
-    ).toBe(false)
-    expect(
-      areRunJobsSuccessful([
-        {
-          status: 'completed',
-          conclusion: 'success',
-          steps: [
-            {status: 'completed', conclusion: 'neutral'},
-            {status: 'in_progress', conclusion: null},
-          ],
-        },
-      ]),
-    ).toBe(false)
-  })
-})
-
-describe('isPrivateClosureSatisfied', () => {
-  it('requires all three private entries positively terminal in the current artifact', () => {
-    // #given / #when / #then
-    expect(isPrivateClosureSatisfied({total: 3, resolved: 3, unresolved: 0, unavailable: 0})).toBe(true)
-    expect(isPrivateClosureSatisfied({total: 3, resolved: 2, unresolved: 0, unavailable: 1})).toBe(false)
-    expect(isPrivateClosureSatisfied({total: 3, resolved: 0, unresolved: 0, unavailable: 3})).toBe(false)
-    expect(isPrivateClosureSatisfied({total: 3, resolved: 2, unresolved: 1, unavailable: 0})).toBe(false)
+    expect(aggregate).toEqual({total: 3, observed: 0, unresolved: 3, unavailable: 0})
   })
 })
 
 describe('determineCollectorStatus', () => {
-  it('is ready for all-terminal evidence, partial for mixed, unavailable for all-unavailable', () => {
-    // #given / #when / #then
-    expect(determineCollectorStatus(['qualified', 'no-longer-applicable'])).toBe('ready')
-    expect(determineCollectorStatus(['qualified', 'unresolved'])).toBe('partial')
-    expect(determineCollectorStatus(['qualified', 'preflight-failed'])).toBe('partial')
+  it('is partial for any mix of non-unavailable evidence and unavailable only when everything is unavailable', () => {
+    // #given / #when / #then: `ready` was removed from `CollectorStatus` now that nothing can
+    // produce a terminal disposition; `unresolved`/`preflight-failed` mixes are always `partial`.
+    expect(determineCollectorStatus(['unresolved', 'preflight-failed'])).toBe('partial')
+    expect(determineCollectorStatus(['unresolved'])).toBe('partial')
+    expect(determineCollectorStatus(['preflight-failed'])).toBe('partial')
     expect(determineCollectorStatus(['unavailable', 'unavailable'])).toBe('unavailable')
+    expect(determineCollectorStatus([])).toBe('unavailable')
   })
 })
 
@@ -575,23 +358,25 @@ describe('determineCollectorStatus', () => {
 // ---------------------------------------------------------------------------
 
 describe('buildArtifact and serializeArtifact', () => {
-  it('produces a schema-v1 envelope bound to producer and baseline', () => {
+  it('produces a schema-v2 envelope bound to producer and baseline', () => {
     // #given
-    const record: PublicDisposition = {
+    const record: PublicObservation = {
       repository: 'example/widget',
-      disposition: 'qualified',
+      state: 'unresolved',
       observedAt: '2026-09-11T21:00:00Z',
       fetchStatusClass: 'success',
-      rejectionReason: null,
+      observation: null,
       event: 'issue_comment',
       runId: 1001,
       runAttempt: 1,
       runUrl: 'https://github.com/example/widget/actions/runs/1001',
       workflowPath: '.github/workflows/fro-bot.yaml',
-      actionRef: V0_SHA,
+      declaredActionRef: V0_SHA,
       resolvedActionSha: V0_SHA,
+      reportedJobs: null,
+      ancestryFromPreflight: null,
     }
-    const privateAggregate = aggregatePrivate(['qualified', 'qualified', 'qualified'])
+    const privateAggregate = aggregatePrivate(['unresolved', 'unresolved', 'unresolved'])
 
     // #when
     const artifact = buildArtifact({
@@ -601,33 +386,35 @@ describe('buildArtifact and serializeArtifact', () => {
         minimumReleasePublishedAt: MINIMUM_RELEASE_PUBLISHED_AT,
         credentialPreflightCommit: PREFLIGHT_SHA,
       },
-      collectorStatus: 'ready',
-      publicDispositions: [record],
+      collectorStatus: 'partial',
+      publicObservations: [record],
       privateAggregate,
     })
 
     // #then
-    expect(isSchemaV1Envelope(artifact)).toBe(true)
+    expect(isSchemaV2Envelope(artifact)).toBe(true)
     expect(artifact.producer).toEqual(PRODUCER)
     expect(artifact.baseline.credentialPreflightCommit).toBe(PREFLIGHT_SHA)
     expect(serializeArtifact(artifact).includes('private-canary')).toBe(false)
   })
 })
 
-describe('isSchemaV1Envelope', () => {
-  const record: PublicDisposition = {
+describe('isSchemaV2Envelope', () => {
+  const record: PublicObservation = {
     repository: 'example/widget',
-    disposition: 'qualified',
+    state: 'unresolved',
     observedAt: '2026-09-11T21:00:00Z',
     fetchStatusClass: 'success',
-    rejectionReason: null,
+    observation: null,
     event: 'issue_comment',
     runId: 1001,
     runAttempt: 1,
     runUrl: 'https://github.com/example/widget/actions/runs/1001',
     workflowPath: '.github/workflows/fro-bot.yaml',
-    actionRef: V0_SHA,
+    declaredActionRef: V0_SHA,
     resolvedActionSha: V0_SHA,
+    reportedJobs: null,
+    ancestryFromPreflight: null,
   }
   const artifact = buildArtifact({
     producer: PRODUCER,
@@ -636,21 +423,19 @@ describe('isSchemaV1Envelope', () => {
       minimumReleasePublishedAt: MINIMUM_RELEASE_PUBLISHED_AT,
       credentialPreflightCommit: PREFLIGHT_SHA,
     },
-    collectorStatus: 'ready',
-    publicDispositions: [record],
-    privateAggregate: aggregatePrivate(['qualified', 'qualified', 'qualified']),
+    collectorStatus: 'partial',
+    publicObservations: [record],
+    privateAggregate: aggregatePrivate(['unresolved', 'unresolved', 'unresolved']),
   })
 
   it('validates every public entry field and type, not just the container', () => {
     // #given / #when / #then
-    expect(isSchemaV1Envelope(artifact)).toBe(true)
-    expect(isSchemaV1Envelope({...artifact, public: [{...record, runId: 'one'}]})).toBe(false)
-    expect(isSchemaV1Envelope({...artifact, public: [{repository: 'example/widget', disposition: 'qualified'}]})).toBe(
-      false,
-    )
-    expect(isSchemaV1Envelope({...artifact, public: [{...record, disposition: 'bogus'}]})).toBe(false)
-    expect(isSchemaV1Envelope({...artifact, public: [{...record, fetchStatusClass: 'not-a-class'}]})).toBe(false)
-    expect(isSchemaV1Envelope({...artifact, public: ['not-an-object']})).toBe(false)
+    expect(isSchemaV2Envelope(artifact)).toBe(true)
+    expect(isSchemaV2Envelope({...artifact, public: [{...record, runId: 'one'}]})).toBe(false)
+    expect(isSchemaV2Envelope({...artifact, public: [{repository: 'example/widget', state: 'qualified'}]})).toBe(false)
+    expect(isSchemaV2Envelope({...artifact, public: [{...record, state: 'bogus'}]})).toBe(false)
+    expect(isSchemaV2Envelope({...artifact, public: [{...record, fetchStatusClass: 'not-a-class'}]})).toBe(false)
+    expect(isSchemaV2Envelope({...artifact, public: ['not-an-object']})).toBe(false)
   })
 })
 
@@ -659,10 +444,34 @@ describe('isSchemaV1Envelope', () => {
 // ---------------------------------------------------------------------------
 
 describe('collectRuntimeVerification', () => {
-  it('qualifies a post-release affected-event success with v0 provenance', async () => {
+  it('leaves a post-release affected-event success non-terminal even with a direct v0 reference', async () => {
     // #given
     const adapters = makeAdapters({
       runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+    })
+
+    // #when
+    const artifact = await collect({adapters})
+
+    // #then: a direct, qualifiable reference is evidence, not proof of terminal qualification.
+    const record = publicRecord(artifact.public)
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('direct-reference-observed')
+    expect(record.fetchStatusClass).toBe('success')
+    expect(record.event).toBe('issue_comment')
+    expect(record.runId).toBe(1001)
+    expect(record.runAttempt).toBe(1)
+    expect(record.runUrl).toBe('https://github.com/example/widget/actions/runs/1001')
+    expect(record.declaredActionRef).toBe(V0_SHA)
+    expect(artifact.collectorStatus).toBe('partial')
+    expect(artifact.private).toEqual({total: 3, observed: 0, unresolved: 3, unavailable: 0})
+  })
+
+  it('accepts a freely pinned @v0 reference as qualifiable but still non-terminal', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      workflowContent: () => ({ok: true, content: workflowContent('v0')}),
     })
 
     // #when
@@ -670,46 +479,66 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('qualified')
-    expect(record.fetchStatusClass).toBe('success')
-    expect(record.event).toBe('issue_comment')
-    expect(record.runId).toBe(1001)
-    expect(record.runAttempt).toBe(1)
-    expect(record.runUrl).toBe('https://github.com/example/widget/actions/runs/1001')
-    expect(record.actionRef).toBe(V0_SHA)
-    expect(record.resolvedActionSha).toBe(V0_SHA)
-    expect(artifact.collectorStatus).toBe('ready')
-    expect(artifact.private).toEqual({total: 3, resolved: 3, unresolved: 0, unavailable: 0})
+    expect(record.state).toBe('unresolved')
+    expect(record.declaredActionRef).toBe('v0')
   })
 
-  it('qualifies a freely pinned @v0 reference too', async () => {
+  it('carries job and step identity through into reported jobs', async () => {
     // #given
     const adapters = makeAdapters({
       runPages: () => ({ok: true, runs: [run()], nextPage: null}),
-      workflowContent: () => ({ok: true, content: workflowContent('v0')}),
-      logs: () => ({ok: true, text: resolvedLine(V0_SHA, 'v0')}),
+      runJobs: () => ({
+        ok: true,
+        jobs: [
+          {
+            name: 'fro-bot',
+            status: 'completed',
+            conclusion: 'success',
+            steps: [{name: 'Run fro-bot/agent', number: 3, status: 'completed', conclusion: 'success'}],
+          },
+        ],
+      }),
     })
 
     // #when
     const artifact = await collect({adapters})
 
     // #then
-    expect(publicRecord(artifact.public).disposition).toBe('qualified')
-    expect(publicRecord(artifact.public).actionRef).toBe('v0')
+    const record = publicRecord(artifact.public)
+    expect(record.reportedJobs).toEqual([
+      {
+        name: 'fro-bot',
+        status: 'completed',
+        conclusion: 'success',
+        steps: [{name: 'Run fro-bot/agent', number: 3, status: 'completed', conclusion: 'success'}],
+      },
+    ])
   })
 
-  it('rejects a fork pull request even when logs contain a forged download line', async () => {
+  it('records reportedJobs as null on a jobs-fetch failure, never an empty success', async () => {
     // #given
-    let logsRequested = false
     const adapters = makeAdapters({
-      runPages: () => ({
-        ok: true,
-        runs: [run({event: 'pull_request', headRepositoryFullName: 'attacker/widget'})],
-        nextPage: null,
-      }),
-      logs: () => {
-        logsRequested = true
-        return {ok: true, text: resolvedLine(V0_SHA)}
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      runJobs: () => ({ok: false, fetchStatusClass: 'error'}),
+    })
+
+    // #when
+    const artifact = await collect({adapters})
+
+    // #then
+    const record = publicRecord(artifact.public)
+    expect(record.reportedJobs).toBeNull()
+    expect(record.state).toBe('unresolved')
+  })
+
+  it('checks preflight ancestry for a literal full-SHA action reference', async () => {
+    // #given
+    const ancestryCalls: string[] = []
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      descendantOfPreflight: sha => {
+        ancestryCalls.push(sha)
+        return {ok: true, descendant: false}
       },
     })
 
@@ -718,9 +547,83 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe(FORK_PULL_REQUEST_REJECTION_REASON)
-    expect(logsRequested).toBe(false)
+    expect(ancestryCalls).toEqual([V0_SHA])
+    expect(record.resolvedActionSha).toBe(V0_SHA)
+    expect(record.ancestryFromPreflight).toBe(false)
+  })
+
+  it('never resolves a floating reference to a SHA or checks its ancestry', async () => {
+    // #given
+    const ancestryCalls: string[] = []
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      workflowContent: () => ({ok: true, content: workflowContent('v0')}),
+      descendantOfPreflight: sha => {
+        ancestryCalls.push(sha)
+        return {ok: true, descendant: true}
+      },
+    })
+
+    // #when
+    const artifact = await collect({adapters})
+
+    // #then
+    const record = publicRecord(artifact.public)
+    expect(ancestryCalls).toEqual([])
+    expect(record.resolvedActionSha).toBeNull()
+    expect(record.ancestryFromPreflight).toBeNull()
+  })
+
+  it('stays non-terminal even when every reported job looks fully successful', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      runJobs: () => ({
+        ok: true,
+        jobs: [
+          {
+            name: 'fro-bot',
+            status: 'completed',
+            conclusion: 'success',
+            steps: [{name: 'Run fro-bot/agent', number: 1, status: 'completed', conclusion: 'success'}],
+          },
+        ],
+      }),
+      descendantOfPreflight: () => ({ok: true, descendant: true}),
+    })
+
+    // #when
+    const artifact = await collect({adapters})
+
+    // #then
+    const record = publicRecord(artifact.public)
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('direct-reference-observed')
+  })
+
+  it('rejects a fork pull request without fetching workflow content', async () => {
+    // #given
+    let contentRequested = false
+    const adapters = makeAdapters({
+      runPages: () => ({
+        ok: true,
+        runs: [run({event: 'pull_request', headRepositoryFullName: 'attacker/widget'})],
+        nextPage: null,
+      }),
+      workflowContent: () => {
+        contentRequested = true
+        return {ok: true, content: workflowContent()}
+      },
+    })
+
+    // #when
+    const artifact = await collect({adapters})
+
+    // #then
+    const record = publicRecord(artifact.public)
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe(FORK_PULL_REQUEST_OBSERVATION)
+    expect(contentRequested).toBe(false)
   })
 
   it('requires every executable Fro Bot reference to be qualifiable', async () => {
@@ -739,8 +642,8 @@ describe('collectRuntimeVerification', () => {
 
     // #when / #then
     const record = publicRecord((await collect({adapters})).public)
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('non-qualifiable-action-reference')
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('ineligible-action-reference')
   })
 
   it('fails closed on malformed workflow YAML', async () => {
@@ -752,11 +655,11 @@ describe('collectRuntimeVerification', () => {
 
     // #when / #then
     const record = publicRecord((await collect({adapters})).public)
-    expect(record.disposition).toBe('unavailable')
+    expect(record.state).toBe('unavailable')
     expect(record.fetchStatusClass).toBe('malformed')
   })
 
-  it('resolves an archived repository as no-longer-applicable', async () => {
+  it('treats an archived repository as inconclusive rather than removed', async () => {
     // #given
     const adapters = makeAdapters({
       repository: () => ({ok: true, fullName: 'example/widget', archived: true, defaultBranch: 'main', private: false}),
@@ -765,14 +668,14 @@ describe('collectRuntimeVerification', () => {
     // #when
     const artifact = await collect({adapters})
 
-    // #then
+    // #then: archival is recorded information, not proof the repository stopped invoking Fro Bot.
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('no-longer-applicable')
-    expect(record.rejectionReason).toBe('repository-archived')
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('repository-archived')
     expect(record.fetchStatusClass).toBe('success')
   })
 
-  it('resolves a default branch with no remaining Fro Bot consumer as no-longer-applicable', async () => {
+  it('resolves a default branch with no direct reference as unresolved, not removed', async () => {
     // #given
     const adapters = makeAdapters({
       runPages: () => ({ok: true, runs: [], nextPage: null}),
@@ -784,11 +687,11 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('no-longer-applicable')
-    expect(record.rejectionReason).toBe('workflow-removed')
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('no-direct-reference-observed')
   })
 
-  it('does not infer workflow removal from configured paths when another current workflow consumes Fro Bot', async () => {
+  it('does not infer anything from configured paths when another current workflow consumes Fro Bot', async () => {
     // #given
     const adapters = makeAdapters({
       runPages: () => ({ok: true, runs: [], nextPage: null}),
@@ -801,11 +704,11 @@ describe('collectRuntimeVerification', () => {
 
     // #when / #then
     const record = publicRecord((await collect({adapters})).public)
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('no-qualifying-run')
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('direct-reference-observed')
   })
 
-  it('permits workflow removal only after full current-workflow enumeration succeeds', async () => {
+  it('scans every current workflow path before concluding no direct reference was observed', async () => {
     // #given
     const adapters = makeAdapters({
       runPages: () => ({ok: true, runs: [], nextPage: null}),
@@ -815,15 +718,104 @@ describe('collectRuntimeVerification', () => {
 
     // #when / #then
     const record = publicRecord((await collect({adapters})).public)
-    expect(record.disposition).toBe('no-longer-applicable')
-    expect(record.rejectionReason).toBe('workflow-removed')
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('no-direct-reference-observed')
   })
 
-  it('classifies a success without an unambiguous action line as unresolved', async () => {
-    // #given
+  it('never treats an external step-level composite action as evidence of qualification or removal', async () => {
+    // #given: the workflow only ever invokes an unrelated external action directly; whatever that
+    // action does internally is outside this collector's authenticated visibility, and there is no
+    // recursive traversal left to go find out.
     const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
-      logs: () => ({ok: true, text: 'run succeeded but no action download line was retained\n'}),
+      runPages: () => ({ok: true, runs: [], nextPage: null}),
+      workflowContent: () => ({
+        ok: true,
+        content: ['jobs:', '  build:', '    steps:', '      - uses: some-owner/some-repo@v1', ''].join('\n'),
+      }),
+    })
+
+    // #when
+    const artifact = await collect({adapters})
+
+    // #then: absence of a directly-discovered reference is unresolved, never a removal conclusion.
+    const record = publicRecord(artifact.public)
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('no-direct-reference-observed')
+  })
+
+  it('never asks any adapter to fetch an external reusable-workflow target', async () => {
+    // #given: the workflow references an arbitrary external reusable workflow at the job level.
+    // Recursive external `uses:` traversal was deleted as an unfixable trust-boundary defect that
+    // steered a private-capable credential at attacker-controlled repositories; this proves it
+    // cannot come back by recording every repository any adapter method is invoked with.
+    const calls: {readonly method: string; readonly owner: string; readonly repo: string}[] = []
+    const recordCall = (method: string, entry: InventoryEntry): void => {
+      calls.push({method, owner: entry.owner, repo: entry.repo})
+    }
+    const externalWrapperContent = [
+      'jobs:',
+      '  bot:',
+      '    uses: attacker-owner/attacker-repo/.github/workflows/x.yaml@main',
+      '',
+    ].join('\n')
+    const adapters: CollectorAdapters = {
+      getRepository: async entry => {
+        recordCall('getRepository', entry)
+        return entry.owner === PUBLIC_ENTRY.owner
+          ? {ok: true, fullName: `${entry.owner}/${entry.repo}`, archived: false, defaultBranch: 'main', private: false}
+          : {ok: true, fullName: `${entry.owner}/${entry.repo}`, archived: false, defaultBranch: 'main', private: true}
+      },
+      listRunPage: async entry => {
+        recordCall('listRunPage', entry)
+        return {ok: true, runs: [], nextPage: null}
+      },
+      listWorkflowPaths: async entry => {
+        recordCall('listWorkflowPaths', entry)
+        return {ok: true, paths: entry.workflowPaths}
+      },
+      getWorkflowContent: async entry => {
+        recordCall('getWorkflowContent', entry)
+        return {ok: true, content: externalWrapperContent}
+      },
+      getRunJobs: async entry => {
+        recordCall('getRunJobs', entry)
+        return {ok: true, jobs: []}
+      },
+      isDescendantOfPreflight: async () => ({ok: true, descendant: true}),
+    }
+
+    // #when
+    const artifact = await collect({adapters})
+
+    // #then
+    const publicResult = publicRecord(artifact.public)
+    expect(publicResult.state).toBe('unresolved')
+    expect(publicResult.observation).toBe('no-direct-reference-observed')
+    const knownRepositories = new Set([
+      `${PUBLIC_ENTRY.owner}/${PUBLIC_ENTRY.repo}`,
+      ...privateEntries().map(entry => `${entry.owner}/${entry.repo}`),
+    ])
+    expect(calls.length).toBeGreaterThan(0)
+    for (const call of calls) {
+      expect(knownRepositories.has(`${call.owner}/${call.repo}`)).toBe(true)
+    }
+    expect(calls.some(call => call.owner === 'attacker-owner' || call.repo === 'attacker-repo')).toBe(false)
+  })
+
+  it('treats a Fro Bot step guarded by if: false as non-terminal evidence, not a qualifying run', async () => {
+    // #given: the step is statically present in the workflow document regardless of its runtime
+    // `if:` guard, since this collector never executes or resolves conditions.
+    const guardedContent = [
+      'jobs:',
+      '  fro-bot:',
+      '    steps:',
+      '      - if: false',
+      '        uses: fro-bot/agent@v0',
+      '',
+    ].join('\n')
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
+      workflowContent: () => ({ok: true, content: guardedContent}),
     })
 
     // #when
@@ -831,49 +823,8 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('missing-action-resolution')
-  })
-
-  it('fails closed on realistic duplicated/truncated/reordered log fixtures', async () => {
-    // #given
-    const ambiguous = `${resolvedLine(V0_SHA, 'v0')}${resolvedLine(OTHER_SHA, 'v0')}`
-    const adaptersAmbiguous = makeAdapters({
-      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
-      workflowContent: () => ({ok: true, content: workflowContent('v0')}),
-      logs: () => ({ok: true, text: ambiguous}),
-    })
-    const adaptersTruncated = makeAdapters({
-      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
-      workflowContent: () => ({ok: true, content: workflowContent('v0')}),
-      logs: () => ({ok: true, text: `Download action repository 'fro-bot/agent@v0' (SHA:${V0_SHA}`}),
-    })
-
-    // #when
-    const artifactAmbiguous = await collect({adapters: adaptersAmbiguous})
-    const artifactTruncated = await collect({adapters: adaptersTruncated})
-
-    // #then
-    expect(publicRecord(artifactAmbiguous.public).rejectionReason).toBe('ambiguous-action-resolution')
-    expect(publicRecord(artifactTruncated.public).rejectionReason).toBe('missing-action-resolution')
-  })
-
-  it('does not qualify a non-descendant resolved action SHA', async () => {
-    // #given
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
-      logs: () => ({ok: true, text: resolvedLine(OLD_V0_SHA, OLD_V0_SHA)}),
-      workflowContent: () => ({ok: true, content: workflowContent(OLD_V0_SHA)}),
-      ancestry: () => ({ok: true, descendant: false}),
-    })
-
-    // #when
-    const artifact = await collect({adapters})
-
-    // #then
-    const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('non-descendant-action-sha')
+    expect(record.state).toBe('unresolved')
+    expect(record.declaredActionRef).toBe('v0')
   })
 
   it('does not qualify a non-v0 action reference', async () => {
@@ -888,53 +839,8 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('non-qualifiable-action-reference')
-  })
-
-  it('reports a preflight refusal as preflight-failed without qualifying', async () => {
-    // #given
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run({conclusion: 'failure'})], nextPage: null}),
-      logs: () => ({ok: true, text: `##[error]${CREDENTIAL_REFUSAL_MARKER}: origin URL carries a credential\n`}),
-    })
-
-    // #when
-    const artifact = await collect({adapters})
-
-    // #then
-    const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('preflight-failed')
-    expect(record.rejectionReason).toBe('credential-preflight-refused')
-    expect(record.fetchStatusClass).toBe('success')
-  })
-
-  it('lets a later successful rerun attempt qualify and carry its attempt metadata', async () => {
-    // #given
-    const adapters = makeAdapters({
-      runPages: () => ({
-        ok: true,
-        runs: [
-          run({id: 2001, runAttempt: 1, conclusion: 'failure', createdAt: '2026-09-11T20:00:00Z'}),
-          run({id: 2001, runAttempt: 2, conclusion: 'success', createdAt: '2026-09-11T20:30:00Z'}),
-        ],
-        nextPage: null,
-      }),
-      workflowContent: () => ({ok: true, content: workflowContent('v0')}),
-      logs: (_entry, _runId, attempt) =>
-        attempt === 1
-          ? {ok: true, text: `##[error]${CREDENTIAL_REFUSAL_MARKER}\n`}
-          : {ok: true, text: resolvedLine(V0_SHA, 'v0')},
-    })
-
-    // #when
-    const artifact = await collect({adapters})
-
-    // #then
-    const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('qualified')
-    expect(record.runId).toBe(2001)
-    expect(record.runAttempt).toBe(2)
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('ineligible-action-reference')
   })
 
   it('ignores pre-release and non-affected runs', async () => {
@@ -956,8 +862,8 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('no-qualifying-run')
+    expect(record.state).toBe('unresolved')
+    expect(record.observation).toBe('direct-reference-observed')
   })
 
   it('returns unavailable when pagination exhausts the configured bound', async () => {
@@ -971,12 +877,12 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unavailable')
-    expect(record.rejectionReason).toBe('pagination-bound-exhausted')
+    expect(record.state).toBe('unavailable')
+    expect(record.observation).toBe('pagination-bound-exhausted')
     expect(LIMITS.maxRunPages).toBeGreaterThan(0)
   })
 
-  it('continues across run pages until a candidate qualifies', async () => {
+  it('continues across run pages until a candidate is evaluated', async () => {
     // #given
     const adapters = makeAdapters({
       runPages: (_entry, page) =>
@@ -984,15 +890,15 @@ describe('collectRuntimeVerification', () => {
           ? {ok: true, runs: [run({id: 7001, event: 'push'})], nextPage: 2}
           : {ok: true, runs: [run({id: 7002})], nextPage: null},
       workflowContent: () => ({ok: true, content: workflowContent('v0')}),
-      logs: () => ({ok: true, text: resolvedLine(V0_SHA, 'v0')}),
     })
 
     // #when
     const artifact = await collect({adapters})
 
     // #then
-    expect(publicRecord(artifact.public).disposition).toBe('qualified')
-    expect(publicRecord(artifact.public).runId).toBe(7002)
+    const record = publicRecord(artifact.public)
+    expect(record.state).toBe('unresolved')
+    expect(record.runId).toBe(7002)
   })
 
   it('stops paginating at the release boundary instead of trusting later pages', async () => {
@@ -1015,13 +921,14 @@ describe('collectRuntimeVerification', () => {
     const artifact = await collect({adapters})
 
     // #then
-    expect(publicRecord(artifact.public).disposition).toBe('qualified')
-    expect(publicRecord(artifact.public).runId).toBe(8001)
+    const record = publicRecord(artifact.public)
+    expect(record.state).toBe('unresolved')
+    expect(record.runId).toBe(8001)
   })
 
   it('does not let runs from unrelated workflow paths terminate pagination', async () => {
-    // #given: page one holds only an unrelated-path pre-release run; the qualifying run for
-    // this entry lives on page two and must still be reached.
+    // #given: page one holds only an unrelated-path pre-release run; the candidate for this
+    // entry lives on page two and must still be reached.
     const adapters = makeAdapters({
       runPages: (_entry, page) =>
         page === 1
@@ -1038,12 +945,12 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('qualified')
+    expect(record.state).toBe('unresolved')
     expect(record.runId).toBe(9002)
   })
 
-  it('does not spend the candidate-log budget on unrelated workflow paths', async () => {
-    // #given: more unrelated-path runs than the log budget, plus one qualifying relevant run.
+  it('does not spend the candidate budget on unrelated workflow paths', async () => {
+    // #given: more unrelated-path runs than the candidate budget, plus one relevant run.
     const unrelated = Array.from({length: LIMITS.maxCandidateLogs + 2}, (_value, index) =>
       run({
         id: 9100 + index,
@@ -1053,26 +960,24 @@ describe('collectRuntimeVerification', () => {
     )
     const adapters = makeAdapters({
       runPages: () => ({ok: true, runs: [...unrelated, run({id: 9200})], nextPage: null}),
-      logs: () => ({ok: true, text: resolvedLine(V0_SHA)}),
     })
 
     // #when
     const artifact = await collect({adapters})
 
-    // #then
+    // #then: the unrelated-path runs never enter the candidate list, so the budget stays intact.
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('qualified')
+    expect(record.state).toBe('unresolved')
     expect(record.runId).toBe(9200)
   })
 
-  it('returns unavailable when candidate log work exhausts the configured bound', async () => {
+  it('returns unavailable when candidate evaluation work exhausts the configured bound', async () => {
     // #given
     const candidates = Array.from({length: LIMITS.maxCandidateLogs + 1}, (_value, index) =>
       run({id: 4000 + index, createdAt: `2026-09-11T20:${String(index).padStart(2, '0')}:00Z`}),
     )
     const adapters = makeAdapters({
       runPages: () => ({ok: true, runs: candidates, nextPage: null}),
-      logs: () => ({ok: true, text: 'no action line\n'}),
     })
 
     // #when
@@ -1080,8 +985,8 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unavailable')
-    expect(record.rejectionReason).toBe('candidate-log-bound-exhausted')
+    expect(record.state).toBe('unavailable')
+    expect(record.observation).toBe('candidate-log-bound-exhausted')
   })
 
   it('keeps private 403 and 404 unavailable', async () => {
@@ -1097,8 +1002,8 @@ describe('collectRuntimeVerification', () => {
     const artifact = await collect({adapters})
 
     // #then
-    expect(publicRecord(artifact.public).disposition).toBe('unresolved')
-    expect(artifact.private).toEqual({total: 3, resolved: 0, unresolved: 0, unavailable: 3})
+    expect(publicRecord(artifact.public).state).toBe('unresolved')
+    expect(artifact.private).toEqual({total: 3, observed: 0, unresolved: 0, unavailable: 3})
     expect(artifact.collectorStatus).toBe('partial')
   })
 
@@ -1108,8 +1013,8 @@ describe('collectRuntimeVerification', () => {
 
     // #when / #then
     const record = publicRecord((await collect({adapters})).public)
-    expect(record.disposition).toBe('unavailable')
-    expect(record.rejectionReason).toBe('repository-unavailable')
+    expect(record.state).toBe('unavailable')
+    expect(record.observation).toBe('repository-unavailable')
     expect(record.fetchStatusClass).toBe('not-found')
   })
 
@@ -1132,8 +1037,8 @@ describe('collectRuntimeVerification', () => {
 
     // #when / #then
     const identityRecord = publicRecord((await collect({adapters: identityMismatch})).public)
-    expect(identityRecord.disposition).toBe('unavailable')
-    expect(identityRecord.rejectionReason).toBe('repository-identity-mismatch')
+    expect(identityRecord.state).toBe('unavailable')
+    expect(identityRecord.observation).toBe('repository-identity-mismatch')
     expect(runsRequested).toBe(false)
 
     const visibilityMismatch = makeAdapters({
@@ -1143,8 +1048,8 @@ describe('collectRuntimeVerification', () => {
       },
     })
     const visibilityRecord = publicRecord((await collect({adapters: visibilityMismatch})).public)
-    expect(visibilityRecord.disposition).toBe('unavailable')
-    expect(visibilityRecord.rejectionReason).toBe('repository-visibility-mismatch')
+    expect(visibilityRecord.state).toBe('unavailable')
+    expect(visibilityRecord.observation).toBe('repository-visibility-mismatch')
     expect(visibilityRecord.runId).toBeNull()
     expect(visibilityRecord.runUrl).toBeNull()
     expect(serializeArtifact(await collect({adapters: visibilityMismatch})).includes('/actions/runs/')).toBe(false)
@@ -1161,7 +1066,7 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unavailable')
+    expect(record.state).toBe('unavailable')
     expect(record.fetchStatusClass).toBe('malformed')
   })
 
@@ -1175,7 +1080,7 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     expect(artifact.collectorStatus).toBe('unavailable')
-    expect(artifact.private).toEqual({total: 3, resolved: 0, unresolved: 0, unavailable: 3})
+    expect(artifact.private).toEqual({total: 3, observed: 0, unresolved: 0, unavailable: 3})
     expect(serialized.includes(PRIVATE_OWNER)).toBe(false)
     expect(serialized.includes(PRIVATE_REPO_PREFIX)).toBe(false)
   })
@@ -1199,7 +1104,7 @@ describe('collectRuntimeVerification', () => {
     expect(serialized.includes(PRIVATE_OWNER)).toBe(false)
     expect(serialized.includes(PRIVATE_REPO_PREFIX)).toBe(false)
     expect(artifact.private.total).toBe(3)
-    expect(Object.keys(artifact.private)).toEqual(['total', 'resolved', 'unresolved', 'unavailable'])
+    expect(Object.keys(artifact.private)).toEqual(['total', 'observed', 'unresolved', 'unavailable'])
   })
 
   it('emits a schema-valid artifact on every recoverable path', async () => {
@@ -1207,7 +1112,7 @@ describe('collectRuntimeVerification', () => {
     const configs: readonly FakeAdapterConfig[] = [
       {runPages: () => ({ok: true, runs: [run()], nextPage: null})},
       {runPages: () => ({ok: false, fetchStatusClass: 'timeout'})},
-      {logs: () => ({ok: false, fetchStatusClass: 'rate-limited'})},
+      {workflowContent: () => ({ok: false, fetchStatusClass: 'rate-limited'})},
     ]
 
     // #when / #then
@@ -1218,7 +1123,7 @@ describe('collectRuntimeVerification', () => {
           runPages: config.runPages ?? (() => ({ok: true, runs: [run()], nextPage: null})),
         }),
       })
-      expect(isSchemaV1Envelope(artifact)).toBe(true)
+      expect(isSchemaV2Envelope(artifact)).toBe(true)
     }
   })
 
@@ -1250,153 +1155,14 @@ describe('collectRuntimeVerification', () => {
     expect(serializeArtifact(first)).toBe(serializeArtifact(second))
   })
 
-  it('does not qualify a forged bare action-download echo on an issue_comment run', async () => {
-    // #given: a repository-controlled step echoes the phrase; gh prefixes it with an ordinary step name.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run({event: 'issue_comment'})], nextPage: null}),
-      logs: () => ({ok: true, text: forgedLine(V0_SHA)}),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('missing-action-resolution')
-  })
-
-  it('does not qualify a forged bare action-download echo on an issues run', async () => {
+  it('reports workflow content unavailable when the candidate provenance fetch fails', async () => {
     // #given
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run({event: 'issues'})], nextPage: null}),
-      logs: () => ({ok: true, text: forgedLine(V0_SHA)}),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('missing-action-resolution')
-  })
-
-  it('does not qualify a forged bare action-download echo on a same-repository pull_request run', async () => {
-    // #given
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run({event: 'pull_request'})], nextPage: null}),
-      logs: () => ({ok: true, text: forgedLine(V0_SHA)}),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('missing-action-resolution')
-  })
-
-  it('does not qualify a successful overall run whose Fro Bot step refused credentials', async () => {
-    // #given: a downstream continue-on-error step refuses credentials while the run concludes success.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
-      logs: () => ({ok: true, text: `${resolvedLine(V0_SHA)}\n##[error]${CREDENTIAL_REFUSAL_MARKER}\n`}),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('preflight-failed')
-    expect(record.rejectionReason).toBe('credential-preflight-refused')
-  })
-
-  it('classifies unavailable when authenticated job evidence cannot be retrieved', async () => {
-    // #given
+    let contentCalls = 0
     const adapters = makeAdapters({
       runPages: () => ({ok: true, runs: [run()], nextPage: null}),
-      jobs: () => ({ok: false, fetchStatusClass: 'forbidden'}),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unavailable')
-    expect(record.rejectionReason).toBe('run-jobs-unavailable')
-    expect(record.fetchStatusClass).toBe('forbidden')
-  })
-
-  it('does not qualify a successful overall run whose job evidence shows a failure', async () => {
-    // #given: overall run success with a failed job (for example a continue-on-error step).
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
-      jobs: () => ({ok: true, jobs: [{status: 'completed', conclusion: 'failure', steps: []}]}),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('run-jobs-not-successful')
-  })
-
-  it('qualifies a run whose conditional step was legitimately skipped', async () => {
-    // #given: an `if:`-guarded downstream step concluded skipped, which is a normal outcome.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
-      jobs: () => ({
-        ok: true,
-        jobs: [
-          {
-            status: 'completed',
-            conclusion: 'success',
-            steps: [
-              {status: 'completed', conclusion: 'success'},
-              {status: 'completed', conclusion: 'skipped'},
-            ],
-          },
-        ],
-      }),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('qualified')
-  })
-
-  it('does not qualify when one of several jobs failed', async () => {
-    // #given: the overall run succeeded but one job recorded a failure conclusion.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
-      jobs: () => ({
-        ok: true,
-        jobs: [
-          {status: 'completed', conclusion: 'success', steps: [{status: 'completed', conclusion: 'success'}]},
-          {status: 'completed', conclusion: 'failure', steps: [{status: 'completed', conclusion: 'failure'}]},
-        ],
-      }),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('run-jobs-not-successful')
-  })
-
-  it('does not fetch job evidence for a candidate that fails provenance first', async () => {
-    // #given: workflow content is unavailable, so provenance fails before job evidence is needed.
-    let jobsCalls = 0
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
-      workflowContent: () => ({ok: false, fetchStatusClass: 'forbidden'}),
-      jobs: () => {
-        jobsCalls += 1
-        return {ok: true, jobs: [successfulJob()]}
+      workflowContent: () => {
+        contentCalls += 1
+        return {ok: false, fetchStatusClass: 'forbidden'}
       },
     })
 
@@ -1404,168 +1170,38 @@ describe('collectRuntimeVerification', () => {
     const record = publicRecord((await collect({adapters})).public)
 
     // #then
-    expect(record.disposition).toBe('unavailable')
-    expect(record.rejectionReason).toBe('workflow-content-unavailable')
-    expect(jobsCalls).toBe(0)
+    expect(record.state).toBe('unavailable')
+    expect(record.observation).toBe('workflow-content-unavailable')
+    expect(contentCalls).toBeGreaterThan(0)
   })
 
-  it('surfaces a log retrieval timeout as unavailable', async () => {
-    // #given
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
-      logs: () => ({ok: false, fetchStatusClass: 'timeout'}),
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unavailable')
-    expect(record.rejectionReason).toBe('run-logs-unavailable')
-    expect(record.fetchStatusClass).toBe('timeout')
-  })
-
-  it('does not classify a local composite-action consumer as workflow-removed', async () => {
-    // #given: the only Fro Bot reference lives behind a local composite action directory.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [], nextPage: null}),
-      workflowPaths: () => ['.github/workflows/ci.yaml'],
-      workflowContent: (_entry, path) => {
-        if (path === '.github/workflows/ci.yaml') {
-          return {ok: true, content: ['jobs:', '  build:', '    steps:', '      - uses: ./local-action', ''].join('\n')}
-        }
-        if (path === 'local-action/action.yml') {
-          return {
-            ok: true,
-            content: ['runs:', '  using: composite', '  steps:', '    - uses: fro-bot/agent@v0', ''].join('\n'),
-          }
-        }
-        return {ok: false, fetchStatusClass: 'not-found'}
-      },
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('no-qualifying-run')
-  })
-
-  it('does not classify a local reusable-workflow consumer as workflow-removed', async () => {
-    // #given: the only Fro Bot reference lives behind a local reusable workflow.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [], nextPage: null}),
-      workflowPaths: () => ['.github/workflows/ci.yaml'],
-      workflowContent: (_entry, path) =>
-        path === '.github/workflows/ci.yaml'
-          ? {ok: true, content: ['jobs:', '  bot:', '    uses: ./.github/workflows/fro-bot.yaml', ''].join('\n')}
-          : {ok: true, content: workflowContent('v0')},
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('no-qualifying-run')
-  })
-
-  it('does not classify workflow-removed when a readable external wrapper consumes Fro Bot', async () => {
-    // #given: a non-local reusable workflow is resolved and inspected; it invokes Fro Bot.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [], nextPage: null}),
-      workflowPaths: () => ['.github/workflows/ci.yaml'],
-      workflowContent: (entry, path) => {
-        if (entry.owner === 'some-org' && entry.repo === 'wrappers') {
-          return path === '.github/workflows/fro-bot.yaml'
-            ? {ok: true, content: workflowContent('v0')}
-            : {ok: false, fetchStatusClass: 'not-found'}
-        }
-        return {
-          ok: true,
-          content: ['jobs:', '  bot:', '    uses: some-org/wrappers/.github/workflows/fro-bot.yaml@v1', ''].join('\n'),
-        }
-      },
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unresolved')
-    expect(record.rejectionReason).toBe('no-qualifying-run')
-  })
-
-  it('classifies workflow-removed when a readable external wrapper has no Fro Bot reference', async () => {
-    // #given: the external wrapper is fully readable and free of Fro Bot references.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [], nextPage: null}),
-      workflowPaths: () => ['.github/workflows/ci.yaml'],
-      workflowContent: (entry, path) => {
-        if (entry.owner === 'some-org' && entry.repo === 'wrappers') {
-          return path === '.github/workflows/fro-bot.yaml'
-            ? {ok: true, content: ['jobs:', '  build:', '    steps:', '      - run: echo clean', ''].join('\n')}
-            : {ok: false, fetchStatusClass: 'not-found'}
-        }
-        return {
-          ok: true,
-          content: ['jobs:', '  bot:', '    uses: some-org/wrappers/.github/workflows/fro-bot.yaml@v1', ''].join('\n'),
-        }
-      },
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('no-longer-applicable')
-    expect(record.rejectionReason).toBe('workflow-removed')
-  })
-
-  it('fails closed when an external reusable-workflow wrapper cannot be resolved', async () => {
-    // #given: the external wrapper cannot be fetched, so removal cannot be proven.
-    const adapters = makeAdapters({
-      runPages: () => ({ok: true, runs: [], nextPage: null}),
-      workflowPaths: () => ['.github/workflows/ci.yaml'],
-      workflowContent: entry => {
-        if (entry.owner === 'some-org' && entry.repo === 'wrappers') {
-          return {ok: false, fetchStatusClass: 'forbidden'}
-        }
-        return {
-          ok: true,
-          content: ['jobs:', '  bot:', '    uses: some-org/wrappers/.github/workflows/fro-bot.yaml@v1', ''].join('\n'),
-        }
-      },
-    })
-
-    // #when
-    const record = publicRecord((await collect({adapters})).public)
-
-    // #then
-    expect(record.disposition).toBe('unavailable')
-    expect(record.rejectionReason).toBe('indirect-wrapper-unresolved')
-    expect(record.fetchStatusClass).toBe('forbidden')
-  })
-
-  it('continues to an older candidate when the newest candidate is unavailable', async () => {
-    // #given: the newest candidate's logs cannot be retrieved; an older candidate qualifies.
+  it('reports unavailable when a newer candidate is unavailable, even though an older candidate is definitive', async () => {
+    // #given: the newest candidate's workflow content cannot be retrieved; an older candidate
+    // resolves cleanly. The newer candidate's unavailability may have been the qualifying run, so
+    // that uncertainty must not be discarded in favor of the older, more definitive-looking result.
+    const newestSha = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1'
+    const olderSha = 'b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2'
     const adapters = makeAdapters({
       runPages: () => ({
         ok: true,
-        runs: [run({id: 6001, createdAt: '2026-09-11T20:30:00Z'}), run({id: 6002, createdAt: '2026-09-11T20:00:00Z'})],
+        runs: [
+          run({id: 6001, createdAt: '2026-09-11T20:30:00Z', headSha: newestSha}),
+          run({id: 6002, createdAt: '2026-09-11T20:00:00Z', headSha: olderSha}),
+        ],
         nextPage: null,
       }),
-      logs: (_entry, runId) =>
-        runId === 6001 ? {ok: false, fetchStatusClass: 'timeout'} : {ok: true, text: resolvedLine(V0_SHA)},
+      workflowContent: (_entry, _path, ref) =>
+        ref === newestSha ? {ok: false, fetchStatusClass: 'timeout'} : {ok: true, content: workflowContent()},
     })
 
     // #when
     const record = publicRecord((await collect({adapters})).public)
 
     // #then
-    expect(record.disposition).toBe('qualified')
-    expect(record.runId).toBe(6002)
+    expect(record.state).toBe('unavailable')
+    expect(record.observation).toBe('workflow-content-unavailable')
+    expect(record.fetchStatusClass).toBe('timeout')
+    expect(record.runId).toBe(6001)
   })
 
   it('reports an uncertain default-branch workflow read as unavailable', async () => {
@@ -1580,8 +1216,8 @@ describe('collectRuntimeVerification', () => {
 
     // #then
     const record = publicRecord(artifact.public)
-    expect(record.disposition).toBe('unavailable')
-    expect(record.rejectionReason).toBe('workflow-read-unavailable')
+    expect(record.state).toBe('unavailable')
+    expect(record.observation).toBe('workflow-read-unavailable')
     expect(record.fetchStatusClass).toBe('forbidden')
   })
 })
@@ -1594,6 +1230,7 @@ describe('createGitHubAdapters', () => {
   it('returns the validated canonical repository identity and visibility fields', async () => {
     // #given
     const adapters = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
       token: 'fixture-token',
       fetchImpl: async () =>
         new Response(
@@ -1616,7 +1253,11 @@ describe('createGitHubAdapters', () => {
     // #given
     const response = new Response('{}', {status: 200})
     Object.defineProperty(response, 'redirected', {value: true})
-    const adapters = createGitHubAdapters({token: 'fixture-token', fetchImpl: async () => response})
+    const adapters = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
+      token: 'fixture-token',
+      fetchImpl: async () => response,
+    })
 
     // #when / #then
     await expect(adapters.getRepository(PUBLIC_ENTRY)).resolves.toEqual({ok: false, fetchStatusClass: 'redirect'})
@@ -1625,6 +1266,7 @@ describe('createGitHubAdapters', () => {
   it('bounds response size before parsing', async () => {
     // #given
     const adapters = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
       token: 'fixture-token',
       maxResponseBytes: 8,
       fetchImpl: async () => new Response(JSON.stringify({archived: false}), {status: 200}),
@@ -1642,12 +1284,14 @@ describe('createGitHubAdapters', () => {
     const timeoutError = new Error('timed out')
     timeoutError.name = 'TimeoutError'
     const timedOut = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
       token: 'fixture-token',
       fetchImpl: async () => {
         throw timeoutError
       },
     })
     const malformed = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
       token: 'fixture-token',
       fetchImpl: async () => new Response('not json', {status: 200}),
     })
@@ -1657,19 +1301,10 @@ describe('createGitHubAdapters', () => {
     expect(await malformed.getRepository(PUBLIC_ENTRY)).toEqual({ok: false, fetchStatusClass: 'malformed'})
   })
 
-  it('classifies gh log subprocess timeouts distinctly from other failures', () => {
-    // #given / #when / #then
-    expect(classifyGhFailure({code: 'ETIMEDOUT'})).toBe('timeout')
-    expect(classifyGhFailure({signal: 'SIGKILL'})).toBe('timeout')
-    expect(classifyGhFailure({code: 'ENOBUFS'})).toBe('oversized')
-    expect(classifyGhFailure({status: 403})).toBe('forbidden')
-    expect(classifyGhFailure({status: 429})).toBe('rate-limited')
-    expect(classifyGhFailure(new Error('boom'))).toBe('error')
-  })
-
   it('classifies HTTP failures without echoing response bodies', async () => {
     // #given
     const adapters = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
       token: 'fixture-token',
       fetchImpl: async () => new Response(`private-canary-body`, {status: 403}),
     })
@@ -1697,6 +1332,7 @@ describe('createGitHubAdapters', () => {
       })),
     }
     const adapters = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
       token: 'fixture-token',
       fetchImpl: async () => new Response(JSON.stringify(fullPage), {status: 200}),
     })
@@ -1711,5 +1347,87 @@ describe('createGitHubAdapters', () => {
     expect(runs).toHaveLength(LIMITS.runsPerPage)
     expect(runs[0]?.event).toBe('issues')
     expect(nextPage).toBe(2)
+  })
+
+  it('fails closed without issuing a network request for a target outside the trusted inventories', async () => {
+    // #given
+    const calls: string[] = []
+    const adapters = createGitHubAdapters({
+      token: 'fixture-token',
+      publicInventory: [PUBLIC_ENTRY],
+      privateInventory: privateEntries(),
+      fetchImpl: async input => {
+        calls.push(String(input))
+        return new Response(JSON.stringify({archived: false}), {status: 200})
+      },
+    })
+    const rogueEntry: InventoryEntry = {
+      owner: 'rogue-owner',
+      repo: 'rogue-repo',
+      workflowPaths: ['.github/workflows/fro-bot.yaml'],
+    }
+
+    // #when
+    const result = await adapters.getRepository(rogueEntry)
+
+    // #then
+    expect(result).toEqual({ok: false, fetchStatusClass: 'forbidden'})
+    expect(calls).toHaveLength(0)
+  })
+
+  it('normalizes owner/repo casing when checking inventory membership', async () => {
+    // #given: the inventory is lowercase but the entry under evaluation is not.
+    const adapters = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
+      token: 'fixture-token',
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({full_name: 'Example/Widget', private: false, archived: false, default_branch: 'trunk'}),
+          {status: 200},
+        ),
+    })
+    const differentlyCasedEntry: InventoryEntry = {
+      owner: PUBLIC_ENTRY.owner.toUpperCase(),
+      repo: PUBLIC_ENTRY.repo.toUpperCase(),
+      workflowPaths: PUBLIC_ENTRY.workflowPaths,
+    }
+
+    // #when
+    const result = await adapters.getRepository(differentlyCasedEntry)
+
+    // #then
+    expect(result.ok).toBe(true)
+  })
+
+  it('abandons an oversized response body instead of fully buffering it', async () => {
+    // #given: three 20-byte chunks are available (well past the 10-byte limit); fully draining
+    // the stream would require pulling all three plus a final close, i.e. at least 4 pulls.
+    let pulls = 0
+    const totalChunks = 3
+    const remainingChunks = [new Uint8Array(20), new Uint8Array(20), new Uint8Array(20)]
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1
+        const chunk = remainingChunks.shift()
+        if (chunk === undefined) {
+          controller.close()
+          return
+        }
+        controller.enqueue(chunk)
+      },
+    })
+    const adapters = createGitHubAdapters({
+      ...ADAPTER_INVENTORY,
+      token: 'fixture-token',
+      maxResponseBytes: 10,
+      fetchImpl: async () => new Response(stream, {status: 200}),
+    })
+
+    // #when
+    const result = await adapters.getRepository(PUBLIC_ENTRY)
+
+    // #then: the body was abandoned well short of a full drain, not merely measured after the fact.
+    expect(result).toEqual({ok: false, fetchStatusClass: 'oversized'})
+    expect(pulls).toBeLessThan(totalChunks + 1)
   })
 })

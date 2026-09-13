@@ -137,7 +137,7 @@ env:
 
     Validate before use; if any check fails, make NO #1598 mutation and record
     "data unavailable" or an operator-review warning in the DMR:
-    - schema version is 1;
+    - schema version is 2;
     - producer run ID and run attempt equal the trusted GITHUB_RUN_ID and
       GITHUB_RUN_ATTEMPT;
     - producer schedule is the exact daily cron 30 15 * * *;
@@ -146,9 +146,17 @@ env:
       the current-run metadata cannot be read, evidence is unavailable;
     - minimum release tag is v0.111.0;
     - required ancestor commit is 9d971b4cc5d1e47cbbb4ea5cb60e2d703ceabf97;
-    - public entries are 24 and the private total is 3.
+    - public entries are 24 and private.total is 3.
     A stale, replayed, or mismatched producer identity is invalid. A missing or
     failed artifact download yields no usable file, so make no mutation.
+
+    Non-terminal by construction: every observation state (unresolved,
+    preflight-failed, unavailable) and collector status (partial, unavailable) is
+    non-terminal. No combination of collector evidence proves a repository has
+    migrated off this action or that a workflow reference was removed. In
+    particular, an observation of no-direct-reference-observed is NOT evidence of
+    removal — it means only that no direct action reference was found in the
+    scanned workflow content.
 
     Managed block markers (exactly one ordered pair; only bytes between them may
     change):
@@ -161,25 +169,31 @@ env:
     names, aliases, URLs, or per-repository evidence. Use only the aggregate private
     counts in the artifact.
 
-    Progress: union newly resolved public dispositions into the existing managed
-    block and never demote an existing resolution. Public evidence links are
-    allowed. Preserve the displayed private aggregate floor for reporting; it is never
-    closure evidence.
+    Progress: report observations, not resolutions. For each public entry in the
+    managed block, record its state, its observation slug, and — where present —
+    declaredActionRef, resolvedActionSha, ancestryFromPreflight, and a public
+    runUrl. Union newly observed public entries into the existing managed block
+    and never demote an existing operator disposition. Preserve the displayed
+    private aggregate (private.observed of private.total) for reporting; it is
+    never closure evidence.
 
-    Material change only: edit #1598 at most once, and only when a public
-    repository newly resolves, the aggregate private resolved count increases, an
-    evidence-backed public blocker materially changes, or completion is reached.
-    Otherwise leave #1598 byte-for-byte unchanged and update only the DMR.
+    Material change only: edit #1598 at most once, and only when observations
+    materially change (a public entry's state, observation slug, or evidence
+    fields change) or an operator disposition newly lands in
+    .github/dmr-runtime-verification-dispositions.yaml. Otherwise leave #1598
+    byte-for-byte unchanged and update only the DMR.
 
     Editing: read the full #1598 body, change only the managed block to build the
     candidate, re-read immediately before mutating, and abort if any byte outside
     the markers changed; rebuild from the final body. Never overwrite human content
     outside the markers.
 
-    Closure: close #1598 only when all 24 public entries resolve and the CURRENT
-    VALIDATED ARTIFACT positively resolves all 3 private entries. Historical
-    aggregate progress, displayed private counts, or editable issue text alone
-    can never satisfy private closure.
+    Closure: close #1598 only when
+    .github/dmr-runtime-verification-dispositions.yaml, read from the trusted
+    repository checkout — never from the artifact — shows all 24 public entries
+    dispositioned (non-null) and private.dispositioned equals private.total (3).
+    Collector evidence, artifact contents, displayed counts, and issue text can
+    never satisfy closure on their own.
     Write the final managed block first, then close with no comment.
 
     If #1598 is already closed: do not use the artifact or update #1598; the
