@@ -51,10 +51,14 @@ export const LIMITS = {
   runsPerPage: 100,
   maxWorkflowPages: 3,
   workflowsPerPage: 100,
+  maxJobPages: 2,
+  jobsPerPage: 100,
   maxCandidateLogs: 5,
+  maxIndirectionDepth: 3,
   maxResponseBytes: 1_000_000,
   maxLogBytes: 8_000_000,
   requestTimeoutMs: 15_000,
+  logTimeoutMs: 30_000,
 } as const
 
 export interface InventoryEntry {
@@ -200,6 +204,21 @@ export type WorkflowPathsResult =
 export type RunLogsResult =
   {readonly ok: true; readonly text: string} | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
 
+export interface RunStepEvidence {
+  readonly status: string
+  readonly conclusion: string | null
+}
+
+export interface RunJobEvidence {
+  readonly status: string
+  readonly conclusion: string | null
+  readonly steps: readonly RunStepEvidence[]
+}
+
+export type RunJobsResult =
+  | {readonly ok: true; readonly jobs: readonly RunJobEvidence[]}
+  | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
+
 export type AncestryResult =
   {readonly ok: true; readonly descendant: boolean} | {readonly ok: false; readonly fetchStatusClass: FetchStatusClass}
 
@@ -209,6 +228,7 @@ export interface CollectorAdapters {
   readonly listWorkflowPaths: (entry: InventoryEntry) => Promise<WorkflowPathsResult>
   readonly getWorkflowContent: (entry: InventoryEntry, path: string, ref: string) => Promise<WorkflowContentResult>
   readonly getRunLogs: (entry: InventoryEntry, runId: number, runAttempt: number) => Promise<RunLogsResult>
+  readonly getRunJobs: (entry: InventoryEntry, runId: number, runAttempt: number) => Promise<RunJobsResult>
   readonly isDescendantOfPreflight: (sha: string) => Promise<AncestryResult>
 }
 
@@ -242,13 +262,42 @@ export type ActionReferencesResult =
   | {readonly ok: true; readonly references: readonly string[]}
   | {readonly ok: false; readonly fetchStatusClass: 'malformed'}
 
+export interface WorkflowIndirections {
+  readonly directReferences: readonly string[]
+  readonly localWorkflowPaths: readonly string[]
+  readonly localActionPaths: readonly string[]
+  readonly externalJobWrappers: readonly string[]
+}
+
+export type WorkflowIndirectionsResult =
+  {readonly ok: true; readonly value: WorkflowIndirections} | {readonly ok: false; readonly reason: 'malformed'}
+
 export const FORK_PULL_REQUEST_REJECTION_REASON = 'fork-pull-request'
 
 // ---------------------------------------------------------------------------
 // Pure parsers, classifiers, and sanitizers
 // ---------------------------------------------------------------------------
 
-const RESOLVED_ACTION_PATTERN = /Download action repository 'fro-bot\/agent@([^']+)' \(SHA:([0-9a-f]{40})\)/g
+/**
+ * `gh run view --log` attributes runner job-setup lines to this sentinel step name, which is where
+ * the runner's own `Download action repository` records appear. Anchoring provenance to it keeps an
+ * ordinary step that merely echoes that phrase from qualifying, since `gh` prefixes every log line
+ * — forged or genuine — with `<job>\t<step>\t<timestamp>`.
+ *
+ * This is a `gh` implementation detail rather than a runner contract: if a future `gh` renames the
+ * sentinel, every repository degrades to `missing-action-resolution` (unresolved) instead of
+ * qualifying falsely. That is the safe direction, but it stalls progress silently, so a sweep that
+ * reports no resolutions across the whole inventory should be checked against this constant first.
+ */
+export const SETUP_STEP_NAME = 'UNKNOWN STEP'
+
+// A downloaded `gh run view --log` line is `job\tstep\ttimestamp message`. The runner emits the
+// `Download action repository` record during job setup, which gh attributes to the setup sentinel
+// step; a repository-controlled step echoing the phrase appears under its own step name.
+const RESOLVED_ACTION_PATTERN = new RegExp(
+  String.raw`(?:^|\n)[^\t\n]*\t${SETUP_STEP_NAME}\t\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z Download action repository 'fro-bot/agent@([^']+)' \(SHA:([0-9a-f]{40})\)`,
+  'g',
+)
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/
 const ACTION_REFERENCE_PATTERN = /^fro-bot\/agent@(.+)$/
 
@@ -258,6 +307,12 @@ function isFullSha(value: string): boolean {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && Array.isArray(value) === false
+}
+
+/** Normalize a `uses: ./...` reference to a repository-relative path (`./` normalizes to the root). */
+function normalizeLocalPath(uses: string): string {
+  const raw = uses.slice(2).replace(/\/+$/, '')
+  return raw === '.' ? '' : raw
 }
 
 /** Parse executable `jobs.*.steps[].uses` values from a workflow document. */
@@ -302,6 +357,73 @@ export function extractActionReferences(workflowContent: string): readonly strin
     return []
   }
   return [...new Set(result.references)]
+}
+
+/**
+ * Parse a workflow or composite-action manifest into the direct Fro Bot references plus every
+ * indirection that must be resolved before a repository can be declared free of Fro Bot:
+ * local reusable workflows (`jobs.*.uses: ./.github/workflows/<file>`), local action directories
+ * (`steps[].uses: ./<path>`), and non-local (external) job-level reusable workflows that could
+ * themselves invoke Fro Bot. Malformed YAML fails closed.
+ */
+export function parseWorkflowIndirections(workflowContent: string): WorkflowIndirectionsResult {
+  let document: unknown
+  try {
+    document = parse(workflowContent)
+  } catch {
+    return {ok: false, reason: 'malformed'}
+  }
+
+  const directReferences: string[] = []
+  const localWorkflowPaths: string[] = []
+  const localActionPaths: string[] = []
+  const externalJobWrappers: string[] = []
+
+  const collectStep = (step: unknown): void => {
+    if (isObject(step) === false || typeof step.uses !== 'string') {
+      return
+    }
+    const uses = step.uses
+    const match = ACTION_REFERENCE_PATTERN.exec(uses)
+    if (match?.[1] !== undefined) {
+      directReferences.push(match[1])
+      return
+    }
+    if (uses.startsWith('./')) {
+      localActionPaths.push(normalizeLocalPath(uses))
+    }
+  }
+
+  if (isObject(document)) {
+    const jobs = document.jobs
+    if (isObject(jobs)) {
+      for (const job of Object.values(jobs)) {
+        if (isObject(job) === false) {
+          continue
+        }
+        if (typeof job.uses === 'string' && job.uses.length > 0) {
+          if (job.uses.startsWith('./')) {
+            localWorkflowPaths.push(normalizeLocalPath(job.uses))
+          } else {
+            externalJobWrappers.push(job.uses)
+          }
+        }
+        if (Array.isArray(job.steps)) {
+          for (const step of job.steps) {
+            collectStep(step)
+          }
+        }
+      }
+    }
+    const runs = document.runs
+    if (isObject(runs) && Array.isArray(runs.steps)) {
+      for (const step of runs.steps) {
+        collectStep(step)
+      }
+    }
+  }
+
+  return {ok: true, value: {directReferences, localWorkflowPaths, localActionPaths, externalJobWrappers}}
 }
 
 /**
@@ -375,12 +497,36 @@ export function parsePrivateInventory(raw: string | undefined): ParsePrivateInve
       if (typeof path !== 'string' || path.length === 0) return {ok: false, reason: 'invalid-entry'}
       paths.push(path)
     }
-    const key = `${record.owner}/${record.repo}`
+    const key = `${record.owner.toLowerCase()}/${record.repo.toLowerCase()}`
     if (seen.has(key)) return {ok: false, reason: 'duplicate-entry'}
     seen.add(key)
     entries.push({owner: record.owner, repo: record.repo, workflowPaths: paths})
   }
   return {ok: true, entries}
+}
+
+/**
+ * Bound the authenticated per-job evidence to a fail-closed rule that rejects only genuinely bad
+ * terminal outcomes (`failure`, `cancelled`, `timed_out`, `action_required`, `stale`) at both job and
+ * step level. `success`, `skipped`, and `neutral` are accepted: an `if:`-guarded step concluding
+ * `skipped` is normal, and a skipped Fro Bot job or step is already fail-closed by provenance, since
+ * the action download record would be absent. Jobs that are not yet `completed` are always rejected.
+ */
+export function areRunJobsSuccessful(jobs: readonly RunJobEvidence[]): boolean {
+  if (jobs.length === 0) {
+    return false
+  }
+  return jobs.every(
+    job =>
+      isAcceptableCompletion(job.status, job.conclusion) &&
+      job.steps.every(step => isAcceptableCompletion(step.status, step.conclusion)),
+  )
+}
+
+const ACCEPTED_COMPLETION_CONCLUSIONS: readonly string[] = ['success', 'skipped', 'neutral']
+
+function isAcceptableCompletion(status: string, conclusion: string | null): boolean {
+  return status === 'completed' && conclusion !== null && ACCEPTED_COMPLETION_CONCLUSIONS.includes(conclusion)
 }
 
 export function aggregatePrivate(dispositions: readonly Disposition[]): PrivateAggregate {
@@ -452,9 +598,59 @@ function hasNumberFields(value: Record<string, unknown>, fields: readonly string
   return fields.every(field => typeof value[field] === 'number')
 }
 
+const DISPOSITION_VALUES: readonly Disposition[] = [
+  'qualified',
+  'no-longer-applicable',
+  'unresolved',
+  'preflight-failed',
+  'unavailable',
+]
+
+const FETCH_STATUS_CLASS_VALUES: readonly FetchStatusClass[] = [
+  'success',
+  'not-found',
+  'forbidden',
+  'rate-limited',
+  'timeout',
+  'oversized',
+  'malformed',
+  'redirect',
+  'error',
+]
+
+function isNullableString(value: unknown): boolean {
+  return value === null || typeof value === 'string'
+}
+
+function isNullableNumber(value: unknown): boolean {
+  return value === null || typeof value === 'number'
+}
+
+function isPublicDispositionRecord(value: unknown): boolean {
+  if (isRecord(value) === false) return false
+  return (
+    typeof value.repository === 'string' &&
+    value.repository.length > 0 &&
+    typeof value.disposition === 'string' &&
+    DISPOSITION_VALUES.includes(value.disposition as Disposition) &&
+    typeof value.observedAt === 'string' &&
+    typeof value.fetchStatusClass === 'string' &&
+    FETCH_STATUS_CLASS_VALUES.includes(value.fetchStatusClass as FetchStatusClass) &&
+    isNullableString(value.rejectionReason) &&
+    isNullableString(value.event) &&
+    isNullableNumber(value.runId) &&
+    isNullableNumber(value.runAttempt) &&
+    isNullableString(value.runUrl) &&
+    isNullableString(value.workflowPath) &&
+    isNullableString(value.actionRef) &&
+    isNullableString(value.resolvedActionSha)
+  )
+}
+
 /**
  * Structural validation of the version-1 envelope. `main()` runs this before writing the artifact
  * so a future shape regression fails closed with a constant-class message instead of publishing it.
+ * Each public entry's required fields and types are validated, not merely the container shape.
  */
 export function isSchemaV1Envelope(value: unknown): value is ArtifactEnvelope {
   if (isRecord(value) === false) return false
@@ -467,6 +663,7 @@ export function isSchemaV1Envelope(value: unknown): value is ArtifactEnvelope {
     hasStringFields(baseline, ['minimumRelease', 'minimumReleasePublishedAt', 'credentialPreflightCommit']) &&
     (collectorStatus === 'ready' || collectorStatus === 'partial' || collectorStatus === 'unavailable') &&
     Array.isArray(publicRecords) &&
+    publicRecords.every(isPublicDispositionRecord) &&
     isRecord(privateAggregate) &&
     hasNumberFields(privateAggregate, ['total', 'resolved', 'unresolved', 'unavailable'])
   )
@@ -531,10 +728,12 @@ async function evaluateRun(
       fetchStatusClass: logs.fetchStatusClass,
     })
   }
+  if (logs.text.includes(CREDENTIAL_REFUSAL_MARKER)) {
+    // Evaluated before any success-based qualification: a downstream continue-on-error step can
+    // refuse credentials while the overall run still concludes success.
+    return withRun(base, run, {disposition: 'preflight-failed', rejectionReason: 'credential-preflight-refused'})
+  }
   if (run.conclusion !== 'success') {
-    if (logs.text.includes(CREDENTIAL_REFUSAL_MARKER)) {
-      return withRun(base, run, {disposition: 'preflight-failed', rejectionReason: 'credential-preflight-refused'})
-    }
     return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'terminal-run-failed'})
   }
   const content = await adapters.getWorkflowContent(entry, run.path, run.headSha)
@@ -600,7 +799,183 @@ async function evaluateRun(
       resolvedActionSha: resolved.sha,
     })
   }
+  // Provenance is satisfied; only now is the bounded per-job evidence fetch worth spending.
+  const jobs = await adapters.getRunJobs(entry, run.id, run.runAttempt)
+  if (jobs.ok === false) {
+    return withRun(base, run, {
+      disposition: 'unavailable',
+      rejectionReason: 'run-jobs-unavailable',
+      fetchStatusClass: jobs.fetchStatusClass,
+    })
+  }
+  if (areRunJobsSuccessful(jobs.jobs) === false) {
+    // Overall run success is not proof the Fro Bot invocation itself succeeded.
+    return withRun(base, run, {disposition: 'unresolved', rejectionReason: 'run-jobs-not-successful'})
+  }
   return withRun(base, run, {disposition: 'qualified', actionRef, resolvedActionSha: resolved.sha})
+}
+
+type WorkflowInspectionResult =
+  | {readonly ok: true; readonly sawReference: boolean}
+  | {readonly ok: false; readonly rejectionReason: string; readonly fetchStatusClass: FetchStatusClass}
+
+interface ExternalWorkflowTarget {
+  readonly owner: string
+  readonly repo: string
+  readonly path: string
+  readonly ref: string
+}
+
+/** Parse `owner/repo/path@ref` job-level reusable-workflow `uses` values; anything else is unresolvable. */
+const EXTERNAL_WORKFLOW_PATTERN = /^([^/@\s]+)\/([^/@\s]+)\/([^@\s]+)@(\S+)$/
+
+function parseExternalWorkflowReference(uses: string): ExternalWorkflowTarget | null {
+  const match = EXTERNAL_WORKFLOW_PATTERN.exec(uses)
+  if (match === null) {
+    return null
+  }
+  const owner = match[1]
+  const repo = match[2]
+  const path = match[3]
+  const ref = match[4]
+  if (owner === undefined || repo === undefined || path === undefined || ref === undefined) {
+    return null
+  }
+  if (path.length === 0 || ref.length === 0) {
+    return null
+  }
+  return {owner, repo, path, ref}
+}
+
+/**
+ * Resolve an external reusable workflow from its own repository at the referenced ref and inspect it
+ * within the same depth and visited-set bounds as local wrappers. An unresolvable fetch fails closed.
+ */
+async function inspectExternalWorkflow(
+  target: ExternalWorkflowTarget,
+  adapters: CollectorAdapters,
+  visited: Set<string>,
+  depth: number,
+): Promise<WorkflowInspectionResult> {
+  const visitKey = `workflow:${target.owner}/${target.repo}@${target.ref}:${target.path}`
+  if (visited.has(visitKey)) {
+    return {ok: true, sawReference: false}
+  }
+  visited.add(visitKey)
+  if (depth + 1 > LIMITS.maxIndirectionDepth) {
+    return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'success'}
+  }
+  const externalEntry: InventoryEntry = {owner: target.owner, repo: target.repo, workflowPaths: []}
+  const result = await adapters.getWorkflowContent(externalEntry, target.path, target.ref)
+  if (result.ok === false) {
+    return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: result.fetchStatusClass}
+  }
+  return inspectManifestContent(externalEntry, adapters, target.ref, result.content, visited, depth + 1)
+}
+
+async function inspectManifestContent(
+  entry: InventoryEntry,
+  adapters: CollectorAdapters,
+  ref: string,
+  content: string,
+  visited: Set<string>,
+  depth: number,
+): Promise<WorkflowInspectionResult> {
+  const parsed = parseWorkflowIndirections(content)
+  if (parsed.ok === false) {
+    return {ok: false, rejectionReason: 'workflow-read-unavailable', fetchStatusClass: 'malformed'}
+  }
+  const indirections = parsed.value
+  if (indirections.directReferences.length > 0) {
+    return {ok: true, sawReference: true}
+  }
+  for (const wrapper of indirections.externalJobWrappers) {
+    // A non-local wrapper could itself invoke Fro Bot; resolve and inspect it, or fail closed.
+    const target = parseExternalWorkflowReference(wrapper)
+    if (target === null) {
+      return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'success'}
+    }
+    const nested = await inspectExternalWorkflow(target, adapters, visited, depth)
+    if (nested.ok === false) {
+      return nested
+    }
+    if (nested.sawReference) {
+      return {ok: true, sawReference: true}
+    }
+  }
+  for (const localPath of indirections.localWorkflowPaths) {
+    const nested = await inspectWorkflow(entry, adapters, ref, localPath, visited, depth + 1)
+    if (nested.ok === false) {
+      return nested
+    }
+    if (nested.sawReference) {
+      return {ok: true, sawReference: true}
+    }
+  }
+  for (const actionDir of indirections.localActionPaths) {
+    const nested = await inspectLocalAction(entry, adapters, ref, actionDir, visited, depth + 1)
+    if (nested.ok === false) {
+      return nested
+    }
+    if (nested.sawReference) {
+      return {ok: true, sawReference: true}
+    }
+  }
+  return {ok: true, sawReference: false}
+}
+
+async function inspectWorkflow(
+  entry: InventoryEntry,
+  adapters: CollectorAdapters,
+  ref: string,
+  path: string,
+  visited: Set<string>,
+  depth: number,
+): Promise<WorkflowInspectionResult> {
+  const visitKey = `workflow:${entry.owner}/${entry.repo}@${ref}:${path}`
+  if (visited.has(visitKey)) {
+    return {ok: true, sawReference: false}
+  }
+  visited.add(visitKey)
+  if (depth > LIMITS.maxIndirectionDepth) {
+    return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'success'}
+  }
+  const result = await adapters.getWorkflowContent(entry, path, ref)
+  if (result.ok === false) {
+    return {ok: false, rejectionReason: 'workflow-read-unavailable', fetchStatusClass: result.fetchStatusClass}
+  }
+  return inspectManifestContent(entry, adapters, ref, result.content, visited, depth)
+}
+
+async function inspectLocalAction(
+  entry: InventoryEntry,
+  adapters: CollectorAdapters,
+  ref: string,
+  actionDir: string,
+  visited: Set<string>,
+  depth: number,
+): Promise<WorkflowInspectionResult> {
+  const visitKey = `action:${entry.owner}/${entry.repo}@${ref}:${actionDir}`
+  if (visited.has(visitKey)) {
+    return {ok: true, sawReference: false}
+  }
+  visited.add(visitKey)
+  if (depth > LIMITS.maxIndirectionDepth) {
+    return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'success'}
+  }
+  const candidates =
+    actionDir === '' ? ['action.yml', 'action.yaml'] : [`${actionDir}/action.yml`, `${actionDir}/action.yaml`]
+  for (const candidate of candidates) {
+    const result = await adapters.getWorkflowContent(entry, candidate, ref)
+    if (result.ok === true) {
+      return inspectManifestContent(entry, adapters, ref, result.content, visited, depth)
+    }
+    if (result.fetchStatusClass !== 'not-found') {
+      return {ok: false, rejectionReason: 'indirect-wrapper-unavailable', fetchStatusClass: result.fetchStatusClass}
+    }
+  }
+  // A local `uses: ./<path>` target with no action manifest cannot be resolved; fail closed.
+  return {ok: false, rejectionReason: 'indirect-wrapper-unresolved', fetchStatusClass: 'not-found'}
 }
 
 async function classifyDefaultBranch(
@@ -617,25 +992,18 @@ async function classifyDefaultBranch(
     }
   }
 
+  const visited = new Set<string>()
   let sawReference = false
   for (const path of workflowPaths.paths) {
-    const result = await adapters.getWorkflowContent(entry, path, defaultBranch)
-    if (result.ok === false) {
+    const inspected = await inspectWorkflow(entry, adapters, defaultBranch, path, visited, 0)
+    if (inspected.ok === false) {
       return {
         disposition: 'unavailable',
-        rejectionReason: 'workflow-read-unavailable',
-        fetchStatusClass: result.fetchStatusClass,
+        rejectionReason: inspected.rejectionReason,
+        fetchStatusClass: inspected.fetchStatusClass,
       }
     }
-    const parsedReferences = parseActionReferences(result.content)
-    if (parsedReferences.ok === false) {
-      return {
-        disposition: 'unavailable',
-        rejectionReason: 'workflow-read-unavailable',
-        fetchStatusClass: parsedReferences.fetchStatusClass,
-      }
-    }
-    if (parsedReferences.references.length > 0) {
+    if (inspected.sawReference) {
       sawReference = true
     }
   }
@@ -724,6 +1092,7 @@ async function collectEntry(
 
   let evaluations = 0
   let best: PublicDisposition | null = null
+  let unavailableFallback: PublicDisposition | null = null
   for (const run of filtered) {
     if (evaluations >= LIMITS.maxCandidateLogs) {
       return {
@@ -735,8 +1104,16 @@ async function collectEntry(
     }
     evaluations += 1
     const evaluation = await evaluateRun(base, entry, run, adapters)
-    if (evaluation.disposition === 'qualified' || evaluation.disposition === 'unavailable') {
+    if (evaluation.disposition === 'qualified') {
       return evaluation
+    }
+    if (evaluation.disposition === 'unavailable') {
+      // Do not let one unavailable candidate mask a later in-budget candidate that qualifies;
+      // surface unavailable only if nothing better is found.
+      if (unavailableFallback === null) {
+        unavailableFallback = evaluation
+      }
+      continue
     }
     if (best === null || (best.disposition !== 'preflight-failed' && evaluation.disposition === 'preflight-failed')) {
       best = evaluation
@@ -744,6 +1121,9 @@ async function collectEntry(
   }
   if (best !== null) {
     return best
+  }
+  if (unavailableFallback !== null) {
+    return unavailableFallback
   }
 
   const branch = await classifyDefaultBranch(entry, adapters, repository.defaultBranch)
@@ -823,9 +1203,29 @@ export interface GitHubAdapterOptions {
   readonly timeoutMs?: number
   readonly maxResponseBytes?: number
   readonly maxLogBytes?: number
+  readonly logTimeoutMs?: number
+  readonly logKillSignal?: NodeJS.Signals
 }
 
-function defaultRunGh(token: string, maxBytes: number): GhLogRunner {
+/**
+ * Classify a `gh run view --log` subprocess failure as a constant fetch-status class. A timeout is
+ * classified distinctly from other failures so one stalled log retrieval cannot consume the job.
+ */
+export function classifyGhFailure(error: unknown): FetchStatusClass {
+  const shape = error as {readonly code?: unknown; readonly status?: unknown; readonly signal?: unknown}
+  if (shape.code === 'ENOBUFS') {
+    return 'oversized'
+  }
+  if (shape.code === 'ETIMEDOUT' || shape.signal === 'SIGTERM' || shape.signal === 'SIGKILL') {
+    return 'timeout'
+  }
+  if (typeof shape.status === 'number') {
+    return failureClass(shape.status)
+  }
+  return 'error'
+}
+
+function defaultRunGh(token: string, maxBytes: number, timeoutMs: number, killSignal: NodeJS.Signals): GhLogRunner {
   return (entry, runId, runAttempt) => {
     try {
       const text = execFileSync(
@@ -843,20 +1243,15 @@ function defaultRunGh(token: string, maxBytes: number): GhLogRunner {
         {
           encoding: 'utf8',
           maxBuffer: maxBytes,
+          timeout: timeoutMs,
+          killSignal,
           env: {...process.env, GH_TOKEN: token},
           stdio: ['ignore', 'pipe', 'pipe'],
         },
       )
       return {ok: true, text}
     } catch (error: unknown) {
-      const shape = error as {readonly code?: unknown; readonly status?: unknown}
-      if (shape.code === 'ENOBUFS') {
-        return {ok: false, fetchStatusClass: 'oversized'}
-      }
-      if (typeof shape.status === 'number') {
-        return {ok: false, fetchStatusClass: failureClass(shape.status)}
-      }
-      return {ok: false, fetchStatusClass: 'error'}
+      return {ok: false, fetchStatusClass: classifyGhFailure(error)}
     }
   }
 }
@@ -865,7 +1260,14 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? LIMITS.requestTimeoutMs
   const maxResponseBytes = options.maxResponseBytes ?? LIMITS.maxResponseBytes
-  const getRunLogs = options.runGh ?? defaultRunGh(options.token, options.maxLogBytes ?? LIMITS.maxLogBytes)
+  const getRunLogs =
+    options.runGh ??
+    defaultRunGh(
+      options.token,
+      options.maxLogBytes ?? LIMITS.maxLogBytes,
+      options.logTimeoutMs ?? LIMITS.logTimeoutMs,
+      options.logKillSignal ?? 'SIGKILL',
+    )
 
   const request = async (path: string, accept: string): Promise<FetchTextResult> => {
     try {
@@ -1006,6 +1408,37 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
       return {ok: true, content: response.text}
     },
     getRunLogs: async (entry, runId, runAttempt) => getRunLogs(entry, runId, runAttempt),
+    getRunJobs: async (entry, runId, runAttempt) => {
+      const jobs: RunJobEvidence[] = []
+      let page = 1
+      while (true) {
+        const response = await request(
+          `/repos/${entry.owner}/${entry.repo}/actions/runs/${runId}/attempts/${runAttempt}/jobs?per_page=${LIMITS.jobsPerPage}&page=${page}`,
+          'application/vnd.github+json',
+        )
+        if (response.ok === false) {
+          return response
+        }
+        const parsed = safeJson(response.text)
+        if (parsed.ok === false || isObject(parsed.value) === false || Array.isArray(parsed.value.jobs) === false) {
+          return {ok: false, fetchStatusClass: 'malformed'}
+        }
+        for (const job of parsed.value.jobs) {
+          const evidence = toRunJobEvidence(job)
+          if (evidence === null) {
+            return {ok: false, fetchStatusClass: 'malformed'}
+          }
+          jobs.push(evidence)
+        }
+        if (parsed.value.jobs.length < LIMITS.jobsPerPage) {
+          return {ok: true, jobs}
+        }
+        if (page >= LIMITS.maxJobPages) {
+          return {ok: false, fetchStatusClass: 'error'}
+        }
+        page += 1
+      }
+    },
     isDescendantOfPreflight: async sha => {
       const response = await request(
         `/repos/fro-bot/agent/compare/${CREDENTIAL_PREFLIGHT_COMMIT}...${sha}`,
@@ -1027,6 +1460,28 @@ export function createGitHubAdapters(options: GitHubAdapterOptions): CollectorAd
       return {ok: true, descendant: status === 'ahead' || status === 'identical'}
     },
   }
+}
+
+function toRunJobEvidence(value: unknown): RunJobEvidence | null {
+  if (isObject(value) === false) return null
+  const status = value.status
+  const conclusion = value.conclusion
+  if (typeof status !== 'string') return null
+  if (conclusion !== null && typeof conclusion !== 'string') return null
+  const rawSteps = value.steps
+  if (rawSteps !== undefined && Array.isArray(rawSteps) === false) return null
+  const steps: RunStepEvidence[] = []
+  if (Array.isArray(rawSteps)) {
+    for (const step of rawSteps) {
+      if (isObject(step) === false) return null
+      const stepStatus = step.status
+      const stepConclusion = step.conclusion
+      if (typeof stepStatus !== 'string') return null
+      if (stepConclusion !== null && typeof stepConclusion !== 'string') return null
+      steps.push({status: stepStatus, conclusion: stepConclusion})
+    }
+  }
+  return {status, conclusion, steps}
 }
 
 function toWorkflowRun(value: unknown): WorkflowRun | null {

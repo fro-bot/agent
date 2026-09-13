@@ -2,7 +2,9 @@ import {describe, expect, it} from 'vitest'
 import {
   AFFECTED_EVENTS,
   aggregatePrivate,
+  areRunJobsSuccessful,
   buildArtifact,
+  classifyGhFailure,
   collectRuntimeVerification,
   createGitHubAdapters,
   CREDENTIAL_PREFLIGHT_COMMIT,
@@ -20,10 +22,12 @@ import {
   parseActionReferences,
   parsePrivateInventory,
   parseResolvedActionSha,
+  parseWorkflowIndirections,
   PRIVATE_INVENTORY_TOTAL,
   PUBLIC_INVENTORY,
   SCHEMA_VERSION,
   serializeArtifact,
+  SETUP_STEP_NAME,
   type AncestryResult,
   type CollectInput,
   type CollectorAdapters,
@@ -31,6 +35,8 @@ import {
   type ProducerIdentity,
   type PublicDisposition,
   type RepositoryResult,
+  type RunJobEvidence,
+  type RunJobsResult,
   type RunLogsResult,
   type RunPageResult,
   type WorkflowContentResult,
@@ -87,7 +93,15 @@ function run(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
 }
 
 function resolvedLine(sha: string, ref = V0_SHA): string {
-  return `Download action repository 'fro-bot/agent@${ref}' (SHA:${sha})\n`
+  // Mirrors a genuine `gh run view --log` line: the runner emits the download record during job
+  // setup and gh attributes it to its sentinel setup step, so that step field is the anchor.
+  return `fro-bot\t${SETUP_STEP_NAME}\t2026-09-11T20:00:00.0000000Z Download action repository 'fro-bot/agent@${ref}' (SHA:${sha})\n`
+}
+
+function forgedLine(sha: string, ref = V0_SHA): string {
+  // A repository-controlled step can print this text, and `gh run view --log` prefixes EVERY line
+  // with `job\tstep\ttimestamp` — so a forged line carries a full prefix under an ordinary step name.
+  return `Fro Bot\tRun echo\t2026-09-11T20:00:00.0000000Z Download action repository 'fro-bot/agent@${ref}' (SHA:${sha})\n`
 }
 
 function workflowContent(ref = V0_SHA): string {
@@ -106,7 +120,12 @@ interface FakeAdapterConfig {
     ref: string,
   ) => WorkflowContentResult | Promise<WorkflowContentResult>
   readonly logs?: (entry: InventoryEntry, runId: number, attempt: number) => RunLogsResult | Promise<RunLogsResult>
+  readonly jobs?: (entry: InventoryEntry, runId: number, attempt: number) => RunJobsResult | Promise<RunJobsResult>
   readonly ancestry?: (sha: string) => AncestryResult | Promise<AncestryResult>
+}
+
+function successfulJob(): RunJobEvidence {
+  return {status: 'completed', conclusion: 'success', steps: [{status: 'completed', conclusion: 'success'}]}
 }
 
 const UNRELATED_WORKFLOW_PATH = '.github/workflows/unrelated.yaml'
@@ -129,6 +148,8 @@ function makeAdapters(config: FakeAdapterConfig = {}): CollectorAdapters {
       config.workflowContent?.(entry, path, ref) ?? {ok: true, content: workflowContent()},
     getRunLogs: async (entry, runId, attempt) =>
       config.logs?.(entry, runId, attempt) ?? {ok: true, text: resolvedLine(V0_SHA)},
+    getRunJobs: async (entry, runId, attempt) =>
+      config.jobs?.(entry, runId, attempt) ?? {ok: true, jobs: [successfulJob()]},
     isDescendantOfPreflight: async sha => config.ancestry?.(sha) ?? {ok: true, descendant: true},
   }
 }
@@ -234,6 +255,23 @@ describe('parsePrivateInventory', () => {
     expect(duplicateResult.ok).toBe(false)
     expect(duplicateResult.ok ? '' : duplicateResult.reason).toBe('duplicate-entry')
   })
+
+  it('rejects case-variant duplicates using case-insensitive identity semantics', () => {
+    // #given: three entries that differ only by owner/repo casing cannot contribute three
+    // terminal dispositions toward closure.
+    const [base] = privateEntries()
+    if (base === undefined) {
+      throw new Error('expected a private entry fixture')
+    }
+    const variant = {owner: base.owner.toUpperCase(), repo: base.repo.toUpperCase(), workflowPaths: base.workflowPaths}
+
+    // #when
+    const result = parsePrivateInventory(JSON.stringify([base, variant, privateEntries()[1]]))
+
+    // #then
+    expect(result.ok).toBe(false)
+    expect(result.ok ? '' : result.reason).toBe('duplicate-entry')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -294,6 +332,62 @@ describe('extractActionReferences', () => {
   })
 })
 
+describe('parseWorkflowIndirections', () => {
+  it('separates direct references from local and external indirections', () => {
+    // #given
+    const content = [
+      'jobs:',
+      '  bot:',
+      '    uses: ./.github/workflows/fro-bot.yaml',
+      '  remote:',
+      '    uses: some-org/wrappers/.github/workflows/fro-bot.yaml@v1',
+      '  build:',
+      '    steps:',
+      '      - uses: ./local-action',
+      '      - uses: fro-bot/agent@v0',
+      '',
+    ].join('\n')
+
+    // #when
+    const result = parseWorkflowIndirections(content)
+
+    // #then
+    expect(result.ok).toBe(true)
+    const value = result.ok ? result.value : undefined
+    expect(value?.directReferences).toEqual(['v0'])
+    expect(value?.localWorkflowPaths).toEqual(['.github/workflows/fro-bot.yaml'])
+    expect(value?.localActionPaths).toEqual(['local-action'])
+    expect(value?.externalJobWrappers).toEqual(['some-org/wrappers/.github/workflows/fro-bot.yaml@v1'])
+  })
+
+  it('finds direct references inside a composite action runs.steps manifest', () => {
+    // #given
+    const content = ['runs:', '  using: composite', '  steps:', '    - uses: fro-bot/agent@v0', ''].join('\n')
+
+    // #when
+    const result = parseWorkflowIndirections(content)
+
+    // #then
+    expect(result.ok ? result.value.directReferences : []).toEqual(['v0'])
+  })
+
+  it('normalizes a repository-root local reference instead of ignoring it', () => {
+    // #given
+    const content = ['jobs:', '  build:', '    steps:', '      - uses: ./', ''].join('\n')
+
+    // #when
+    const result = parseWorkflowIndirections(content)
+
+    // #then
+    expect(result.ok ? result.value.localActionPaths : []).toEqual([''])
+  })
+
+  it('fails closed on malformed YAML', () => {
+    // #given / #when / #then
+    expect(parseWorkflowIndirections('jobs:\n  build:\n    steps: [\n')).toEqual({ok: false, reason: 'malformed'})
+  })
+})
+
 describe('isQualifiableActionReference', () => {
   it('accepts v0 and full commit SHAs but rejects tags, branches, and short SHAs', () => {
     // #given / #when / #then
@@ -331,6 +425,25 @@ describe('parseResolvedActionSha', () => {
 
     // #then
     expect(result).toEqual({ok: true, sha: V0_SHA})
+  })
+
+  it('rejects a forged line whose full prefix names an ordinary step', () => {
+    // #given: a repository step echoes the phrase; gh prefixes it with that step's own name.
+    const logs = forgedLine(V0_SHA, 'v0')
+
+    // #when
+    const result = parseResolvedActionSha(logs, 'v0')
+
+    // #then
+    expect(result).toEqual({ok: false, reason: 'missing'})
+  })
+
+  it('rejects a timestamped download line attributed to a named step', () => {
+    // #given: a valid timestamp is not enough; the step field must be the runner setup sentinel.
+    const logs = `fro-bot\tBuild\t2026-09-11T20:00:00.0000000Z Download action repository 'fro-bot/agent@v0' (SHA:${V0_SHA})\n`
+
+    // #when / #then
+    expect(parseResolvedActionSha(logs, 'v0')).toEqual({ok: false, reason: 'missing'})
   })
 
   it('fails closed on a truncated line or when no line exists', () => {
@@ -373,6 +486,67 @@ describe('aggregatePrivate', () => {
 
     // #then
     expect(aggregate).toEqual({total: 3, resolved: 1, unresolved: 2, unavailable: 0})
+  })
+})
+
+describe('areRunJobsSuccessful', () => {
+  it('accepts completed success, skipped, and neutral jobs and steps', () => {
+    // #given / #when / #then
+    expect(areRunJobsSuccessful([successfulJob()])).toBe(true)
+    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'skipped', steps: []}])).toBe(true)
+    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'neutral', steps: []}])).toBe(true)
+    expect(
+      areRunJobsSuccessful([
+        {
+          status: 'completed',
+          conclusion: 'success',
+          steps: [
+            {status: 'completed', conclusion: 'success'},
+            {status: 'completed', conclusion: 'skipped'},
+            {status: 'completed', conclusion: 'neutral'},
+          ],
+        },
+      ]),
+    ).toBe(true)
+  })
+
+  it('rejects bad terminal conclusions and jobs that are not yet completed', () => {
+    // #given / #when / #then
+    expect(areRunJobsSuccessful([])).toBe(false)
+    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'failure', steps: []}])).toBe(false)
+    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'cancelled', steps: []}])).toBe(false)
+    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'timed_out', steps: []}])).toBe(false)
+    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'action_required', steps: []}])).toBe(false)
+    expect(areRunJobsSuccessful([{status: 'completed', conclusion: 'stale', steps: []}])).toBe(false)
+    expect(areRunJobsSuccessful([{status: 'in_progress', conclusion: null, steps: []}])).toBe(false)
+  })
+
+  it('requires every step of an accepted job to be acceptable', () => {
+    // #given / #when / #then
+    expect(
+      areRunJobsSuccessful([
+        {
+          status: 'completed',
+          conclusion: 'success',
+          steps: [
+            {status: 'completed', conclusion: 'success'},
+            {status: 'completed', conclusion: 'failure'},
+          ],
+        },
+      ]),
+    ).toBe(false)
+    expect(
+      areRunJobsSuccessful([
+        {
+          status: 'completed',
+          conclusion: 'success',
+          steps: [
+            {status: 'completed', conclusion: 'neutral'},
+            {status: 'in_progress', conclusion: null},
+          ],
+        },
+      ]),
+    ).toBe(false)
   })
 })
 
@@ -437,6 +611,46 @@ describe('buildArtifact and serializeArtifact', () => {
     expect(artifact.producer).toEqual(PRODUCER)
     expect(artifact.baseline.credentialPreflightCommit).toBe(PREFLIGHT_SHA)
     expect(serializeArtifact(artifact).includes('private-canary')).toBe(false)
+  })
+})
+
+describe('isSchemaV1Envelope', () => {
+  const record: PublicDisposition = {
+    repository: 'example/widget',
+    disposition: 'qualified',
+    observedAt: '2026-09-11T21:00:00Z',
+    fetchStatusClass: 'success',
+    rejectionReason: null,
+    event: 'issue_comment',
+    runId: 1001,
+    runAttempt: 1,
+    runUrl: 'https://github.com/example/widget/actions/runs/1001',
+    workflowPath: '.github/workflows/fro-bot.yaml',
+    actionRef: V0_SHA,
+    resolvedActionSha: V0_SHA,
+  }
+  const artifact = buildArtifact({
+    producer: PRODUCER,
+    baseline: {
+      minimumRelease: MINIMUM_RELEASE,
+      minimumReleasePublishedAt: MINIMUM_RELEASE_PUBLISHED_AT,
+      credentialPreflightCommit: PREFLIGHT_SHA,
+    },
+    collectorStatus: 'ready',
+    publicDispositions: [record],
+    privateAggregate: aggregatePrivate(['qualified', 'qualified', 'qualified']),
+  })
+
+  it('validates every public entry field and type, not just the container', () => {
+    // #given / #when / #then
+    expect(isSchemaV1Envelope(artifact)).toBe(true)
+    expect(isSchemaV1Envelope({...artifact, public: [{...record, runId: 'one'}]})).toBe(false)
+    expect(isSchemaV1Envelope({...artifact, public: [{repository: 'example/widget', disposition: 'qualified'}]})).toBe(
+      false,
+    )
+    expect(isSchemaV1Envelope({...artifact, public: [{...record, disposition: 'bogus'}]})).toBe(false)
+    expect(isSchemaV1Envelope({...artifact, public: [{...record, fetchStatusClass: 'not-a-class'}]})).toBe(false)
+    expect(isSchemaV1Envelope({...artifact, public: ['not-an-object']})).toBe(false)
   })
 })
 
@@ -1036,6 +1250,324 @@ describe('collectRuntimeVerification', () => {
     expect(serializeArtifact(first)).toBe(serializeArtifact(second))
   })
 
+  it('does not qualify a forged bare action-download echo on an issue_comment run', async () => {
+    // #given: a repository-controlled step echoes the phrase; gh prefixes it with an ordinary step name.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run({event: 'issue_comment'})], nextPage: null}),
+      logs: () => ({ok: true, text: forgedLine(V0_SHA)}),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('missing-action-resolution')
+  })
+
+  it('does not qualify a forged bare action-download echo on an issues run', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run({event: 'issues'})], nextPage: null}),
+      logs: () => ({ok: true, text: forgedLine(V0_SHA)}),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('missing-action-resolution')
+  })
+
+  it('does not qualify a forged bare action-download echo on a same-repository pull_request run', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run({event: 'pull_request'})], nextPage: null}),
+      logs: () => ({ok: true, text: forgedLine(V0_SHA)}),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('missing-action-resolution')
+  })
+
+  it('does not qualify a successful overall run whose Fro Bot step refused credentials', async () => {
+    // #given: a downstream continue-on-error step refuses credentials while the run concludes success.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
+      logs: () => ({ok: true, text: `${resolvedLine(V0_SHA)}\n##[error]${CREDENTIAL_REFUSAL_MARKER}\n`}),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('preflight-failed')
+    expect(record.rejectionReason).toBe('credential-preflight-refused')
+  })
+
+  it('classifies unavailable when authenticated job evidence cannot be retrieved', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      jobs: () => ({ok: false, fetchStatusClass: 'forbidden'}),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unavailable')
+    expect(record.rejectionReason).toBe('run-jobs-unavailable')
+    expect(record.fetchStatusClass).toBe('forbidden')
+  })
+
+  it('does not qualify a successful overall run whose job evidence shows a failure', async () => {
+    // #given: overall run success with a failed job (for example a continue-on-error step).
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
+      jobs: () => ({ok: true, jobs: [{status: 'completed', conclusion: 'failure', steps: []}]}),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('run-jobs-not-successful')
+  })
+
+  it('qualifies a run whose conditional step was legitimately skipped', async () => {
+    // #given: an `if:`-guarded downstream step concluded skipped, which is a normal outcome.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
+      jobs: () => ({
+        ok: true,
+        jobs: [
+          {
+            status: 'completed',
+            conclusion: 'success',
+            steps: [
+              {status: 'completed', conclusion: 'success'},
+              {status: 'completed', conclusion: 'skipped'},
+            ],
+          },
+        ],
+      }),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('qualified')
+  })
+
+  it('does not qualify when one of several jobs failed', async () => {
+    // #given: the overall run succeeded but one job recorded a failure conclusion.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run({conclusion: 'success'})], nextPage: null}),
+      jobs: () => ({
+        ok: true,
+        jobs: [
+          {status: 'completed', conclusion: 'success', steps: [{status: 'completed', conclusion: 'success'}]},
+          {status: 'completed', conclusion: 'failure', steps: [{status: 'completed', conclusion: 'failure'}]},
+        ],
+      }),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('run-jobs-not-successful')
+  })
+
+  it('does not fetch job evidence for a candidate that fails provenance first', async () => {
+    // #given: workflow content is unavailable, so provenance fails before job evidence is needed.
+    let jobsCalls = 0
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      workflowContent: () => ({ok: false, fetchStatusClass: 'forbidden'}),
+      jobs: () => {
+        jobsCalls += 1
+        return {ok: true, jobs: [successfulJob()]}
+      },
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unavailable')
+    expect(record.rejectionReason).toBe('workflow-content-unavailable')
+    expect(jobsCalls).toBe(0)
+  })
+
+  it('surfaces a log retrieval timeout as unavailable', async () => {
+    // #given
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [run()], nextPage: null}),
+      logs: () => ({ok: false, fetchStatusClass: 'timeout'}),
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unavailable')
+    expect(record.rejectionReason).toBe('run-logs-unavailable')
+    expect(record.fetchStatusClass).toBe('timeout')
+  })
+
+  it('does not classify a local composite-action consumer as workflow-removed', async () => {
+    // #given: the only Fro Bot reference lives behind a local composite action directory.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [], nextPage: null}),
+      workflowPaths: () => ['.github/workflows/ci.yaml'],
+      workflowContent: (_entry, path) => {
+        if (path === '.github/workflows/ci.yaml') {
+          return {ok: true, content: ['jobs:', '  build:', '    steps:', '      - uses: ./local-action', ''].join('\n')}
+        }
+        if (path === 'local-action/action.yml') {
+          return {
+            ok: true,
+            content: ['runs:', '  using: composite', '  steps:', '    - uses: fro-bot/agent@v0', ''].join('\n'),
+          }
+        }
+        return {ok: false, fetchStatusClass: 'not-found'}
+      },
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('no-qualifying-run')
+  })
+
+  it('does not classify a local reusable-workflow consumer as workflow-removed', async () => {
+    // #given: the only Fro Bot reference lives behind a local reusable workflow.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [], nextPage: null}),
+      workflowPaths: () => ['.github/workflows/ci.yaml'],
+      workflowContent: (_entry, path) =>
+        path === '.github/workflows/ci.yaml'
+          ? {ok: true, content: ['jobs:', '  bot:', '    uses: ./.github/workflows/fro-bot.yaml', ''].join('\n')}
+          : {ok: true, content: workflowContent('v0')},
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('no-qualifying-run')
+  })
+
+  it('does not classify workflow-removed when a readable external wrapper consumes Fro Bot', async () => {
+    // #given: a non-local reusable workflow is resolved and inspected; it invokes Fro Bot.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [], nextPage: null}),
+      workflowPaths: () => ['.github/workflows/ci.yaml'],
+      workflowContent: (entry, path) => {
+        if (entry.owner === 'some-org' && entry.repo === 'wrappers') {
+          return path === '.github/workflows/fro-bot.yaml'
+            ? {ok: true, content: workflowContent('v0')}
+            : {ok: false, fetchStatusClass: 'not-found'}
+        }
+        return {
+          ok: true,
+          content: ['jobs:', '  bot:', '    uses: some-org/wrappers/.github/workflows/fro-bot.yaml@v1', ''].join('\n'),
+        }
+      },
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unresolved')
+    expect(record.rejectionReason).toBe('no-qualifying-run')
+  })
+
+  it('classifies workflow-removed when a readable external wrapper has no Fro Bot reference', async () => {
+    // #given: the external wrapper is fully readable and free of Fro Bot references.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [], nextPage: null}),
+      workflowPaths: () => ['.github/workflows/ci.yaml'],
+      workflowContent: (entry, path) => {
+        if (entry.owner === 'some-org' && entry.repo === 'wrappers') {
+          return path === '.github/workflows/fro-bot.yaml'
+            ? {ok: true, content: ['jobs:', '  build:', '    steps:', '      - run: echo clean', ''].join('\n')}
+            : {ok: false, fetchStatusClass: 'not-found'}
+        }
+        return {
+          ok: true,
+          content: ['jobs:', '  bot:', '    uses: some-org/wrappers/.github/workflows/fro-bot.yaml@v1', ''].join('\n'),
+        }
+      },
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('no-longer-applicable')
+    expect(record.rejectionReason).toBe('workflow-removed')
+  })
+
+  it('fails closed when an external reusable-workflow wrapper cannot be resolved', async () => {
+    // #given: the external wrapper cannot be fetched, so removal cannot be proven.
+    const adapters = makeAdapters({
+      runPages: () => ({ok: true, runs: [], nextPage: null}),
+      workflowPaths: () => ['.github/workflows/ci.yaml'],
+      workflowContent: entry => {
+        if (entry.owner === 'some-org' && entry.repo === 'wrappers') {
+          return {ok: false, fetchStatusClass: 'forbidden'}
+        }
+        return {
+          ok: true,
+          content: ['jobs:', '  bot:', '    uses: some-org/wrappers/.github/workflows/fro-bot.yaml@v1', ''].join('\n'),
+        }
+      },
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('unavailable')
+    expect(record.rejectionReason).toBe('indirect-wrapper-unresolved')
+    expect(record.fetchStatusClass).toBe('forbidden')
+  })
+
+  it('continues to an older candidate when the newest candidate is unavailable', async () => {
+    // #given: the newest candidate's logs cannot be retrieved; an older candidate qualifies.
+    const adapters = makeAdapters({
+      runPages: () => ({
+        ok: true,
+        runs: [run({id: 6001, createdAt: '2026-09-11T20:30:00Z'}), run({id: 6002, createdAt: '2026-09-11T20:00:00Z'})],
+        nextPage: null,
+      }),
+      logs: (_entry, runId) =>
+        runId === 6001 ? {ok: false, fetchStatusClass: 'timeout'} : {ok: true, text: resolvedLine(V0_SHA)},
+    })
+
+    // #when
+    const record = publicRecord((await collect({adapters})).public)
+
+    // #then
+    expect(record.disposition).toBe('qualified')
+    expect(record.runId).toBe(6002)
+  })
+
   it('reports an uncertain default-branch workflow read as unavailable', async () => {
     // #given
     const adapters = makeAdapters({
@@ -1123,6 +1655,16 @@ describe('createGitHubAdapters', () => {
     // #when / #then
     expect(await timedOut.getRepository(PUBLIC_ENTRY)).toEqual({ok: false, fetchStatusClass: 'timeout'})
     expect(await malformed.getRepository(PUBLIC_ENTRY)).toEqual({ok: false, fetchStatusClass: 'malformed'})
+  })
+
+  it('classifies gh log subprocess timeouts distinctly from other failures', () => {
+    // #given / #when / #then
+    expect(classifyGhFailure({code: 'ETIMEDOUT'})).toBe('timeout')
+    expect(classifyGhFailure({signal: 'SIGKILL'})).toBe('timeout')
+    expect(classifyGhFailure({code: 'ENOBUFS'})).toBe('oversized')
+    expect(classifyGhFailure({status: 403})).toBe('forbidden')
+    expect(classifyGhFailure({status: 429})).toBe('rate-limited')
+    expect(classifyGhFailure(new Error('boom'))).toBe('error')
   })
 
   it('classifies HTTP failures without echoing response bodies', async () => {
