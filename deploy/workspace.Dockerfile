@@ -121,7 +121,7 @@ WORKDIR /app
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
 ARG OPENCODE_VERSION=1.18.30+harness.7c479429
-ARG SYSTEMATIC_VERSION=3.16.3
+ARG SYSTEMATIC_VERSION=3.18.2
 
 # System packages:
 #   git            — clone.ts runs `git clone` via execFile
