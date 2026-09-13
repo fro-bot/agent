@@ -1,13 +1,15 @@
 ---
 type: architecture
-last-updated: "2026-09-04"
-updated-by: "pr-1527"
+last-updated: "2026-09-07"
+updated-by: "schedule-d7190410-34062354146"
 sources:
   - src/main.ts
   - src/post.ts
   - src/harness/run.ts
   - src/harness/post.ts
+  - src/harness/config/state-keys.ts
   - src/services/cache/save.ts
+  - src/shared/cache-save-result.ts
   - packages/runtime/src/index.ts
   - packages/runtime/src/coordination/types.ts
   - packages/harness/src/cli.ts
@@ -132,13 +134,13 @@ The runtime package exports five module groups:
 
 ### Action Modules (`src/`)
 
-**Shared** — `logger.ts` provides JSON-structured logging with automatic credential redaction. `types.ts` defines core interfaces (`ActionInputs`, `CacheResult`, `RunContext`). `constants.ts` pins default versions for OpenCode, Bun, oMo, and Systematic.
+**Shared** — `logger.ts` provides JSON-structured logging with automatic credential redaction. `types.ts` defines core interfaces (`ActionInputs`, `CacheResult`, `RunContext`). `constants.ts` pins default versions for OpenCode, Bun, oMo, and Systematic. `cache-save-result.ts` defines the persistence-outcome contract that cleanup hands to the post-action hook and that the `cache-save-result` action output reports (see [[Session Persistence]]).
 
 **Services** — `github/` wraps Octokit and the `NormalizedEvent` system (see [[Execution Lifecycle]]). `cache/` manages GitHub Actions cache with corruption detection and S3 fallback. `setup/` orchestrates tool installation, including the new opt-in oMo installation controlled by the `enable-omo` input (see [[Setup and Configuration]]).
 
 **Features** — `agent/` bridges the runtime prompt builder with GitHub-specific context and the output-mode resolver (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic, including the PR review opt-out label handled in `skip-conditions-pr.ts` (see [[Execution Lifecycle]]). `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` (RFC-010) manages branch, commit, and PR operations via the GitHub Git Data API, and hosts the **brokered push** state machine that commits an agent's fix directly to a same-repo PR head branch on a trusted comment trigger, without ever handing the agent a credential (see [[Execution Lifecycle]] and [[Setup and Configuration]]).
 
-**Harness** — `run.ts` orchestrates the full execution lifecycle through discrete phases, including the new lock acquisition phase. `post.ts` handles the post-action cache save. `config/` parses action inputs and manages state keys.
+**Harness** — `run.ts` orchestrates the full execution lifecycle through discrete phases, including the new lock acquisition phase. `post.ts` handles the post-action cache save, gated on the persistence outcome and metadata flags that cleanup wrote to action state. `config/` parses action inputs, publishes outputs, and manages the state keys that cross the main-step/post-hook process boundary (see [[Execution Lifecycle]]).
 
 ## Design Decisions
 
