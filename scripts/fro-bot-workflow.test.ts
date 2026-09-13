@@ -723,3 +723,66 @@ describe('CI workflow: Test GitHub Action checkout', () => {
     expect(checkoutWith.ref).toBe('${' + "{ github.event.pull_request.head.sha || '' }}")
   })
 })
+
+// The #1598 runtime-verification sweep is a temporary addition to the daily maintenance prompt.
+// It grants the schedule run exactly one extra mutable issue and nothing else, so these tests pin
+// the bounds that keep it from becoming a general-purpose issue-editing licence.
+describe('fro-bot workflow — #1598 runtime-verification sweep prompt', () => {
+  const schedulePrompt = (): string => {
+    const workflow = parse(readFileSync(WORKFLOW_PATH, 'utf8')) as {readonly env: Record<string, unknown>}
+    const prompt = workflow.env.SCHEDULE_PROMPT
+    if (typeof prompt !== 'string') throw new TypeError('SCHEDULE_PROMPT is missing from the workflow env')
+    return prompt
+  }
+
+  it('grants the daily run exactly one extra mutable issue and skips once it is closed', () => {
+    // #given the daily maintenance prompt
+    const prompt = schedulePrompt()
+
+    // #then the single-issue rule survives, widened only by the named exception
+    expect(prompt).toContain('Apart from the #1598 exception below, this run must update')
+    expect(prompt).toContain('ONE issue only')
+    expect(prompt).toContain('it is the one additional issue this run may update')
+    expect(prompt).toContain('Skip this section entirely when #1598 is closed')
+  })
+
+  it('treats an unverified repository as unverified, never as migrated or removed', () => {
+    // #given the sweep instructions
+    const prompt = schedulePrompt()
+
+    // #then absence of evidence is never promoted into a conclusion
+    expect(prompt).toContain('Record a repository as verified only on a run you actually observed')
+    expect(prompt).toContain('none of them is')
+    expect(prompt).toContain('evidence of removal or of migration')
+    expect(prompt).toContain('data unavailable')
+  })
+
+  it('never guesses at the private repositories it cannot see', () => {
+    // #given the sweep instructions
+    const prompt = schedulePrompt()
+
+    // #then the private count is maintainer-owned
+    expect(prompt).toContain('not visible to this run')
+    expect(prompt).toContain('never guess at it; only a maintainer updates it')
+  })
+
+  it('confines edits to the Runtime verification section and forbids demotion', () => {
+    // #given the sweep instructions
+    const prompt = schedulePrompt()
+
+    // #then the rest of the issue body is off limits and progress is monotonic
+    expect(prompt).toContain('Update only the "Runtime verification" section')
+    expect(prompt).toContain('Never edit any other part of the issue body')
+    expect(prompt).toContain('never uncheck an existing')
+    expect(prompt).toContain('leave #1598 unchanged')
+  })
+
+  it('closes the tracker only on a complete sweep', () => {
+    // #given the sweep instructions
+    const prompt = schedulePrompt()
+
+    // #then closure needs all 27 and is ordered after the final write
+    expect(prompt).toContain('only when all 27 active repositories are recorded as verified')
+    expect(prompt).toContain('Write the final count first, then close it with no comment')
+  })
+})

@@ -117,7 +117,39 @@ env:
     - Notes (use "data unavailable" for any inaccessible data source)
 
     Do NOT comment on or modify individual issues/PRs. Do NOT apply labels.
-    Do NOT open PRs. This run must update ONE issue only.
+    Do NOT open PRs. Apart from the #1598 exception below, this run must update
+    ONE issue only.
+
+    == RUNTIME VERIFICATION SWEEP (fro-bot/agent#1598) ==
+    While #1598 is open, it is the one additional issue this run may update.
+    Skip this section entirely when #1598 is closed.
+
+    #1598 tracks downstream repositories migrating onto the credential preflight
+    from #1597, released in v0.111.0. Its "Runtime verification" section counts
+    how many of the 27 active repositories have been observed running a release
+    that contains the fix.
+
+    For each unverified public repository listed in the issue body, look for a
+    completed successful `fro-bot/agent` run on `pull_request`, `issue_comment`,
+    or `issues` whose action reference resolves at or after v0.111.0:
+      gh run list --repo <owner>/<repo> --workflow <workflow> --json databaseId,event,conclusion,headSha,updatedAt
+    Record a repository as verified only on a run you actually observed. A
+    repository you cannot read, one with no qualifying run yet, and one whose
+    runs all predate v0.111.0 are all simply unverified — none of them is
+    evidence of removal or of migration. Report unreadable repositories as "data
+    unavailable" rather than guessing.
+
+    The 3 private repositories are not visible to this run. Leave their count as
+    recorded in the issue and never guess at it; only a maintainer updates it.
+
+    Update only the "Runtime verification" section: refresh the verified count and
+    note newly verified repositories with a link to the run that verified them.
+    Never edit any other part of the issue body, and never uncheck an existing
+    entry. If nothing newly verified, leave #1598 unchanged and report the current
+    count in the daily report instead.
+
+    Close #1598 only when all 27 active repositories are recorded as verified.
+    Write the final count first, then close it with no comment.
 
   WIKI_PROMPT: |
     You are maintaining a project wiki as an Obsidian vault in `docs/wiki/`.
