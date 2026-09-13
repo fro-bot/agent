@@ -53,7 +53,7 @@ fro-bot/agent/
 ├── deploy/                     # Docker Compose stack, Dockerfiles, mitmproxy egress topology
 │   └── scripts/                # Plain Node ESM (.mjs) deploy helpers; node --test runner
 │
-├── scripts/                    # Repo-level build scripts (build-action-dist, unicode checks, release)
+├── scripts/                    # Repo-level build/release tooling plus temporary DMR runtime verification
 │   └── release/                # Release dispatch scripts
 │
 ├── .github/
@@ -96,7 +96,7 @@ fro-bot/agent/
 - **`packages/runtime/`** — Shared runtime primitives consumed by both `src/` and `packages/gateway/`; owns the authoritative version-pin constants.
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
 - **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations; uses `node --test`, not Vitest.
-- **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch.
+- **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch, and the temporary `collect-dmr-runtime-verification.ts` collector, which gathers bounded runtime-verification observations for the trusted daily maintenance path (terminal resolution is recorded separately in `.github/dmr-runtime-verification-dispositions.yaml`).
 - **`evals/`** — Gated agent-outcome eval corpus that runs the real execution path against disposable fixture repos; the pure gate and baseline tests run in normal CI, while live scenarios require `FRO_BOT_EVAL=1`.
 - **`.github/workflows/`** — All CI/CD automation; 12 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.
@@ -125,7 +125,7 @@ fro-bot/agent/
 | `ci.yaml` | `merge_group`, `pull_request`, `push`, `workflow_dispatch` | Main CI: test, lint, type-check, build, dist diff |
 | `codeql-analysis.yaml` | `push`, `pull_request`, `schedule`, `workflow_dispatch` | CodeQL security scanning |
 | `copilot-setup-steps.yaml` | `push`, `pull_request`, `workflow_dispatch` | Copilot environment setup steps |
-| `fro-bot.yaml` | `issue_comment`, `issues`, `schedule`, `workflow_dispatch` | Fro Bot agent invocation (the Action under development) |
+| `fro-bot.yaml` | `issue_comment`, `issues`, `schedule`, `workflow_dispatch` | Fro Bot agent invocation; daily maintenance also includes the temporary trusted runtime-verification collection path on the exact `30 15 * * *` schedule when enabled |
 | `harness-integrate.yaml` | `workflow_call` | LLM-merge integration of OpenCode refs into the harness build; called by `harness-release.yaml` |
 | `harness-release.yaml` | `push (harness-v* tags), workflow_dispatch` | Build matrix and publish for `@fro.bot/harness` |
 | `osv-scanner.yaml` | `merge_group`, `pull_request`, `push`, `schedule` | PR-differential vulnerability enforcement plus report-only full scans for merge queue/main/scheduled runs |

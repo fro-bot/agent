@@ -74,6 +74,12 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `buildOperatorApp` | Function | `packages/gateway/src/web/server.ts` | Operator Hono app factory |
 | `createWorkflowDispatcher` | Function | `packages/gateway/src/github/dispatch.ts` | `/fro-bot dispatch` GitHub Actions workflow-dispatch adapter (fire-and-forget; no queue, concurrency, or local run-state) |
 
+### Repo-level scripts
+
+| Symbol | Type | Location | Role |
+| --- | --- | --- | --- |
+| `collectRuntimeVerification` | Function | `scripts/collect-dmr-runtime-verification.ts` | Collects sanitized runtime-verification evidence for the temporary daily DMR sweep |
+
 ## Invariants
 
 These are CI-enforced constraints. Violating any of them breaks the build or the system contract.
@@ -155,6 +161,24 @@ post.ts (separate Action step)
 ```
 
 > See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md)
+
+### Daily runtime-verification collection (temporary)
+
+The daily DMR schedule has a temporary `collect-dmr-runtime-verification` job. It can run only for the exact `30 15 * * *` cron when `DMR_RUNTIME_VERIFICATION_ENABLED` is `true`. The job reads the fixed 24-entry public inventory and an aggregate-only three-entry private inventory, injecting `FRO_BOT_PAT` and the private-inventory secret only into the collection step, then uploads a sanitized artifact with one-day retention. The existing `fro-bot` job depends on the collector but remains fail-soft through `always()` and `!cancelled()`; existing non-DMR triggers and PAT routes are unchanged.
+
+GitHub Actions exposes no forge-resistant way to prove an action executed in a downstream workflow run, so the collector is observation-only and type-level incapable of concluding an entry is finally resolved. Two earlier designs were deleted as unfixable: log-scraping provenance (`gh run view --log` keys on author-controlled step names, and a runner downloads an action during job setup before evaluating step-level `if`, so a skipped step still produces download evidence) and recursive traversal of external `uses:` targets (public workflow content could steer a private-capable PAT to arbitrary repositories).
+
+```
+exact daily schedule + enablement variable
+  └─→ collect-dmr-runtime-verification
+        └─→ .context/dmr-runtime-verification/runtime-verification-evidence.json
+              └─→ fro-bot daily maintenance prompt
+                    └─→ .github/dmr-runtime-verification-dispositions.yaml (operator-authored, closure gate)
+```
+
+The DMR prompt consumes that evidence file as untrusted data. On material progress it may change only the managed marker block in issue #1598 and never receives private identity; every reported state is non-terminal by construction, and no combination of collector evidence proves a repository migrated or that a workflow reference was removed. Terminal resolution is recorded only by a human operator in `.github/dmr-runtime-verification-dispositions.yaml`, changed solely through a reviewed pull request under branch protection. #1598 closes only when that file shows all 24 public entries dispositioned and all 3 private entries counted as dispositioned.
+
+After #1598 is closed, the tracker gate skips the secret-bearing collection step and the DMR emits a cleanup reminder. Removing the enablement variable, dedicated secret, and temporary collector/protocol is separate approved cleanup work.
 
 ### 2. Gateway Mention-Loop
 

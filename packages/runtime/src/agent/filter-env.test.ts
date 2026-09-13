@@ -43,6 +43,22 @@ describe('filterAgentEnv', () => {
     expect(result).toEqual({GITHUB_REPOSITORY: 'fro-bot/agent'})
   })
 
+  it('retains the trusted rerun attempt while dropping nearby GitHub variables', () => {
+    // #given the trusted non-secret rerun attempt and nearby sensitive/unrecognized variables
+    const env = {
+      GITHUB_RUN_ATTEMPT: '2',
+      GITHUB_RUN_ATTEMPT_TOKEN: 'ghs_secret',
+      GITHUB_RUN_ATTEMPT_NOTE: 'unrecognized',
+      GITHUB_UNRECOGNIZED: 'unrecognized',
+    }
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then only the exact trusted attempt variable survives
+    expect(result).toEqual({GITHUB_RUN_ATTEMPT: '2'})
+  })
+
   it('drops arbitrary secret-shaped vars', () => {
     // #given
     const env = {
