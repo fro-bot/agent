@@ -343,7 +343,7 @@ async function readBoundedText(response: Response): Promise<string> {
 }
 
 /** Live GithubClient backed by the GitHub REST API, authenticated with a bearer token. */
-export function createGithubClient(token: string): GithubClient {
+export function createGithubClient(token: string, fetchImpl: typeof fetch = fetch): GithubClient {
   const headers = {
     Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
@@ -353,7 +353,7 @@ export function createGithubClient(token: string): GithubClient {
   async function fetchOk(url: string): Promise<Response> {
     let response: Response
     try {
-      response = await fetch(url, {headers, signal: AbortSignal.timeout(15_000)})
+      response = await fetchImpl(url, {headers, signal: AbortSignal.timeout(15_000)})
     } catch {
       throw new Error('network-error')
     }
@@ -415,9 +415,9 @@ export function createGithubClient(token: string): GithubClient {
       return issueBody
     },
     async resolveRef(ref) {
-      const body = await getJson(`https://api.github.com/repos/fro-bot/agent/commits/${ref}`)
+      const body = await getJson(`https://api.github.com/repos/fro-bot/agent/commits/${encodeURIComponent(ref)}`)
       const sha = (body as {sha?: unknown} | null)?.sha
-      if (typeof sha !== 'string') {
+      if (typeof sha !== 'string' || !SHA_RE.test(sha)) {
         throw new TypeError('malformed-commit-response')
       }
       return sha

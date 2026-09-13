@@ -1,5 +1,6 @@
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {
+  createGithubClient,
   parseRepositoriesFromIssueBody,
   PREFLIGHT_COMMIT,
   runSweep,
@@ -353,5 +354,63 @@ describe('runSweep', () => {
 
     // #when / #then an empty roster means the parser broke, not that the sweep found nothing
     await expect(runSweep(client, () => new Date('2026-01-01T00:00:00Z'))).rejects.toThrow(/empty/)
+  })
+})
+
+/** Builds a minimal fetch-compatible Response for the fake fetch used in createGithubClient tests. */
+function fakeJsonResponse(body: unknown): Response {
+  return {
+    ok: true,
+    status: 200,
+    headers: {get: () => null},
+    text: async () => JSON.stringify(body),
+  } as unknown as Response
+}
+
+describe('createGithubClient', () => {
+  it('percent-encodes a path-traversal ref so the request cannot leave the commits endpoint', async () => {
+    // #given a downstream `uses:` ref smuggling path-traversal segments
+    const maliciousRef = '../../../../orgs/some-private-org/repos'
+    const capturedUrls: string[] = []
+    const fakeFetch: typeof fetch = async (input): Promise<Response> => {
+      capturedUrls.push(String(input))
+      return fakeJsonResponse({sha: 'a'.repeat(40)})
+    }
+    const client = createGithubClient('token', fakeFetch)
+
+    // #when
+    await client.resolveRef(maliciousRef)
+
+    // #then the captured request URL never escapes the fro-bot/agent commits path
+    expect(capturedUrls).toHaveLength(1)
+    const [capturedUrl] = capturedUrls as [string]
+    expect(capturedUrl.startsWith('https://api.github.com/repos/fro-bot/agent/commits/')).toBe(true)
+    expect(capturedUrl).not.toContain('/orgs/')
+    expect(capturedUrl).toContain(encodeURIComponent(maliciousRef))
+  })
+
+  it('rejects a resolved sha that does not match the 40-hex shape, keeping it out of compareCommits', async () => {
+    // #given resolveRef's upstream response returns a non-SHA string
+    const fakeFetch: typeof fetch = async (): Promise<Response> => fakeJsonResponse({sha: 'not-a-real-sha'})
+    const realClient = createGithubClient('token', fakeFetch)
+    const compareCommits = vi.fn(async () => 0)
+    const client: GithubClient = {
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => workflowYaml('v0'),
+      resolveRef: realClient.resolveRef,
+      compareCommits,
+      getIssueBody: async () => {
+        throw new Error('unexpected call: getIssueBody')
+      },
+    }
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then the malformed sha never reaches compareCommits and the repository is unavailable
+    expect(compareCommits).not.toHaveBeenCalled()
+    expect(result.status).toBe('unavailable')
+    expect(result.status).not.toBe('not-verified')
+    expect(result.status).not.toBe('verified')
   })
 })
