@@ -208,7 +208,7 @@ describe('runBuildOrchestration — notice write failure on success', () => {
 })
 
 describe('formatBundleFailureOutput', () => {
-  it('surfaces stdout diagnostics (tsc writes errors to stdout, not stderr)', () => {
+  it('surfaces stdout diagnostics with command context (tsc writes errors to stdout, not stderr)', () => {
     // #given a child failure whose diagnostics landed on stdout with empty stderr
     const error = new Error('Command failed: bunx tsc --noEmit -p tsconfig.json')
     const stdout = 'tsdown.config.ts(60,5): error TS2769: No overload matches this call.\n'
@@ -217,9 +217,14 @@ describe('formatBundleFailureOutput', () => {
     // #when formatting the failure output
     const output = formatBundleFailureOutput(error, stdout, stderr)
 
-    // #then the stdout diagnostics are surfaced, not swallowed behind a bare spawn-failed message
-    expect(output).toContain('TS2769')
-    expect(output).not.toContain('bundle spawn failed')
+    // #then the stdout diagnostics are surfaced with the failing command identified,
+    // not swallowed behind the bare (no-diagnostics) spawn-failed message
+    expect(output).toBe(
+      '[build-action-dist] bundle command failed: Command failed: bunx tsc --noEmit -p tsconfig.json\n' +
+        '[build-action-dist] bundle stdout:\n' +
+        'tsdown.config.ts(60,5): error TS2769: No overload matches this call.\n',
+    )
+    expect(output).not.toContain('bundle spawn failed:')
   })
 
   it('reports a bare spawn-failed message when both streams are empty', () => {
@@ -233,7 +238,7 @@ describe('formatBundleFailureOutput', () => {
     expect(output).toBe('[build-action-dist] bundle spawn failed: ENOENT: spawn bunx\n')
   })
 
-  it('surfaces both streams, clearly labelled, when both have content', () => {
+  it('surfaces both streams, clearly labelled, in stderr-then-stdout order, when both have content', () => {
     // #given both stdout and stderr are non-empty
     const error = new Error('Command failed')
     const stdout = 'stdout diagnostic\n'
@@ -242,20 +247,46 @@ describe('formatBundleFailureOutput', () => {
     // #when formatting the failure output
     const output = formatBundleFailureOutput(error, stdout, stderr)
 
-    // #then both are present and distinguishable
-    expect(output).toContain('stdout diagnostic')
-    expect(output).toContain('stderr diagnostic')
+    // #then the command context is prefixed, and stderr is fully rendered before stdout
+    expect(output).toBe(
+      '[build-action-dist] bundle command failed: Command failed\n' +
+        '[build-action-dist] bundle stderr:\n' +
+        'stderr diagnostic\n' +
+        '[build-action-dist] bundle stdout:\n' +
+        'stdout diagnostic\n',
+    )
   })
 
-  it('preserves raw stderr output when only stderr has content', () => {
-    // #given only stderr is populated (existing behaviour)
+  it('never glues a label onto an unterminated stream (no trailing newline on either stream)', () => {
+    // #given neither stream ends in a newline — the direct regression case for a child
+    // whose output was truncated (e.g. by maxBuffer) without a final line break
+    const error = new Error('Command failed')
+    const stdout = 'a'
+    const stderr = 'b'
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, stdout, stderr)
+
+    // #then each stream is newline-terminated before the next label, so no label is
+    // glued onto the previous stream's last line
+    expect(output).toBe(
+      '[build-action-dist] bundle command failed: Command failed\n' +
+        '[build-action-dist] bundle stderr:\n' +
+        'b\n' +
+        '[build-action-dist] bundle stdout:\n' +
+        'a\n',
+    )
+  })
+
+  it('prefixes stderr-only output with command context', () => {
+    // #given only stderr is populated
     const error = new Error('Command failed')
     const stderr = 'raw stderr content\n'
 
     // #when formatting the failure output
     const output = formatBundleFailureOutput(error, '', stderr)
 
-    // #then stderr is passed through unchanged
-    expect(output).toBe(stderr)
+    // #then stderr is passed through, with the failing command identified ahead of it
+    expect(output).toBe('[build-action-dist] bundle command failed: Command failed\nraw stderr content\n')
   })
 })

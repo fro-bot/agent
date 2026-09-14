@@ -302,3 +302,88 @@ describe('ARCHITECTURE.md documented version pins match packages/runtime/src/sha
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// .github/renovate.json5 — ARCHITECTURE.md customManager actually matches
+//
+// The customManager that tracks the Systematic version documented in
+// ARCHITECTURE.md (matchStrings anchored on "Pinned Systematic version
+// (`X.Y.Z`)") is only useful if its regex actually matches the Role-cell
+// wording currently in the file. extractDocumentedVersion above anchors on
+// the row's *first* cell (the constant name), not this phrasing — so if
+// someone rewords the Role cell, extractDocumentedVersion keeps passing while
+// the customManager silently stops matching, and the next Systematic bump
+// goes red again with nothing pointing at the cause. This extracts the
+// *live* matchStrings pattern from renovateText (not a hardcoded copy, which
+// could drift from the config independently) and proves it actually matches
+// the real architectureText, capturing the same value the exported constant
+// has.
+//
+// The block is found by anchoring on the managerFilePatterns entry naming
+// ARCHITECTURE.md, not a bare substring search for "ARCHITECTURE.md" — that
+// substring also appears in this very block's own explanatory comment (and in
+// this file's comment above), so a looser anchor risks the same
+// comment-vs-code confusion the renovate allowedVersions extractor above
+// warns about. customManagers entries are flat objects (arrays use [] not
+// {}), so `[^{}]*` cannot cross into a neighboring block.
+// extractArchitectureManagerBlock throws unless exactly one such block
+// exists, rather than silently picking one.
+// ---------------------------------------------------------------------------
+
+function extractArchitectureManagerBlock(text: string): string {
+  const blockPattern = /\{[^{}]*managerFilePatterns:\s*\[[^\]]*ARCHITECTURE[^\]]*\.md[^\]]*\][^{}]*\}/g
+  const matches = [...text.matchAll(blockPattern)]
+
+  if (matches.length !== 1) {
+    throw new Error(
+      `.github/renovate.json5: expected exactly one customManager block with a managerFilePatterns entry for ARCHITECTURE.md, found ${matches.length}`,
+    )
+  }
+
+  // matches.length === 1 above guarantees matches[0] exists; the `?.` here is
+  // only to satisfy noUncheckedIndexedAccess, not a real fallibility branch.
+  return matches[0]?.[0] ?? ''
+}
+
+function extractArchitectureMatchStringsPattern(blockText: string): RegExp {
+  const matchStringsMatch = /matchStrings:\s*\[\s*'([^']*)'\s*\]/.exec(blockText)
+
+  if (matchStringsMatch?.[1] === undefined) {
+    throw new Error(
+      '.github/renovate.json5: ARCHITECTURE.md customManager block has no single-entry matchStrings array',
+    )
+  }
+
+  // The pattern lives in a JSON5 single-quoted string, where `\\` (two
+  // backslash characters in the file) is the escape for one literal
+  // backslash. Un-escaping that here — rather than hardcoding the already-
+  // unescaped pattern as a copy — is what keeps this test bound to the real
+  // config instead of a duplicate that could drift from it independently.
+  const rawPattern = matchStringsMatch[1]
+  const unescaped = rawPattern.replaceAll('\\\\', '\\')
+
+  return new RegExp(unescaped)
+}
+
+describe('renovate ARCHITECTURE.md customManager matches the real documented value', () => {
+  it('matches architectureText exactly once and captures DEFAULT_SYSTEMATIC_VERSION', () => {
+    // #given the live matchStrings regex extracted from the ARCHITECTURE.md customManager block
+    const blockText = extractArchitectureManagerBlock(renovateText)
+    const pattern = extractArchitectureMatchStringsPattern(blockText)
+    const globalPattern = new RegExp(pattern.source, 'g')
+
+    // #when running it against the real ARCHITECTURE.md text
+    const matches = [...architectureText.matchAll(globalPattern)]
+
+    // #then it must match exactly once, and the captured value must agree with
+    // the exported constant — a reworded Role cell that breaks this match
+    // would otherwise regress silently, with only the next Systematic bump's
+    // Renovate PR failing to catch it, and nothing pointing at why
+    expect(
+      matches.length,
+      `.github/renovate.json5 ARCHITECTURE.md customManager pattern /${pattern.source}/ matched ARCHITECTURE.md ${matches.length} times, expected exactly 1`,
+    ).toBe(1)
+
+    expect(matches[0]?.groups?.currentValue).toBe(DEFAULT_SYSTEMATIC_VERSION)
+  })
+})

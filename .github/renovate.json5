@@ -98,9 +98,11 @@
     },
     {
       // ARCHITECTURE.md documents the pinned Systematic version; pin-invariants.test.ts
-      // asserts it matches DEFAULT_SYSTEMATIC_VERSION.
+      // asserts it matches DEFAULT_SYSTEMATIC_VERSION. Anchored to the repo-root file only
+      // (^...$) — there is exactly one tracked ARCHITECTURE.md, and an unanchored pattern
+      // would also match a nested packages/*/ARCHITECTURE.md if one were ever added.
       customType: 'regex',
-      managerFilePatterns: ['/ARCHITECTURE\\.md/'],
+      managerFilePatterns: ['/^ARCHITECTURE\\.md$/'],
       matchStrings: ['Pinned Systematic version \\(`(?<currentValue>\\d+\\.\\d+\\.\\d+)`\\)'],
       depNameTemplate: '@fro.bot/systematic',
       datasourceTemplate: 'npm',
