@@ -366,6 +366,30 @@ function extractArchitectureMatchStringsPattern(blockText: string): RegExp {
 }
 
 describe('renovate ARCHITECTURE.md customManager matches the real documented value', () => {
+  it('throws when two customManager blocks both target ARCHITECTURE.md', () => {
+    // #given two customManager blocks, each with a managerFilePatterns entry for ARCHITECTURE.md —
+    // the exact two-block near-miss this file's design rationale cites
+    const text = [
+      "{managerFilePatterns: ['ARCHITECTURE.md'], matchStrings: ['a']}",
+      "{managerFilePatterns: ['ARCHITECTURE.md'], matchStrings: ['b']}",
+    ].join('\n')
+
+    // #when / #then extraction must throw naming the count, not silently pick one
+    expect(() => extractArchitectureManagerBlock(text)).toThrow(
+      /expected exactly one customManager block with a managerFilePatterns entry for ARCHITECTURE\.md, found 2/,
+    )
+  })
+
+  it('throws when no customManager block targets ARCHITECTURE.md', () => {
+    // #given a customManager block that targets a different file entirely
+    const text = "{managerFilePatterns: ['OTHER.md'], matchStrings: ['a']}"
+
+    // #when / #then extraction must throw naming zero found, not return an empty match
+    expect(() => extractArchitectureManagerBlock(text)).toThrow(
+      /expected exactly one customManager block with a managerFilePatterns entry for ARCHITECTURE\.md, found 0/,
+    )
+  })
+
   it('matches architectureText exactly once and captures DEFAULT_SYSTEMATIC_VERSION', () => {
     // #given the live matchStrings regex extracted from the ARCHITECTURE.md customManager block
     const blockText = extractArchitectureManagerBlock(renovateText)

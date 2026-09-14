@@ -147,8 +147,8 @@ const BUNDLE_MAX_BUFFER_BYTES = 10 * 1024 * 1024
 
 // Factored out of the catch block so the non-numeric `error.code` case is an explicit,
 // commented branch rather than falling through a ternary's `else` and silently
-// collapsing to 1 the same way a plain tool failure would.
-function deriveBundleExitCode(error: unknown): number {
+// collapsing to 1 the same way a plain tool failure would. Exported for unit testing.
+export function deriveBundleExitCode(error: unknown): number {
   const code = error != null && typeof error === 'object' && 'code' in error ? error.code : undefined
   if (typeof code === 'number') {
     return code

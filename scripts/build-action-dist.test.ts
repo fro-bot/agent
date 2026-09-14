@@ -1,5 +1,5 @@
 import {describe, expect, it, vi} from 'vitest'
-import {formatBundleFailureOutput, runBuildOrchestration} from './build-action-dist.js'
+import {deriveBundleExitCode, formatBundleFailureOutput, runBuildOrchestration} from './build-action-dist.js'
 
 // The orchestration function takes injectable step callbacks so we can test
 // the ordering/exit-code contract without spawning real processes.
@@ -288,5 +288,51 @@ describe('formatBundleFailureOutput', () => {
 
     // #then stderr is passed through, with the failing command identified ahead of it
     expect(output).toBe('[build-action-dist] bundle command failed: Command failed\nraw stderr content\n')
+  })
+})
+
+describe('deriveBundleExitCode', () => {
+  it('returns the numeric error.code as-is', () => {
+    // #given an error carrying a numeric exit code
+    const error = {code: 2}
+
+    // #when deriving the bundle exit code
+    const exitCode = deriveBundleExitCode(error)
+
+    // #then the numeric code is returned unchanged
+    expect(exitCode).toBe(2)
+  })
+
+  it('falls back to 1 when error.code is the maxBuffer overflow string', () => {
+    // #given execFile's maxBuffer overflow error, whose code is a string, not a number
+    const error = {code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'}
+
+    // #when deriving the bundle exit code
+    const exitCode = deriveBundleExitCode(error)
+
+    // #then there is no numeric exit code to report, so this falls back to 1
+    expect(exitCode).toBe(1)
+  })
+
+  it('falls back to 1 when error.code is missing', () => {
+    // #given an error object with no code property
+    const error = new Error('Command failed')
+
+    // #when deriving the bundle exit code
+    const exitCode = deriveBundleExitCode(error)
+
+    // #then this falls back to 1
+    expect(exitCode).toBe(1)
+  })
+
+  it('falls back to 1 for a non-object thrown value', () => {
+    // #given a thrown value that is not an object at all
+    const error = 'a plain string was thrown'
+
+    // #when deriving the bundle exit code
+    const exitCode = deriveBundleExitCode(error)
+
+    // #then this falls back to 1
+    expect(exitCode).toBe(1)
   })
 })
