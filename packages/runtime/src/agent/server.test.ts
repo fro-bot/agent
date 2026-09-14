@@ -204,6 +204,29 @@ describe('bootstrapOpenCodeServer', () => {
     expect(capturedFilewatcherFlag).toBe('false')
   })
 
+  it('treats an empty-string OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER as unset and applies the default', async () => {
+    // #given an empty string, matching how GitHub Actions materializes an unset `env:` input
+    process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER = ''
+    const logger = createMockLogger()
+    let capturedFilewatcherFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedFilewatcherFlag = process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedFilewatcherFlag).toBe('true')
+  })
+
   it('fails the bootstrap when the actual server URL differs from the pinned port', async () => {
     // #given
     const logger = createMockLogger()

@@ -269,10 +269,16 @@ export async function bootstrapOpenCodeServer(
     // FRO_BOT_OPENCODE_URL above. Nothing in this project consumes file-change
     // events -- the stream handler and gateway both read message/tool lifecycle
     // events only -- so the watcher is pure overhead here. Only default it when
-    // absent: an operator who explicitly set it (including to `false`) already
-    // made that call and wins. OPENCODE_ is allowlisted by filterAgentEnv, so it
-    // survives the scrub below without a change to that file.
-    if (process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER === undefined) {
+    // unset: an operator who explicitly set it (including to `false`) already
+    // made that call and wins. Treat an empty string as unset too -- GitHub
+    // Actions materializes an unset `env:` input as `''`, not as an absent key,
+    // and OpenCode's boolean config does not read `''` as true, so leaving it in
+    // place would silently keep the watcher on. OPENCODE_ is allowlisted by
+    // filterAgentEnv, so it survives the scrub below without a change to that file.
+    if (
+      process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER === undefined ||
+      process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER === ''
+    ) {
       process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER = 'true'
     }
     const spawnOptions = {signal, hostname: '127.0.0.1', port, timeout: timeoutMs}

@@ -409,7 +409,7 @@ The version is pinned in `deploy/workspace.Dockerfile` as `ARG OPENCODE_VERSION=
 
 Outbound TLS from the workspace flows through `mitmproxy`. The container entrypoint installs the mitmproxy CA into the **system** trust store via `update-ca-certificates` before launching — `git` and the OpenCode binary read the system bundle, not `NODE_EXTRA_CA_CERTS`, so this step is required for cloning and model calls to succeed through the proxy. Set `OBJECT_STORE_HOSTS` and any provider hosts your deployment uses (see [Egress Allowlist](#egress-allowlist)).
 
-The image bakes `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true` — nothing in the workspace consumes file-change events, so the watcher is disabled by default (override it via `deploy/compose.yaml` if you need it). The one consequence: OpenCode's cached VCS branch can go stale after a checkout, since that cache refreshes from watcher events.
+The image bakes `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true` — nothing in the workspace consumes file-change events, so the watcher is disabled by default (override it via `deploy/.env` or `deploy/compose.yaml` if you need it). The one consequence: OpenCode's cached VCS branch can go stale after a checkout, since that cache refreshes from watcher events.
 
 #### Model and provider configuration
 
