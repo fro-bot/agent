@@ -107,6 +107,22 @@ export async function runBuildOrchestration(steps: OrchestratorSteps): Promise<n
   return 0
 }
 
+/**
+ * Pure formatter for a failed bundle spawn's captured output. `tsc` writes its
+ * diagnostics to stdout, not stderr, so both streams must be inspected — a
+ * type error otherwise produces an empty stderr and the underlying failure is
+ * silently discarded. Exported for unit testing.
+ */
+export function formatBundleFailureOutput(error: unknown, stdout: string, stderr: string): string {
+  if (stdout === '' && stderr === '') {
+    return `[build-action-dist] bundle spawn failed: ${error instanceof Error ? error.message : String(error)}\n`
+  }
+  if (stdout !== '' && stderr !== '') {
+    return `[build-action-dist] bundle stderr:\n${stderr}[build-action-dist] bundle stdout:\n${stdout}`
+  }
+  return stdout === '' ? stderr : `[build-action-dist] bundle stdout:\n${stdout}`
+}
+
 async function runBundle(): Promise<StepResult> {
   try {
     // Mirror apps/action/package.json build: tsc --noEmit then tsdown.
@@ -127,13 +143,11 @@ async function runBundle(): Promise<StepResult> {
       error != null && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string'
         ? error.stderr
         : ''
-    if (stderr === '') {
-      process.stderr.write(
-        `[build-action-dist] bundle spawn failed: ${error instanceof Error ? error.message : String(error)}\n`,
-      )
-    } else {
-      process.stderr.write(stderr)
-    }
+    const stdout =
+      error != null && typeof error === 'object' && 'stdout' in error && typeof error.stdout === 'string'
+        ? error.stdout
+        : ''
+    process.stderr.write(formatBundleFailureOutput(error, stdout, stderr))
     return {exitCode}
   }
 }

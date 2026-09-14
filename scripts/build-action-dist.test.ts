@@ -1,5 +1,5 @@
 import {describe, expect, it, vi} from 'vitest'
-import {runBuildOrchestration} from './build-action-dist.js'
+import {formatBundleFailureOutput, runBuildOrchestration} from './build-action-dist.js'
 
 // The orchestration function takes injectable step callbacks so we can test
 // the ordering/exit-code contract without spawning real processes.
@@ -204,5 +204,58 @@ describe('runBuildOrchestration — notice write failure on success', () => {
 
     // #then exit code is 1 (notice write failure path returns 1)
     expect(exitCode).toBe(1)
+  })
+})
+
+describe('formatBundleFailureOutput', () => {
+  it('surfaces stdout diagnostics (tsc writes errors to stdout, not stderr)', () => {
+    // #given a child failure whose diagnostics landed on stdout with empty stderr
+    const error = new Error('Command failed: bunx tsc --noEmit -p tsconfig.json')
+    const stdout = 'tsdown.config.ts(60,5): error TS2769: No overload matches this call.\n'
+    const stderr = ''
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, stdout, stderr)
+
+    // #then the stdout diagnostics are surfaced, not swallowed behind a bare spawn-failed message
+    expect(output).toContain('TS2769')
+    expect(output).not.toContain('bundle spawn failed')
+  })
+
+  it('reports a bare spawn-failed message when both streams are empty', () => {
+    // #given a spawn error with no captured stdout/stderr
+    const error = new Error('ENOENT: spawn bunx')
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, '', '')
+
+    // #then the existing bare message is preserved
+    expect(output).toBe('[build-action-dist] bundle spawn failed: ENOENT: spawn bunx\n')
+  })
+
+  it('surfaces both streams, clearly labelled, when both have content', () => {
+    // #given both stdout and stderr are non-empty
+    const error = new Error('Command failed')
+    const stdout = 'stdout diagnostic\n'
+    const stderr = 'stderr diagnostic\n'
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, stdout, stderr)
+
+    // #then both are present and distinguishable
+    expect(output).toContain('stdout diagnostic')
+    expect(output).toContain('stderr diagnostic')
+  })
+
+  it('preserves raw stderr output when only stderr has content', () => {
+    // #given only stderr is populated (existing behaviour)
+    const error = new Error('Command failed')
+    const stderr = 'raw stderr content\n'
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, '', stderr)
+
+    // #then stderr is passed through unchanged
+    expect(output).toBe(stderr)
   })
 })

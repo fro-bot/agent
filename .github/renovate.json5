@@ -97,6 +97,15 @@
       datasourceTemplate: 'npm',
     },
     {
+      // ARCHITECTURE.md documents the pinned Systematic version; pin-invariants.test.ts
+      // asserts it matches DEFAULT_SYSTEMATIC_VERSION.
+      customType: 'regex',
+      managerFilePatterns: ['/ARCHITECTURE\\.md/'],
+      matchStrings: ['Pinned Systematic version \\(`(?<currentValue>\\d+\\.\\d+\\.\\d+)`\\)'],
+      depNameTemplate: '@fro.bot/systematic',
+      datasourceTemplate: 'npm',
+    },
+    {
       // Tracks the Bun version ARG in deploy/gateway.Dockerfile.
       // Keep in lockstep with the oven-sh/bun allowedVersions cap.
       customType: 'regex',
