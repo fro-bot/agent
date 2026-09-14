@@ -1,6 +1,7 @@
 ---
 date: 2026-09-13
 topic: opencode-background-subagents
+status: draft
 ---
 
 # OpenCode Background Subagents and File Watcher
@@ -62,7 +63,7 @@ Separately, the OpenCode file watcher runs in both surfaces and nothing in this 
 
 **File watcher**
 
-- R1. Disable the OpenCode file watcher in both the Action's OpenCode child and the workspace container.
+- R1. Disable the OpenCode file watcher in both the Action's OpenCode child and the workspace container, by setting `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true` in the environment the OpenCode process reads. There is no config-file equivalent; the environment variable is the only lever.
 - R2. Ship the file watcher change independently of background subagents, with no shared machinery.
 
 **Ownership and visibility**
@@ -94,10 +95,11 @@ Separately, the OpenCode file watcher runs in both surfaces and nothing in this 
 - R17. Each invocation has a single deadline covering execution and drain, reserving time for cancellation and teardown, and it is not extended by a completion notification, retry, or extension.
 - R18. On deadline expiry the harness stops admission, cancels owned work with a teardown signal separate from the expired execution signal, settles approvals, and reports once.
 - R19. Cancellation counts as confirmed for an owned entry only on an observable terminal signal: an injected completion or error turn, a cancellation the server acknowledged, or confirmed termination of the server process itself. Absent one of those, the entry is unknown.
-- R19a. Unfinished child work is non-fatal only for entries whose cancellation is confirmed; an unknown entry, an unconfirmed live writer, or a lost lock lease is not reported as success.
+- R19a. Unfinished child work is non-fatal only for entries whose cancellation is confirmed; an unknown entry, an unconfirmed live writer, or a lease lost while held is not reported as success.
 - R20. The harness owns publication: exactly one response is published after drain, and a background subagent never publishes an invocation response.
 - R21. The harness declines cache persistence when it cannot confirm that writers have terminated.
-- R22. The Action renews its coordination lock lease for the whole protected interval, covering execution, drain, and persistence, and fails closed when a renewal does not succeed.
+- R22. When the Action holds a coordination lock, it renews the lease for the whole protected interval, covering execution, drain, and persistence, and fails closed when a renewal does not succeed.
+- R22a. The lease clauses in R22 and R19a apply only when a lock was acquired. An Action that proceeds without one — S3 unconfigured, or acquisition failed — keeps its current fail-open behaviour: background dispatch is still permitted and the run does not fail for want of a lease. R21 governs cache persistence in that case exactly as it does otherwise, because confirming that writers terminated does not depend on holding a lock.
 
 **Reporting and recovery**
 
@@ -109,15 +111,18 @@ Separately, the OpenCode file watcher runs in both surfaces and nothing in this 
 ## Acceptance Examples
 
 - AE1. **Covers R4, R6, R16.** Given a run whose agent dispatched a background subagent, when the parent session reports idle while that subagent is still running, the harness continues waiting rather than returning from execution.
-- AE2. **Covers R6, R13.** Given a background job that was cancelled, when no completion notification is ever injected, the harness resolves the entry through its deadline rather than waiting indefinitely for a notification that cannot arrive.
+- AE2. **Covers R6, R17, R19.** Given a background job that was cancelled, when no completion notification is ever injected, the harness resolves the entry through its deadline rather than waiting indefinitely for a notification that cannot arrive.
 - AE3. **Covers R3, R13.** Given a task execution extended onto an existing job, when a single completion notification arrives for it, the harness settles that entry once and does not report a second outstanding execution.
 - AE4. **Covers R9.** Given a background subagent requesting a tool that requires approval, when the request is raised, it reaches the run's approval coordinator and posts to the originating thread.
-- AE5. **Covers R15, R17.** Given an invocation in finalization, when the agent attempts a new background dispatch, the dispatch is rejected rather than queued.
+- AE5. **Covers R14, R15.** Given an invocation in finalization, when the agent attempts a new background dispatch, the dispatch is rejected rather than queued.
 - AE6. **Covers R19, R19a, R21.** Given an expired deadline where no terminal signal was observed for an owned entry, when the run finishes, it reports that entry as unknown and declines cache persistence rather than reporting success.
 - AE7. **Covers R23.** Given a run where one dispatched execution did not finish, when the harness publishes, the response names that execution by its label rather than reporting a generic count.
 - AE8. **Covers R16a.** Given an invocation with outstanding owned work, when a terminal path other than the idle branch is reached, that path also declines to end the run.
 - AE9. **Covers R20.** Given a run where a background subagent produced a result, when the harness publishes, exactly one comment or review is delivered for the invocation.
 - AE10. **Covers R8.** Given a dropped and reconnected event stream, when the harness cannot account for work across the gap, it treats outstanding work as unknown and cancels rather than declaring the drain complete.
+- AE11. **Covers R12.** Given a background subagent that attempts to dispatch a background subagent of its own, when that dispatch is made, it is refused because depth is limited to one level.
+- AE12. **Covers R14.** Given an invocation already at its outstanding-execution cap, when the agent attempts another dispatch, the gate refuses it before any child execution starts rather than recording an overage after the fact.
+- AE13. **Covers R21, R22a.** Given a run proceeding without a coordination lock because S3 is unconfigured, when background work completes and terminates confirmably, the run persists cache normally and does not fail for want of a lease.
 
 ---
 
@@ -149,6 +154,8 @@ Separately, the OpenCode file watcher runs in both surfaces and nothing in this 
 - Bound dispatch before execution rather than observing it after: an event consumer only learns of a subagent once it is already running, so observation cannot enforce a cap.
 - Retain gateway run ownership through drain rather than restricting background subagents to read-only tools: keeping the approval gate intact preserves the fail-closed guarantee without narrowing what background work can do.
 - Treat unknown as distinct from zero: every ambiguous case resolves toward cancellation and an incomplete report rather than toward declaring success.
+- Renew the lock lease, superseding a recorded decision: `src/harness/phases/acquire-lock.ts` documents "No heartbeat in v1" and sets `heartbeatIntervalMs: 0`, justified by a 15-minute TTL covering a median two-minute Action run. Background work invalidates that premise, so the lease is renewed for the protected interval. The fail-open posture when no lock was acquired is deliberately left untouched — that is a separate decision, and R22a keeps it.
+- Keep the watcher change reversible by operators: both surfaces default the flag rather than forcing it, so an operator who sets it explicitly wins on either surface.
 
 ---
 
@@ -172,7 +179,7 @@ Separately, the OpenCode file watcher runs in both surfaces and nothing in this 
 ### Deferred to Planning
 
 - [Affects R8][Technical] How does the harness reconcile owned work after an event-stream reconnect, given that the stream offers no replay and the gap itself is not directly observable?
-- [Affects R22][Technical] Whether lease renewal reuses the gateway's existing heartbeat or needs an Action-side equivalent. The policy is decided; the mechanism is not.
+- [Affects R22][Technical] Whether lease renewal reuses the gateway's existing heartbeat (`packages/runtime/src/coordination/heartbeat.ts`) or needs an Action-side equivalent. The policy is decided, including the unlocked case in R22a; only the mechanism is open.
 - [Affects R13][Needs research] Whether two outstanding and eight total are the right caps once real reviewer fan-out is measured.
 
 ---
