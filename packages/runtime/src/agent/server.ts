@@ -265,6 +265,16 @@ export async function bootstrapOpenCodeServer(
     // is intentionally NOT reverted after bootstrap: it remains set in the
     // harness process too, which is harmless and aids debugging.
     process.env.FRO_BOT_OPENCODE_URL = pinnedUrl
+    // Set before spawn so the child captures it at spawn time, same as
+    // FRO_BOT_OPENCODE_URL above. Nothing in this project consumes file-change
+    // events -- the stream handler and gateway both read message/tool lifecycle
+    // events only -- so the watcher is pure overhead here. Only default it when
+    // absent: an operator who explicitly set it (including to `false`) already
+    // made that call and wins. OPENCODE_ is allowlisted by filterAgentEnv, so it
+    // survives the scrub below without a change to that file.
+    if (process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER === undefined) {
+      process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER = 'true'
+    }
     const spawnOptions = {signal, hostname: '127.0.0.1', port, timeout: timeoutMs}
     // Measured separately from the total: timeoutMs bounds this call alone, so comparing
     // it against time that also covers port acquisition would misreport the real margin.

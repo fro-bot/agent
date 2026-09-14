@@ -158,6 +158,52 @@ describe('bootstrapOpenCodeServer', () => {
     expect(process.env.FRO_BOT_OPENCODE_URL).toBe(serverUrl)
   })
 
+  it('sets OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true before spawn when the operator did not set it', async () => {
+    // #given
+    delete process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+    const logger = createMockLogger()
+    let capturedFilewatcherFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedFilewatcherFlag = process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedFilewatcherFlag).toBe('true')
+  })
+
+  it('does not override an operator-set OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER value', async () => {
+    // #given
+    process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER = 'false'
+    const logger = createMockLogger()
+    let capturedFilewatcherFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedFilewatcherFlag = process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedFilewatcherFlag).toBe('false')
+  })
+
   it('fails the bootstrap when the actual server URL differs from the pinned port', async () => {
     // #given
     const logger = createMockLogger()
