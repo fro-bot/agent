@@ -1,5 +1,5 @@
 import {describe, expect, it, vi} from 'vitest'
-import {runBuildOrchestration} from './build-action-dist.js'
+import {deriveBundleExitCode, formatBundleFailureOutput, runBuildOrchestration} from './build-action-dist.js'
 
 // The orchestration function takes injectable step callbacks so we can test
 // the ordering/exit-code contract without spawning real processes.
@@ -203,6 +203,136 @@ describe('runBuildOrchestration — notice write failure on success', () => {
     const exitCode = await runBuildOrchestration(steps)
 
     // #then exit code is 1 (notice write failure path returns 1)
+    expect(exitCode).toBe(1)
+  })
+})
+
+describe('formatBundleFailureOutput', () => {
+  it('surfaces stdout diagnostics with command context (tsc writes errors to stdout, not stderr)', () => {
+    // #given a child failure whose diagnostics landed on stdout with empty stderr
+    const error = new Error('Command failed: bunx tsc --noEmit -p tsconfig.json')
+    const stdout = 'tsdown.config.ts(60,5): error TS2769: No overload matches this call.\n'
+    const stderr = ''
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, stdout, stderr)
+
+    // #then the stdout diagnostics are surfaced with the failing command identified,
+    // not swallowed behind the bare (no-diagnostics) spawn-failed message
+    expect(output).toBe(
+      '[build-action-dist] bundle command failed: Command failed: bunx tsc --noEmit -p tsconfig.json\n' +
+        '[build-action-dist] bundle stdout:\n' +
+        'tsdown.config.ts(60,5): error TS2769: No overload matches this call.\n',
+    )
+    expect(output).not.toContain('bundle spawn failed:')
+  })
+
+  it('reports a bare spawn-failed message when both streams are empty', () => {
+    // #given a spawn error with no captured stdout/stderr
+    const error = new Error('ENOENT: spawn bunx')
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, '', '')
+
+    // #then the existing bare message is preserved
+    expect(output).toBe('[build-action-dist] bundle spawn failed: ENOENT: spawn bunx\n')
+  })
+
+  it('surfaces both streams, clearly labelled, in stderr-then-stdout order, when both have content', () => {
+    // #given both stdout and stderr are non-empty
+    const error = new Error('Command failed')
+    const stdout = 'stdout diagnostic\n'
+    const stderr = 'stderr diagnostic\n'
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, stdout, stderr)
+
+    // #then the command context is prefixed, and stderr is fully rendered before stdout
+    expect(output).toBe(
+      '[build-action-dist] bundle command failed: Command failed\n' +
+        '[build-action-dist] bundle stderr:\n' +
+        'stderr diagnostic\n' +
+        '[build-action-dist] bundle stdout:\n' +
+        'stdout diagnostic\n',
+    )
+  })
+
+  it('never glues a label onto an unterminated stream (no trailing newline on either stream)', () => {
+    // #given neither stream ends in a newline — the direct regression case for a child
+    // whose output was truncated (e.g. by maxBuffer) without a final line break
+    const error = new Error('Command failed')
+    const stdout = 'a'
+    const stderr = 'b'
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, stdout, stderr)
+
+    // #then each stream is newline-terminated before the next label, so no label is
+    // glued onto the previous stream's last line
+    expect(output).toBe(
+      '[build-action-dist] bundle command failed: Command failed\n' +
+        '[build-action-dist] bundle stderr:\n' +
+        'b\n' +
+        '[build-action-dist] bundle stdout:\n' +
+        'a\n',
+    )
+  })
+
+  it('prefixes stderr-only output with command context', () => {
+    // #given only stderr is populated
+    const error = new Error('Command failed')
+    const stderr = 'raw stderr content\n'
+
+    // #when formatting the failure output
+    const output = formatBundleFailureOutput(error, '', stderr)
+
+    // #then stderr is passed through, with the failing command identified ahead of it
+    expect(output).toBe('[build-action-dist] bundle command failed: Command failed\nraw stderr content\n')
+  })
+})
+
+describe('deriveBundleExitCode', () => {
+  it('returns the numeric error.code as-is', () => {
+    // #given an error carrying a numeric exit code
+    const error = {code: 2}
+
+    // #when deriving the bundle exit code
+    const exitCode = deriveBundleExitCode(error)
+
+    // #then the numeric code is returned unchanged
+    expect(exitCode).toBe(2)
+  })
+
+  it('falls back to 1 when error.code is the maxBuffer overflow string', () => {
+    // #given execFile's maxBuffer overflow error, whose code is a string, not a number
+    const error = {code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'}
+
+    // #when deriving the bundle exit code
+    const exitCode = deriveBundleExitCode(error)
+
+    // #then there is no numeric exit code to report, so this falls back to 1
+    expect(exitCode).toBe(1)
+  })
+
+  it('falls back to 1 when error.code is missing', () => {
+    // #given an error object with no code property
+    const error = new Error('Command failed')
+
+    // #when deriving the bundle exit code
+    const exitCode = deriveBundleExitCode(error)
+
+    // #then this falls back to 1
+    expect(exitCode).toBe(1)
+  })
+
+  it('falls back to 1 for a non-object thrown value', () => {
+    // #given a thrown value that is not an object at all
+    const error = 'a plain string was thrown'
+
+    // #when deriving the bundle exit code
+    const exitCode = deriveBundleExitCode(error)
+
+    // #then this falls back to 1
     expect(exitCode).toBe(1)
   })
 })

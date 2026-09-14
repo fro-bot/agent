@@ -57,7 +57,7 @@ export default defineConfig([
   {
     entry: ['apps/action/src/main.ts', 'apps/action/src/post.ts'],
     fixedExtension: false,
-    inlineOnly: false,
+    deps: {onlyBundle: false},
     minify: true,
     // Source maps roughly triple committed dist/ size and the action never reads them.
     sourcemap: false,
@@ -74,7 +74,7 @@ export default defineConfig([
     // chunks shared with main.js/post.js.
     entry: ['apps/action/src/session-tools.ts'],
     fixedExtension: false,
-    inlineOnly: false,
+    deps: {onlyBundle: false},
     minify: true,
     sourcemap: false,
     dts: false,

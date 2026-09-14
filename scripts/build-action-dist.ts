@@ -107,6 +107,62 @@ export async function runBuildOrchestration(steps: OrchestratorSteps): Promise<n
   return 0
 }
 
+// Ensures a stream's captured output ends in exactly one newline before it is
+// interpolated between labelled sections, so a label never lands glued onto an
+// unterminated tail line (e.g. `warning: foo[build-action-dist] bundle stdout:`).
+function ensureTrailingNewline(text: string): string {
+  return text.endsWith('\n') ? text : `${text}\n`
+}
+
+/**
+ * Pure formatter for a failed bundle spawn's captured output. `tsc` writes its
+ * diagnostics to stdout, not stderr, so both streams must be inspected — a
+ * type error otherwise produces an empty stderr and the underlying failure is
+ * silently discarded. Exported for unit testing.
+ */
+export function formatBundleFailureOutput(error: unknown, stdout: string, stderr: string): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (stdout === '' && stderr === '') {
+    return `[build-action-dist] bundle spawn failed: ${message}\n`
+  }
+  // Unlike the spawn-failed case above, both children ran and one of them exited
+  // non-zero — `error.message` here is `Command failed: <cmd> <args>`, the only thing
+  // identifying *which* of tsc/tsdown failed. Always include it: for a tsdown failure
+  // whose stderr is a bare rolldown message, this is the only attribution available.
+  const commandLine = `[build-action-dist] bundle command failed: ${message}\n`
+  if (stdout !== '' && stderr !== '') {
+    return `${commandLine}[build-action-dist] bundle stderr:\n${ensureTrailingNewline(stderr)}[build-action-dist] bundle stdout:\n${ensureTrailingNewline(stdout)}`
+  }
+  return stdout === ''
+    ? `${commandLine}${ensureTrailingNewline(stderr)}`
+    : `${commandLine}[build-action-dist] bundle stdout:\n${ensureTrailingNewline(stdout)}`
+}
+
+// Node's default 1 MB `maxBuffer` silently truncates a child's stdout/stderr once
+// exceeded, killing the child. Now that stdout is the primary diagnostic channel
+// (tsc writes its errors there), a truncated capture would hide the real failure.
+// 10 MB comfortably covers verbose tsc/rolldown output without retaining an
+// effectively unbounded buffer for a build step that runs once per CI job.
+const BUNDLE_MAX_BUFFER_BYTES = 10 * 1024 * 1024
+
+// Factored out of the catch block so the non-numeric `error.code` case is an explicit,
+// commented branch rather than falling through a ternary's `else` and silently
+// collapsing to 1 the same way a plain tool failure would. Exported for unit testing.
+export function deriveBundleExitCode(error: unknown): number {
+  const code = error != null && typeof error === 'object' && 'code' in error ? error.code : undefined
+  if (typeof code === 'number') {
+    return code
+  }
+  // execFile sets error.code to the *string* 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' (not a
+  // number) when a child's output exceeds maxBuffer; there is no numeric exit code to
+  // report for a killed child, so this falls back to a plain failure code (1). The
+  // overflow itself is still distinguishable in the output: formatBundleFailureOutput
+  // always includes error.message, and Node's maxBuffer error message names the
+  // overflowing stream (e.g. "stdout maxBuffer length exceeded"), unlike a bare tool
+  // failure.
+  return 1
+}
+
 async function runBundle(): Promise<StepResult> {
   try {
     // Mirror apps/action/package.json build: tsc --noEmit then tsdown.
@@ -114,26 +170,25 @@ async function runBundle(): Promise<StepResult> {
     await execFileAsync('bunx', ['tsc', '--noEmit', '-p', 'tsconfig.json'], {
       cwd: REPO_ROOT,
       encoding: 'utf8',
+      maxBuffer: BUNDLE_MAX_BUFFER_BYTES,
     })
     await execFileAsync('bunx', ['tsdown', '-c', 'tsdown.config.ts'], {
       cwd: REPO_ROOT,
       encoding: 'utf8',
+      maxBuffer: BUNDLE_MAX_BUFFER_BYTES,
     })
     return {exitCode: 0}
   } catch (error) {
-    const exitCode =
-      error != null && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : 1
+    const exitCode = deriveBundleExitCode(error)
     const stderr =
       error != null && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string'
         ? error.stderr
         : ''
-    if (stderr === '') {
-      process.stderr.write(
-        `[build-action-dist] bundle spawn failed: ${error instanceof Error ? error.message : String(error)}\n`,
-      )
-    } else {
-      process.stderr.write(stderr)
-    }
+    const stdout =
+      error != null && typeof error === 'object' && 'stdout' in error && typeof error.stdout === 'string'
+        ? error.stdout
+        : ''
+    process.stderr.write(formatBundleFailureOutput(error, stdout, stderr))
     return {exitCode}
   }
 }
