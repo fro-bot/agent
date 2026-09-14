@@ -123,6 +123,7 @@ Separately, the OpenCode file watcher runs in both surfaces and nothing in this 
 - AE11. **Covers R12.** Given a background subagent that attempts to dispatch a background subagent of its own, when that dispatch is made, it is refused because depth is limited to one level.
 - AE12. **Covers R14.** Given an invocation already at its outstanding-execution cap, when the agent attempts another dispatch, the gate refuses it before any child execution starts rather than recording an overage after the fact.
 - AE13. **Covers R21, R22a.** Given a run proceeding without a coordination lock because S3 is unconfigured, when background work completes and terminates confirmably, the run persists cache normally and does not fail for want of a lease.
+- AE14. **Covers R24.** Given a gateway that restarted while the workspace server kept running owned background work, when it starts up, it reconciles that work against persisted run state and admits no conflicting run until reconciliation finishes.
 
 ---
 
@@ -163,8 +164,9 @@ Separately, the OpenCode file watcher runs in both surfaces and nothing in this 
 
 - The pinned harness base is `anomalyco/opencode` at `1.18.30`; behaviour was verified against that tree. A base bump requires re-verifying the flag names, the notification path, and the correlation key R3 depends on.
 - An operator who sets `OPENCODE_EXPERIMENTAL=true` enables background subagents independently of this work, so the ownership and cap machinery must hold whether or not this project sets the specific flag.
-- `filterAgentEnv` allowlists the `OPENCODE_` prefix, so both flags already reach the OpenCode child without a change to the deny set.
+- `filterAgentEnv` allowlists the `OPENCODE_` prefix, so every flag named here already reaches the OpenCode child without a change to the deny set.
 - The `OPENCODE_EXPERIMENTAL` umbrella also enables background subagents, and an explicit `false` overrides the umbrella. An operator setting the umbrella would enable the capability independently of this work.
+- The watcher flag is not umbrella-gated, despite sharing the `OPENCODE_EXPERIMENTAL_` prefix: it resolves through the flag module's own boolean with a `false` default and is read directly at the watcher's entry, never through the umbrella-aware path that governs background subagents. R2 therefore ships and takes effect on its own, without enabling anything in R3 through R24.
 - Upstream `SessionRunState.cancel()` cancels registered descendant jobs, but its traversal covers running jobs only, so a completed child linking the root to a running grandchild is not reached. This is part of why depth is limited to one.
 - Disabling the watcher leaves OpenCode's cached VCS branch stale after a checkout, since that cache refreshes from watcher events. Accepted, and more visible on the long-lived container than in CI.
 
