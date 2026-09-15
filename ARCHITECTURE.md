@@ -61,7 +61,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
 | `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | Initialize SDK server lifecycle; probes instance-scoped readiness before reporting success |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
-| `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.18.3`) |
+| `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.18.4`) |
 | `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness version (`1.18.30+harness.7c479429`) |
 
 ### `packages/gateway/`
