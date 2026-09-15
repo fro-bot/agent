@@ -106,6 +106,12 @@ export async function executeOpenCode(
   try {
     let serverUrl: string | null = null
     if (serverHandle == null) {
+      // This branch is currently unreachable from the Action: CacheRestorePhaseResult.serverHandle
+      // is non-nullable, bootstrap failure returns early, and the execute phase always passes the
+      // handle through. If it ever becomes live, note that it inherits OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+      // only because bootstrapOpenCodeServer (server.ts) sets that env var as a side effect and
+      // deliberately never reverts it -- nothing here sets it directly, so a spawn on this path would
+      // otherwise start with the watcher on.
       const opencode = await deadline.run(
         async () => withScrubbedEnv(async () => createOpencode({signal: deadline.signal}), logger),
         'OpenCode server creation',
