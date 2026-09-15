@@ -373,6 +373,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - The heartbeat keeps renewing through drain. Stopping it is what lets another instance sweep the run as stale and kill the subagents.
 - `executeWorkOnHeldSlot` hands off only after drain, so the next run cannot start writing the workspace under the previous one.
 - One deadline covers execution and drain, reserving 30 seconds for teardown. A completion notification does not extend it.
+- This unit persists the run's ownership onto its run state — the root session and the set of owned session ids — as it adopts and settles. Nothing writes that today: `RunState.details` currently carries only `cancelledBy`, `failureKind`, and `channelId`. Unit 7 reads those fields to reconcile after a restart, so until this unit writes them, startup reconciliation has nothing to read and is inert. Ownership must be persisted as it changes rather than at completion, since the restart it protects against can happen at any point during the run.
 
 **Test scenarios:**
 - Happy path: a run with outstanding work drains, then completes and hands off the slot
@@ -380,7 +381,9 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - Edge case: the heartbeat renews during a drain longer than its interval
 - Error path: the deadline expires mid-drain, cancellation runs, and the run reports incomplete
 - Edge case: a completion notification arriving during drain does not extend the deadline
+- Edge case: ownership is persisted onto run state as entries are adopted, not only at completion
 - Integration: a second queued run for the same channel does not start until the first has drained
+- Integration: a run interrupted mid-drain leaves run state a restart can reconcile from
 
 **Verification:**
 - No two runs hold the same workspace concurrently, and no draining run is swept as stale.
