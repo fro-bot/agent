@@ -243,6 +243,8 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - Extensions and promotions count toward the total — an extension is a new submission against an existing entry, and a promotion converts foreground work the caps never saw.
 - Once the invocation enters finalization or cancellation, admission refuses everything.
 - A refusal returns a structured error identifying which cap was exceeded, so the caller can surface it to the model rather than failing silently.
+- Admission decides only whether a dispatch may proceed; it never mutates the ledger. The dispatching caller adopts the entry after admission succeeds. Every unit that wires admission into a call site owns that adopt, and a caller that admits without adopting produces work the ledger cannot see — the exact failure this plan exists to prevent.
+- Depth arrives on the request rather than being inferred from the dispatch kind, because the caller is the only party that knows how deep the requesting session already sits.
 
 **Test scenarios:**
 - Happy path: a dispatch below both caps is admitted
@@ -274,7 +276,8 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - Liveness comes from session status, which holds an entry only while a session is non-idle. A candidate that reports idle has finished; one that reports busy is live. Only live candidates absent from the ledger are adopted, and only those created during this invocation.
 - Run on subscription, after any discontinuity, and on a bounded interval. A dispatch event dropped without a detected discontinuity is the plan's central hazard otherwise: the ledger would read zero while a child writes, and nothing would ever trigger a re-check. The interval reconciliation is bounded and cheap — the same `children` call and status check, not a heavier sweep.
 - A ledger entry whose session is no longer live is settled.
-- A failed reconciliation marks the ledger unknown rather than empty.
+- A failed reconciliation marks the ledger unknown rather than empty. Specifically it marks the entries that were outstanding at the time of the failure, and leaves settled entries alone — a settled entry was confirmed finished by a positive observation, and a later failed call is not evidence against it.
+- An entry discovered by reconciliation rather than by an observed dispatch has no dispatch-site label to carry, so it is labelled as reconciled. Unit 13 reports by label, and a reader should be able to tell work the harness watched start from work it found already running.
 - The gateway consumes this primitive through `packages/gateway/src/runtime-effect.ts`, following how that file already wraps other runtime primitives (Unit 7 depends on it for startup reconciliation); the Action consumes it directly (Unit 8), since it has no equivalent wrapper layer.
 
 **Test scenarios:**
