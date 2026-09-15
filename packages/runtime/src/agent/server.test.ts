@@ -158,6 +158,98 @@ describe('bootstrapOpenCodeServer', () => {
     expect(process.env.FRO_BOT_OPENCODE_URL).toBe(serverUrl)
   })
 
+  it('leaves OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER set in the parent process after bootstrap', async () => {
+    // #given the variable is unset, so bootstrap supplies the default
+    delete process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+    const logger = createMockLogger()
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then the value persists rather than being reverted. The fallback spawn in
+    // executeOpenCode has no assignment of its own and inherits this one, so reverting
+    // here would silently start that path with the watcher on.
+    expect(result.success).toBe(true)
+    expect(process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER).toBe('true')
+  })
+
+  it('sets OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true before spawn when the operator did not set it', async () => {
+    // #given
+    delete process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+    const logger = createMockLogger()
+    let capturedFilewatcherFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedFilewatcherFlag = process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedFilewatcherFlag).toBe('true')
+  })
+
+  it('does not override an operator-set OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER value', async () => {
+    // #given
+    process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER = 'false'
+    const logger = createMockLogger()
+    let capturedFilewatcherFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedFilewatcherFlag = process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedFilewatcherFlag).toBe('false')
+  })
+
+  it('treats an empty-string OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER as unset and applies the default', async () => {
+    // #given an empty string, matching how GitHub Actions materializes an unset `env:` input
+    process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER = ''
+    const logger = createMockLogger()
+    let capturedFilewatcherFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedFilewatcherFlag = process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedFilewatcherFlag).toBe('true')
+  })
+
   it('fails the bootstrap when the actual server URL differs from the pinned port', async () => {
     // #given
     const logger = createMockLogger()

@@ -187,6 +187,13 @@ RUN set -euo pipefail \
     && rm -f "/tmp/${oc_asset}.tar.gz" /tmp/SHA256SUMS \
     && opencode --version
 
+# Disable OpenCode's file watcher by default: nothing in this container consumes
+# file-change events, so the watcher is pure overhead. A deployer can still
+# override this through compose. Accepted consequence: OpenCode's cached VCS
+# branch can go stale after a checkout, since that cache refreshes from watcher
+# events (see deploy/README.md).
+ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true
+
 # Base workspace OpenCode config: declare the Systematic plugin and disable
 # autoupdate. The model and provider block are NOT baked — the entrypoint
 # overlays them at runtime from WORKSPACE_OPENCODE_MODEL and
