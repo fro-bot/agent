@@ -306,13 +306,14 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Files:**
 - Modify: `packages/gateway/src/execute/run-core.ts`
 - Modify: `packages/gateway/src/approvals/coordinator.ts`
-- Modify: `packages/gateway/src/approvals/registry.ts`
 - Test: `packages/gateway/src/execute/run-core.test.ts`
 - Test: `packages/gateway/src/approvals/approval-flow.integration.test.ts`
+- Test: `packages/gateway/src/execute/run.test.ts` (coordinator test doubles need the widened interface)
 
 **Approach:**
-- Replace root-session equality at the nine filters in `run-core.ts:437-672` with an ownership check. An unowned session stays out of scope — widening to every workspace session would route a stranger's approval to this run's thread.
-- The registry's settlement gate at `registry.ts:581-598` moves from root equality to ownership, so a reply settles only the approval it names.
+- Replace root-session equality at eight of the nine filters in `run-core.ts:437-672` with an ownership check. An unowned session stays out of scope — widening to every workspace session would route a stranger's approval to this run's thread.
+- `session.idle` is the exception and stays root-scoped. It resolves the run, so treating a descendant's idle as the run's idle would end the run while the root is still working — invisibility traded for premature termination. Root idle with outstanding work is a drain decision, and it belongs to Unit 6.
+- The registry's cross-session guard needs no change: it already compares the registered entry's own session against the reply's, so a reply settles only the approval it names. Confirm that before touching it rather than assuming a root-equality bug that is not there.
 - Activity accounting covers the owned tree, so a busy descendant does not read as an inactive run.
 
 **Patterns to follow:**
@@ -323,6 +324,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - Edge case: a session belonging to no run is ignored rather than routed
 - Edge case: two descendants requesting approval concurrently settle independently
 - Error path: a reply naming an already-settled approval is rejected, not applied to another
+- Edge case: an event from a session owned by a different run is not handled by this one
 - Integration: a busy descendant keeps the run from reading as inactive while the root is idle
 
 **Verification:**
