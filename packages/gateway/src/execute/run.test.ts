@@ -43,6 +43,8 @@ vi.mock('../approvals/coordinator.js', () => ({
     onPermissionReplied: vi.fn(),
     pending: vi.fn().mockReturnValue([]),
     dispose: vi.fn(),
+    addOwnedSession: vi.fn(),
+    isOwned: vi.fn().mockReturnValue(true),
   }),
 }))
 
@@ -1601,6 +1603,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -1671,6 +1675,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -1735,6 +1741,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -1796,6 +1804,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -1898,6 +1908,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -2142,6 +2154,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -2209,6 +2223,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -2241,6 +2257,8 @@ describe('runMention', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: disposeFn,
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       })
 
       const deps = makeDeps()
@@ -2265,6 +2283,8 @@ describe('runMention', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: disposeFn,
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       })
 
       const deps = makeDeps()
@@ -2309,6 +2329,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -2360,6 +2382,8 @@ describe('runMention', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
       mockCreatePermissionCoordinator.mockReturnValue(fakeCoordinator)
 
@@ -2503,6 +2527,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -2568,6 +2594,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -2611,6 +2639,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -2694,6 +2724,8 @@ describe('runMention', () => {
           onPermissionReplied: vi.fn(),
           pending: vi.fn().mockReturnValue([]),
           dispose: vi.fn(),
+          addOwnedSession: vi.fn(),
+          isOwned: vi.fn().mockReturnValue(true),
         }
       })
 
@@ -4247,6 +4279,8 @@ describe('reaction wiring — lifecycle hooks', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
     })
 
@@ -4532,6 +4566,8 @@ describe('approval: pending wait → decision → run continues', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
     })
 
@@ -4574,6 +4610,8 @@ describe('approval: pending wait → decision → run continues', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
     })
 
@@ -5681,6 +5719,8 @@ describe('approval transport selection', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
     })
 
@@ -5717,6 +5757,8 @@ describe('approval transport selection', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
     })
 
@@ -8303,6 +8345,8 @@ describe('operatorPushDispatcher wiring', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
     })
 
@@ -8365,6 +8409,8 @@ describe('operatorPushDispatcher wiring', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
     })
     mockRunOpenCodeCore.mockImplementation(async () => {
@@ -8405,6 +8451,8 @@ describe('operatorPushDispatcher wiring', () => {
         onPermissionReplied: vi.fn(),
         pending: vi.fn().mockReturnValue([]),
         dispose: vi.fn(),
+        addOwnedSession: vi.fn(),
+        isOwned: vi.fn().mockReturnValue(true),
       }
     })
     mockRunOpenCodeCore.mockImplementation(async () => {

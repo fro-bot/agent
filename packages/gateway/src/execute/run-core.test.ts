@@ -275,13 +275,26 @@ function buildParams(
 // Tests
 // ---------------------------------------------------------------------------
 
-/** Build a fake PermissionCoordinator with vi.fn() methods. */
-function makeCoordinator(): PermissionCoordinator {
+/**
+ * Build a fake PermissionCoordinator with vi.fn() methods.
+ *
+ * `isOwned` models a real coordinator's ownership set: it starts empty and
+ * grows via `addOwnedSession` calls (run-core registers the root session id
+ * this way immediately after session creation). Pass `extraOwned` to
+ * pre-adopt descendant session ids the way a future ledger-adoption unit
+ * would, so tests can exercise descendant routing without that wiring.
+ */
+function makeCoordinator(extraOwned: readonly string[] = []): PermissionCoordinator {
+  const owned = new Set<string>(extraOwned)
   return {
     onPermissionAsked: vi.fn().mockResolvedValue('once'),
     onPermissionReplied: vi.fn(),
     pending: vi.fn().mockReturnValue([]),
     dispose: vi.fn(),
+    addOwnedSession: vi.fn((sessionID: string) => {
+      owned.add(sessionID)
+    }),
+    isOwned: vi.fn((sessionID: string) => owned.has(sessionID)),
   }
 }
 
@@ -2658,6 +2671,181 @@ describe('runOpenCodeCore', () => {
         // #then — no dangling timers remain
         expect(vi.getTimerCount()).toBe(0)
       })
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Ownership-based event routing (Unit 4)
+  //
+  // `sess-123` is the root session (default in makeHandle/sessionCreateOk).
+  // A "descendant" in these tests is any session id pre-adopted into the fake
+  // coordinator via `makeCoordinator([...])`, modelling a ledger adoption a
+  // later unit performs — Unit 4 only builds the routing that consults
+  // ownership, not the adoption wiring itself.
+  // ---------------------------------------------------------------------------
+  describe('ownership-based event routing', () => {
+    const DESCENDANT = 'sess-descendant-1'
+    const DESCENDANT_2 = 'sess-descendant-2'
+    const FOREIGN = 'sess-other-run'
+
+    it('happy path: a descendant approval request is forwarded to the coordinator', async () => {
+      // #given — DESCENDANT is pre-adopted (as a later unit's ledger-adoption would do)
+      const coordinator = makeCoordinator([DESCENDANT])
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([permissionAskedEvent('req-desc-1', DESCENDANT), sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), coordinator}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — the descendant's request reached the coordinator exactly as a root request would
+      expect(coordinator.onPermissionAsked).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({requestID: 'req-desc-1', sessionID: DESCENDANT}),
+      )
+    })
+
+    it('edge case: a session belonging to no run is ignored rather than routed', async () => {
+      // #given — FOREIGN is never adopted; only the root is owned
+      const coordinator = makeCoordinator()
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            permissionAskedEvent('req-foreign-1', FOREIGN),
+            partDeltaObjectEvent('should not appear', FOREIGN),
+            toolCalledEvent('call-1', 'bash', {command: 'ls'}, FOREIGN),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — nothing from the foreign session reached a handler
+      expect(coordinator.onPermissionAsked).not.toHaveBeenCalled()
+      expect(sink._appended).toEqual([])
+    })
+
+    it('edge case: two descendants requesting approval concurrently are each forwarded independently', async () => {
+      // #given
+      const coordinator = makeCoordinator([DESCENDANT, DESCENDANT_2])
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            permissionAskedEvent('req-a', DESCENDANT),
+            permissionAskedEvent('req-b', DESCENDANT_2),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), coordinator}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — both reached the coordinator, each with its own request/session pairing
+      expect(coordinator.onPermissionAsked).toHaveBeenCalledTimes(2)
+      expect(coordinator.onPermissionAsked).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'req-a', sessionID: DESCENDANT}),
+      )
+      expect(coordinator.onPermissionAsked).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'req-b', sessionID: DESCENDANT_2}),
+      )
+    })
+
+    it('cross-run isolation: an event from a session owned by a different run is not handled by this one', async () => {
+      // #given — FOREIGN represents a session that belongs to a wholly different
+      // run's tree (e.g. another gateway invocation in the same workspace). It is
+      // never adopted into this run's coordinator, so it must never reach this
+      // run's handlers — proving the workspace-wide cross-run leak stays closed
+      // rather than assuming it from the unowned-session case above.
+      const coordinator = makeCoordinator([DESCENDANT])
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            // A permission ask from a totally different run's session.
+            permissionAskedEvent('req-cross-run', FOREIGN),
+            // Text and tool activity from that same foreign session.
+            partDeltaObjectEvent('leaked output?', FOREIGN),
+            toolCalledEvent('call-cross', 'bash', {command: 'rm -rf /'}, FOREIGN),
+            toolSuccessEvent('call-cross', null, FOREIGN),
+            // This run's own descendant activity, to prove the gate is selective
+            // rather than blocking everything.
+            partDeltaObjectEvent('legit output', DESCENDANT),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — the foreign session never reached the coordinator or the sink,
+      // while the owned descendant's output did.
+      expect(coordinator.onPermissionAsked).not.toHaveBeenCalled()
+      expect(sink._appended).toEqual(['legit output'])
+    })
+
+    it('integration: a busy descendant keeps the run from reading as inactive while the root is idle', async () => {
+      // #given — fake timers; inactivity window shorter than the descendant's
+      // steady drumbeat of tool activity. The root session produces nothing
+      // after the initial prompt (it "looks idle" from an activity standpoint)
+      // but the descendant keeps sending tool events that must reset the
+      // inactivity timer, because activity accounting now covers the owned tree.
+      vi.useFakeTimers()
+      const WINDOW = 5_000
+      const coordinator = makeCoordinator([DESCENDANT])
+
+      const eventQueue: object[] = []
+      let resolveNext: (() => void) | null = null
+      async function* controlledStream(): AsyncGenerator<object> {
+        while (true) {
+          if (eventQueue.length > 0) {
+            const next = eventQueue.shift()
+            if (next === undefined) break
+            yield next
+          } else {
+            await new Promise<void>(resolve => {
+              resolveNext = resolve
+            })
+          }
+        }
+      }
+      const emitNext = (event: object) => {
+        eventQueue.push(event)
+        if (resolveNext !== null) {
+          const r = resolveNext
+          resolveNext = null
+          r()
+        }
+      }
+
+      const handle = makeHandle({subscribe: async () => Promise.resolve({stream: controlledStream()})})
+      const params = {...buildParams(handle), coordinator, inactivityTimeoutMs: WINDOW}
+
+      const runPromise = runOpenCodeCore(params)
+
+      // Only the descendant produces activity; the root is silent the whole time.
+      emitNext(toolCalledEvent('d-1', 'bash', {command: 'echo 1'}, DESCENDANT))
+      emitNext(toolSuccessEvent('d-1', null, DESCENDANT))
+      await vi.advanceTimersByTimeAsync(WINDOW - 1000)
+      emitNext(toolCalledEvent('d-2', 'bash', {command: 'echo 2'}, DESCENDANT))
+      emitNext(toolSuccessEvent('d-2', null, DESCENDANT))
+      await vi.advanceTimersByTimeAsync(WINDOW - 1000)
+      emitNext(toolCalledEvent('d-3', 'bash', {command: 'echo 3'}, DESCENDANT))
+      emitNext(toolSuccessEvent('d-3', null, DESCENDANT))
+      await vi.advanceTimersByTimeAsync(WINDOW - 1000)
+
+      // Now the root itself goes idle — resolves the run.
+      emitNext(sessionIdleEvent('sess-123'))
+
+      // #then — resolves successfully; the descendant's activity prevented an
+      // inactivity-timeout even though the root produced nothing on its own.
+      await expect(runPromise).resolves.toBeUndefined()
+      vi.useRealTimers()
     })
   })
 })

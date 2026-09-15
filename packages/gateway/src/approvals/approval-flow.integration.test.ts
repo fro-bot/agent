@@ -363,6 +363,82 @@ describe('approval flow — cross-seam integration', () => {
     expect(postReplyCalls.every(c => c.decision === 'reject')).toBe(true)
   })
 
+  // 6b. descendant approvals (Unit 4) ─────────────────────────────────────
+  //
+  // These exercise the registry/coordinator seam directly, below run-core's
+  // ownership-routing gate. In production only an owned session's events
+  // reach `coordinator.onPermissionAsked` at all (run-core.test.ts covers that
+  // gate); here SESSION_A models a run's root and SESSION_B/SESSION_C model
+  // two descendant sessions already adopted by that same run, to prove the
+  // registry settles each independently regardless of which session in the
+  // owned tree raised it.
+
+  const SESSION_C = 'sess-ccc'
+
+  it('two descendants requesting approval concurrently settle independently', async () => {
+    // #given — two different descendant sessions (SESSION_B, SESSION_C) of the same run
+    const {coordinator, registry, postReplyCalls, renderCalls} = setup()
+    const reqB = makeRequest('req-desc-b', SESSION_B)
+    const reqC = makeRequest('req-desc-c', SESSION_C)
+
+    const pB = coordinator.onPermissionAsked(reqB)
+    const pC = coordinator.onPermissionAsked(reqC)
+    expect(registry.pending()).toEqual(expect.arrayContaining(['req-desc-b', 'req-desc-c']))
+
+    // #when — settle only the first descendant's approval
+    coordinator.onPermissionReplied(makeReplyEvent('req-desc-b', 'once', SESSION_B))
+    await vi.runAllTimersAsync()
+
+    // #then — req-desc-b settled; req-desc-c (different session) is untouched by the cascade
+    // that only applies to open siblings sharing the SAME sessionID.
+    expect(await pB).toBe('once')
+    expect(registry.has('req-desc-b')).toBe(false)
+    expect(registry.has('req-desc-c')).toBe(true)
+    expect(registry.pending()).toEqual(['req-desc-c'])
+
+    // #when — settle the second descendant's approval independently
+    coordinator.onPermissionReplied(makeReplyEvent('req-desc-c', 'reject', SESSION_C))
+    await vi.runAllTimersAsync()
+
+    // #then — both settled, each with its own decision, no cross-contamination
+    expect(await pC).toBe('reject')
+    expect(registry.has('req-desc-c')).toBe(false)
+    expect(renderCalls.find(c => c.request.requestID === 'req-desc-b')?.decision).toBe('once')
+    expect(renderCalls.find(c => c.request.requestID === 'req-desc-c')?.decision).toBe('reject')
+    expect(postReplyCalls).toHaveLength(0) // both were OpenCode-initiated (open → replied), no button POST
+  })
+
+  it('error path: a reply naming an already-settled approval is rejected, not applied to another', async () => {
+    // #given — one descendant approval, already settled
+    const {coordinator, registry, renderCalls} = setup()
+    const reqB = makeRequest('req-settled', SESSION_B)
+    const reqC = makeRequest('req-other', SESSION_C)
+
+    const pB = coordinator.onPermissionAsked(reqB)
+    const pC = coordinator.onPermissionAsked(reqC)
+    coordinator.onPermissionReplied(makeReplyEvent('req-settled', 'once', SESSION_B))
+    await vi.runAllTimersAsync()
+    await pB
+    expect(registry.has('req-settled')).toBe(false)
+    const renderCountAfterFirstSettle = renderCalls.length
+
+    // #when — a second reply names the same, already-settled requestID (e.g. a duplicate
+    // or delayed echo). It must be a no-op, and MUST NOT be misapplied to req-other.
+    coordinator.onPermissionReplied(makeReplyEvent('req-settled', 'reject', SESSION_B))
+    await vi.runAllTimersAsync()
+
+    // #then — no additional render fired (nothing to settle for an unknown entry),
+    // and the unrelated open request is completely unaffected.
+    expect(renderCalls).toHaveLength(renderCountAfterFirstSettle)
+    expect(registry.has('req-other')).toBe(true)
+    expect(registry.pending()).toEqual(['req-other'])
+
+    // Clean up the still-open request so the test doesn't leak a pending timer.
+    coordinator.onPermissionReplied(makeReplyEvent('req-other', 'once', SESSION_C))
+    await vi.runAllTimersAsync()
+    await pC
+  })
+
   // 7. sse-drop / no reply within deadline ──────────────────────────────────
 
   it('sse-drop: no permission.replied ever → deadline fires → fail-closed reject, pending() empty', async () => {

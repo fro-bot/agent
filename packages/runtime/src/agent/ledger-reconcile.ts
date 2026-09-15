@@ -19,9 +19,25 @@
  *   finished (or never started); a session present in it is live right now.
  *
  * A candidate is adopted only when it is BOTH a child of the parent AND live
- * AND absent from the ledger. A ledger entry is settled only when its session
- * is confirmed no longer live. Nothing is ever adopted or settled from
- * `children()` output alone.
+ * AND absent from the ledger. Nothing is ever adopted from `children()`
+ * output alone.
+ *
+ * Liveness is not enough on its own to settle or hold an entry — it must
+ * also be scoped to this parent's children, because `liveSessionIds()` is
+ * server-wide (every non-idle session, under any parent). Every ledger entry
+ * therefore falls into one of three cases on each pass:
+ * - Child of this parent AND live → outstanding. Adopted if the ledger did
+ *   not already know about it.
+ * - Child of this parent AND NOT live → finished. Settled.
+ * - NOT a child of this parent at all → unverifiable. The reconciler has no
+ *   basis to claim this entry is part of this parent's tree, so it is marked
+ *   `unknown` — never settled (settling asserts a positive observation of
+ *   completion this pass never made) and never left outstanding (that would
+ *   let a session live under someone else's tree block this parent's drain
+ *   forever). This is the security-relevant case: a persisted or forged
+ *   ledger entry naming a session that happens to be live elsewhere on the
+ *   server must never be treated as this run's live work merely because
+ *   `liveSessionIds()` says it is live *somewhere*.
  *
  * Failure handling: a failed reconciliation call (either upstream call
  * rejecting or returning an error) marks every currently-outstanding ledger
@@ -108,6 +124,7 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
 
   const children = childrenResult.data
   const liveSessionIds = liveResult.data
+  const childSessionIds = new Set(children.map(child => child.id))
   const knownSessionIds = new Set(ledger.snapshot().map(entry => entry.sessionId))
 
   const adopted: string[] = []
@@ -119,19 +136,33 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
   }
 
   const settled: string[] = []
+  const downgradedToUnknown: string[] = []
   for (const entry of ledger.snapshot()) {
     if (entry.state !== 'outstanding' && entry.state !== 'unknown') continue
+
+    if (childSessionIds.has(entry.sessionId) === false) {
+      // Not a child of this parent at all — this pass has no basis to claim the
+      // entry, whether or not `liveSessionIds` happens to report it live under
+      // some other tree. Downgrade to unknown rather than settle (no positive
+      // observation of completion was made) or leave outstanding (that would
+      // block drain forever on work that was never this parent's to begin with).
+      ledger.markUnknown(entry.sessionId)
+      downgradedToUnknown.push(entry.sessionId)
+      continue
+    }
+
     if (liveSessionIds.has(entry.sessionId) === true) continue
     ledger.settle(entry.sessionId)
     settled.push(entry.sessionId)
   }
 
-  if (adopted.length > 0 || settled.length > 0) {
+  if (adopted.length > 0 || settled.length > 0 || downgradedToUnknown.length > 0) {
     logger.debug('Ledger reconciliation adjusted ownership', {
       source: 'reconcileLedgerOnce',
       parentSessionId,
       adopted,
       settled,
+      downgradedToUnknown,
     })
   }
 

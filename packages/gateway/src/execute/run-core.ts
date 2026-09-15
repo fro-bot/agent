@@ -330,6 +330,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       throw new RunCoreError('unreachable', 'Session create returned no data')
     }
     sessionId = sessionResponse.data.id
+    // Register the root session as owned before anything else observes events for
+    // it. Ownership (root or an adopted descendant) is what the event-routing
+    // checks below consult — an unowned session never reaches a handler.
+    coordinator.addOwnedSession(sessionId)
     logger.info({sessionId}, 'run-core: session created')
   } catch (error) {
     if (error instanceof RunCoreError) throw error
@@ -434,6 +438,23 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     resetInactivity()
   }
 
+  // Ownership check: true for the root session, or a descendant session this
+  // run's ledger has adopted (surfaced through `coordinator.isOwned`). False
+  // for a null session id (no session on the payload) and false for any
+  // session this run does not own — including a session belonging to a
+  // different run's tree. This is the boundary that keeps a stranger's tool
+  // calls, approvals, and activity out of this run's handling: widening it
+  // to every workspace session would route a stranger's approval into this
+  // run's Discord thread.
+  // Captured into its own binding: `coordinator` is narrowed to non-undefined by the
+  // pre-flight check above, but that narrowing does not carry across the function
+  // boundary of a nested `function` declaration — this binding does.
+  const ownershipCoordinator: PermissionCoordinator = coordinator
+
+  function isOwnedSession(eventSessionID: string | null): boolean {
+    return eventSessionID !== null && ownershipCoordinator.isOwned(eventSessionID)
+  }
+
   try {
     for await (const rawEvent of abortableStream) {
       // Check abort at the top of each iteration so we exit as soon as the signal
@@ -455,7 +476,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // delta may be {type:'text', text:string} or a plain string when field === 'text'.
         // Reasoning suppression: skip any delta whose partID is a known reasoning part.
         const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === sessionId) {
+        if (isOwnedSession(eventSessionID)) {
           const deltaPartId = getStringProperty(eventPayload, 'partID')
           if (deltaPartId !== null && reasoningPartIds.has(deltaPartId)) {
             // This delta belongs to a reasoning part — suppress it entirely.
@@ -476,7 +497,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // Sync/session.next shape: delta is a plain string or {type:'text', text:string}.
         // No partID on this legacy path — reasoning suppression does not apply here.
         const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === sessionId) {
+        if (isOwnedSession(eventSessionID)) {
           const deltaRaw = getObjectProperty(eventPayload, 'delta')
           const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
           if (deltaText != null) {
@@ -491,7 +512,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // stream, so both branches are live.
         const part = getObjectProperty(eventPayload, 'part')
         const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
-        if (eventSessionID === sessionId) {
+        if (isOwnedSession(eventSessionID)) {
           const partType = getStringProperty(part, 'type')
           if (partType === 'reasoning') {
             // Reasoning suppression: register this part's ID so its deltas are suppressed
@@ -532,7 +553,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       } else if (eventType === 'session.next.tool.called') {
         // V2 sync tool lifecycle: cache call info for correlation with success event.
         const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === sessionId) {
+        if (isOwnedSession(eventSessionID)) {
           const callID = getStringProperty(eventPayload, 'callID')
           const tool = getStringProperty(eventPayload, 'tool')
           const input = getObjectProperty(eventPayload, 'input')
@@ -544,7 +565,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       } else if (eventType === 'session.next.tool.success') {
         // V2 sync tool lifecycle: resolve title and surface progress line to Discord.
         const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === sessionId) {
+        if (isOwnedSession(eventSessionID)) {
           const callID = getStringProperty(eventPayload, 'callID')
           if (callID !== null) {
             const callInfo = pendingToolCalls.get(callID)
@@ -576,7 +597,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         }
       } else if (eventType === 'permission.asked') {
         const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === sessionId) {
+        if (isOwnedSession(eventSessionID)) {
           // approval-required mode: route to coordinator.
           // Coordinator is guaranteed non-null here (pre-flight check above).
           const req = parsePermissionRequest(eventPayload)
@@ -598,7 +619,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // Authoritative settlement — route to coordinator.
         // Coordinator is guaranteed non-null here (pre-flight check above).
         const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === sessionId) {
+        if (isOwnedSession(eventSessionID)) {
           const ev = parsePermissionReply(eventPayload)
           if (ev === null) {
             logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
@@ -614,6 +635,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           }
         }
       } else if (eventType === 'session.idle') {
+        // Deliberately root-scoped, NOT an ownership check: this is the signal
+        // that ends the loop below. Widening it to ownership would let a
+        // descendant's own idle transition end the run while the root is still
+        // working — the exact invisibility this effort exists to fix, just
+        // relocated. Descendant completion is a drain concern (a later unit);
+        // here a descendant going idle is simply not handled (no branch below).
         const eventSessionID = getEventSessionID(rawEvent)
         if (eventSessionID === sessionId) {
           logger.info(
@@ -627,7 +654,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         }
       } else if (eventType === 'session.error') {
         const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === null || eventSessionID === sessionId) {
+        // A null session id means the payload didn't carry one (rare) — treated as
+        // ours defensively, matching the prior root-scoped behaviour, since we
+        // cannot attribute it to a specific session at all. Otherwise: ownership,
+        // not root equality — a descendant's error is this run's problem too.
+        if (eventSessionID === null || isOwnedSession(eventSessionID)) {
           const errorDetail = getStringProperty(eventPayload, 'error') ?? 'unknown session error'
           logger.error({sessionId, detail: errorDetail}, 'run-core: session.error received')
           clearInactivity()

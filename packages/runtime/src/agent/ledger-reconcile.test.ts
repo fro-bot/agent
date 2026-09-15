@@ -177,6 +177,66 @@ describe('reconcileLedgerOnce', () => {
     expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'settled'}])
   })
 
+  it('three-way: a child of this parent that is live is left outstanding (adopted if new)', async () => {
+    // #given — a session that IS a child of this parent and IS live
+    const ledger = createOwnershipLedger()
+    const adapter = makeAdapter({
+      children: async () => ok([{id: 'child-1'}]),
+      liveSessionIds: async () => ok(new Set(['child-1'])),
+    })
+
+    // #when
+    await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
+
+    // #then — adopted and left outstanding, not settled or marked unknown
+    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reconciled', state: 'outstanding'}])
+  })
+
+  it('three-way: a child of this parent that is not live is settled', async () => {
+    // #given — a ledger entry that IS a child of this parent but is NOT live
+    const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent')
+    const adapter = makeAdapter({
+      children: async () => ok([{id: 'child-1'}]),
+      liveSessionIds: async () => ok(new Set<string>()),
+    })
+
+    // #when
+    await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
+
+    // #then — settled, since the child of this parent is confirmed no longer live
+    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'settled'}])
+  })
+
+  it('three-way (regression guard): a ledger entry live elsewhere on the server but not a child of this parent is marked unknown, not settled and not left outstanding', async () => {
+    // #given — a ledger entry naming a session that liveSessionIds() reports live (it is running
+    // somewhere on the server right now), but children(parentSessionId) does NOT include it — the
+    // live server does not recognize it as a descendant of this parent at all.
+    const ledger = createOwnershipLedger()
+    ledger.adopt('elsewhere-child', 'reviewer-subagent')
+    const adapter = makeAdapter({
+      children: async () => ok([]), // not a child of this parent
+      liveSessionIds: async () => ok(new Set(['elsewhere-child'])), // live, but under someone else's tree
+    })
+
+    // #when
+    const result = await reconcileLedgerOnce({
+      ledger,
+      adapter,
+      parentSessionId: PARENT_SESSION_ID,
+      logger: makeLogger(),
+    })
+
+    // #then — marked unknown: not settled (no positive observation of completion), and not left
+    // outstanding (that would block drain forever on work that was never this parent's).
+    expect(result.success).toBe(true)
+    expect(ledger.snapshot()).toEqual([{sessionId: 'elsewhere-child', label: 'reviewer-subagent', state: 'unknown'}])
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.unknown()).toBe(1)
+    expect(ledger.isDrainComplete()).toBe(true)
+    expect(ledger.isPersistenceSafe()).toBe(false)
+  })
+
   it('integration: a dispatch whose event was dropped is still discovered without a detected discontinuity', async () => {
     // #given — a child session is live upstream but the ledger never learned of it via any event
     const ledger = createOwnershipLedger()
