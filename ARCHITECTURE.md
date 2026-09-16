@@ -60,6 +60,9 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion status |
 | `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
 | `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | Initialize SDK server lifecycle; probes instance-scoped readiness before reporting success |
+| `createOwnershipLedger` | Function | `packages/runtime/src/agent/ownership-ledger.ts` | In-memory 3-state (outstanding/settled/unknown) ledger for background subagent executions, keyed by child session id |
+| `reconcileLedgerOnce` / `createLedgerReconciler` | Function | `packages/runtime/src/agent/ledger-reconcile.ts` | Recovers the ownership ledger from dispatch/settlement events the SSE stream never delivered, against `children()`/`liveSessionIds()` |
+| `createDispatchAdmission` | Function | `packages/runtime/src/agent/dispatch-admission.ts` | Pre-start outstanding/total/depth admission gate for background dispatch; built, not yet wired into either surface's dispatch path |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version (`3.18.4`) |
 | `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness version (`1.18.30+harness.7c479429`) |
@@ -73,6 +76,8 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `buildDiscordPrompt` | Function | `packages/gateway/src/execute/prompt.ts` | Discord-specific prompt builder |
 | `buildOperatorApp` | Function | `packages/gateway/src/web/server.ts` | Operator Hono app factory |
 | `createWorkflowDispatcher` | Function | `packages/gateway/src/github/dispatch.ts` | `/fro-bot dispatch` GitHub Actions workflow-dispatch adapter (fire-and-forget; no queue, concurrency, or local run-state) |
+| `createDiscordApprovalOnPending` | Function | `packages/gateway/src/approvals/discord-transport.ts` | Discord approval transport; auto-denies on a terminal (channel/thread-gone) delivery failure |
+| `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Startup sweep: reattaches stale `EXECUTING` runs and reconciles persisted background-subagent ownership against the live workspace server |
 
 ## Invariants
 
@@ -187,11 +192,20 @@ Discord messageCreate event
               │     buildDiscordPrompt → OpenCode (workspace:9200, bearer auth)
               │     → SSE event stream → discord/streaming.ts → thread reply
               │
-              ├─→ tool approval (if any tool set to `ask`)
+              ├─→ background dispatch observation (ownership ledger)
+              │     `task` tool completes with state.metadata.background === true
+              │     → ledger.adopt(childSessionId) + coordinator.addOwnedSession
+              │     → descendant's deltas/tools/approvals now route like the root's
+              │
+              ├─→ tool approval (if any tool set to `ask`; root or adopted descendant)
               │     permission.asked → Discord embed (Approve/Deny buttons)
               │     → approval registry → workspace resume/reject
+              │     (a terminal Discord delivery failure — channel/thread gone —
+              │      auto-denies on the server instead of hanging out the run budget)
               │
               └─→ completion
+                    root session.idle with ledger entries still outstanding → drain
+                      (periodic reconciliation until settled or the run deadline expires)
                     run → COMPLETED; heartbeat stop; lock release
                     on failure → FAILED; coarse error reply to thread
 ```
@@ -281,7 +295,19 @@ The write-ahead log itself no longer crosses either transport on save: `DB_TRANS
 
 ### S3 Conditional-Write Lock (Action + Gateway)
 
-The Action and Gateway use the same runtime-owned S3 conditional-write lock (`If-None-Match` / `If-Match`) to coordinate per-repo execution so GitHub and Discord surfaces cannot overlap. Action acquisition lives in `src/harness/phases/acquire-lock.ts` and uses a 15-minute TTL without a heartbeat or `RunState`; `src/harness/phases/cleanup.ts` releases it in a cleanup `finally` block. The shared lock implementation is `packages/runtime/src/coordination/lock.ts`. The Gateway adds heartbeat and run state during execution, with startup stale recovery in `packages/gateway/src/execute/recovery.ts`.
+The Action and Gateway use the same runtime-owned S3 conditional-write lock (`If-None-Match` / `If-Match`) to coordinate per-repo execution so GitHub and Discord surfaces cannot overlap. Action acquisition lives in `src/harness/phases/acquire-lock.ts` and uses a 15-minute TTL without a heartbeat or `RunState`; `src/harness/phases/cleanup.ts` releases it in a cleanup `finally` block. The shared lock implementation is `packages/runtime/src/coordination/lock.ts`. The Gateway adds heartbeat and run state during execution, with startup stale recovery in `packages/gateway/src/execute/recovery.ts` — which also reconciles any persisted background-subagent ownership claim against the live workspace server (see Background Subagent Ownership Ledger below) before deciding whether a stale run's lock can be released.
+
+### Background Subagent Ownership Ledger (Gateway)
+
+`runMention` creates a fresh `OwnershipLedger` (`packages/runtime/src/agent/ownership-ledger.ts`) per run and hands it to `runOpenCodeCore` (`packages/gateway/src/execute/run-core.ts`), keyed on the descendant's child session id rather than its job id — upstream reuses job ids across extensions, so a job-keyed ledger would let a delayed notification for a stale job settle a newer execution. Each entry is `outstanding` (adopted, not yet confirmed finished), `settled` (confirmed finished, terminal), or `unknown` (a dropped event or a failed reconciliation call — never collapsed into `settled`, and blocks `isPersistenceSafe()` without blocking `isDrainComplete()`). A background dispatch is observed, not requested: when a `task` tool call completes carrying `state.metadata.background === true` and a `jobId`, `run-core` adopts that `jobId` into the ledger and calls `coordinator.addOwnedSession(jobId)` — from that point the descendant's own text deltas, tool events, and permission asks route through the same handlers as the root session (`PermissionCoordinator.isOwned`, `packages/gateway/src/approvals/coordinator.ts`) instead of being dropped by the root-session-only filters that used to gate every event branch. Root `session.idle` is deliberately NOT an ownership check — it always resolves the run's completion signal, and a descendant's own idle transition must never be mistaken for the root's. Root idle with `ledger.isDrainComplete() === false` instead enters a drain state: the run stays alive, continuing to route descendant events and approvals, while `createLedgerReconciler` (`packages/runtime/src/agent/ledger-reconcile.ts`) polls every `DEFAULT_LEDGER_RECONCILE_INTERVAL_MS` (30s) — until every entry settles or the run's own deadline expires, at which point every still-outstanding entry is individually `session.abort`-ed and downgraded to `unknown` (a cancellation request was sent, but nothing confirms the child actually stopped).
+
+Reconciliation (`reconcileLedgerOnce`) is the mechanism that recovers the ledger from events the SSE stream never delivered — a reconnect, a discontinuity, or a silent drop. It asks upstream two separate questions and never conflates them: `children(parentSessionId)` is a bare parent-id lookup with no liveness filter (it returns every child ever created, including long-finished ones, so adopting its result wholesale would block drain forever), and `liveSessionIds()` is server-wide non-idle session status. A candidate is adopted only when it is a child of the parent AND live AND not already known; an existing entry is settled only when it is a child of the parent and NOT live; an entry that is not a child of the parent at all — even if `liveSessionIds()` reports it live somewhere else on the server — is downgraded to `unknown`, never settled and never left outstanding, because a persisted or forged entry naming a session live under a different tree must never grant this run's drain or Discord thread access to it. `run.ts` persists the ledger's non-settled entries onto `RunState.details` (`rootSessionId`, `ownedSessionIds`) on every mutation via `wrapLedgerWithHooks`, fire-and-forget; `recovery.ts`'s `reconcileOwnedSessions` reads that claim back on gateway restart, seeds a throwaway ledger with it, and runs one reconciliation pass scoped to the persisted `rootSessionId` before treating any of it as live — a restart is not a workspace restart (subagents may still be writing), but a claim the live server does not corroborate is downgraded, never restored.
+
+Bounded admission (`createDispatchAdmission`, `packages/runtime/src/agent/dispatch-admission.ts`) gates a dispatch BEFORE it starts against an outstanding cap (`DEFAULT_MAX_OUTSTANDING_DISPATCHES` = 2), a lifetime total cap (`DEFAULT_MAX_TOTAL_DISPATCHES` = 8, tracked by its own monotonic counter since `ledger.adopt` is idempotent per session id and would undercount an extension or a promotion), and a depth fixed at 1 (deliberately not configurable — a depth knob would reopen a grandchild-traversal gap upstream cancellation leaves open, since it walks running jobs only). Both caps are provisional (picked during planning, not derived from production fan-out data) and live in `packages/runtime/src/shared/constants.ts` rather than either surface's own config, since the Action and gateway are meant to admit through the same module. **This module has no caller yet** — the gateway currently observes and adopts background dispatches without gating whether they were allowed to start; wiring it into the dispatch path is a later phase.
+
+### Approval Denial on Undeliverable Discord Notification
+
+`createDiscordApprovalOnPending` (`packages/gateway/src/approvals/discord-transport.ts`) posts a tool-approval embed with Approve/Deny buttons and waits for a human. If the bound thread was deleted, that post fails, nobody can answer it, and the run would otherwise wait out its full budget for a decision that can never arrive. `handleUndeliverable` reclassifies a TERMINAL Discord failure — `UnknownChannel` or `MissingAccess`, matched on `DiscordAPIError.code` (a stable numeric code), never on `error.message`, so a wording change upstream cannot silently reclassify a rate limit or a 5xx as fatal — into an immediate server-side denial via `approvalRegistry.applySettlement({decision: 'reject', reason: 'disposed'})`, rather than leaving the entry `open` for a POST that can never succeed. Retryable failures (rate limits, 5xx, network errors) are left alone; the entry stays open via `markMessagePostFailed` so a later settlement can still deliver once the transient condition clears. The denial is deliberately visible, not silent: it logs at `error` with the Discord code, and posts a best-effort thread note worded distinctly from a human "Deny" click or a deadline timeout — because this mechanism turns Discord notification availability into a denial control, and an operator diagnosing a run must be able to tell a delivery failure from a person saying no.
 
 ### OpenCode File Watcher Disabled By Default
 

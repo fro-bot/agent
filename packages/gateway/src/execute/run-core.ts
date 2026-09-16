@@ -21,11 +21,16 @@
  * replicated locally.
  */
 
-import type {OpenCodeServerHandle} from '@fro-bot/runtime'
+import type {OpenCodeServerHandle, OwnershipLedger, Logger as RuntimeLogger} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 
-import {createInactivityTimer} from '@fro-bot/runtime'
+import {
+  createInactivityTimer,
+  createLedgerReconciler,
+  createSdkLedgerReconcileAdapter,
+  reconcileLedgerOnce,
+} from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 import {formatToolPart} from './format-part.js'
 
@@ -43,6 +48,7 @@ export type RunCoreErrorKind =
   | 'inactivity-timeout' // run exceeded the inactivity timeout (no text/tool progress)
   | 'stream-ended' // event stream closed before session.idle was received
   | 'missing-coordinator' // approval-required mode but no coordinator provided (fail-closed)
+  | 'drain-timeout' // root session went idle with owned work outstanding and the deadline expired before it settled
 
 /**
  * Error thrown by `runOpenCodeCore` on any failure path.
@@ -147,6 +153,43 @@ export interface RunCoreParams {
    * When absent, no inactivity timeout is applied.
    */
   readonly inactivityTimeoutMs?: number
+  /**
+   * Ownership ledger for background subagents this run has dispatched.
+   *
+   * When present, `runOpenCodeCore` does three additional things it otherwise
+   * skips entirely (backward-compatible no-op when absent):
+   * - Adopts a session into the ledger (and registers it with
+   *   `coordinator.addOwnedSession`) when a `task` tool call completes with
+   *   `state.metadata.background === true` — the observable signal that a
+   *   background dispatch was made (see `tool/task.ts` upstream).
+   * - Treats the root session's `session.idle` as a DRAIN signal rather than
+   *   completion when the ledger has outstanding entries: the run keeps
+   *   consuming the event stream (routing descendant approvals/activity as
+   *   normal) and periodically reconciling (via `createLedgerReconciler`)
+   *   until every entry settles or the run's own deadline (`signal`) expires.
+   *   Only once the ledger reports drain-complete does `runOpenCodeCore`
+   *   return — so a caller awaiting this call already waits out the full
+   *   drain, and no separate drain stage is needed in `run.ts`.
+   * - On deadline expiry while draining, cancels every still-outstanding
+   *   entry individually (`session.abort`) and throws `RunCoreError` with
+   *   kind `'drain-timeout'` instead of waiting indefinitely.
+   */
+  readonly ownershipLedger?: OwnershipLedger
+  /**
+   * Called after every ledger mutation (adopt/settle/markUnknown) with the
+   * root session id and the current set of NOT-YET-SETTLED owned session ids
+   * (outstanding + unknown; settled entries are omitted since recovery has
+   * nothing left to reconcile for them). `run.ts` uses this to persist
+   * ownership onto the run's `RunState.details` continuously, matching the
+   * shape `recovery.ts`'s `readPersistedOwnership` reads
+   * (`details.rootSessionId`, `details.ownedSessionIds`). Fire-and-forget from
+   * `runOpenCodeCore`'s perspective — a slow or failing persist must never
+   * stall event processing. No-op when absent.
+   */
+  readonly onOwnershipChange?: (info: {
+    readonly rootSessionId: string
+    readonly ownedSessionIds: readonly string[]
+  }) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +205,57 @@ function getStringProperty(value: unknown, property: string): string | null {
 function getObjectProperty(value: unknown, property: string): unknown {
   if (value == null || typeof value !== 'object') return null
   return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
+}
+
+function getBooleanProperty(value: unknown, property: string): boolean | null {
+  if (value == null || typeof value !== 'object') return null
+  const descriptor = Object.getOwnPropertyDescriptor(value, property)
+  return typeof descriptor?.value === 'boolean' ? descriptor.value : null
+}
+
+/**
+ * Adapt the gateway's `(context, message)` logger to the runtime's
+ * `(message, context)` `Logger` shape the ledger-reconciliation primitives
+ * expect. Mirrors `toLedgerReconcileLogger` in `execute/recovery.ts` —
+ * duplicated locally rather than imported to avoid a cross-module coupling
+ * for four one-line functions.
+ */
+function toRuntimeLogger(logger: GatewayLogger): RuntimeLogger {
+  return {
+    debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
+    info: (msg, ctx) => logger.info(ctx ?? {}, msg),
+    warning: (msg, ctx) => logger.warn(ctx ?? {}, msg),
+    error: (msg, ctx) => logger.error(ctx ?? {}, msg),
+  }
+}
+
+/**
+ * Wrap an `OwnershipLedger` so every mutating call also fires `onChange` —
+ * used to persist ownership onto run state and to re-check drain completion
+ * after every adopt/settle/markUnknown, regardless of whether the mutation
+ * came from an observed dispatch event or a reconciliation pass (both go
+ * through this wrapper since reconciliation is handed the wrapped instance).
+ */
+function wrapLedgerWithHooks(ledger: OwnershipLedger, onChange: () => void): OwnershipLedger {
+  return {
+    adopt: (sessionId, label) => {
+      ledger.adopt(sessionId, label)
+      onChange()
+    },
+    settle: sessionId => {
+      ledger.settle(sessionId)
+      onChange()
+    },
+    markUnknown: sessionId => {
+      ledger.markUnknown(sessionId)
+      onChange()
+    },
+    outstanding: () => ledger.outstanding(),
+    unknown: () => ledger.unknown(),
+    isDrainComplete: () => ledger.isDrainComplete(),
+    isPersistenceSafe: () => ledger.isPersistenceSafe(),
+    snapshot: () => ledger.snapshot(),
+  }
 }
 
 function getSessionID(value: unknown): string | null {
@@ -257,6 +351,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     onActivity,
     onBusy,
     inactivityTimeoutMs,
+    ownershipLedger,
+    onOwnershipChange,
   } = params
   const {client} = handle
 
@@ -349,6 +445,50 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     throw new RunCoreError('timeout', 'Run timed out: signal aborted after session creation')
   }
 
+  // ── 1c. Drain machinery — inert when no ledger is provided ─────────────────
+  // `draining` becomes true the first time the root session goes idle with
+  // outstanding owned work. `drainDoneController` is a purely-internal signal
+  // (never a failure) that unblocks the abortable stream once the ledger
+  // reports drain-complete, without conflating that with `combinedSignal`
+  // (whose abort always means timeout/inactivity/cancel).
+  let draining = false
+  const drainDoneController = new AbortController()
+
+  function persistOwnership(): void {
+    if (ownershipLedger === undefined) return
+    const ownedSessionIds = ownershipLedger
+      .snapshot()
+      .filter(entry => entry.state !== 'settled')
+      .map(entry => entry.sessionId)
+    onOwnershipChange?.({rootSessionId: sessionId, ownedSessionIds})
+  }
+
+  function checkDrainComplete(): void {
+    if (ownershipLedger !== undefined && draining === true && ownershipLedger.isDrainComplete()) {
+      drainDoneController.abort()
+    }
+  }
+
+  const ledger: OwnershipLedger | undefined =
+    ownershipLedger === undefined
+      ? undefined
+      : wrapLedgerWithHooks(ownershipLedger, () => {
+          persistOwnership()
+          checkDrainComplete()
+        })
+
+  const reconcileAdapter = ledger === undefined ? undefined : createSdkLedgerReconcileAdapter(client)
+  const runtimeLogger = ledger === undefined ? undefined : toRuntimeLogger(logger)
+  const reconciler =
+    ledger === undefined || reconcileAdapter === undefined || runtimeLogger === undefined
+      ? undefined
+      : createLedgerReconciler({
+          ledger,
+          adapter: reconcileAdapter,
+          parentSessionId: sessionId,
+          logger: runtimeLogger,
+        })
+
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
   // Subscribe BEFORE prompt to eliminate the race where permission.asked fires
   // before the SSE listener exists.
@@ -421,7 +561,15 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // indefinitely waiting for the next event when the signal fires mid-stream.
   // The inner generator races each `next()` call against the abort signal so
   // the loop exits promptly even when the SSE server is silent.
-  const abortableStream = makeAbortableStream(eventStream, combinedSignal)
+  //
+  // `iterationSignal` additionally includes `drainDoneController.signal` so the
+  // loop also unblocks the instant the ledger reports drain-complete, rather
+  // than waiting for the next SSE event that may never arrive. Every existing
+  // `combinedSignal.aborted` check below is unaffected — it still means
+  // exactly "timeout/inactivity/cancel", never "drain finished".
+  const iterationSignal =
+    ledger === undefined ? combinedSignal : AbortSignal.any([combinedSignal, drainDoneController.signal])
+  const abortableStream = makeAbortableStream(eventStream, iterationSignal)
 
   // Observability counters (#1101): disambiguate a genuine workspace hang (zero events
   // observed) from an event-delivery/routing gap (events arrived but none reset the
@@ -530,6 +678,29 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
               const stateInput = getObjectProperty(toolState, 'input')
               const stateTitle = getStringProperty(toolState, 'title')
               logger.debug({tool, status}, 'run-core: tool completed (message.part.updated)')
+
+              // Background dispatch observed: a `task` tool call completes immediately
+              // once dispatch begins, carrying `metadata.background === true` and
+              // `metadata.jobId` (the child session id) -- see upstream `tool/task.ts`.
+              // Adopt the child into the ledger and register it as owned so its own
+              // events and approvals route from here on. Admission (whether the
+              // dispatch was allowed to start) is a separate concern this call site
+              // does not own -- by the time this event arrives the dispatch already ran.
+              if (ledger !== undefined && status === 'completed' && tool === 'task') {
+                const stateMetadata = getObjectProperty(toolState, 'metadata')
+                const jobId = getStringProperty(stateMetadata, 'jobId')
+                const isBackground = getBooleanProperty(stateMetadata, 'background')
+                if (jobId !== null && isBackground === true) {
+                  const label = stateTitle ?? 'background task'
+                  ledger.adopt(jobId, label)
+                  ownershipCoordinator.addOwnedSession(jobId)
+                  logger.info(
+                    {sessionId, jobId, label},
+                    'run-core: background dispatch observed -- adopted into ownership ledger',
+                  )
+                }
+              }
+
               appendToolSummary(
                 {
                   tool,
@@ -635,22 +806,52 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           }
         }
       } else if (eventType === 'session.idle') {
-        // Deliberately root-scoped, NOT an ownership check: this is the signal
-        // that ends the loop below. Widening it to ownership would let a
-        // descendant's own idle transition end the run while the root is still
-        // working — the exact invisibility this effort exists to fix, just
-        // relocated. Descendant completion is a drain concern (a later unit);
-        // here a descendant going idle is simply not handled (no branch below).
+        // Deliberately root-scoped, NOT an ownership check: a descendant's own
+        // idle transition must never end the run while the root is still
+        // working. Root idle is the signal to CONSIDER finishing; whether that
+        // is actually allowed is the ledger's call, below.
         const eventSessionID = getEventSessionID(rawEvent)
         if (eventSessionID === sessionId) {
-          logger.info(
-            {sessionId, totalEvents, activityEvents, lastEventType},
-            'run-core: session.idle received — stream complete',
-          )
-          // Signal not-busy: work is done.
-          onBusy?.(false)
-          clearInactivity()
-          return
+          if (ledger === undefined || ledger.isDrainComplete()) {
+            logger.info(
+              {sessionId, totalEvents, activityEvents, lastEventType},
+              'run-core: session.idle received — stream complete',
+            )
+            // Signal not-busy: work is done.
+            onBusy?.(false)
+            clearInactivity()
+            return
+          }
+
+          // Outstanding owned work: enter (or remain in) drain rather than
+          // completing. The run stays alive — slot, lease, and approval routing
+          // all continue exactly as during execution — until the ledger settles
+          // or the run's own deadline (`combinedSignal`) expires.
+          if (draining === false) {
+            draining = true
+            logger.info(
+              {sessionId, outstanding: ledger.outstanding(), totalEvents, activityEvents},
+              'run-core: root session idle with owned work outstanding — draining',
+            )
+            onBusy?.(false)
+            clearInactivity()
+          }
+
+          // Immediate reconcile pass so already-finished background work settles
+          // without waiting for the reconciler's interval. Fire-and-forget: its
+          // mutations (via the wrapped ledger) trigger persistence and the
+          // drain-complete check on their own once they land.
+          if (reconcileAdapter !== undefined && runtimeLogger !== undefined) {
+            // eslint-disable-next-line no-void
+            void reconcileLedgerOnce({
+              ledger,
+              adapter: reconcileAdapter,
+              parentSessionId: sessionId,
+              logger: runtimeLogger,
+            }).catch(() => {
+              // reconcileLedgerOnce never rejects; this satisfies no-floating-promises.
+            })
+          }
         }
       } else if (eventType === 'session.error') {
         const eventSessionID = getEventSessionID(rawEvent)
@@ -675,11 +876,61 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // The explicit clearInactivity() calls on the session.idle and session.error paths are
     // kept as defensive double-clears — pause()/dispose() on an already-cleared timer is a no-op.
     inactivityTimer.dispose()
+    reconciler?.dispose()
+  }
+
+  // Drain completed successfully: the ledger reported drain-complete and
+  // `drainDoneController` unblocked the stream — NOT a failure path. Checked
+  // before `combinedSignal.aborted` because both signals feed `iterationSignal`
+  // and only one can be responsible for a given exit.
+  if (combinedSignal.aborted === false && drainDoneController.signal.aborted === true) {
+    logger.info(
+      {sessionId, totalEvents, activityEvents, lastEventType},
+      'run-core: drain complete — owned work settled',
+    )
+    onBusy?.(false)
+    clearInactivity()
+    return
   }
 
   // Stream exhausted (loop exited normally or via break). Distinguish timeout from premature close.
   // NOTE: this block runs AFTER the finally above, so clearInactivity() has already fired.
   if (combinedSignal.aborted) {
+    if (ledger !== undefined && draining === true) {
+      // The run's own deadline covers execution AND drain — there is no
+      // separate drain budget to extend, and a completion notification never
+      // resets `combinedSignal`. Cancel every still-outstanding entry
+      // individually (a completed entry linking to a running one is never the
+      // gateway's problem at depth one, but cancelling per-entry rather than a
+      // single tree-cancel means raising the depth later does not silently
+      // reintroduce that gap). Each entry is downgraded to `unknown` — the
+      // cancellation request was sent, but nothing here confirms the child
+      // actually stopped, so `unknown` (not `settled`) is the honest state.
+      const outstandingEntries = ledger.snapshot().filter(entry => entry.state === 'outstanding')
+      await Promise.allSettled(
+        outstandingEntries.map(async entry => {
+          try {
+            await client.session.abort({
+              path: {id: entry.sessionId},
+              query: {directory},
+              signal: AbortSignal.timeout(5_000),
+            })
+          } catch (error) {
+            logger.warn(
+              {sessionId: entry.sessionId, detail: error instanceof Error ? error.message : String(error)},
+              'run-core: failed to abort owned session during drain-deadline cancellation',
+            )
+          }
+          ledger.markUnknown(entry.sessionId)
+        }),
+      )
+      logger.warn(
+        {sessionId, cancelledCount: outstandingEntries.length, totalEvents, activityEvents},
+        'run-core: drain deadline expired — cancelled outstanding owned work, run reports incomplete',
+      )
+      throw new RunCoreError('drain-timeout', 'Run timed out while draining outstanding owned work')
+    }
+
     // Inactivity is the tighter bound (always < hard ceiling), so on the rare both-aborted
     // tick we attribute to inactivity-timeout deliberately.
     if (inactivityArmed && inactivityTimer.signal.aborted) {

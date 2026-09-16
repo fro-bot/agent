@@ -1,4 +1,4 @@
-import type {CoordinationConfig, HeartbeatController} from '@fro-bot/runtime'
+import type {CoordinationConfig, HeartbeatController, RunState} from '@fro-bot/runtime'
 import type {Message, ThreadChannel} from 'discord.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
@@ -9,6 +9,7 @@ import type {RunMentionDeps, RunTask} from './run.js'
 import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
 import * as runtimeModule from '@fro-bot/runtime'
+import {err, ok} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as coordinatorModule from '../approvals/coordinator.js'
 import * as discordApprovalsModule from '../discord/approvals.js'
@@ -497,6 +498,42 @@ function setupHappyPath(heartbeatOverrides?: {start?: ReturnType<typeof vi.fn>; 
     },
   } as unknown as ReturnType<typeof attachModule.attachOpencode>)
   vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+}
+
+/**
+ * In-memory `CoordinationConfig` whose `getObject`/`conditionalPut` perform a real
+ * read-modify-write cycle (mirrors `cancel.test.ts`'s `makeCoordinationConfig`), so
+ * `patchRunDetails` — NOT mocked by this file's `vi.mock('@fro-bot/runtime', ...)`,
+ * which only overrides `acquireLock`/`releaseLock`/`createRun`/`transitionRun`/
+ * `createHeartbeatController` — actually executes against it.
+ */
+function makeOwnershipCoordinationConfig(initialState: RunState, initialEtag = 'etag-1') {
+  let stored = {state: initialState, etag: initialEtag}
+  const writes: RunState[] = []
+  const config: CoordinationConfig = {
+    storeAdapter: {
+      upload: vi.fn(async () => ok(undefined)),
+      download: vi.fn(async () => ok(undefined)),
+      getObject: vi.fn(async () => ok({data: JSON.stringify(stored.state), etag: stored.etag})),
+      conditionalPut: vi.fn(async (_key: string, data: string, opts: {readonly ifMatch?: string}) => {
+        if (opts.ifMatch !== undefined && opts.ifMatch !== stored.etag) {
+          return err(new Error('etag mismatch (412)'))
+        }
+        const nextEtag = `etag-${Math.random().toString(36).slice(2)}`
+        const nextState = JSON.parse(data) as RunState
+        writes.push(nextState)
+        stored = {state: nextState, etag: nextEtag}
+        return ok({etag: nextEtag})
+      }),
+      list: vi.fn(async () => ok([])),
+    },
+    storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+    lockTtlSeconds: 900,
+    heartbeatIntervalMs: 30_000,
+    staleThresholdMs: 60_000,
+    pendingStaleThresholdMs: 30 * 60_000,
+  }
+  return {config, writes: () => writes}
 }
 
 // ---------------------------------------------------------------------------
@@ -8204,6 +8241,29 @@ describe('failureKind persistence on FAILED transitions', () => {
     const summary = toRunSummary(result.data.state, {owner: 'acme', repo: 'widget'})
     expect(summary?.failureKind).toBe('inactivity-timeout')
   })
+
+  it('drain-timeout failure: detailsPatch.failureKind = internal "drain-timeout" kind (projects to max-duration-timeout)', async () => {
+    // #given — Unit 6: a run's deadline covers execution AND drain, so a drain-timeout
+    // is operator-facing exactly the same deadline-expiry outcome as a plain timeout.
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('drain-timeout', 'drain deadline expired'))
+
+    const deps = makeDeps()
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('drain-timeout')
+
+    const {toOperatorFailureKind} = await import('../operator-contract/run-status.js')
+    expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('max-duration-timeout')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -8478,5 +8538,198 @@ describe('operatorPushDispatcher wiring', () => {
     // unreached — otherwise this test would pass even if dispatch never fired
     expect(throwingDispatcher.dispatchApprovalPending.mock.calls.length).toBeGreaterThanOrEqual(1)
     expect(throwingDispatcher.dispatchRunFailed.mock.calls.length).toBeGreaterThanOrEqual(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit 6: drain — hold the run through outstanding owned work
+// ---------------------------------------------------------------------------
+
+describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('heartbeat is not stopped until runOpenCodeCore resolves, even across a drain longer than the heartbeat interval', async () => {
+    // #given — fake timers; runOpenCodeCore (which owns the whole drain loop internally)
+    // is held open by a controlled promise so the test can advance time past a single
+    // heartbeat interval (30s default) while the run is still "draining".
+    vi.useFakeTimers()
+    const {runMention} = await import('./run.js')
+    const startFn = vi.fn()
+    const stopFn = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: buildMockRunState()},
+    })
+    setupHappyPath({start: startFn, stop: stopFn})
+
+    let resolveRun: (() => void) | undefined
+    mockRunOpenCodeCore.mockImplementation(
+      async () =>
+        new Promise<void>(resolve => {
+          resolveRun = resolve
+        }),
+    )
+
+    const deps = makeDeps()
+    const message = makeMessage()
+    const runPromise = runMention(message, makeBinding(), deps)
+
+    // Let admission run through to heartbeat.start() + runOpenCodeCore being invoked.
+    await vi.advanceTimersByTimeAsync(0)
+    expect(startFn).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+
+    // #when — advance well past a single heartbeat interval while still draining.
+    await vi.advanceTimersByTimeAsync(65_000)
+
+    // #then — the run is still executing (drain in progress): stop() must not have fired.
+    // Stopping the heartbeat is what lets ANOTHER instance sweep this run as stale and
+    // kill the subagents — firing it while owned work is outstanding would be a bug.
+    expect(stopFn).not.toHaveBeenCalled()
+
+    // #and — once drain completes (runOpenCodeCore resolves), stop() fires exactly once.
+    resolveRun?.()
+    await runPromise
+    expect(stopFn).toHaveBeenCalledOnce()
+  })
+
+  it('ownership is persisted onto run state as entries are adopted, not only at completion', async () => {
+    // #given
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const {config: coordinationConfig, writes} = makeOwnershipCoordinationConfig(
+      buildMockRunState({phase: 'EXECUTING'}),
+    )
+
+    let capturedOnOwnershipChange:
+      ((info: {readonly rootSessionId: string; readonly ownedSessionIds: readonly string[]}) => void) | undefined
+    let resolveRun: (() => void) | undefined
+    mockRunOpenCodeCore.mockImplementation(async params => {
+      capturedOnOwnershipChange = (params as {onOwnershipChange?: typeof capturedOnOwnershipChange}).onOwnershipChange
+      await new Promise<void>(resolve => {
+        resolveRun = resolve
+      })
+    })
+
+    const deps = makeDeps({coordinationConfig})
+    const message = makeMessage()
+    const runPromise = runMention(message, makeBinding(), deps)
+
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(capturedOnOwnershipChange).toBeDefined()
+
+    // #when — an entry is adopted mid-execution, well before the run resolves.
+    capturedOnOwnershipChange?.({rootSessionId: 'root-1', ownedSessionIds: ['child-1']})
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then — already persisted, before `runOpenCodeCore` (and therefore the run) has resolved.
+    expect(writes().length).toBeGreaterThanOrEqual(1)
+    const firstWrite = writes()[0]
+    expect(firstWrite?.details.rootSessionId).toBe('root-1')
+    expect(firstWrite?.details.ownedSessionIds).toEqual(['child-1'])
+
+    // Drive the run to completion so nothing leaks into the next test.
+    resolveRun?.()
+    await runPromise
+  })
+
+  it('a run interrupted mid-drain leaves run state in the exact shape recovery.ts reads (rootSessionId, ownedSessionIds)', async () => {
+    // #given — same setup as above, but the run is never allowed to resolve (simulating
+    // a crash/restart mid-drain): only the persisted state matters for this assertion.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const {config: coordinationConfig, writes} = makeOwnershipCoordinationConfig(
+      buildMockRunState({phase: 'EXECUTING'}),
+    )
+
+    let capturedOnOwnershipChange:
+      ((info: {readonly rootSessionId: string; readonly ownedSessionIds: readonly string[]}) => void) | undefined
+    mockRunOpenCodeCore.mockImplementation(
+      async params =>
+        new Promise<void>(() => {
+          // Deliberately never resolves — models a gateway crash mid-drain.
+          capturedOnOwnershipChange = (params as {onOwnershipChange?: typeof capturedOnOwnershipChange})
+            .onOwnershipChange
+        }),
+    )
+
+    const deps = makeDeps({coordinationConfig})
+    const message = makeMessage()
+    // Fire-and-forget: this promise never resolves by construction (see above), so it must
+    // not be awaited.
+    // eslint-disable-next-line no-void
+    void runMention(message, makeBinding(), deps)
+
+    await new Promise(resolve => setTimeout(resolve, 10))
+    capturedOnOwnershipChange?.({rootSessionId: 'root-crash-1', ownedSessionIds: ['child-crash-1', 'child-crash-2']})
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then — what landed in the store uses the EXACT field names
+    // `recovery.ts`'s `readPersistedOwnership` reads: `details.rootSessionId` (string) and
+    // `details.ownedSessionIds` (string[]) — see `packages/gateway/src/execute/recovery.ts`
+    // (`run.details.rootSessionId`, `run.details.ownedSessionIds`) and its own Unit 7 test
+    // suite's `persistedOwnershipDetails()` helper, which asserts against those same two keys.
+    const lastWrite = writes().at(-1)
+    expect(Object.keys(lastWrite?.details ?? {}).sort()).toEqual(['ownedSessionIds', 'rootSessionId'])
+    expect(lastWrite?.details.rootSessionId).toBe('root-crash-1')
+    expect(lastWrite?.details.ownedSessionIds).toEqual(['child-crash-1', 'child-crash-2'])
+  })
+
+  it('integration: a second queued run does not start until the first has finished draining', async () => {
+    // #given — the first run's runOpenCodeCore call is held open (simulating drain) while
+    // a second message arrives and is enqueued for the same channel.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const releaseFn = vi.fn()
+    const sharedConcurrency = {
+      tryAcquire: vi.fn().mockReturnValue('ok'),
+      release: releaseFn,
+      activeCount: vi.fn().mockReturnValue(1),
+      max: 3,
+    }
+    const queue = makeDefaultQueue()
+
+    const pendingMessage = makeMessage()
+    const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue})
+    const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
+    ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
+
+    const callOrder: string[] = []
+    let resolveFirstDrain: (() => void) | undefined
+    mockRunOpenCodeCore.mockImplementationOnce(async () => {
+      callOrder.push('run-1-start')
+      await new Promise<void>(resolve => {
+        resolveFirstDrain = resolve
+      })
+      callOrder.push('run-1-drain-complete')
+    })
+    mockRunOpenCodeCore.mockImplementationOnce(async () => {
+      callOrder.push('run-2-start')
+    })
+
+    const deps = makeDeps({concurrency: sharedConcurrency, queue})
+    const message = makeMessage()
+
+    // #when — start the first run; it blocks in "drain"
+    const runPromise = runMention(message, makeBinding(), deps)
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then — the second (queued) run has not started while the first is still draining
+    expect(callOrder).toEqual(['run-1-start'])
+    expect(releaseFn).not.toHaveBeenCalled()
+
+    // #when — the first run's drain completes
+    resolveFirstDrain?.()
+    await runPromise
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then — the second run started only AFTER the first fully resolved
+    expect(callOrder).toEqual(['run-1-start', 'run-1-drain-complete', 'run-2-start'])
+    expect(releaseFn).toHaveBeenCalledExactlyOnceWith(CHANNEL_ID)
   })
 })

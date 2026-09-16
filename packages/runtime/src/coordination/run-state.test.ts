@@ -5,7 +5,7 @@ import type {CoordinationConfig, RunState} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {err, ok} from '../shared/types.js'
-import {createRun, findStaleRuns, parseRunState, transitionRun} from './run-state.js'
+import {createRun, findStaleRuns, parseRunState, patchRunDetails, transitionRun} from './run-state.js'
 
 function createLogger(): Logger {
   return {
@@ -871,5 +871,153 @@ describe('run-state coordination', () => {
       key: 'fro-bot-state/coordination/owner/repo/runs/invalid.json',
     })
     expect(typeof malformedLogCall?.[1]?.error).toBe('string')
+  })
+
+  // ---------------------------------------------------------------------------
+  // patchRunDetails — same-phase detail patch (Unit 6: ownership persistence)
+  // ---------------------------------------------------------------------------
+
+  describe('patchRunDetails', () => {
+    it('merges a shallow patch into details without changing phase', async () => {
+      // #given — an EXECUTING run with no ownership fields yet
+      const executing = createRunState({phase: 'EXECUTING', details: {channelId: 'ch-1'}})
+      const storeAdapter = createStoreAdapter({
+        getObject: vi.fn(async () => ok({data: JSON.stringify(executing), etag: 'etag-1'})),
+        conditionalPut: vi.fn(async () => ok({etag: 'etag-2'})),
+      })
+      const config = createCoordinationConfig(storeAdapter)
+      const logger = createLogger()
+
+      // #when
+      const result = await patchRunDetails(
+        config,
+        'coordination',
+        'owner/repo',
+        'run-1',
+        {rootSessionId: 'root-1', ownedSessionIds: ['child-1', 'child-2']},
+        logger,
+      )
+
+      // #then — phase is untouched; details is merged (existing channelId preserved)
+      expect(result.success).toBe(true)
+      const expectedState = {
+        ...executing,
+        details: {channelId: 'ch-1', rootSessionId: 'root-1', ownedSessionIds: ['child-1', 'child-2']},
+      }
+      expect(result).toEqual(ok({etag: 'etag-2', state: expectedState}))
+      expect(storeAdapter.conditionalPut).toHaveBeenCalledWith(
+        'fro-bot-state/coordination/owner/repo/runs/run-1.json',
+        JSON.stringify(expectedState),
+        {ifMatch: 'etag-1', tagging: 'object-type=run-state'},
+      )
+    })
+
+    it('a later patch replaces the whole array under a repeated key rather than merging into it', async () => {
+      // #given — a run already carrying a partial ownedSessionIds list from a prior patch
+      const partiallyOwned = createRunState({
+        phase: 'EXECUTING',
+        details: {rootSessionId: 'root-1', ownedSessionIds: ['child-1']},
+      })
+      const storeAdapter = createStoreAdapter({
+        getObject: vi.fn(async () => ok({data: JSON.stringify(partiallyOwned), etag: 'etag-1'})),
+        conditionalPut: vi.fn(async () => ok({etag: 'etag-2'})),
+      })
+      const config = createCoordinationConfig(storeAdapter)
+      const logger = createLogger()
+
+      // #when — a second entry is adopted
+      const result = await patchRunDetails(
+        config,
+        'coordination',
+        'owner/repo',
+        'run-1',
+        {rootSessionId: 'root-1', ownedSessionIds: ['child-1', 'child-2']},
+        logger,
+      )
+
+      // #then — the whole array is replaced (shallow merge, not a deep array merge)
+      expect(result.success).toBe(true)
+      expect(result.success === true ? result.data.state.details.ownedSessionIds : null).toEqual(['child-1', 'child-2'])
+    })
+
+    it('re-reads the object fresh on every call rather than reusing a caller-held etag', async () => {
+      // #given — an in-memory store where a concurrent write (simulating the
+      // heartbeat's own read-patch-write cycle) lands BETWEEN two patchRunDetails
+      // calls that share no etag with each other.
+      let stored = {state: createRunState({phase: 'EXECUTING', details: {}}), etag: 'etag-1'}
+      const getObjectMock = vi.fn(async () => ok({data: JSON.stringify(stored.state), etag: stored.etag}))
+      const conditionalPutMock = vi.fn(
+        async (_key: string, data: string, opts: {readonly ifMatch?: string; readonly tagging?: string}) => {
+          if (opts.ifMatch !== undefined && opts.ifMatch !== stored.etag) {
+            return err(new Error('etag mismatch (412)'))
+          }
+          const nextEtag = `etag-${stored.etag}-next`
+          stored = {state: JSON.parse(data) as RunState, etag: nextEtag}
+          return ok({etag: nextEtag})
+        },
+      )
+      const storeAdapter = createStoreAdapter({getObject: getObjectMock, conditionalPut: conditionalPutMock})
+      const config = createCoordinationConfig(storeAdapter)
+      const logger = createLogger()
+
+      // #when — first patch commits (root session adopted)
+      const first = await patchRunDetails(
+        config,
+        'coordination',
+        'owner/repo',
+        'run-1',
+        {rootSessionId: 'root-1'},
+        logger,
+      )
+      expect(first.success).toBe(true)
+
+      // A concurrent write lands here — e.g. the heartbeat controller's own
+      // read-patch-write cycle bumping `last_heartbeat` — advancing the stored etag
+      // without patchRunDetails's caller ever seeing it.
+      stored = {state: {...stored.state, last_heartbeat: '2026-04-24T18:16:00.000Z'}, etag: 'etag-from-heartbeat'}
+
+      // #then — a second patch, issued by a caller that never re-read after the
+      // heartbeat's write, still succeeds: it reads fresh rather than reusing the
+      // first call's etag, so it is not a guaranteed 412.
+      const second = await patchRunDetails(
+        config,
+        'coordination',
+        'owner/repo',
+        'run-1',
+        {ownedSessionIds: ['child-1']},
+        logger,
+      )
+      expect(second.success).toBe(true)
+      expect(second.success === true ? second.data.state.details : null).toEqual({
+        rootSessionId: 'root-1',
+        ownedSessionIds: ['child-1'],
+      })
+      // #and — the heartbeat's own field survived the merge (fresh read picked it up).
+      expect(second.success === true ? second.data.state.last_heartbeat : null).toBe('2026-04-24T18:16:00.000Z')
+    })
+
+    it('returns an error rather than throwing when the current run-state cannot be read', async () => {
+      // #given
+      const storeAdapter = createStoreAdapter({
+        getObject: vi.fn(async () => err(new Error('S3 unreachable'))),
+      })
+      const config = createCoordinationConfig(storeAdapter)
+      const logger = createLogger()
+
+      // #when
+      const result = await patchRunDetails(
+        config,
+        'coordination',
+        'owner/repo',
+        'run-1',
+        {rootSessionId: 'root-1'},
+        logger,
+      )
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(result.success === false ? result.error.message : '').toContain('S3 unreachable')
+      expect(storeAdapter.conditionalPut).not.toHaveBeenCalled()
+    })
   })
 })
