@@ -1,6 +1,7 @@
 import type {OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode, Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
+import type {AttemptSettlement} from './attempt-outcome.js'
 import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
@@ -40,18 +41,14 @@ export interface AttemptResult {
   readonly shouldRetry: boolean
   readonly eventStreamResult: EventStreamResult
   /**
-   * True only when the shared execution deadline is what forced this attempt to conclude, as
-   * determined at the one point retry.ts's `runPromptAttempt` knows the answer: immediately after
-   * the poll/wait race settles, before `collectEventResults()`'s bounded SSE cleanup can advance
-   * the clock further (see `deadlineConcludedWait`). Only ever populated on the ledger-deferred
-   * failure fold-back (see `deferredFailedPromptStartResult`) -- explicitly `false` there when the
-   * ledger wait resolved on its own before the deadline, not omitted, so callers can rely on its
-   * presence whenever a deferred failure was folded back. Never set on a success. Deferral
-   * describes *why* an attempt waited (outstanding owned work); this describes *what ended it*
-   * (the deadline, as opposed to the attempt resolving on its own) -- callers use this, not
-   * deadline state re-observed later during teardown, to tell those apart.
+   * Why observation of this attempt stopped, as decided at the one point it was actually decided
+   * -- never re-derived later from a clock read. See attempt-outcome.ts's module doc for the
+   * governing invariant: selecting an error never proves quiescence, and observing quiescence
+   * never erases an error. Every `AttemptResult` construction site states the settlement it
+   * actually observed; callers (execution.ts) read this instead of inferring a cause from deadline
+   * or ledger state observed after the fact.
    */
-  readonly deadlineConcluded?: boolean
+  readonly settlement: AttemptSettlement
 }
 
 export async function sendPromptToSession(
@@ -96,6 +93,7 @@ export async function sendPromptToSession(
         llmError: promptLlmError,
         outcome,
         shouldRetry: shouldRetryFromOutcome(outcome),
+        settlement: {kind: 'failure-observed'},
         eventStreamResult: {
           tokens: null,
           model: null,

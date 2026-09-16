@@ -155,6 +155,64 @@ function createMockClient(events: readonly Event[]) {
   }
 }
 
+function mockSendPromptToSession(result: AttemptResult): ReturnType<typeof vi.fn> {
+  const sendPromptToSession = vi.fn().mockResolvedValue(result)
+  vi.doMock('./prompt-sender.js', () => ({
+    sendPromptToSession,
+    buildContinuationPrompt: vi.fn().mockReturnValue('continue from where the previous turn left off'),
+  }))
+  return sendPromptToSession
+}
+
+function mockOpencodeClient(): ReturnType<typeof createMockClient> {
+  const client = createMockClient([])
+  vi.mocked(createOpencode).mockResolvedValue({
+    client: client as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+    server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+  })
+  return client
+}
+
+/**
+ * A controllable `ExecutionDeadline` double: `run()` mirrors the real admission check (throws a
+ * `DeadlineExceededError`-named error when already expired), but `isExpired()`/`isTimedOut()` are
+ * driven entirely by the test, not wall-clock time -- lets each row flip expiry at an exact point
+ * in the sequence instead of racing fake timers.
+ */
+function createControlledDeadline(): {
+  readonly deadline: ExecutionDeadline
+  readonly setExpired: (value: boolean) => void
+} {
+  let expired = false
+  const deadline: ExecutionDeadline = {
+    timeoutMs: 1_000,
+    signal: new AbortController().signal,
+    isExpired: () => expired,
+    isTimedOut: () => expired,
+    remainingMs: () => (expired ? 0 : 1_000),
+    run: async operation => {
+      if (expired) {
+        const error = new Error('deadline exceeded (test double)')
+        error.name = 'DeadlineExceededError'
+        throw error
+      }
+      return operation()
+    },
+    dispose: vi.fn(),
+  }
+  return {deadline, setExpired: (value: boolean) => (expired = value)}
+}
+
+async function mockControlledDeadline(): Promise<ReturnType<typeof createControlledDeadline>> {
+  const actualRetry = await vi.importActual<typeof import('./retry.js')>('./retry.js')
+  const controlled = createControlledDeadline()
+  vi.doMock('./retry.js', () => ({
+    ...actualRetry,
+    createExecutionDeadline: vi.fn().mockReturnValue(controlled.deadline),
+  }))
+  return controlled
+}
+
 describe('executeOpenCode — ownership ledger threading (Unit 11)', () => {
   let mockLogger: Logger
 
@@ -215,6 +273,7 @@ describe('executeOpenCode — ownership ledger threading (Unit 11)', () => {
       llmError: {type: 'rate_limit', message: 'rate limited', retryable: true},
       outcome: 'turn_failed_retryable',
       shouldRetry: true,
+      settlement: {kind: 'failure-observed'},
       eventStreamResult: {
         tokens: null,
         model: null,
@@ -231,6 +290,7 @@ describe('executeOpenCode — ownership ledger threading (Unit 11)', () => {
       llmError: null,
       outcome: 'completed',
       shouldRetry: false,
+      settlement: {kind: 'completion-observed'},
       eventStreamResult: {
         tokens: null,
         model: null,
@@ -420,7 +480,7 @@ const EMPTY_EVENT_STREAM_RESULT = {
   llmError: null,
 }
 
-describe('executeOpenCode — deadlineConcluded governs abort, not deferred (round 6 regression)', () => {
+describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement restructure)', () => {
   let mockLogger: Logger
 
   beforeEach(() => {
@@ -431,53 +491,137 @@ describe('executeOpenCode — deadlineConcluded governs abort, not deferred (rou
   afterEach(async () => {
     vi.doUnmock('./prompt-sender.js')
     vi.doUnmock('./retry.js')
+    vi.doUnmock('./prompt.js')
     vi.resetModules()
     vi.useRealTimers()
     vi.restoreAllMocks()
   })
 
-  it('does not abort a ledger-deferred failure that resolved before the deadline, even though later cleanup pushes deadline.isExpired() to true', async () => {
-    // #given `sendPromptToSession` reports a failure whose `deadlineConcluded` was captured as
-    // `false` inside retry.ts (the ledger wait resolved on its own, well before any deadline) --
-    // but the mock does not actually resolve back to executeOpenCode until 2s later, well past the
-    // 1s budget. If the finalizer re-derived its abort signal from live deadline.isExpired() state
-    // instead of trusting the captured field, it would wrongly abort here.
-    vi.useFakeTimers()
-    const deferredEarlyFailure: AttemptResult = {
+  // Row 1 (complement of the many existing "expired during cleanup" success tests in
+  // opencode.test.ts, e.g. 'preserves terminal success when title reassertion crosses the
+  // deadline') -- completed, deadline never expires, no abort.
+  it('row 1: completed while the deadline has not expired does not abort', async () => {
+    mockSendPromptToSession({
+      success: true,
+      error: null,
+      llmError: null,
+      outcome: 'completed',
+      shouldRetry: false,
+      settlement: {kind: 'completion-observed'},
+      eventStreamResult: EMPTY_EVENT_STREAM_RESULT,
+    })
+    const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
+    const client = mockOpencodeClient()
+
+    const result = await freshExecuteOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 60_000,
+      omoProviders: createDisabledProviders(),
+    })
+
+    expect(result.success).toBe(true)
+    expect(client.session.abort).not.toHaveBeenCalled()
+  })
+
+  // Row 3 (complement of the existing opencode.test.ts row-4 pin, 'preserves a pre-deadline
+  // retryable failure when cleanup crosses the deadline without retrying') -- a terminal failure
+  // decided well before the deadline, deadline still open, no abort.
+  it('row 3: a terminal failure decided before the deadline expires does not abort', async () => {
+    mockSendPromptToSession({
+      success: false,
+      error: 'model provider rejected the request',
+      llmError: null,
+      outcome: 'turn_failed_terminal',
+      shouldRetry: false,
+      settlement: {kind: 'failure-observed'},
+      eventStreamResult: EMPTY_EVENT_STREAM_RESULT,
+    })
+    const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
+    const client = mockOpencodeClient()
+
+    const result = await freshExecuteOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 60_000,
+      omoProviders: createDisabledProviders(),
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.error).toBe('model provider rejected the request')
+    expect(client.session.abort).not.toHaveBeenCalled()
+  })
+
+  // Rows 6/7: a ledger-deferred failure that resolved on its own, before the deadline. Row 6 asks
+  // before the deadline later expires at all; row 7 asks with the deadline expiring afterward
+  // during unrelated cleanup (inspectResponseFile, mocked here to flip the deadline double after
+  // `sendPromptToSession` has already settled). Neither aborts -- the failure was decided, not the
+  // deadline. This replaces the old "round 6 regression" coverage, which pinned a `deadlineConcluded`
+  // field retry.ts no longer populates (removed in steps 3b/5 of this restructure); these two prove
+  // the same real property against `executeOpenCode`'s own capture, not a fabricated field.
+  it('row 6: a ledger-deferred failure resolved before the deadline does not abort', async () => {
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+    ledger.settle('ses_child')
+    mockSendPromptToSession({
       success: false,
       error: 'ledger-deferred failure resolved before the deadline',
       llmError: null,
       outcome: 'turn_failed_terminal',
       shouldRetry: false,
+      settlement: {kind: 'failure-observed'},
       eventStreamResult: EMPTY_EVENT_STREAM_RESULT,
-      deadlineConcluded: false,
-    }
-    const sendPromptToSession = vi
-      .fn()
-      .mockImplementation(async () => new Promise(resolve => setTimeout(() => resolve(deferredEarlyFailure), 2_000)))
-    vi.doMock('./prompt-sender.js', () => ({
-      sendPromptToSession,
-      buildContinuationPrompt: vi.fn(),
+    })
+    const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
+    const client = mockOpencodeClient()
+
+    const result = await freshExecuteOpenCode(
+      createMockPromptOptions(),
+      mockLogger,
+      {agent: null, model: null, timeoutMs: 60_000, omoProviders: createDisabledProviders()},
+      undefined,
+      ledger,
+    )
+
+    expect(result.success).toBe(false)
+    expect(result.error).toBe('ledger-deferred failure resolved before the deadline')
+    expect(client.session.abort).not.toHaveBeenCalled()
+  })
+
+  it('row 7: a ledger-deferred failure resolved before the deadline does not abort even when the deadline expires during later cleanup', async () => {
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+    ledger.settle('ses_child')
+    const {setExpired} = await mockControlledDeadline()
+    mockSendPromptToSession({
+      success: false,
+      error: 'ledger-deferred failure resolved before the deadline',
+      llmError: null,
+      outcome: 'turn_failed_terminal',
+      shouldRetry: false,
+      settlement: {kind: 'failure-observed'},
+      eventStreamResult: EMPTY_EVENT_STREAM_RESULT,
+    })
+    // inspectResponseFile runs strictly after executeOpenCode captures this attempt's settle-time
+    // deadline state -- flipping expiry here simulates unrelated post-decision cleanup crossing the
+    // deadline, exactly like the real reassertSessionTitle/SSE-shutdown timing this test stands in for.
+    vi.doMock('./response-file.js', () => ({
+      inspectResponseFile: vi.fn().mockImplementation(async () => {
+        setExpired(true)
+        return 'absent'
+      }),
     }))
     const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
-    const client = createMockClient([])
-    vi.mocked(createOpencode).mockResolvedValue({
-      client: client as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-    })
+    const client = mockOpencodeClient()
 
-    // #when
-    const resultPromise = freshExecuteOpenCode(createMockPromptOptions(), mockLogger, {
-      agent: null,
-      model: null,
-      timeoutMs: 1_000,
-      omoProviders: createDisabledProviders(),
-    })
-    await vi.advanceTimersByTimeAsync(2_000)
-    const result = await resultPromise
+    const result = await freshExecuteOpenCode(
+      createMockPromptOptions(),
+      mockLogger,
+      {agent: null, model: null, timeoutMs: 1_000, omoProviders: createDisabledProviders()},
+      undefined,
+      ledger,
+    )
 
-    // #then — the original failure survives, and no abort fires despite the deadline having
-    // genuinely expired by the time execution.ts got control back
     expect(result.success).toBe(false)
     expect(result.error).toBe('ledger-deferred failure resolved before the deadline')
     expect(result.error).not.toContain('Execution timed out')
@@ -485,30 +629,22 @@ describe('executeOpenCode — deadlineConcluded governs abort, not deferred (rou
   })
 
   it('retry-exhaustion reaches the same post-loop path as any other decided failure: the last attempt governs abort, not a separate branch', async () => {
-    // #given every attempt (up to MAX_LLM_RETRIES) reports a retryable ledger-deferred failure that
-    // resolved before the deadline -- proving retries exhausting naturally shares the same
-    // `lastAttemptDeadlineConcluded`-driven post-loop code as a single decisive break
+    // #given every attempt (up to MAX_LLM_RETRIES) reports a retryable failure that resolved well
+    // before the deadline -- proving retry exhaustion shares the same per-attempt-captured cause as
+    // a single decisive break, not a separate code path
     vi.useFakeTimers()
-    const retryableDeferredEarly: AttemptResult = {
+    const retryableFailure: AttemptResult = {
       success: false,
-      error: 'retryable ledger-deferred failure resolved before the deadline',
+      error: 'retryable failure resolved before the deadline',
       llmError: {type: 'rate_limit', message: 'rate limited', retryable: true},
       outcome: 'turn_failed_retryable',
       shouldRetry: true,
+      settlement: {kind: 'failure-observed'},
       eventStreamResult: EMPTY_EVENT_STREAM_RESULT,
-      deadlineConcluded: false,
     }
-    const sendPromptToSession = vi.fn().mockResolvedValue(retryableDeferredEarly)
-    vi.doMock('./prompt-sender.js', () => ({
-      sendPromptToSession,
-      buildContinuationPrompt: vi.fn().mockReturnValue('continue from where the previous turn left off'),
-    }))
+    const sendPromptToSession = mockSendPromptToSession(retryableFailure)
     const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
-    const client = createMockClient([])
-    vi.mocked(createOpencode).mockResolvedValue({
-      client: client as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-    })
+    const client = mockOpencodeClient()
 
     // #when — a generous budget so the loop exhausts retries on its own merits, not because the
     // shared deadline expired mid-retry
@@ -524,15 +660,115 @@ describe('executeOpenCode — deadlineConcluded governs abort, not deferred (rou
     // #then — every attempt was used, the final failure is reported, and no abort fires
     expect(sendPromptToSession).toHaveBeenCalledTimes(MAX_LLM_RETRIES)
     expect(result.success).toBe(false)
-    expect(result.error).toBe('retryable ledger-deferred failure resolved before the deadline')
+    expect(result.error).toBe('retryable failure resolved before the deadline')
     expect(client.session.abort).not.toHaveBeenCalled()
+  })
+
+  // Rows 10/11: an unexpected, non-deadline-tagged exception. Row 10 proves the deliberate
+  // asymmetry from the brief's note -- nothing was decided, so an already-expired clock still
+  // aborts (absence of a settlement, not the clock deciding). Row 11 is its required complement.
+  it.each([
+    {
+      expiredAtThrow: true,
+      expectAbort: true,
+      label: 'row 10: an unexpired-untagged exception aborts when the deadline had already expired',
+    },
+    {
+      expiredAtThrow: false,
+      expectAbort: false,
+      label: 'row 11: an unexpired-untagged exception does not abort when the deadline has not expired',
+    },
+  ])('$label', async ({expiredAtThrow, expectAbort}) => {
+    const {setExpired} = await mockControlledDeadline()
+    // Session creation (an earlier deadline.run() call) must still succeed, so the deadline flips
+    // to expired only once the unrelated exception is about to throw -- proving the exception
+    // itself is what execution.ts reacts to, not an already-failing setup step.
+    vi.doMock('./prompt.js', () => ({
+      buildAgentPrompt: vi.fn().mockImplementation(() => {
+        setExpired(expiredAtThrow)
+        throw new Error('unexpected failure unrelated to the deadline')
+      }),
+    }))
+    const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
+    const client = mockOpencodeClient()
+
+    const result = await freshExecuteOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 1_000,
+      omoProviders: createDisabledProviders(),
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.error).toBe('unexpected failure unrelated to the deadline')
+    expect(result.exitCode).toBe(1)
+    expect(client.session.abort).toHaveBeenCalledTimes(expectAbort ? 1 : 0)
+  })
+
+  // Row 12: plain success, no ledger, well inside budget -- the baseline case every other row is a
+  // deviation from.
+  it('row 12: success with no ledger, inside budget, does not abort', async () => {
+    mockSendPromptToSession({
+      success: true,
+      error: null,
+      llmError: null,
+      outcome: 'completed',
+      shouldRetry: false,
+      settlement: {kind: 'completion-observed'},
+      eventStreamResult: EMPTY_EVENT_STREAM_RESULT,
+    })
+    const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
+    const client = mockOpencodeClient()
+
+    const result = await freshExecuteOpenCode(createMockPromptOptions(), mockLogger, {
+      agent: null,
+      model: null,
+      timeoutMs: 60_000,
+      omoProviders: createDisabledProviders(),
+    })
+
+    expect(result.success).toBe(true)
+    expect(client.session.abort).not.toHaveBeenCalled()
+  })
+
+  // Lifecycle: a retryable failure with the ledger still outstanding must not start a continuation,
+  // even though the outcome alone would otherwise qualify.
+  it('lifecycle: a retryable failure with an outstanding ledger entry starts no continuation', async () => {
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task') // never settled -- outstanding for the whole run
+    const retryableFailure: AttemptResult = {
+      success: false,
+      error: 'retryable failure with owned work still outstanding',
+      llmError: {type: 'rate_limit', message: 'rate limited', retryable: true},
+      outcome: 'turn_failed_retryable',
+      shouldRetry: true,
+      settlement: {kind: 'failure-observed'},
+      eventStreamResult: EMPTY_EVENT_STREAM_RESULT,
+    }
+    const sendPromptToSession = mockSendPromptToSession(retryableFailure)
+    const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
+    mockOpencodeClient()
+
+    const result = await freshExecuteOpenCode(
+      createMockPromptOptions(),
+      mockLogger,
+      {agent: null, model: null, timeoutMs: 60_000, omoProviders: createDisabledProviders()},
+      undefined,
+      ledger,
+    )
+
+    expect(sendPromptToSession).toHaveBeenCalledOnce()
+    expect(result.success).toBe(false)
+    expect(result.error).toBe('retryable failure with owned work still outstanding')
   })
 
   it('aborts unfinished remote work when isExpired() is true but isTimedOut() remains false (the finalizer must consult isExpired(), not isTimedOut())', async () => {
     // #given a deadline double whose isTimedOut() never latches -- only isExpired() reports the
     // expiry. The existing "unlatched" regression coverage pins this distinction inside
     // runPromptAttempt (retry.ts); nothing previously pinned it at the executeOpenCode finalizer
-    // itself, so this is a genuinely new assertion.
+    // itself, so this is a genuinely new assertion. The finalizer itself never calls either --
+    // this proves the *admission* check at the top of the retry loop (which does) correctly sets
+    // the selected stopping cause the finalizer then trusts.
     const actualRetry = await vi.importActual<typeof import('./retry.js')>('./retry.js')
     const deadline: ExecutionDeadline = {
       timeoutMs: 1_000,
@@ -548,11 +784,7 @@ describe('executeOpenCode — deadlineConcluded governs abort, not deferred (rou
       createExecutionDeadline: vi.fn().mockReturnValue(deadline),
     }))
     const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
-    const client = createMockClient([])
-    vi.mocked(createOpencode).mockResolvedValue({
-      client: client as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-    })
+    const client = mockOpencodeClient()
 
     // #when — the deadline reports expired from the very first check, before any attempt is made
     const result = await freshExecuteOpenCode(createMockPromptOptions(), mockLogger, {

@@ -5898,7 +5898,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
   })
 
-  it('rejects a terminal result when wall-clock expiry precedes the timeout callback', async () => {
+  it('returns a typed timeout result when wall-clock expiry precedes the timeout callback', async () => {
     // #given — the poll result resolves after deadlineAt, while the timeout callback remains unlatched
     vi.useFakeTimers()
     try {
@@ -5936,15 +5936,18 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         undefined,
         deadline,
       )
-      const rejection = (async () => {
-        await expect(resultPromise).rejects.toMatchObject({name: 'DeadlineExceededError'})
-      })()
       await vi.advanceTimersByTimeAsync(0)
       vi.setSystemTime(deadlineAt + 1)
       await vi.advanceTimersByTimeAsync(500)
+      const result = await resultPromise
 
-      // #then — wall-clock expiry is authoritative even though isTimedOut() is still false
-      await rejection
+      // #then — wall-clock expiry is authoritative even though isTimedOut() is still false; the
+      // post-race ladder's `throw createDeadlineExceededError(...)` is gone (Steps 3b/5 of the
+      // restructure) — a bare `deadline` settlement with no preserved failure now reduces to a
+      // typed timeout result instead
+      expect(result.success).toBe(false)
+      expect(result.outcome).toBe('timeout')
+      expect(result.error).toBe('Attempt did not settle before the execution deadline')
     } finally {
       vi.useRealTimers()
     }
@@ -5972,20 +5975,25 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       } as unknown as Event,
     ])
 
-    // #when / #then
-    await expect(
-      runPromptAttempt(
-        {session: {status: vi.fn()}} as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-        'ses_123',
-        '/workspace',
-        30_000,
-        mockLogger,
-        eventStream.stream,
-        undefined,
-        undefined,
-        deadline,
-      ),
-    ).rejects.toMatchObject({name: 'DeadlineExceededError'})
+    // #when
+    const result = await runPromptAttempt(
+      {session: {status: vi.fn()}} as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+      undefined,
+      undefined,
+      deadline,
+    )
+
+    // #then — a bare `deadline` settlement (the auth event was never classified because
+    // `deadline.isExpired()` was already true when it arrived, so no failure survives to be
+    // preserved) now reduces to a typed timeout result instead of a thrown DeadlineExceededError
+    expect(result.success).toBe(false)
+    expect(result.outcome).toBe('timeout')
+    expect(result.error).toBe('Attempt did not settle before the execution deadline')
   })
 
   it('removes the poll interval abort listener when the timer wins', async () => {

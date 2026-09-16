@@ -282,30 +282,62 @@ describe('processEventStream — ownership ledger integration', () => {
     })
   })
 
-  it('marks outstanding entries unknown on a stream discontinuity', async () => {
+  it('marks outstanding entries unknown on a stream discontinuity and returns a partial result instead of throwing', async () => {
     // #given a ledger with an outstanding child, and a stream that throws mid-iteration
     const ledger = createOwnershipLedger()
     ledger.adopt(CHILD_SESSION_ID, 'do the thing')
     const eventStream = createDiscontinuousEventStream([], new Error('connection reset'))
 
-    // #when the stream is processed
-    await expect(
-      processEventStream(
-        eventStream,
-        ROOT_SESSION_ID,
-        new AbortController().signal,
-        createMockLogger(),
-        undefined,
-        undefined,
-        undefined,
-        ledger,
-      ),
-    ).rejects.toThrow('connection reset')
+    // #when the stream is processed — a discontinuity is an observation-channel failure, not
+    // proof the turn ended, so the accumulated result is returned rather than thrown away
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
 
     // #then the outstanding entry is downgraded to unknown, never inferred as settled
     expect(ledger.outstanding()).toBe(0)
     expect(ledger.unknown()).toBe(1)
     expect(ledger.snapshot()).toContainEqual({sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'unknown'})
+
+    // #then termination metadata says the channel closed unexpectedly — not that the turn concluded
+    expect(result.discontinuity).toEqual({message: 'connection reset'})
+  })
+
+  it('does not mark outstanding entries unknown, and does not fabricate a discontinuity, on an intentional abort', async () => {
+    // #given a ledger with an outstanding child, and a stream that throws because the caller aborted it
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const abortController = new AbortController()
+    const abortError = new DOMException('Aborted', 'AbortError')
+    const eventStream = createDiscontinuousEventStream([], abortError)
+    abortController.abort()
+
+    // #when the stream is processed with an already-aborted signal
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the caller's own abort is not treated as a transport failure — nothing is marked unknown
+    expect(ledger.outstanding()).toBe(1)
+    expect(ledger.unknown()).toBe(0)
+
+    // #then no termination metadata and no llmError are fabricated from an intentional shutdown
+    expect(result.discontinuity).toBeUndefined()
+    expect(result.llmError).toBeNull()
   })
 
   it('behaves exactly as before when no background dispatch occurs and no ledger is supplied (integration)', async () => {
@@ -354,6 +386,104 @@ describe('processEventStream — ownership ledger integration', () => {
       expect.stringContaining('adopted into ownership ledger'),
       expect.anything(),
     )
+  })
+})
+
+describe('processEventStream — structured failure capture on the activity tracker', () => {
+  it('a terminal provider failure is retrievable in structured form immediately after observation', async () => {
+    // #given an activity tracker and a context_overflow session.error on the root session
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([contextOverflowErrorEvent(ROOT_SESSION_ID)])
+
+    // #when processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the structured ErrorInfo and its classification path are retrievable directly off the tracker
+    expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
+    expect(activityTracker.classificationPath).toBe('structured')
+
+    // #then a run with only a terminal failure never records a generic one
+    expect(activityTracker.genericError).toBeUndefined()
+  })
+
+  it('a generic failure is retrievable in structured form immediately, and a later terminal failure upgrades it', async () => {
+    // #given an activity tracker and a generic session.error, observed in its own call so the
+    // structured record can be inspected before anything terminal arrives
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    await processEventStream(
+      createMockEventStream([sessionErrorEvent(ROOT_SESSION_ID)]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the generic failure is retrievable in structured form immediately — not just as the string on sessionError
+    expect(activityTracker.genericError?.type).toBeDefined()
+    expect(activityTracker.genericError?.type).not.toBe('context_overflow')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+
+    // #when a later terminal provider failure is observed on the same tracker
+    const result = await processEventStream(
+      createMockEventStream([contextOverflowErrorEvent(ROOT_SESSION_ID)]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the terminal failure upgrades it — the terminal record now wins and the earlier
+    // generic record is cleared rather than left reachable, and the final llmError returned to
+    // the caller reflects the upgrade, not the earlier generic error
+    expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
+    expect(activityTracker.genericError).toBeUndefined()
+    expect(result.llmError?.type).toBe('context_overflow')
+  })
+
+  it('a second generic failure does not displace the first', async () => {
+    // #given an activity tracker and two distinct generic session.error events on the root session
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const secondGenericErrorEvent: Event = {
+      type: 'session.error',
+      properties: {sessionID: ROOT_SESSION_ID, error: 'second failure'},
+    } as unknown as Event
+    const eventStream = createMockEventStream([sessionErrorEvent(ROOT_SESSION_ID), secondGenericErrorEvent])
+
+    // #when processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the first generic error's message is preserved, not overwritten by the second
+    expect(activityTracker.sessionError).toBe('boom')
+
+    // #then still no terminal failure was ever observed
+    expect(activityTracker.terminalProviderError).toBeUndefined()
   })
 })
 

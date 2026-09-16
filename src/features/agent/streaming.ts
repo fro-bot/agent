@@ -26,6 +26,14 @@ export interface EventStreamResult {
   readonly commentsPosted: number
   readonly llmError: ErrorInfo | null
   readonly classificationPath?: ClassificationPath
+  /**
+   * Set only when the event stream loop exited via an unexpected discontinuity -- not an
+   * intentional local shutdown (caller abort, deadline expiry) and not a terminal signal
+   * (session.idle, completed assistant message). A stream break is an observation-channel
+   * failure, never evidence the turn ended: this field says the channel closed early, and
+   * nothing more. Ledger reconciliation and polling continue independently of it.
+   */
+  readonly discontinuity?: {readonly message: string}
 }
 
 /** Mutable by design — updated in-place during stream processing. */
@@ -41,6 +49,16 @@ export interface ActivityTracker {
   sessionError: string | null
   /** Set when a terminal provider ErrorInfo has been classified; first terminal signal wins. */
   terminalProviderError?: ErrorInfo
+  /**
+   * Structured form of the first generic (non-terminal) failure observed; retrievable
+   * immediately, without waiting for the turn to conclude. Cleared if a later terminal
+   * provider failure arrives -- `terminalProviderError` becomes authoritative at that point
+   * (see `getObservedFailure`) and the generic record is dropped rather than left reachable.
+   * A second generic failure never displaces this one while it stands.
+   */
+  genericError?: ErrorInfo
+  /** Classification path for whichever failure (terminal or generic) is currently recorded. */
+  classificationPath?: ClassificationPath
 }
 
 /** Shared provider-terminal classification for `session.status`/`retry`, used by both SSE and REST poll paths. */
@@ -65,12 +83,18 @@ function isTerminalProviderError(error: ErrorInfo): boolean {
   return error.type === 'context_overflow' || error.type === 'quota_exceeded' || error.type === 'provider_auth_error'
 }
 
+/** True when a thrown stream error reflects a shutdown we asked for, not one the transport handed us. */
+function isIntentionalShutdown(error: unknown, signal: AbortSignal): boolean {
+  return signal.aborted || (error instanceof Error && error.name === 'AbortError')
+}
+
 /** Merge generic and terminal observations while freezing the first terminal provider signal. */
 export function mergeActivityError(
   existing: ErrorInfo | null,
   candidate: ErrorInfo,
   activityTracker?: ActivityTracker,
   genericSessionError?: string,
+  classificationPath?: ClassificationPath,
 ): ErrorInfo {
   const existingTerminal = activityTracker?.terminalProviderError
   if (existingTerminal != null) return existingTerminal
@@ -85,14 +109,38 @@ export function mergeActivityError(
     activityTracker.terminalProviderError = merged
     activityTracker.sessionError = merged.message
     activityTracker.currentTurnTerminalSignalReceived = true
+    if (classificationPath != null) activityTracker.classificationPath = classificationPath
+    // A terminal signal is authoritative from here on -- clear any earlier generic record
+    // rather than leaving its (possibly sensitive) content reachable off the tracker.
+    activityTracker.genericError = undefined
     return merged
   }
 
   if (activityTracker != null && activityTracker.sessionError == null && genericSessionError != null) {
     activityTracker.sessionError = genericSessionError
+    // `merged === candidate` is guaranteed here: `existing` can only be non-null once
+    // `sessionError` has already been set by a prior call (both are written together below
+    // and by the terminal branch above), so `sessionError == null` implies `existing == null`.
+    activityTracker.genericError = merged
+    if (classificationPath != null) activityTracker.classificationPath = classificationPath
   }
 
   return merged
+}
+
+/**
+ * Single point of retrieval for whichever failure is currently recorded on the tracker, in
+ * precedence order: a terminal provider failure always wins once observed (it upgrades any
+ * earlier generic failure), otherwise the first generic failure. Returns null if nothing has
+ * been observed yet. Callers should use this instead of reading `terminalProviderError` /
+ * `genericError` directly and re-deriving the precedence themselves.
+ */
+export function getObservedFailure(
+  activityTracker: ActivityTracker,
+): {readonly error: ErrorInfo; readonly classificationPath: ClassificationPath | undefined} | null {
+  const error = activityTracker.terminalProviderError ?? activityTracker.genericError
+  if (error == null) return null
+  return {error, classificationPath: activityTracker.classificationPath}
 }
 
 export function logServerEvent(event: Event, logger: Logger): void {
@@ -627,7 +675,7 @@ export async function processEventStream(
               type: terminalError.type,
             })
             classificationPath = 'structured'
-            llmError = mergeActivityError(llmError, terminalError, activityTracker)
+            llmError = mergeActivityError(llmError, terminalError, activityTracker, undefined, classificationPath)
           }
         }
       } else if (eventType === 'session.error') {
@@ -703,7 +751,7 @@ export async function processEventStream(
             if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
             logger.error('Session error classified as terminal provider error', {sessionId, type: terminalError.type})
             classificationPath = 'structured'
-            llmError = mergeActivityError(llmError, terminalError, activityTracker)
+            llmError = mergeActivityError(llmError, terminalError, activityTracker, undefined, classificationPath)
           } else if (llmError == null || isTerminalProviderError(llmError) === false) {
             const errorStr = normalizeSessionError(sessionError)
             let genericError: ErrorInfo
@@ -730,7 +778,7 @@ export async function processEventStream(
               }
             }
             if (classificationPath == null) classificationPath = genericClassificationPath
-            llmError = mergeActivityError(llmError, genericError, activityTracker, errorStr)
+            llmError = mergeActivityError(llmError, genericError, activityTracker, errorStr, classificationPath)
           }
         }
       } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
@@ -754,24 +802,40 @@ export async function processEventStream(
     }
   }
 
+  let discontinuity: {readonly message: string} | undefined
+
   try {
     await consumeStream()
   } catch (error) {
-    // Stream discontinuity: never infer "nothing outstanding" from a stream that
-    // stopped talking. Mark every currently-outstanding owned entry unknown —
-    // reconciliation (triggered by the caller that owns the SDK client, since this
-    // function only has the stream) is how they later resolve to settled or cancelled.
-    if (ownershipLedger !== undefined) {
-      const outstandingEntries = ownershipLedger.snapshot().filter(entry => entry.state === 'outstanding')
-      for (const entry of outstandingEntries) {
-        ownershipLedger.markUnknown(entry.sessionId)
-      }
-      logger.warning('Event stream discontinuity — marked outstanding owned entries unknown', {
+    if (isIntentionalShutdown(error, signal)) {
+      // The caller told us to stop (deadline expiry, attempt abort, etc.) -- this is not a
+      // transport failure, it's the expected shape of a requested shutdown. Say nothing
+      // about the turn: no diagnostic, no ledger churn, no fabricated failure.
+    } else {
+      // Unexpected discontinuity: the observation channel closed without an intentional
+      // shutdown and without a terminal signal. Selecting an error never proves quiescence,
+      // and observing quiescence never erases an error -- this must never be read as the turn
+      // concluding, only as "we can no longer see it." Preserve everything accumulated so far
+      // instead of throwing it away, and mark every currently-outstanding owned entry unknown
+      // -- reconciliation (triggered by the caller that owns the SDK client, since this
+      // function only has the stream) is how they later resolve to settled or cancelled.
+      const message = error instanceof Error ? error.message : String(error)
+      discontinuity = {message}
+      logger.warning('Event stream discontinuity — observation channel closed unexpectedly', {
         sessionId,
-        unknownCount: outstandingEntries.length,
+        error: message,
       })
+      if (ownershipLedger !== undefined) {
+        const outstandingEntries = ownershipLedger.snapshot().filter(entry => entry.state === 'outstanding')
+        for (const entry of outstandingEntries) {
+          ownershipLedger.markUnknown(entry.sessionId)
+        }
+        logger.warning('Event stream discontinuity — marked outstanding owned entries unknown', {
+          sessionId,
+          unknownCount: outstandingEntries.length,
+        })
+      }
     }
-    throw error
   }
 
   if (lastText.length > 0) outputTextContent(lastText)
@@ -785,6 +849,7 @@ export async function processEventStream(
     commentsPosted,
     llmError,
     classificationPath,
+    ...(discontinuity == null ? {} : {discontinuity}),
   }
 }
 

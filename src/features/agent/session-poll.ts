@@ -1,6 +1,13 @@
-import type {OwnershipLedger} from '@fro-bot/runtime'
+import type {ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
+/**
+ * Settlement vocabulary from Step 1 of this restructure — see that module's doc comment for the
+ * governing invariant ("selecting an error never proves quiescence, and observing quiescence
+ * never erases an error"). This step establishes the cause inside the branch that decides to
+ * return, instead of the caller inferring it from a post-hoc clock read.
+ */
+import type {AttemptObservation, FailureObservation} from './attempt-outcome.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
@@ -13,9 +20,61 @@ const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
 const ERROR_GRACE_CYCLES = 3
 export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 
+/**
+ * Public return shape, unchanged from before this step. `pollForSessionCompletion` stays a thin
+ * adapter over `pollForSessionCompletionObservation` (below) so `retry.ts` and existing tests
+ * compile and behave exactly as before — the settlement cause is available to callers that ask
+ * for it via `pollForSessionCompletionObservation`, without forcing every existing caller to
+ * consume it yet.
+ */
 interface PollResult {
   readonly completed: boolean
   readonly error: string | null
+}
+
+function completionObservation(): AttemptObservation {
+  return {settlement: {kind: 'completion-observed'}, failures: []}
+}
+
+function providerFailureObservation(error: ErrorInfo): AttemptObservation {
+  const failure: FailureObservation = {source: 'provider', message: error.message, llmError: error}
+  return {settlement: {kind: 'failure-observed'}, failures: [failure]}
+}
+
+function sessionFailureObservation(message: string): AttemptObservation {
+  const failure: FailureObservation = {source: 'session', message, llmError: null}
+  return {settlement: {kind: 'failure-observed'}, failures: [failure]}
+}
+
+function deadlineObservation(): AttemptObservation {
+  return {settlement: {kind: 'deadline'}, failures: []}
+}
+
+function cancelledObservation(): AttemptObservation {
+  return {settlement: {kind: 'cancelled', reason: 'Aborted'}, failures: []}
+}
+
+function watchdogObservation(message: string): AttemptObservation {
+  return {settlement: {kind: 'watchdog', message}, failures: []}
+}
+
+/**
+ * Adapter preserving the pre-existing `{completed, error}` shape for callers that have not been
+ * rewired to consume `AttemptObservation` yet (`retry.ts`'s `pollResult.completed`/`.error`, and
+ * characterization tests asserting exact `{completed, error}` equality). Diagnostic text is
+ * unchanged from what each branch returned before this step.
+ */
+function toPollResult(observation: AttemptObservation): PollResult {
+  if (observation.settlement.kind === 'completion-observed') return {completed: true, error: null}
+
+  const failure = observation.failures[0]
+  if (failure != null) return {completed: false, error: failure.message}
+
+  if (observation.settlement.kind === 'watchdog') return {completed: false, error: observation.settlement.message}
+
+  // 'deadline' and 'cancelled' both preserve the original undifferentiated 'Aborted' diagnostic
+  // text at this adapter boundary — the differentiation is in `observation.settlement.kind`.
+  return {completed: false, error: 'Aborted'}
 }
 
 /**
@@ -121,7 +180,7 @@ async function detectMessageActivity(
   logger: Logger,
   signal: AbortSignal,
   deadline?: ExecutionDeadline,
-): Promise<PollResult | null> {
+): Promise<AttemptObservation | null> {
   if (activityTracker?.baselineMessageIds == null) return null
 
   if (typeof client.session.messages !== 'function') {
@@ -177,10 +236,15 @@ async function detectMessageActivity(
     messageId: latestAssistantMessageId,
   })
 
-  return {completed: true, error: null}
+  return completionObservation()
 }
 
-export async function pollForSessionCompletion(
+/**
+ * Core implementation: each branch establishes its own settlement cause at the point it decides
+ * to return, per the invariant in `attempt-outcome.ts`. `pollForSessionCompletion` (below) is a
+ * thin `{completed, error}` adapter over this for callers not yet rewired to consume the cause.
+ */
+export async function pollForSessionCompletionObservation(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
   sessionId: string,
   directory: string,
@@ -190,7 +254,7 @@ export async function pollForSessionCompletion(
   activityTracker?: ActivityTracker,
   deadline?: ExecutionDeadline,
   ownershipLedger?: OwnershipLedger,
-): Promise<PollResult> {
+): Promise<AttemptObservation> {
   const pollStart = Date.now()
   let errorGraceCycles = 0
   let firstSessionError: string | null = null
@@ -198,9 +262,12 @@ export async function pollForSessionCompletion(
   while (!signal.aborted) {
     const terminalProviderError = activityTracker?.terminalProviderError
     if (terminalProviderError != null) {
-      return {completed: false, error: terminalProviderError.message}
+      // Preserved producer policy: an already-accepted provider error wins here even if the
+      // deadline has since expired (checked next) — this is a legitimate provider-terminal result
+      // winning at the boundary, not a deadline conclusion. See attempt-outcome.ts module doc.
+      return providerFailureObservation(terminalProviderError)
     }
-    if (deadline?.isExpired() === true) return {completed: false, error: 'Aborted'}
+    if (deadline?.isExpired() === true) return deadlineObservation()
     try {
       const delay = async () => {
         await waitForAbortableDelay(POLL_INTERVAL_MS, signal)
@@ -208,14 +275,20 @@ export async function pollForSessionCompletion(
       if (deadline == null) await delay()
       else await deadline.run(delay, 'poll interval')
     } catch {
+      // waitForAbortableDelay() itself never rejects; deadline.run() rejects here exclusively via
+      // deadline exhaustion. A terminal error already accepted still wins per the preserved policy.
       const terminalError = activityTracker?.terminalProviderError
-      if (terminalError != null) return {completed: false, error: terminalError.message}
-      return {completed: false, error: 'Aborted'}
+      if (terminalError != null) return providerFailureObservation(terminalError)
+      return deadlineObservation()
     }
     if (signal.aborted) {
+      // `signal` may be a combined AbortSignal.any([..., deadline.signal]) (see retry.ts), so an
+      // abort here can be deadline-caused as well as externally cancelled — ask the deadline
+      // itself rather than assuming cancellation.
       const terminalError = activityTracker?.terminalProviderError
-      if (terminalError != null) return {completed: false, error: terminalError.message}
-      return {completed: false, error: 'Aborted'}
+      if (terminalError != null) return providerFailureObservation(terminalError)
+      if (deadline?.isExpired() === true) return deadlineObservation()
+      return cancelledObservation()
     }
 
     const observedSessionError = activityTracker?.sessionError
@@ -223,7 +296,7 @@ export async function pollForSessionCompletion(
       firstSessionError = observedSessionError
     }
     const terminalError = activityTracker?.terminalProviderError
-    if (terminalError != null) return {completed: false, error: terminalError.message}
+    if (terminalError != null) return providerFailureObservation(terminalError)
     const sessionError = firstSessionError
 
     if (sessionError == null) {
@@ -236,7 +309,7 @@ export async function pollForSessionCompletion(
           error: sessionError,
           graceCycles: errorGraceCycles,
         })
-        return {completed: false, error: `Session error: ${sessionError}`}
+        return sessionFailureObservation(`Session error: ${sessionError}`)
       }
       continue
     }
@@ -247,16 +320,21 @@ export async function pollForSessionCompletion(
           sessionId,
           outstanding: ownershipLedger?.outstanding(),
         })
+      } else if (deadline?.isExpired() === true) {
+        // Checked at the completion decision itself, not re-derived later: a completion first
+        // observed after the deadline is rejected, matching the deadline check every other branch
+        // performs at its own return point.
+        return deadlineObservation()
       } else {
         logger.debug('Session idle detected via event stream', {sessionId})
-        return {completed: true, error: null}
+        return completionObservation()
       }
     }
 
     const elapsed = Date.now() - pollStart
     if (deadline == null && maxPollTimeMs > 0 && elapsed >= maxPollTimeMs) {
       logger.warning('Poll timeout reached', {elapsedMs: elapsed, maxPollTimeMs})
-      return {completed: false, error: `Poll timeout after ${elapsed}ms`}
+      return watchdogObservation(`Poll timeout after ${elapsed}ms`)
     }
 
     try {
@@ -275,6 +353,11 @@ export async function pollForSessionCompletion(
             'Stable completed-assistant message observed but owned work outstanding — deferring completion',
             {sessionId, outstanding: ownershipLedger?.outstanding()},
           )
+        } else if (deadline?.isExpired() === true) {
+          // The completed-assistant message itself may have been produced (and its two-poll
+          // stability confirmed, via the async session.messages() requests above) after the
+          // deadline expired -- admission is checked here, at the decision, not inferred later.
+          return deadlineObservation()
         } else {
           return messageResult
         }
@@ -299,16 +382,20 @@ export async function pollForSessionCompletion(
             sessionId,
             outstanding: ownershipLedger?.outstanding(),
           })
+        } else if (deadline?.isExpired() === true) {
+          // The idle status itself was fetched via an async session.status() request (above) that
+          // may have crossed the deadline -- checked here, at admission, not re-derived later.
+          return deadlineObservation()
         } else {
           logger.debug('Session idle detected via polling', {sessionId})
-          return {completed: true, error: null}
+          return completionObservation()
         }
       } else if (sessionStatus.type === 'retry') {
         // Poll-only terminal provider signals fail fast instead of waiting out the full timeout.
         const terminalError = classifyRetryStatusError(sessionStatus)
         if (terminalError != null) {
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null)
-            return {completed: false, error: 'Aborted'}
+            return deadlineObservation()
           logger.error('Session status retry classified as terminal provider error via poll', {
             sessionId,
             type: sessionStatus.type,
@@ -316,7 +403,7 @@ export async function pollForSessionCompletion(
           if (activityTracker != null) {
             mergeActivityError(null, terminalError, activityTracker)
           }
-          return {completed: false, error: activityTracker?.terminalProviderError?.message ?? terminalError.message}
+          return providerFailureObservation(activityTracker?.terminalProviderError ?? terminalError)
         }
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       } else {
@@ -330,10 +417,9 @@ export async function pollForSessionCompletion(
             elapsedMs: activityElapsed,
             sessionId,
           })
-          return {
-            completed: false,
-            error: `No agent activity detected after ${activityElapsed}ms — server may have crashed during prompt processing`,
-          }
+          return watchdogObservation(
+            `No agent activity detected after ${activityElapsed}ms — server may have crashed during prompt processing`,
+          )
         }
       }
     } catch (pollError) {
@@ -341,7 +427,37 @@ export async function pollForSessionCompletion(
     }
   }
 
-  return {completed: false, error: 'Aborted'}
+  // Loop exited because `signal` was already aborted at the top-of-loop check — same
+  // deadline-vs-cancellation distinction as the mid-loop abort check above.
+  const terminalError = activityTracker?.terminalProviderError
+  if (terminalError != null) return providerFailureObservation(terminalError)
+  if (deadline?.isExpired() === true) return deadlineObservation()
+  return cancelledObservation()
+}
+
+export async function pollForSessionCompletion(
+  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  sessionId: string,
+  directory: string,
+  signal: AbortSignal,
+  logger: Logger,
+  maxPollTimeMs: number = DEFAULT_TIMEOUT_MS,
+  activityTracker?: ActivityTracker,
+  deadline?: ExecutionDeadline,
+  ownershipLedger?: OwnershipLedger,
+): Promise<PollResult> {
+  const observation = await pollForSessionCompletionObservation(
+    client,
+    sessionId,
+    directory,
+    signal,
+    logger,
+    maxPollTimeMs,
+    activityTracker,
+    deadline,
+    ownershipLedger,
+  )
+  return toPollResult(observation)
 }
 
 export async function waitForEventProcessorShutdown(
