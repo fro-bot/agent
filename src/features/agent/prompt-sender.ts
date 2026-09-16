@@ -1,3 +1,4 @@
+import type {OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode, Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
@@ -51,6 +52,7 @@ export async function sendPromptToSession(
   serverUrl?: string | null,
   deadline?: ExecutionDeadline,
   onPermissionAsked?: PermissionAskedResponder,
+  ownershipLedger?: OwnershipLedger,
 ): Promise<AttemptResult> {
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart, ...(fileParts ?? [])]
@@ -117,6 +119,7 @@ export async function sendPromptToSession(
         deadline,
         attemptAbortController,
         onPermissionAsked,
+        ownershipLedger,
       )
     return await runAttempt()
   } finally {

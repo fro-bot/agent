@@ -145,14 +145,13 @@ export async function run(): Promise<number> {
     agentSuccess = execution.success
 
     // Drain: owned background work settles before anything below this point
-    // publishes, persists, or releases (Unit 10). `ledger: undefined` means
-    // this call is presently a no-op -- nothing yet threads a populated ledger
-    // into the Action's execution path (see execute.ts's `runDrain` docs). The
-    // deadline math and client are wired now so a future unit activates this
-    // by passing a real ledger through, without touching the call site again.
+    // publishes, persists, or releases (Unit 10). `execution.ownershipLedger` is
+    // populated whenever execution actually ran (Unit 11); it is only absent when
+    // `SKIP_AGENT_EXECUTION=true` skipped execution entirely, in which case this
+    // call is a no-op exactly like before.
     const drainLogger = createLogger({phase: 'drain'})
     const drainResult = await runDrain({
-      ledger: undefined,
+      ledger: execution.ownershipLedger,
       client: cacheRestore.serverHandle.client,
       parentSessionId: execution.sessionId,
       deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),

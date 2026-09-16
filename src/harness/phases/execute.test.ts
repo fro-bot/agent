@@ -732,6 +732,213 @@ describe('runExecute overflow recovery', () => {
   })
 })
 
+/** A client whose one adopted child always reports live -- forces drain past reconciliation into cancellation. */
+function createStuckSessionClient(callOrder: string[]): SessionClient {
+  return createFakeSessionClient({
+    children: async () => ({data: [{id: 'ses_child'}]}),
+    status: async () => ({data: {ses_child: {}}}),
+    abort: async (args: {path: {id: string}; signal: AbortSignal}) => {
+      callOrder.push(`abort:${args.path.id}`)
+      return {data: {}}
+    },
+  })
+}
+
+describe('runExecute overflow recovery — ownership ledger (Unit 11)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(executeOpenCode).mockReset()
+    mocks.readResponseFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
+    mocks.resolveOutputMode.mockReturnValue('branch-pr')
+    mocks.getInput.mockReturnValue('branch-pr')
+    mocks.searchSessions.mockResolvedValue([])
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('cancels outstanding work on the overflowed session before archiving it', async () => {
+    // #given the overflowed session's execution adopted a background dispatch that is still
+    // outstanding, and a client that never confirms it stopped
+    const callOrder: string[] = []
+    const cacheRestore = createCacheRestore()
+    const client = createStuckSessionClient(callOrder)
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockImplementation(async (_url: string, sessionId: string) => {
+      callOrder.push(`archive:${sessionId}`)
+      return true
+    })
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, sessionId: 'recovered-session', llmError: null}),
+    )
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs and overflow recovery kicks in
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then the outstanding entry was cancelled BEFORE the overflowed session was archived
+    expect(callOrder).toEqual(['abort:ses_child', 'archive:overflowed-session'])
+  })
+
+  it('starts the recovery session with a fresh ledger rather than inheriting the exhausted one', async () => {
+    // #given the overflowed session's ledger has outstanding work at the moment recovery begins
+    const callOrder: string[] = []
+    const cacheRestore = createCacheRestore()
+    const client = createStuckSessionClient(callOrder)
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockResolvedValue(true)
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, sessionId: 'recovered-session', llmError: null}),
+    )
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs and overflow recovery starts a fresh session
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then the recovery call received a DIFFERENT ledger object with nothing outstanding --
+    // caps reset rather than carrying over the overflowed session's exhausted budget
+    const firstLedger = vi.mocked(executeOpenCode).mock.calls[0]?.[4]
+    const recoveryLedger = vi.mocked(executeOpenCode).mock.calls[1]?.[4]
+    expect(recoveryLedger).toBeDefined()
+    expect(recoveryLedger).not.toBe(firstLedger)
+    expect(recoveryLedger?.outstanding()).toBe(0)
+  })
+
+  it('marks the entry unknown, blocking persistence, when cancellation cannot be confirmed during recovery', async () => {
+    // #given the overflowed session's outstanding entry is cancelled but the client never
+    // confirms it actually stopped (still reports live on every subsequent check)
+    const callOrder: string[] = []
+    const cacheRestore = createCacheRestore()
+    const client = createStuckSessionClient(callOrder)
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockResolvedValue(true)
+    let overflowedLedgerRef: import('@fro-bot/runtime').OwnershipLedger | undefined
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      overflowedLedgerRef = ledger
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, sessionId: 'recovered-session', llmError: null}),
+    )
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs and archives the overflowed session
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then a cancellation request was made, but it is never treated as confirmed on the
+    // strength of the abort call alone -- the entry lands in unknown, and persistence
+    // safety (isPersistenceSafe) reflects that honestly rather than reporting drained
+    expect(callOrder).toContain('abort:ses_child')
+    expect(overflowedLedgerRef?.snapshot()).toContainEqual({
+      sessionId: 'ses_child',
+      label: 'background task',
+      state: 'unknown',
+    })
+    expect(overflowedLedgerRef?.isPersistenceSafe()).toBe(false)
+  })
+
+  it('leaves the overflowed session with no outstanding work by the time the recovery session begins (integration)', async () => {
+    // #given the same stuck-work setup as the cancellation tests above
+    const callOrder: string[] = []
+    const cacheRestore = createCacheRestore()
+    const client = createStuckSessionClient(callOrder)
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockResolvedValue(true)
+    let overflowedLedgerRef: import('@fro-bot/runtime').OwnershipLedger | undefined
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      overflowedLedgerRef = ledger
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockImplementationOnce(async () => {
+      // #then by the time the SECOND (recovery) call starts, the overflowed session's
+      // ledger has nothing left outstanding -- no two sessions hold outstanding work
+      // on this workspace at the same time
+      expect(overflowedLedgerRef?.outstanding()).toBe(0)
+      return createAgentResult({
+        success: true,
+        exitCode: 0,
+        error: null,
+        sessionId: 'recovered-session',
+        llmError: null,
+      })
+    })
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    expect(vi.mocked(executeOpenCode)).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('computeDrainDeadlineMs', () => {
   it('reserves 30 seconds for teardown by default', () => {
     // #given the invocation's total timeout and how long execution already took

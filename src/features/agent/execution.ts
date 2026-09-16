@@ -1,4 +1,4 @@
-import type {ErrorInfo} from '@fro-bot/runtime'
+import type {ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {OpenCodeServerHandle} from './server-adapter.js'
 import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
@@ -62,6 +62,7 @@ export async function executeOpenCode(
   logger: Logger,
   config?: ExecutionConfig,
   serverHandle?: OpenCodeServerHandle,
+  ownershipLedger?: OwnershipLedger,
 ): Promise<AgentResult> {
   const startTime = Date.now()
   const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -208,6 +209,7 @@ export async function executeOpenCode(
             serverUrl,
             deadline,
             onPermissionAsked,
+            ownershipLedger,
           )
           shouldAbortRemoteOnTimeout = false
           return attemptResult

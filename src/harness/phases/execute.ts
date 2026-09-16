@@ -23,6 +23,7 @@ import * as core from '@actions/core'
 import {
   archiveSession,
   createLedgerReconciler,
+  createOwnershipLedger,
   createSdkLedgerReconcileAdapter,
   findLatestSession,
   reconcileLedgerOnce,
@@ -56,6 +57,14 @@ export interface ExecutePhaseResult {
     readonly archivedSessionId: string
     readonly archiveSucceeded: boolean
   }
+  /**
+   * The ownership ledger backing this phase's active session (the recovery
+   * session's ledger once overflow recovery has run, otherwise the original
+   * session's). Absent only when execution was skipped entirely
+   * (`SKIP_AGENT_EXECUTION=true`). Threaded to `runDrain` by the caller
+   * (plan Unit 11).
+   */
+  readonly ownershipLedger?: OwnershipLedger
   /**
    * Wall-clock time spent inside this phase (including a context-overflow
    * recovery restart), in milliseconds. `runDrain`'s caller subtracts this
@@ -106,6 +115,8 @@ interface ContextOverflowRecoveryOptions {
   readonly executionConfig: ExecutionConfig
   readonly overflowedResult: ExecutePhaseResult
   readonly overflowedSessionId: string
+  /** The ledger backing the overflowed session's own execution -- cancelled and settled before it is archived. */
+  readonly overflowedLedger: OwnershipLedger
   readonly resolveSessionId: (candidateSessionId: string | null, afterTimestamp: number) => Promise<string | null>
 }
 
@@ -122,8 +133,24 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     executionConfig,
     overflowedResult,
     overflowedSessionId,
+    overflowedLedger,
     resolveSessionId,
   } = options
+
+  // Cancel and settle work the overflowed session still owns BEFORE archiving it:
+  // archival re-runs under a new session id while the overflowed session's own
+  // subagents keep running, so without this both sets of writers would touch the
+  // same workspace and git index concurrently. Reuses `runDrain`'s confirm-or-unknown
+  // cancellation rather than a second implementation; `deadlineMs: 0` skips straight
+  // from the unconditional first reconciliation pass to cancellation for anything
+  // reconciliation did not already resolve.
+  await runDrain({
+    ledger: overflowedLedger,
+    client: cacheRestore.serverHandle.client,
+    parentSessionId: overflowedSessionId,
+    deadlineMs: 0,
+    logger: execLogger,
+  })
 
   const archiveSucceeded = await archiveSession(cacheRestore.serverHandle.server.url, overflowedSessionId, execLogger)
   if (archiveSucceeded === false) {
@@ -180,12 +207,17 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
       })
     }
   }
+  // Fresh ledger for the recovery session: recovery does not inherit any outstanding,
+  // unknown, or settled entries from the session it replaces -- its dispatch budget
+  // starts clean rather than carrying over an exhausted one.
+  const recoveryLedger = createOwnershipLedger()
   const recoveryStartTime = Date.now()
   const recoveryExecResult = await executeOpenCode(
     recoveryPromptOptions,
     execLogger,
     recoveryExecutionConfig,
     cacheRestore.serverHandle,
+    recoveryLedger,
   )
   const recoverySessionId = await resolveSessionId(recoveryExecResult.sessionId, recoveryStartTime)
 
@@ -207,6 +239,7 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     sessionId: recoverySessionId,
     resolvedOutputMode: overflowedResult.resolvedOutputMode,
     outputModeMigration: overflowedResult.outputModeMigration,
+    ownershipLedger: recoveryLedger,
     overflowRecovery: {
       recovered: recoveryExecResult.success,
       archivedSessionId: overflowedSessionId,
@@ -313,7 +346,18 @@ export async function runExecute(
       return latestSession.session.id
     }
 
-    const execResult = await executeOpenCode(promptOptions, execLogger, executionConfig, cacheRestore.serverHandle)
+    // One ledger per invocation, not per attempt: constructed once here and threaded
+    // through to every LLM retry attempt inside `executeOpenCode` (plan Unit 11, Part 1
+    // and Part 2). Overflow recovery below replaces it with a fresh one rather than
+    // reusing this one across the session boundary.
+    const ledger = createOwnershipLedger()
+    const execResult = await executeOpenCode(
+      promptOptions,
+      execLogger,
+      executionConfig,
+      cacheRestore.serverHandle,
+      ledger,
+    )
 
     const sessionId = await resolveSessionId(execResult.sessionId, executionStartTime)
 
@@ -322,6 +366,7 @@ export async function runExecute(
       sessionId,
       resolvedOutputMode,
       outputModeMigration,
+      ownershipLedger: ledger,
       // Overwritten by the final return below once the whole phase has finished.
       executionDurationMs: 0,
     }
@@ -351,6 +396,7 @@ export async function runExecute(
         executionConfig,
         overflowedResult: result,
         overflowedSessionId: sessionId,
+        overflowedLedger: ledger,
         resolveSessionId,
       })
     }
