@@ -607,12 +607,12 @@ describe('executeOpenCode', () => {
       const result = await resultPromise
 
       // #then — cleanup may consume the remaining budget, but cannot rewrite terminal success. The
-      // shared deadline did expire while SSE shutdown was bounded-waiting, so teardown still attempts
-      // a best-effort remote abort -- that abort can never rewrite the already-selected success.
+      // shared deadline did expire while SSE shutdown was bounded-waiting, but the success was
+      // already accepted before that -- teardown must not abort an already-completed session.
       expect(result).toMatchObject({success: true, exitCode: 0})
       expect(mockClient.session.messages).toHaveBeenCalledOnce()
       expect(mockClient.session.update).not.toHaveBeenCalled()
-      expect(mockClient.session.abort).toHaveBeenCalledOnce()
+      expect(mockClient.session.abort).not.toHaveBeenCalled()
     } finally {
       await vi.advanceTimersByTimeAsync(4_000)
       if (resultPromise != null) await resultPromise
@@ -645,12 +645,13 @@ describe('executeOpenCode', () => {
       const result = await resultPromise
 
       // #then — primary failure survives cleanup and cannot open a continuation attempt. The shared
-      // deadline did expire during cleanup, so teardown still attempts a best-effort remote abort.
+      // deadline did expire during cleanup, but the failure was already accepted (not deferred past
+      // an ownership-ledger gate) before that happened -- teardown must not abort the session over it.
       expect(result).toMatchObject({success: false, exitCode: 1})
       expect(result.error).toContain('fetch failed')
       expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
       expect(mockClient.session.update).not.toHaveBeenCalled()
-      expect(mockClient.session.abort).toHaveBeenCalledOnce()
+      expect(mockClient.session.abort).not.toHaveBeenCalled()
     } finally {
       await vi.advanceTimersByTimeAsync(4_000)
       if (resultPromise != null) await resultPromise
@@ -703,12 +704,13 @@ describe('executeOpenCode', () => {
       const result = await resultPromise
 
       // #then — the terminal result survives a timed-out best-effort artifact read. The shared
-      // deadline expired while the artifact read was hanging, so teardown still attempts abort.
+      // deadline expired while the artifact read was hanging, but success was already accepted
+      // before that -- teardown must not abort the already-completed session.
       expect(result).toMatchObject({success: true, exitCode: 0})
       expect(mockClient.session.messages).toHaveBeenCalledTimes(2)
       expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
       expect(mockClient.session.update).not.toHaveBeenCalled()
-      expect(mockClient.session.abort).toHaveBeenCalledOnce()
+      expect(mockClient.session.abort).not.toHaveBeenCalled()
     } finally {
       await vi.advanceTimersByTimeAsync(4_000)
       if (resultPromise != null) await resultPromise

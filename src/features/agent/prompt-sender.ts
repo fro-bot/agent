@@ -39,6 +39,14 @@ export interface AttemptResult {
   /** Compatibility view derived from outcome; outcome is authoritative. */
   readonly shouldRetry: boolean
   readonly eventStreamResult: EventStreamResult
+  /**
+   * True only when this failure was preserved past the ownership-ledger early-exit gate and
+   * folded back in after the shared deadline forced the watchdog to give up (see retry.ts's
+   * `deferredFailedPromptStartResult`). Never set on a success. Callers use this -- not deadline
+   * state observed later during teardown -- to tell a decided outcome apart from one the deadline
+   * itself had to conclude.
+   */
+  readonly deferred?: boolean
 }
 
 export async function sendPromptToSession(

@@ -81,6 +81,13 @@ export async function executeOpenCode(
     llmError: null,
   }
   let lastLlmError: ErrorInfo | null = null
+  // Set immediately before every return that reflects a decided outcome (success, or a failure
+  // the attempt itself selected) -- never inferred afterward from deadline state, and never
+  // cleared. See the finalizer below for why this replaces consulting the deadline alone.
+  let terminalOutcomeAccepted = false
+  // Mirrors `lastError`/`lastLlmError`: the most recent attempt's own `deferred` flag, read only
+  // by the after-loop failure return below.
+  let lastAttemptDeferred = false
   logger.info('Executing OpenCode agent (SDK mode)', {
     agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
@@ -224,6 +231,7 @@ export async function executeOpenCode(
       final = mergeArtifactResults(result.eventStreamResult, final)
 
       if (result.success) {
+        terminalOutcomeAccepted = true
         return {
           success: true,
           exitCode: 0,
@@ -243,6 +251,7 @@ export async function executeOpenCode(
 
       lastError = result.error
       lastLlmError = result.llmError
+      lastAttemptDeferred = result.deferred === true
       const promptWasAccepted = promptAccepted
       if (result.outcome !== 'submit_failed') promptAccepted = true
 
@@ -285,6 +294,12 @@ export async function executeOpenCode(
       }, 'retry delay')
     }
 
+    // The loop can only reach here via a decided failure (response file present, non-retryable,
+    // or retries exhausted) or because the shared deadline forced it to give up mid-retry. Only
+    // the former is an accepted terminal outcome -- a deferred failure folded back after deadline
+    // expiry (lastAttemptDeferred) means the deadline is why this attempt ended, not the attempt
+    // itself, and the remote session must still be considered for abort.
+    terminalOutcomeAccepted = lastAttemptDeferred === false
     return {
       success: false,
       exitCode: 1,
@@ -302,6 +317,10 @@ export async function executeOpenCode(
     }
   } catch (error) {
     if (deadline.isTimedOut()) return timeoutResult()
+    // A genuine unexpected exception, not a synthesized timeout. Treat it as terminal unless the
+    // wall-clock deadline had already expired when it was caught -- isExpired() (not isTimedOut())
+    // so an in-flight expiry that the latched timer has not yet observed still counts.
+    terminalOutcomeAccepted = deadline.isExpired() === false
     const duration = Date.now() - startTime
     const errorMessage = toErrorMessage(error)
     const transportFailure = isLlmFetchError(error)
@@ -322,15 +341,37 @@ export async function executeOpenCode(
       classificationPath: transportFailure ? 'fallback' : 'unclassified',
     }
   } finally {
-    // Consult the shared deadline directly rather than a caller-tracked flag: the flag's correctness
-    // depended on being cleared/set at exactly the right point in this function's control flow, and
-    // three rounds of regressions (see retry.ts's runPromptAttempt deferred-failure handling) came from
-    // that dependency. `deadline.isTimedOut()` is the single independent source of truth for whether
-    // teardown must attempt to abort the remote session -- true whenever the shared budget expired,
-    // regardless of how or why the attempt loop returned. This best-effort abort never rewrites the
-    // already-selected result (success or failure); it only tries to stop remote work that may still
-    // be running under a session the harness itself gave up waiting on.
-    if (deadline.isTimedOut() && client != null && sessionId != null)
+    // Teardown must abort only when BOTH hold: the wall-clock deadline expired, and no terminal
+    // outcome was accepted. Neither condition alone is enough -- four rounds of regressions on this
+    // function family (see retry.ts's runPromptAttempt deferred-failure handling) each fixed one and
+    // broke its mirror image:
+    //   1. a failed prompt submission was silently discarded when the ownership ledger deferred
+    //      completion (a failure could report success);
+    //   2. restoring it after the deadline throw let expiry replace it with a generic timeout;
+    //   3. suppressing that throw meant a normal return, which cleared a caller-tracked
+    //      `shouldAbortRemoteOnTimeout` flag, so an expired session was never aborted;
+    //   4. deleting that flag in favor of consulting `deadline.isTimedOut()` alone made the abort
+    //      unconditional on expiry, so a run that succeeded before the deadline -- whose bounded
+    //      stream cleanup then crossed it -- had its already-reported-successful remote session
+    //      aborted anyway. Upstream, aborting a session cancels its background jobs regardless of
+    //      whether it already completed, which is exactly the owned work `runDrain` (running after
+    //      this finalizer, see harness/run.ts) exists to settle gracefully -- an unconditional abort
+    //      here pre-empts that mechanism entirely.
+    //
+    // `deadline.isExpired()` (not `isTimedOut()`) is used for the first condition: `isTimedOut()` is
+    // latched timer state, so under event-loop starvation teardown could observe `false`, dispose the
+    // timer, and skip aborting genuinely unfinished work -- the same failure mode as round 2, just on
+    // the other side of the deadline. `isExpired()` checks wall-clock time on demand and only falls
+    // back to the latch, so it is authoritative even when the timer callback has not yet run.
+    //
+    // `terminalOutcomeAccepted` is the second condition, and unlike the deleted flag it is derived
+    // from the result rather than threaded through control flow: it is set exactly once, immediately
+    // before each return that reflects a decided outcome (success, or a failure the attempt itself
+    // selected, as opposed to one the deadline had to conclude on the attempt's behalf -- see
+    // retry.ts's `deferred` field on `AttemptResult`). Once a return statement sets it, the value is
+    // already final; nothing between that assignment and this finalizer can change what was decided,
+    // so it cannot go stale the way a flag tracking control flow can.
+    if (deadline.isExpired() && terminalOutcomeAccepted === false && client != null && sessionId != null)
       await abortRemoteSession(client, sessionId, logger)
     deadline.dispose()
     if (ownsServer) server?.close()

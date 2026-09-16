@@ -575,9 +575,10 @@ export async function runPromptAttempt(
           outcome,
           shouldRetry: shouldRetryFromOutcome(outcome),
           eventStreamResult,
+          deferred: true,
         }
       }
-      return deferredFailedPromptStartResult
+      return {...deferredFailedPromptStartResult, deferred: true}
     }
 
     // Merge poll-observed terminal provider errors (SSE may never have emitted one) into the authoritative result.

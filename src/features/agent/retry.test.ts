@@ -417,10 +417,12 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
       )
 
       // #then — the watchdog observed completion, but the deferred submission failure survives
-      // instead of being reported as a false success
+      // instead of being reported as a false success. `deferred: true` marks it as a failure the
+      // deadline had to conclude on the attempt's behalf, not one the attempt itself decided --
+      // callers use that to tell it apart from an immediately-accepted terminal failure.
       expect(startPrompt).toHaveBeenCalledOnce()
       expect(waitFn).toHaveBeenCalled()
-      expect(result).toBe(FAILED_ATTEMPT_RESULT)
+      expect(result).toEqual({...FAILED_ATTEMPT_RESULT, deferred: true})
       expect(result.success).toBe(false)
       expect(result.error).toBe(FAILED_ATTEMPT_RESULT.error)
     })
@@ -462,7 +464,7 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
       )
 
       // #then — the classified llmError survives the deferral just as `error` does
-      expect(result).toBe(FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR)
+      expect(result).toEqual({...FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR, deferred: true})
       expect(result.success).toBe(false)
       expect(result.error).toBe(FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR.error)
       expect(result.llmError).toBe(RATE_LIMIT_ERROR)
