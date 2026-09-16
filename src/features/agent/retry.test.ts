@@ -417,12 +417,12 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
       )
 
       // #then — the watchdog observed completion, but the deferred submission failure survives
-      // instead of being reported as a false success. `deferred: true` marks it as a failure the
-      // deadline had to conclude on the attempt's behalf, not one the attempt itself decided --
-      // callers use that to tell it apart from an immediately-accepted terminal failure.
+      // instead of being reported as a false success. `deadlineConcluded: false` marks it as a
+      // failure the ledger deferred but that resolved on its own, well before any deadline --
+      // distinct from one the deadline itself had to conclude (see the mid-drain-expiry test below).
       expect(startPrompt).toHaveBeenCalledOnce()
       expect(waitFn).toHaveBeenCalled()
-      expect(result).toEqual({...FAILED_ATTEMPT_RESULT, deferred: true})
+      expect(result).toEqual({...FAILED_ATTEMPT_RESULT, deadlineConcluded: false})
       expect(result.success).toBe(false)
       expect(result.error).toBe(FAILED_ATTEMPT_RESULT.error)
     })
@@ -464,7 +464,7 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
       )
 
       // #then — the classified llmError survives the deferral just as `error` does
-      expect(result).toEqual({...FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR, deferred: true})
+      expect(result).toEqual({...FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR, deadlineConcluded: false})
       expect(result.success).toBe(false)
       expect(result.error).toBe(FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR.error)
       expect(result.llmError).toBe(RATE_LIMIT_ERROR)
@@ -550,10 +550,14 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
         const result = await resultPromise
 
         // #then — the deferred submission failure is reported as itself; the deadline-expiration
-        // throw never fires because the fold-back now runs before it
+        // throw never fires because the fold-back now runs before it. The deadline genuinely is what
+        // ended this wait (the poll loop kept looping on ledger-blocked completion until expiry), so
+        // `deadlineConcluded` must be `true` here -- unlike the earlier "resolves via wait()" tests
+        // above, where no deadline was even supplied.
         expect(result.success).toBe(false)
         expect(result.error).toBe(FAILED_ATTEMPT_RESULT.error)
         expect(result.outcome).not.toBe('timeout')
+        expect(result.deadlineConcluded).toBe(true)
       } finally {
         vi.useRealTimers()
       }

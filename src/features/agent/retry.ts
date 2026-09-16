@@ -543,13 +543,21 @@ export async function runPromptAttempt(
       pollPromise,
     ])
 
+    // The one point where it is known whether the deadline is what ended this wait: the poll/wait
+    // race above has just settled, and collectEventResults()'s bounded SSE cleanup (next) has not
+    // yet had a chance to advance the clock. Captured once, here, and reused immutably below for the
+    // deferred-failure fold-back's `deadlineConcluded` -- re-deriving it from deadline state after
+    // cleanup is exactly what made round 3's control-flow flag unsafe, since the deadline keeps
+    // advancing during cleanup while an already-decided outcome does not.
+    const deadlineConcludedWait = deadline?.isExpired() === true
+
     // A deferred failure must survive deadline expiry: only throw the generic timeout when there is
     // no known failure to preserve. Checked at the exact same point as before this fix (prior to
     // collectEventResults(), so bounded SSE cleanup time can never flip this check from false to
     // true out from under a plain no-ledger attempt) -- the only new behavior is that a deferred
     // failure now suppresses the throw instead of losing to it.
     if (
-      deadline?.isExpired() === true &&
+      deadlineConcludedWait &&
       activityTracker.terminalProviderError == null &&
       deferredFailedPromptStartResult == null
     ) {
@@ -563,6 +571,11 @@ export async function runPromptAttempt(
     // settled instead of at prompt-submission time. This must run before every other post-watchdog
     // branch below: none of them know the prompt itself already failed, and letting one of them
     // report success would silently swallow that failure the same way the deferred discard used to.
+    // `deadlineConcluded` records *what ended the wait*, not *why it waited* -- the ledger is why
+    // every result reached here at all, but plenty of them resolve well before the deadline once the
+    // outstanding work settles, so `deadlineConcludedWait` (captured above, before this attempt ever
+    // has to decide) is what tells a caller whether the remote session is still doing something the
+    // deadline cut short.
     if (deferredFailedPromptStartResult != null) {
       if (activityTracker.firstMeaningfulEventReceived === true) {
         const effectiveLlmError = eventStreamResult.llmError ?? deferredFailedPromptStartResult.llmError
@@ -575,10 +588,10 @@ export async function runPromptAttempt(
           outcome,
           shouldRetry: shouldRetryFromOutcome(outcome),
           eventStreamResult,
-          deferred: true,
+          deadlineConcluded: deadlineConcludedWait,
         }
       }
-      return {...deferredFailedPromptStartResult, deferred: true}
+      return {...deferredFailedPromptStartResult, deadlineConcluded: deadlineConcludedWait}
     }
 
     // Merge poll-observed terminal provider errors (SSE may never have emitted one) into the authoritative result.

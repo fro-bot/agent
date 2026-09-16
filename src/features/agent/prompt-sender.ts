@@ -40,13 +40,18 @@ export interface AttemptResult {
   readonly shouldRetry: boolean
   readonly eventStreamResult: EventStreamResult
   /**
-   * True only when this failure was preserved past the ownership-ledger early-exit gate and
-   * folded back in after the shared deadline forced the watchdog to give up (see retry.ts's
-   * `deferredFailedPromptStartResult`). Never set on a success. Callers use this -- not deadline
-   * state observed later during teardown -- to tell a decided outcome apart from one the deadline
-   * itself had to conclude.
+   * True only when the shared execution deadline is what forced this attempt to conclude, as
+   * determined at the one point retry.ts's `runPromptAttempt` knows the answer: immediately after
+   * the poll/wait race settles, before `collectEventResults()`'s bounded SSE cleanup can advance
+   * the clock further (see `deadlineConcludedWait`). Only ever populated on the ledger-deferred
+   * failure fold-back (see `deferredFailedPromptStartResult`) -- explicitly `false` there when the
+   * ledger wait resolved on its own before the deadline, not omitted, so callers can rely on its
+   * presence whenever a deferred failure was folded back. Never set on a success. Deferral
+   * describes *why* an attempt waited (outstanding owned work); this describes *what ended it*
+   * (the deadline, as opposed to the attempt resolving on its own) -- callers use this, not
+   * deadline state re-observed later during teardown, to tell those apart.
    */
-  readonly deferred?: boolean
+  readonly deadlineConcluded?: boolean
 }
 
 export async function sendPromptToSession(

@@ -85,9 +85,9 @@ export async function executeOpenCode(
   // the attempt itself selected) -- never inferred afterward from deadline state, and never
   // cleared. See the finalizer below for why this replaces consulting the deadline alone.
   let terminalOutcomeAccepted = false
-  // Mirrors `lastError`/`lastLlmError`: the most recent attempt's own `deferred` flag, read only
-  // by the after-loop failure return below.
-  let lastAttemptDeferred = false
+  // Mirrors `lastError`/`lastLlmError`: the most recent attempt's own `deadlineConcluded` flag,
+  // read only by the after-loop failure return below.
+  let lastAttemptDeadlineConcluded = false
   logger.info('Executing OpenCode agent (SDK mode)', {
     agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
@@ -251,7 +251,7 @@ export async function executeOpenCode(
 
       lastError = result.error
       lastLlmError = result.llmError
-      lastAttemptDeferred = result.deferred === true
+      lastAttemptDeadlineConcluded = result.deadlineConcluded === true
       const promptWasAccepted = promptAccepted
       if (result.outcome !== 'submit_failed') promptAccepted = true
 
@@ -294,12 +294,13 @@ export async function executeOpenCode(
       }, 'retry delay')
     }
 
-    // The loop can only reach here via a decided failure (response file present, non-retryable,
-    // or retries exhausted) or because the shared deadline forced it to give up mid-retry. Only
-    // the former is an accepted terminal outcome -- a deferred failure folded back after deadline
-    // expiry (lastAttemptDeferred) means the deadline is why this attempt ended, not the attempt
-    // itself, and the remote session must still be considered for abort.
-    terminalOutcomeAccepted = lastAttemptDeferred === false
+    // The loop can only reach here via a decided failure (response file present, non-retryable, or
+    // retries exhausted -- the same post-loop path either way, see the finalizer below) or because
+    // the shared deadline forced it to give up mid-retry. Only the former is an accepted terminal
+    // outcome -- a deferred failure the deadline itself concluded (lastAttemptDeadlineConcluded)
+    // means the deadline is why this attempt ended, not the attempt itself, and the remote session
+    // must still be considered for abort.
+    terminalOutcomeAccepted = lastAttemptDeadlineConcluded === false
     return {
       success: false,
       exitCode: 1,
@@ -342,21 +343,25 @@ export async function executeOpenCode(
     }
   } finally {
     // Teardown must abort only when BOTH hold: the wall-clock deadline expired, and no terminal
-    // outcome was accepted. Neither condition alone is enough -- four rounds of regressions on this
-    // function family (see retry.ts's runPromptAttempt deferred-failure handling) each fixed one and
-    // broke its mirror image:
-    //   1. a failed prompt submission was silently discarded when the ownership ledger deferred
-    //      completion (a failure could report success);
-    //   2. restoring it after the deadline throw let expiry replace it with a generic timeout;
-    //   3. suppressing that throw meant a normal return, which cleared a caller-tracked
-    //      `shouldAbortRemoteOnTimeout` flag, so an expired session was never aborted;
-    //   4. deleting that flag in favor of consulting `deadline.isTimedOut()` alone made the abort
-    //      unconditional on expiry, so a run that succeeded before the deadline -- whose bounded
-    //      stream cleanup then crossed it -- had its already-reported-successful remote session
-    //      aborted anyway. Upstream, aborting a session cancels its background jobs regardless of
-    //      whether it already completed, which is exactly the owned work `runDrain` (running after
-    //      this finalizer, see harness/run.ts) exists to settle gracefully -- an unconditional abort
-    //      here pre-empts that mechanism entirely.
+    // outcome was accepted. Neither condition alone is enough -- five rounds of regressions on this
+    // function family (see retry.ts's runPromptAttempt deferred-failure handling) each fixed one
+    // failure mode and broke its mirror image: a failed prompt submission silently discarded when
+    // the ownership ledger deferred completion (1), vs. restoring it in a way that lost to the
+    // deadline throw instead of suppressing it (2); a control-flow flag a normal return could clear,
+    // so an expired session was never aborted (3), vs. consulting `deadline.isTimedOut()` alone,
+    // making the abort unconditional on expiry and pre-empting `runDrain`'s owned-work settlement
+    // for a success whose bounded cleanup merely crossed the deadline afterward (4); and a `deferred`
+    // marker that conflated *why* an attempt waited (outstanding ledger work) with *what ended it*
+    // (5) -- most ledger-deferred waits resolve on their own well before the deadline, so marking
+    // every one of them deadline-concluded aborted sessions whose cleanup simply ran long, not
+    // sessions the deadline actually cut off.
+    //
+    // The fix: `AttemptResult.deadlineConcluded` (retry.ts) answers only "did the deadline end this
+    // wait", captured at the one point that's knowable -- immediately after the poll/wait race
+    // settles, before further cleanup can advance the clock. `terminalOutcomeAccepted` below reads
+    // that captured signal (via `lastAttemptDeadlineConcluded`), never deadline state re-observed
+    // later during teardown -- the same principle that made round 3's control-flow flag unsafe
+    // applies just as much to re-deriving the signal itself after time has moved on.
     //
     // `deadline.isExpired()` (not `isTimedOut()`) is used for the first condition: `isTimedOut()` is
     // latched timer state, so under event-loop starvation teardown could observe `false`, dispose the
@@ -364,13 +369,13 @@ export async function executeOpenCode(
     // the other side of the deadline. `isExpired()` checks wall-clock time on demand and only falls
     // back to the latch, so it is authoritative even when the timer callback has not yet run.
     //
-    // `terminalOutcomeAccepted` is the second condition, and unlike the deleted flag it is derived
+    // `terminalOutcomeAccepted` is the second condition, and unlike a control-flow flag it is derived
     // from the result rather than threaded through control flow: it is set exactly once, immediately
     // before each return that reflects a decided outcome (success, or a failure the attempt itself
-    // selected, as opposed to one the deadline had to conclude on the attempt's behalf -- see
-    // retry.ts's `deferred` field on `AttemptResult`). Once a return statement sets it, the value is
-    // already final; nothing between that assignment and this finalizer can change what was decided,
-    // so it cannot go stale the way a flag tracking control flow can.
+    // selected, as opposed to one the deadline had to conclude on the attempt's behalf). Once a
+    // return statement sets it, the value is already final; nothing between that assignment and this
+    // finalizer can change what was decided, so it cannot go stale the way a flag tracking control
+    // flow can.
     if (deadline.isExpired() && terminalOutcomeAccepted === false && client != null && sessionId != null)
       await abortRemoteSession(client, sessionId, logger)
     deadline.dispose()
