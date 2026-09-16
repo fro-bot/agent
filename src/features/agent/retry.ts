@@ -445,6 +445,14 @@ export async function runPromptAttempt(
     await stopEventProcessor()
   }
 
+  // Set only when the ledger defers a *failed* promptStartResult past the early exit below.
+  // Deferral changes when the attempt resolves, never what it reports: once the watchdog
+  // settles, this is folded back in using the exact same merge the immediate early exit would
+  // have applied, just later. A successful promptStartResult never populates this -- the ledger
+  // gate exists precisely so a successful turn does not end the run while owned work is live,
+  // and that behavior must stay untouched.
+  let deferredFailedPromptStartResult: AttemptResult | null = null
+
   try {
     // Ensure the lazy SDK SSE stream begins connecting before prompt submission. Without this,
     // event.subscribe().stream is only consumed after promptAsync returns, so early current-turn
@@ -461,6 +469,11 @@ export async function runPromptAttempt(
           // Owned work is still outstanding: decline to resolve through this early exit and fall
           // through to the watchdog below instead — the event processor stays running (no
           // stopEventProcessor() call here) and the same gated poll/wait race decides completion.
+          // A failed promptStartResult must not be discarded here: save it so the eventual
+          // AttemptResult still reports the failure instead of a watchdog-observed false success.
+          if (promptStartResult.success === false) {
+            deferredFailedPromptStartResult = promptStartResult
+          }
           logger.debug('Prompt start result observed but owned work outstanding — deferring completion', {
             sessionId,
             outstanding: ownershipLedger?.outstanding(),
@@ -535,6 +548,28 @@ export async function runPromptAttempt(
     }
 
     await collectEventResults()
+
+    // Fold back a promptStartResult failure the ledger deferred past the early exit above — using
+    // the exact same merge that early exit would have applied, just now that the watchdog has
+    // settled instead of at prompt-submission time. This must run before every other post-watchdog
+    // branch below: none of them know the prompt itself already failed, and letting one of them
+    // report success would silently swallow that failure the same way the deferred discard used to.
+    if (deferredFailedPromptStartResult != null) {
+      if (activityTracker.firstMeaningfulEventReceived === true) {
+        const effectiveLlmError = eventStreamResult.llmError ?? deferredFailedPromptStartResult.llmError
+        const outcome: AttemptOutcome =
+          effectiveLlmError?.retryable === true ? 'turn_failed_retryable' : 'turn_failed_terminal'
+        return {
+          ...deferredFailedPromptStartResult,
+          error: deferredFailedPromptStartResult.error,
+          llmError: effectiveLlmError,
+          outcome,
+          shouldRetry: shouldRetryFromOutcome(outcome),
+          eventStreamResult,
+        }
+      }
+      return deferredFailedPromptStartResult
+    }
 
     // Merge poll-observed terminal provider errors (SSE may never have emitted one) into the authoritative result.
     if (

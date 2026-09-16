@@ -50,6 +50,15 @@ function formatCacheSaveResult(value: CacheSaveStateValue): string {
  * in `save.ts` -- the two declines happen in different call sites, so each names its own
  * reason through its own channel rather than inventing a shared one.
  *
+ * `ownership-declined` is a plain string, not a `{sentence, retryDetail}` pair, because
+ * unlike every other not-persisted outcome it never gets a retry clause at all, in either
+ * phase: `post.ts` deliberately does NOT retry a `declined-for-safety` save (see the
+ * `cacheSaved === 'declined-for-safety'` branch in `post.ts`, which honors the decline
+ * instead) -- and its own `phase: 'post-skip-safety'` row must say the same thing
+ * `cleanup.ts`'s `phase: 'main'` row says, or the two rows tell contradictory stories
+ * about the same decision. So this sentence states plainly that the post-action step will
+ * not retry it, for both phases alike.
+ *
  * `skipped-empty` and `checkpoint-declined` are the only two entries with a trailing
  * "the post-action step retries" clause, and that clause is true only when this sentence
  * is rendered from `cleanup.ts`'s `phase: 'main'` write -- a post-action retry genuinely
@@ -70,10 +79,8 @@ const OUTCOME_TO_REMEDIATION = {
       'Session state did not persist this run \u2014 the database could not be checkpointed, so no write was attempted',
     retryDetail: undefined,
   },
-  'ownership-declined': {
-    sentence: 'Session state did not persist this run \u2014 persistence safety could not be confirmed',
-    retryDetail: 'once that condition clears',
-  },
+  'ownership-declined':
+    'Session state did not persist this run \u2014 persistence safety could not be confirmed; the post-action step will not retry it.',
   'cache-rejected':
     'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.',
   'cache-error':

@@ -612,6 +612,22 @@ describe('writeCacheSaveResultSummary', () => {
     expect(remediationText).not.toContain('s3-backup')
   })
 
+  it('states plainly that the post-action step will not retry an ownership decline, from the main-phase row', async () => {
+    // #given the review finding this unit fixes: cleanup.ts's main-phase row used to
+    // claim "the post-action step retries once that condition clears", but post.ts's
+    // `declined-for-safety` branch deliberately never retries -- it honors the decline.
+    // Both rows must tell the same story about the same decision.
+    // #when
+    await writeCacheSaveResultSummary(ownershipDeclinedResult, 'main', logger)
+
+    // #then the sentence says the post-action step will not retry it, and makes no retry
+    // promise of any kind (no "once that condition clears", no bare "retries" clause)
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('the post-action step will not retry it')
+    expect(remediationText).not.toContain('post-action step retries')
+    expect(remediationText).not.toContain('once that condition clears')
+  })
+
   it('omits the Reason line when declineReason is not supplied for an ownership-declined result', async () => {
     // #given a caller that (incorrectly, or in a future refactor) omits the reason --
     // the base sentence must still render rather than throwing

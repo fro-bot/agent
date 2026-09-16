@@ -220,10 +220,12 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - Edge case: settling an entry that was never adopted does not create one
 - Edge case: settling the same entry twice leaves the count unchanged
 - Error path: an entry marked unknown is excluded from settled but still blocks a persistence check
-- Integration: a ledger with one unknown and zero outstanding reports drain-complete but persistence-unsafe
+- Integration: a ledger with one unknown and zero outstanding reports neither drain-complete nor persistence-safe
 
 **Verification:**
 - A caller can distinguish "nothing outstanding" from "nothing known to be outstanding" without reading ledger internals.
+
+**Disproved during implementation.** This unit originally specified that an unknown entry blocks persistence but not drain, so a failed reconciliation could not wedge a run. That was wrong, and review caught it across five call sites. Drain gates publication, session pruning, server shutdown, the checkpoint, cache save, and lock release — so letting it complete over an unconfirmable entry does not avoid a wedge, it ends the run while a writer may still be live, which is the hazard this plan exists to close. Unknown now blocks both, and the run deadline rather than the predicate is what bounds the wait.
 
 - [ ] **Unit 2: Pin subagent depth to one**
 
@@ -264,26 +266,31 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - Test: `packages/runtime/src/agent/ledger-reconcile.test.ts`
 
 **Approach:**
-- `GET /session/{sessionID}/children` discovers candidates. It is a `parent_id` lookup with no liveness filter, so it returns every child ever created under the parent — adopting its result wholesale would keep the ledger permanently non-empty with historical children and block drain and persistence forever.
-- Liveness comes from session status, which holds an entry only while a session is non-idle. A candidate that reports idle has finished; one that reports busy is live. Only live candidates absent from the ledger are adopted, and only those created during this invocation.
-- Run on subscription, after any discontinuity, and on a bounded interval. A dispatch event dropped without a detected discontinuity is the plan's central hazard otherwise: the ledger would read zero while a child writes, and nothing would ever trigger a re-check. The interval reconciliation is bounded and cheap — the same `children` call and status check, not a heavier sweep.
+- Reconciliation settles what the ledger already tracks. It does not adopt a session the ledger never learned about from an observed dispatch — see the disproved assumption below.
+- `GET /session/{sessionID}/children` establishes parentage. It is a `parent_id` lookup with no liveness filter, so it returns every child ever created under the parent and cannot stand alone.
+- Liveness comes from session status, which holds an entry only while a session is non-idle. For a tracked entry: a live child of this parent stays outstanding, a child that is no longer live settles, and an entry that is not a child of this parent at all is marked unknown — there is no basis to claim it and no observation of completion to justify settling it.
+- Run on subscription, after any discontinuity, and on a bounded interval, so a settlement event that was dropped is still recovered. An empty ledger short-circuits before making any call, so a run with no background work pays nothing.
 - A ledger entry whose session is no longer live is settled.
 - A failed reconciliation marks the ledger unknown rather than empty. Specifically it marks the entries that were outstanding at the time of the failure, and leaves settled entries alone — a settled entry was confirmed finished by a positive observation, and a later failed call is not evidence against it.
-- An entry discovered by reconciliation rather than by an observed dispatch has no dispatch-site label to carry, so it is labelled as reconciled. Unit 13 reports by label, and a reader should be able to tell work the harness watched start from work it found already running.
 - The gateway consumes this primitive through `packages/gateway/src/runtime-effect.ts`, following how that file already wraps other runtime primitives (Unit 7 depends on it for startup reconciliation); the Action consumes it directly (Unit 8), since it has no equivalent wrapper layer.
 
 **Test scenarios:**
-- Happy path: a live child absent from the ledger is adopted
-- Happy path: a ledger entry whose session reports idle is settled
-- Edge case: a completed child from a previous invocation is not adopted
-- Edge case: a child that completed during this invocation is not re-adopted after settling
+- Happy path: a tracked entry that is a live child of this parent stays outstanding
+- Happy path: a tracked entry whose session reports idle is settled
+- Edge case: a live child this ledger never tracked is not adopted
+- Edge case: a tracked entry that is not a child of this parent is marked unknown
 - Edge case: reconciliation is idempotent across repeated runs
 - Edge case: reconciliation runs on its interval even with no subscription event or discontinuity
+- Edge case: an empty ledger performs no remote calls at all
 - Error path: a failed reconciliation call leaves the ledger unknown, not empty
-- Integration: a dispatch whose event was dropped is still discovered without a detected discontinuity
+- Integration: a tracked entry whose settlement event was dropped is still settled without a detected discontinuity
 
 **Verification:**
-- A lost dispatch event does not produce a ledger reading of zero even when no discontinuity is detected, and a parent with a long history of completed children still drains.
+- A parent with a long history of completed children still drains, and no run pays a remote call for background work it never dispatched.
+
+**Disproved during implementation — and this one leaves a hazard open.** This unit originally specified adopting live untracked children, so that a dispatch whose event was dropped would still be recovered. That is not possible from this project's position. Upstream creates the child session before the background branch, so foreground `task` delegation produces one identically, and `background: true` is written only onto tool-part metadata, never onto the session record — `children()` and the status map carry no discriminant at all. Adoption therefore claimed ordinary foreground subagents as owned background work on every run, and with unknown blocking drain, one transient API failure could hold a successful run in drain until it timed out.
+
+The consequence: **a dispatch whose event is never observed is unrecoverable.** The ledger cannot know about work it never saw, and nothing available to a client can tell that work apart from a foreground subagent. This is a real gap, not a solved problem, and the release gate must weigh it — it is bounded by the run deadline, and nothing can dispatch in background today, but it does not close on its own. Closing it needs an upstream discriminant on the session record, or a server-side hook that sees the tool's actual arguments.
 
 ### Phase 2 — Gateway
 
@@ -629,6 +636,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - This phase gates Phases 1–3 rather than sitting beside them as a peer step: the flag flips only once every prior unit has merged with its tests passing.
 - Upstream has no background-job cap of its own, and this plan cut its attempt at one (see Scope Boundaries). Nothing bounds how many dispatches an invocation makes; what bounds the invocation is its deadline, and what keeps work from outliving it is drain. Do not flip this flag on the assumption a cap exists.
 - Before flipping, demonstrate terminal quiescence independently of any gate: a late completion notification and a dispatch racing finalization must both be handled correctly. Zero observed outstanding work is not proof that nothing can start more.
+- **Weigh the unrecoverable dropped dispatch before flipping** (see Unit 3). A dispatch whose event is never observed cannot be recovered, because nothing available to a client distinguishes a background child session from a foreground one. The ledger reads zero and the run proceeds normally over work it does not know about. That is the plan's original central hazard, still open. It is bounded by the run deadline and cannot occur while dispatch is disabled, but enabling the flag is exactly what makes it reachable — decide deliberately whether that is acceptable, rather than inheriting the assumption that reconciliation covers it.
 - Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` on both surfaces, following the pattern established for the file watcher — default only when unset or empty, so an operator value wins.
 - Note the umbrella interaction: `OPENCODE_EXPERIMENTAL=true` enables background subagents independently, so the ownership machinery must hold whether or not this project sets the specific flag. The umbrella is unset everywhere in this repository today, so the interaction is latent rather than active; the rollout should assert it stays unset until Units 1–13 land, rather than assuming it.
 - Background subagents are new execution contexts, not exceptions to containment: descendants run under the same `filterAgentEnv` scrub (`packages/runtime/src/agent/filter-env.ts`) as the root, and on the gateway, the same mitmproxy egress allowlist, with no additional inherited credentials or destinations.
@@ -667,6 +675,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 | The 30-second reserve is wrong once drain exists | It is configurable, the value is recorded as derived from teardown measured without drain, and re-measurement from the drain tail is tracked once drain exists |
 | An operator sets the experimental umbrella and enables this before the machinery lands | The machinery must hold independently of who set the flag; the umbrella is confirmed unset everywhere in this repository today, and rollout asserts it stays unset until the machinery lands (Unit 14) |
 | Unbounded fan-out exhausts an invocation's budget, with no cap to stop it | Accepted rather than mitigated. The deadline bounds the invocation and drain bounds what outlives it; a cap was attempted and cut as unenforceable. Revisit only with measured evidence (see Deferred to Separate Tasks) |
+| A dispatch whose event is never observed leaves the ledger reading zero while a child writes | **Open.** Reconciliation was meant to cover this and cannot: no discriminant exists between a background child session and a foreground one, so adopting untracked children claimed ordinary delegation as owned work. Bounded by the run deadline, unreachable while dispatch is disabled, and a stated input to the release gate (Unit 14) |
 
 ## Documentation / Operational Notes
 

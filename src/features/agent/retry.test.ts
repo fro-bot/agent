@@ -18,6 +18,7 @@
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptResult} from './prompt-sender.js'
+import type {ErrorInfo} from './types.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -72,6 +73,38 @@ const COMPLETED_ATTEMPT_RESULT: AttemptResult = {
     commentsPosted: 0,
     llmError: null,
   },
+}
+
+// A submission failure -- the only shape `startPrompt` ever returns non-null in production (see
+// `sendPromptToSession`'s `createSubmissionFailure`): the prompt never reached the model at all.
+const FAILED_ATTEMPT_RESULT: AttemptResult = {
+  success: false,
+  error: 'prompt submission failed: 503',
+  llmError: null,
+  outcome: 'submit_failed',
+  shouldRetry: false,
+  eventStreamResult: {
+    tokens: null,
+    model: null,
+    cost: null,
+    prsCreated: [],
+    commitsCreated: [],
+    commentsPosted: 0,
+    llmError: null,
+  },
+}
+
+const RATE_LIMIT_ERROR: ErrorInfo = {
+  type: 'rate_limit',
+  message: 'rate limited',
+  retryable: true,
+}
+
+// llmError travels separately from `error` on `AttemptResult` -- a submission failure can carry
+// both a human-readable `error` string and a classified `llmError` the retry loop keys off of.
+const FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR: AttemptResult = {
+  ...FAILED_ATTEMPT_RESULT,
+  llmError: RATE_LIMIT_ERROR,
 }
 
 describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
@@ -327,5 +360,156 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
     expect(mockClient.session.messages).toHaveBeenCalled()
     expect(result.success).toBe(false)
     expect(result.error).toContain('Poll timeout')
+  })
+
+  describe('deferred promptStartResult failure survives the watchdog', () => {
+    it('a failed prompt whose completion is deferred by outstanding owned work still reports its error when the attempt finally resolves', async () => {
+      // #given wait() eventually reports success, the ledger has outstanding work, and startPrompt
+      // itself already failed (a submission failure) before the ledger deferral kicked in
+      let resolveWait!: () => void
+      const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+        async () =>
+          new Promise<TestWaitResponse>(resolve => {
+            resolveWait = () => resolve({data: undefined, error: undefined})
+          }),
+      )
+      vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+      const {runPromptAttempt} = await import('./retry.js')
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const startPrompt = vi.fn(async () => FAILED_ATTEMPT_RESULT)
+      const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+      // No current-turn activity events: a submission failure means the turn never actually
+      // started, so nothing streams for it -- only the deferred watchdog observes completion.
+      const eventStream = createMockEventStream([
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ])
+      setTimeout(() => resolveWait(), 20)
+
+      // #when
+      const result = await runPromptAttempt(
+        mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+        'ses_123',
+        '/workspace',
+        1_500,
+        mockLogger,
+        eventStream,
+        'http://localhost:1234',
+        startPrompt,
+        undefined,
+        undefined,
+        undefined,
+        ledger,
+      )
+
+      // #then — the watchdog observed completion, but the deferred submission failure survives
+      // instead of being reported as a false success
+      expect(startPrompt).toHaveBeenCalledOnce()
+      expect(waitFn).toHaveBeenCalled()
+      expect(result).toBe(FAILED_ATTEMPT_RESULT)
+      expect(result.success).toBe(false)
+      expect(result.error).toBe(FAILED_ATTEMPT_RESULT.error)
+    })
+
+    it('the same for llmError, which travels separately from error', async () => {
+      // #given the same deferred-failure shape, but the submission failure also carries a classified llmError
+      let resolveWait!: () => void
+      const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+        async () =>
+          new Promise<TestWaitResponse>(resolve => {
+            resolveWait = () => resolve({data: undefined, error: undefined})
+          }),
+      )
+      vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+      const {runPromptAttempt} = await import('./retry.js')
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const startPrompt = vi.fn(async () => FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR)
+      const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+      const eventStream = createMockEventStream([
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ])
+      setTimeout(() => resolveWait(), 20)
+
+      // #when
+      const result = await runPromptAttempt(
+        mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+        'ses_123',
+        '/workspace',
+        1_500,
+        mockLogger,
+        eventStream,
+        'http://localhost:1234',
+        startPrompt,
+        undefined,
+        undefined,
+        undefined,
+        ledger,
+      )
+
+      // #then — the classified llmError survives the deferral just as `error` does
+      expect(result).toBe(FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR)
+      expect(result.success).toBe(false)
+      expect(result.error).toBe(FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR.error)
+      expect(result.llmError).toBe(RATE_LIMIT_ERROR)
+    })
+
+    it('a successful prompt deferred by outstanding work is unaffected', async () => {
+      // #given the same deferral, but startPrompt itself succeeded (COMPLETED_ATTEMPT_RESULT) — the
+      // ledger gate must still hold the run open for owned work, and no failure should be fabricated
+      const {runPromptAttempt} = await import('./retry.js')
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const startPrompt = vi.fn(async () => COMPLETED_ATTEMPT_RESULT)
+      const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+
+      // #when — no v2 wait mock is installed, so this falls back to poll, which times out because
+      // nothing else signals completion — exactly today's behavior for a deferred success
+      const result = await runPromptAttempt(
+        mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+        'ses_123',
+        '/workspace',
+        1_500,
+        mockLogger,
+        createMockEventStream([]),
+        undefined,
+        startPrompt,
+        undefined,
+        undefined,
+        undefined,
+        ledger,
+      )
+
+      // #then — declined the early exit exactly as before; nothing about the failure-preservation
+      // fix changes the outcome for a successful deferred prompt
+      expect(startPrompt).toHaveBeenCalledOnce()
+      expect(result).not.toBe(COMPLETED_ATTEMPT_RESULT)
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('Poll timeout')
+    })
+
+    it('existing retry behavior with no ledger is unchanged', async () => {
+      // #given a failed promptStartResult and no ledger argument at all
+      const {runPromptAttempt} = await import('./retry.js')
+      const startPrompt = vi.fn(async () => FAILED_ATTEMPT_RESULT)
+      const mockClient = {session: {status: vi.fn()}}
+
+      // #when
+      const result = await runPromptAttempt(
+        mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+        'ses_123',
+        '/workspace',
+        400,
+        mockLogger,
+        createMockEventStream([]),
+        undefined,
+        startPrompt,
+      )
+
+      // #then — resolves immediately through the existing (non-deferred) early exit, exactly as
+      // every run without a ledger does today; the new deferral machinery never engages
+      expect(result).toBe(FAILED_ATTEMPT_RESULT)
+      expect(mockClient.session.status).not.toHaveBeenCalled()
+    })
   })
 })

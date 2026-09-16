@@ -61,12 +61,16 @@
  *
  * Failure handling: a failed reconciliation call (either upstream call
  * rejecting or returning an error) marks every currently-outstanding ledger
- * entry `unknown` rather than leaving them untouched or settling them. This
- * matters because `unknown` — unlike `outstanding` — does not block
- * `isDrainComplete()`, only `isPersistenceSafe()`. A failed call must never
- * make the ledger look empty (which would wrongly unblock persistence), but it
- * also must not make a permanently-unreachable status check block drain
- * forever. `unknown` is the fail-safe middle state the ledger was designed for.
+ * entry `unknown` rather than leaving them untouched or settling them.
+ * `unknown` blocks `isDrainComplete()` exactly as `outstanding` does — both
+ * are required to be zero before either predicate returns `true` (see
+ * `ownership-ledger.ts`), because an entry the harness cannot confirm might
+ * still be a live writer. A failed call must never settle an entry it did not
+ * actually observe finishing (that would wrongly unblock both drain and
+ * persistence), so the only safe move is downgrading it to `unknown` and
+ * leaving the caller's own deadline — not this predicate — to bound how long
+ * an unresolvable status blocks the run. `unknown` is the fail-safe middle
+ * state the ledger was designed for.
  * Settling FROM unknown is still allowed, and only ever happens on a later
  * pass where the session is confirmed both a child of this parent (via
  * `children()`) AND absent from `liveSessionIds()` — never as a timeout or a
