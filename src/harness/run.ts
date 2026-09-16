@@ -1,4 +1,9 @@
-import type {ObjectStoreConfig, OutputModeMigrationState, OutputModeRequestState} from '@fro-bot/runtime'
+import type {
+  ObjectStoreConfig,
+  OutputModeMigrationState,
+  OutputModeRequestState,
+  OwnershipLedger,
+} from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
 import type {AttachmentResult} from '../features/attachments/index.js'
@@ -10,7 +15,7 @@ import {createLogger} from '../shared/logger.js'
 import {setActionOutputs} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
 import {runAcknowledge} from './phases/acknowledge.js'
-import {runAcquireLock} from './phases/acquire-lock.js'
+import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
@@ -38,6 +43,18 @@ export async function run(): Promise<number> {
   let runId = ''
   let sessionRetention: number | null = null
   let lockEtag: string | null = null
+  // Renews the coordination lock's lease across execution, drain, and persistence (plan
+  // Unit 12) -- null whenever this run holds no lock (S3 disabled, acquisition failed, or
+  // another surface already holds it). Held here, not inside acquire-lock.ts, because it
+  // must outlive the acquire-lock phase call and reach runCleanup in the finally block
+  // below, exactly like lockEtag already does.
+  let leaseRenewal: LeaseController | null = null
+  // Hoisted out of the try block (like lockEtag above) because runCleanup runs from the
+  // outer finally block, where a `const` declared inside try is out of scope. Populated
+  // right after runExecute returns; stays undefined only when execution never ran
+  // (SKIP_AGENT_EXECUTION=true) or the try block failed before reaching that point --
+  // both cases runCleanup treats as an empty, persistence-safe ledger.
+  let ownershipLedger: OwnershipLedger | undefined
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
   let storeConfig: ObjectStoreConfig = {
@@ -107,6 +124,7 @@ export async function run(): Promise<number> {
     switch (lockResult.outcome) {
       case 'acquired':
         lockEtag = lockResult.lockEtag
+        leaseRenewal = lockResult.renewal
         break
       case 'held-by-other':
         bootstrapLogger.info('Skipping run — coordination lock held by another surface', {
@@ -143,6 +161,7 @@ export async function run(): Promise<number> {
 
     const execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
     agentSuccess = execution.success
+    ownershipLedger = execution.ownershipLedger
 
     // Drain: owned background work settles before anything below this point
     // publishes, persists, or releases (Unit 10). `execution.ownershipLedger` is
@@ -250,6 +269,8 @@ export async function run(): Promise<number> {
       repo,
       runId,
       lockEtag,
+      ownershipLedger,
+      leaseRenewal,
     })
   }
 

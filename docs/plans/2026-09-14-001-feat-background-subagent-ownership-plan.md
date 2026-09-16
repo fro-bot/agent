@@ -562,7 +562,9 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Files:**
 - Modify: `src/harness/phases/cleanup.ts`
 - Modify: `src/harness/phases/acquire-lock.ts`
-- Modify: `src/features/agent/execution.ts`
+- Modify: `src/harness/run.ts`
+- Modify: `src/shared/cache-save-result.ts`
+- Modify: `src/features/observability/job-summary.ts`
 - Test: `src/harness/phases/cleanup.test.ts`
 - Test: `src/harness/phases/acquire-lock.test.ts`
 
@@ -570,7 +572,9 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - The harness publishes after drain; a background subagent never publishes an invocation response. Publication stays run-scoped, so a retry cannot clobber another invocation's output.
 - Persistence declines when entries are unknown or the server's quiescence is unconfirmed. The checkpoint needs a quiet writer, and the existing shutdown poll is best-effort.
 - Persistence declining is a visible outcome, not a silent skip: the run's observability output states that the cache was not saved and why, so an operator does not discover it later only from a missing session on the next run.
-- The lease renews across execution, drain, and persistence, reusing `packages/runtime/src/coordination/heartbeat.ts`. A failed renewal fails closed.
+- The lease renews across execution, drain, and persistence. Use `renewLease` directly rather than the gateway's heartbeat controller: that controller reads and writes a `RunState` record, and the Action deliberately never creates one — the lock alone provides its mutual exclusion. Renewal is a timer started at acquisition and stopped after persistence, so it spans the protected interval without being threaded through the phases between.
+- Renewal changes the lock record's etag, so releasing with the acquisition etag fails the conditional delete and leaks the lock for the next surface. Release with the most recently confirmed renewal etag, and stop renewal by awaiting any in-flight tick so that value is settled before release reads it.
+- A failed renewal fails closed by declining persistence, not by failing the run — the same posture as the other two declines.
 - When no lock was acquired — S3 unconfigured or acquisition failed — the fail-open posture is unchanged and R21 still governs persistence (see origin: R22a).
 
 **Test scenarios:**
@@ -580,6 +584,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - Edge case: a declined persistence is recorded in the run's outcome, not only omitted from the cache save
 - Error path: a failed lease renewal fails closed
 - Edge case: a run holding no lock persists normally and does not fail for want of a lease
+- Edge case: release uses the renewed etag rather than the acquisition etag once renewal has ticked
 - Integration: exactly one comment or review is delivered when a subagent produced a result
 
 **Verification:**

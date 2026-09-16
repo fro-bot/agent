@@ -39,6 +39,15 @@ function formatCacheSaveResult(value: CacheSaveStateValue): string {
  * help either -- a declined checkpoint means no write was attempted at all, and an empty
  * observation means there was nothing to write in the first place.
  *
+ * `ownership-declined` also gets its own sentence: unlike `checkpoint-declined` (the
+ * database itself could not be checkpointed), this decline happens before the checkpoint
+ * is ever attempted, because persistence safety could not be confirmed. Its specific
+ * cause (unresolved ownership, unconfirmed quiescence, or a failed lease renewal) is
+ * supplied by the caller as `declineReason` and appended to this base sentence, the same
+ * way `checkpoint-declined`'s own `reason` is appended by `writeCheckpointDeclineSummary`
+ * in `save.ts` -- the two declines happen in different call sites, so each names its own
+ * reason through its own channel rather than inventing a shared one.
+ *
  * `skipped-empty` and `checkpoint-declined` are the only two entries with a trailing
  * "the post-action step retries" clause, and that clause is true only when this sentence
  * is rendered from `cleanup.ts`'s `phase: 'main'` write -- a post-action retry genuinely
@@ -58,6 +67,10 @@ const OUTCOME_TO_REMEDIATION = {
     sentence:
       'Session state did not persist this run \u2014 the database could not be checkpointed, so no write was attempted',
     retryDetail: undefined,
+  },
+  'ownership-declined': {
+    sentence: 'Session state did not persist this run \u2014 persistence safety could not be confirmed',
+    retryDetail: 'once that condition clears',
   },
   'cache-rejected':
     'Session state did not persist this run \u2014 the cache service did not accept the write, which on a comment-triggered run usually means a read-only cache token, but can also be a key collision or a transient cache-service failure; enable `s3-backup` to persist state independent of the Actions cache.',
@@ -111,6 +124,7 @@ export async function writeCacheSaveResultSummary(
   result: CacheSaveResult,
   phase: 'main' | 'post-retry',
   logger: Logger,
+  declineReason?: string,
 ): Promise<void> {
   try {
     const value = toCacheSaveStateValue(result)
@@ -128,8 +142,19 @@ export async function writeCacheSaveResultSummary(
       core.summary.addRaw(`${remediation}\n`)
     }
 
+    // Declared here (not folded into a fifth OUTCOME_TO_REMEDIATION variant per specific
+    // cause) because the reason is only known at the ownership-declined call site --
+    // runCleanup already distinguishes which of the three conditions applied and would
+    // otherwise have to smuggle that distinction through a fabricated CacheSaveResult
+    // shape. A reader must be able to tell WHY without reading logs, so this is not a
+    // second channel -- it augments the same 'Session Persistence' row this function
+    // always writes.
+    if (declineReason != null && result.outcome === 'ownership-declined') {
+      core.summary.addRaw(`**Reason:** ${declineReason}\n`)
+    }
+
     await core.summary.write()
-    logger.debug('Wrote cache save result summary', {value})
+    logger.debug('Wrote cache save result summary', {value, declineReason})
   } catch (error) {
     const errorMsg = toErrorMessage(error)
     logger.warning('Failed to write cache save result summary', {error: errorMsg})

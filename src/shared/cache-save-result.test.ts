@@ -26,6 +26,11 @@ const OUTCOME_EXPECTATIONS = {
     description: 'the SQLite write-ahead log could not be checkpointed before the save could proceed',
     backendsAttempted: false,
   },
+  'ownership-declined': {
+    description:
+      'persistence safety could not be confirmed -- unresolved ownership, unconfirmed server quiescence, or a failed coordination lease renewal',
+    backendsAttempted: false,
+  },
   'cache-rejected': {
     description:
       'the Actions cache write returned its -1 sentinel; an inference covering both a denial and a collision, never distinguished',
@@ -48,6 +53,7 @@ describe('CacheSaveOutcome', () => {
       'cache-error',
       'cache-rejected',
       'checkpoint-declined',
+      'ownership-declined',
       'persisted',
       'skipped-by-configuration',
       'skipped-empty',
@@ -61,6 +67,7 @@ describe('CacheSaveOutcome', () => {
       'skipped-by-configuration',
       'skipped-empty',
       'checkpoint-declined',
+      'ownership-declined',
     ]
 
     for (const outcome of skippedOutcomes) {

@@ -309,6 +309,11 @@ describe('writeCacheSaveResultSummary', () => {
     storePersisted: false,
     outcome: 'checkpoint-declined',
   }
+  const ownershipDeclinedResult: CacheSaveResult = {
+    cachePersisted: false,
+    storePersisted: false,
+    outcome: 'ownership-declined',
+  }
 
   beforeEach(() => {
     vi.clearAllMocks()
@@ -447,6 +452,39 @@ describe('writeCacheSaveResultSummary', () => {
     const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
     expect(remediationText).toContain('could not be checkpointed')
     expect(remediationText).not.toContain('post-action step retries')
+  })
+
+  it('reports a declined persistence distinctly from a rejected write, and names why via declineReason', async () => {
+    // #given persistence safety could not be confirmed (unresolved ownership, unconfirmed
+    // quiescence, or a failed lease renewal) -- the review finding this unit exists to fix:
+    // a decline must be visible with a reason, not silent
+    // #when
+    await writeCacheSaveResultSummary(
+      ownershipDeclinedResult,
+      'main',
+      logger,
+      'the coordination lease could not be renewed',
+    )
+
+    // #then the base sentence names persistence safety, distinct from a rejected write,
+    // and the specific declineReason is appended so a reader does not need the logs
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('persistence safety could not be confirmed')
+    expect(remediationText).toContain('**Reason:** the coordination lease could not be renewed')
+    expect(remediationText).not.toContain('did not accept the write')
+    expect(remediationText).not.toContain('s3-backup')
+  })
+
+  it('omits the Reason line when declineReason is not supplied for an ownership-declined result', async () => {
+    // #given a caller that (incorrectly, or in a future refactor) omits the reason --
+    // the base sentence must still render rather than throwing
+    // #when
+    await writeCacheSaveResultSummary(ownershipDeclinedResult, 'main', logger)
+
+    // #then
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('persistence safety could not be confirmed')
+    expect(remediationText).not.toContain('**Reason:**')
   })
 
   it('does not fail the run when the summary write throws', async () => {
