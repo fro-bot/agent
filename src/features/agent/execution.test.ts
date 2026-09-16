@@ -272,3 +272,137 @@ describe('executeOpenCode — ownership ledger threading (Unit 11)', () => {
     }
   })
 })
+
+function createDisabledProviders() {
+  return {
+    claude: 'no',
+    copilot: 'no',
+    gemini: 'no',
+    openai: 'no',
+    opencodeZen: 'no',
+    zaiCodingPlan: 'no',
+    kimiForCoding: 'no',
+  } as const
+}
+
+/**
+ * Prompt submission that fails immediately, and a session that never reports idle -- the poll
+ * watchdog never completes on its own, so only the shared deadline forces a resolution.
+ */
+function createStuckMockClient(promptOutcome: {error: string} | {data: {parts: {type: string; text: string}[]}}) {
+  const promptAsync = vi.fn().mockResolvedValue(promptOutcome)
+  return {
+    session: {
+      create: vi.fn().mockResolvedValue({data: {id: 'ses_root', title: 'Test', version: '1'}}),
+      update: vi.fn().mockResolvedValue({data: {}}),
+      abort: vi.fn().mockResolvedValue({data: undefined}),
+      promptAsync,
+      messages: vi.fn().mockResolvedValue({data: []}),
+      children: vi.fn().mockResolvedValue({data: []}),
+      status: vi.fn().mockResolvedValue({data: {ses_root: {type: 'busy'}}}),
+    },
+    event: {
+      subscribe: vi.fn().mockImplementation(async () => ({
+        stream: createPromptStartedEventStream(promptAsync, []),
+      })),
+    },
+  }
+}
+
+describe('executeOpenCode — deadline teardown consults the shared deadline directly (round 3 regression)', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('reports the original failure and aborts the expired remote session when a deferred failure survives deadline expiry', async () => {
+    // #given a failed prompt submission (a real LLM-fetch-classified failure, not a synthesized
+    // timeout), outstanding owned work that defers completion, and no other completion signal --
+    // the session never reports idle, so only the shared deadline can end the attempt
+    vi.useFakeTimers()
+    const client = createStuckMockClient({error: 'fetch failed'})
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: client as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+    })
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+
+    // #when the shared deadline expires while the ledger is still blocking completion
+    const resultPromise = executeOpenCode(
+      createMockPromptOptions(),
+      mockLogger,
+      {
+        agent: null,
+        model: null,
+        timeoutMs: 1_000,
+        omoProviders: createDisabledProviders(),
+      },
+      undefined,
+      ledger,
+    )
+    await vi.advanceTimersByTimeAsync(4_000)
+    const result = await resultPromise
+
+    // #then the attempt reports the original submission failure, never a synthesized timeout message
+    expect(result.success).toBe(false)
+    expect(result.error).toBe('fetch failed')
+    expect(result.error).not.toContain('Execution timed out')
+
+    // #and no retry was attempted after the deadline expired, even though the preserved failure is
+    // classified retryable (an LLM fetch error) and would otherwise be eligible for a resend
+    expect(client.session.promptAsync).toHaveBeenCalledOnce()
+
+    // #and teardown still aborts the remote session: the shared deadline is consulted directly in
+    // executeOpenCode's finalizer instead of a caller-tracked flag, so a normal return that happened
+    // only because a deferred failure survived deadline expiry still triggers cleanup
+    expect(client.session.abort).toHaveBeenCalledOnce()
+  })
+
+  it('a successful deferred prompt at expiry is unaffected: still resolves to a timeout, with the remote session aborted', async () => {
+    // #given a prompt submission that succeeds (startPrompt returns null, exactly as production's
+    // sendPromptToSession does on success), outstanding owned work that defers completion, and no
+    // other completion signal -- the deadline-expiration throw fires exactly as it did before this
+    // fix, because no failure was ever preserved to suppress it
+    vi.useFakeTimers()
+    const client = createStuckMockClient({data: {parts: [{type: 'text', text: 'ok'}]}})
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: client as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+    })
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+
+    // #when the shared deadline expires while the ledger is still blocking completion
+    const resultPromise = executeOpenCode(
+      createMockPromptOptions(),
+      mockLogger,
+      {
+        agent: null,
+        model: null,
+        timeoutMs: 1_000,
+        omoProviders: createDisabledProviders(),
+      },
+      undefined,
+      ledger,
+    )
+    await vi.advanceTimersByTimeAsync(4_000)
+    const result = await resultPromise
+
+    // #then this remains a generic timeout, exactly as before -- the fix only changes the
+    // deferred-*failure* path
+    expect(result.success).toBe(false)
+    expect(result.exitCode).toBe(130)
+    expect(result.error).toBe('Execution timed out after 1000ms')
+
+    // #and teardown still aborts the remote session
+    expect(client.session.abort).toHaveBeenCalledOnce()
+  })
+})

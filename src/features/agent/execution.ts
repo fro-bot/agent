@@ -81,7 +81,6 @@ export async function executeOpenCode(
     llmError: null,
   }
   let lastLlmError: ErrorInfo | null = null
-  let shouldAbortRemoteOnTimeout = true
   logger.info('Executing OpenCode agent (SDK mode)', {
     agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
@@ -211,7 +210,6 @@ export async function executeOpenCode(
             onPermissionAsked,
             ownershipLedger,
           )
-          shouldAbortRemoteOnTimeout = false
           return attemptResult
         } finally {
           if (deadline.isExpired() === false)
@@ -275,7 +273,6 @@ export async function executeOpenCode(
         nextPrompt = {kind: 'initial'}
       }
 
-      shouldAbortRemoteOnTimeout = true
       logger.warning('LLM fetch error detected, retrying with continuation prompt', {
         attempt,
         maxAttempts: MAX_LLM_RETRIES,
@@ -325,7 +322,15 @@ export async function executeOpenCode(
       classificationPath: transportFailure ? 'fallback' : 'unclassified',
     }
   } finally {
-    if (shouldAbortRemoteOnTimeout && deadline.isTimedOut() && client != null && sessionId != null)
+    // Consult the shared deadline directly rather than a caller-tracked flag: the flag's correctness
+    // depended on being cleared/set at exactly the right point in this function's control flow, and
+    // three rounds of regressions (see retry.ts's runPromptAttempt deferred-failure handling) came from
+    // that dependency. `deadline.isTimedOut()` is the single independent source of truth for whether
+    // teardown must attempt to abort the remote session -- true whenever the shared budget expired,
+    // regardless of how or why the attempt loop returned. This best-effort abort never rewrites the
+    // already-selected result (success or failure); it only tries to stop remote work that may still
+    // be running under a session the harness itself gave up waiting on.
+    if (deadline.isTimedOut() && client != null && sessionId != null)
       await abortRemoteSession(client, sessionId, logger)
     deadline.dispose()
     if (ownsServer) server?.close()

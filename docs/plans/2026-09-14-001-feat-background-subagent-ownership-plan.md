@@ -165,10 +165,10 @@ stateDiagram-v2
     [*] --> Admitting
     Admitting --> Running: prompt submitted
     Running --> Running: dispatch observed, entry opened
-    Running --> Draining: root idle AND outstanding > 0
-    Running --> Settling: root idle AND outstanding == 0
+    Running --> Draining: root idle AND (outstanding > 0 OR unknown > 0)
+    Running --> Settling: root idle AND outstanding == 0 AND unknown == 0
     Draining --> Draining: completion turn injected, entry settled
-    Draining --> Settling: outstanding == 0
+    Draining --> Settling: outstanding == 0 AND unknown == 0
     Draining --> Cancelling: deadline reserve reached
     Cancelling --> Settling: every entry confirmed or unknown
     Settling --> [*]: publish, persist, release
@@ -635,6 +635,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 - This phase gates Phases 1–3 rather than sitting beside them as a peer step: the flag flips only once every prior unit has merged with its tests passing.
 - Upstream has no background-job cap of its own, and this plan cut its attempt at one (see Scope Boundaries). Nothing bounds how many dispatches an invocation makes; what bounds the invocation is its deadline, and what keeps work from outliving it is drain. Do not flip this flag on the assumption a cap exists.
 - Before flipping, demonstrate terminal quiescence independently of any gate: a late completion notification and a dispatch racing finalization must both be handled correctly. Zero observed outstanding work is not proof that nothing can start more.
+- **Resolve the conflated lifecycle signals first.** An independent review of `runPromptAttempt` and `executeOpenCode` found that several facts are inferred from things that do not imply them, and the invariant they violate is one sentence: selecting an error never proves quiescence, and observing quiescence never erases an error. Specifically — a terminal provider classification is treated as an observed terminal turn signal even when it came from a retry status; root idle sets sticky flags that a later resumption never clears, which matters precisely because a background completion injects another parent turn; the completed-assistant fallback accepts two stable observations without checking idle status, message error, or finish reason, though upstream distinguishes `tool-calls` and `unknown` from a finished turn; and a deferred failure returns before poll-observed terminal errors are merged, so a poll-only terminal error can lose to a retryable saved one. These are not created by this plan and most are reachable today, but each one becomes materially worse once a descendant can produce the signal — descendant provider-status handling in particular is already ownership-widened while `session.error` is root-scoped.
+- Verify the umbrella empirically rather than by repository search. `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` resolves through `enabledByExperimental` (upstream `packages/opencode/src/effect/runtime-flags.ts:11-14,43`), so an unset specific flag inherits `OPENCODE_EXPERIMENTAL`. The umbrella is unset everywhere in this repository, but `deploy/.env` is not committed, so the gateway's deployed environment cannot be confirmed from the repository alone.
 - **Weigh the unrecoverable dropped dispatch before flipping** (see Unit 3). A dispatch whose event is never observed cannot be recovered, because nothing available to a client distinguishes a background child session from a foreground one. The ledger reads zero and the run proceeds normally over work it does not know about. That is the plan's original central hazard, still open. It is bounded by the run deadline and cannot occur while dispatch is disabled, but enabling the flag is exactly what makes it reachable — decide deliberately whether that is acceptable, rather than inheriting the assumption that reconciliation covers it.
 - Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` on both surfaces, following the pattern established for the file watcher — default only when unset or empty, so an operator value wins.
 - Note the umbrella interaction: `OPENCODE_EXPERIMENTAL=true` enables background subagents independently, so the ownership machinery must hold whether or not this project sets the specific flag. The umbrella is unset everywhere in this repository today, so the interaction is latent rather than active; the rollout should assert it stays unset until Units 1–13 land, rather than assuming it.
