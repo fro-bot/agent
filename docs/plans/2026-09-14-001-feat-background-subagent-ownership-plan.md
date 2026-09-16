@@ -469,8 +469,9 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 - Test: `src/features/agent/session-poll.test.ts`
 
 **Approach:**
-- Four paths currently end a run independently: the stable completed-assistant poll (`retry.ts:185-234`), the v2 session-wait success path (`retry.ts:290-349`), the sticky terminal flags (`retry.ts:371-378`), and the early `promptStartResult != null` return after `collectEventResults()` (`retry.ts:434-456`). The origin document names the first three; the fourth was found during research.
-- Each consults the ledger before resolving as complete. Gating one and not another leaves the run exiting through whichever is left.
+- Four paths currently end a run independently. Two live in `session-poll.ts` rather than `retry.ts`, despite the names suggesting otherwise: the stable completed-assistant poll is `detectMessageActivity` and its consumer in `pollForSessionCompletion`, and the sticky terminal flags are read at two separate branches in that same loop — one for flags the event stream set, one for a REST-polled idle status. `retry.ts:185-234` is `readCompletedAssistantMessageParts`, a post-idle artifact read that reports nothing, and `retry.ts:371-378` is the activity tracker's object literal, not a read site. The remaining two are genuinely in `retry.ts`: the v2 session-wait success path (`290-349`) and the early `promptStartResult != null` return after `collectEventResults()` (`434-456`).
+- Each consults the ledger before resolving as complete. Gating one and not another leaves the run exiting through whichever is left. A blocked early return must fall through to the already-gated watchdog rather than returning, so declining to complete does not mean declining to make progress.
+- Prove each gate has teeth by neutering the shared predicate and confirming the targeted tests fail. These paths race, so a green suite is weak evidence that any individual gate is load-bearing.
 
 **Execution note:** Start with a failing test per path, since the paths race and a passing suite can hide one that was never gated.
 

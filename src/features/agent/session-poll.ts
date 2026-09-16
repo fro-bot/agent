@@ -1,3 +1,4 @@
+import type {OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {ExecutionDeadline} from './retry.js'
@@ -15,6 +16,17 @@ export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 interface PollResult {
   readonly completed: boolean
   readonly error: string | null
+}
+
+/**
+ * `true` when a supplied ledger still has owned work outstanding — the gate every
+ * terminal completion path in this module (and in `retry.ts`) consults before
+ * reporting `completed: true`. Absent ledger means single-session behavior:
+ * never blocks (backward-compatible no-op), matching `isOwnedSession` in
+ * `streaming.ts`.
+ */
+export function ledgerBlocksCompletion(ledger?: OwnershipLedger): boolean {
+  return ledger !== undefined && ledger.isDrainComplete() === false
 }
 
 function getStringProperty(value: unknown, property: string): string | null {
@@ -177,6 +189,7 @@ export async function pollForSessionCompletion(
   maxPollTimeMs: number = DEFAULT_TIMEOUT_MS,
   activityTracker?: ActivityTracker,
   deadline?: ExecutionDeadline,
+  ownershipLedger?: OwnershipLedger,
 ): Promise<PollResult> {
   const pollStart = Date.now()
   let errorGraceCycles = 0
@@ -229,8 +242,15 @@ export async function pollForSessionCompletion(
     }
 
     if (activityTracker?.sessionIdle === true && activityTracker.currentTurnTerminalSignalReceived) {
-      logger.debug('Session idle detected via event stream', {sessionId})
-      return {completed: true, error: null}
+      if (ledgerBlocksCompletion(ownershipLedger)) {
+        logger.debug('Session idle detected via event stream but owned work outstanding — deferring completion', {
+          sessionId,
+          outstanding: ownershipLedger?.outstanding(),
+        })
+      } else {
+        logger.debug('Session idle detected via event stream', {sessionId})
+        return {completed: true, error: null}
+      }
     }
 
     const elapsed = Date.now() - pollStart
@@ -249,7 +269,16 @@ export async function pollForSessionCompletion(
         signal,
         deadline,
       )
-      if (messageResult != null) return messageResult
+      if (messageResult != null) {
+        if (ledgerBlocksCompletion(ownershipLedger)) {
+          logger.debug(
+            'Stable completed-assistant message observed but owned work outstanding — deferring completion',
+            {sessionId, outstanding: ownershipLedger?.outstanding()},
+          )
+        } else {
+          return messageResult
+        }
+      }
 
       const statusResponse = await runPollRequest(
         async () => client.session.status({query: {directory}, signal}),
@@ -265,6 +294,11 @@ export async function pollForSessionCompletion(
       } else if (sessionStatus.type === 'idle') {
         if (activityTracker != null && activityTracker.currentTurnTerminalSignalReceived !== true) {
           logger.debug('Session idle detected before terminal signal; continuing watchdog', {sessionId})
+        } else if (ledgerBlocksCompletion(ownershipLedger)) {
+          logger.debug('Session idle detected via polling but owned work outstanding — deferring completion', {
+            sessionId,
+            outstanding: ownershipLedger?.outstanding(),
+          })
         } else {
           logger.debug('Session idle detected via polling', {sessionId})
           return {completed: true, error: null}

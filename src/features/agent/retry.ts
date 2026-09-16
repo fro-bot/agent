@@ -1,10 +1,16 @@
+import type {OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode, Event} from '@opencode-ai/sdk'
 import type {createOpencodeClient} from '@opencode-ai/sdk/v2'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptOutcome, AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {pollForSessionCompletion, waitForAbortableDelay, waitForEventProcessorShutdown} from './session-poll.js'
+import {
+  ledgerBlocksCompletion,
+  pollForSessionCompletion,
+  waitForAbortableDelay,
+  waitForEventProcessorShutdown,
+} from './session-poll.js'
 import {detectArtifactsFromMessageParts, processEventStream} from './streaming.js'
 
 export type PromptStartResult = AttemptResult | null
@@ -294,6 +300,7 @@ async function startV2SessionWait(
   logger: Logger,
   signal: AbortSignal,
   deadline?: ExecutionDeadline,
+  ownershipLedger?: OwnershipLedger,
 ): Promise<V2WaitOutcome> {
   const v2Client =
     deadline == null
@@ -340,6 +347,16 @@ async function startV2SessionWait(
       })
       return 'terminal-provider-failed'
     }
+    if (ledgerBlocksCompletion(ownershipLedger)) {
+      logger.debug(
+        'v2.session.wait() resolved with terminal signal but owned work outstanding — deferring to poll watchdog',
+        {
+          sessionId,
+          outstanding: ownershipLedger?.outstanding(),
+        },
+      )
+      return 'fallback-to-poll'
+    }
     logger.debug('v2.session.wait() resolved with terminal signal — session is done', {sessionId})
     return 'succeeded'
   } catch (error) {
@@ -360,6 +377,7 @@ export async function runPromptAttempt(
   deadline?: ExecutionDeadline,
   attemptAbortController?: AbortController,
   onPermissionAsked?: PermissionAskedResponder,
+  ownershipLedger?: OwnershipLedger,
 ): Promise<AttemptResult> {
   const attemptController = attemptAbortController ?? new AbortController()
   const eventAbortController = new AbortController()
@@ -402,6 +420,7 @@ export async function runPromptAttempt(
     activityTracker,
     deadline,
     onPermissionAsked,
+    ownershipLedger,
   )
     .then(result => {
       eventStreamResult = result
@@ -438,21 +457,31 @@ export async function runPromptAttempt(
       const promptStartResult =
         deadline == null ? await startPrompt() : await deadline.run(startPrompt, 'prompt submission')
       if (promptStartResult != null) {
-        await collectEventResults()
-        if (activityTracker.firstMeaningfulEventReceived === true) {
-          const effectiveLlmError = eventStreamResult.llmError ?? promptStartResult.llmError
-          const outcome: AttemptOutcome =
-            effectiveLlmError?.retryable === true ? 'turn_failed_retryable' : 'turn_failed_terminal'
-          return {
-            ...promptStartResult,
-            error: promptStartResult.error,
-            llmError: effectiveLlmError,
-            outcome,
-            shouldRetry: shouldRetryFromOutcome(outcome),
-            eventStreamResult,
+        if (ledgerBlocksCompletion(ownershipLedger)) {
+          // Owned work is still outstanding: decline to resolve through this early exit and fall
+          // through to the watchdog below instead — the event processor stays running (no
+          // stopEventProcessor() call here) and the same gated poll/wait race decides completion.
+          logger.debug('Prompt start result observed but owned work outstanding — deferring completion', {
+            sessionId,
+            outstanding: ownershipLedger?.outstanding(),
+          })
+        } else {
+          await collectEventResults()
+          if (activityTracker.firstMeaningfulEventReceived === true) {
+            const effectiveLlmError = eventStreamResult.llmError ?? promptStartResult.llmError
+            const outcome: AttemptOutcome =
+              effectiveLlmError?.retryable === true ? 'turn_failed_retryable' : 'turn_failed_terminal'
+            return {
+              ...promptStartResult,
+              error: promptStartResult.error,
+              llmError: effectiveLlmError,
+              outcome,
+              shouldRetry: shouldRetryFromOutcome(outcome),
+              eventStreamResult,
+            }
           }
+          return promptStartResult
         }
-        return promptStartResult
       }
     }
 
@@ -466,10 +495,19 @@ export async function runPromptAttempt(
       timeoutMs,
       activityTracker,
       deadline,
+      ownershipLedger,
     )
 
     // Authoritative completion signal when available; falls back to the poller otherwise.
-    const waitPromise = startV2SessionWait(serverUrl, sessionId, activityTracker, logger, waitSignal, deadline)
+    const waitPromise = startV2SessionWait(
+      serverUrl,
+      sessionId,
+      activityTracker,
+      logger,
+      waitSignal,
+      deadline,
+      ownershipLedger,
+    )
 
     // Race: wait() succeeds → success; terminal provider failure → failure (never success);
     // wait() falls back → use poll result.
