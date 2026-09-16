@@ -27,7 +27,17 @@ import {createLogger} from '../../shared/logger.js'
  * also ending renewal before persistence is what needs it protected.
  */
 export interface LeaseController {
-  /** `true` once any renewal tick since `start` has failed. A failed renewal fails closed: a caller about to persist state must treat this the same as an unconfirmed writer. */
+  /**
+   * `true` when the MOST RECENT renewal tick failed -- not latched across the whole
+   * lease lifetime. A later successful renewal resets this back to `false` (see the
+   * `tick()` implementation and `acquire-lock.test.ts`'s "hasFailed() reflects the
+   * most recent tick, not history" case): a conditional write succeeding against the
+   * current ETag is fresh evidence the lock is still held, so there is nothing left
+   * for a stale failure to warn about. A failed renewal still fails closed in the
+   * moment -- a caller about to persist state right after a failed tick must treat
+   * this the same as an unconfirmed writer -- but that protection does not survive
+   * a subsequent confirmed success.
+   */
   readonly hasFailed: () => boolean
   /**
    * The most recently confirmed lock ETag (the initial acquisition ETag if no renewal has

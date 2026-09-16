@@ -1,34 +1,54 @@
 /**
- * Ledger reconciliation: recovers the ownership ledger from events it never saw.
+ * Ledger reconciliation: settles tracked ownership entries against upstream
+ * state the event stream never delivered a confirmation for.
  *
- * The ledger (`ownership-ledger.ts`) learns about background work from a stream
- * of dispatch/settlement events. That stream has no replay: a reconnect, a
- * discontinuity, or a silent drop with no reconnect at all can leave the ledger
- * reading zero while a child session is still writing. Reconciliation asks
- * upstream directly instead of waiting for an event that may never arrive.
+ * The ledger (`ownership-ledger.ts`) learns about background work from a
+ * stream of dispatch/settlement events. That stream has no replay: a
+ * reconnect, a discontinuity, or a silent drop with no reconnect at all can
+ * leave a tracked entry `outstanding` forever even after the session it
+ * names has actually finished. Reconciliation asks upstream directly instead
+ * of waiting for a completion event that may never arrive.
  *
- * Two upstream questions, deliberately kept separate:
- * - `children(parentSessionId)` — DISCOVERY. A bare `parent_id` lookup with no
- *   liveness filter. It returns every child session ever created under the
- *   parent, including ones that finished long ago. Adopting its result wholesale
- *   would keep the ledger permanently non-empty with historical children, and
- *   drain (and persistence) would never complete. This was a real defect caught
- *   in review; this module must never adopt a `children()` candidate on its own.
+ * This module settles what it already tracks. It does NOT adopt sessions the
+ * ledger has never heard of. An earlier version adopted any live, untracked
+ * child returned by `children(parentSessionId)`, meant to recover a
+ * background dispatch whose event was dropped before the ledger ever learned
+ * of it. That could not work and was actively harmful: upstream creates a
+ * child session identically for foreground `task` delegation and for
+ * background dispatch — the only difference is a `background: true` flag on
+ * the tool-call metadata, which never reaches the session record itself (see
+ * `session.children` / `session.status` in `../session/backend.js`, and
+ * upstream `packages/opencode/src/tool/task.ts`: the child session is created
+ * before the foreground/background branch, and `background` is stamped only
+ * onto the returned tool part's metadata). `children()` and `liveSessionIds()`
+ * therefore have no discriminant between an ordinary foreground subagent and
+ * a background dispatch. Adopting on that basis meant an unrelated foreground
+ * subagent, mid-run at a reconcile tick, could be adopted as this run's owned
+ * background work — making every run's drain depend on a classification that
+ * cannot be made. That adoption path has been removed. See "Known gap" below
+ * for what this leaves unrecoverable.
+ *
+ * Two upstream questions, both still needed to settle tracked entries safely:
+ * - `children(parentSessionId)` — DISCOVERY. A bare `parent_id` lookup with
+ *   no liveness filter. Used only to confirm a *tracked* entry's session id
+ *   is actually a descendant of this parent — never to introduce a new entry.
  * - `liveSessionIds()` — LIVENESS. Backed by session status, which holds an
- *   entry only while a session is non-idle. A session absent from this set has
- *   finished (or never started); a session present in it is live right now.
+ *   entry only while a session is non-idle. A session absent from this set
+ *   has finished (or never started); a session present in it is live right
+ *   now.
  *
- * A candidate is adopted only when it is BOTH a child of the parent AND live
- * AND absent from the ledger. Nothing is ever adopted from `children()`
- * output alone.
- *
- * Liveness is not enough on its own to settle or hold an entry — it must
- * also be scoped to this parent's children, because `liveSessionIds()` is
- * server-wide (every non-idle session, under any parent). Every ledger entry
- * therefore falls into one of three cases on each pass:
- * - Child of this parent AND live → outstanding. Adopted if the ledger did
- *   not already know about it.
- * - Child of this parent AND NOT live → finished. Settled.
+ * Every ledger entry that is currently `outstanding` or `unknown` falls into
+ * one of three cases on each pass:
+ * - Child of this parent AND live → left as-is. `outstanding` stays
+ *   outstanding. An `unknown` entry stays `unknown` here too — this loop only
+ *   ever settles or downgrades, it never re-promotes `unknown` back to
+ *   `outstanding`; it can only leave `unknown` via the settle branch below.
+ * - Child of this parent AND NOT live → finished. Settled. This settlement IS
+ *   inferred from absence — the session is missing from `liveSessionIds()` —
+ *   but that absence is checked against a session upstream still
+ *   affirmatively confirms (via `children()`) belongs to this parent's tree.
+ *   That is the one place this module treats absence of liveness as evidence
+ *   of completion; it never treats absence of an *event* the same way.
  * - NOT a child of this parent at all → unverifiable. The reconciler has no
  *   basis to claim this entry is part of this parent's tree, so it is marked
  *   `unknown` — never settled (settling asserts a positive observation of
@@ -48,8 +68,30 @@
  * also must not make a permanently-unreachable status check block drain
  * forever. `unknown` is the fail-safe middle state the ledger was designed for.
  * Settling FROM unknown is still allowed, and only ever happens on a later
- * POSITIVE observation (a status check that confirms the session is no longer
- * live) — never inferred from the absence of evidence.
+ * pass where the session is confirmed both a child of this parent (via
+ * `children()`) AND absent from `liveSessionIds()` — never as a timeout or a
+ * default.
+ *
+ * Empty-ledger short circuit: when the ledger has no entries at all, this
+ * module makes no remote calls. With adoption gone there is nothing an empty
+ * ledger could learn from `children()`/`liveSessionIds()` — every branch
+ * below only ever acts on entries already in the ledger. Skipping the pass
+ * saves two upstream calls per Action run and two every
+ * `DEFAULT_LEDGER_RECONCILE_INTERVAL_MS` per gateway run, for a call that
+ * would otherwise be a guaranteed no-op.
+ *
+ * Known gap: a background dispatch whose *dispatch* event (not settlement
+ * event) never reaches the ledger — dropped mid-stream, or during a
+ * reconnect gap before the ledger ever learns the session id — is now
+ * unrecoverable by reconciliation. There is no discriminant this module can
+ * use to discover it after the fact (see above), so it is never adopted and
+ * never counted toward drain. This is bounded by the run's own deadline (an
+ * unrecoverable dispatch does not hang a run forever, it is just silently
+ * excluded from the drain wait), and nothing in this codebase can currently
+ * issue a background dispatch at all, so the gap has no live exposure today.
+ * If background dispatch ships, recovering a dropped dispatch event needs a
+ * real discriminant upstream (e.g. a `background` flag on the session record
+ * itself) — this module must not paper over that absence by guessing again.
  */
 
 import type {Result} from '@bfra.me/es/result'
@@ -63,7 +105,7 @@ import {toError} from '../shared/errors.js'
 /** Bounded interval between reconciliation passes run only because the interval elapsed. */
 export const DEFAULT_LEDGER_RECONCILE_INTERVAL_MS = 30_000
 
-/** A candidate child session discovered via upstream's `children` lookup. */
+/** A child session returned by upstream's `children` lookup, used only to confirm tracked entries. */
 export interface LedgerReconcileChild {
   readonly id: string
 }
@@ -92,18 +134,25 @@ export interface ReconcileLedgerOptions {
   readonly logger: Logger
 }
 
-/** Label recorded for entries this module adopts — reconciliation has no caller-supplied label to preserve. */
-const RECONCILED_LABEL = 'reconciled'
-
 /**
- * Run one reconciliation pass: adopt live untracked children, settle entries
- * that are no longer live, and — on failure — mark outstanding entries unknown.
+ * Run one reconciliation pass: settle tracked entries that are no longer
+ * live, downgrade tracked entries this parent can no longer vouch for to
+ * `unknown`, and — on failure — mark outstanding entries unknown. Never
+ * adopts a session the ledger does not already track (see module doc).
  *
  * Idempotent: running this repeatedly against an unchanged upstream view makes
- * no further ledger changes (`adopt` and `settle` are themselves idempotent).
+ * no further ledger changes (`settle` and `markUnknown` are themselves
+ * idempotent).
+ *
+ * Makes no upstream calls when the ledger has no entries at all — see
+ * "Empty-ledger short circuit" in the module doc.
  */
 export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Promise<Result<void, Error>> {
   const {ledger, adapter, parentSessionId, logger} = options
+
+  if (ledger.snapshot().length === 0) {
+    return ok(undefined)
+  }
 
   const [childrenResult, liveResult] = await Promise.all([adapter.children(parentSessionId), adapter.liveSessionIds()])
 
@@ -125,15 +174,6 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
   const children = childrenResult.data
   const liveSessionIds = liveResult.data
   const childSessionIds = new Set(children.map(child => child.id))
-  const knownSessionIds = new Set(ledger.snapshot().map(entry => entry.sessionId))
-
-  const adopted: string[] = []
-  for (const child of children) {
-    if (knownSessionIds.has(child.id) === true) continue
-    if (liveSessionIds.has(child.id) === false) continue
-    ledger.adopt(child.id, RECONCILED_LABEL)
-    adopted.push(child.id)
-  }
 
   const settled: string[] = []
   const downgradedToUnknown: string[] = []
@@ -156,11 +196,10 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
     settled.push(entry.sessionId)
   }
 
-  if (adopted.length > 0 || settled.length > 0 || downgradedToUnknown.length > 0) {
+  if (settled.length > 0 || downgradedToUnknown.length > 0) {
     logger.debug('Ledger reconciliation adjusted ownership', {
       source: 'reconcileLedgerOnce',
       parentSessionId,
-      adopted,
       settled,
       downgradedToUnknown,
     })
@@ -183,18 +222,19 @@ export interface CreateLedgerReconcilerOptions extends ReconcileLedgerOptions {
  * Arms a bounded-interval reconciliation pass, independent of the subscription
  * and discontinuity triggers a caller wires up elsewhere by calling
  * `reconcileLedgerOnce` directly. The interval exists because a dropped
- * dispatch event with no detected discontinuity has nothing else to trigger a
- * re-check — this is the plan's central hazard, and belt-and-braces triggers
- * (subscription, discontinuity) do not cover it.
+ * settlement event for a tracked entry, with no detected discontinuity, has
+ * nothing else to trigger a re-check — belt-and-braces triggers (subscription,
+ * discontinuity) do not cover a silent drop.
  *
  * Overlap guard: each tick is skipped while a previous pass is still in
- * flight. `reconcileLedgerOnce` makes two remote calls per pass; if either
- * slows past `intervalMs`, letting a second pass start would stack concurrent
- * calls against the same upstream and ledger. A skipped tick is never lost
- * work — the next tick (or the very next `reconcileLedgerOnce` the pass
- * finishes with) picks up the current state, and the fixed-cadence interval
- * (rather than self-rescheduling after each pass) keeps the "one tick per
- * `intervalMs`, barring overlap" timing callers and tests already rely on.
+ * flight. `reconcileLedgerOnce` makes up to two remote calls per pass (none
+ * at all when the ledger is empty); if either slows past `intervalMs`,
+ * letting a second pass start would stack concurrent calls against the same
+ * upstream and ledger. A skipped tick is never lost work — the next tick (or
+ * the very next `reconcileLedgerOnce` the pass finishes with) picks up the
+ * current state, and the fixed-cadence interval (rather than
+ * self-rescheduling after each pass) keeps the "one tick per `intervalMs`,
+ * barring overlap" timing callers and tests already rely on.
  */
 export function createLedgerReconciler(options: CreateLedgerReconcilerOptions): LedgerReconciler {
   const {intervalMs = DEFAULT_LEDGER_RECONCILE_INTERVAL_MS, ...reconcileOptions} = options

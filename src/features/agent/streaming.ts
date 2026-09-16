@@ -631,10 +631,40 @@ export async function processEventStream(
           }
         }
       } else if (eventType === 'session.error') {
-        if (isOwnedSession(getSessionID(eventPayload), sessionId, ownershipLedger)) {
+        const errorEventSessionID = getSessionID(eventPayload)
+        if (isOwnedSession(errorEventSessionID, sessionId, ownershipLedger)) {
           const sessionError = getObjectProperty(eventPayload, 'error')
           // Bounded log: never pass the raw session error payload to the logger.
           logger.error('Session error received', {sessionType: typeof sessionError})
+
+          // Root-scoped, mirroring `session.idle` below for the same reason: a
+          // descendant's error is real information (logged above, and its
+          // ledger entry is marked `unknown` below) but must not end this
+          // run's turn or feed `recoverFromContextOverflow`
+          // (`src/harness/phases/execute.ts`, gated on this function's
+          // returned `llmError.type === 'context_overflow'`). Without this
+          // guard a descendant reporting context_overflow would archive and
+          // restart the ROOT session on the descendant's behalf, and any
+          // descendant error would end a turn the root session is still
+          // actively running — the same premature-termination class idle was
+          // kept root-scoped to avoid, through a different event.
+          //
+          // Chose `markUnknown` over `settle`: an error report is evidence
+          // something went wrong, not proof the session stopped writing —
+          // the same uncertainty a dropped stream event or a failed
+          // reconciliation call leaves (see the discontinuity handler below,
+          // and `OwnershipLedger`'s own doc on why `unknown` is never
+          // collapsed into `settled`). The one signal this file treats as
+          // confirmed-finished for an error outcome is upstream's injected
+          // `<task id="..." state="error">` completion marker (handled earlier
+          // in this loop, in the `message.part.updated` branch), which calls
+          // `settle` unconditionally for both `completed` and `error` states —
+          // that is upstream's own authoritative "this execution is done"
+          // signal; a raw `session.error` event is not.
+          if (errorEventSessionID !== sessionId) {
+            if (errorEventSessionID != null) ownershipLedger?.markUnknown(errorEventSessionID)
+            continue
+          }
 
           // Allowlisted structured fields only — never echo the raw session error object/URL.
           const errorData = getObjectProperty(sessionError, 'data')
@@ -704,6 +734,14 @@ export async function processEventStream(
           }
         }
       } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
+        // Deliberately root-scoped by construction (`=== sessionId`, not
+        // `isOwnedSession`): a descendant going idle says nothing about
+        // whether the root session's own turn is done, and treating it as
+        // this run's idle would end the parent's turn while it is still
+        // working. `session.error` above is root-scoped for the identical
+        // reason. The next person widening a filter in this function should
+        // ask the same question these two answered: does this signal, when
+        // it fires on a descendant, actually mean the ROOT session is done?
         if (activityTracker != null) {
           activityTracker.sessionIdle = true
           activityTracker.currentTurnTerminalSignalReceived = true

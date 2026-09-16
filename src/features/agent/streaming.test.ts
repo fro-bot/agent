@@ -107,6 +107,13 @@ function sessionErrorEvent(sessionID: string): Event {
   return {type: 'session.error', properties: {sessionID, error: 'boom'}} as unknown as Event
 }
 
+function contextOverflowErrorEvent(sessionID: string): Event {
+  return {
+    type: 'session.error',
+    properties: {sessionID, error: {name: 'ContextOverflowError'}},
+  } as unknown as Event
+}
+
 function toolSuccessEvent(sessionID: string): Event {
   return {
     type: 'session.next.tool.called',
@@ -589,11 +596,44 @@ describe('processEventStream — ownership check widens descendant events, no-le
     expect(result.llmError).toBeNull()
   })
 
-  it("session.error: with a ledger an ADOPTED descendant's error is now this run's problem too, unlike before", async () => {
-    // #given a ledger that has adopted the child session, and a session.error on that child
+  it("session.error: a descendant's error does not end the parent's turn or surface as this run's llmError", async () => {
+    // #given a ledger that has adopted the child session, an activity tracker, and a session.error on the CHILD
     const ledger: OwnershipLedger = createOwnershipLedger()
     ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const eventStream = createMockEventStream([sessionErrorEvent(CHILD_SESSION_ID)])
+
+    // #when processed with the ledger and tracker supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the descendant's error does not reach this run's llmError and does not end the turn
+    expect(result.llmError).toBeNull()
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+    expect(activityTracker.sessionError).toBeNull()
+
+    // #then it is still observed: the descendant's ledger entry no longer reads outstanding
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'unknown'}])
+  })
+
+  it("session.error: a descendant's context_overflow does not surface as llmError, so it cannot trigger root-session overflow recovery", async () => {
+    // #given a ledger that has adopted the child session, and a context_overflow session.error on the CHILD
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const eventStream = createMockEventStream([contextOverflowErrorEvent(CHILD_SESSION_ID)])
 
     // #when processed with the ledger supplied
     const result = await processEventStream(
@@ -607,8 +647,65 @@ describe('processEventStream — ownership check widens descendant events, no-le
       ledger,
     )
 
-    // #then the descendant's error surfaces as this run's llmError
-    expect(result.llmError).not.toBeNull()
+    // #then no llmError reaches the caller — `runExecute`'s overflow-recovery gate
+    // (`result.llmError?.type === 'context_overflow'`) never sees this descendant's error
+    expect(result.llmError).toBeNull()
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'unknown'}])
+  })
+
+  it("session.error: the ROOT session's own context_overflow error still ends the turn and still surfaces as llmError, unchanged", async () => {
+    // #given a ledger (present, but the error fires on the ROOT session id, not a descendant) and an activity tracker
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([contextOverflowErrorEvent(ROOT_SESSION_ID)])
+
+    // #when processed with the ledger and tracker supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the root's own error still ends the turn and still surfaces as llmError, exactly as before ownership widening
+    expect(result.llmError?.type).toBe('context_overflow')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // #then the unrelated adopted descendant entry is untouched by the root's own error
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'outstanding'}])
+  })
+
+  it('session.error: a run with no ledger is unaffected by the root-scoping change', async () => {
+    // #given no ledger at all, and a session.error on the root session (the only session a no-ledger run knows about)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([contextOverflowErrorEvent(ROOT_SESSION_ID)])
+
+    // #when processed with no ledger
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then unchanged: the root session's own error still ends the turn and surfaces as llmError
+    expect(result.llmError?.type).toBe('context_overflow')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
   })
 
   it('session.idle stays root-scoped: a descendant idle never ends the run', async () => {

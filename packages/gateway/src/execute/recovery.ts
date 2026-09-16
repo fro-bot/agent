@@ -301,10 +301,11 @@ async function reconcileOwnedSessions(opts: ReconcileOwnedSessionsOpts): Promise
     return {kind: 'reattach-failed'}
   }
 
-  // Read outcomes back only for the sessions this run actually claimed —
-  // `reconcileLedgerOnce` may also adopt other live children it discovers
-  // under `rootSessionId` that were never part of this run's persisted
-  // claim; those are not this function's concern.
+  // Read outcomes back only for the sessions this run actually claimed.
+  // `reconcileLedgerOnce` never adopts sessions beyond what this throwaway
+  // ledger was seeded with above (it settles/downgrades tracked entries
+  // only — see its module doc), so the snapshot below can only ever contain
+  // exactly `persisted.ownedSessionIds`.
   const stateBySessionId = new Map(ledger.snapshot().map(entry => [entry.sessionId, entry.state] as const))
   const liveOwned: string[] = []
   const confirmedFinished: string[] = []

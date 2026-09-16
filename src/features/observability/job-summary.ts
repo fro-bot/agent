@@ -17,6 +17,7 @@ const CACHE_SAVE_RESULT_LABELS: Record<CacheSaveStateValue, string> = {
   durable: '✅ persisted',
   'store-only': '📦 persisted (object store only)',
   skipped: '⏭️ skipped',
+  'declined-for-safety': '🔒 declined (safety)',
   'not-persisted': '❌ not persisted',
 }
 
@@ -80,7 +81,10 @@ const OUTCOME_TO_REMEDIATION = {
   persisted: undefined,
 } as const satisfies Record<CacheSaveOutcome, string | undefined | {sentence: string; retryDetail: string | undefined}>
 
-function cacheSaveResultRemediation(result: CacheSaveResult, phase: 'main' | 'post-retry'): string | undefined {
+function cacheSaveResultRemediation(
+  result: CacheSaveResult,
+  phase: 'main' | 'post-retry' | 'post-skip-safety',
+): string | undefined {
   // store-only is a state-value distinction, not a separate CacheSaveOutcome (it only
   // arises from cache-rejected/cache-error plus storePersisted -- see
   // OUTCOME_TO_STATE_VALUE in cache-save-result.ts) -- so it is handled ahead of the
@@ -117,19 +121,27 @@ function cacheSaveResultRemediation(result: CacheSaveResult, phase: 'main' | 'po
  * cache-save-result-contract plan's Unit 3. `post.ts` calls this same function after a
  * retried save so a red state from a retry is visible without reading logs, even though
  * the post hook cannot populate the `cache-save-result` output itself (see the comment at
- * that call site).
+ * that call site). `post.ts` also calls this for `phase: 'post-skip-safety'`, when it
+ * honors a `declined-for-safety` state instead of retrying -- a silent skip would be just
+ * as misleading as the silent retry-that-overrides-the-decline this row exists to prevent,
+ * so that skip gets its own labeled row rather than only a log line.
  *
  * Non-blocking: logs a warning on failure but never throws, the same as `writeJobSummary`.
  */
 export async function writeCacheSaveResultSummary(
   result: CacheSaveResult,
-  phase: 'main' | 'post-retry',
+  phase: 'main' | 'post-retry' | 'post-skip-safety',
   logger: Logger,
   declineReason?: string,
 ): Promise<void> {
   try {
     const value = toCacheSaveStateValue(result)
-    const heading = phase === 'main' ? 'Session Persistence' : 'Session Persistence (post-action retry)'
+    const heading =
+      phase === 'main'
+        ? 'Session Persistence'
+        : phase === 'post-retry'
+          ? 'Session Persistence (post-action retry)'
+          : 'Session Persistence (post-action: safety decline honored, not retried)'
     core.summary.addHeading(heading, 3).addTable([
       [
         {data: 'Field', header: true},
@@ -191,9 +203,10 @@ const UNFINISHED_ENTRY_STATE_LABELS: Readonly<Record<OwnershipEntryState, string
  * `execute.ts`), so nothing here can honestly claim one or the other. `unknown` and any
  * residual `outstanding` entries are what the drain could not confirm finished; both are
  * named in the same list (with their state labelled) rather than only reporting a count,
- * per this unit's goal. A reconciliation-discovered entry keeps its `reconciled` label
- * as-is -- that is deliberately how a reader tells work this run watched start from work
- * it found already running (see `ledger-reconcile.ts`'s `RECONCILED_LABEL`).
+ * per this unit's goal. Every entry's label is whatever the dispatch site supplied when
+ * it called `ledger.adopt` -- reconciliation itself never adopts an entry (it only settles
+ * or downgrades what dispatch already adopted; see `ledger-reconcile.ts`'s module doc), so
+ * there is no separate reconciliation-only label to preserve here.
  *
  * `unknown` entries additionally get an explicit degraded-state banner: an entry the
  * drain could not confirm is neither finished nor cancelled, and folding it silently

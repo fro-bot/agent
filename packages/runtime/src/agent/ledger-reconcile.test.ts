@@ -27,12 +27,18 @@ function makeAdapter(overrides: Partial<LedgerReconcileAdapter> = {}): LedgerRec
 }
 
 describe('reconcileLedgerOnce', () => {
-  it('happy path: a live child absent from the ledger is adopted', async () => {
-    // #given — a live child the ledger has never heard of
+  it('regression guard: a live foreground child of this parent, never tracked by the ledger, is NOT adopted', async () => {
+    // #given — upstream reports a live child under this parent that the ledger has never heard
+    // of. This is exactly the shape of an ordinary foreground `task` subagent mid-run: upstream
+    // creates its child session identically for foreground and background dispatch, so
+    // `children()` and `liveSessionIds()` alone cannot tell the two apart — there is no
+    // discriminant to adopt on. An untracked entry (already-tracked entries below are a
+    // different case) must never be adopted regardless of what upstream reports about it.
     const ledger = createOwnershipLedger()
+    ledger.adopt('other-tracked-child', 'reviewer-subagent') // keeps the ledger non-empty so the pass actually runs upstream calls
     const adapter = makeAdapter({
-      children: async () => ok([{id: 'child-1'}]),
-      liveSessionIds: async () => ok(new Set(['child-1'])),
+      children: async () => ok([{id: 'other-tracked-child'}, {id: 'foreground-child'}]),
+      liveSessionIds: async () => ok(new Set(['other-tracked-child', 'foreground-child'])),
     })
 
     // #when
@@ -43,10 +49,35 @@ describe('reconcileLedgerOnce', () => {
       logger: makeLogger(),
     })
 
-    // #then
+    // #then — the untracked live child is never adopted; only the entry the ledger already
+    // tracked is present, and it stays outstanding (still live, still a child of this parent).
     expect(result.success).toBe(true)
-    expect(ledger.outstanding()).toBe(1)
-    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reconciled', state: 'outstanding'}])
+    expect(ledger.snapshot()).toEqual([
+      {sessionId: 'other-tracked-child', label: 'reviewer-subagent', state: 'outstanding'},
+    ])
+    expect(ledger.isTracked('foreground-child')).toBe(false)
+  })
+
+  it('empty ledger: performs no remote calls at all', async () => {
+    // #given — a ledger with nothing tracked, and an adapter that fails the test if called
+    const ledger = createOwnershipLedger()
+    const children = vi.fn(async () => ok([{id: 'irrelevant'}]))
+    const liveSessionIds = vi.fn(async () => ok(new Set<string>()))
+    const adapter = makeAdapter({children, liveSessionIds})
+
+    // #when
+    const result = await reconcileLedgerOnce({
+      ledger,
+      adapter,
+      parentSessionId: PARENT_SESSION_ID,
+      logger: makeLogger(),
+    })
+
+    // #then — no upstream call was made; there is nothing an empty ledger could learn
+    expect(result.success).toBe(true)
+    expect(children).not.toHaveBeenCalled()
+    expect(liveSessionIds).not.toHaveBeenCalled()
+    expect(ledger.snapshot()).toEqual([])
   })
 
   it('happy path: a ledger entry whose session reports idle is settled', async () => {
@@ -66,25 +97,11 @@ describe('reconcileLedgerOnce', () => {
     expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'settled'}])
   })
 
-  it('edge case: a completed child from a previous invocation is not adopted', async () => {
-    // #given — children() returns a long-idle historical child; it is not in the live set
+  it('edge case: a tracked entry that is a child but no longer live settles, and stays settled', async () => {
+    // #given — child-1 is already tracked (adopted via the real dispatch-observed path, not by
+    // reconciliation) and live; a later pass observes it went idle
     const ledger = createOwnershipLedger()
-    const adapter = makeAdapter({
-      children: async () => ok([{id: 'ancient-child'}]),
-      liveSessionIds: async () => ok(new Set<string>()),
-    })
-
-    // #when
-    await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
-
-    // #then — never adopted, ledger stays empty
-    expect(ledger.snapshot()).toEqual([])
-    expect(ledger.outstanding()).toBe(0)
-  })
-
-  it('edge case: a child that completed during this invocation is not re-adopted after settling', async () => {
-    // #given — child-1 is live, gets adopted, then goes idle and is settled
-    const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent')
     let live = new Set(['child-1'])
     const adapter = makeAdapter({
       children: async () => ok([{id: 'child-1'}]),
@@ -100,12 +117,13 @@ describe('reconcileLedgerOnce', () => {
 
     // #then — settled once, never bounced back to outstanding
     expect(ledger.outstanding()).toBe(0)
-    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reconciled', state: 'settled'}])
+    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'settled'}])
   })
 
   it('edge case: reconciliation is idempotent across repeated runs', async () => {
-    // #given — a stable upstream view across repeated passes
+    // #given — a tracked, live entry and a stable upstream view across repeated passes
     const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent')
     const adapter = makeAdapter({
       children: async () => ok([{id: 'child-1'}]),
       liveSessionIds: async () => ok(new Set(['child-1'])),
@@ -180,9 +198,10 @@ describe('reconcileLedgerOnce', () => {
     expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'settled'}])
   })
 
-  it('three-way: a child of this parent that is live is left outstanding (adopted if new)', async () => {
-    // #given — a session that IS a child of this parent and IS live
+  it('three-way: a tracked entry that is a live child of this parent stays outstanding', async () => {
+    // #given — a tracked entry that IS a child of this parent and IS live
     const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent')
     const adapter = makeAdapter({
       children: async () => ok([{id: 'child-1'}]),
       liveSessionIds: async () => ok(new Set(['child-1'])),
@@ -191,11 +210,11 @@ describe('reconcileLedgerOnce', () => {
     // #when
     await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
 
-    // #then — adopted and left outstanding, not settled or marked unknown
-    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reconciled', state: 'outstanding'}])
+    // #then — left outstanding, not settled or marked unknown
+    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'outstanding'}])
   })
 
-  it('three-way: a child of this parent that is not live is settled', async () => {
+  it('three-way: a tracked entry that is a child of this parent but not live is settled', async () => {
     // #given — a ledger entry that IS a child of this parent but is NOT live
     const ledger = createOwnershipLedger()
     ledger.adopt('child-1', 'reviewer-subagent')
@@ -211,7 +230,7 @@ describe('reconcileLedgerOnce', () => {
     expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'settled'}])
   })
 
-  it('three-way (regression guard): a ledger entry live elsewhere on the server but not a child of this parent is marked unknown, not settled and not left outstanding', async () => {
+  it('three-way (regression guard): a tracked entry live elsewhere on the server but not a child of this parent is marked unknown, not settled and not left outstanding', async () => {
     // #given — a ledger entry naming a session that liveSessionIds() reports live (it is running
     // somewhere on the server right now), but children(parentSessionId) does NOT include it — the
     // live server does not recognize it as a descendant of this parent at all.
@@ -241,12 +260,14 @@ describe('reconcileLedgerOnce', () => {
     expect(ledger.isPersistenceSafe()).toBe(false)
   })
 
-  it('integration: a dispatch whose event was dropped is still discovered without a detected discontinuity', async () => {
-    // #given — a child session is live upstream but the ledger never learned of it via any event
+  it('integration: a tracked entry whose settlement event was dropped is still settled without a detected discontinuity', async () => {
+    // #given — a tracked entry the ledger already knows about (adopted via the real
+    // dispatch-observed path), whose completion event never arrived; upstream now reports it idle
     const ledger = createOwnershipLedger()
+    ledger.adopt('dropped-settlement-child', 'background task')
     const adapter = makeAdapter({
-      children: async () => ok([{id: 'dropped-dispatch-child'}]),
-      liveSessionIds: async () => ok(new Set(['dropped-dispatch-child'])),
+      children: async () => ok([{id: 'dropped-settlement-child'}]),
+      liveSessionIds: async () => ok(new Set<string>()),
     })
 
     // #when — reconciliation runs (e.g. on its interval), with no discontinuity ever signaled
@@ -257,10 +278,12 @@ describe('reconcileLedgerOnce', () => {
       logger: makeLogger(),
     })
 
-    // #then — the ledger no longer reads zero while the child writes
+    // #then — settled without waiting on an event that never arrived
     expect(result.success).toBe(true)
-    expect(ledger.outstanding()).toBe(1)
-    expect(ledger.isPersistenceSafe()).toBe(false)
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.snapshot()).toEqual([
+      {sessionId: 'dropped-settlement-child', label: 'background task', state: 'settled'},
+    ])
   })
 })
 
@@ -274,11 +297,12 @@ describe('createLedgerReconciler', () => {
   })
 
   it('edge case: reconciliation runs on its interval even with no subscription event or discontinuity', async () => {
-    // #given — a live child never reported by any event, and no subscription/discontinuity trigger fires
+    // #given — a tracked entry that goes idle upstream, and no subscription/discontinuity trigger fires
     const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent')
     const adapter = makeAdapter({
       children: async () => ok([{id: 'child-1'}]),
-      liveSessionIds: async () => ok(new Set(['child-1'])),
+      liveSessionIds: async () => ok(new Set<string>()),
     })
     const reconciler = createLedgerReconciler({
       ledger,
@@ -288,20 +312,22 @@ describe('createLedgerReconciler', () => {
     })
 
     // #when — only the interval elapses
-    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.outstanding()).toBe(1)
     await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
 
     // #then
-    expect(ledger.outstanding()).toBe(1)
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'settled'}])
     reconciler.dispose()
   })
 
   it('does not run again after dispose', async () => {
     // #given
     const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent')
     const adapter = makeAdapter({
       children: async () => ok([{id: 'child-1'}]),
-      liveSessionIds: async () => ok(new Set(['child-1'])),
+      liveSessionIds: async () => ok(new Set<string>()),
     })
     const reconciler = createLedgerReconciler({
       ledger,
@@ -317,7 +343,7 @@ describe('createLedgerReconciler', () => {
     await vi.advanceTimersByTimeAsync(10_000)
 
     // #then — no pass ever ran
-    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.outstanding()).toBe(1)
   })
 
   it('skips a tick while a pass is still in flight rather than starting a second pass', async () => {
@@ -334,6 +360,7 @@ describe('createLedgerReconciler', () => {
       },
     })
     const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent') // non-empty so each tick actually calls upstream
     const reconciler = createLedgerReconciler({
       ledger,
       adapter,
@@ -376,6 +403,7 @@ describe('createLedgerReconciler', () => {
       },
     })
     const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent') // non-empty so the tick actually calls upstream
     const reconciler = createLedgerReconciler({
       ledger,
       adapter,

@@ -268,6 +268,16 @@ export function buildCIConfig(
   // position to make, so we pin the upstream setting instead of building a
   // depth check of our own.
   //
+  // Verified evidence (the `.slim/clonedeps/` checkout this cites is not present
+  // in the CI checkout, so this is recorded here for a reader without the clone):
+  // `subagent_depth` is a top-level key in the v1 config schema, defined as
+  // `subagent_depth: Schema.optional(NonNegativeInt)` at
+  // `packages/core/src/v1/config/config.ts:84`, and read at the exact site this
+  // pin is defending against, `packages/opencode/src/tool/task.ts:111`, as
+  // `depth >= (cfg.subagent_depth ?? 1)`. Both confirmed against the clone at
+  // `base_version` (`packages/harness/harness.config.json`) as of this comment;
+  // re-verify against the pinned tag if `base_version` moves.
+  //
   // Depth matters because upstream cancellation walks RUNNING jobs only: a
   // completed child that links the root session to a still-running
   // grandchild is never walked, so the grandchild can outlive the

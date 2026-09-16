@@ -270,17 +270,20 @@ function statesEqual(
  * but it IS a real state change that must reach `onChange` so the unknown
  * entry is persisted.
  *
- * `onAdopted` is the gateway's hook point for registering a reconciliation-
- * recovered child with `coordinator.addOwnedSession` — see `runOpenCodeCore`.
- * It intentionally lives here, at the gateway's existing ledger-wrapping
- * boundary, rather than as a callback threaded through `reconcileLedgerOnce`
- * in `@fro-bot/runtime`: that primitive is shared with the Action, which has
- * no coordinator concept at all, and every ledger mutation — whether from the
- * observed `task`-tool-completion path or a reconciliation pass — already
- * flows through this single wrapper (reconciliation is handed the wrapped
- * ledger instance). Adding a gateway-only hook here keeps the runtime
- * primitive free of gateway concepts and leaves the Action's direct,
- * unwrapped use of `createLedgerReconciler`/`reconcileLedgerOnce` untouched.
+ * `onAdopted` is the gateway's hook point for registering a directly-observed
+ * dispatch with `coordinator.addOwnedSession` — see `runOpenCodeCore`. In
+ * practice this fires only from the `task`-tool-completion path: reconciliation
+ * never calls `adopt` (it settles or downgrades already-tracked entries only —
+ * see `@fro-bot/runtime`'s `ledger-reconcile.ts` module doc), so a
+ * reconciliation pass never reaches this branch. It intentionally lives here,
+ * at the gateway's existing ledger-wrapping boundary, rather than as a
+ * callback threaded through `reconcileLedgerOnce` in `@fro-bot/runtime`: that
+ * primitive is shared with the Action, which has no coordinator concept at
+ * all, and every ledger mutation — from either path — already flows through
+ * this single wrapper (reconciliation is handed the wrapped ledger instance).
+ * Adding a gateway-only hook here keeps the runtime primitive free of gateway
+ * concepts and leaves the Action's direct, unwrapped use of
+ * `createLedgerReconciler`/`reconcileLedgerOnce` untouched.
  *
  * Exported for direct unit testing of the no-op detection: through the real
  * `runOpenCodeCore` → `reconcileLedgerOnce` path, `settle`/`markUnknown` can
@@ -553,11 +556,15 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             persistOwnership()
             checkDrainComplete()
           },
-          // A reconciliation-recovered child must become visible to event routing
-          // (`coordinator.isOwned`) exactly as a directly-observed dispatch does —
-          // otherwise its tool events and permission asks are dropped as foreign.
-          // `reconcileLedgerOnce` is handed this wrapped ledger (below), so its
-          // adoptions reach this hook the same way the task-tool-completion path does.
+          // A directly-observed dispatch (the task-tool-completion path below) must become
+          // visible to event routing (`coordinator.isOwned`) the moment it is adopted —
+          // otherwise its tool events and permission asks are dropped as foreign. This hook is
+          // the single place `ledger.adopt` calls reach the coordinator. `reconcileLedgerOnce` is
+          // handed this same wrapped ledger (below) for its settle/downgrade mutations, but it
+          // never calls `adopt` itself — it settles or downgrades what is already tracked, never
+          // adopting a session the ledger has not already learned about (see
+          // `@fro-bot/runtime`'s `ledger-reconcile.ts` module doc) — so this hook only ever fires
+          // from the task-tool-completion path, never from a reconciliation pass.
           adoptedSessionId => ownershipCoordinator.addOwnedSession(adoptedSessionId),
         )
 
@@ -765,11 +772,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
               // `metadata.jobId` (the child session id) -- see upstream `tool/task.ts`.
               // Adopt the child into the ledger; the wrapped ledger's `onAdopted` hook
               // (see `wrapLedgerWithHooks`) registers it with the coordinator so its own
-              // events and approvals route from here on -- the same hook reconciliation-
-              // recovered adoptions go through, so there is a single adoption->ownership
-              // path rather than two. Admission (whether the dispatch was allowed to
-              // start) is a separate concern this call site does not own -- by the time
-              // this event arrives the dispatch already ran.
+              // events and approvals route from here on. This is the ONLY path that calls
+              // `ledger.adopt` -- reconciliation never adopts an untracked session (see
+              // `@fro-bot/runtime`'s `ledger-reconcile.ts` module doc), so there is exactly
+              // one adoption->ownership path, not two. Admission (whether the dispatch was
+              // allowed to start) is a separate concern this call site does not own -- by
+              // the time this event arrives the dispatch already ran.
               if (ledger !== undefined && status === 'completed' && tool === 'task') {
                 const stateMetadata = getObjectProperty(toolState, 'metadata')
                 const jobId = getStringProperty(stateMetadata, 'jobId')

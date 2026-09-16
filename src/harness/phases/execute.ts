@@ -468,14 +468,13 @@ export async function runExecute(
  *
  * No-op (zero calls, immediate return) when `ledger` is not supplied --
  * matching the established no-ledger-means-single-session convention from
- * Units 4, 8, and 9. Nothing yet threads a populated ledger into the
- * Action's execution path: `sendPromptToSession` never passes an
- * `ownershipLedger` down to `runPromptAttempt`/`processEventStream`, so
- * background dispatches this invocation makes are never adopted today --
- * that wiring is out of this unit's scope (`src/features/agent/execution.ts`,
- * `prompt-sender.ts`, `retry.ts`, `streaming.ts`). This function is the
- * drain machinery a future unit activates by passing a real ledger through;
- * today's production call site passes `ledger: undefined`.
+ * Units 4, 8, and 9. This is no longer a hypothetical: `src/harness/run.ts`
+ * threads `execution.ownershipLedger` (populated by `runExecute` below
+ * whenever execution actually ran) into this call, so a real run's
+ * background dispatches are adopted and drained here. The `ledger`
+ * parameter now goes unpopulated only when `SKIP_AGENT_EXECUTION=true`
+ * skipped execution entirely -- in which case this call remains the same
+ * no-op it always was.
  */
 export interface DrainOutcome {
   /** `true` once the deadline was reached before the ledger fully drained. */
@@ -537,10 +536,13 @@ async function cancelOutstanding(options: {
 }): Promise<DrainOutcome> {
   const {ledger, client, logger, reconcileOptions} = options
 
-  // Final reconciliation pass BEFORE building the cancel set: a child that
-  // started between an earlier snapshot and now (or one only reconciliation
-  // itself can discover) must still be cancelled, not silently skipped because
-  // it wasn't in the ledger yet when an earlier snapshot was taken.
+  // Final reconciliation pass BEFORE building the cancel set, so the set
+  // reflects liveness as of now rather than a stale earlier snapshot: an entry
+  // that settled in the meantime is not needlessly aborted, and one still live
+  // is still cancelled. Reconciliation only ever settles or downgrades entries
+  // the ledger already tracks -- it cannot discover an untracked child, since
+  // nothing upstream distinguishes a background child session from a foreground
+  // one.
   await reconcileLedgerOnce(reconcileOptions)
 
   // Cancel everything not confirmed settled -- outstanding AND unknown. An

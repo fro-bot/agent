@@ -1010,7 +1010,8 @@ describe('runDrain', () => {
   })
 
   it('completes immediately when nothing is outstanding, without delaying finalize', async () => {
-    // #given a ledger with nothing outstanding and a live client
+    // #given a ledger with nothing tracked at all -- reconciliation has nothing to
+    // settle, so it must never call upstream just to check
     const ledger = createOwnershipLedger()
     const children = vi.fn(async () => ({data: []}))
     const status = vi.fn(async () => ({data: {}}))
@@ -1025,9 +1026,11 @@ describe('runDrain', () => {
       logger,
     })
 
-    // #then a single reconciliation pass is enough -- no interval wait loop engaged
-    expect(children).toHaveBeenCalledTimes(1)
-    expect(status).toHaveBeenCalledTimes(1)
+    // #then the empty-ledger short circuit means reconciliation never calls upstream at
+    // all -- there is nothing tracked for `children`/`liveSessionIds` to confirm against,
+    // so drain completes without the round trip and without delaying finalize
+    expect(children).not.toHaveBeenCalled()
+    expect(status).not.toHaveBeenCalled()
     expect(outcome.expired).toBe(false)
     expect(outcome.unknownCount).toBe(0)
   })
@@ -1067,22 +1070,24 @@ describe('runDrain', () => {
     }
   })
 
-  it('discovers a dropped dispatch via periodic reconciliation when no discontinuity was ever detected', async () => {
-    // #given a ledger that never adopted anything -- the dispatch event that should have
-    // called `adopt` was silently dropped, and no discontinuity ever fired to trigger a
-    // recheck. Nothing but reconciliation can find this child.
+  it('settles a tracked entry whose completion event never arrived, via periodic reconciliation when no discontinuity was ever detected', async () => {
+    // #given a ledger entry the event stream never confirmed complete -- an earlier pass
+    // already downgraded it to unknown -- and no discontinuity ever fired to trigger a
+    // recheck. Only the interval-driven periodic pass can still confirm it settled.
+    // Reconciliation cannot adopt an untracked session; this entry is tracked from the start.
     vi.useFakeTimers()
     try {
       const ledger = createOwnershipLedger()
-      expect(ledger.isDrainComplete()).toBe(true)
+      ledger.adopt('ses_child', 'background task')
+      ledger.markUnknown('ses_child')
       const status = vi.fn<() => Promise<{data: Record<string, unknown>}>>()
-      status.mockResolvedValueOnce({data: {ses_dropped: {}}}).mockResolvedValue({data: {}})
+      status.mockResolvedValueOnce({data: {ses_child: {}}}).mockResolvedValue({data: {}})
       const client = createFakeSessionClient({
-        children: async () => ({data: [{id: 'ses_dropped'}]}),
+        children: async () => ({data: [{id: 'ses_child'}]}),
         status,
       })
 
-      // #when drain runs
+      // #when drain runs and the periodic reconciler fires
       const outcomePromise = runDrain({
         ledger,
         client,
@@ -1095,13 +1100,42 @@ describe('runDrain', () => {
       await vi.advanceTimersByTimeAsync(200)
       const outcome = await outcomePromise
 
-      // #then the dropped dispatch is discovered, adopted (labelled "reconciled" -- it has
-      // no dispatch-site label to carry), and settles before drain returns
+      // #then the already-tracked entry, confirmed a child and no longer live, settles once
+      // a later pass observes it -- the dropped settlement is recovered, not a dropped dispatch
       expect(outcome.expired).toBe(false)
-      expect(ledger.snapshot()).toContainEqual({sessionId: 'ses_dropped', label: 'reconciled', state: 'settled'})
+      expect(ledger.snapshot()).toContainEqual({sessionId: 'ses_child', label: 'background task', state: 'settled'})
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('does not adopt an untracked live child -- drain completes without it (documented gap)', async () => {
+    // #given a live child session upstream reports under this parent, but the ledger
+    // never learned of it at all -- e.g. its dispatch event was dropped before ever
+    // reaching the ledger. There is no tracked entry for it, tracked or otherwise.
+    const ledger = createOwnershipLedger()
+    const children = vi.fn(async () => ({data: [{id: 'ses_untracked'}]}))
+    const status = vi.fn(async () => ({data: {ses_untracked: {}}}))
+    const client = createFakeSessionClient({children, status})
+
+    // #when drain runs
+    const outcome = await runDrain({
+      ledger,
+      client,
+      parentSessionId: 'ses_root',
+      deadlineMs: 60_000,
+      logger,
+    })
+
+    // #then the ledger has nothing tracked, so reconciliation's empty-ledger short circuit
+    // means `children`/`status` are never even called -- the untracked live child is never
+    // adopted, never appears in the ledger, and drain completes without waiting on it. This
+    // is the documented, bounded gap: a future change that reintroduces adoption would need
+    // to call upstream even for an empty ledger, and this assertion would catch it.
+    expect(children).not.toHaveBeenCalled()
+    expect(status).not.toHaveBeenCalled()
+    expect(outcome.expired).toBe(false)
+    expect(ledger.snapshot()).toHaveLength(0)
   })
 
   it('cancels outstanding work with a fresh signal when the deadline expires, and reports incomplete', async () => {
@@ -1222,25 +1256,21 @@ describe('runDrain', () => {
     }
   })
 
-  it('includes a child discovered by the final reconciliation pass in the cancel set', async () => {
-    // #given a known outstanding entry keeps drain alive past its deadline. A second
-    // child only becomes visible to `children()` on the LATER call — the final
-    // reconciliation pass cancellation runs right before building the cancel set,
-    // not the earlier passes made during the wait loop.
+  it('includes a still-live tracked entry in the cancel set, reconfirmed by the final reconciliation pass', async () => {
+    // #given a known outstanding entry that stays a live child of this parent through
+    // every reconciliation pass, including the final pass `cancelOutstanding` runs
+    // immediately before building the cancel set -- not just the earlier passes made
+    // during the wait loop. Reconciliation cannot adopt a new, previously-untracked
+    // child; only this already-tracked entry is ever at stake.
     vi.useFakeTimers()
     try {
       const ledger = createOwnershipLedger()
       ledger.adopt('ses_known', 'background task')
-      let childrenCallCount = 0
       const abort = vi.fn(async () => ({data: {}}))
+      const children = vi.fn(async () => ({data: [{id: 'ses_known'}]}))
       const client = createFakeSessionClient({
-        children: async () => {
-          childrenCallCount += 1
-          return childrenCallCount === 1
-            ? {data: [{id: 'ses_known'}]}
-            : {data: [{id: 'ses_known'}, {id: 'ses_discovered'}]}
-        },
-        status: async () => ({data: {ses_known: {}, ses_discovered: {}}}),
+        children,
+        status: async () => ({data: {ses_known: {}}}),
         abort,
       })
 
@@ -1259,12 +1289,13 @@ describe('runDrain', () => {
       await vi.advanceTimersByTimeAsync(200)
       const outcome = await outcomePromise
 
-      // #then the newly-discovered child was adopted by the final reconciliation pass
-      // and included in the cancel set -- not silently skipped because it wasn't in
-      // the ledger when an earlier snapshot was taken.
-      expect(abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'ses_discovered'}}))
-      expect(outcome.cancelledCount).toBe(2)
-      expect(ledger.snapshot().find(entry => entry.sessionId === 'ses_discovered')).toBeDefined()
+      // #then the final reconciliation pass ran (a second `children()` call beyond the
+      // unconditional first pass), re-confirming the entry is still this parent's live
+      // child before the cancel set is built -- so it is cancelled, not silently skipped
+      // because an earlier snapshot was taken before that pass ran.
+      expect(children.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'ses_known'}}))
+      expect(outcome.cancelledCount).toBe(1)
     } finally {
       vi.useRealTimers()
     }

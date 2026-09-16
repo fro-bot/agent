@@ -537,10 +537,12 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     // #when cleanup runs
     await runCleanup(baseOptions({ownershipLedger: ledger}))
 
-    // #then saveCache is never attempted -- persistence is declined, not merely retried
+    // #then saveCache is never attempted -- persistence is declined, not merely retried.
+    // 'declined-for-safety', not 'not-persisted': that value tells the post hook to honor
+    // the decline instead of silently retrying it (see cache-save-result.ts).
     expect(saveCache).not.toHaveBeenCalled()
     const {saveState} = await import('@actions/core')
-    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'not-persisted')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
   })
 
   it('persists normally when the ownership ledger is empty (every run today, unchanged behavior)', async () => {
@@ -567,10 +569,11 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     // #when cleanup runs
     await runCleanup(baseOptions({serverHandle: createServerHandle(false)}))
 
-    // #then saveCache is never attempted
+    // #then saveCache is never attempted, and the state is 'declined-for-safety' so the
+    // post hook honors the decline instead of retrying it
     expect(saveCache).not.toHaveBeenCalled()
     const {saveState} = await import('@actions/core')
-    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'not-persisted')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
   })
 
   it('declines cache persistence when the lease renewal has failed, without stopping renewal first', async () => {
@@ -594,6 +597,10 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     const core = await import('@actions/core')
     const remediationText = vi.mocked(core.summary.addRaw).mock.calls.flat().join(' ')
     expect(remediationText).toContain('lease could not be renewed')
+    // #and the state is 'declined-for-safety' -- the post hook must honor this decline,
+    // not retry it, since a failed lease is exactly the case the process boundary can't help
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
     // #and stop() is still called exactly once, after the decision, not to make it
     expect(lease.stop).toHaveBeenCalledTimes(1)
   })

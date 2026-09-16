@@ -3279,16 +3279,18 @@ describe('runOpenCodeCore', () => {
     })
   })
 
-  describe('reconciliation-recovered adoption (P1 fix) — the coordinator learns about ledger-only adoptions', () => {
+  describe('reconciliation settles what it tracks; it does not adopt what it cannot identify', () => {
     const CHILD = 'sess-reconciled-child'
 
     afterEach(() => {
       vi.useRealTimers()
     })
 
-    it('a child adopted purely by reconciliation becomes visible to coordinator.isOwned(), and its subsequent tool event is routed rather than dropped', async () => {
-      // #given — fake timers; a child reconciliation discovers via children()+liveSessionIds()
-      // that NEVER arrives via the task-tool-completion event path (simulating a dropped event).
+    it('regression guard: a live child the ledger never tracked is NOT adopted by reconciliation, and its events stay foreign to the coordinator', async () => {
+      // #given — fake timers; the server reports CHILD as a live child of the root, but no
+      // task-tool-completion event ever fires for it. This is exactly the shape of an ordinary
+      // foreground `task` subagent mid-run — upstream creates its child session identically to a
+      // background dispatch, so `children()`+`liveSessionIds()` alone cannot tell them apart.
       vi.useFakeTimers()
       const coordinator = makeCoordinator()
       const ownershipLedger = createOwnershipLedger()
@@ -3311,46 +3313,93 @@ describe('runOpenCodeCore', () => {
       }
       const runPromise = runOpenCodeCore(params)
 
-      // #when — no task-tool-completion event ever fires for CHILD; only the reconciler's
-      // fixed interval discovers and adopts it.
+      // #when — no task-tool-completion event ever fires for CHILD; the reconciler's fixed
+      // interval fires, with CHILD live and a child of the root per the server the whole time.
       expect(coordinator.isOwned(CHILD)).toBe(false)
       await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
 
-      // #then — the coordinator learned about the reconciliation-recovered child, not just the ledger.
-      expect(coordinator.isOwned(CHILD)).toBe(true)
-      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('outstanding')
+      // #then — still not owned, still not tracked. There is no discriminant reconciliation
+      // could use to adopt this session, so it never does.
+      expect(coordinator.isOwned(CHILD)).toBe(false)
+      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)).toBeUndefined()
 
-      // #and — a subsequent tool event for that child is routed (appended to the sink),
-      // not dropped as foreign the way it would be pre-fix.
+      // #and — a subsequent tool event for that child is dropped as foreign, not routed
       emitNext(toolCalledEvent('c-1', 'bash', {command: 'npm test'}, CHILD))
       emitNext(toolSuccessEvent('c-1', null, CHILD))
       await vi.advanceTimersByTimeAsync(0)
-      expect(sink._appended.some(line => line.includes('npm test'))).toBe(true)
+      expect(sink._appended.some(line => line.includes('npm test'))).toBe(false)
 
-      // Cleanup: abort so the still-outstanding child does not leave the run hanging.
-      controller.abort()
-      await expect(runPromise).rejects.toThrow()
+      // Cleanup: nothing is owned or outstanding, so root session.idle completes the run.
+      emitNext(sessionIdleEvent('sess-123'))
+      await runPromise
+      controller.abort() // no-op safety net; run already resolved
+    })
+
+    it('a background dispatch observed via the real event path, whose settlement event is dropped, is still settled by reconciliation', async () => {
+      // #given — CHILD is adopted the real way (a `task`-tool-completion event carrying
+      // `metadata.background === true`), registering it with the coordinator. Its own
+      // completion/settlement event then never arrives — simulating a dropped event — but the
+      // server reports it no longer live.
+      vi.useFakeTimers()
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      const {stream, emitNext} = makeControlledStream()
+
+      const handle = makeHandle({
+        subscribe: async () => Promise.resolve({stream}),
+        sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
+        sessionStatus: async () => ({data: {}, error: null}), // CHILD absent — no longer live
+      })
+
+      const sink = makeSink()
+      const controller = new AbortController()
+      const params = {
+        ...buildParams(handle),
+        coordinator,
+        ownershipLedger,
+        sink,
+        signal: controller.signal,
+      }
+      const runPromise = runOpenCodeCore(params)
+
+      emitNext(backgroundTaskCompletedEvent(CHILD))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(coordinator.isOwned(CHILD)).toBe(true)
+      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('outstanding')
+
+      // #when — CHILD's own completion event never arrives, but the reconciler's fixed
+      // interval fires and observes CHILD is no longer in liveSessionIds()
+      await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
+
+      // #then — settled without ever seeing a completion event for CHILD
+      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
+
+      // Cleanup: nothing outstanding remains, so root session.idle completes the run.
+      emitNext(sessionIdleEvent('sess-123'))
+      await runPromise
     })
 
     it("the Action's use of the reconciliation primitive is unaffected by the gateway's adoption callback (no coordinator exists there)", async () => {
       // #given — `reconcileLedgerOnce` invoked directly against a bare (unwrapped)
       // ownership ledger, exactly as `src/harness/phases/execute.ts` (the Action) does —
-      // no gateway, no coordinator, no `wrapLedgerWithHooks` in the call path at all.
+      // no gateway, no coordinator, no `wrapLedgerWithHooks` in the call path at all. CHILD is
+      // adopted the real way first — reconciliation only ever settles what is already tracked.
       const {reconcileLedgerOnce} = await import('@fro-bot/runtime')
       const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'background task')
       const adapter = {
         children: async () => ({success: true as const, data: [{id: CHILD}]}),
-        liveSessionIds: async () => ({success: true as const, data: new Set([CHILD])}),
+        liveSessionIds: async () => ({success: true as const, data: new Set<string>()}),
       }
       const logger = {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}
 
       // #when
       const result = await reconcileLedgerOnce({ledger, adapter, parentSessionId: 'root', logger})
 
-      // #then — adoption still works exactly as before; nothing about the gateway's
-      // coordinator-registration hook is required or referenced by this call path.
+      // #then — the tracked entry is settled; nothing about the gateway's coordinator-registration
+      // hook is required or referenced by this call path.
       expect(result.success).toBe(true)
-      expect(ledger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('outstanding')
+      expect(ledger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
     })
   })
 

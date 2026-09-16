@@ -382,8 +382,10 @@ describe('writeJobSummary', () => {
       )
     })
 
-    it('reconciled work keeps its reconciled label, distinct from a dispatch-site label', async () => {
-      // #given an entry discovered by reconciliation rather than observed dispatch
+    it('renders whatever label the dispatch site supplied, unmodified', async () => {
+      // #given an entry adopted with an arbitrary caller-supplied label (the summary never
+      // rewrites it -- reconciliation itself never adopts an entry, so there is no separate
+      // reconciliation-only label path to preserve; see `writeBackgroundWorkSummary`'s doc comment)
       const ledger = createOwnershipLedger()
       ledger.adopt('session-1', 'reconciled')
       ledger.markUnknown('session-1')
@@ -392,7 +394,7 @@ describe('writeJobSummary', () => {
       // #when
       await writeJobSummary(options, logger, ledger)
 
-      // #then the reader can tell this was discovered work, not watched-from-dispatch work
+      // #then the label is rendered exactly as supplied
       expect(core.summary.addList).toHaveBeenCalledWith(['reconciled (unconfirmed)'])
     })
 
