@@ -1,4 +1,4 @@
-import type {ClassificationPath, ErrorInfo} from '@fro-bot/runtime'
+import type {ClassificationPath, ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
@@ -255,6 +255,58 @@ function isStreamActivityEvent(eventType: string | null): boolean {
   return eventType === 'message.part.delta' || eventType?.startsWith('session.next.') === true
 }
 
+/**
+ * Ownership check: true for the root session, or for a descendant session
+ * this run's ledger has adopted (in any state — outstanding, unknown, or
+ * settled; a trailing event from an already-settled descendant is still
+ * attributable to this run, it just arrived late). False for a null session
+ * id and false for any session this run does not own — including a session
+ * belonging to a different run's tree. `ledger` absent means single-session
+ * behavior: only the root session is owned, matching every existing run
+ * exactly (backward-compatible no-op).
+ *
+ * A user-defined type guard so callers narrow `eventSessionID` to `string`
+ * after `if (!isOwnedSession(...)) continue`.
+ */
+function isOwnedSession(
+  eventSessionID: string | null,
+  sessionId: string,
+  ledger?: OwnershipLedger,
+): eventSessionID is string {
+  if (eventSessionID === null) return false
+  if (eventSessionID === sessionId) return true
+  if (ledger === undefined) return false
+  return ledger.snapshot().some(entry => entry.sessionId === eventSessionID)
+}
+
+/** A parsed `<task id="..." state="completed|error">` marker from an injected background-task completion turn. */
+interface InjectedTaskCompletion {
+  readonly childSessionId: string
+  readonly state: 'completed' | 'error'
+}
+
+/**
+ * Upstream's `task` tool injects a synthetic text prompt into the PARENT
+ * session when a background dispatch finishes (see `tool/task.ts`'s
+ * `inject()` / `renderOutput()`), rendered as
+ * `<task id="{childSessionId}" state="completed|error">...`. This is the
+ * only observable signal on the wire that a background execution settled —
+ * there is no structured field carrying it. Matches the opening tag only;
+ * the running state is never injected this way (only completed/error are).
+ */
+const INJECTED_TASK_COMPLETION_PATTERN = /<task id="([^"]+)" state="(completed|error)">/
+
+function parseInjectedTaskCompletion(text: string): InjectedTaskCompletion | null {
+  const match = INJECTED_TASK_COMPLETION_PATTERN.exec(text)
+  if (match == null) return null
+
+  const childSessionId = match[1]
+  const state = match[2]
+  if (childSessionId == null || (state !== 'completed' && state !== 'error')) return null
+
+  return {childSessionId, state}
+}
+
 interface ToolCallInfo {
   readonly tool: string
   readonly input: unknown
@@ -277,6 +329,7 @@ export async function processEventStream(
   activityTracker?: ActivityTracker,
   deadline?: ExecutionDeadline,
   onPermissionAsked?: PermissionAskedResponder,
+  ownershipLedger?: OwnershipLedger,
 ): Promise<EventStreamResult> {
   let lastText = ''
   let tokens: TokenUsage | null = null
@@ -291,289 +344,359 @@ export async function processEventStream(
   // V2 sync tool lifecycle: correlate called→success by callID
   const pendingToolCalls = new Map<string, ToolCallInfo>()
 
-  for await (const event of stream) {
-    if (signal.aborted) break
-    logServerEvent(event, logger)
-    const eventType = getEventKind(event)
-    const eventPayload = getEventPayload(event)
+  // Isolated in its own function so a discontinuity (thrown error mid-stream) can be
+  // caught around the whole loop without reindenting every branch inside it — the
+  // catch below marks outstanding owned entries unknown before rethrowing.
+  async function consumeStream(): Promise<void> {
+    for await (const event of stream) {
+      if (signal.aborted) break
+      logServerEvent(event, logger)
+      const eventType = getEventKind(event)
+      const eventPayload = getEventPayload(event)
 
-    if (eventType === 'permission.asked') {
-      const eventSessionID = getEventSessionID(event)
-      if (eventSessionID !== sessionId) continue
+      if (eventType === 'permission.asked') {
+        const eventSessionID = getEventSessionID(event)
+        if (!isOwnedSession(eventSessionID, sessionId, ownershipLedger)) continue
 
-      const requestID = getStringProperty(eventPayload, 'id')
-      const permission = getStringProperty(eventPayload, 'permission') ?? 'unknown'
-      const rawPatterns = getObjectProperty(eventPayload, 'patterns')
-      const patterns: string[] = Array.isArray(rawPatterns)
-        ? rawPatterns.filter((pattern): pattern is string => typeof pattern === 'string')
-        : []
-      const context = {sessionId, permission, patterns}
+        const requestID = getStringProperty(eventPayload, 'id')
+        const permission = getStringProperty(eventPayload, 'permission') ?? 'unknown'
+        const rawPatterns = getObjectProperty(eventPayload, 'patterns')
+        const patterns: string[] = Array.isArray(rawPatterns)
+          ? rawPatterns.filter((pattern): pattern is string => typeof pattern === 'string')
+          : []
+        const context = {sessionId, eventSessionID, permission, patterns}
 
-      if (requestID == null) {
-        logger.warning('OpenCode permission request missing request id', context)
+        if (requestID == null) {
+          logger.warning('OpenCode permission request missing request id', context)
+          continue
+        }
+
+        // A descendant's request is denied exactly like the root's — there is no
+        // human approval path on this surface, and widening ownership only means
+        // the denial now also covers owned descendants. `sessionID` must be the
+        // event's own session id (not the root's) so the reply targets the
+        // session that actually asked.
+        const request: PermissionAskedRequest = {
+          requestID,
+          sessionID: eventSessionID,
+          permission,
+          patterns,
+        }
+        if (onPermissionAsked === undefined) {
+          logger.warning('OpenCode permission request observed but no responder is configured', context)
+        } else {
+          logger.warning('Rejecting OpenCode permission request', context)
+          try {
+            await onPermissionAsked(request)
+          } catch (error) {
+            logger.warning('Failed to reject OpenCode permission request', {
+              ...context,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+        }
         continue
       }
 
-      const request: PermissionAskedRequest = {
-        requestID,
-        sessionID: sessionId,
-        permission,
-        patterns,
-      }
-      if (onPermissionAsked === undefined) {
-        logger.warning('OpenCode permission request observed but no responder is configured', context)
-      } else {
-        logger.warning('Rejecting OpenCode permission request', context)
-        try {
-          await onPermissionAsked(request)
-        } catch (error) {
-          logger.warning('Failed to reject OpenCode permission request', {
-            ...context,
-            error: error instanceof Error ? error.message : String(error),
-          })
-        }
-      }
-      continue
-    }
+      // Permission handling must run before this guard; an ask on an unarmed turn would otherwise be skipped and hang.
+      if (activityTracker?.currentTurnArmed === false) continue
 
-    // Permission handling must run before this guard; an ask on an unarmed turn would otherwise be skipped and hang.
-    if (activityTracker?.currentTurnArmed === false) continue
-
-    if (activityTracker != null && isStreamActivityEvent(eventType)) {
-      const eventSessionID = getEventSessionID(event)
-      if (eventSessionID === sessionId) activityTracker.firstMeaningfulEventReceived = true
-    }
-
-    if (eventType === 'message.part.delta') {
-      // New SDK shape: streaming text delta events accumulate into lastText, flushed on session.idle.
-      // delta may be an object {type:'text', text:string} or a plain string when field === 'text'.
-      const eventSessionID = getEventSessionID(event)
-      if (eventSessionID === sessionId) {
-        const delta = getObjectProperty(eventPayload, 'delta')
-        const deltaType = getStringProperty(delta, 'type')
-        const deltaText = getStringProperty(delta, 'text')
-        if (deltaType === 'text' && deltaText != null) {
-          lastText += deltaText
-        } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
-          lastText += delta
-        }
+      if (activityTracker != null && isStreamActivityEvent(eventType)) {
+        const eventSessionID = getEventSessionID(event)
+        if (isOwnedSession(eventSessionID, sessionId, ownershipLedger))
+          activityTracker.firstMeaningfulEventReceived = true
       }
-    } else if (eventType === 'session.next.text.delta') {
-      // Sync/session.next shape: delta is either a plain string or {type:'text', text:string}
-      const eventSessionID = getEventSessionID(event)
-      if (eventSessionID === sessionId) {
-        const deltaRaw = getObjectProperty(eventPayload, 'delta')
-        const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
-        if (deltaText != null) lastText += deltaText
-      }
-    } else if (eventType === 'session.next.tool.called') {
-      // V2 sync tool lifecycle: cache call info for correlation with success event
-      const eventSessionID = getEventSessionID(event)
-      if (eventSessionID === sessionId) {
-        const callID = getStringProperty(eventPayload, 'callID')
-        const tool = getStringProperty(eventPayload, 'tool')
-        const input = getObjectProperty(eventPayload, 'input')
-        if (callID != null && tool != null) {
-          pendingToolCalls.set(callID, {tool, input})
-          logger.debug('Tool called', {callID, tool})
-        }
-      }
-    } else if (eventType === 'session.next.tool.success') {
-      // V2 sync tool lifecycle: render output and detect artifacts using correlated call info
-      const eventSessionID = getEventSessionID(event)
-      if (eventSessionID === sessionId) {
-        const callID = getStringProperty(eventPayload, 'callID')
-        if (callID === null) continue
 
-        const callInfo = pendingToolCalls.get(callID)
-        if (callInfo !== undefined) {
-          pendingToolCalls.delete(callID)
-          const {tool, input} = callInfo
-          // Title resolution: structured.title → input.title → bash command → tool name
-          const structured = getObjectProperty(eventPayload, 'structured')
-          const title =
-            getStringProperty(structured, 'title') ??
-            getStringProperty(input, 'title') ??
-            (tool.toLowerCase() === 'bash'
-              ? String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? tool)
-              : tool)
-          outputToolExecution(tool, title)
-          if (tool.toLowerCase() === 'bash') {
-            const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
-            // Collect text output from content array for artifact detection
-            const contentArr = getObjectProperty(eventPayload, 'content')
-            const outputText = Array.isArray(contentArr)
-              ? contentArr
-                  .map((item: unknown) =>
-                    getStringProperty(item, 'type') === 'text' ? (getStringProperty(item, 'text') ?? '') : '',
-                  )
-                  .join('\n')
-              : ''
-            detectArtifacts(
-              command,
-              outputText,
-              prsCreated,
-              commitsCreated,
-              () => {
-                commentsPosted++
-              },
-              commentsPostedUrls,
-            )
+      if (eventType === 'message.part.delta') {
+        // New SDK shape: streaming text delta events accumulate into lastText, flushed on session.idle.
+        // delta may be an object {type:'text', text:string} or a plain string when field === 'text'.
+        const eventSessionID = getEventSessionID(event)
+        if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
+          const delta = getObjectProperty(eventPayload, 'delta')
+          const deltaType = getStringProperty(delta, 'type')
+          const deltaText = getStringProperty(delta, 'text')
+          if (deltaType === 'text' && deltaText != null) {
+            lastText += deltaText
+          } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
+            lastText += delta
           }
         }
-      }
-    } else if (eventType === 'message.part.updated') {
-      const part = getObjectProperty(eventPayload, 'part')
-      const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
-      if (eventSessionID !== sessionId) continue
-      if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
+      } else if (eventType === 'session.next.text.delta') {
+        // Sync/session.next shape: delta is either a plain string or {type:'text', text:string}
+        const eventSessionID = getEventSessionID(event)
+        if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
+          const deltaRaw = getObjectProperty(eventPayload, 'delta')
+          const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
+          if (deltaText != null) lastText += deltaText
+        }
+      } else if (eventType === 'session.next.tool.called') {
+        // V2 sync tool lifecycle: cache call info for correlation with success event
+        const eventSessionID = getEventSessionID(event)
+        if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
+          const callID = getStringProperty(eventPayload, 'callID')
+          const tool = getStringProperty(eventPayload, 'tool')
+          const input = getObjectProperty(eventPayload, 'input')
+          if (callID != null && tool != null) {
+            pendingToolCalls.set(callID, {tool, input})
+            logger.debug('Tool called', {callID, tool})
+          }
+        }
+      } else if (eventType === 'session.next.tool.success') {
+        // V2 sync tool lifecycle: render output and detect artifacts using correlated call info
+        const eventSessionID = getEventSessionID(event)
+        if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
+          const callID = getStringProperty(eventPayload, 'callID')
+          if (callID === null) continue
 
-      const partType = getStringProperty(part, 'type')
-      if (partType === 'text') {
-        const text = getStringProperty(part, 'text')
-        if (text != null) lastText = text
-        const endTime = getNumberProperty(getObjectProperty(part, 'time'), 'end')
-        if (endTime != null) {
+          const callInfo = pendingToolCalls.get(callID)
+          if (callInfo !== undefined) {
+            pendingToolCalls.delete(callID)
+            const {tool, input} = callInfo
+            // Title resolution: structured.title → input.title → bash command → tool name
+            const structured = getObjectProperty(eventPayload, 'structured')
+            const title =
+              getStringProperty(structured, 'title') ??
+              getStringProperty(input, 'title') ??
+              (tool.toLowerCase() === 'bash'
+                ? String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? tool)
+                : tool)
+            outputToolExecution(tool, title)
+            if (tool.toLowerCase() === 'bash') {
+              const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
+              // Collect text output from content array for artifact detection
+              const contentArr = getObjectProperty(eventPayload, 'content')
+              const outputText = Array.isArray(contentArr)
+                ? contentArr
+                    .map((item: unknown) =>
+                      getStringProperty(item, 'type') === 'text' ? (getStringProperty(item, 'text') ?? '') : '',
+                    )
+                    .join('\n')
+                : ''
+              detectArtifacts(
+                command,
+                outputText,
+                prsCreated,
+                commitsCreated,
+                () => {
+                  commentsPosted++
+                },
+                commentsPostedUrls,
+              )
+            }
+          }
+        }
+      } else if (eventType === 'message.part.updated') {
+        const part = getObjectProperty(eventPayload, 'part')
+        const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
+        if (!isOwnedSession(eventSessionID, sessionId, ownershipLedger)) continue
+        if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
+
+        const partType = getStringProperty(part, 'type')
+        if (partType === 'text') {
+          const text = getStringProperty(part, 'text')
+          if (text != null) lastText = text
+          const endTime = getNumberProperty(getObjectProperty(part, 'time'), 'end')
+          if (endTime != null) {
+            // Root-only, never ownership-widened: this checks whether the ROOT's own
+            // text part is the synthetic turn upstream injects into the parent
+            // session when a background dispatch finishes (see `tool/task.ts`'s
+            // `inject()`). A descendant emitting similar-looking text is not this
+            // signal — only the parent session ever receives the injected turn.
+            if (ownershipLedger !== undefined && eventSessionID === sessionId && text != null) {
+              const completion = parseInjectedTaskCompletion(text)
+              if (completion !== null) {
+                ownershipLedger.settle(completion.childSessionId)
+                logger.info('Background task completion turn observed — settled ownership entry', {
+                  sessionId,
+                  childSessionId: completion.childSessionId,
+                  state: completion.state,
+                })
+              }
+            }
+            outputTextContent(lastText)
+            lastText = ''
+          }
+        } else if (partType === 'tool') {
+          const toolState = getObjectProperty(part, 'state')
+          if (getStringProperty(toolState, 'status') === 'completed') {
+            const tool = getStringProperty(part, 'tool') ?? ''
+
+            // Background dispatch observed: a `task` tool call completes
+            // immediately once dispatch begins, carrying `metadata.background
+            // === true` and `metadata.jobId` (the child session id) — see
+            // upstream `tool/task.ts`. Adopt the child into the ledger so its
+            // own events route from here on. Mirrors the gateway's detection in
+            // `run-core.ts` exactly — same signal, same fields.
+            if (ownershipLedger !== undefined && tool === 'task') {
+              const stateMetadata = getObjectProperty(toolState, 'metadata')
+              const jobId = getStringProperty(stateMetadata, 'jobId')
+              const isBackground = getBooleanProperty(stateMetadata, 'background')
+              if (jobId !== null && isBackground === true) {
+                const label = getStringProperty(toolState, 'title') ?? 'background task'
+                ownershipLedger.adopt(jobId, label)
+                logger.info('Background dispatch observed — adopted into ownership ledger', {sessionId, jobId, label})
+              }
+            }
+
+            outputToolExecution(tool, String(getObjectProperty(toolState, 'title') ?? ''))
+            if (tool.toLowerCase() === 'bash') {
+              const input = getObjectProperty(toolState, 'input')
+              const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
+              const output = String(getObjectProperty(toolState, 'output') ?? '')
+              detectArtifacts(
+                command,
+                output,
+                prsCreated,
+                commitsCreated,
+                () => {
+                  commentsPosted++
+                },
+                commentsPostedUrls,
+              )
+            }
+          }
+        }
+      } else if (eventType === 'message.updated') {
+        const msg = getObjectProperty(eventPayload, 'info')
+        const eventSessionID = getSessionID(eventPayload) ?? getSessionID(msg)
+        const tokensData = getObjectProperty(msg, 'tokens')
+        if (
+          isOwnedSession(eventSessionID, sessionId, ownershipLedger) &&
+          getStringProperty(msg, 'role') === 'assistant' &&
+          tokensData != null
+        ) {
+          if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
+          tokens = {
+            input: getNumberProperty(tokensData, 'input') ?? 0,
+            output: getNumberProperty(tokensData, 'output') ?? 0,
+            reasoning: getNumberProperty(tokensData, 'reasoning') ?? 0,
+            cache: {
+              read: getNumberProperty(getObjectProperty(tokensData, 'cache'), 'read') ?? 0,
+              write: getNumberProperty(getObjectProperty(tokensData, 'cache'), 'write') ?? 0,
+            },
+          }
+          model = getStringProperty(msg, 'modelID')
+          cost = getNumberProperty(msg, 'cost')
+          logger.debug('Token usage received', {tokens, model, cost})
+        }
+      } else if (eventType === 'session.status') {
+        if (isOwnedSession(getSessionID(eventPayload), sessionId, ownershipLedger)) {
+          const status = getObjectProperty(eventPayload, 'status')
+          const terminalError = classifyRetryStatusError(status)
+          if (terminalError != null) {
+            if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
+            logger.error('Session status retry classified as terminal provider error', {
+              sessionId,
+              type: terminalError.type,
+            })
+            classificationPath = 'structured'
+            llmError = mergeActivityError(llmError, terminalError, activityTracker)
+          }
+        }
+      } else if (eventType === 'session.error') {
+        if (isOwnedSession(getSessionID(eventPayload), sessionId, ownershipLedger)) {
+          const sessionError = getObjectProperty(eventPayload, 'error')
+          // Bounded log: never pass the raw session error payload to the logger.
+          logger.error('Session error received', {sessionType: typeof sessionError})
+
+          // Allowlisted structured fields only — never echo the raw session error object/URL.
+          const errorData = getObjectProperty(sessionError, 'data')
+          const status =
+            getNumberProperty(sessionError, 'status') ??
+            getNumberProperty(sessionError, 'statusCode') ??
+            getNumberProperty(errorData, 'status') ??
+            getNumberProperty(errorData, 'statusCode')
+          const code = getStringProperty(sessionError, 'code') ?? getStringProperty(errorData, 'code')
+          const name = getStringProperty(sessionError, 'name') ?? getStringProperty(errorData, 'name')
+          // Intentional tradeoff: object message text is classification-only for quota and excluded from safe
+          // fetch-retry classification, so object {message: 'fetch failed'} remains non-retryable; string/thrown
+          // fetch errors remain retryable.
+          const structuredMessage =
+            getStringProperty(sessionError, 'message') ?? getStringProperty(errorData, 'message')
+          const plainMessage = typeof sessionError === 'string' ? sessionError : undefined
+          const message = structuredMessage ?? plainMessage
+
+          const terminalError =
+            classifyProviderAuthError({
+              kind: 'session-error',
+              name,
+            }) ??
+            classifyContextOverflowError({
+              kind: 'session-error',
+              name,
+            }) ??
+            classifyQuotaError({
+              kind: 'session-error',
+              status: status ?? undefined,
+              code: code ?? undefined,
+              message: message ?? undefined,
+            })
+
+          if (terminalError != null) {
+            if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
+            logger.error('Session error classified as terminal provider error', {sessionId, type: terminalError.type})
+            classificationPath = 'structured'
+            llmError = mergeActivityError(llmError, terminalError, activityTracker)
+          } else if (llmError == null || isTerminalProviderError(llmError) === false) {
+            const errorStr = normalizeSessionError(sessionError)
+            let genericError: ErrorInfo
+            let genericClassificationPath: ClassificationPath
+            if (isLlmFetchError(errorStr)) {
+              genericError = createLLMFetchError(errorStr, model ?? undefined)
+              genericClassificationPath = 'fallback'
+            } else if (status === 429) {
+              // Ordinary 429 without account_rate_limit stays retryable rate_limit.
+              genericError = createErrorInfo('rate_limit', errorStr, true)
+              genericClassificationPath = 'name'
+            } else {
+              const isRetryable =
+                getBooleanProperty(sessionError, 'isRetryable') ?? getBooleanProperty(errorData, 'isRetryable')
+              if (isRetryable === true) {
+                genericError = createRetryableApiError(errorStr, model ?? undefined)
+                genericClassificationPath = 'structured'
+              } else if (isRetryable === false) {
+                genericError = createAgentError(errorStr)
+                genericClassificationPath = 'structured'
+              } else {
+                genericError = createAgentError(errorStr)
+                genericClassificationPath = name != null || status != null || code != null ? 'name' : 'unclassified'
+              }
+            }
+            if (classificationPath == null) classificationPath = genericClassificationPath
+            llmError = mergeActivityError(llmError, genericError, activityTracker, errorStr)
+          }
+        }
+      } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
+        if (activityTracker != null) {
+          activityTracker.sessionIdle = true
+          activityTracker.currentTurnTerminalSignalReceived = true
+        }
+        if (lastText.length > 0) {
           outputTextContent(lastText)
           lastText = ''
         }
-      } else if (partType === 'tool') {
-        const toolState = getObjectProperty(part, 'state')
-        if (getStringProperty(toolState, 'status') === 'completed') {
-          const tool = getStringProperty(part, 'tool') ?? ''
-          outputToolExecution(tool, String(getObjectProperty(toolState, 'title') ?? ''))
-          if (tool.toLowerCase() === 'bash') {
-            const input = getObjectProperty(toolState, 'input')
-            const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
-            const output = String(getObjectProperty(toolState, 'output') ?? '')
-            detectArtifacts(
-              command,
-              output,
-              prsCreated,
-              commitsCreated,
-              () => {
-                commentsPosted++
-              },
-              commentsPostedUrls,
-            )
-          }
-        }
-      }
-    } else if (eventType === 'message.updated') {
-      const msg = getObjectProperty(eventPayload, 'info')
-      const eventSessionID = getSessionID(eventPayload) ?? getSessionID(msg)
-      const tokensData = getObjectProperty(msg, 'tokens')
-      if (eventSessionID === sessionId && getStringProperty(msg, 'role') === 'assistant' && tokensData != null) {
-        if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
-        tokens = {
-          input: getNumberProperty(tokensData, 'input') ?? 0,
-          output: getNumberProperty(tokensData, 'output') ?? 0,
-          reasoning: getNumberProperty(tokensData, 'reasoning') ?? 0,
-          cache: {
-            read: getNumberProperty(getObjectProperty(tokensData, 'cache'), 'read') ?? 0,
-            write: getNumberProperty(getObjectProperty(tokensData, 'cache'), 'write') ?? 0,
-          },
-        }
-        model = getStringProperty(msg, 'modelID')
-        cost = getNumberProperty(msg, 'cost')
-        logger.debug('Token usage received', {tokens, model, cost})
-      }
-    } else if (eventType === 'session.status') {
-      if (getSessionID(eventPayload) === sessionId) {
-        const status = getObjectProperty(eventPayload, 'status')
-        const terminalError = classifyRetryStatusError(status)
-        if (terminalError != null) {
-          if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
-          logger.error('Session status retry classified as terminal provider error', {
-            sessionId,
-            type: terminalError.type,
-          })
-          classificationPath = 'structured'
-          llmError = mergeActivityError(llmError, terminalError, activityTracker)
-        }
-      }
-    } else if (eventType === 'session.error') {
-      if (getSessionID(eventPayload) === sessionId) {
-        const sessionError = getObjectProperty(eventPayload, 'error')
-        // Bounded log: never pass the raw session error payload to the logger.
-        logger.error('Session error received', {sessionType: typeof sessionError})
-
-        // Allowlisted structured fields only — never echo the raw session error object/URL.
-        const errorData = getObjectProperty(sessionError, 'data')
-        const status =
-          getNumberProperty(sessionError, 'status') ??
-          getNumberProperty(sessionError, 'statusCode') ??
-          getNumberProperty(errorData, 'status') ??
-          getNumberProperty(errorData, 'statusCode')
-        const code = getStringProperty(sessionError, 'code') ?? getStringProperty(errorData, 'code')
-        const name = getStringProperty(sessionError, 'name') ?? getStringProperty(errorData, 'name')
-        // Intentional tradeoff: object message text is classification-only for quota and excluded from safe
-        // fetch-retry classification, so object {message: 'fetch failed'} remains non-retryable; string/thrown
-        // fetch errors remain retryable.
-        const structuredMessage = getStringProperty(sessionError, 'message') ?? getStringProperty(errorData, 'message')
-        const plainMessage = typeof sessionError === 'string' ? sessionError : undefined
-        const message = structuredMessage ?? plainMessage
-
-        const terminalError =
-          classifyProviderAuthError({
-            kind: 'session-error',
-            name,
-          }) ??
-          classifyContextOverflowError({
-            kind: 'session-error',
-            name,
-          }) ??
-          classifyQuotaError({
-            kind: 'session-error',
-            status: status ?? undefined,
-            code: code ?? undefined,
-            message: message ?? undefined,
-          })
-
-        if (terminalError != null) {
-          if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
-          logger.error('Session error classified as terminal provider error', {sessionId, type: terminalError.type})
-          classificationPath = 'structured'
-          llmError = mergeActivityError(llmError, terminalError, activityTracker)
-        } else if (llmError == null || isTerminalProviderError(llmError) === false) {
-          const errorStr = normalizeSessionError(sessionError)
-          let genericError: ErrorInfo
-          let genericClassificationPath: ClassificationPath
-          if (isLlmFetchError(errorStr)) {
-            genericError = createLLMFetchError(errorStr, model ?? undefined)
-            genericClassificationPath = 'fallback'
-          } else if (status === 429) {
-            // Ordinary 429 without account_rate_limit stays retryable rate_limit.
-            genericError = createErrorInfo('rate_limit', errorStr, true)
-            genericClassificationPath = 'name'
-          } else {
-            const isRetryable =
-              getBooleanProperty(sessionError, 'isRetryable') ?? getBooleanProperty(errorData, 'isRetryable')
-            if (isRetryable === true) {
-              genericError = createRetryableApiError(errorStr, model ?? undefined)
-              genericClassificationPath = 'structured'
-            } else if (isRetryable === false) {
-              genericError = createAgentError(errorStr)
-              genericClassificationPath = 'structured'
-            } else {
-              genericError = createAgentError(errorStr)
-              genericClassificationPath = name != null || status != null || code != null ? 'name' : 'unclassified'
-            }
-          }
-          if (classificationPath == null) classificationPath = genericClassificationPath
-          llmError = mergeActivityError(llmError, genericError, activityTracker, errorStr)
-        }
-      }
-    } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
-      if (activityTracker != null) {
-        activityTracker.sessionIdle = true
-        activityTracker.currentTurnTerminalSignalReceived = true
-      }
-      if (lastText.length > 0) {
-        outputTextContent(lastText)
-        lastText = ''
       }
     }
+  }
+
+  try {
+    await consumeStream()
+  } catch (error) {
+    // Stream discontinuity: never infer "nothing outstanding" from a stream that
+    // stopped talking. Mark every currently-outstanding owned entry unknown —
+    // reconciliation (triggered by the caller that owns the SDK client, since this
+    // function only has the stream) is how they later resolve to settled or cancelled.
+    if (ownershipLedger !== undefined) {
+      const outstandingEntries = ownershipLedger.snapshot().filter(entry => entry.state === 'outstanding')
+      for (const entry of outstandingEntries) {
+        ownershipLedger.markUnknown(entry.sessionId)
+      }
+      logger.warning('Event stream discontinuity — marked outstanding owned entries unknown', {
+        sessionId,
+        unknownCount: outstandingEntries.length,
+      })
+    }
+    throw error
   }
 
   if (lastText.length > 0) outputTextContent(lastText)
