@@ -87,11 +87,18 @@ function injectedCompletionEvent(rootSessionID: string, childSessionID: string, 
 }
 
 function messageUpdatedEvent(sessionID: string): Event {
+  return messageUpdatedEventWithTokens(sessionID, {input: 1, output: 2, reasoning: 0, cache: {read: 0, write: 0}})
+}
+
+function messageUpdatedEventWithTokens(
+  sessionID: string,
+  tokens: {input: number; output: number; reasoning: number; cache: {read: number; write: number}},
+): Event {
   return {
     type: 'message.updated',
     properties: {
       sessionID,
-      info: {role: 'assistant', tokens: {input: 1, output: 2, reasoning: 0, cache: {read: 0, write: 0}}},
+      info: {role: 'assistant', tokens},
     },
   } as unknown as Event
 }
@@ -440,6 +447,105 @@ describe('processEventStream — ownership check widens descendant events, no-le
 
     // #then the descendant's token usage is now recorded
     expect(result.tokens).not.toBeNull()
+  })
+
+  it("message.updated: a root-only run (no ledger) reports the root session's totals unchanged", async () => {
+    // #given two message.updated reports on the root session only, no ledger
+    const eventStream = createMockEventStream([
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 20, output: 8, reasoning: 2, cache: {read: 4, write: 6}}),
+    ])
+
+    // #when processed without a ledger
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the latest root report wins, exactly as plain assignment always produced
+    expect(result.tokens).toEqual({input: 20, output: 8, reasoning: 2, cache: {read: 4, write: 6}})
+  })
+
+  it('message.updated: two owned sessions each reporting tokens sum rather than overwrite', async () => {
+    // #given a ledger adopting a child, and both root and child reporting token usage
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const eventStream = createMockEventStream([
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}}),
+      messageUpdatedEventWithTokens(CHILD_SESSION_ID, {input: 7, output: 3, reasoning: 0, cache: {read: 1, write: 1}}),
+    ])
+
+    // #when processed with the ledger supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the two sessions' totals are summed, not overwritten
+    expect(result.tokens).toEqual({input: 17, output: 8, reasoning: 1, cache: {read: 3, write: 4}})
+  })
+
+  it("message.updated: a descendant's message arriving after the root's does not erase the root's contribution", async () => {
+    // #given a ledger adopting a child, with the CHILD's report arriving AFTER the root's
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const eventStream = createMockEventStream([
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}}),
+      messageUpdatedEventWithTokens(CHILD_SESSION_ID, {input: 7, output: 3, reasoning: 0, cache: {read: 1, write: 1}}),
+    ])
+
+    // #when processed with the ledger supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the root's contribution (input: 10, output: 5) is still present in the sum —
+    // this is the regression guard: against plain assignment, the child's later report
+    // would replace the root's entirely, leaving {input: 7, output: 3, ...} instead.
+    expect(result.tokens?.input).toBeGreaterThanOrEqual(10)
+    expect(result.tokens).toEqual({input: 17, output: 8, reasoning: 1, cache: {read: 3, write: 4}})
+  })
+
+  it('message.updated: repeated cumulative reports from one session count once, not twice', async () => {
+    // #given a ledger adopting a child, with the child reporting twice (a growing cumulative total for the same message)
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const eventStream = createMockEventStream([
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}}),
+      messageUpdatedEventWithTokens(CHILD_SESSION_ID, {input: 5, output: 2, reasoning: 0, cache: {read: 0, write: 0}}),
+      messageUpdatedEventWithTokens(CHILD_SESSION_ID, {input: 7, output: 3, reasoning: 0, cache: {read: 1, write: 1}}),
+    ])
+
+    // #when processed with the ledger supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the child's second (cumulative) report replaces its first, not adds to it —
+    // sum is root (10) + child's LATEST report (7) = 17, not 10 + 5 + 7 = 22
+    expect(result.tokens).toEqual({input: 17, output: 8, reasoning: 1, cache: {read: 3, write: 4}})
   })
 
   it('session.error: without a ledger a foreign session never sets llmError, same as before', async () => {

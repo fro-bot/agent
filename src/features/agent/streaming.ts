@@ -194,6 +194,32 @@ function getObjectProperty(value: unknown, property: string): unknown {
   return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
 }
 
+/**
+ * Sums each owned session's latest-reported token totals into the run's overall cost.
+ * Per-session latest-wins (see `tokensBySession` in `processEventStream`) plus a sum
+ * across sessions gives the true run cost without a single session's report clobbering
+ * another's. An empty map (no ledger, or no message.updated seen yet) yields `null`,
+ * matching the pre-fix behavior of an untouched `tokens` variable.
+ */
+function sumOwnedSessionTokens(tokensBySession: ReadonlyMap<string, TokenUsage>): TokenUsage | null {
+  if (tokensBySession.size === 0) return null
+
+  let input = 0
+  let output = 0
+  let reasoning = 0
+  let cacheRead = 0
+  let cacheWrite = 0
+  for (const sessionTokens of tokensBySession.values()) {
+    input += sessionTokens.input
+    output += sessionTokens.output
+    reasoning += sessionTokens.reasoning
+    cacheRead += sessionTokens.cache.read
+    cacheWrite += sessionTokens.cache.write
+  }
+
+  return {input, output, reasoning, cache: {read: cacheRead, write: cacheWrite}}
+}
+
 const SESSION_ERROR_FIELD_MAX_LENGTH = 256
 const GENERIC_SESSION_ERROR = 'Unknown session error'
 
@@ -332,7 +358,15 @@ export async function processEventStream(
   ownershipLedger?: OwnershipLedger,
 ): Promise<EventStreamResult> {
   let lastText = ''
-  let tokens: TokenUsage | null = null
+  // Per-session latest-reported totals. OpenCode reports cumulative totals per
+  // message (see message.tokens in the upstream session store, and
+  // ctx.assistantMessage.tokens = usage.tokens in processor.ts) rather than
+  // deltas, so the latest report for a given session is that session's running
+  // total — taking the latest per session and summing across owned sessions
+  // gives the run's true cost. A root-only run (the only case before ownership
+  // widening) has exactly one key here, so the sum equals what plain
+  // assignment always produced.
+  const tokensBySession = new Map<string, TokenUsage>()
   let model: string | null = null
   let cost: number | null = null
   const prsCreated: string[] = []
@@ -566,7 +600,7 @@ export async function processEventStream(
           tokensData != null
         ) {
           if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
-          tokens = {
+          const sessionTokens: TokenUsage = {
             input: getNumberProperty(tokensData, 'input') ?? 0,
             output: getNumberProperty(tokensData, 'output') ?? 0,
             reasoning: getNumberProperty(tokensData, 'reasoning') ?? 0,
@@ -575,9 +609,12 @@ export async function processEventStream(
               write: getNumberProperty(getObjectProperty(tokensData, 'cache'), 'write') ?? 0,
             },
           }
+          // eventSessionID is narrowed to string here: isOwnedSession is a type guard that
+          // rejects null ids, so this branch only runs when it resolved to a real session id.
+          tokensBySession.set(eventSessionID, sessionTokens)
           model = getStringProperty(msg, 'modelID')
           cost = getNumberProperty(msg, 'cost')
-          logger.debug('Token usage received', {tokens, model, cost})
+          logger.debug('Token usage received', {tokens: sessionTokens, model, cost})
         }
       } else if (eventType === 'session.status') {
         if (isOwnedSession(getSessionID(eventPayload), sessionId, ownershipLedger)) {
@@ -701,7 +738,7 @@ export async function processEventStream(
 
   if (lastText.length > 0) outputTextContent(lastText)
   return {
-    tokens,
+    tokens: sumOwnedSessionTokens(tokensBySession),
     model,
     cost,
     prsCreated,
