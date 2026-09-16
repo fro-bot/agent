@@ -3,7 +3,7 @@ import type {createOpencode, Event} from '@opencode-ai/sdk'
 import type {createOpencodeClient} from '@opencode-ai/sdk/v2'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation, TurnEvidence} from './attempt-outcome.js'
-import type {AttemptOutcome, AttemptResult} from './prompt-sender.js'
+import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {reduceAttemptOutcome} from './attempt-outcome.js'
@@ -284,15 +284,12 @@ export function mergeArtifactResults(
 export const MAX_LLM_RETRIES = 4
 export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
 
-/**
- * Single source of truth for the outcome-to-retry mapping. Lives here rather
- * than beside the `AttemptOutcome` type because the runtime dependency runs
- * prompt-sender to retry; exporting it the other way would close that into a
- * cycle.
- */
-export function shouldRetryFromOutcome(outcome: AttemptOutcome): boolean {
-  return outcome === 'turn_failed_retryable'
-}
+// `shouldRetryFromOutcome` now lives in attempt-outcome.ts, beside `reduceAttemptOutcome` which
+// needs it internally -- see that module for the definition. Re-exported here because
+// prompt-sender.ts already depends on retry.ts at runtime for `runPromptAttempt`, and that
+// existing value edge is the direction to extend, not a fresh one back into attempt-outcome.ts
+// (see docs/solutions/best-practices/extract-shared-helpers-toward-the-value-dependency-2026-08-08.md).
+export {shouldRetryFromOutcome} from './attempt-outcome.js'
 
 /**
  * Create a v2 client attached to an existing OpenCode server URL.
@@ -319,37 +316,6 @@ async function tryCreateV2Client(
  * report a settlement cause. Distinguished from `AttemptObservation` by the absence of a
  * `settlement` key (see the `'settlement' in outcome` check at the call site).
  */
-/**
- * session-poll.ts's own `sessionFailureObservation()` helper records a raw diagnostic message for
- * a persisted generic session error but no classified `ErrorInfo` (see its definition there).
- * Enriches such a failure from whatever classified error the SSE processor had already recorded
- * on the tracker by the moment the observation was captured -- called immediately after the race
- * settles, before `collectEventResults()`'s bounded cleanup runs, so this reads the tracker at the
- * same instant the winning observation itself was produced, not after cleanup has had a chance to
- * advance it further. This never changes which failure won or why observation stopped; it only
- * fills in evidence absent from a failure the winning producer already selected.
- */
-function enrichSessionFailureWithClassifiedError(
-  observation: AttemptObservation,
-  activityTracker: ActivityTracker,
-): AttemptObservation {
-  if (observation.settlement.kind !== 'failure-observed') return observation
-  const needsEnrichment = observation.failures.some(failure => failure.source === 'session' && failure.llmError == null)
-  if (!needsEnrichment) return observation
-
-  const observedFailure = getObservedFailure(activityTracker)
-  if (observedFailure == null) return observation
-
-  return {
-    ...observation,
-    failures: observation.failures.map(failure =>
-      failure.source === 'session' && failure.llmError == null
-        ? {...failure, llmError: observedFailure.error, classificationPath: observedFailure.classificationPath}
-        : failure,
-    ),
-  }
-}
-
 type V2WaitObservation = {readonly kind: 'fallback-to-poll'} | AttemptObservation
 
 async function startV2SessionWait(
@@ -561,17 +527,64 @@ export async function runPromptAttempt(
           })
         } else {
           await collectEventResults()
-          if (activityTracker.firstMeaningfulEventReceived === true) {
-            const effectiveLlmError = eventStreamResult.llmError ?? promptStartResult.llmError
-            const outcome: AttemptOutcome =
-              effectiveLlmError?.retryable === true ? 'turn_failed_retryable' : 'turn_failed_terminal'
+          // A submission failure only ever reaches here as `promptStartResult.success === false`
+          // in production (see sendPromptToSession's createSubmissionFailure); a success passes
+          // through unchanged since there is nothing to reduce. For a failure, route it through
+          // the single reducer instead of gating on activity: `TurnEvidence.accepted` describes
+          // whether the turn was accepted, not whether captured failure evidence is worth
+          // considering -- a provider or session failure already recorded on the tracker (e.g. an
+          // auth/quota/context-overflow `session.error`) must still outrank the submission failure
+          // per `reduceAttemptOutcome`'s precedence rules even when no activity was ever observed.
+          if (promptStartResult.success === false) {
+            const failures: FailureObservation[] = []
+            if (activityTracker.terminalProviderError == null) {
+              const observedFailure = getObservedFailure(activityTracker)
+              if (observedFailure != null) {
+                failures.push({
+                  source: 'session',
+                  message: observedFailure.error.message,
+                  llmError: observedFailure.error,
+                  classificationPath: observedFailure.classificationPath,
+                })
+              }
+            } else {
+              failures.push({
+                source: 'provider',
+                message: activityTracker.terminalProviderError.message,
+                llmError: activityTracker.terminalProviderError,
+              })
+            }
+            failures.push({
+              source: 'submission',
+              message: promptStartResult.error ?? 'Prompt submission failed',
+              llmError: promptStartResult.llmError,
+            })
+            const turnEvidence: TurnEvidence = {accepted: activityTracker.firstMeaningfulEventReceived === true}
+            const reduced = reduceAttemptOutcome({settlement: {kind: 'failure-observed'}, failures}, null, turnEvidence)
+            // Base on the SSE-observed `eventStreamResult` only once the turn was actually accepted
+            // -- that is where any real tokens/cost/artifacts accumulated. Otherwise nothing ever
+            // reached the remote, so `promptStartResult`'s own (synthetic) `eventStreamResult` is
+            // the accurate one, and it also already carries the submission failure's own
+            // `classificationPath` -- discarding it here would silently drop that field even when
+            // the submission failure is still what won.
+            let mergedEventStreamResult = turnEvidence.accepted
+              ? eventStreamResult
+              : promptStartResult.eventStreamResult
+            if (reduced.llmError != null && mergedEventStreamResult.llmError?.type !== reduced.llmError.type) {
+              mergedEventStreamResult = {
+                ...mergedEventStreamResult,
+                llmError: reduced.llmError,
+                classificationPath: reduced.classificationPath ?? mergedEventStreamResult.classificationPath,
+              }
+            }
             return {
-              ...promptStartResult,
-              error: promptStartResult.error,
-              llmError: effectiveLlmError,
-              outcome,
-              shouldRetry: shouldRetryFromOutcome(outcome),
-              eventStreamResult,
+              success: reduced.success,
+              error: reduced.error,
+              llmError: reduced.llmError,
+              outcome: reduced.outcome,
+              shouldRetry: reduced.shouldRetry,
+              settlement: reduced.settlement,
+              eventStreamResult: mergedEventStreamResult,
             }
           }
           return promptStartResult
@@ -608,13 +621,10 @@ export async function runPromptAttempt(
     // post-race clock recheck ever second-guesses it. This is the one race in this function whose
     // winner decides the settlement cause; `collectEventResults()`'s bounded cleanup (next) can
     // enrich artifacts and usage afterward, but it can never reopen this decision.
-    const winningObservation: AttemptObservation = enrichSessionFailureWithClassifiedError(
-      await Promise.race([
-        waitObservationPromise.then(async outcome => ('settlement' in outcome ? outcome : pollObservationPromise)),
-        pollObservationPromise,
-      ]),
-      activityTracker,
-    )
+    const winningObservation: AttemptObservation = await Promise.race([
+      waitObservationPromise.then(async outcome => ('settlement' in outcome ? outcome : pollObservationPromise)),
+      pollObservationPromise,
+    ])
 
     await collectEventResults()
 

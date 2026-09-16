@@ -18,7 +18,6 @@
  */
 import type {ClassificationPath, ErrorInfo} from '@fro-bot/runtime'
 import type {AttemptOutcome} from './prompt-sender.js'
-import {shouldRetryFromOutcome} from './retry.js'
 
 /**
  * Why an attempt stopped observing. Deliberately separate from which failure
@@ -79,6 +78,17 @@ export interface AttemptOutcomeResult {
   readonly settlement: AttemptSettlement
   /** Compatibility view derived from outcome; outcome is authoritative. */
   readonly shouldRetry: boolean
+}
+
+/**
+ * Single source of truth for the outcome-to-retry mapping. Lives beside the reducer that needs it
+ * internally -- this module is the pure leaf in the attempt-outcome/retry relationship, so it must
+ * not import back from retry.ts (the orchestrator that already imports `reduceAttemptOutcome` from
+ * here); that would close the two into a cycle. retry.ts re-exports this for prompt-sender.ts,
+ * which already depends on retry.ts at runtime.
+ */
+export function shouldRetryFromOutcome(outcome: AttemptOutcome): boolean {
+  return outcome === 'turn_failed_retryable'
 }
 
 /**

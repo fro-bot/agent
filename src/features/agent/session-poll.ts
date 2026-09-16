@@ -12,7 +12,7 @@ import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {classifyRetryStatusError, mergeActivityError} from './streaming.js'
+import {classifyRetryStatusError, getObservedFailure, mergeActivityError} from './streaming.js'
 
 const POLL_INTERVAL_MS = 500
 const POLL_REQUEST_TIMEOUT_MS = 5_000
@@ -41,8 +41,21 @@ function providerFailureObservation(error: ErrorInfo): AttemptObservation {
   return {settlement: {kind: 'failure-observed'}, failures: [failure]}
 }
 
-function sessionFailureObservation(message: string): AttemptObservation {
-  const failure: FailureObservation = {source: 'session', message, llmError: null}
+/**
+ * Captures classified failure evidence (llmError + classificationPath) at construction time,
+ * from whatever the SSE processor has already recorded on `activityTracker` at this exact poll
+ * cycle -- not read later by a delayed continuation after this observation has already settled.
+ * See attempt-outcome.ts's module doc for the governing invariant: a settled observation's
+ * evidence is an immutable snapshot from the moment its producer settled.
+ */
+function sessionFailureObservation(message: string, activityTracker?: ActivityTracker): AttemptObservation {
+  const observedFailure = activityTracker == null ? null : getObservedFailure(activityTracker)
+  const failure: FailureObservation = {
+    source: 'session',
+    message,
+    llmError: observedFailure?.error ?? null,
+    classificationPath: observedFailure?.classificationPath,
+  }
   return {settlement: {kind: 'failure-observed'}, failures: [failure]}
 }
 
@@ -309,7 +322,7 @@ export async function pollForSessionCompletionObservation(
           error: sessionError,
           graceCycles: errorGraceCycles,
         })
-        return sessionFailureObservation(`Session error: ${sessionError}`)
+        return sessionFailureObservation(`Session error: ${sessionError}`, activityTracker)
       }
       continue
     }

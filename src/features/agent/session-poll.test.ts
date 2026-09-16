@@ -1,3 +1,4 @@
+import type {ErrorInfo} from '@fro-bot/runtime'
 import type {createOpencode} from '@opencode-ai/sdk'
 /**
  * Unit 9: gate every terminal path.
@@ -753,5 +754,120 @@ describe('pollForSessionCompletionObservation — settlement causes', () => {
     // #then — still polling (busy, no terminal signal), proven by repeated status calls instead
     // of an inactivity settlement
     expect(statusFn.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  describe('failure-observed: session error persisting through the grace period captures classified evidence at construction (Finding 1 fix)', () => {
+    const CLASSIFIED_ERROR: ErrorInfo = {
+      type: 'llm_fetch_error',
+      message: 'classified session failure',
+      retryable: true,
+    }
+
+    it('attaches whatever classified evidence the SSE processor has already recorded on the tracker, without a later enrichment pass', async () => {
+      // #given the SSE side of processing has already classified this session error onto the
+      // tracker (genericError + classificationPath) by the time the grace period elapses -- this
+      // producer must read that evidence itself, at construction, not rely on a caller reading the
+      // tracker again afterward (the deleted `enrichSessionFailureWithClassifiedError`)
+      vi.useFakeTimers()
+      const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+      const activityTracker: ActivityTracker = {
+        firstMeaningfulEventReceived: true,
+        currentTurnTerminalSignalReceived: false,
+        sessionIdle: false,
+        sessionError: 'network error',
+        genericError: CLASSIFIED_ERROR,
+        classificationPath: 'fallback',
+      }
+
+      // #when
+      const observationPromise = pollForSessionCompletionObservation(
+        mockClient as unknown as MockClient,
+        'ses_123',
+        '/workspace',
+        new AbortController().signal,
+        mockLogger,
+        30_000,
+        activityTracker,
+      )
+      await vi.advanceTimersByTimeAsync(2_000)
+      const observation = await observationPromise
+
+      // #then
+      expect(observation.settlement.kind).toBe('failure-observed')
+      expect(observation.failures).toHaveLength(1)
+      expect(observation.failures[0]?.source).toBe('session')
+      expect(observation.failures[0]?.llmError).toBe(CLASSIFIED_ERROR)
+      expect(observation.failures[0]?.classificationPath).toBe('fallback')
+    })
+
+    it('complement: with no classified evidence recorded, the failure still reports its raw message with a null llmError', async () => {
+      // #given the identical persisting-session-error shape, but nothing on the tracker has been
+      // classified yet -- this must not fabricate evidence that was never observed
+      vi.useFakeTimers()
+      const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+      const activityTracker: ActivityTracker = {
+        firstMeaningfulEventReceived: true,
+        currentTurnTerminalSignalReceived: false,
+        sessionIdle: false,
+        sessionError: 'network error',
+      }
+
+      // #when
+      const observationPromise = pollForSessionCompletionObservation(
+        mockClient as unknown as MockClient,
+        'ses_123',
+        '/workspace',
+        new AbortController().signal,
+        mockLogger,
+        30_000,
+        activityTracker,
+      )
+      await vi.advanceTimersByTimeAsync(2_000)
+      const observation = await observationPromise
+
+      // #then
+      expect(observation.settlement.kind).toBe('failure-observed')
+      expect(observation.failures[0]?.llmError).toBeNull()
+      expect(observation.failures[0]?.message).toContain('network error')
+    })
+
+    it('a delayed continuation mutating the tracker after settlement cannot rewrite the already-returned observation', async () => {
+      // #given the same settled observation as the first test in this block
+      vi.useFakeTimers()
+      const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+      const activityTracker: ActivityTracker = {
+        firstMeaningfulEventReceived: true,
+        currentTurnTerminalSignalReceived: false,
+        sessionIdle: false,
+        sessionError: 'network error',
+        genericError: CLASSIFIED_ERROR,
+        classificationPath: 'fallback',
+      }
+      const observationPromise = pollForSessionCompletionObservation(
+        mockClient as unknown as MockClient,
+        'ses_123',
+        '/workspace',
+        new AbortController().signal,
+        mockLogger,
+        30_000,
+        activityTracker,
+      )
+      await vi.advanceTimersByTimeAsync(2_000)
+      const observation = await observationPromise
+
+      // #when — a delayed continuation (e.g. a later SSE event) mutates the same tracker object
+      // after this producer has already settled and returned
+      activityTracker.terminalProviderError = {
+        type: 'provider_auth_error',
+        message: 'later provider failure',
+        retryable: false,
+      }
+      activityTracker.classificationPath = 'structured'
+
+      // #then — the already-returned observation's snapshot is untouched
+      expect(observation.failures[0]?.llmError).toBe(CLASSIFIED_ERROR)
+      expect(observation.failures[0]?.classificationPath).toBe('fallback')
+      expect(observation.failures[0]?.source).toBe('session')
+    })
   })
 })

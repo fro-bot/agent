@@ -775,10 +775,134 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
         startPrompt,
       )
 
-      // #then — resolves immediately through the existing (non-deferred) early exit, exactly as
-      // every run without a ledger does today; the new deferral machinery never engages
-      expect(result).toBe(FAILED_ATTEMPT_RESULT)
+      // #then — resolves through the existing (non-deferred) early exit, exactly as every run
+      // without a ledger does today; the new deferral machinery never engages. Uses `toEqual`
+      // rather than `toBe`: this path now always constructs its result through the shared
+      // reducer (Finding 2 fix) so a provider/session failure recorded on the tracker can still
+      // outrank the submission failure even with no activity -- identical values, not the same
+      // object reference, is the actual contract here.
+      expect(result).toEqual(FAILED_ATTEMPT_RESULT)
       expect(mockClient.session.status).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('early prompt-start return honors provider/session precedence over the submission failure (Finding 2 fix)', () => {
+    it('a provider session.error with no message/delta activity still wins over the submission failure', async () => {
+      // #given no ledger, a failed startPrompt (submission failure), and an SSE-observed terminal
+      // provider auth failure -- with NO message.part.delta/message.part.updated activity at all,
+      // so `activityTracker.firstMeaningfulEventReceived` stays false throughout. `startPrompt`
+      // resolves after a short delay so the armed stream's provider event is fully processed
+      // before `collectEventResults()` tears the event processor down.
+      vi.useFakeTimers()
+      try {
+        const {runPromptAttempt} = await import('./retry.js')
+        const startPrompt = vi.fn(async () => {
+          await new Promise<void>(resolve => setTimeout(resolve, 20))
+          return FAILED_ATTEMPT_RESULT
+        })
+        const mockClient = {session: {status: vi.fn()}}
+        const eventStream = createArmedEventStream([
+          {
+            type: 'session.error',
+            properties: {
+              sessionID: 'ses_123',
+              error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
+            },
+          } as unknown as Event,
+        ])
+
+        // #when
+        const resultPromise = runPromptAttempt(
+          mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+          'ses_123',
+          '/workspace',
+          400,
+          mockLogger,
+          eventStream,
+          undefined,
+          startPrompt,
+        )
+        await vi.advanceTimersByTimeAsync(50)
+        const result = await resultPromise
+
+        // #then — the provider failure wins the reducer's precedence even though the turn was
+        // never "accepted"; the submission failure is discarded outright, not merged with it
+        expect(result.success).toBe(false)
+        expect(result.outcome).toBe('turn_failed_terminal')
+        expect(result.outcome).not.toBe('submit_failed')
+        expect(result.llmError?.type).toBe('provider_auth_error')
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('complement: with genuinely no provider/session evidence, the same no-activity path still reports submit_failed', async () => {
+      // #given the identical shape but no session.error event at all -- the sibling of the
+      // provider-wins case above, proving the reducer does not fabricate a win when there is
+      // nothing to win with. (Also proven independently by "existing retry behavior with no
+      // ledger is unchanged" above.)
+      const {runPromptAttempt} = await import('./retry.js')
+      const startPrompt = vi.fn(async () => FAILED_ATTEMPT_RESULT)
+      const mockClient = {session: {status: vi.fn()}}
+
+      // #when
+      const result = await runPromptAttempt(
+        mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+        'ses_123',
+        '/workspace',
+        400,
+        mockLogger,
+        createMockEventStream([]),
+        undefined,
+        startPrompt,
+      )
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(result.outcome).toBe('submit_failed')
+      expect(result.error).toBe(FAILED_ATTEMPT_RESULT.error)
+    })
+
+    it('a context-overflow provider error on the same no-activity path reaches the caller with the classification recovery depends on', async () => {
+      // #given the same no-activity shape, but the provider failure classifies as context_overflow
+      // -- `src/harness/phases/execute.ts`'s `recoverFromContextOverflow` is gated on exactly this
+      // classification reaching the caller
+      vi.useFakeTimers()
+      try {
+        const {runPromptAttempt} = await import('./retry.js')
+        const startPrompt = vi.fn(async () => {
+          await new Promise<void>(resolve => setTimeout(resolve, 20))
+          return FAILED_ATTEMPT_RESULT
+        })
+        const mockClient = {session: {status: vi.fn()}}
+        const eventStream = createArmedEventStream([
+          {
+            type: 'session.error',
+            properties: {sessionID: 'ses_123', error: {name: 'ContextOverflowError'}},
+          } as unknown as Event,
+        ])
+
+        // #when
+        const resultPromise = runPromptAttempt(
+          mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+          'ses_123',
+          '/workspace',
+          400,
+          mockLogger,
+          eventStream,
+          undefined,
+          startPrompt,
+        )
+        await vi.advanceTimersByTimeAsync(50)
+        const result = await resultPromise
+
+        // #then
+        expect(result.success).toBe(false)
+        expect(result.llmError?.type).toBe('context_overflow')
+        expect(result.outcome).toBe('turn_failed_terminal')
+      } finally {
+        vi.useRealTimers()
+      }
     })
   })
 })
