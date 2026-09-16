@@ -1,4 +1,5 @@
 import type {BootstrapPhaseResult} from './phases/bootstrap.js'
+import type {CacheRestorePhaseResult} from './phases/cache-restore.js'
 import type {RoutingPhaseResult} from './phases/routing.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {createLogger} from '../shared/logger.js'
@@ -67,6 +68,8 @@ vi.mock('./phases/acquire-lock.js', () => ({
 }))
 
 vi.mock('./phases/execute.js', () => ({
+  computeDrainDeadlineMs: vi.fn(() => 60_000),
+  runDrain: vi.fn().mockResolvedValue({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}),
   runExecute: vi.fn(),
   resolveRequestedOutputModeState: vi.fn(() => 'omitted'),
 }))
@@ -74,6 +77,10 @@ vi.mock('./phases/execute.js', () => ({
 vi.mock('./phases/finalize.js', () => ({
   runFinalize: vi.fn(),
   runFinalizeWithResult: vi.fn().mockResolvedValue({exitCode: 0, deliveryKind: 'none'}),
+}))
+
+vi.mock('./phases/review-reconciliation.js', () => ({
+  runReviewReconciliation: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('./phases/routing.js', () => ({
@@ -315,5 +322,100 @@ describe('run', () => {
     const {runExecute} = await import('./phases/execute.js')
     expect(runAcknowledge).not.toHaveBeenCalled()
     expect(runExecute).not.toHaveBeenCalled()
+  })
+
+  it('drains owned work after execution and strictly before review reconciliation, finalize (publish), and cleanup (prune/shutdown/persist/release)', async () => {
+    // #given a full happy path through every phase up to and past execution
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runRouting} = await import('./phases/routing.js')
+    const {runDedup} = await import('./phases/dedup.js')
+    const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {runAcknowledge} = await import('./phases/acknowledge.js')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {runSessionPrep} = await import('./phases/session-prep.js')
+    const {runExecute, runDrain} = await import('./phases/execute.js')
+    const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+
+    const callOrder: string[] = []
+
+    vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
+    vi.mocked(runRouting).mockResolvedValue(createRouting())
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: null})
+    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 's3-disabled'})
+    vi.mocked(runAcknowledge).mockResolvedValue({
+      repo: 'owner/repo',
+      commentId: null,
+      issueNumber: 42,
+      issueType: 'pr',
+      botLogin: 'fro-bot',
+    })
+    vi.mocked(runCacheRestore).mockImplementation(async () => {
+      callOrder.push('cache-restore')
+      return {
+        cacheResult: {hit: false, key: 'cache-key', restoredPath: '', corrupted: false, source: 'cache'},
+        cacheStatus: 'miss',
+        serverHandle: {
+          client: {} as CacheRestorePhaseResult['serverHandle']['client'],
+          server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+          shutdown: vi.fn().mockResolvedValue({quiesced: true}),
+        },
+      }
+    })
+    vi.mocked(runSessionPrep).mockResolvedValue({
+      recentSessions: [],
+      priorWorkContext: [],
+      attachmentResult: null,
+      normalizedWorkspace: '/workspace',
+      logicalKey: null,
+      continueSessionId: null,
+      isContinuation: false,
+      sessionTitle: null,
+    })
+    vi.mocked(runExecute).mockImplementation(async () => {
+      callOrder.push('execute')
+      return {
+        success: true,
+        exitCode: 0,
+        sessionId: 'ses_root',
+        error: null,
+        tokenUsage: null,
+        model: null,
+        cost: null,
+        prsCreated: [],
+        commitsCreated: [],
+        commentsPosted: 0,
+        llmError: null,
+        resolvedOutputMode: 'branch-pr',
+        outputModeMigration: {requested: 'omitted', resolved: 'branch-pr'},
+        executionDurationMs: 10,
+      }
+    })
+    vi.mocked(runDrain).mockImplementation(async () => {
+      callOrder.push('drain')
+      return {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}
+    })
+    vi.mocked(runReviewReconciliation).mockImplementation(async () => {
+      callOrder.push('review-reconciliation')
+      return {reconciled: false, reason: 'not-applicable'}
+    })
+    vi.mocked(runFinalizeWithResult).mockImplementation(async () => {
+      callOrder.push('finalize')
+      return {exitCode: 0, deliveryKind: 'none'}
+    })
+    vi.mocked(runCleanup).mockImplementation(async () => {
+      callOrder.push('cleanup')
+    })
+
+    // #when the run executes end to end
+    const exitCode = await run()
+
+    // #then drain runs after execution and strictly before review reconciliation
+    // (which can post a review), finalize (which publishes the response), and
+    // cleanup (prune, shutdown, persist, lock release) -- matching cleanup.test.ts's
+    // ordering-assertion style
+    expect(exitCode).toBe(0)
+    expect(callOrder).toEqual(['cache-restore', 'execute', 'drain', 'review-reconciliation', 'finalize', 'cleanup'])
   })
 })

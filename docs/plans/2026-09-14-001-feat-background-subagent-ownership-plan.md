@@ -525,17 +525,22 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Dependencies:** Unit 1, Unit 10
 
 **Files:**
+- Modify: `src/features/agent/execution.ts`
+- Modify: `src/features/agent/prompt-sender.ts`
 - Modify: `src/harness/phases/execute.ts`
 - Modify: `src/features/agent/retry.ts`
 - Test: `src/harness/phases/execute.test.ts`
+- Test: `src/features/agent/execution.test.ts`
 
 **Approach:**
+- This unit constructs the Action's ledger and threads it to the units already built to accept one. Units 8, 9, and 10 each take an optional ledger and are inert without it, and nothing in production supplies one — `createOwnershipLedger` appears only in tests, and `sendPromptToSession` does not pass it through to `runPromptAttempt`. Until that chain is closed the Action observes no descendants, gates no terminal path, and drains nothing. Close it first; the rest of this unit is untestable otherwise.
 - `recoverFromContextOverflow` archives the overflowed session and re-runs under a new id. Its subagents keep running, and the recovery session dispatches its own — two sets of writers on one workspace and git index.
 - Cancel and settle owned work before archiving. Caps reset for the recovery session, so recovery does not inherit an exhausted budget.
 - Retry reuses the same session, so ownership carries rather than transfers; the ledger must not be rebuilt per attempt.
 - This is in scope because background work is what makes the corruption reachable at all — without background subagents, an overflowed session's work ends when the session is archived. It is also what makes surviving overflow recovery possible: the ledger is what lets the recovery session know what to cancel before two sets of writers touch the same workspace.
 
 **Test scenarios:**
+- Happy path: a run with a dispatched background subagent reaches drain with a populated ledger, end to end through the real call chain
 - Happy path: retry preserves the ledger across attempts
 - Edge case: overflow recovery cancels owned work before archiving
 - Edge case: the recovery session starts with caps reset

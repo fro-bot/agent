@@ -1,13 +1,16 @@
-import type {SessionSearchResult} from '@fro-bot/runtime'
+import type {SessionClient, SessionSearchResult} from '@fro-bot/runtime'
 import type {AgentResult} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
+import type {Logger} from '../../shared/logger.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
+import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {executeOpenCode} from '../../features/agent/index.js'
-import {runExecute} from './execute.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
+import {computeDrainDeadlineMs, DEFAULT_DRAIN_TEARDOWN_RESERVE_MS, runDrain, runExecute} from './execute.js'
 
 const mocks = vi.hoisted(() => ({
   archiveSession: vi.fn(),
@@ -44,14 +47,18 @@ vi.mock('node:fs/promises', () => ({
   rm: mocks.removeResponseFile,
 }))
 
-vi.mock('@fro-bot/runtime', () => ({
-  archiveSession: mocks.archiveSession,
-  findLatestSession: mocks.findLatestSession,
-  parseResponseFile: mocks.parseResponseFile,
-  resolveResponseDelivery: mocks.resolveResponseDelivery,
-  searchSessions: mocks.searchSessions,
-  writeSessionSummary: mocks.writeSessionSummary,
-}))
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original: typeof import('@fro-bot/runtime') = await importOriginal()
+  return {
+    ...original,
+    archiveSession: mocks.archiveSession,
+    findLatestSession: mocks.findLatestSession,
+    parseResponseFile: mocks.parseResponseFile,
+    resolveResponseDelivery: mocks.resolveResponseDelivery,
+    searchSessions: mocks.searchSessions,
+    writeSessionSummary: mocks.writeSessionSummary,
+  }
+})
 
 vi.mock('../../features/agent/index.js', () => ({
   executeOpenCode: mocks.executeOpenCode,
@@ -722,5 +729,322 @@ describe('runExecute overflow recovery', () => {
     expect(mocks.searchSessions).not.toHaveBeenCalled()
     expect(result).toMatchObject({success: true, sessionId: 'successful-session', llmError: null})
     expect(result.overflowRecovery).toBeUndefined()
+  })
+})
+
+describe('computeDrainDeadlineMs', () => {
+  it('reserves 30 seconds for teardown by default', () => {
+    // #given the invocation's total timeout and how long execution already took
+    // #when the remaining drain budget is computed with the default reserve
+    const deadlineMs = computeDrainDeadlineMs(120_000, 10_000)
+
+    // #then the reserve is subtracted alongside the elapsed execution time
+    expect(DEFAULT_DRAIN_TEARDOWN_RESERVE_MS).toBe(30_000)
+    expect(deadlineMs).toBe(120_000 - 30_000 - 10_000)
+  })
+
+  it('never returns a negative budget', () => {
+    // #given execution and the reserve already exceed the total timeout
+    // #when the remaining drain budget is computed
+    const deadlineMs = computeDrainDeadlineMs(1_000, 900)
+
+    // #then the budget floors at zero rather than going negative
+    expect(deadlineMs).toBe(0)
+  })
+
+  it('accepts an overridden teardown reserve', () => {
+    // #given a caller-supplied reserve, distinct from the default
+    // #when the remaining drain budget is computed
+    const deadlineMs = computeDrainDeadlineMs(100_000, 5_000, 10_000)
+
+    // #then the override is used instead of the default 30 seconds
+    expect(deadlineMs).toBe(100_000 - 10_000 - 5_000)
+  })
+})
+
+function createFakeSessionClient(overrides: {
+  children?: () => Promise<{data?: unknown; error?: unknown}>
+  status?: () => Promise<{data?: unknown; error?: unknown}>
+  abort?: (args: {path: {id: string}; signal: AbortSignal}) => Promise<{data?: unknown; error?: unknown}>
+}): SessionClient {
+  return {
+    session: {
+      children: overrides.children ?? (async () => ({data: []})),
+      status: overrides.status ?? (async () => ({data: {}})),
+      abort: overrides.abort ?? (async () => ({data: {}})),
+    },
+  } as unknown as SessionClient
+}
+
+describe('runDrain', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  it('is a complete no-op when no ledger is supplied', async () => {
+    // #given a run with no ownership ledger at all -- today's production shape
+    const children = vi.fn(async () => ({data: []}))
+    const client = createFakeSessionClient({children})
+
+    // #when drain runs without a ledger
+    const outcome = await runDrain({
+      ledger: undefined,
+      client,
+      parentSessionId: 'ses_root',
+      deadlineMs: 60_000,
+      logger,
+    })
+
+    // #then nothing is reconciled or cancelled -- single-session runs are unchanged
+    expect(children).not.toHaveBeenCalled()
+    expect(outcome).toEqual({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0})
+  })
+
+  it('completes immediately when nothing is outstanding, without delaying finalize', async () => {
+    // #given a ledger with nothing outstanding and a live client
+    const ledger = createOwnershipLedger()
+    const children = vi.fn(async () => ({data: []}))
+    const status = vi.fn(async () => ({data: {}}))
+    const client = createFakeSessionClient({children, status})
+
+    // #when drain runs
+    const outcome = await runDrain({
+      ledger,
+      client,
+      parentSessionId: 'ses_root',
+      deadlineMs: 60_000,
+      logger,
+    })
+
+    // #then a single reconciliation pass is enough -- no interval wait loop engaged
+    expect(children).toHaveBeenCalledTimes(1)
+    expect(status).toHaveBeenCalledTimes(1)
+    expect(outcome.expired).toBe(false)
+    expect(outcome.unknownCount).toBe(0)
+  })
+
+  it('settles outstanding work discovered before finalize, via periodic reconciliation', async () => {
+    // #given a ledger with one adopted entry that is still live on the first pass
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const status = vi.fn<() => Promise<{data: Record<string, unknown>}>>()
+      status.mockResolvedValueOnce({data: {ses_child: {}}}).mockResolvedValue({data: {}})
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status,
+      })
+
+      // #when drain runs and the periodic reconciler fires
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 5_000,
+        logger,
+        reconcileIntervalMs: 20,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the entry settles once the child is no longer live, and finalize can proceed
+      expect(outcome.expired).toBe(false)
+      expect(outcome.unknownCount).toBe(0)
+      expect(ledger.snapshot()).toContainEqual({sessionId: 'ses_child', label: 'background task', state: 'settled'})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('discovers a dropped dispatch via periodic reconciliation when no discontinuity was ever detected', async () => {
+    // #given a ledger that never adopted anything -- the dispatch event that should have
+    // called `adopt` was silently dropped, and no discontinuity ever fired to trigger a
+    // recheck. Nothing but reconciliation can find this child.
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      expect(ledger.isDrainComplete()).toBe(true)
+      const status = vi.fn<() => Promise<{data: Record<string, unknown>}>>()
+      status.mockResolvedValueOnce({data: {ses_dropped: {}}}).mockResolvedValue({data: {}})
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_dropped'}]}),
+        status,
+      })
+
+      // #when drain runs
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 5_000,
+        logger,
+        reconcileIntervalMs: 20,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the dropped dispatch is discovered, adopted (labelled "reconciled" -- it has
+      // no dispatch-site label to carry), and settles before drain returns
+      expect(outcome.expired).toBe(false)
+      expect(ledger.snapshot()).toContainEqual({sessionId: 'ses_dropped', label: 'reconciled', state: 'settled'})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels outstanding work with a fresh signal when the deadline expires, and reports incomplete', async () => {
+    // #given an entry that never settles, and a client whose abort call succeeds and is
+    // then confirmed by a positive post-cancellation liveness check
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      let abortSignalAtCallTime: AbortSignal | null = null
+      let liveAfterAbort = false
+      const abort = vi.fn(async (args: {path: {id: string}; signal: AbortSignal}) => {
+        abortSignalAtCallTime = args.signal
+        liveAfterAbort = false
+        return {data: {}}
+      })
+      const status = vi.fn(async () => ({data: liveAfterAbort ? {ses_child: {}} : {}}))
+      liveAfterAbort = true
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status,
+        abort,
+      })
+
+      // #when drain runs past its deadline
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then cancellation was requested with a signal that is not already aborted --
+      // distinct from any expired execution-deadline signal -- and confirmed settled
+      expect(abort).toHaveBeenCalledWith({path: {id: 'ses_child'}, signal: expect.any(AbortSignal) as AbortSignal})
+      expect(abortSignalAtCallTime).not.toBeNull()
+      expect((abortSignalAtCallTime as unknown as AbortSignal).aborted).toBe(false)
+      expect(outcome).toMatchObject({expired: true, cancelledCount: 1, settledCount: 1, unknownCount: 0})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('leaves an entry unknown when the deadline expires and cancellation cannot be confirmed', async () => {
+    // #given an entry that never settles, and a post-cancellation liveness check that still
+    // (or again) reports it live -- cancellation was requested but nothing confirms the
+    // child actually stopped
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status: async () => ({data: {ses_child: {}}}),
+      })
+
+      // #when drain runs past its deadline
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the entry is downgraded to unknown, not falsely reported settled
+      expect(outcome).toMatchObject({expired: true, cancelledCount: 1, settledCount: 0, unknownCount: 1})
+      expect(ledger.snapshot()).toContainEqual({sessionId: 'ses_child', label: 'background task', state: 'unknown'})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('marks outstanding entries unknown, rather than claiming drain, when no client is available', async () => {
+    // #given a ledger with outstanding work but nothing to reconcile against
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+
+    // #when drain runs with a null client
+    const outcome = await runDrain({
+      ledger,
+      client: null,
+      parentSessionId: null,
+      deadlineMs: 60_000,
+      logger,
+    })
+
+    // #then the entry is honestly unknown, not silently reported as drained
+    expect(outcome).toEqual({expired: true, cancelledCount: 0, settledCount: 0, unknownCount: 1})
+  })
+
+  it('does not rewrite a terminal outcome already decided by execution, even when drain expires', async () => {
+    // #given a run that already finished successfully before drain starts
+    mocks.getInput.mockReturnValue('branch-pr')
+    mocks.resolveOutputMode.mockReturnValue('branch-pr')
+    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
+    mocks.readResponseFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, llmError: null, sessionId: 'decided-session'}),
+    )
+    const execution = await runExecute(
+      createBootstrap(1_000),
+      createRouting(),
+      createCacheRestore(),
+      createSessionPrep(),
+      createMetrics(),
+      0,
+    )
+    expect(execution.success).toBe(true)
+    expect(execution.exitCode).toBe(0)
+
+    // #when a long-running drain against unrelated outstanding work expires
+    vi.useFakeTimers()
+    let outcome: Awaited<ReturnType<typeof runDrain>>
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status: async () => ({data: {ses_child: {}}}),
+      })
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: execution.sessionId,
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      outcome = await outcomePromise
+    } finally {
+      vi.useRealTimers()
+    }
+
+    // #then drain's own incomplete outcome never touches the execution result -- the two
+    // are separate values, and the decided success/exitCode survive unchanged
+    expect(outcome.expired).toBe(true)
+    expect(execution.success).toBe(true)
+    expect(execution.exitCode).toBe(0)
+    expect(execution.sessionId).toBe('decided-session')
   })
 })

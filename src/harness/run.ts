@@ -15,7 +15,7 @@ import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
-import {resolveRequestedOutputModeState, runExecute} from './phases/execute.js'
+import {computeDrainDeadlineMs, resolveRequestedOutputModeState, runDrain, runExecute} from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
 import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
@@ -143,6 +143,28 @@ export async function run(): Promise<number> {
 
     const execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
     agentSuccess = execution.success
+
+    // Drain: owned background work settles before anything below this point
+    // publishes, persists, or releases (Unit 10). `ledger: undefined` means
+    // this call is presently a no-op -- nothing yet threads a populated ledger
+    // into the Action's execution path (see execute.ts's `runDrain` docs). The
+    // deadline math and client are wired now so a future unit activates this
+    // by passing a real ledger through, without touching the call site again.
+    const drainLogger = createLogger({phase: 'drain'})
+    const drainResult = await runDrain({
+      ledger: undefined,
+      client: cacheRestore.serverHandle.client,
+      parentSessionId: execution.sessionId,
+      deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
+      logger: drainLogger,
+    })
+    if (drainResult.expired) {
+      drainLogger.warning('Drain deadline reached before owned work settled; run reports incomplete', {
+        cancelledCount: drainResult.cancelledCount,
+        settledCount: drainResult.settledCount,
+        unknownCount: drainResult.unknownCount,
+      })
+    }
 
     // Review reconciliation: after the agent session, check if a formal APPROVE
     // is needed to satisfy branch protection when the agent delivered a PASS
