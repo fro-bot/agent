@@ -32,8 +32,50 @@ interface PollResult {
   readonly error: string | null
 }
 
-function completionObservation(): AttemptObservation {
-  return {settlement: {kind: 'completion-observed'}, failures: []}
+/**
+ * Single snapshot point for whatever failure evidence the SSE processor has already recorded on
+ * `activityTracker` at the exact moment a producer below is deciding to return -- never read by a
+ * delayed continuation after that producer has already settled. Every observation constructor
+ * that can legitimately carry failure evidence funnels through this so there is exactly one place
+ * that knows how to read the tracker, matching `startV2SessionWait`'s completion branch in
+ * retry.ts (the pre-existing correct reference implementation this mirrors).
+ */
+function snapshotObservedFailure(
+  activityTracker: ActivityTracker | undefined,
+): ReturnType<typeof getObservedFailure> | null {
+  return activityTracker == null ? null : getObservedFailure(activityTracker)
+}
+
+/**
+ * `activityTracker` is a required parameter, not optional: a completion observation snapshots
+ * whatever failure evidence is already recorded on the tracker at this exact decision point, so a
+ * producer cannot compile a `completion-observed` observation while silently discarding pending
+ * failure evidence (the bug pattern this closes off -- see attempt-outcome.ts's module doc for the
+ * governing invariant). The settlement still reports `completion-observed` even when a failure is
+ * snapshotted here: the cause is what stopped observation, the failure is what
+ * `reduceAttemptOutcome` reports -- see that function's precedence rules.
+ */
+/**
+ * Shared by every observation constructor below that can legitimately carry pending failure
+ * evidence: reads whatever `snapshotObservedFailure` finds at this exact decision point and
+ * shapes it into the single-element (or empty) `failures` array each settlement returns.
+ */
+function snapshotFailures(activityTracker: ActivityTracker | undefined): FailureObservation[] {
+  const observedFailure = snapshotObservedFailure(activityTracker)
+  return observedFailure == null
+    ? []
+    : [
+        {
+          source: 'session',
+          message: observedFailure.error.message,
+          llmError: observedFailure.error,
+          classificationPath: observedFailure.classificationPath,
+        },
+      ]
+}
+
+function completionObservation(activityTracker: ActivityTracker | undefined): AttemptObservation {
+  return {settlement: {kind: 'completion-observed'}, failures: snapshotFailures(activityTracker)}
 }
 
 function providerFailureObservation(error: ErrorInfo): AttemptObservation {
@@ -42,14 +84,12 @@ function providerFailureObservation(error: ErrorInfo): AttemptObservation {
 }
 
 /**
- * Captures classified failure evidence (llmError + classificationPath) at construction time,
- * from whatever the SSE processor has already recorded on `activityTracker` at this exact poll
- * cycle -- not read later by a delayed continuation after this observation has already settled.
- * See attempt-outcome.ts's module doc for the governing invariant: a settled observation's
- * evidence is an immutable snapshot from the moment its producer settled.
+ * Captures classified failure evidence (llmError + classificationPath) at construction time, via
+ * `snapshotObservedFailure` above. `activityTracker` is required (not optional) for the same
+ * reason as `completionObservation`: a producer that forgets to pass it does not compile.
  */
-function sessionFailureObservation(message: string, activityTracker?: ActivityTracker): AttemptObservation {
-  const observedFailure = activityTracker == null ? null : getObservedFailure(activityTracker)
+function sessionFailureObservation(message: string, activityTracker: ActivityTracker | undefined): AttemptObservation {
+  const observedFailure = snapshotObservedFailure(activityTracker)
   const failure: FailureObservation = {
     source: 'session',
     message,
@@ -59,16 +99,32 @@ function sessionFailureObservation(message: string, activityTracker?: ActivityTr
   return {settlement: {kind: 'failure-observed'}, failures: [failure]}
 }
 
-function deadlineObservation(): AttemptObservation {
-  return {settlement: {kind: 'deadline'}, failures: []}
+/**
+ * `deadline`/`cancelled`/`watchdog` settlements can never be misreported as success --
+ * `reduceAttemptOutcome`'s success gate requires `settlement.kind === 'completion-observed'` --
+ * but success was never the hazard here. Without a snapshot, a pending session failure sitting on
+ * the tracker (e.g. still inside `ERROR_GRACE_CYCLES`) was silently discarded when one of these
+ * fired first, and `reduceAttemptOutcome` fell through to `settlementFallback`'s generic
+ * diagnostic instead -- the exact "expiry replaced the known error with a generic timeout" defect
+ * this restructure exists to close. `activityTracker` is required (not optional) for the same
+ * reason as `completionObservation`/`sessionFailureObservation` above: a call site that forgets
+ * to pass it does not compile. The settlement cause is unchanged by this -- these three still
+ * report `deadline`/`cancelled`/`watchdog` respectively; only the evidence attached to that cause
+ * changes. Call sites that explicitly check `terminalProviderError` before reaching one of these
+ * are deciding the settlement cause itself (provider-failure-observed vs. deadline/cancelled) and
+ * are preserved as-is; `snapshotFailures` independently applies the same provider-over-session
+ * precedence for whatever evidence remains once that decision has already gone the other way.
+ */
+function deadlineObservation(activityTracker: ActivityTracker | undefined): AttemptObservation {
+  return {settlement: {kind: 'deadline'}, failures: snapshotFailures(activityTracker)}
 }
 
-function cancelledObservation(): AttemptObservation {
-  return {settlement: {kind: 'cancelled', reason: 'Aborted'}, failures: []}
+function cancelledObservation(activityTracker: ActivityTracker | undefined): AttemptObservation {
+  return {settlement: {kind: 'cancelled', reason: 'Aborted'}, failures: snapshotFailures(activityTracker)}
 }
 
-function watchdogObservation(message: string): AttemptObservation {
-  return {settlement: {kind: 'watchdog', message}, failures: []}
+function watchdogObservation(message: string, activityTracker: ActivityTracker | undefined): AttemptObservation {
+  return {settlement: {kind: 'watchdog', message}, failures: snapshotFailures(activityTracker)}
 }
 
 /**
@@ -249,7 +305,7 @@ async function detectMessageActivity(
     messageId: latestAssistantMessageId,
   })
 
-  return completionObservation()
+  return completionObservation(activityTracker)
 }
 
 /**
@@ -280,7 +336,7 @@ export async function pollForSessionCompletionObservation(
       // winning at the boundary, not a deadline conclusion. See attempt-outcome.ts module doc.
       return providerFailureObservation(terminalProviderError)
     }
-    if (deadline?.isExpired() === true) return deadlineObservation()
+    if (deadline?.isExpired() === true) return deadlineObservation(activityTracker)
     try {
       const delay = async () => {
         await waitForAbortableDelay(POLL_INTERVAL_MS, signal)
@@ -292,7 +348,7 @@ export async function pollForSessionCompletionObservation(
       // deadline exhaustion. A terminal error already accepted still wins per the preserved policy.
       const terminalError = activityTracker?.terminalProviderError
       if (terminalError != null) return providerFailureObservation(terminalError)
-      return deadlineObservation()
+      return deadlineObservation(activityTracker)
     }
     if (signal.aborted) {
       // `signal` may be a combined AbortSignal.any([..., deadline.signal]) (see retry.ts), so an
@@ -300,8 +356,8 @@ export async function pollForSessionCompletionObservation(
       // itself rather than assuming cancellation.
       const terminalError = activityTracker?.terminalProviderError
       if (terminalError != null) return providerFailureObservation(terminalError)
-      if (deadline?.isExpired() === true) return deadlineObservation()
-      return cancelledObservation()
+      if (deadline?.isExpired() === true) return deadlineObservation(activityTracker)
+      return cancelledObservation(activityTracker)
     }
 
     const observedSessionError = activityTracker?.sessionError
@@ -337,17 +393,17 @@ export async function pollForSessionCompletionObservation(
         // Checked at the completion decision itself, not re-derived later: a completion first
         // observed after the deadline is rejected, matching the deadline check every other branch
         // performs at its own return point.
-        return deadlineObservation()
+        return deadlineObservation(activityTracker)
       } else {
         logger.debug('Session idle detected via event stream', {sessionId})
-        return completionObservation()
+        return completionObservation(activityTracker)
       }
     }
 
     const elapsed = Date.now() - pollStart
     if (deadline == null && maxPollTimeMs > 0 && elapsed >= maxPollTimeMs) {
       logger.warning('Poll timeout reached', {elapsedMs: elapsed, maxPollTimeMs})
-      return watchdogObservation(`Poll timeout after ${elapsed}ms`)
+      return watchdogObservation(`Poll timeout after ${elapsed}ms`, activityTracker)
     }
 
     try {
@@ -370,7 +426,7 @@ export async function pollForSessionCompletionObservation(
           // The completed-assistant message itself may have been produced (and its two-poll
           // stability confirmed, via the async session.messages() requests above) after the
           // deadline expired -- admission is checked here, at the decision, not inferred later.
-          return deadlineObservation()
+          return deadlineObservation(activityTracker)
         } else {
           return messageResult
         }
@@ -398,17 +454,17 @@ export async function pollForSessionCompletionObservation(
         } else if (deadline?.isExpired() === true) {
           // The idle status itself was fetched via an async session.status() request (above) that
           // may have crossed the deadline -- checked here, at admission, not re-derived later.
-          return deadlineObservation()
+          return deadlineObservation(activityTracker)
         } else {
           logger.debug('Session idle detected via polling', {sessionId})
-          return completionObservation()
+          return completionObservation(activityTracker)
         }
       } else if (sessionStatus.type === 'retry') {
         // Poll-only terminal provider signals fail fast instead of waiting out the full timeout.
         const terminalError = classifyRetryStatusError(sessionStatus)
         if (terminalError != null) {
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null)
-            return deadlineObservation()
+            return deadlineObservation(activityTracker)
           logger.error('Session status retry classified as terminal provider error via poll', {
             sessionId,
             type: sessionStatus.type,
@@ -432,6 +488,7 @@ export async function pollForSessionCompletionObservation(
           })
           return watchdogObservation(
             `No agent activity detected after ${activityElapsed}ms — server may have crashed during prompt processing`,
+            activityTracker,
           )
         }
       }
@@ -444,8 +501,8 @@ export async function pollForSessionCompletionObservation(
   // deadline-vs-cancellation distinction as the mid-loop abort check above.
   const terminalError = activityTracker?.terminalProviderError
   if (terminalError != null) return providerFailureObservation(terminalError)
-  if (deadline?.isExpired() === true) return deadlineObservation()
-  return cancelledObservation()
+  if (deadline?.isExpired() === true) return deadlineObservation(activityTracker)
+  return cancelledObservation(activityTracker)
 }
 
 export async function pollForSessionCompletion(

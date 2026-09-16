@@ -24,6 +24,7 @@ import type {ActivityTracker} from './streaming.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
+import {reduceAttemptOutcome} from './attempt-outcome.js'
 import {
   INITIAL_ACTIVITY_TIMEOUT_MS,
   pollForSessionCompletion,
@@ -869,5 +870,705 @@ describe('pollForSessionCompletionObservation — settlement causes', () => {
       expect(observation.failures[0]?.classificationPath).toBe('fallback')
       expect(observation.failures[0]?.source).toBe('session')
     })
+  })
+})
+
+/**
+ * Finding: `completionObservation()` hardcoded `failures: []`, so a completion decision reached
+ * after an awaited request (`session.messages()` in `detectMessageActivity`, `session.status()`
+ * in the idle-via-polling branch) could win with an empty snapshot even when the SSE processor
+ * recorded a real failure on the shared tracker while that request was in flight -- reported as
+ * success, silently swallowing the failure. The fix makes `activityTracker` a required parameter
+ * of every observation constructor that can carry evidence, so a producer cannot omit the
+ * snapshot and compile. Every test below has an explicit complement proving the mirror case does
+ * NOT trip the same assertion, per the two prior one-sided review rounds on this exact module.
+ */
+/**
+ * A `session.messages()` mock whose first call resolves immediately with the stable assistant
+ * message (arming `detectMessageActivity`'s two-poll stability check), and whose second call
+ * returns a promise the test controls directly -- simulating that request being in flight while
+ * the SSE processor concurrently mutates `activityTracker`.
+ */
+function pendingMessagesClient(stableInfo: Record<string, unknown>) {
+  let callCount = 0
+  let resolveSecond: ((value: {data: unknown[]}) => void) | undefined
+  const messagesFn = vi.fn().mockImplementation(async () => {
+    callCount++
+    if (callCount === 1) return {data: [{info: stableInfo}]}
+    return new Promise<{data: unknown[]}>(resolve => {
+      resolveSecond = resolve
+    })
+  })
+  const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
+  return {
+    client: {session: {messages: messagesFn, status: statusFn}},
+    resolveSecond: async (): Promise<void> => {
+      resolveSecond?.({data: [{info: stableInfo}]})
+    },
+  }
+}
+
+/**
+ * A `session.status()` mock whose first call resolves `busy`, and whose second call returns a
+ * promise the test controls directly -- simulating that request being in flight while the SSE
+ * processor concurrently mutates `activityTracker`.
+ */
+function pendingStatusClient() {
+  let callCount = 0
+  let resolveSecond: ((value: {data: Record<string, {type: string}>}) => void) | undefined
+  const statusFn = vi.fn().mockImplementation(async () => {
+    callCount++
+    if (callCount === 1) return {data: {ses_123: {type: 'busy'}}}
+    return new Promise<{data: Record<string, {type: string}>}>(resolve => {
+      resolveSecond = resolve
+    })
+  })
+  return {
+    client: {session: {status: statusFn}},
+    resolveSecond: async (): Promise<void> => {
+      resolveSecond?.({data: {ses_123: {type: 'idle'}}})
+    },
+  }
+}
+
+describe('completion-observed snapshots pending failure evidence at the decision point (session-poll false-success finding)', () => {
+  let mockLogger: Logger
+
+  const TERMINAL_PROVIDER_ERROR: ErrorInfo = {
+    type: 'provider_auth_error',
+    message: 'auth rejected mid-poll',
+    retryable: false,
+  }
+  const GENERIC_SESSION_ERROR: ErrorInfo = {
+    type: 'llm_fetch_error',
+    message: 'classified session failure',
+    retryable: true,
+  }
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('provider failure delivered while session.messages() is in flight wins reduction — never success', async () => {
+    // #given a completed-assistant message stable across two polls, with the confirming second
+    // session.messages() request held in flight
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      baselineMessageIds: new Set(),
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    expect(activityTracker.completedAssistantMessageId).toBe('msg_new')
+    await vi.advanceTimersByTimeAsync(500)
+
+    // #when an SSE-accepted provider failure lands on the tracker while that request is pending,
+    // then the request resolves with the same stable message
+    activityTracker.terminalProviderError = TERMINAL_PROVIDER_ERROR
+    await resolveSecond()
+    const observation = await observationPromise
+
+    // #then the completion decision still fires (the cause is what stopped observation) but its
+    // snapshot carries the failure, so reduction never reports success
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.llmError).toBe(TERMINAL_PROVIDER_ERROR)
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.outcome).toBe('turn_failed_terminal')
+  })
+
+  it('complement: no failure delivered while session.messages() is in flight still reduces to success', async () => {
+    // #given the identical stable-message setup, but nothing lands on the tracker while the
+    // confirming request is pending
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      baselineMessageIds: new Set(),
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+
+    // #when the in-flight request resolves with no failure ever having landed on the tracker
+    await resolveSecond()
+    const observation = await observationPromise
+
+    // #then completion reduces to success, exactly as a clean run does today
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(observation.failures).toEqual([])
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(true)
+    expect(reduced.outcome).toBe('completed')
+  })
+
+  it('a generic session failure delivered while session.status() is in flight wins reduction — never success', async () => {
+    // #given the sticky terminal flags already set (so the idle-via-polling branch is admitted),
+    // and the confirming session.status() request held in flight
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingStatusClient()
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: true,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+
+    // #when an SSE-observed generic session failure lands on the tracker while that request is
+    // pending, then the request resolves idle
+    activityTracker.sessionError = 'LLM fetch failed'
+    activityTracker.genericError = GENERIC_SESSION_ERROR
+    activityTracker.classificationPath = 'fallback'
+    await resolveSecond()
+    const observation = await observationPromise
+
+    // #then the completion decision still fires, but its snapshot carries the failure
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.llmError).toBe(GENERIC_SESSION_ERROR)
+    expect(observation.failures[0]?.classificationPath).toBe('fallback')
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.outcome).toBe('turn_failed_retryable')
+  })
+
+  it('complement: no failure delivered while session.status() is in flight still reduces to success', async () => {
+    // #given the identical sticky-flag setup, but nothing lands on the tracker while the
+    // confirming request is pending
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingStatusClient()
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: true,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+
+    // #when the in-flight request resolves idle with no failure ever having landed
+    await resolveSecond()
+    const observation = await observationPromise
+
+    // #then completion reduces to success, exactly as a clean run does today
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(observation.failures).toEqual([])
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(true)
+    expect(reduced.outcome).toBe('completed')
+  })
+
+  it('precedence: a terminal provider failure outranks a concurrently-present generic session failure in the completion snapshot', async () => {
+    // #given both a generic session failure already recorded AND a terminal provider failure
+    // landing while session.messages() is in flight -- pinning that the completion snapshot
+    // applies the same provider-over-session precedence as every other producer in this module
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      baselineMessageIds: new Set(),
+      sessionIdle: false,
+      sessionError: null,
+      genericError: GENERIC_SESSION_ERROR,
+      classificationPath: 'fallback',
+    }
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+
+    // #when a terminal provider failure lands on the tracker while the confirming request is
+    // pending, then the request resolves with the same stable message. `sessionError` (the
+    // string that would trip this module's own grace-cycle continue branch) is deliberately left
+    // unset here -- this test isolates the completion snapshot's own provider-over-session
+    // precedence, not the grace-cycle path already covered elsewhere in this file.
+    activityTracker.terminalProviderError = TERMINAL_PROVIDER_ERROR
+    await resolveSecond()
+    const observation = await observationPromise
+
+    // #then the snapshot carries only the provider failure — the earlier generic one is
+    // superseded, matching `getObservedFailure`'s own precedence and `mergeActivityError`'s
+    // terminal-supersedes-generic behavior
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.llmError).toBe(TERMINAL_PROVIDER_ERROR)
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.outcome).toBe('turn_failed_terminal')
+    expect(reduced.llmError).toBe(TERMINAL_PROVIDER_ERROR)
+  })
+
+  it('immutability: a failure delivered after the completion decision does not retroactively enter the returned snapshot', async () => {
+    // #given a completion observation that already settled with no failure present
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      baselineMessageIds: new Set(),
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+    await resolveSecond()
+    const observation = await observationPromise
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(observation.failures).toEqual([])
+
+    // #when a delayed continuation (e.g. a later SSE event) mutates the same tracker object after
+    // this producer has already settled and returned
+    activityTracker.terminalProviderError = TERMINAL_PROVIDER_ERROR
+
+    // #then the already-returned observation's snapshot is untouched
+    expect(observation.failures).toEqual([])
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(true)
+  })
+})
+
+/**
+ * Finding: `deadlineObservation()`, `cancelledObservation()`, and `watchdogObservation()`
+ * hardcoded `failures: []` -- unlike `completionObservation()`/`sessionFailureObservation()`,
+ * they took no `activityTracker` and could never snapshot pending evidence. A generic session
+ * error sitting on the tracker (e.g. still inside `ERROR_GRACE_CYCLES`) was silently discarded
+ * whenever one of these three fired first, and `reduceAttemptOutcome` fell through to
+ * `settlementFallback`'s generic diagnostic -- the exact "expiry replaced the known error with a
+ * generic timeout" defect this restructure exists to close. The fix gives all three the same
+ * required-tracker snapshot treatment `completionObservation` already has, without changing the
+ * settlement cause itself. Every test below has an explicit complement proving the mirror case
+ * does NOT trip the same assertion.
+ */
+describe('deadline/cancelled/watchdog snapshot pending failure evidence at settlement (evidence-erasure fix)', () => {
+  let mockLogger: Logger
+
+  const GENERIC_SESSION_ERROR: ErrorInfo = {
+    type: 'llm_fetch_error',
+    message: 'classified session failure',
+    retryable: true,
+  }
+  const TERMINAL_PROVIDER_ERROR: ErrorInfo = {
+    type: 'provider_auth_error',
+    message: 'auth rejected',
+    retryable: false,
+  }
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('deadline: a generic session error pending on the tracker is reported, not a generic timeout, and the settlement stays "deadline"', async () => {
+    // #given a generic session error already recorded on the tracker (mirrors mergeActivityError's
+    // coupling of sessionError + genericError), and a deadline that is already expired
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: 'network error',
+      genericError: GENERIC_SESSION_ERROR,
+      classificationPath: 'fallback',
+    }
+
+    // #when
+    const observation = await pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+      fakeExpiredDeadline(),
+    )
+
+    // #then the cause is still deadline, but the pending failure is reported instead of the
+    // generic settlementFallback diagnostic
+    expect(observation.settlement.kind).toBe('deadline')
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.source).toBe('session')
+    expect(observation.failures[0]?.llmError).toBe(GENERIC_SESSION_ERROR)
+    expect(observation.failures[0]?.classificationPath).toBe('fallback')
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.error).toBe('classified session failure')
+    expect(reduced.llmError).toBe(GENERIC_SESSION_ERROR)
+    expect(reduced.settlement.kind).toBe('deadline')
+  })
+
+  it('complement: with genuinely no evidence, an expired deadline still produces the generic settlementFallback diagnostic', async () => {
+    // #given no failure ever recorded on the tracker
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+
+    // #when
+    const observation = await pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+      fakeExpiredDeadline(),
+    )
+
+    // #then settlementFallback stays reachable for the genuinely-no-evidence case
+    expect(observation.settlement.kind).toBe('deadline')
+    expect(observation.failures).toEqual([])
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.outcome).toBe('timeout')
+    expect(reduced.error).toBe('Attempt did not settle before the execution deadline')
+    expect(reduced.llmError).toBeNull()
+  })
+
+  it('deadline: a terminal provider error still wins over a pending generic error, with classification intact', async () => {
+    // #given both a pending generic error and an already-accepted terminal provider error on the
+    // tracker, with the deadline also already expired
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: 'network error',
+      genericError: GENERIC_SESSION_ERROR,
+      classificationPath: 'fallback',
+      terminalProviderError: TERMINAL_PROVIDER_ERROR,
+    }
+
+    // #when
+    const observation = await pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+      fakeExpiredDeadline(),
+    )
+
+    // #then this is a deliberate producer policy: an already-accepted provider error wins the
+    // settlement cause itself, not just the evidence
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.settlement.kind).not.toBe('deadline')
+    expect(observation.failures).toEqual([
+      {source: 'provider', message: TERMINAL_PROVIDER_ERROR.message, llmError: TERMINAL_PROVIDER_ERROR},
+    ])
+  })
+
+  it('cancelled: a generic session error pending on the tracker is reported, not lost, when externally cancelled', async () => {
+    // #given an already-aborted signal and a generic session error already recorded on the tracker
+    const abortController = new AbortController()
+    abortController.abort()
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: 'network error',
+      genericError: GENERIC_SESSION_ERROR,
+      classificationPath: 'fallback',
+    }
+
+    // #when
+    const observation = await pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+
+    // #then
+    expect(observation.settlement.kind).toBe('cancelled')
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.llmError).toBe(GENERIC_SESSION_ERROR)
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.error).toBe('classified session failure')
+    expect(reduced.settlement.kind).toBe('cancelled')
+  })
+
+  it('complement: with genuinely no evidence, external cancellation still produces the generic settlementFallback diagnostic', async () => {
+    // #given an already-aborted signal and nothing ever recorded on the tracker
+    const abortController = new AbortController()
+    abortController.abort()
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+
+    // #when
+    const observation = await pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+
+    // #then settlementFallback stays reachable for the genuinely-no-evidence case
+    expect(observation.settlement.kind).toBe('cancelled')
+    expect(observation.failures).toEqual([])
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.outcome).toBe('turn_failed_terminal')
+    expect(reduced.error).toBe('Aborted')
+    expect(reduced.llmError).toBeNull()
+  })
+
+  it('cancelled: a terminal provider error still wins over a pending generic error, with classification intact', async () => {
+    // #given both a pending generic error and an already-accepted terminal provider error on the
+    // tracker, with the signal also already aborted
+    const abortController = new AbortController()
+    abortController.abort()
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: 'network error',
+      genericError: GENERIC_SESSION_ERROR,
+      classificationPath: 'fallback',
+      terminalProviderError: TERMINAL_PROVIDER_ERROR,
+    }
+
+    // #when
+    const observation = await pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+
+    // #then
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.settlement.kind).not.toBe('cancelled')
+    expect(observation.failures).toEqual([
+      {source: 'provider', message: TERMINAL_PROVIDER_ERROR.message, llmError: TERMINAL_PROVIDER_ERROR},
+    ])
+  })
+
+  it('watchdog: a generic error pending on the tracker is reported, not lost, when the local poll timeout fires', async () => {
+    // #given a structured failure recorded on the tracker (`genericError`), captured here with
+    // `sessionError: null` to isolate the watchdog's own snapshot from the separate
+    // ERROR_GRACE_CYCLES continuation path (already covered above and in the completion-observed
+    // block) -- once the raw `sessionError` string is set, the grace-cycle branch always
+    // `continue`s ahead of the watchdog check, matching the existing precedence test's shape
+    // (`sessionError: null` + `genericError` set) elsewhere in this file.
+    vi.useFakeTimers()
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+      genericError: GENERIC_SESSION_ERROR,
+      classificationPath: 'fallback',
+    }
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(2_000)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('watchdog')
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.llmError).toBe(GENERIC_SESSION_ERROR)
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.error).toBe('classified session failure')
+    expect(reduced.settlement.kind).toBe('watchdog')
+  })
+
+  it('complement: with genuinely no evidence, the local poll timeout still produces the generic settlementFallback diagnostic', async () => {
+    // #given no failure ever recorded, no shared deadline, so the local poll budget is authoritative
+    vi.useFakeTimers()
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_000,
+    )
+    await vi.advanceTimersByTimeAsync(2_000)
+    const observation = await observationPromise
+
+    // #then settlementFallback stays reachable for the genuinely-no-evidence case
+    expect(observation.settlement.kind).toBe('watchdog')
+    expect(observation.failures).toEqual([])
+    assertWatchdogSettlement(observation.settlement)
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.outcome).toBe('turn_failed_terminal')
+    expect(reduced.error).toBe(observation.settlement.message)
+    expect(reduced.llmError).toBeNull()
+  })
+
+  it('watchdog: a terminal provider error still wins over a pending generic error, with classification intact', async () => {
+    // #given both a pending generic error and an already-accepted terminal provider error present
+    // from the very first poll iteration -- the top-of-loop terminal check wins before the
+    // watchdog's elapsed-time check is ever reached
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+      genericError: GENERIC_SESSION_ERROR,
+      classificationPath: 'fallback',
+      terminalProviderError: TERMINAL_PROVIDER_ERROR,
+    }
+
+    // #when
+    const observation = await pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_000,
+      activityTracker,
+    )
+
+    // #then
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.settlement.kind).not.toBe('watchdog')
+    expect(observation.failures).toEqual([
+      {source: 'provider', message: TERMINAL_PROVIDER_ERROR.message, llmError: TERMINAL_PROVIDER_ERROR},
+    ])
+  })
+
+  it('immutability: a failure arriving after a deadline settlement does not retroactively enter the returned snapshot', async () => {
+    // #given a deadline settlement that already fired with no evidence present
+    const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+
+    const observation = await pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+      fakeExpiredDeadline(),
+    )
+    expect(observation.settlement.kind).toBe('deadline')
+    expect(observation.failures).toEqual([])
+
+    // #when a delayed continuation (e.g. a later SSE event) mutates the same tracker object after
+    // this producer has already settled and returned
+    activityTracker.sessionError = 'network error'
+    activityTracker.genericError = GENERIC_SESSION_ERROR
+
+    // #then the already-returned observation's snapshot is untouched
+    expect(observation.failures).toEqual([])
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+    expect(reduced.success).toBe(false)
+    expect(reduced.outcome).toBe('timeout')
   })
 })
