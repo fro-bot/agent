@@ -18,7 +18,7 @@ import type {createOpencode} from '@opencode-ai/sdk'
  * `ownershipLedger` gate.
  */
 import type {Logger} from '../../shared/logger.js'
-import type {AttemptSettlement} from './attempt-outcome.js'
+import type {AttemptObservation, AttemptSettlement, FailureObservation} from './attempt-outcome.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
@@ -29,6 +29,7 @@ import {
   INITIAL_ACTIVITY_TIMEOUT_MS,
   pollForSessionCompletion,
   pollForSessionCompletionObservation,
+  toPollResult,
 } from './session-poll.js'
 
 type MockClient = Awaited<ReturnType<typeof createOpencode>>['client']
@@ -1570,5 +1571,218 @@ describe('deadline/cancelled/watchdog snapshot pending failure evidence at settl
     const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
     expect(reduced.success).toBe(false)
     expect(reduced.outcome).toBe('timeout')
+  })
+})
+
+/**
+ * Non-blocking review finding on the approved background-subagent-ownership-plan PR:
+ * `pollForSessionCompletion`'s `toPollResult` adapter mapped any `completion-observed`
+ * settlement straight to `{completed: true, error: null}` *before* consulting the failure
+ * snapshot the settlement carries. Since `completionObservation()` can now snapshot a real
+ * failure recorded while an awaited request was in flight (see the block above,
+ * "completion-observed snapshots pending failure evidence..."), the legacy adapter could report
+ * success for a completion that carries a genuine provider or session failure. There are no
+ * production callers of the adapter today (`retry.ts` moved to
+ * `pollForSessionCompletionObservation`), but 31 existing tests exercise it and any future
+ * caller would get a silently wrong answer. The fix: `toPollResult` now consults the failure
+ * snapshot first, mapping a failure-bearing completion the same way it maps a `failure-observed`
+ * settlement — via `selectAdapterFailure`'s provider-over-session precedence. The settlement
+ * cause itself (`completion-observed`) is untouched; only this legacy projection changed.
+ */
+describe('pollForSessionCompletion adapter does not report success for a completion that carries a failure', () => {
+  let mockLogger: Logger
+
+  const TERMINAL_PROVIDER_ERROR: ErrorInfo = {
+    type: 'provider_auth_error',
+    message: 'auth rejected mid-poll (adapter fixture)',
+    retryable: false,
+  }
+  const GENERIC_SESSION_ERROR: ErrorInfo = {
+    type: 'llm_fetch_error',
+    message: 'classified session failure (adapter fixture)',
+    retryable: true,
+  }
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a provider failure delivered while session.messages() is in flight is reported by the adapter, not swallowed as success', async () => {
+    // #given the identical race as the modern-API fixture above: a stable completed-assistant
+    // message with the confirming second session.messages() request held in flight
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      baselineMessageIds: new Set(),
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const resultPromise = pollForSessionCompletion(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #when an SSE-accepted provider failure lands on the tracker while that request is pending
+    activityTracker.terminalProviderError = TERMINAL_PROVIDER_ERROR
+    await resolveSecond()
+    const result = await resultPromise
+
+    // #then the legacy `{completed, error}` shape must report the failure, not success
+    expect(result.completed).toBe(false)
+    expect(result.error).toBe(TERMINAL_PROVIDER_ERROR.message)
+  })
+
+  it('same fixture through the modern API: settlement stays completion-observed and the failure snapshot carries the provider error', async () => {
+    // #given the identical race, run through `pollForSessionCompletionObservation` directly —
+    // this pins that fixing the adapter did not move or weaken the settlement cause itself
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      baselineMessageIds: new Set(),
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    activityTracker.terminalProviderError = TERMINAL_PROVIDER_ERROR
+    await resolveSecond()
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.llmError).toBe(TERMINAL_PROVIDER_ERROR)
+  })
+
+  it('a generic session failure delivered while session.status() is in flight is reported by the adapter, not swallowed as success', async () => {
+    // #given the sticky terminal flags already set, and the confirming session.status() request
+    // held in flight
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingStatusClient()
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: true,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const resultPromise = pollForSessionCompletion(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #when an SSE-observed generic session failure lands on the tracker while that request is
+    // pending, then the request resolves idle
+    activityTracker.sessionError = 'LLM fetch failed'
+    activityTracker.genericError = GENERIC_SESSION_ERROR
+    activityTracker.classificationPath = 'fallback'
+    await resolveSecond()
+    const result = await resultPromise
+
+    // #then
+    expect(result.completed).toBe(false)
+    expect(result.error).toBe(GENERIC_SESSION_ERROR.message)
+  })
+
+  it('same fixture through the modern API: settlement stays completion-observed and the failure snapshot carries the session error', async () => {
+    // #given the identical race, run through `pollForSessionCompletionObservation` directly
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingStatusClient()
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: true,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    activityTracker.sessionError = 'LLM fetch failed'
+    activityTracker.genericError = GENERIC_SESSION_ERROR
+    activityTracker.classificationPath = 'fallback'
+    await resolveSecond()
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.llmError).toBe(GENERIC_SESSION_ERROR)
+  })
+
+  it('precedence: a synthetic completion snapshot carrying both a provider and a session failure projects the provider message, matching reduceAttemptOutcome', () => {
+    // #given a completion observation whose failure snapshot carries both sources at once — not
+    // reachable through the real constructors in this module (they only ever snapshot a single
+    // failure, already precedence-resolved by `getObservedFailure`), but exercised directly here
+    // to pin that the adapter's own precedence rule matches `selectWinningFailure` in
+    // attempt-outcome.ts rather than relying on array order
+    const sessionFailure: FailureObservation = {
+      source: 'session',
+      message: 'session-sourced message should lose',
+      llmError: GENERIC_SESSION_ERROR,
+    }
+    const providerFailure: FailureObservation = {
+      source: 'provider',
+      message: TERMINAL_PROVIDER_ERROR.message,
+      llmError: TERMINAL_PROVIDER_ERROR,
+    }
+    const observation: AttemptObservation = {
+      settlement: {kind: 'completion-observed'},
+      failures: [sessionFailure, providerFailure],
+    }
+
+    // #when
+    const result = toPollResult(observation)
+
+    // #then
+    expect(result).toEqual({completed: false, error: TERMINAL_PROVIDER_ERROR.message})
+  })
+
+  it('complement: a clean completion with no failures still projects to {completed: true, error: null}', () => {
+    // #given a completion observation with an empty failure snapshot — the ordinary, successful
+    // case this adapter must keep working exactly as before
+    const observation: AttemptObservation = {
+      settlement: {kind: 'completion-observed'},
+      failures: [],
+    }
+
+    // #when
+    const result = toPollResult(observation)
+
+    // #then
+    expect(result).toEqual({completed: true, error: null})
   })
 })

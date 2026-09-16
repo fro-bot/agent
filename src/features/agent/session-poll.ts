@@ -27,7 +27,7 @@ export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
  * for it via `pollForSessionCompletionObservation`, without forcing every existing caller to
  * consume it yet.
  */
-interface PollResult {
+export interface PollResult {
   readonly completed: boolean
   readonly error: string | null
 }
@@ -128,16 +128,40 @@ function watchdogObservation(message: string, activityTracker: ActivityTracker |
 }
 
 /**
+ * Precedence-ordered failure pick for the adapter, mirroring `selectWinningFailure` in
+ * attempt-outcome.ts (provider beats session beats anything else). The constructors in this file
+ * only ever snapshot a single failure, so in practice this degrades to `failures[0]` for real
+ * call sites -- the explicit ordering exists so a `completion-observed` settlement carrying a
+ * failure (a request in flight when the failure landed) is judged by the same rule a
+ * `failure-observed` settlement would be, not by array position.
+ */
+function selectAdapterFailure(failures: readonly FailureObservation[]): FailureObservation | null {
+  const providerFailure = failures.find(failure => failure.source === 'provider')
+  if (providerFailure != null) return providerFailure
+
+  const sessionFailure = failures.find(failure => failure.source === 'session')
+  if (sessionFailure != null) return sessionFailure
+
+  return failures[0] ?? null
+}
+
+/**
  * Adapter preserving the pre-existing `{completed, error}` shape for callers that have not been
  * rewired to consume `AttemptObservation` yet (`retry.ts`'s `pollResult.completed`/`.error`, and
  * characterization tests asserting exact `{completed, error}` equality). Diagnostic text is
  * unchanged from what each branch returned before this step.
+ *
+ * The failure snapshot is considered before the settlement cause: a `completion-observed`
+ * settlement whose snapshot carries a failure (evidence recorded while a request was still in
+ * flight) is not a legacy success -- it projects the same way a `failure-observed` settlement
+ * would, via `selectAdapterFailure`'s provider-over-session precedence. The settlement itself is
+ * untouched; only this legacy projection changes.
  */
-function toPollResult(observation: AttemptObservation): PollResult {
-  if (observation.settlement.kind === 'completion-observed') return {completed: true, error: null}
-
-  const failure = observation.failures[0]
+export function toPollResult(observation: AttemptObservation): PollResult {
+  const failure = selectAdapterFailure(observation.failures)
   if (failure != null) return {completed: false, error: failure.message}
+
+  if (observation.settlement.kind === 'completion-observed') return {completed: true, error: null}
 
   if (observation.settlement.kind === 'watchdog') return {completed: false, error: observation.settlement.message}
 
