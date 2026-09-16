@@ -77,7 +77,12 @@ describe('CacheSaveOutcome', () => {
 })
 
 describe('CacheSaveResult', () => {
-  it('is constructible with every outcome and both persistence axes independent of each other', () => {
+  // 'ownership-declined' is deliberately not in this fixture: it is exhaustively covered
+  // by OUTCOME_EXPECTATIONS above and the toCacheSaveStateValue case table below. This
+  // fixture exists to demonstrate the two persistence axes varying independently (see the
+  // duplicated 'persisted' entries), not to enumerate every CacheSaveOutcome -- that
+  // guarantee is the compile-time satisfies-pinned tables, not this array.
+  it('constructs representative outcomes with both persistence axes independent of each other', () => {
     const results: readonly CacheSaveResult[] = [
       {cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'},
       {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'},

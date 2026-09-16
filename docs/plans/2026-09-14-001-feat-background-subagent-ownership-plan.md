@@ -132,7 +132,7 @@ Lease renewal is not new: `packages/runtime/src/coordination/heartbeat.ts`, alre
 ## Key Technical Decisions
 
 - **Key the ledger on the child session identifier, not the job identifier.** Job ids can be reused, and notifications carry the child session id. Keying on the job id lets a delayed notification settle a newer execution (see origin: R3).
-- **Reconcile against the server, not only the stream.** The stream provides no replay after a reconnect, so a dispatch observed by nobody would otherwise leave the ledger reading zero while a child writes. `GET /session/{sessionID}/children` supplies candidates and session status supplies liveness — `children` alone is a `parent_id` lookup that returns completed children too, so presence is not evidence of outstanding work.
+- **Reconcile against the server, not only the stream.** The stream provides no replay after a reconnect, so a tracked entry whose settlement event was dropped would otherwise sit outstanding forever. `GET /session/{sessionID}/children` supplies candidates and session status supplies liveness — `children` alone is a `parent_id` lookup that returns completed children too, so presence is not evidence of outstanding work. This settles only entries the ledger already tracks; it cannot recover a dispatch whose own event was never observed (Unit 3's known gap, still open — see Risks & Dependencies).
 - **Cancel every ledger entry individually.** Upstream `SessionRunState.cancel()` traverses running jobs only, so a completed child linking the root to a running grandchild is never reached. Depth one makes that unreachable today; cancelling per entry means raising the depth later does not silently reintroduce it.
 - **Cancel owned work before archiving an overflowed session.** Overflow recovery archives and re-runs under a new session id. Without this, the archived session's subagents and the recovery session's subagents write the same workspace concurrently.
 - **Reserve 30 seconds of the deadline for teardown.** Measured post-execution teardown on real runs was 5.1 s and 14.7 s, dominated by S3 session sync at up to 10.2 s; the reserve doubles the worst observation. It is configurable, because drain does not exist yet and this measures teardown without it.
@@ -148,10 +148,9 @@ Lease renewal is not new: `packages/runtime/src/coordination/heartbeat.ts`, alre
 
 - How much deadline to reserve for teardown: 30 seconds, derived from measured runs rather than assumed (origin left this as the one blocking question).
 - What correlates an execution across dispatch, extension, promotion, and notification: the child session identifier.
-- Where caps are enforced: the dispatch path, before the background execution starts.
+- Where caps would be enforced and the shape of a cap-rejection: resolved during planning, then moot — dispatch caps were cut entirely during implementation (see Scope Boundaries).
 - Whether lease renewal reuses the gateway's heartbeat: yes — `packages/runtime/src/coordination/heartbeat.ts` already provides the primitive, and `packages/gateway/src/runtime-effect.ts:77-87` already wraps renewal.
-- Whether reconciliation needs to run on a timer as well as on discontinuity: yes — periodic reconciliation is a requirement (Unit 3), bounded and cheap, running on an interval as well as on subscription and discontinuity. Discontinuity detection alone leaves the plan's central hazard unresolved: a dispatch event dropped without a detected discontinuity would leave the ledger reading zero while a child writes, with nothing to trigger a re-check.
-- The exact shape of the cap-rejection surfaced to the model: a structured tool error the agent can read and adapt to, not a silent refusal — an agent that cannot see the refusal keeps spending turns on a path that can never start.
+- Whether reconciliation needs to run on a timer as well as on discontinuity: yes — periodic reconciliation is a requirement (Unit 3), bounded and cheap, running on an interval as well as on subscription and discontinuity. Discontinuity detection alone leaves a dropped *settlement* event for a tracked entry unresolved: with nothing to trigger a re-check, that entry would sit outstanding forever. (A dropped *dispatch* event is a separate, still-open gap — see Unit 3.)
 
 ### Deferred to Implementation
 
@@ -186,7 +185,7 @@ stateDiagram-v2
     end note
 ```
 
-The ledger distinguishes three states per entry — outstanding, settled, unknown — and `unknown` is never collapsed into zero. Terminal steps read `outstanding == 0`; persistence additionally requires no `unknown` entries.
+The ledger distinguishes three states per entry — outstanding, settled, unknown — and `unknown` is never collapsed into zero. Both drain completion and persistence require `outstanding == 0` AND no `unknown` entries — the same predicate, asked at two different moments (stop waiting vs. write to disk).
 
 ## Implementation Units
 
@@ -665,7 +664,6 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 
 | Risk | Mitigation |
 |------|------------|
-| A dispatch event is never observed and the ledger reads zero | Reconcile against `session.children` on subscription, after any discontinuity, and on a bounded interval (Unit 3) |
 | Overflow recovery leaves two sets of writers on one workspace | Cancel and settle owned work before archiving (Unit 11) |
 | A terminal path is left ungated and the run exits through it | One test per path, each proving it declines while work is outstanding (Unit 9) |
 | Cache persists over a live writer | Persistence declines on unknown entries or unconfirmed quiescence, and the decline is a visible outcome, not a silent skip (Unit 12) |

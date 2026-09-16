@@ -174,9 +174,9 @@ main.ts
 
 post.ts (separate Action step)
   └─→ harness/post.ts (runPost)
-        └─→ saveCache retry — skipped when CACHE_SAVED already reports durable/store-only/skipped;
-              an absent or unrecognized state retries (not-persisted). Writes its own job-summary
-              row on retry (no cache-save-result output: post: steps run after every other step)
+        └─→ saveCache retry — skipped when CACHE_SAVED already reports durable/store-only/skipped/
+              declined-for-safety; an absent or unrecognized state retries (not-persisted). Writes its own
+              job-summary row on retry (no cache-save-result output: post: steps run after every other step)
 ```
 
 > See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md)

@@ -18,6 +18,7 @@
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptResult} from './prompt-sender.js'
+import type {ExecutionDeadline} from './retry.js'
 import type {ErrorInfo} from './types.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
@@ -52,6 +53,19 @@ function makeV2Module(waitFn: TestWaitFn) {
 
 function createMockEventStream(events: Event[] = []): AsyncIterable<Event> {
   return (async function* () {
+    for (const event of events) {
+      yield event
+    }
+  })()
+}
+
+// Events yielded immediately race the `currentTurnArmed` flip that happens after
+// `listSessionMessageIds()` resolves (a macrotask away, not just a microtask) when `startPrompt`
+// is supplied -- an unarmed event is silently dropped (retry.ts's `processEventStream` gate).
+// Deferring the first yield past a `setTimeout(0)` guarantees arming has already happened.
+function createArmedEventStream(events: Event[] = []): AsyncIterable<Event> {
+  return (async function* () {
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
     for (const event of events) {
       yield event
     }
@@ -486,6 +500,233 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
       expect(result).not.toBe(COMPLETED_ATTEMPT_RESULT)
       expect(result.success).toBe(false)
       expect(result.error).toContain('Poll timeout')
+    })
+
+    it('the deferred failure survives a shared ExecutionDeadline expiring mid-drain: reports the original failure, not a timeout', async () => {
+      // #given a failed promptStartResult deferred by outstanding owned work, no other completion
+      // signal (no serverUrl -- v2 wait is never even attempted), and a shared deadline that expires
+      // while the watchdog is still polling. This is the exact ordering the regression exploited: the
+      // deadline-expiration throw used to run before the deferred-failure fold-back.
+      vi.useFakeTimers()
+      try {
+        const {runPromptAttempt} = await import('./retry.js')
+        const ledger = createOwnershipLedger()
+        ledger.adopt('ses_child', 'background task')
+        const startPrompt = vi.fn(async () => FAILED_ATTEMPT_RESULT)
+        const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+        // No current-turn activity events: a submission failure means the turn never actually started.
+        const eventStream = createMockEventStream([])
+        const deadlineAt = Date.now() + 1_000
+        const deadline: ExecutionDeadline = {
+          timeoutMs: 1_000,
+          signal: new AbortController().signal,
+          isExpired: () => Date.now() >= deadlineAt,
+          isTimedOut: () => false,
+          remainingMs: () => Math.max(0, deadlineAt - Date.now()),
+          run: async operation => operation(),
+          dispose: vi.fn(),
+        }
+
+        // #when
+        const resultPromise = runPromptAttempt(
+          mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+          'ses_123',
+          '/workspace',
+          1_500,
+          mockLogger,
+          eventStream,
+          undefined,
+          startPrompt,
+          deadline,
+          undefined,
+          undefined,
+          ledger,
+        )
+        await vi.advanceTimersByTimeAsync(0)
+        vi.setSystemTime(deadlineAt + 1)
+        await vi.advanceTimersByTimeAsync(1_500)
+        const result = await resultPromise
+
+        // #then — the deferred submission failure is reported as itself; the deadline-expiration
+        // throw never fires because the fold-back now runs before it
+        expect(result.success).toBe(false)
+        expect(result.error).toBe(FAILED_ATTEMPT_RESULT.error)
+        expect(result.outcome).not.toBe('timeout')
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('the deferred-failure merge path with a meaningful event observed: llmError precedence, computed outcome, and shouldRetry', async () => {
+      // #given the ledger defers completion, an activity event arms firstMeaningfulEventReceived,
+      // and the event stream separately observes its own (distinct) llmError via a session.error
+      // event -- the merge must prefer the stream-observed llmError over the deferred one, exactly
+      // as the non-deferred early-exit path already does
+      let resolveWait!: () => void
+      const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+        async () =>
+          new Promise<TestWaitResponse>(resolve => {
+            resolveWait = () => resolve({data: undefined, error: undefined})
+          }),
+      )
+      vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+      const {runPromptAttempt} = await import('./retry.js')
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const startPrompt = vi.fn(async () => FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR)
+      const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+      const eventStream = createArmedEventStream([
+        {
+          type: 'message.part.delta',
+          properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
+        } as unknown as Event,
+        // Distinct rate_limit llmError from the one on FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR --
+        // classified from status alone, so its message differs ('status=429' vs 'rate limited').
+        {
+          type: 'session.error',
+          properties: {sessionID: 'ses_123', error: {status: 429}},
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ])
+      setTimeout(() => resolveWait(), 20)
+
+      // #when
+      const result = await runPromptAttempt(
+        mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+        'ses_123',
+        '/workspace',
+        1_500,
+        mockLogger,
+        eventStream,
+        'http://localhost:1234',
+        startPrompt,
+        undefined,
+        undefined,
+        undefined,
+        ledger,
+      )
+
+      // #then — matches the non-deferred early-exit path's merge rules exactly: the stream-observed
+      // llmError wins, the outcome is derived from its retryability, and shouldRetry follows outcome
+      expect(result.success).toBe(false)
+      expect(result.llmError?.type).toBe('rate_limit')
+      expect(result.llmError?.message).toBe('status=429')
+      expect(result.llmError?.message).not.toBe(RATE_LIMIT_ERROR.message)
+      expect(result.outcome).toBe('turn_failed_retryable')
+      expect(result.shouldRetry).toBe(true)
+    })
+
+    it('an expired deadline still prevents a further retry attempt, even though the preserved failure computes shouldRetry: true', async () => {
+      // #given the same deferred-failure-with-retryable-llmError shape as above, but this time the
+      // shared deadline expires mid-drain instead of resolving via wait(). The fix must preserve the
+      // failure (and its honestly-computed shouldRetry: true) without extending the deadline itself --
+      // a caller gating retries on deadline.isExpired() (as executeOpenCode does) must still see it expired.
+      vi.useFakeTimers()
+      try {
+        const {runPromptAttempt} = await import('./retry.js')
+        const ledger = createOwnershipLedger()
+        ledger.adopt('ses_child', 'background task')
+        const startPrompt = vi.fn(async () => FAILED_ATTEMPT_RESULT_WITH_LLM_ERROR)
+        const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+        const eventStream = createArmedEventStream([
+          {
+            type: 'message.part.delta',
+            properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
+          } as unknown as Event,
+        ])
+        const deadlineAt = Date.now() + 1_000
+        const deadline: ExecutionDeadline = {
+          timeoutMs: 1_000,
+          signal: new AbortController().signal,
+          isExpired: () => Date.now() >= deadlineAt,
+          isTimedOut: () => false,
+          remainingMs: () => Math.max(0, deadlineAt - Date.now()),
+          run: async operation => operation(),
+          dispose: vi.fn(),
+        }
+
+        // #when
+        const resultPromise = runPromptAttempt(
+          mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+          'ses_123',
+          '/workspace',
+          1_500,
+          mockLogger,
+          eventStream,
+          undefined,
+          startPrompt,
+          deadline,
+          undefined,
+          undefined,
+          ledger,
+        )
+        await vi.advanceTimersByTimeAsync(0)
+        vi.setSystemTime(deadlineAt + 1)
+        await vi.advanceTimersByTimeAsync(1_500)
+        const result = await resultPromise
+
+        // #then — the failure (and its honest shouldRetry: true) is reported, but the shared deadline
+        // the caller checks independently is still expired: a retry loop gated on isExpired() stops here
+        expect(result.success).toBe(false)
+        expect(result.outcome).toBe('turn_failed_retryable')
+        expect(result.shouldRetry).toBe(true)
+        expect(deadline.isExpired()).toBe(true)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('a successful prompt deferred by outstanding work is unaffected even when the shared deadline expires mid-drain', async () => {
+      // #given the ledger defers a *successful* promptStartResult, and the deadline expires before
+      // any other completion signal arrives -- unlike a deferred failure, a deferred success never
+      // populates deferredFailedPromptStartResult, so the deadline-expiration throw must still fire
+      // exactly as it did before this fix; only the failure path changed
+      vi.useFakeTimers()
+      try {
+        const {runPromptAttempt} = await import('./retry.js')
+        const ledger = createOwnershipLedger()
+        ledger.adopt('ses_child', 'background task')
+        const startPrompt = vi.fn(async () => COMPLETED_ATTEMPT_RESULT)
+        const mockClient = {session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})}}
+        const eventStream = createMockEventStream([])
+        const deadlineAt = Date.now() + 1_000
+        const deadline: ExecutionDeadline = {
+          timeoutMs: 1_000,
+          signal: new AbortController().signal,
+          isExpired: () => Date.now() >= deadlineAt,
+          isTimedOut: () => false,
+          remainingMs: () => Math.max(0, deadlineAt - Date.now()),
+          run: async operation => operation(),
+          dispose: vi.fn(),
+        }
+
+        // #when
+        const resultPromise = runPromptAttempt(
+          mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+          'ses_123',
+          '/workspace',
+          1_500,
+          mockLogger,
+          eventStream,
+          undefined,
+          startPrompt,
+          deadline,
+          undefined,
+          undefined,
+          ledger,
+        )
+        const rejection = (async () => {
+          await expect(resultPromise).rejects.toMatchObject({name: 'DeadlineExceededError'})
+        })()
+        await vi.advanceTimersByTimeAsync(0)
+        vi.setSystemTime(deadlineAt + 1)
+        await vi.advanceTimersByTimeAsync(1_500)
+
+        // #then — unchanged from today: a deferred success with no other completion signal times out
+        await rejection
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('existing retry behavior with no ledger is unchanged', async () => {

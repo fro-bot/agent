@@ -543,7 +543,16 @@ export async function runPromptAttempt(
       pollPromise,
     ])
 
-    if (deadline?.isExpired() === true && activityTracker.terminalProviderError == null) {
+    // A deferred failure must survive deadline expiry: only throw the generic timeout when there is
+    // no known failure to preserve. Checked at the exact same point as before this fix (prior to
+    // collectEventResults(), so bounded SSE cleanup time can never flip this check from false to
+    // true out from under a plain no-ledger attempt) -- the only new behavior is that a deferred
+    // failure now suppresses the throw instead of losing to it.
+    if (
+      deadline?.isExpired() === true &&
+      activityTracker.terminalProviderError == null &&
+      deferredFailedPromptStartResult == null
+    ) {
       throw createDeadlineExceededError('prompt attempt')
     }
 

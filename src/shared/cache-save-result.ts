@@ -61,7 +61,7 @@ export interface CacheSaveResult {
 /**
  * The `CACHE_SAVED` state-key value the harness layer (`cleanup.ts`, `post.ts`) hands off
  * across the main step/post-hook process boundary. Widened from a boolean to this
- * four-value enum so the post hook can gate its retry on durability actually achieved
+ * five-value enum so the post hook can gate its retry on durability actually achieved
  * (`durable`, `store-only`) rather than on cache-write success alone — the boolean
  * conflated a store-only save with total failure and caused a redundant object-store
  * upload (see the cache-save-result-contract plan).

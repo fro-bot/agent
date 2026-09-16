@@ -541,8 +541,12 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     // 'declined-for-safety', not 'not-persisted': that value tells the post hook to honor
     // the decline instead of silently retrying it (see cache-save-result.ts).
     expect(saveCache).not.toHaveBeenCalled()
-    const {saveState} = await import('@actions/core')
+    const {saveState, setOutput} = await import('@actions/core')
     expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+    // #and the public cache-save-result Action output reflects the same decline, not just
+    // the internal CACHE_SAVED state handoff -- a caller watching only the output would
+    // otherwise never see a real safety decline happen
+    expect(setOutput).toHaveBeenCalledWith('cache-save-result', 'declined-for-safety')
   })
 
   it('persists normally when the ownership ledger is empty (every run today, unchanged behavior)', async () => {
