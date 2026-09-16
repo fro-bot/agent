@@ -238,6 +238,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 **Approach:**
 - Admission consults the ledger and a phase flag. Two outstanding and eight total, both configurable; depth stays fixed at one, because a depth knob reopens the grandchild traversal gap the rest of this plan assumes stays shut.
+- This unit builds the gate; Unit 14 wires it to the `task` permission request, which is the only point upstream that precedes child-session creation. Nothing else in this plan can call it — every other signal arrives after the dispatch has already started.
 - The caps live in `packages/runtime/src/shared/constants.ts` as `DEFAULT_MAX_OUTSTANDING_DISPATCHES` and `DEFAULT_MAX_TOTAL_DISPATCHES`, following the existing `DEFAULT_*` tunables there (e.g. `DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS`) rather than `packages/gateway/src/config.ts` — both surfaces admit through this same module, and neither surface owns the value.
 - The defaults are provisional, on the same footing as the teardown reserve: revising them needs production fan-out data from real reviewer runs (see Deferred to Separate Tasks), not a number picked during planning.
 - Extensions and promotions count toward the total — an extension is a new submission against an existing entry, and a promotion converts foreground work the caps never saw.
@@ -612,15 +613,51 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Verification:**
 - A reader can tell from the output which work finished, which was cancelled, and which is unknown.
 
+- [ ] **Unit 14: Enforce the caps at the permission seam**
+
+**Goal:** A dispatch that would exceed a cap is refused before it starts, not observed after it has.
+
+**Requirements:** R14, R15
+
+**Dependencies:** Unit 2, Unit 11
+
+**Files:**
+- Modify: `src/services/setup/ci-config.ts`
+- Modify: `src/features/agent/streaming.ts`
+- Modify: `src/features/agent/execution.ts`
+- Modify: `packages/gateway/src/execute/run-core.ts`
+- Test: `src/services/setup/ci-config.test.ts`
+- Test: `src/features/agent/streaming.test.ts`
+- Test: `packages/gateway/src/execute/run-core.test.ts`
+
+**Approach:**
+- The admission gate Unit 2 built has no caller, and the observation point the rest of this plan uses cannot be one. A dispatch is observed when the `task` tool part reports `completed`, and by then upstream has already created the child session, registered the job, and forked it. Detection is not admission.
+- The real seam is the permission request. `task` asks for permission before the child session exists and before the job is registered, and the tool blocks on the reply — so a refusal there prevents the dispatch rather than racing it. That requires configuring the `task` permission as `ask`; it is unset today, so no permission event fires at all and dispatches proceed ungated.
+- This collides with the Action's current handling. It rejects every permission request it sees, because there is no human to ask — so turning the permission on without changing that would deny every background dispatch outright. The `task` permission becomes the one case the Action answers on its own: consult admission, reject when a cap would be exceeded, approve otherwise. Every other permission keeps being denied.
+- It collides differently on the gateway, where permissions route to Discord buttons. A cap decision is not a human judgement and must not become one. `task` is answered from admission before the request reaches the approval transport, leaving the human gate for the tool calls a human should actually see.
+- Count on approval rather than on observation, so a refused dispatch leaves no residue and an approved one is counted exactly once.
+
+**Test scenarios:**
+- Happy path: a dispatch under both caps is approved and proceeds
+- Edge case: a dispatch that would exceed the outstanding cap is rejected at the permission seam
+- Edge case: a dispatch that would exceed the total cap is rejected, including one arriving as an extension
+- Edge case: every non-`task` permission is still denied on the Action
+- Edge case: a `task` permission on the gateway is answered from admission and never reaches Discord
+- Error path: a rejected dispatch is reported so the model can adapt rather than retrying blindly
+- Integration: the ledger counts an approved dispatch once, and a rejected one not at all
+
+**Verification:**
+- A capped dispatch never creates a child session, proven against the permission reply rather than against a later abort.
+
 ### Phase 4 — Release gate
 
-- [ ] **Unit 14: Enable the flag and verify end to end**
+- [ ] **Unit 15: Enable the flag and verify end to end**
 
 **Goal:** Turn the capability on once the machinery holds.
 
 **Requirements:** R3–R24
 
-**Dependencies:** Units 1–13
+**Dependencies:** Units 1–14
 
 **Files:**
 - Modify: `packages/runtime/src/agent/server.ts`
@@ -630,8 +667,9 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 **Approach:**
 - This phase gates Phases 1–3 rather than sitting beside them as a peer step: the flag flips only once every prior unit has merged with its tests passing.
+- Upstream has no background-job cap of its own to configure: the env flag only enables the capability, and `subagent_depth` bounds nesting rather than count. Whatever bound exists is the one Unit 14 enforces.
 - Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` on both surfaces, following the pattern established for the file watcher — default only when unset or empty, so an operator value wins.
-- Note the umbrella interaction: `OPENCODE_EXPERIMENTAL=true` enables background subagents independently, so the ownership machinery must hold whether or not this project sets the specific flag. The umbrella is unset everywhere in this repository today, so the interaction is latent rather than active; the rollout should assert it stays unset until Units 1–13 land, rather than assuming it.
+- Note the umbrella interaction: `OPENCODE_EXPERIMENTAL=true` enables background subagents independently, so the ownership machinery must hold whether or not this project sets the specific flag. The umbrella is unset everywhere in this repository today, so the interaction is latent rather than active; the rollout should assert it stays unset until Units 1–14 land, rather than assuming it.
 - Background subagents are new execution contexts, not exceptions to containment: descendants run under the same `filterAgentEnv` scrub (`packages/runtime/src/agent/filter-env.ts`) as the root, and on the gateway, the same mitmproxy egress allowlist, with no additional inherited credentials or destinations.
 
 **Test scenarios:**
