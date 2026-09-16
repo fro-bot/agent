@@ -114,6 +114,16 @@ function contextOverflowErrorEvent(sessionID: string): Event {
   } as unknown as Event
 }
 
+function retryStatusEvent(sessionID: string): Event {
+  return {
+    type: 'session.status',
+    properties: {
+      sessionID,
+      status: {type: 'retry', action: {reason: 'account_rate_limit', provider: 'anthropic'}, message: 'quota'},
+    },
+  } as unknown as Event
+}
+
 function toolSuccessEvent(sessionID: string): Event {
   return {
     type: 'session.next.tool.called',
@@ -485,6 +495,57 @@ describe('processEventStream — structured failure capture on the activity trac
     // #then still no terminal failure was ever observed
     expect(activityTracker.terminalProviderError).toBeUndefined()
   })
+
+  it('a classified root retry status no longer sets terminal lifecycle state, but its failure still merges with full precedence', async () => {
+    // #given an activity tracker and a root session.status retry classified as terminal (quota)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const result = await processEventStream(
+      createMockEventStream([retryStatusEvent(ROOT_SESSION_ID)]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the failure still merges with full precedence -- terminal, structured, retrievable
+    // immediately off the tracker -- exactly as before this change
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+    expect(activityTracker.classificationPath).toBe('structured')
+
+    // #then selecting this error is not proof the turn ended -- that lifecycle flag is reserved
+    // for truly terminal signals (session.idle, a completed assistant message)
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+  })
+
+  it("complement: the root's own retry status behaves exactly as before apart from the lifecycle write", async () => {
+    // #given a root session.status retry followed by the actual terminal signal (session.idle)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const idleEvent: Event = {type: 'session.idle', properties: {sessionID: ROOT_SESSION_ID}} as unknown as Event
+    const result = await processEventStream(
+      createMockEventStream([retryStatusEvent(ROOT_SESSION_ID), idleEvent]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the failure is still observed and returned, and the lifecycle flag is set -- by the
+    // session.idle signal that actually observed quiescence, not by the classification itself
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(activityTracker.sessionIdle).toBe(true)
+  })
 })
 
 describe('processEventStream — ownership check widens descendant events, no-ledger path unchanged', () => {
@@ -809,7 +870,9 @@ describe('processEventStream — ownership check widens descendant events, no-le
 
     // #then the root's own error still ends the turn and still surfaces as llmError, exactly as before ownership widening
     expect(result.llmError?.type).toBe('context_overflow')
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended -- that lifecycle flag is reserved for
+    // truly terminal signals (session.idle, a completed assistant message), which this test never emits.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     // #then the unrelated adopted descendant entry is untouched by the root's own error
     expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'outstanding'}])
   })
@@ -835,7 +898,103 @@ describe('processEventStream — ownership check widens descendant events, no-le
 
     // #then unchanged: the root session's own error still ends the turn and surfaces as llmError
     expect(result.llmError?.type).toBe('context_overflow')
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+  })
+
+  it("session.status: a descendant's retry status does not write root failure state, root llmError, or root lifecycle state", async () => {
+    // #given a ledger that has adopted the child session, an activity tracker, and a retry status on the CHILD
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([retryStatusEvent(CHILD_SESSION_ID)])
+
+    // #when processed with the ledger and tracker supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the descendant's retry status does not reach this run's llmError, root failure
+    // accumulator, or lifecycle state
+    expect(result.llmError).toBeNull()
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.sessionError).toBeNull()
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+
+    // #then it is still observed: the descendant's ledger entry no longer reads outstanding, and
+    // is left unresolved (marked unknown), not settled -- a retry status is not proof the
+    // descendant's own turn concluded either
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'unknown'}])
+  })
+
+  it("complement: the ROOT session's own retry status still ends the turn and still writes root failure state, unchanged", async () => {
+    // #given a ledger (present, but the retry status fires on the ROOT session id, not a descendant) and a tracker
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([retryStatusEvent(ROOT_SESSION_ID)])
+
+    // #when processed with the ledger and tracker supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the root's own retry status still merges into llmError and the tracker's failure state,
+    // exactly as before ownership widening -- only the lifecycle write is gone (see Finding A)
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+
+    // #then the unrelated adopted descendant entry is untouched by the root's own retry status
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'outstanding'}])
+  })
+
+  it('session.status: a run with no ledger is unaffected by the root-scoping change', async () => {
+    // #given no ledger at all, and a retry status on the root session (the only session a no-ledger run knows about)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([retryStatusEvent(ROOT_SESSION_ID)])
+
+    // #when processed with no ledger
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then unchanged: the root session's own retry status still merges into llmError
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
   })
 
   it('session.idle stays root-scoped: a descendant idle never ends the run', async () => {

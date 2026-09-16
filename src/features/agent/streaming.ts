@@ -108,7 +108,6 @@ export function mergeActivityError(
   if (activityTracker != null && isTerminalProviderError(merged)) {
     activityTracker.terminalProviderError = merged
     activityTracker.sessionError = merged.message
-    activityTracker.currentTurnTerminalSignalReceived = true
     if (classificationPath != null) activityTracker.classificationPath = classificationPath
     // A terminal signal is authoritative from here on -- clear any earlier generic record
     // rather than leaving its (possibly sensitive) content reachable off the tracker.
@@ -665,10 +664,27 @@ export async function processEventStream(
           logger.debug('Token usage received', {tokens: sessionTokens, model, cost})
         }
       } else if (eventType === 'session.status') {
-        if (isOwnedSession(getSessionID(eventPayload), sessionId, ownershipLedger)) {
+        const statusEventSessionID = getSessionID(eventPayload)
+        if (isOwnedSession(statusEventSessionID, sessionId, ownershipLedger)) {
           const status = getObjectProperty(eventPayload, 'status')
           const terminalError = classifyRetryStatusError(status)
           if (terminalError != null) {
+            // Root-scoped, mirroring `session.error` below for the same reason: a
+            // descendant's retry status is real information -- classified above for
+            // bounded diagnostics (logged just below), and its ledger entry marked
+            // `unknown` -- but must not overwrite the root's own failure accumulator,
+            // `llmError`, or lifecycle state. A descendant's completion is the
+            // injected-completion and reconciliation path's responsibility, not this
+            // branch's; see the `session.error` branch's comment for the full rationale.
+            if (statusEventSessionID !== sessionId) {
+              logger.error('Session status retry classified as terminal provider error on a descendant session', {
+                sessionId,
+                type: terminalError.type,
+              })
+              ownershipLedger?.markUnknown(statusEventSessionID)
+              continue
+            }
+
             if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
             logger.error('Session status retry classified as terminal provider error', {
               sessionId,
