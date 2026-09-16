@@ -1,13 +1,3 @@
-export {createDispatchAdmission} from './dispatch-admission.js'
-export type {
-  DispatchAdmission,
-  DispatchAdmissionOptions,
-  DispatchKind,
-  DispatchRefusal,
-  DispatchRefusalReason,
-  DispatchRequest,
-  DispatchTerminalPhase,
-} from './dispatch-admission.js'
 export {
   createAgentError,
   createErrorInfo,

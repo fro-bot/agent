@@ -82,11 +82,3 @@ export const DEDUP_CACHE_PREFIX = 'fro-bot-dedup-v1' as const
 
 // Storage version (increment on breaking changes)
 export const STORAGE_VERSION = 1
-
-// Background subagent dispatch admission caps (packages/runtime/src/agent/dispatch-admission.ts).
-// Both surfaces (Action and gateway) admit through that one module, so the caps live here rather
-// than in either surface's own config. Provisional, on the same footing as the teardown reserve --
-// picked during planning, not derived from production fan-out data; revisit once real reviewer runs
-// produce dispatch volume to validate against.
-export const DEFAULT_MAX_OUTSTANDING_DISPATCHES = 2
-export const DEFAULT_MAX_TOTAL_DISPATCHES = 8

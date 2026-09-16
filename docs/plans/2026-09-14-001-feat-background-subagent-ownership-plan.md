@@ -28,7 +28,8 @@ R3–R24 of the origin document. R1 and R2 (the file watcher) shipped separately
 
 - R3–R8. Ownership ledger, descendant event handling, retry survival, unknown-not-zero, subscription readiness, discontinuity handling
 - R9–R11. Descendant approval routing, tree-aware activity, run ownership through drain
-- R12–R15. Depth limit, dispatch caps, pre-execution enforcement, no dispatch after finalization
+- R12. Depth limit, enforced by configuring the upstream setting rather than by a gate of our own
+- R13–R15. Dispatch caps, pre-execution enforcement, no dispatch after finalization — **cut**, see Scope Boundaries
 - R16–R22a. Drain before terminal steps, every terminal path, single deadline, expiry behaviour, confirmed cancellation, publication ownership, persistence declining, lock lease
 - R23–R24. Labelled reporting, gateway startup reconciliation
 
@@ -36,12 +37,13 @@ R3–R24 of the origin document. R1 and R2 (the file watcher) shipped separately
 
 - No change to OpenCode itself. The events and APIs required already exist.
 - Background work is not resumable across runs. The upstream registry is process-local; cache persistence does not change that.
-- Subagent depth stays at one. Raising it requires solving the grandchild traversal gap below on its own terms.
+- Subagent depth stays at one. Raising it requires solving the grandchild traversal gap below on its own terms. Enforce it by setting upstream's own `subagent_depth`, which is checked before execution against real session ancestry — not by a depth field a caller supplies, which the caller is in no position to know.
 - The four declined flags from the origin document remain unset.
+- **Dispatch caps are cut** (R13–R15). They cannot be enforced at any seam this project can reach, and the attempt misfires on the project's own workflows. The only pre-execution seam reachable from a client is the `task` permission request, which fires for every `task` call — foreground delegation included — and carries nothing distinguishing background from foreground, so a cap there refuses ordinary work. Worse, upstream fails *every* pending permission for a session when one is rejected, so refusing a background dispatch would collaterally refuse unrelated foreground approvals. The gate itself could not hold its own contract either: it reads an observation ledger that only populates on completed dispatches, so several admissions pass before any registers. And the requirement is not satisfiable in principle — an extension reuses a running job and a promotion converts one, so neither can be counted before execution starts. The deadline already bounds how long an invocation waits, and drain already prevents work outliving it; a cap would bound concurrent resource pressure, which is a different problem with no evidence yet that this project has it.
 
 ### Deferred to Separate Tasks
 
-- Validating the dispatch caps against real reviewer fan-out: needs production data this plan cannot produce.
+- Resource admission, if production shows unbounded fan-out is a real problem rather than an imagined one. It needs a server-side design around actual start, extend, and promote transitions — a plugin hook that receives the tool's real arguments, not permission-event bookkeeping — and measured fan-out to size anything by. Neither exists today.
 - Revisiting the teardown reserve once drain exists and can be measured: the value here is derived from teardown as it exists today. The concrete follow-up is re-measuring from the drain tail — timing teardown from when drain ends, not from run start — once Unit 10 exists.
 
 ## Context & Research
@@ -223,41 +225,30 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Verification:**
 - A caller can distinguish "nothing outstanding" from "nothing known to be outstanding" without reading ledger internals.
 
-- [ ] **Unit 2: Bounded dispatch admission**
+- [ ] **Unit 2: Pin subagent depth to one**
 
-**Goal:** Refuse a dispatch that would exceed depth, outstanding, or total caps, before the execution starts.
+**Goal:** Nesting stays at one level, enforced where it can actually be checked.
 
-**Requirements:** R12, R13, R14, R15
+**Requirements:** R12
 
-**Dependencies:** Unit 1
+**Dependencies:** None
 
 **Files:**
-- Create: `packages/runtime/src/agent/dispatch-admission.ts`
-- Modify: `packages/runtime/src/shared/constants.ts`
-- Test: `packages/runtime/src/agent/dispatch-admission.test.ts`
+- Modify: `src/services/setup/ci-config.ts`
+- Test: `src/services/setup/ci-config.test.ts`
 
 **Approach:**
-- Admission consults the ledger and a phase flag. Two outstanding and eight total, both configurable; depth stays fixed at one, because a depth knob reopens the grandchild traversal gap the rest of this plan assumes stays shut.
-- This unit builds the gate; Unit 14 wires it to the `task` permission request, which is the only point upstream that precedes child-session creation. Nothing else in this plan can call it — every other signal arrives after the dispatch has already started.
-- The caps live in `packages/runtime/src/shared/constants.ts` as `DEFAULT_MAX_OUTSTANDING_DISPATCHES` and `DEFAULT_MAX_TOTAL_DISPATCHES`, following the existing `DEFAULT_*` tunables there (e.g. `DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS`) rather than `packages/gateway/src/config.ts` — both surfaces admit through this same module, and neither surface owns the value.
-- The defaults are provisional, on the same footing as the teardown reserve: revising them needs production fan-out data from real reviewer runs (see Deferred to Separate Tasks), not a number picked during planning.
-- Extensions and promotions count toward the total — an extension is a new submission against an existing entry, and a promotion converts foreground work the caps never saw.
-- Once the invocation enters finalization or cancellation, admission refuses everything.
-- A refusal returns a structured error identifying which cap was exceeded, so the caller can surface it to the model rather than failing silently.
-- Admission decides only whether a dispatch may proceed; it never mutates the ledger. The dispatching caller adopts the entry after admission succeeds. Every unit that wires admission into a call site owns that adopt, and a caller that admits without adopting produces work the ledger cannot see — the exact failure this plan exists to prevent.
-- Depth arrives on the request rather than being inferred from the dispatch kind, because the caller is the only party that knows how deep the requesting session already sits.
+- Set `subagent_depth` to one in the CI config rather than building a depth check of our own. Upstream checks it before execution against real session ancestry, which a client cannot cheaply reconstruct — a depth value passed in by the caller is a guess, and the caller is the party least able to make it.
+- Depth matters because upstream cancellation walks running jobs only, so a completed child linking the root to a running grandchild is never reached. Depth one makes that unreachable. This is the requirement the cut caps were tangled with, and it survives them because it is enforceable where they were not.
+- This unit originally built a dispatch admission gate for the outstanding and total caps. That gate was removed: it could not be wired anywhere without refusing ordinary foreground delegation, and its own contract could not hold. See Scope Boundaries.
 
 **Test scenarios:**
-- Happy path: a dispatch below both caps is admitted
-- Edge case: the dispatch that would make outstanding three is refused, and the ledger is unchanged
-- Edge case: an extension against an existing entry counts toward the total
-- Edge case: a promotion of foreground work counts toward the total
-- Error path: every dispatch is refused once finalization has begun
-- Edge case: depth beyond one is refused
-- Error path: a refused dispatch's error identifies which cap was exceeded
+- Happy path: the generated CI config pins `subagent_depth` to one
+- Edge case: an operator value is not silently overridden without being recorded
+- Edge case: the pin survives each config mode the setup supports
 
 **Verification:**
-- No path admits work after the invocation stops accepting it, and a refusal leaves no ledger residue.
+- A generated config carries the depth pin, and nothing in this project re-implements a depth check against it.
 
 - [ ] **Unit 3: Ledger reconciliation**
 
@@ -618,51 +609,15 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Verification:**
 - A reader can tell from the output which work finished, which was cancelled, and which is unknown.
 
-- [ ] **Unit 14: Enforce the caps at the permission seam**
-
-**Goal:** A dispatch that would exceed a cap is refused before it starts, not observed after it has.
-
-**Requirements:** R14, R15
-
-**Dependencies:** Unit 2, Unit 11
-
-**Files:**
-- Modify: `src/services/setup/ci-config.ts`
-- Modify: `src/features/agent/streaming.ts`
-- Modify: `src/features/agent/execution.ts`
-- Modify: `packages/gateway/src/execute/run-core.ts`
-- Test: `src/services/setup/ci-config.test.ts`
-- Test: `src/features/agent/streaming.test.ts`
-- Test: `packages/gateway/src/execute/run-core.test.ts`
-
-**Approach:**
-- The admission gate Unit 2 built has no caller, and the observation point the rest of this plan uses cannot be one. A dispatch is observed when the `task` tool part reports `completed`, and by then upstream has already created the child session, registered the job, and forked it. Detection is not admission.
-- The real seam is the permission request. `task` asks for permission before the child session exists and before the job is registered, and the tool blocks on the reply — so a refusal there prevents the dispatch rather than racing it. That requires configuring the `task` permission as `ask`; it is unset today, so no permission event fires at all and dispatches proceed ungated.
-- This collides with the Action's current handling. It rejects every permission request it sees, because there is no human to ask — so turning the permission on without changing that would deny every background dispatch outright. The `task` permission becomes the one case the Action answers on its own: consult admission, reject when a cap would be exceeded, approve otherwise. Every other permission keeps being denied.
-- It collides differently on the gateway, where permissions route to Discord buttons. A cap decision is not a human judgement and must not become one. `task` is answered from admission before the request reaches the approval transport, leaving the human gate for the tool calls a human should actually see.
-- Count on approval rather than on observation, so a refused dispatch leaves no residue and an approved one is counted exactly once.
-
-**Test scenarios:**
-- Happy path: a dispatch under both caps is approved and proceeds
-- Edge case: a dispatch that would exceed the outstanding cap is rejected at the permission seam
-- Edge case: a dispatch that would exceed the total cap is rejected, including one arriving as an extension
-- Edge case: every non-`task` permission is still denied on the Action
-- Edge case: a `task` permission on the gateway is answered from admission and never reaches Discord
-- Error path: a rejected dispatch is reported so the model can adapt rather than retrying blindly
-- Integration: the ledger counts an approved dispatch once, and a rejected one not at all
-
-**Verification:**
-- A capped dispatch never creates a child session, proven against the permission reply rather than against a later abort.
-
 ### Phase 4 — Release gate
 
-- [ ] **Unit 15: Enable the flag and verify end to end**
+- [ ] **Unit 14: Enable the flag and verify end to end**
 
 **Goal:** Turn the capability on once the machinery holds.
 
 **Requirements:** R3–R24
 
-**Dependencies:** Units 1–14
+**Dependencies:** Units 1–13
 
 **Files:**
 - Modify: `packages/runtime/src/agent/server.ts`
@@ -672,9 +627,10 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 **Approach:**
 - This phase gates Phases 1–3 rather than sitting beside them as a peer step: the flag flips only once every prior unit has merged with its tests passing.
-- Upstream has no background-job cap of its own to configure: the env flag only enables the capability, and `subagent_depth` bounds nesting rather than count. Whatever bound exists is the one Unit 14 enforces.
+- Upstream has no background-job cap of its own, and this plan cut its attempt at one (see Scope Boundaries). Nothing bounds how many dispatches an invocation makes; what bounds the invocation is its deadline, and what keeps work from outliving it is drain. Do not flip this flag on the assumption a cap exists.
+- Before flipping, demonstrate terminal quiescence independently of any gate: a late completion notification and a dispatch racing finalization must both be handled correctly. Zero observed outstanding work is not proof that nothing can start more.
 - Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` on both surfaces, following the pattern established for the file watcher — default only when unset or empty, so an operator value wins.
-- Note the umbrella interaction: `OPENCODE_EXPERIMENTAL=true` enables background subagents independently, so the ownership machinery must hold whether or not this project sets the specific flag. The umbrella is unset everywhere in this repository today, so the interaction is latent rather than active; the rollout should assert it stays unset until Units 1–14 land, rather than assuming it.
+- Note the umbrella interaction: `OPENCODE_EXPERIMENTAL=true` enables background subagents independently, so the ownership machinery must hold whether or not this project sets the specific flag. The umbrella is unset everywhere in this repository today, so the interaction is latent rather than active; the rollout should assert it stays unset until Units 1–13 land, rather than assuming it.
 - Background subagents are new execution contexts, not exceptions to containment: descendants run under the same `filterAgentEnv` scrub (`packages/runtime/src/agent/filter-env.ts`) as the root, and on the gateway, the same mitmproxy egress allowlist, with no additional inherited credentials or destinations.
 
 **Test scenarios:**
@@ -710,6 +666,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 | A restarted gateway replays stale or corrupted persisted ownership and re-adopts sessions it does not own | Persisted state is advisory only; it is intersected with live server state and mismatches downgrade to unknown before restoring ownership (Unit 7) |
 | The 30-second reserve is wrong once drain exists | It is configurable, the value is recorded as derived from teardown measured without drain, and re-measurement from the drain tail is tracked once drain exists |
 | An operator sets the experimental umbrella and enables this before the machinery lands | The machinery must hold independently of who set the flag; the umbrella is confirmed unset everywhere in this repository today, and rollout asserts it stays unset until the machinery lands (Unit 14) |
+| Unbounded fan-out exhausts an invocation's budget, with no cap to stop it | Accepted rather than mitigated. The deadline bounds the invocation and drain bounds what outlives it; a cap was attempted and cut as unenforceable. Revisit only with measured evidence (see Deferred to Separate Tasks) |
 
 ## Documentation / Operational Notes
 
