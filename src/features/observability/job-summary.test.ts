@@ -1,6 +1,7 @@
 import type {CacheSaveResult} from '../../shared/cache-save-result.js'
 import type {CommentSummaryOptions, RunMetrics} from './types.js'
 import * as core from '@actions/core'
+import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createLogger} from '../../shared/logger.js'
@@ -285,6 +286,140 @@ describe('writeJobSummary', () => {
     await expect(writeJobSummary(options, logger)).resolves.not.toThrow()
     expect(logger.warning).toHaveBeenCalledWith('Failed to write job summary', {error: 'Write failed'})
     expect(core.warning).toHaveBeenCalledWith('Failed to write job summary: Write failed')
+  })
+
+  describe('Background Work section', () => {
+    it('omits the section entirely when no ledger is supplied (byte-identical to today)', async () => {
+      // #given a run with no ownership ledger at all -- every run in production before this unit
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger)
+
+      // #then nothing about background work is added
+      expect(core.summary.addHeading).not.toHaveBeenCalledWith('Background Work', 3)
+    })
+
+    it('omits the section entirely when the ledger is empty (byte-identical to today)', async () => {
+      // #given a ledger that adopted nothing this run
+      const ledger = createOwnershipLedger()
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then nothing about background work is added -- an empty ledger must not add an empty section
+      expect(core.summary.addHeading).not.toHaveBeenCalledWith('Background Work', 3)
+    })
+
+    it('happy path: a fully drained run reports no unfinished work', async () => {
+      // #given two entries, both settled
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.adopt('session-2', 'linter-subagent')
+      ledger.settle('session-1')
+      ledger.settle('session-2')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then the section confirms nothing is missing, without naming anything as unfinished
+      expect(core.summary.addHeading).toHaveBeenCalledWith('Background Work', 3)
+      expect(core.summary.addRaw).toHaveBeenCalledWith('All background work finished.\n')
+      expect(core.summary.addRaw).not.toHaveBeenCalledWith(expect.stringContaining('Did not finish'))
+    })
+
+    it('edge case: one unfinished execution is named by label, cancelled at the deadline', async () => {
+      // #given a run that cancelled two reviewer subagents at the deadline: reconciliation
+      // confirmed one stopped (settled) and could not confirm the other (unknown)
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent-a')
+      ledger.adopt('session-2', 'reviewer-subagent-b')
+      ledger.settle('session-1')
+      ledger.markUnknown('session-2')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then the unconfirmed one is named by label, not folded into a bare count -- and
+      // the settled one is not named as unfinished (the array is exact, not a superset)
+      expect(core.summary.addRaw).toHaveBeenCalledWith('**Did not finish:**\n')
+      expect(core.summary.addList).toHaveBeenCalledWith(['reviewer-subagent-b (unconfirmed)'])
+    })
+
+    it('edge case: an unknown entry is reported as unknown rather than finished', async () => {
+      // #given a single entry the drain could not confirm
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'linter-subagent')
+      ledger.markUnknown('session-1')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then it is listed with its unconfirmed state, never claimed as finished
+      expect(core.summary.addList).toHaveBeenCalledWith(['linter-subagent (unconfirmed)'])
+      expect(core.summary.addRaw).not.toHaveBeenCalledWith('All background work finished.\n')
+    })
+
+    it('edge case: a run finishing with unknown entries explicitly reports the degraded state', async () => {
+      // #given one settled entry and one unknown entry
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.adopt('session-2', 'linter-subagent')
+      ledger.settle('session-1')
+      ledger.markUnknown('session-2')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then a distinct degraded-state banner is written, not just an unfinished-work list
+      expect(core.summary.addRaw).toHaveBeenCalledWith(
+        expect.stringContaining('could not be confirmed finished or cancelled'),
+      )
+    })
+
+    it('reconciled work keeps its reconciled label, distinct from a dispatch-site label', async () => {
+      // #given an entry discovered by reconciliation rather than observed dispatch
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reconciled')
+      ledger.markUnknown('session-1')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then the reader can tell this was discovered work, not watched-from-dispatch work
+      expect(core.summary.addList).toHaveBeenCalledWith(['reconciled (unconfirmed)'])
+    })
+
+    it('integration: descendant token usage appears alongside the ledger section', async () => {
+      // #given a run whose metrics.tokenUsage reflects an owned descendant's usage
+      // (streaming.ts routes message.updated events from adopted descendants into the
+      // same token accounting as the root session -- see isOwnedSession) and a ledger
+      // naming that descendant
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.settle('session-1')
+      const options = createMockOptions({
+        metrics: createMockMetrics({
+          tokenUsage: {input: 1000, output: 500, reasoning: 0, cache: {read: 0, write: 0}},
+          model: 'claude-sonnet-4-20250514',
+          cost: 0.01,
+        }),
+      })
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then both the token accounting and the background-work section are present --
+      // the ledger section does not suppress or replace the existing Token Usage table
+      expect(core.summary.addHeading).toHaveBeenCalledWith('Token Usage', 3)
+      expect(core.summary.addHeading).toHaveBeenCalledWith('Background Work', 3)
+    })
   })
 })
 

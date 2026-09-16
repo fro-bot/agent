@@ -1,3 +1,4 @@
+import type {OwnershipEntryState, OwnershipLedger, OwnershipLedgerEntry} from '@fro-bot/runtime'
 import type {CacheSaveOutcome, CacheSaveResult, CacheSaveStateValue} from '../../shared/cache-save-result.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CommentSummaryOptions} from './types.js'
@@ -163,13 +164,83 @@ export async function writeCacheSaveResultSummary(
 }
 
 /**
+ * Human-readable state label for an entry named in the "did not finish" list. `settled`
+ * is present only to keep this exhaustive over `OwnershipEntryState` without a cast --
+ * it is never actually looked up, since `writeBackgroundWorkSummary` only indexes this
+ * for entries already filtered to `state !== 'settled'`.
+ */
+const UNFINISHED_ENTRY_STATE_LABELS: Readonly<Record<OwnershipEntryState, string>> = {
+  outstanding: 'still running',
+  unknown: 'unconfirmed',
+  settled: 'finished',
+}
+
+/**
+ * Writes the "Background Work" job-summary section reporting what this invocation's
+ * ownership ledger owned and what became of it, naming unfinished executions by label
+ * rather than by count so a reviewer can tell which coverage was lost (plan Unit 13,
+ * R23).
+ *
+ * Deliberately silent (adds nothing) when `ledger` is absent or its snapshot is empty --
+ * a run with no background dispatch, which is every run in production today, must
+ * produce byte-identical output to before this section existed.
+ *
+ * `settled` entries are not listed individually: they cover both a normal completion
+ * and a cancellation the drain's reconciliation pass positively confirmed had stopped --
+ * the ledger does not distinguish the two (see `runDrain`'s `cancelOutstanding` in
+ * `execute.ts`), so nothing here can honestly claim one or the other. `unknown` and any
+ * residual `outstanding` entries are what the drain could not confirm finished; both are
+ * named in the same list (with their state labelled) rather than only reporting a count,
+ * per this unit's goal. A reconciliation-discovered entry keeps its `reconciled` label
+ * as-is -- that is deliberately how a reader tells work this run watched start from work
+ * it found already running (see `ledger-reconcile.ts`'s `RECONCILED_LABEL`).
+ *
+ * `unknown` entries additionally get an explicit degraded-state banner: an entry the
+ * drain could not confirm is neither finished nor cancelled, and folding it silently
+ * into the unfinished list would let that ambiguity go unnoticed by a reader who only
+ * skims for a nonempty list.
+ */
+function writeBackgroundWorkSummary(ledger: OwnershipLedger | undefined): void {
+  if (ledger === undefined) return
+
+  const snapshot = ledger.snapshot()
+  if (snapshot.length === 0) return
+
+  const unfinished = snapshot.filter((entry): entry is OwnershipLedgerEntry => entry.state !== 'settled')
+  const unknownCount = snapshot.filter(entry => entry.state === 'unknown').length
+
+  core.summary.addHeading('Background Work', 3)
+
+  if (unfinished.length === 0) {
+    core.summary.addRaw('All background work finished.\n')
+  } else {
+    core.summary.addRaw('**Did not finish:**\n')
+    core.summary.addList(
+      unfinished.map(entry => {
+        return `${entry.label} (${UNFINISHED_ENTRY_STATE_LABELS[entry.state]})`
+      }),
+    )
+  }
+
+  if (unknownCount > 0) {
+    core.summary.addRaw(
+      `\u26A0\uFE0F **Degraded:** ${unknownCount} ${unknownCount === 1 ? 'entry' : 'entries'} could not be confirmed finished or cancelled; treat any associated changes as unverified.\n`,
+    )
+  }
+}
+
+/**
  * Write comprehensive job summary to GitHub Actions UI.
  *
  * Uses @actions/core summary API to display run metadata, token usage,
  * created artifacts, and errors in the Actions workflow UI.
  * Non-blocking: logs warning on failure but doesn't throw.
  */
-export async function writeJobSummary(options: CommentSummaryOptions, logger: Logger): Promise<void> {
+export async function writeJobSummary(
+  options: CommentSummaryOptions,
+  logger: Logger,
+  ownershipLedger?: OwnershipLedger,
+): Promise<void> {
   const {eventType, repo, ref, runId, runUrl, metrics, agent, resolvedOutputMode, deliveryKind} = options
 
   try {
@@ -249,6 +320,8 @@ export async function writeJobSummary(options: CommentSummaryOptions, logger: Lo
         core.summary.addRaw(`- **${error.type}** (${status}${classification}): ${error.message}\n`)
       }
     }
+
+    writeBackgroundWorkSummary(ownershipLedger)
 
     await core.summary.write()
     logger.debug('Wrote job summary')
