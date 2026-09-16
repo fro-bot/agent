@@ -37,10 +37,53 @@ export interface LeaseController {
    */
   readonly currentEtag: () => string
   /**
-   * Stop the renewal timer and wait for any in-flight tick to settle, so `hasFailed()` and
-   * `currentEtag()` reflect the final state before the caller acts on them. Idempotent.
+   * Stop the renewal timer and wait, up to `STOP_GRACE_PERIOD_MS`, for any in-flight tick to
+   * settle, so `hasFailed()` and `currentEtag()` reflect the final state before the caller acts
+   * on them. A renewal that is still in flight past the grace period is left to finish on its
+   * own (bounded by `RENEWAL_TIMEOUT_MS`) and `stop()` returns anyway -- cleanup's budget takes
+   * priority over an up-to-the-tick `currentEtag()`. In that case `currentEtag()` may be stale,
+   * which makes the caller's conditional release fail safely rather than block. Idempotent.
    */
   readonly stop: () => Promise<void>
+}
+
+/**
+ * Bounds a single lease renewal call -- a remote conditional write with no timeout of its
+ * own. Well under `DEFAULT_HEARTBEAT_INTERVAL_MS` (30s) so a stalled call settles (as a
+ * failure) before the next tick is due, instead of silently skipping ticks forever: `tick()`
+ * refuses to overlap while `inFlight` is unsettled.
+ */
+const RENEWAL_TIMEOUT_MS = 10_000
+
+/**
+ * How long `stop()` waits for an in-flight renewal before giving up and returning anyway.
+ * Short relative to cleanup's overall budget -- it exists to let a normal (sub-second) tick
+ * settle so `currentEtag()` is fresh, not to guarantee freshness unconditionally.
+ */
+const STOP_GRACE_PERIOD_MS = 5_000
+
+async function delay(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    const handle = setTimeout(resolve, ms)
+    handle.unref?.()
+  })
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const handle = setTimeout(() => reject(new Error(message)), timeoutMs)
+    handle.unref?.()
+    promise.then(
+      value => {
+        clearTimeout(handle)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(handle)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
 }
 
 function createLeaseController(
@@ -67,7 +110,11 @@ function createLeaseController(
       run_id: runId,
     }
 
-    inFlight = renewLease(config, repo, lockRecord, currentEtag, logger)
+    inFlight = withTimeout(
+      renewLease(config, repo, lockRecord, currentEtag, logger),
+      RENEWAL_TIMEOUT_MS,
+      `Lease renewal exceeded ${RENEWAL_TIMEOUT_MS}ms`,
+    )
       .then(renewed => {
         if (renewed.success === false) {
           failed = true
@@ -101,7 +148,10 @@ function createLeaseController(
     currentEtag: () => currentEtag,
     stop: async (): Promise<void> => {
       clearInterval(intervalHandle)
-      await inFlight
+      if (inFlight == null) return
+      // A tick still in flight past the grace period is left to finish on its own (bounded by
+      // RENEWAL_TIMEOUT_MS); stop() does not wait for it further.
+      await Promise.race([inFlight, delay(STOP_GRACE_PERIOD_MS)])
     },
   }
 }

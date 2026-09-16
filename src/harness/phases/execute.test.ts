@@ -1184,6 +1184,92 @@ describe('runDrain', () => {
     }
   })
 
+  it('cancels an already-unknown entry at deadline expiry, not only outstanding ones', async () => {
+    // #given an entry already downgraded to unknown (e.g. a prior failed reconciliation
+    // pass) BEFORE the deadline fires — exactly the entry most likely still live.
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      ledger.markUnknown('ses_child')
+      const abort = vi.fn(async () => ({data: {}}))
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status: async () => ({data: {ses_child: {}}}),
+        abort,
+      })
+
+      // #when drain runs past its deadline
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the unknown entry was cancelled, not skipped because it was never
+      // `outstanding`
+      expect(abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'ses_child'}}))
+      expect(outcome.cancelledCount).toBe(1)
+      expect(ledger.snapshot().find(entry => entry.sessionId === 'ses_child')?.state).toBe('unknown')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('includes a child discovered by the final reconciliation pass in the cancel set', async () => {
+    // #given a known outstanding entry keeps drain alive past its deadline. A second
+    // child only becomes visible to `children()` on the LATER call — the final
+    // reconciliation pass cancellation runs right before building the cancel set,
+    // not the earlier passes made during the wait loop.
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_known', 'background task')
+      let childrenCallCount = 0
+      const abort = vi.fn(async () => ({data: {}}))
+      const client = createFakeSessionClient({
+        children: async () => {
+          childrenCallCount += 1
+          return childrenCallCount === 1
+            ? {data: [{id: 'ses_known'}]}
+            : {data: [{id: 'ses_known'}, {id: 'ses_discovered'}]}
+        },
+        status: async () => ({data: {ses_known: {}, ses_discovered: {}}}),
+        abort,
+      })
+
+      // #when drain runs past its deadline; the periodic reconciler's interval is
+      // longer than the deadline so it never fires -- only the unconditional first
+      // pass and the cancel-path's final pass ever call `children()`.
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the newly-discovered child was adopted by the final reconciliation pass
+      // and included in the cancel set -- not silently skipped because it wasn't in
+      // the ledger when an earlier snapshot was taken.
+      expect(abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'ses_discovered'}}))
+      expect(outcome.cancelledCount).toBe(2)
+      expect(ledger.snapshot().find(entry => entry.sessionId === 'ses_discovered')).toBeDefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('marks outstanding entries unknown, rather than claiming drain, when no client is available', async () => {
     // #given a ledger with outstanding work but nothing to reconcile against
     const ledger = createOwnershipLedger()

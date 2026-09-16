@@ -536,14 +536,25 @@ async function cancelOutstanding(options: {
   readonly reconcileOptions: ReconcileLedgerOptions
 }): Promise<DrainOutcome> {
   const {ledger, client, logger, reconcileOptions} = options
-  const outstandingEntries = ledger.snapshot().filter(entry => entry.state === 'outstanding')
 
-  logger.warning('Drain deadline reached — cancelling outstanding owned work; run reports incomplete', {
-    outstanding: outstandingEntries.length,
+  // Final reconciliation pass BEFORE building the cancel set: a child that
+  // started between an earlier snapshot and now (or one only reconciliation
+  // itself can discover) must still be cancelled, not silently skipped because
+  // it wasn't in the ledger yet when an earlier snapshot was taken.
+  await reconcileLedgerOnce(reconcileOptions)
+
+  // Cancel everything not confirmed settled -- outstanding AND unknown. An
+  // `unknown` entry (a dropped event, or every reconciliation attempt so far
+  // failing) is exactly the one most likely still live; it needs the explicit
+  // abort at least as much as an `outstanding` one does.
+  const unsettledEntries = ledger.snapshot().filter(entry => entry.state !== 'settled')
+
+  logger.warning('Drain deadline reached — cancelling unsettled owned work; run reports incomplete', {
+    unsettled: unsettledEntries.length,
   })
 
   await Promise.allSettled(
-    outstandingEntries.map(async entry => {
+    unsettledEntries.map(async entry => {
       if (typeof client.session.abort !== 'function') return
       try {
         // A fresh signal: the execution deadline that just expired must not also
@@ -563,7 +574,7 @@ async function cancelOutstanding(options: {
   // that already went idle is settled (confirmed) rather than left unknown.
   await reconcileLedgerOnce(reconcileOptions)
 
-  const settledCount = outstandingEntries.filter(cancelled => {
+  const settledCount = unsettledEntries.filter(cancelled => {
     const current = ledger.snapshot().find(candidate => candidate.sessionId === cancelled.sessionId)
     return current?.state === 'settled'
   }).length
@@ -573,12 +584,12 @@ async function cancelOutstanding(options: {
   // confirms the child actually stopped (see docs/solutions/logic-errors/
   // submission-failure-does-not-prove-the-work-never-started-2026-08-08.md).
   for (const entry of ledger.snapshot()) {
-    if (entry.state === 'outstanding') ledger.markUnknown(entry.sessionId)
+    if (entry.state !== 'settled') ledger.markUnknown(entry.sessionId)
   }
 
   return {
     expired: true,
-    cancelledCount: outstandingEntries.length,
+    cancelledCount: unsettledEntries.length,
     settledCount,
     unknownCount: ledger.unknown(),
   }

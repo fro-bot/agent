@@ -1,3 +1,5 @@
+import type {OwnershipLedger} from '@fro-bot/runtime'
+import type {LeaseController} from './phases/acquire-lock.js'
 import type {BootstrapPhaseResult} from './phases/bootstrap.js'
 import type {CacheRestorePhaseResult} from './phases/cache-restore.js'
 import type {RoutingPhaseResult} from './phases/routing.js'
@@ -325,7 +327,9 @@ describe('run', () => {
   })
 
   it('drains owned work after execution and strictly before review reconciliation, finalize (publish), and cleanup (prune/shutdown/persist/release)', async () => {
-    // #given a full happy path through every phase up to and past execution
+    // #given a full happy path through every phase up to and past execution, with an
+    // acquired coordination lock so the lease renewal controller has a real identity to
+    // trace into cleanup
     const {runBootstrap} = await import('./phases/bootstrap.js')
     const {runRouting} = await import('./phases/routing.js')
     const {runDedup} = await import('./phases/dedup.js')
@@ -333,17 +337,33 @@ describe('run', () => {
     const {runAcknowledge} = await import('./phases/acknowledge.js')
     const {runCacheRestore} = await import('./phases/cache-restore.js')
     const {runSessionPrep} = await import('./phases/session-prep.js')
-    const {runExecute, runDrain} = await import('./phases/execute.js')
+    const {runExecute, runDrain, computeDrainDeadlineMs} = await import('./phases/execute.js')
     const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
     const {runFinalizeWithResult} = await import('./phases/finalize.js')
     const {runCleanup} = await import('./phases/cleanup.js')
 
     const callOrder: string[] = []
+    // Identity markers, not shapes: the wiring under test is "does the same instance reach
+    // the next phase", which a same-shaped stand-in would not catch.
+    const ledgerInstance = {} as OwnershipLedger
+    const renewalController: LeaseController = {
+      hasFailed: () => false,
+      currentEtag: () => 'lock-etag-renewed',
+      stop: vi.fn().mockResolvedValue(undefined),
+    }
+    // A deliberately arbitrary, non-round value: if `runDrain`'s deadline were ever pinned
+    // to a hardcoded literal instead of derived from `computeDrainDeadlineMs`'s return, this
+    // value would not appear and the assertion below would fail for the right reason.
+    const derivedDeadlineMs = 741_213
 
     vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
     vi.mocked(runRouting).mockResolvedValue(createRouting())
     vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: null})
-    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 's3-disabled'})
+    vi.mocked(runAcquireLock).mockResolvedValue({
+      outcome: 'acquired',
+      lockEtag: 'lock-etag',
+      renewal: renewalController,
+    })
     vi.mocked(runAcknowledge).mockResolvedValue({
       repo: 'owner/repo',
       commentId: null,
@@ -390,8 +410,10 @@ describe('run', () => {
         resolvedOutputMode: 'branch-pr',
         outputModeMigration: {requested: 'omitted', resolved: 'branch-pr'},
         executionDurationMs: 10,
+        ownershipLedger: ledgerInstance,
       }
     })
+    vi.mocked(computeDrainDeadlineMs).mockReturnValue(derivedDeadlineMs)
     vi.mocked(runDrain).mockImplementation(async () => {
       callOrder.push('drain')
       return {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}
@@ -417,5 +439,101 @@ describe('run', () => {
     // ordering-assertion style
     expect(exitCode).toBe(0)
     expect(callOrder).toEqual(['cache-restore', 'execute', 'drain', 'review-reconciliation', 'finalize', 'cleanup'])
+
+    // #then drain receives the same ledger instance execution produced (identity, not shape)
+    // and the parent session id from the execute result -- a regression that dropped either
+    // wire would silently disable drain while this test's ordering assertion stayed green
+    expect(vi.mocked(runDrain)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ledger: ledgerInstance,
+        parentSessionId: 'ses_root',
+      }),
+    )
+
+    // #then drain's deadline is derived through computeDrainDeadlineMs from the remaining
+    // timeout budget, not a hardcoded value -- assert both that the deadline actually used
+    // is the function's return value, and that the function was fed the run's real timeout
+    // and execution-duration inputs
+    expect(vi.mocked(computeDrainDeadlineMs)).toHaveBeenCalledWith(1_000, 10)
+    expect(vi.mocked(runDrain)).toHaveBeenCalledWith(expect.objectContaining({deadlineMs: derivedDeadlineMs}))
+
+    // #then cleanup receives the same ledger instance and the lease controller acquired
+    // during the lock phase -- dropping either would silently disable persistence gating
+    // or lease renewal while every other assertion in this run stayed green
+    expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownershipLedger: ledgerInstance,
+        leaseRenewal: renewalController,
+      }),
+    )
+  })
+
+  it('passes no lease to cleanup when no coordination lock was acquired', async () => {
+    // #given the lock-free path: S3 coordination is disabled, so runAcquireLock never
+    // produces a lease renewal controller
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runRouting} = await import('./phases/routing.js')
+    const {runDedup} = await import('./phases/dedup.js')
+    const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {runAcknowledge} = await import('./phases/acknowledge.js')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {runSessionPrep} = await import('./phases/session-prep.js')
+    const {runExecute} = await import('./phases/execute.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+
+    vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
+    vi.mocked(runRouting).mockResolvedValue(createRouting())
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: null})
+    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 's3-disabled'})
+    vi.mocked(runAcknowledge).mockResolvedValue({
+      repo: 'owner/repo',
+      commentId: null,
+      issueNumber: 42,
+      issueType: 'pr',
+      botLogin: 'fro-bot',
+    })
+    vi.mocked(runCacheRestore).mockResolvedValue({
+      cacheResult: {hit: false, key: 'cache-key', restoredPath: '', corrupted: false, source: 'cache'},
+      cacheStatus: 'miss',
+      serverHandle: {
+        client: {} as CacheRestorePhaseResult['serverHandle']['client'],
+        server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+        shutdown: vi.fn().mockResolvedValue({quiesced: true}),
+      },
+    })
+    vi.mocked(runSessionPrep).mockResolvedValue({
+      recentSessions: [],
+      priorWorkContext: [],
+      attachmentResult: null,
+      normalizedWorkspace: '/workspace',
+      logicalKey: null,
+      continueSessionId: null,
+      isContinuation: false,
+      sessionTitle: null,
+    })
+    vi.mocked(runExecute).mockResolvedValue({
+      success: true,
+      exitCode: 0,
+      sessionId: 'ses_root',
+      error: null,
+      tokenUsage: null,
+      model: null,
+      cost: null,
+      prsCreated: [],
+      commitsCreated: [],
+      commentsPosted: 0,
+      llmError: null,
+      resolvedOutputMode: 'branch-pr',
+      outputModeMigration: {requested: 'omitted', resolved: 'branch-pr'},
+      executionDurationMs: 10,
+    })
+
+    // #when the run executes end to end without ever acquiring a lock
+    const exitCode = await run()
+
+    // #then the run still completes successfully, and cleanup is told explicitly that
+    // there is no lease to renew or release -- it must not fail for want of one it never held
+    expect(exitCode).toBe(0)
+    expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(expect.objectContaining({leaseRenewal: null}))
   })
 })

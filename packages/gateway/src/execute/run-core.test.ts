@@ -13,10 +13,10 @@ import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
 
-import {createOwnershipLedger} from '@fro-bot/runtime'
+import {createOwnershipLedger, DEFAULT_LEDGER_RECONCILE_INTERVAL_MS} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {RunCoreError, runOpenCodeCore} from './run-core.js'
+import {RunCoreError, runOpenCodeCore, wrapLedgerWithHooks} from './run-core.js'
 
 // ---------------------------------------------------------------------------
 // Test-double helpers
@@ -3163,6 +3163,97 @@ describe('runOpenCodeCore', () => {
       expect(lastCall.ownedSessionIds).not.toContain(CHILD)
     })
 
+    it('root idle does not resolve while an entry is unknown, not only while outstanding', async () => {
+      // #given — an entry already downgraded to unknown (e.g. a dropped event or a
+      // failed reconciliation call) BEFORE the root goes idle. `unknown` is not proof
+      // of completion, so root idle must not treat it as done.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      ownershipLedger.markUnknown(CHILD)
+      const {stream, emitNext} = makeControlledStream()
+      const handle = makeHandle({
+        subscribe: async () => Promise.resolve({stream}),
+        sessionChildren: async () => ({data: [], error: null}),
+        sessionStatus: async () => ({data: {}, error: null}),
+      })
+
+      const controller = new AbortController()
+      const params = {...buildParams(handle), coordinator, ownershipLedger, signal: controller.signal}
+      const runPromise = runOpenCodeCore(params)
+
+      let settled = false
+      runPromise
+        .catch(() => {})
+        .finally(() => {
+          settled = true
+        })
+
+      emitNext(sessionIdleEvent('sess-123'))
+
+      // Give every pending microtask/reconcile pass a chance to run.
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // #then — root idle received `ledger.isDrainComplete() === false` (one unknown
+      // entry), so the promise has NOT settled — unlike the pre-fix behaviour, which
+      // ignored `unknown` entirely and would have resolved here.
+      expect(settled).toBe(false)
+
+      // Cleanup: force the deadline so the run resolves and timers don't leak.
+      controller.abort()
+      await expect(runPromise).rejects.toThrow()
+    })
+
+    it('deadline expiry cancels an already-unknown entry, not only outstanding ones', async () => {
+      // #given — fake timers; a short deadline. The child is unknown (not outstanding)
+      // BEFORE the deadline fires — exactly the entry most likely still live, since
+      // `unknown` means a dropped event or a failed reconciliation call, not a
+      // confirmed finish.
+      vi.useFakeTimers()
+      const DEADLINE_MS = 5_000
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      ownershipLedger.markUnknown(CHILD)
+      const {stream, emitNext} = makeControlledStream()
+
+      const abortSpy = vi.fn().mockResolvedValue({data: {}, error: null})
+      const handle = makeHandle({
+        subscribe: async () => Promise.resolve({stream}),
+        sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
+        sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}),
+        sessionAbort: abortSpy,
+      })
+
+      const controller = new AbortController()
+      setTimeout(() => controller.abort(), DEADLINE_MS)
+      const params = {
+        ...buildParams(handle),
+        coordinator,
+        ownershipLedger,
+        signal: controller.signal,
+      }
+
+      let capturedError: unknown
+      const runPromise = runOpenCodeCore(params).catch((error: unknown) => {
+        capturedError = error
+      })
+
+      emitNext(sessionIdleEvent('sess-123'))
+      await vi.advanceTimersByTimeAsync(100) // let the immediate post-idle reconcile land
+
+      // #when — the deadline fires with the child still unknown.
+      await vi.advanceTimersByTimeAsync(DEADLINE_MS + 100)
+      await runPromise
+
+      // #then — drain-timeout, and the unknown entry was explicitly aborted, not skipped
+      // because it was never `outstanding`.
+      expect(capturedError).toBeInstanceOf(RunCoreError)
+      expect((capturedError as RunCoreError).kind).toBe('drain-timeout')
+      expect(abortSpy).toHaveBeenCalledWith(expect.objectContaining({path: {id: CHILD}}))
+      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('unknown')
+    })
+
     it('a run with no ledger behaves exactly as before — the drain path stays inert', async () => {
       // #given — no ownershipLedger provided at all.
       const coordinator = makeCoordinator()
@@ -3185,6 +3276,227 @@ describe('runOpenCodeCore', () => {
       expect(client.session.children).not.toHaveBeenCalled()
       expect(client.session.status).not.toHaveBeenCalled()
       expect(client.session.abort).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('reconciliation-recovered adoption (P1 fix) — the coordinator learns about ledger-only adoptions', () => {
+    const CHILD = 'sess-reconciled-child'
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('a child adopted purely by reconciliation becomes visible to coordinator.isOwned(), and its subsequent tool event is routed rather than dropped', async () => {
+      // #given — fake timers; a child reconciliation discovers via children()+liveSessionIds()
+      // that NEVER arrives via the task-tool-completion event path (simulating a dropped event).
+      vi.useFakeTimers()
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      const {stream, emitNext} = makeControlledStream()
+
+      const handle = makeHandle({
+        subscribe: async () => Promise.resolve({stream}),
+        sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
+        sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}),
+      })
+
+      const sink = makeSink()
+      const controller = new AbortController()
+      const params = {
+        ...buildParams(handle),
+        coordinator,
+        ownershipLedger,
+        sink,
+        signal: controller.signal,
+      }
+      const runPromise = runOpenCodeCore(params)
+
+      // #when — no task-tool-completion event ever fires for CHILD; only the reconciler's
+      // fixed interval discovers and adopts it.
+      expect(coordinator.isOwned(CHILD)).toBe(false)
+      await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
+
+      // #then — the coordinator learned about the reconciliation-recovered child, not just the ledger.
+      expect(coordinator.isOwned(CHILD)).toBe(true)
+      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('outstanding')
+
+      // #and — a subsequent tool event for that child is routed (appended to the sink),
+      // not dropped as foreign the way it would be pre-fix.
+      emitNext(toolCalledEvent('c-1', 'bash', {command: 'npm test'}, CHILD))
+      emitNext(toolSuccessEvent('c-1', null, CHILD))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(sink._appended.some(line => line.includes('npm test'))).toBe(true)
+
+      // Cleanup: abort so the still-outstanding child does not leave the run hanging.
+      controller.abort()
+      await expect(runPromise).rejects.toThrow()
+    })
+
+    it("the Action's use of the reconciliation primitive is unaffected by the gateway's adoption callback (no coordinator exists there)", async () => {
+      // #given — `reconcileLedgerOnce` invoked directly against a bare (unwrapped)
+      // ownership ledger, exactly as `src/harness/phases/execute.ts` (the Action) does —
+      // no gateway, no coordinator, no `wrapLedgerWithHooks` in the call path at all.
+      const {reconcileLedgerOnce} = await import('@fro-bot/runtime')
+      const ledger = createOwnershipLedger()
+      const adapter = {
+        children: async () => ({success: true as const, data: [{id: CHILD}]}),
+        liveSessionIds: async () => ({success: true as const, data: new Set([CHILD])}),
+      }
+      const logger = {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}
+
+      // #when
+      const result = await reconcileLedgerOnce({ledger, adapter, parentSessionId: 'root', logger})
+
+      // #then — adoption still works exactly as before; nothing about the gateway's
+      // coordinator-registration hook is required or referenced by this call path.
+      expect(result.success).toBe(true)
+      expect(ledger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('outstanding')
+    })
+  })
+
+  describe('idempotent ledger calls do not write to the object store (P2 fix)', () => {
+    const CHILD = 'sess-idempotent-child'
+
+    it('a repeated adopt of an already-tracked session fires no persistence write', async () => {
+      // #given — CHILD already adopted before the duplicate task-tool-completion event arrives.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      const {stream, emitNext} = makeControlledStream()
+      const handle = makeHandle({subscribe: async () => Promise.resolve({stream})})
+
+      const onOwnershipChange = vi.fn()
+      const controller = new AbortController()
+      const params = {
+        ...buildParams(handle),
+        coordinator,
+        ownershipLedger,
+        onOwnershipChange,
+        signal: controller.signal,
+      }
+      const runPromise = runOpenCodeCore(params)
+
+      // #when — a duplicate completion notification for the already-tracked child arrives.
+      emitNext(backgroundTaskCompletedEvent(CHILD))
+      await new Promise(resolve => setTimeout(resolve, 10))
+
+      // #then — the idempotent adopt() call fired no persistence write.
+      expect(onOwnershipChange).not.toHaveBeenCalled()
+
+      controller.abort()
+      await expect(runPromise).rejects.toThrow()
+    })
+
+    it('a settle of an already-settled entry fires no persistence write', () => {
+      // #given — a direct unit test of the wrapper itself. Through the real
+      // `runOpenCodeCore` → `reconcileLedgerOnce` integration path, `settle()` can only
+      // ever be called once per entry per genuine transition (see `wrapLedgerWithHooks`'s
+      // doc comment for why that path cannot force a true duplicate deterministically) —
+      // exercising the wrapper directly is the reliable way to prove its no-op branch.
+      const rawLedger = createOwnershipLedger()
+      rawLedger.adopt(CHILD, 'background task')
+      rawLedger.settle(CHILD)
+      const onChange = vi.fn()
+      const onAdopted = vi.fn()
+      const wrapped = wrapLedgerWithHooks(rawLedger, onChange, onAdopted)
+
+      // #when — settle() is called again on an entry that is already settled.
+      wrapped.settle(CHILD)
+
+      // #then — no persistence write for a call that changed nothing.
+      expect(onChange).not.toHaveBeenCalled()
+      expect(rawLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
+    })
+
+    it('a markUnknown of an already-unknown entry fires no persistence write', () => {
+      // #given — same rationale as the settle test above: unit-test the wrapper directly.
+      // This is the path the drain-deadline cancellation loop actually exercises in
+      // practice (`ledger.markUnknown(entry.sessionId)` for every unsettled entry,
+      // including ones already `unknown`).
+      const rawLedger = createOwnershipLedger()
+      rawLedger.adopt(CHILD, 'background task')
+      rawLedger.markUnknown(CHILD)
+      const onChange = vi.fn()
+      const onAdopted = vi.fn()
+      const wrapped = wrapLedgerWithHooks(rawLedger, onChange, onAdopted)
+
+      // #when
+      wrapped.markUnknown(CHILD)
+
+      // #then
+      expect(onChange).not.toHaveBeenCalled()
+      expect(rawLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('unknown')
+    })
+
+    it('a real state change still fires exactly one persistence write', async () => {
+      // #given — CHILD adopted via the observed task-tool-completion path (a genuine,
+      // first-time state transition from "untracked" to "outstanding").
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      const {stream, emitNext} = makeControlledStream()
+      const handle = makeHandle({subscribe: async () => Promise.resolve({stream})})
+
+      const onOwnershipChange = vi.fn()
+      const controller = new AbortController()
+      const params = {
+        ...buildParams(handle),
+        coordinator,
+        ownershipLedger,
+        onOwnershipChange,
+        signal: controller.signal,
+      }
+      const runPromise = runOpenCodeCore(params)
+
+      // #when
+      emitNext(backgroundTaskCompletedEvent(CHILD))
+      await new Promise(resolve => setTimeout(resolve, 10))
+
+      // #then — exactly one persistence write for the one real transition.
+      expect(onOwnershipChange).toHaveBeenCalledExactlyOnceWith({rootSessionId: 'sess-123', ownedSessionIds: [CHILD]})
+
+      controller.abort()
+      await expect(runPromise).rejects.toThrow()
+    })
+
+    it('an unknown entry reaches the persistence hook and appears in persisted run state', async () => {
+      // #given — CHILD adopted (outstanding), then reconciliation observes it as belonging
+      // to no known parent (not a child of this run) and downgrades it to unknown — a real
+      // state transition distinct from the initial adopt.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      const {stream, emitNext} = makeControlledStream()
+      const handle = makeHandle({
+        subscribe: async () => Promise.resolve({stream}),
+        // CHILD is not reported as a child of this parent at all — reconciliation downgrades
+        // any such outstanding entry to unknown (see ledger-reconcile.ts).
+        sessionChildren: async () => ({data: [], error: null}),
+        sessionStatus: async () => ({data: {}, error: null}),
+      })
+
+      const onOwnershipChange = vi.fn()
+      const controller = new AbortController()
+      const params = {
+        ...buildParams(handle),
+        coordinator,
+        ownershipLedger,
+        onOwnershipChange,
+        signal: controller.signal,
+      }
+      const runPromise = runOpenCodeCore(params)
+
+      // #when — root goes idle; ledger is not drain-complete (CHILD outstanding), so an
+      // immediate reconcile pass runs and downgrades CHILD to unknown.
+      emitNext(sessionIdleEvent('sess-123'))
+      await new Promise(resolve => setTimeout(resolve, 20))
+
+      // #then — the transition to unknown reached the persistence hook, and the entry
+      // still appears in persisted ownedSessionIds (unknown is not settled).
+      expect(onOwnershipChange).toHaveBeenCalledWith({rootSessionId: 'sess-123', ownedSessionIds: [CHILD]})
+      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('unknown')
+
+      controller.abort()
+      await expect(runPromise).rejects.toThrow()
     })
   })
 })

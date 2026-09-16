@@ -302,7 +302,7 @@ function isOwnedSession(
   if (eventSessionID === null) return false
   if (eventSessionID === sessionId) return true
   if (ledger === undefined) return false
-  return ledger.snapshot().some(entry => entry.sessionId === eventSessionID)
+  return ledger.isTracked(eventSessionID)
 }
 
 /** A parsed `<task id="..." state="completed|error">` marker from an injected background-task completion turn. */

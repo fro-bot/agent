@@ -134,11 +134,14 @@ describe('reconcileLedgerOnce', () => {
     // #when
     const result = await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger})
 
-    // #then — marked unknown, never settled, never silently dropped to zero
+    // #then — marked unknown, never settled, never silently dropped to zero. An
+    // unknown entry must keep blocking drain, not just persistence: a caller
+    // cannot treat "we lost track of it" as "it must be done" -- the run keeps
+    // draining (bounded by its own deadline) rather than reporting complete.
     expect(result.success).toBe(false)
     expect(ledger.outstanding()).toBe(0)
     expect(ledger.unknown()).toBe(1)
-    expect(ledger.isDrainComplete()).toBe(true)
+    expect(ledger.isDrainComplete()).toBe(false)
     expect(ledger.isPersistenceSafe()).toBe(false)
     expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'unknown'}])
     expect(logger.warning).toHaveBeenCalledWith(
@@ -228,12 +231,13 @@ describe('reconcileLedgerOnce', () => {
     })
 
     // #then — marked unknown: not settled (no positive observation of completion), and not left
-    // outstanding (that would block drain forever on work that was never this parent's).
+    // outstanding (that would block drain forever on work that was never this parent's). Still
+    // blocks drain, same as it blocks persistence -- unknown is unknown either way.
     expect(result.success).toBe(true)
     expect(ledger.snapshot()).toEqual([{sessionId: 'elsewhere-child', label: 'reviewer-subagent', state: 'unknown'}])
     expect(ledger.outstanding()).toBe(0)
     expect(ledger.unknown()).toBe(1)
-    expect(ledger.isDrainComplete()).toBe(true)
+    expect(ledger.isDrainComplete()).toBe(false)
     expect(ledger.isPersistenceSafe()).toBe(false)
   })
 
@@ -314,5 +318,86 @@ describe('createLedgerReconciler', () => {
 
     // #then — no pass ever ran
     expect(ledger.outstanding()).toBe(0)
+  })
+
+  it('skips a tick while a pass is still in flight rather than starting a second pass', async () => {
+    // #given — children() hangs until released, so the first pass never completes on its own
+    let releaseChildren: (() => void) | undefined
+    let childrenCallCount = 0
+    const adapter = makeAdapter({
+      children: async () => {
+        childrenCallCount += 1
+        await new Promise<void>(resolve => {
+          releaseChildren = resolve
+        })
+        return ok([])
+      },
+    })
+    const ledger = createOwnershipLedger()
+    const reconciler = createLedgerReconciler({
+      ledger,
+      adapter,
+      parentSessionId: PARENT_SESSION_ID,
+      logger: makeLogger(),
+      intervalMs: 1000,
+    })
+
+    // #when — the first tick starts a pass and hangs mid-flight
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(childrenCallCount).toBe(1)
+
+    // A second (and third) interval tick elapses while the first pass is still in flight
+    await vi.advanceTimersByTimeAsync(1000)
+    await vi.advanceTimersByTimeAsync(1000)
+
+    // #then — no second call was made; the overlapping ticks were skipped, not stacked
+    expect(childrenCallCount).toBe(1)
+
+    // #and — once the first pass completes, the next tick runs a fresh pass normally
+    releaseChildren?.()
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(childrenCallCount).toBe(2)
+
+    reconciler.dispose()
+  })
+
+  it('dispose() during an in-flight pass does not leave a dangling timer or throw', async () => {
+    // #given — children() hangs until released, so dispose() is called mid-pass
+    let releaseChildren: (() => void) | undefined
+    let childrenCallCount = 0
+    const adapter = makeAdapter({
+      children: async () => {
+        childrenCallCount += 1
+        await new Promise<void>(resolve => {
+          releaseChildren = resolve
+        })
+        return ok([])
+      },
+    })
+    const ledger = createOwnershipLedger()
+    const reconciler = createLedgerReconciler({
+      ledger,
+      adapter,
+      parentSessionId: PARENT_SESSION_ID,
+      logger: makeLogger(),
+      intervalMs: 1000,
+    })
+
+    // #when — the first tick starts a pass and hangs mid-flight, then dispose() is called
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(childrenCallCount).toBe(1)
+    expect(() => reconciler.dispose()).not.toThrow()
+    expect(() => reconciler.dispose()).not.toThrow() // idempotent
+
+    // #then — no further tick fires even though time keeps advancing (timer is cleared)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(childrenCallCount).toBe(1)
+
+    // #and — letting the in-flight pass finally resolve after dispose() does not throw
+    // or resurrect the timer
+    expect(() => releaseChildren?.()).not.toThrow()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(childrenCallCount).toBe(1)
   })
 })

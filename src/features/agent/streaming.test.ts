@@ -211,6 +211,31 @@ describe('processEventStream — ownership ledger integration', () => {
     expect(ledger.snapshot()).not.toContainEqual(expect.objectContaining({sessionId: UNOWNED_SESSION_ID}))
   })
 
+  it('still routes an event from a SETTLED descendant — a late trailing event is not foreign', async () => {
+    // #given a ledger where the child has already settled (e.g. its completion turn was already observed)
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    ledger.settle(CHILD_SESSION_ID)
+    expect(ledger.snapshot()).toContainEqual({sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'settled'})
+    const eventStream = createMockEventStream([messageUpdatedEvent(CHILD_SESSION_ID)])
+
+    // #when a trailing event from that now-settled session arrives
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then it is still attributed to this run, not dropped as foreign — this would fail if
+    // membership meant "still outstanding" instead of "tracked in any state"
+    expect(result.tokens).not.toBeNull()
+  })
+
   it('auto-denies a descendant permission.asked exactly as it does a root one, targeting the descendant session id', async () => {
     // #given a ledger owning an adopted child, and a permission ask from that child
     const ledger = createOwnershipLedger()

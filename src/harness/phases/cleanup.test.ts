@@ -3,7 +3,7 @@ import type {CleanupPhaseOptions} from './cleanup.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {ok} from '../../shared/types.js'
+import {err, ok} from '../../shared/types.js'
 
 vi.mock('@actions/core', () => ({
   saveState: vi.fn(),
@@ -652,5 +652,32 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     // #then release uses the renewed ETag, never the stale acquisition-time one
     expect(lease.stop).toHaveBeenCalledTimes(1)
     expect(releaseLock).toHaveBeenCalledWith(expect.any(Object), 'owner/repo', '"etag-renewed"', expect.any(Object))
+  })
+
+  it('still reaches lock release after a hung renewal, and a failed conditional delete does not throw out of cleanup', async () => {
+    // #given stop() returned after its grace period because the in-flight renewal never
+    // settled -- currentEtag() is therefore stale, so the conditional delete at release
+    // time is expected to fail its precondition (the safe direction: this run may no
+    // longer actually hold the lock)
+    const {releaseLock} = await import('@fro-bot/runtime')
+    vi.mocked(releaseLock).mockResolvedValueOnce(err(new Error('precondition failed')))
+    const lease = createLeaseController({currentEtag: () => '"etag-stale"'})
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs despite the hung renewal
+    await expect(
+      runCleanup(
+        baseOptions({
+          storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+          lockEtag: '"etag-initial"',
+          leaseRenewal: lease,
+        }),
+      ),
+    ).resolves.toBeUndefined()
+
+    // #then release is still attempted with the (stale) etag stop() settled on, and the
+    // failed conditional delete is swallowed -- non-fatal, matching every other release failure
+    expect(lease.stop).toHaveBeenCalledTimes(1)
+    expect(releaseLock).toHaveBeenCalledWith(expect.any(Object), 'owner/repo', '"etag-stale"', expect.any(Object))
   })
 })

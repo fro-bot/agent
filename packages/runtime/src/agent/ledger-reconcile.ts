@@ -186,17 +186,33 @@ export interface CreateLedgerReconcilerOptions extends ReconcileLedgerOptions {
  * dispatch event with no detected discontinuity has nothing else to trigger a
  * re-check — this is the plan's central hazard, and belt-and-braces triggers
  * (subscription, discontinuity) do not cover it.
+ *
+ * Overlap guard: each tick is skipped while a previous pass is still in
+ * flight. `reconcileLedgerOnce` makes two remote calls per pass; if either
+ * slows past `intervalMs`, letting a second pass start would stack concurrent
+ * calls against the same upstream and ledger. A skipped tick is never lost
+ * work — the next tick (or the very next `reconcileLedgerOnce` the pass
+ * finishes with) picks up the current state, and the fixed-cadence interval
+ * (rather than self-rescheduling after each pass) keeps the "one tick per
+ * `intervalMs`, barring overlap" timing callers and tests already rely on.
  */
 export function createLedgerReconciler(options: CreateLedgerReconcilerOptions): LedgerReconciler {
   const {intervalMs = DEFAULT_LEDGER_RECONCILE_INTERVAL_MS, ...reconcileOptions} = options
 
   let disposed = false
+  let inFlight = false
   const handle = setInterval(() => {
     if (disposed) return
-    reconcileLedgerOnce(reconcileOptions).catch(() => {
-      // reconcileLedgerOnce never rejects (all upstream failures are captured as `err`
-      // results and logged internally); this catch exists only to satisfy no-floating-promises.
-    })
+    if (inFlight) return // a previous pass is still running — skip this tick rather than stack.
+    inFlight = true
+    reconcileLedgerOnce(reconcileOptions)
+      .catch(() => {
+        // reconcileLedgerOnce never rejects (all upstream failures are captured as `err`
+        // results and logged internally); this catch exists only to satisfy no-floating-promises.
+      })
+      .finally(() => {
+        inFlight = false
+      })
   }, intervalMs)
 
   return {

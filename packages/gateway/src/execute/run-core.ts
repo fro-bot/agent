@@ -21,7 +21,12 @@
  * replicated locally.
  */
 
-import type {OpenCodeServerHandle, OwnershipLedger, Logger as RuntimeLogger} from '@fro-bot/runtime'
+import type {
+  OpenCodeServerHandle,
+  OwnershipEntryState,
+  OwnershipLedger,
+  Logger as RuntimeLogger,
+} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 
@@ -229,25 +234,88 @@ function toRuntimeLogger(logger: GatewayLogger): RuntimeLogger {
   }
 }
 
+/** Snapshot of every tracked entry's state, keyed by session id — the comparison basis for detecting a genuine mutation. */
+function snapshotStates(ledger: OwnershipLedger): ReadonlyMap<string, OwnershipEntryState> {
+  return new Map(ledger.snapshot().map(entry => [entry.sessionId, entry.state]))
+}
+
+function statesEqual(
+  before: ReadonlyMap<string, OwnershipEntryState>,
+  after: ReadonlyMap<string, OwnershipEntryState>,
+): boolean {
+  if (before.size !== after.size) return false
+  for (const [sessionId, state] of before) {
+    if (after.get(sessionId) !== state) return false
+  }
+  return true
+}
+
 /**
  * Wrap an `OwnershipLedger` so every mutating call also fires `onChange` —
  * used to persist ownership onto run state and to re-check drain completion
  * after every adopt/settle/markUnknown, regardless of whether the mutation
  * came from an observed dispatch event or a reconciliation pass (both go
  * through this wrapper since reconciliation is handed the wrapped instance).
+ *
+ * `onChange` (and, for `adopt`, `onAdopted`) only fires when the mutation
+ * actually changed the ledger's tracked state. All three mutators are
+ * idempotent by contract (`adopt` on an already-tracked id, `settle` on a
+ * missing or already-settled entry, `markUnknown` on a missing/settled/
+ * already-unknown entry are all no-ops) — firing on those calls would mean a
+ * duplicate event or a repeated reconciliation pass triggers a redundant
+ * remote persistence write for state that did not move. Comparing the full
+ * per-session state snapshot (not just membership) is required, not just an
+ * optimization: an `outstanding` → `unknown` transition keeps the session in
+ * the ledger the whole time, so a membership-only comparison would miss it,
+ * but it IS a real state change that must reach `onChange` so the unknown
+ * entry is persisted.
+ *
+ * `onAdopted` is the gateway's hook point for registering a reconciliation-
+ * recovered child with `coordinator.addOwnedSession` — see `runOpenCodeCore`.
+ * It intentionally lives here, at the gateway's existing ledger-wrapping
+ * boundary, rather than as a callback threaded through `reconcileLedgerOnce`
+ * in `@fro-bot/runtime`: that primitive is shared with the Action, which has
+ * no coordinator concept at all, and every ledger mutation — whether from the
+ * observed `task`-tool-completion path or a reconciliation pass — already
+ * flows through this single wrapper (reconciliation is handed the wrapped
+ * ledger instance). Adding a gateway-only hook here keeps the runtime
+ * primitive free of gateway concepts and leaves the Action's direct,
+ * unwrapped use of `createLedgerReconciler`/`reconcileLedgerOnce` untouched.
+ *
+ * Exported for direct unit testing of the no-op detection: through the real
+ * `runOpenCodeCore` → `reconcileLedgerOnce` path, `settle`/`markUnknown` can
+ * only ever be called once per entry per genuine transition (the reconcile
+ * loop snapshots once and skips non-outstanding/non-unknown entries), so a
+ * true duplicate call cannot be forced deterministically through that
+ * integration path — exercising this wrapper directly is the only reliable
+ * way to prove the no-op branch itself.
  */
-function wrapLedgerWithHooks(ledger: OwnershipLedger, onChange: () => void): OwnershipLedger {
+export function wrapLedgerWithHooks(
+  ledger: OwnershipLedger,
+  onChange: () => void,
+  onAdopted: (sessionId: string) => void,
+): OwnershipLedger {
   return {
     adopt: (sessionId, label) => {
+      const before = snapshotStates(ledger)
       ledger.adopt(sessionId, label)
+      const after = snapshotStates(ledger)
+      if (statesEqual(before, after)) return
+      onAdopted(sessionId)
       onChange()
     },
     settle: sessionId => {
+      const before = snapshotStates(ledger)
       ledger.settle(sessionId)
+      const after = snapshotStates(ledger)
+      if (statesEqual(before, after)) return
       onChange()
     },
     markUnknown: sessionId => {
+      const before = snapshotStates(ledger)
       ledger.markUnknown(sessionId)
+      const after = snapshotStates(ledger)
+      if (statesEqual(before, after)) return
       onChange()
     },
     outstanding: () => ledger.outstanding(),
@@ -255,6 +323,7 @@ function wrapLedgerWithHooks(ledger: OwnershipLedger, onChange: () => void): Own
     isDrainComplete: () => ledger.isDrainComplete(),
     isPersistenceSafe: () => ledger.isPersistenceSafe(),
     snapshot: () => ledger.snapshot(),
+    isTracked: sessionId => ledger.isTracked(sessionId),
   }
 }
 
@@ -368,6 +437,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     )
   }
 
+  // Captured into its own binding immediately after the narrowing check above: `coordinator`
+  // is narrowed to non-undefined here, but that narrowing does not carry across the function
+  // boundary of a nested function/arrow callback (e.g. the ledger's `onAdopted` hook below, or
+  // `isOwnedSession` further down) — this binding does.
+  const ownershipCoordinator: PermissionCoordinator = coordinator
+
   // ── 0b. Inactivity timer setup ─────────────────────────────────────────────
   // When inactivityTimeoutMs is set (>0), the shared `createInactivityTimer` primitive
   // arms a timeout that fires after the configured window of silence. It is reset on
@@ -472,10 +547,19 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   const ledger: OwnershipLedger | undefined =
     ownershipLedger === undefined
       ? undefined
-      : wrapLedgerWithHooks(ownershipLedger, () => {
-          persistOwnership()
-          checkDrainComplete()
-        })
+      : wrapLedgerWithHooks(
+          ownershipLedger,
+          () => {
+            persistOwnership()
+            checkDrainComplete()
+          },
+          // A reconciliation-recovered child must become visible to event routing
+          // (`coordinator.isOwned`) exactly as a directly-observed dispatch does —
+          // otherwise its tool events and permission asks are dropped as foreign.
+          // `reconcileLedgerOnce` is handed this wrapped ledger (below), so its
+          // adoptions reach this hook the same way the task-tool-completion path does.
+          adoptedSessionId => ownershipCoordinator.addOwnedSession(adoptedSessionId),
+        )
 
   const reconcileAdapter = ledger === undefined ? undefined : createSdkLedgerReconcileAdapter(client)
   const runtimeLogger = ledger === undefined ? undefined : toRuntimeLogger(logger)
@@ -593,12 +677,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // different run's tree. This is the boundary that keeps a stranger's tool
   // calls, approvals, and activity out of this run's handling: widening it
   // to every workspace session would route a stranger's approval into this
-  // run's Discord thread.
-  // Captured into its own binding: `coordinator` is narrowed to non-undefined by the
-  // pre-flight check above, but that narrowing does not carry across the function
-  // boundary of a nested `function` declaration — this binding does.
-  const ownershipCoordinator: PermissionCoordinator = coordinator
-
+  // run's Discord thread. Uses the `ownershipCoordinator` binding captured
+  // near the top of this function (see its comment for why a separate
+  // binding is needed at all).
   function isOwnedSession(eventSessionID: string | null): boolean {
     return eventSessionID !== null && ownershipCoordinator.isOwned(eventSessionID)
   }
@@ -682,10 +763,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
               // Background dispatch observed: a `task` tool call completes immediately
               // once dispatch begins, carrying `metadata.background === true` and
               // `metadata.jobId` (the child session id) -- see upstream `tool/task.ts`.
-              // Adopt the child into the ledger and register it as owned so its own
-              // events and approvals route from here on. Admission (whether the
-              // dispatch was allowed to start) is a separate concern this call site
-              // does not own -- by the time this event arrives the dispatch already ran.
+              // Adopt the child into the ledger; the wrapped ledger's `onAdopted` hook
+              // (see `wrapLedgerWithHooks`) registers it with the coordinator so its own
+              // events and approvals route from here on -- the same hook reconciliation-
+              // recovered adoptions go through, so there is a single adoption->ownership
+              // path rather than two. Admission (whether the dispatch was allowed to
+              // start) is a separate concern this call site does not own -- by the time
+              // this event arrives the dispatch already ran.
               if (ledger !== undefined && status === 'completed' && tool === 'task') {
                 const stateMetadata = getObjectProperty(toolState, 'metadata')
                 const jobId = getStringProperty(stateMetadata, 'jobId')
@@ -693,7 +777,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                 if (jobId !== null && isBackground === true) {
                   const label = stateTitle ?? 'background task'
                   ledger.adopt(jobId, label)
-                  ownershipCoordinator.addOwnedSession(jobId)
                   logger.info(
                     {sessionId, jobId, label},
                     'run-core: background dispatch observed -- adopted into ownership ledger',
@@ -899,16 +982,20 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     if (ledger !== undefined && draining === true) {
       // The run's own deadline covers execution AND drain — there is no
       // separate drain budget to extend, and a completion notification never
-      // resets `combinedSignal`. Cancel every still-outstanding entry
-      // individually (a completed entry linking to a running one is never the
-      // gateway's problem at depth one, but cancelling per-entry rather than a
-      // single tree-cancel means raising the depth later does not silently
-      // reintroduce that gap). Each entry is downgraded to `unknown` — the
-      // cancellation request was sent, but nothing here confirms the child
-      // actually stopped, so `unknown` (not `settled`) is the honest state.
-      const outstandingEntries = ledger.snapshot().filter(entry => entry.state === 'outstanding')
+      // resets `combinedSignal`. Cancel every entry that is not confirmed
+      // settled — outstanding AND unknown — individually (a completed entry
+      // linking to a running one is never the gateway's problem at depth one,
+      // but cancelling per-entry rather than a single tree-cancel means raising
+      // the depth later does not silently reintroduce that gap). An `unknown`
+      // entry is exactly the one most likely still live (a dropped event or a
+      // failed reconciliation call, not a confirmed finish) — it needs the
+      // explicit abort at least as much as an `outstanding` one does. Each
+      // entry is downgraded to `unknown` — the cancellation request was sent,
+      // but nothing here confirms the child actually stopped, so `unknown`
+      // (not `settled`) is the honest state.
+      const unsettledEntries = ledger.snapshot().filter(entry => entry.state !== 'settled')
       await Promise.allSettled(
-        outstandingEntries.map(async entry => {
+        unsettledEntries.map(async entry => {
           try {
             await client.session.abort({
               path: {id: entry.sessionId},
@@ -925,8 +1012,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         }),
       )
       logger.warn(
-        {sessionId, cancelledCount: outstandingEntries.length, totalEvents, activityEvents},
-        'run-core: drain deadline expired — cancelled outstanding owned work, run reports incomplete',
+        {sessionId, cancelledCount: unsettledEntries.length, totalEvents, activityEvents},
+        'run-core: drain deadline expired — cancelled unsettled owned work, run reports incomplete',
       )
       throw new RunCoreError('drain-timeout', 'Run timed out while draining outstanding owned work')
     }

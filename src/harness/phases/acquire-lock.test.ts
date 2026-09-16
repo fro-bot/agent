@@ -321,4 +321,59 @@ describe('runAcquireLock lease renewal (plan Unit 12)', () => {
     // #then no renewal call was ever made
     expect(renewLeaseMock).not.toHaveBeenCalled()
   })
+
+  it('stop() returns within its grace period when a renewal is hung', async () => {
+    // #given a renewal call that never settles (e.g. a stalled network request)
+    renewLeaseMock.mockReturnValue(new Promise(() => {}))
+    const storeConfig = createStoreConfig()
+    const result = await runAcquireLock({
+      storeConfig,
+      repo: 'fro-bot/agent',
+      runId: '4444',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    if (result.outcome !== 'acquired') throw new Error('expected acquired outcome')
+
+    // #when the renewal interval fires, starting the hung tick
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(renewLeaseMock).toHaveBeenCalledTimes(1)
+
+    // #and stop() is called while that tick is still in flight
+    const stopPromise = result.renewal.stop()
+
+    // #then stop() settles at its own grace period (5s) -- well before the renewal's own
+    // 10s timeout would otherwise bound it -- so cleanup never blocks on a stalled call
+    await vi.advanceTimersByTimeAsync(5_000)
+    await expect(stopPromise).resolves.toBeUndefined()
+  })
+
+  it('a renewal that exceeds its own timeout marks the controller failed', async () => {
+    // #given a renewal call that never settles
+    renewLeaseMock.mockReturnValue(new Promise(() => {}))
+    const storeConfig = createStoreConfig()
+    const result = await runAcquireLock({
+      storeConfig,
+      repo: 'fro-bot/agent',
+      runId: '5555',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    if (result.outcome !== 'acquired') throw new Error('expected acquired outcome')
+
+    // #when the renewal interval fires
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #then hasFailed() is still false -- the renewal's own timeout has not elapsed yet
+    expect(result.renewal.hasFailed()).toBe(false)
+
+    // #when the renewal's own timeout (10s) elapses without the call settling
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    // #then the timed-out renewal is treated as a failure, same as a rejected/failed tick --
+    // this is exactly the case where a caller about to persist state must decline
+    expect(result.renewal.hasFailed()).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(5_000)
+  })
 })

@@ -85,15 +85,18 @@ describe('createOwnershipLedger', () => {
     expect(ledger.isPersistenceSafe()).toBe(false)
   })
 
-  it('integration: a ledger with one unknown and zero outstanding reports drain-complete but persistence-unsafe', () => {
-    // #given — one entry resolved to unknown, nothing outstanding
+  it('integration: a ledger with one unknown and zero outstanding reports neither drain-complete nor persistence-safe', () => {
+    // #given — one entry resolved to unknown, nothing outstanding. An unknown
+    // entry might still be a live writer, so it must block drain the same way
+    // it blocks persistence -- not knowing is a reason to keep waiting, and
+    // the deadline (not this predicate) is what bounds that wait.
     const ledger = createOwnershipLedger()
     ledger.adopt('session-1', 'reviewer-subagent')
     ledger.markUnknown('session-1')
 
     // #when / #then
     expect(ledger.outstanding()).toBe(0)
-    expect(ledger.isDrainComplete()).toBe(true)
+    expect(ledger.isDrainComplete()).toBe(false)
     expect(ledger.isPersistenceSafe()).toBe(false)
   })
 
@@ -136,6 +139,24 @@ describe('createOwnershipLedger', () => {
     // #then
     expect(ledger.unknown()).toBe(0)
     expect(ledger.isPersistenceSafe()).toBe(true)
+  })
+
+  it('isTracked is true for an entry in every state, and false for an unknown session id', () => {
+    // #given three sessions, one in each state, and a fourth session never adopted
+    const ledger = createOwnershipLedger()
+    ledger.adopt('session-outstanding', 'reviewer-subagent')
+    ledger.adopt('session-unknown', 'linter-subagent')
+    ledger.markUnknown('session-unknown')
+    ledger.adopt('session-settled', 'formatter-subagent')
+    ledger.settle('session-settled')
+
+    // #when / #then — tracked regardless of state
+    expect(ledger.isTracked('session-outstanding')).toBe(true)
+    expect(ledger.isTracked('session-unknown')).toBe(true)
+    expect(ledger.isTracked('session-settled')).toBe(true)
+
+    // #then — a session never adopted is not tracked
+    expect(ledger.isTracked('session-never-adopted')).toBe(false)
   })
 
   it('isDrainComplete and isPersistenceSafe agree when the ledger is fully settled', () => {
