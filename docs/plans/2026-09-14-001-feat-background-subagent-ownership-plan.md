@@ -24,7 +24,7 @@ See origin: `docs/brainstorms/2026-09-13-opencode-background-subagents-requireme
 
 ## Requirements Trace
 
-R3–R24 of the origin document. R1 and R2 (the file watcher) shipped separately and are not in scope.
+Scope only — not a completion claim. R3–R24 of the origin document map to the units below; see [Requirement Status](#requirement-status) for per-requirement verdicts. R1 and R2 (the file watcher) shipped separately and are not in scope.
 
 - R3–R8. Ownership ledger, descendant event handling, retry survival, unknown-not-zero, subscription readiness, discontinuity handling
 - R9–R11. Descendant approval routing, tree-aware activity, run ownership through drain
@@ -32,6 +32,42 @@ R3–R24 of the origin document. R1 and R2 (the file watcher) shipped separately
 - R13–R15. Dispatch caps, pre-execution enforcement, no dispatch after finalization — **cut**, see Scope Boundaries
 - R16–R22a. Drain before terminal steps, every terminal path, single deadline, expiry behaviour, confirmed cancellation, publication ownership, persistence declining, lock lease
 - R23–R24. Labelled reporting, gateway startup reconciliation
+
+## Requirement Status
+
+Unit checkboxes below record artifact existence, not requirement completion — two review rounds surfaced units whose artifacts existed but whose stated requirements were not fully met. A full audit checked every requirement against the code; this table is authoritative for completion. A ticked unit claims only that all of its requirements are `shipped`.
+
+| Requirement | Status | Note |
+|---|---|---|
+| R1 | out of scope | Shipped separately (PR #1608, file watcher). |
+| R2 | out of scope | Shipped separately (PR #1608, file watcher). |
+| R3 | partial | Ledger is keyed on child session id and idempotent; the extension and promotion paths have no implementation, and no promotion path exists at all. |
+| R4 | shipped | Descendant events are handled and unowned sessions are rejected, on both surfaces. |
+| R5 | partial | Ownership survives retry by refusing to retry until drain-complete, not by cancelling or settling the prior tree; no gateway retry path exists. |
+| R6 | partial | Holds for tracked entries, which resolve to unknown and never zero; an unobserved dispatch reads as zero, indistinguishable from "no work dispatched." |
+| R7 | partial | Subscription is ordered before submission on both surfaces, but neither confirms it is live; no readiness handshake exists. |
+| R8 | partial | Unknown resolution and bounded cancellation ship; a discontinuity is recorded but never converted into an incomplete outcome, so polling can still report success (the gateway raises `stream-ended` on early stream close). |
+| R9 | partial | Implemented and ownership-gated, but unexercised — nothing in this codebase issues a background dispatch today. |
+| R10 | partial | Descendant activity resets inactivity, but the run's busy projection is set false on entering drain; the per-request registry also cannot stop upstream from settling every pending approval when one is rejected. |
+| R11 | shipped | Gateway retains slot, lease, and approval routing until drain completes. |
+| R12 | shipped | Subagent depth pinned to one; upstream enforces ancestry. |
+| R13 | cut | See Scope Boundaries. |
+| R14 | cut | See Scope Boundaries. |
+| R15 | cut | See Scope Boundaries; nothing replaces the dispatch-refusal safety clause — stream shutdown after the abort signal is not a dispatch refusal, so a dispatch during finalization is unlikely but not structurally prevented. |
+| R16 | shipped | Drain precedes finalization, pruning, shutdown, persistence, and lock release. |
+| R16a | shipped | Every named terminal path gates on outstanding work. |
+| R17 | partial | One fixed execution deadline is never extended, but execution and drain do not share it — drain receives a derived remaining budget after execution returns. |
+| R18 | partial | Stop-admission, cancellation, and a separate teardown signal ship; no drain-path approval settlement exists, and expiry is not propagated into the invocation result. |
+| R19 | shipped | An unacknowledged `session.abort` is not treated as confirmation; unconfirmed entries become unknown. |
+| R19a | partial | Persistence correctly declines, but the run still finalizes, publishes, writes the dedup marker, emits a success reaction, and exits 0. |
+| R20 | shipped | Harness owns publication; no background-child publication path exists. |
+| R21 | shipped | Persistence declines on unresolved ownership or unconfirmed server quiescence, independent of lock ownership. |
+| R22 | partial | Renewal spans execution, drain, and persistence and protects persistence, but does not fail the invocation closed, and `hasFailed()` reflects only the latest tick. |
+| R22a | shipped | No-lock behaviour stays fail-open as specified. |
+| R23 | partial | Labels and the degraded-state note land in the job summary only; the invocation's published response carries no unfinished-work labels (see Unit 13). |
+| R24 | partial | Reconciliation and cancel-or-unknown ship; nothing gates admission on reconciliation completing, so a run can reach `PENDING` and only later collide with the durable lock. |
+
+**Cross-cutting finding.** Three independent paths — drain expiry with unknown work, stream discontinuity, and lease-renewal failure — each detect a safety condition, log it, and then fail to propagate it into the run's reported outcome: the run still publishes, dedups, reacts success, and exits 0. The dedup marker is the sharpest edge, because a deduped incomplete run is never retried. Fixing this is code work, not a documentation change, and it is a prerequisite for the release gate (Unit 14).
 
 ## Scope Boundaries
 
@@ -191,11 +227,13 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 ### Phase 1 — Shared primitive
 
-- [x] **Unit 1: Ownership ledger**
+- [ ] **Unit 1: Ownership ledger**
 
 **Goal:** A reusable ledger that records the executions an invocation owns and settles each exactly once.
 
 **Requirements:** R3, R6
+
+**Status:** Unticked — R3 and R6 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** None
 
@@ -251,11 +289,13 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Verification:**
 - A generated config carries the depth pin, and nothing in this project re-implements a depth check against it.
 
-- [x] **Unit 3: Ledger reconciliation**
+- [ ] **Unit 3: Ledger reconciliation**
 
 **Goal:** The ledger recovers from events it never saw.
 
 **Requirements:** R6 (tracked entries only), R8
+
+**Status:** Unticked — R6 and R8 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1
 
@@ -295,11 +335,13 @@ That gap is also why R6 above is scoped to tracked entries. A live child this le
 
 ### Phase 2 — Gateway
 
-- [x] **Unit 4: Descendant event handling and approval routing**
+- [ ] **Unit 4: Descendant event handling and approval routing**
 
 **Goal:** Events from owned descendant sessions reach the gateway's handlers, and their approvals reach the existing coordinator.
 
 **Requirements:** R4, R9, R10
+
+**Status:** Unticked — R9 and R10 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1
 
@@ -330,11 +372,13 @@ That gap is also why R6 above is scoped to tracked entries. A live child this le
 **Verification:**
 - A descendant tool call passes the same fail-closed gate a foreground call does.
 
-- [x] **Unit 5: Undeliverable approval auto-rejects**
+- [ ] **Unit 5: Undeliverable approval auto-rejects**
 
 **Goal:** A descendant whose approval notification cannot be delivered is refused rather than left waiting.
 
 **Requirements:** R9
+
+**Status:** Unticked — R9 is partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 4
 
@@ -357,11 +401,13 @@ That gap is also why R6 above is scoped to tracked entries. A live child this le
 **Verification:**
 - No descendant waits on an approval that reached nobody, and a delivery-failure rejection is visible to an operator rather than indistinguishable from a deliberate denial.
 
-- [x] **Unit 6: Hold the run through drain**
+- [ ] **Unit 6: Hold the run through drain**
 
 **Goal:** The gateway keeps its slot, lease, and approval routing until owned work settles.
 
 **Requirements:** R11, R16, R17, R18
+
+**Status:** Unticked — R17 and R18 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 4
 
@@ -390,11 +436,13 @@ That gap is also why R6 above is scoped to tracked entries. A live child this le
 **Verification:**
 - No two runs hold the same workspace concurrently, and no draining run is swept as stale.
 
-- [x] **Unit 7: Startup reconciliation**
+- [ ] **Unit 7: Startup reconciliation**
 
 **Goal:** A restarted gateway reconciles owned work surviving in the workspace server before admitting anything that would conflict.
 
 **Requirements:** R24
+
+**Status:** Unticked — R24 is partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 3
 
@@ -423,11 +471,13 @@ That gap is also why R6 above is scoped to tracked entries. A live child this le
 
 ### Phase 3 — Action
 
-- [x] **Unit 8: Descendant event handling and ledger integration**
+- [ ] **Unit 8: Descendant event handling and ledger integration**
 
 **Goal:** The Action observes owned descendant sessions and records dispatches as they occur.
 
 **Requirements:** R4, R7, R8
+
+**Status:** Unticked — R7 and R8 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 3
 
@@ -486,11 +536,13 @@ That gap is also why R6 above is scoped to tracked entries. A live child this le
 **Verification:**
 - Each of the four paths has a test proving it declines while work is outstanding.
 
-- [x] **Unit 10: Drain before finalize**
+- [ ] **Unit 10: Drain before finalize**
 
 **Goal:** Owned work settles before the Action publishes, persists, or releases anything.
 
 **Requirements:** R16, R17, R18, R19, R19a
+
+**Status:** Unticked — R17, R18, and R19a are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 9
 
@@ -516,11 +568,13 @@ That gap is also why R6 above is scoped to tracked entries. A live child this le
 **Verification:**
 - An ordering assertion pins drain ahead of finalize, matching the existing style in `cleanup.test.ts`.
 
-- [x] **Unit 11: Ownership through retry and overflow**
+- [ ] **Unit 11: Ownership through retry and overflow**
 
 **Goal:** Replacing a session does not orphan the work the previous one owned.
 
 **Requirements:** R5
+
+**Status:** Unticked — R5 is partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 10
 
@@ -550,11 +604,13 @@ That gap is also why R6 above is scoped to tracked entries. A live child this le
 **Verification:**
 - A test proves the archived session has no outstanding work once recovery begins.
 
-- [x] **Unit 12: Publication, persistence, and lease**
+- [ ] **Unit 12: Publication, persistence, and lease**
 
 **Goal:** One response, no persistence over unconfirmed writers, and a lease that lasts the protected interval.
 
 **Requirements:** R19a, R20, R21, R22, R22a
+
+**Status:** Unticked — R19a and R22 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 10
 
