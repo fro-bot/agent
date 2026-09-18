@@ -37,6 +37,8 @@ Scope only — not a completion claim. R3–R24 of the origin document map to th
 
 Unit checkboxes below record artifact existence, not requirement completion — two review rounds surfaced units whose artifacts existed but whose stated requirements were not fully met. A full audit checked every requirement against the code; this table is authoritative for completion. A ticked unit claims only that all of its requirements are `shipped`.
 
+One split runs through several rows and is worth reading first, because the requirements were written as though it did not exist. The Action has two response-delivery paths (`packages/runtime/src/agent/response-delivery.ts`). On the **file-convention** path the harness posts, so it can sequence publication against drain and own the one-response rule. On the **`model-gh`** path — `schedule` and `workflow_dispatch` — the model posts its own response with `gh` during Execute, before drain has run and outside harness control. Requirements phrased as "the harness owns publication" or "drain completes before anything publishes" therefore hold on one path and not the other, and are marked `partial` for that reason rather than because the file-convention implementation is incomplete.
+
 | Requirement | Status | Note |
 |---|---|---|
 | R1 | out of scope | Shipped separately (PR #1608, file watcher). |
@@ -54,13 +56,13 @@ Unit checkboxes below record artifact existence, not requirement completion — 
 | R13 | cut | See Scope Boundaries. |
 | R14 | cut | See Scope Boundaries. |
 | R15 | cut | See Scope Boundaries; nothing replaces the dispatch-refusal safety clause — stream shutdown after the abort signal is not a dispatch refusal, so a dispatch during finalization is unlikely but not structurally prevented. |
-| R16 | shipped | Drain precedes finalization, pruning, shutdown, persistence, and lock release. |
+| R16 | partial | Holds on the file-convention path: drain precedes finalization, pruning, shutdown, persistence, and lock release. Not on `model-gh` (`schedule`, `workflow_dispatch`), where the model posts its own response with `gh` during Execute — `runDrain()` only starts after `runExecute()` returns, so that response publishes before drain. |
 | R16a | partial | The gate exists at each named path, but no test isolates it as load-bearing: the completed-assistant test is independently blocked by busy status until after the ledger settles, and the racing-fixture test is rejected for a missing finish reason before the ledger check is reached. |
 | R17 | partial | One fixed execution deadline is never extended, but execution and drain do not share it — drain receives a derived remaining budget after execution returns. |
 | R18 | partial | Stop-admission, cancellation, and a separate teardown signal ship; no drain-path approval settlement exists, and expiry is not propagated into the invocation result. |
 | R19 | partial | Reconciliation also settles an entry on corroborated absence from the live (non-idle) status map (`ledger-reconcile.ts:198-200`) — a third signal the requirement does not name. Absence from that map confirms the session went idle, not that it terminated; upstream removes idle sessions from the map on their own. |
 | R19a | partial | Persistence correctly declines, but the run still finalizes, publishes, writes the dedup marker, emits a success reaction, and exits 0. |
-| R20 | shipped | Harness owns publication; no background-child publication path exists. |
+| R20 | partial | Holds on the file-convention path, where the harness posts. On `model-gh` the model owns publication, so nothing structurally prevents a credentialed descendant from posting, and finalize accepts any positive comment count rather than proving a single harness-owned publisher. |
 | R21 | shipped | Persistence declines on unresolved ownership or unconfirmed server quiescence, independent of lock ownership. |
 | R22 | partial | Renewal spans execution, drain, and persistence and protects persistence, but does not fail the invocation closed, and `hasFailed()` reflects only the latest tick. |
 | R22a | shipped | No-lock behaviour stays fail-open as specified. |
