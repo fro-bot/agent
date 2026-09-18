@@ -9,9 +9,11 @@ import {
   acknowledgeReceipt,
   addEyesReaction,
   addWorkingLabel,
+  applyTerminalReaction,
   completeAcknowledgment,
   removeWorkingLabel,
   updateReactionOnFailure,
+  updateReactionOnIncomplete,
   updateReactionOnSuccess,
 } from './reactions.js'
 
@@ -285,6 +287,87 @@ describe('updateReactionOnFailure', () => {
       comment_id: 456,
       content: 'confused',
     })
+  })
+})
+
+describe('updateReactionOnIncomplete', () => {
+  let mockLogger: Logger
+  let mockOctokit: Octokit
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
+    vi.clearAllMocks()
+  })
+
+  it('removes eyes reaction and adds no terminal reaction', async () => {
+    // #given an eyes reaction from acknowledgment
+    vi.mocked(mockOctokit.rest.reactions.listForIssueComment).mockResolvedValue({
+      data: [{id: 999, content: 'eyes', user: {login: 'fro-bot[bot]'}}],
+    } as never)
+    const ctx = createMockReactionContext({commentId: 789, botLogin: 'fro-bot[bot]'})
+
+    // #when
+    await updateReactionOnIncomplete(mockOctokit, ctx, mockLogger)
+
+    // #then eyes is removed, but neither hooray nor confused is added -- this invocation
+    // cannot certify completion, so neither an endorsement nor a failure report is honest
+    expect(mockOctokit.rest.reactions.deleteForIssueComment).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      comment_id: 789,
+      reaction_id: 999,
+    })
+    expect(mockOctokit.rest.reactions.createForIssueComment).not.toHaveBeenCalled()
+  })
+
+  it('skips when commentId or botLogin is null', async () => {
+    // #given
+    const ctx = createMockReactionContext({commentId: null, botLogin: 'bot'})
+
+    // #when
+    await updateReactionOnIncomplete(mockOctokit, ctx, mockLogger)
+
+    // #then
+    expect(mockOctokit.rest.reactions.listForIssueComment).not.toHaveBeenCalled()
+    expect(mockLogger.debug).toHaveBeenCalled()
+  })
+})
+
+describe('applyTerminalReaction', () => {
+  let mockLogger: Logger
+  let mockOctokit: Octokit
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
+    vi.clearAllMocks()
+    vi.mocked(mockOctokit.rest.reactions.listForIssueComment).mockResolvedValue({data: []} as never)
+  })
+
+  it.each([
+    ['succeeded', 'hooray'],
+    ['failed', 'confused'],
+  ] as const)('projects %s onto the %s reaction', async (outcome, content) => {
+    // #given
+    const ctx = createMockReactionContext()
+
+    // #when
+    await applyTerminalReaction(mockOctokit, ctx, outcome, mockLogger)
+
+    // #then
+    expect(mockOctokit.rest.reactions.createForIssueComment).toHaveBeenCalledWith(expect.objectContaining({content}))
+  })
+
+  it("projects incomplete onto no terminal reaction (only the transient 'eyes' is removed)", async () => {
+    // #given
+    const ctx = createMockReactionContext()
+
+    // #when
+    await applyTerminalReaction(mockOctokit, ctx, 'incomplete', mockLogger)
+
+    // #then
+    expect(mockOctokit.rest.reactions.createForIssueComment).not.toHaveBeenCalled()
   })
 })
 

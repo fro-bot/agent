@@ -144,6 +144,8 @@ function createExecution(overrides: Partial<ExecutePhaseResult> = {}): ExecutePh
       requested: 'explicit',
       resolved: 'branch-pr',
     },
+    observationGap: false,
+    recoveryBoundaryUnresolved: false,
     executionDurationMs: 0,
     ...overrides,
   }
@@ -753,6 +755,39 @@ describe('runFinalize file-convention delivery', () => {
       expect.anything(),
     )
     expect(mocks.runResponsePost).toHaveBeenCalledTimes(1)
+  })
+
+  it('withholds brokered push, and threads verificationIncomplete into response-post, when this invocation is not verified', async () => {
+    // #given a successful trusted PR mention that would otherwise be eligible for a
+    // brokered push, but this invocation's verification is known incomplete
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs with verificationIncomplete: true
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+      {verificationIncomplete: true},
+    )
+
+    // #then brokered push -- a consequential write from unverified workspace state -- is
+    // never attempted, but the response is still published, with no delivery footer and
+    // with verificationIncomplete threaded through to response-post
+    expect(exitCode).toBe(0)
+    expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
+    expect(mocks.runResponsePost).toHaveBeenCalledWith(
+      expect.objectContaining({verificationIncomplete: true}),
+      expect.anything(),
+    )
+    expect(mocks.runResponsePost.mock.calls[0]?.[0]).not.toHaveProperty('deliveryFooter')
   })
 
   it('returns exitCode 1 when response posting fails after a brokered push succeeds', async () => {

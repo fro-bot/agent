@@ -95,7 +95,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: null,
@@ -157,7 +156,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: null,
@@ -183,7 +181,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: null,
@@ -217,7 +214,6 @@ describe('runCleanup', () => {
         bootstrapLogger: createMockLogger(),
         reactionCtx: null,
         githubClient: null,
-        agentSuccess: true,
         attachmentResult: null,
         serverHandle: null,
         sessionRetention: null,
@@ -253,7 +249,6 @@ describe('runCleanup', () => {
         bootstrapLogger: createMockLogger(),
         reactionCtx: null,
         githubClient: null,
-        agentSuccess: true,
         attachmentResult: null,
         serverHandle: null,
         sessionRetention: null,
@@ -270,7 +265,7 @@ describe('runCleanup', () => {
         runId: 'run-123',
         lockEtag: null,
       }),
-    ).resolves.toBeUndefined()
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
 
     expect(syncMetadataToStore).toHaveBeenCalled()
   })
@@ -285,7 +280,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: createServerHandle(),
       sessionRetention: 10,
@@ -317,7 +311,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: createServerHandle(),
       sessionRetention: 50,
@@ -346,7 +339,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: createServerHandle(),
       sessionRetention: null,
@@ -381,7 +373,6 @@ describe('runCleanup', () => {
       bootstrapLogger: logger,
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle,
       sessionRetention: null,
@@ -425,7 +416,6 @@ describe('runCleanup', () => {
         bootstrapLogger: logger,
         reactionCtx: null,
         githubClient: null,
-        agentSuccess: true,
         attachmentResult: null,
         serverHandle: null,
         sessionRetention: null,
@@ -437,7 +427,7 @@ describe('runCleanup', () => {
         runId: 'run-123',
         lockEtag: null,
       }),
-    ).resolves.toBeUndefined()
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
 
     // #then the throw is caught and logged via cacheLogger (core.warning), not left to
     // crash cleanup
@@ -459,7 +449,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: 10,
@@ -495,7 +484,6 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     bootstrapLogger: createMockLogger(),
     reactionCtx: null,
     githubClient: null,
-    agentSuccess: true,
     attachmentResult: null,
     serverHandle: null,
     sessionRetention: null,
@@ -600,7 +588,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     expect(saveCache).not.toHaveBeenCalled()
     const core = await import('@actions/core')
     const remediationText = vi.mocked(core.summary.addRaw).mock.calls.flat().join(' ')
-    expect(remediationText).toContain('lease could not be renewed')
+    expect(remediationText).toContain('lease could not verify uninterrupted coverage')
     // #and the state is 'declined-for-safety' -- the post hook must honor this decline,
     // not retry it, since a failed lease is exactly the case the process boundary can't help
     const {saveState} = await import('@actions/core')
@@ -684,7 +672,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
           leaseRenewal: lease,
         }),
       ),
-    ).resolves.toBeUndefined()
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
 
     // #then release is still attempted with the (stale) etag stop() settled on, and the
     // failed conditional delete is swallowed -- non-fatal, matching every other release failure

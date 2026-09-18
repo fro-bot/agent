@@ -73,6 +73,18 @@ export interface RunResponsePostParams {
   readonly responseFilePathCandidates?: ResponseFilePathCandidates
   /** Action-generated delivery text appended only to plain comment responses. */
   readonly deliveryFooter?: string
+  /**
+   * `true` when this invocation's verification was already known incomplete at the point
+   * finalize runs -- computed provisionally, before delivery, by
+   * `src/harness/outcome.ts`'s `isVerificationIncomplete` from execution and drain facts
+   * (teardown facts are not known yet). Two effects: a short harness-authored qualification
+   * is appended to the delivered body (the response is still published -- a response is
+   * information, not endorsement), and an `approve` verdict is downgraded to a plain
+   * `COMMENT` review rather than a formal `APPROVE` -- an approval is an endorsement the
+   * harness cannot support when it cannot vouch for its own invocation state. Defaults to
+   * `false` so every existing caller keeps current behavior.
+   */
+  readonly verificationIncomplete?: boolean
 }
 
 export interface ReadAndParseResponseFileParams {
@@ -328,6 +340,17 @@ function bodyWithoutFrontmatter(raw: string): string | null {
   return afterClose.slice(bodyStartMatch[0].length)
 }
 
+/**
+ * Harness-authored qualification appended when verification was already known incomplete
+ * before delivery -- named so it reads as the HARNESS's own uncertainty about its
+ * invocation state, never as a report about the agent's work. The response body itself is
+ * never replaced or withheld for this reason; this only adds context alongside it.
+ */
+function qualifyIfIncomplete(body: string, verificationIncomplete: boolean | undefined): string {
+  if (verificationIncomplete !== true) return body
+  return `${body}\n\n> ⚠️ **Harness note:** this response was delivered, but the harness could not fully verify this invocation's completion (background work, observation continuity, or teardown safety). Treat any associated changes as unconfirmed.`
+}
+
 function appendDeliveryFooter(body: string, deliveryFooter: string | undefined): string {
   if (deliveryFooter == null || deliveryFooter.length === 0) {
     return body
@@ -437,8 +460,16 @@ async function postCommentWithRetry(
  * fail-closed when a guarded review cannot be submitted.
  */
 export async function runResponsePost(params: RunResponsePostParams, logger: Logger): Promise<ResponsePostResult> {
-  const {octokit, agentContext, triggerResult, botLogin, responseFilePath, responseFilePathCandidates, deliveryFooter} =
-    params
+  const {
+    octokit,
+    agentContext,
+    triggerResult,
+    botLogin,
+    responseFilePath,
+    responseFilePathCandidates,
+    deliveryFooter,
+    verificationIncomplete,
+  } = params
 
   const prepared = await readAndParseResponseFile(
     {agentContext, triggerResult, responseFilePath, responseFilePathCandidates},
@@ -450,6 +481,10 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
 
   const {surface, parsed, recoveredFromFallback, actualResponseFilePath, droppedVerdict} = prepared.data
   const {target} = deriveSurfaceAndTarget(agentContext, triggerResult)
+  // Publish either way -- a response is information, not endorsement -- but qualify it when
+  // incompleteness was already known before delivery. Computed once, used everywhere `parsed.body`
+  // would otherwise be used directly below.
+  const responseBody = qualifyIfIncomplete(parsed.body, verificationIncomplete)
 
   if (target == null) {
     logger.error('Response-post: missing target context', {agentContext: {repo: agentContext.repo}})
@@ -462,7 +497,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     })
   }
 
-  const body = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+  const body = withMarker(appendDeliveryFooter(responseBody, deliveryFooter))
 
   if (parsed.verdict == null) {
     // A pull_request trigger's surface is always 'pr-review' and requires a
@@ -478,7 +513,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
 
     // A mention on a PR is review-permitted, not review-required. Its no-verdict
     // response intentionally falls through to the normal comment delivery path.
-    const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+    const commentBody = withMarker(appendDeliveryFooter(responseBody, deliveryFooter))
     const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
     if (posted === false) {
       return failure('post-failed', 'postComment returned null after retries')
@@ -494,7 +529,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
         surface,
         reason: 'missing-target-context',
       })
-      const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+      const commentBody = withMarker(appendDeliveryFooter(responseBody, deliveryFooter))
       const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
       if (posted === false) {
         return failure('post-failed', 'postComment returned null after retries')
@@ -505,8 +540,13 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return failure('missing-target-context', 'Cannot submit a review: bot login is unavailable')
   }
 
+  // An approving verdict downgrades to a plain COMMENT review -- never a formal APPROVE --
+  // when recovered from a fallback artifact OR when this invocation's verification was
+  // already known incomplete: an approval is an endorsement the harness cannot support in
+  // either case. The verdict text itself, and every other finding, is preserved unchanged.
+  const withholdApproval = recoveredFromFallback || verificationIncomplete === true
   const reviewEvent: ReviewEvent =
-    parsed.verdict === 'approve' ? (recoveredFromFallback ? 'COMMENT' : 'APPROVE') : 'REQUEST_CHANGES'
+    parsed.verdict === 'approve' ? (withholdApproval ? 'COMMENT' : 'APPROVE') : 'REQUEST_CHANGES'
 
   if (recoveredFromFallback && parsed.verdict === 'approve') {
     logger.warning('Response-post: withholding approving verdict from fallback response artifact', {
@@ -514,6 +554,10 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
       actualResponsePath: responsePathForLog(actualResponseFilePath),
       expectedResponseDirectory: path.dirname(responseFilePath),
       actualResponseDirectory: path.dirname(actualResponseFilePath),
+    })
+  } else if (verificationIncomplete === true && parsed.verdict === 'approve') {
+    logger.warning('Response-post: withholding approving verdict — invocation verification incomplete', {
+      prNumber: target.number,
     })
   }
 
@@ -529,7 +573,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
         prNumber: target.number,
         surface,
       })
-      const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+      const commentBody = withMarker(appendDeliveryFooter(responseBody, deliveryFooter))
       const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
       if (posted === false) {
         return failure('post-failed', 'postComment returned null after retries')

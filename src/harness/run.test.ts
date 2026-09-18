@@ -14,7 +14,9 @@ vi.mock('@actions/core', () => ({
   setFailed: vi.fn(),
 }))
 
-vi.mock('../features/agent/index.js', () => ({}))
+vi.mock('../features/agent/index.js', () => ({
+  applyTerminalReaction: vi.fn(),
+}))
 
 vi.mock('../features/observability/index.js', () => ({
   createMetricsCollector: vi.fn(() => ({
@@ -22,6 +24,7 @@ vi.mock('../features/observability/index.js', () => ({
     end: vi.fn(),
     recordError: vi.fn(),
   })),
+  writeInvocationOutcomeSummary: vi.fn(),
 }))
 
 vi.mock('../shared/logger.js', () => ({
@@ -35,6 +38,7 @@ vi.mock('../shared/logger.js', () => ({
 
 vi.mock('./config/outputs.js', () => ({
   setActionOutputs: vi.fn(),
+  setInvocationOutcomeOutput: vi.fn(),
 }))
 
 vi.mock('./config/state-keys.js', () => ({
@@ -57,7 +61,7 @@ vi.mock('./phases/cache-restore.js', () => ({
 }))
 
 vi.mock('./phases/cleanup.js', () => ({
-  runCleanup: vi.fn().mockResolvedValue(undefined),
+  runCleanup: vi.fn().mockResolvedValue({quiescenceConfirmed: true, continuityUnverified: false}),
 }))
 
 vi.mock('./phases/dedup.js', () => ({
@@ -409,6 +413,8 @@ describe('run', () => {
         llmError: null,
         resolvedOutputMode: 'branch-pr',
         outputModeMigration: {requested: 'omitted', resolved: 'branch-pr'},
+        observationGap: false,
+        recoveryBoundaryUnresolved: false,
         executionDurationMs: 10,
         ownershipLedger: ledgerInstance,
       }
@@ -428,6 +434,7 @@ describe('run', () => {
     })
     vi.mocked(runCleanup).mockImplementation(async () => {
       callOrder.push('cleanup')
+      return {quiescenceConfirmed: true, continuityUnverified: false}
     })
 
     // #when the run executes end to end
@@ -525,6 +532,8 @@ describe('run', () => {
       llmError: null,
       resolvedOutputMode: 'branch-pr',
       outputModeMigration: {requested: 'omitted', resolved: 'branch-pr'},
+      observationGap: false,
+      recoveryBoundaryUnresolved: false,
       executionDurationMs: 10,
     })
 
@@ -535,5 +544,240 @@ describe('run', () => {
     // there is no lease to renew or release -- it must not fail for want of one it never held
     expect(exitCode).toBe(0)
     expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(expect.objectContaining({leaseRenewal: null}))
+  })
+})
+
+// Shared happy-path wiring for every phase up to and including drain -- each test below
+// overrides only the specific fact under test (execution.observationGap, drain's
+// unknownCount, finalize's exitCode, or cleanup's teardown safety evidence), so a test
+// failing here fails for that one fact, not because the scaffolding drifted. Module-scoped
+// (not nested in the describe below) since it closes over nothing test-local.
+async function mockHappyPathThrough(overrides?: {
+  readonly executionSuccess?: boolean
+  readonly observationGap?: boolean
+  readonly drainUnknownCount?: number
+  readonly finalizeExitCode?: number
+  readonly cleanupSafety?: {readonly quiescenceConfirmed: boolean; readonly continuityUnverified: boolean}
+}): Promise<{
+  readonly saveDedupMarker: typeof import('./phases/dedup.js').saveDedupMarker
+  readonly applyTerminalReaction: typeof import('../features/agent/index.js').applyTerminalReaction
+  readonly setInvocationOutcomeOutput: typeof import('./config/outputs.js').setInvocationOutcomeOutput
+}> {
+  const {runBootstrap} = await import('./phases/bootstrap.js')
+  const {runRouting} = await import('./phases/routing.js')
+  const {runDedup, saveDedupMarker} = await import('./phases/dedup.js')
+  const {runAcquireLock} = await import('./phases/acquire-lock.js')
+  const {runAcknowledge} = await import('./phases/acknowledge.js')
+  const {runCacheRestore} = await import('./phases/cache-restore.js')
+  const {runSessionPrep} = await import('./phases/session-prep.js')
+  const {runExecute, runDrain} = await import('./phases/execute.js')
+  const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
+  const {runFinalizeWithResult} = await import('./phases/finalize.js')
+  const {runCleanup} = await import('./phases/cleanup.js')
+  const {applyTerminalReaction} = await import('../features/agent/index.js')
+  const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+
+  vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
+  vi.mocked(runRouting).mockResolvedValue(createRouting())
+  vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
+  vi.mocked(runAcquireLock).mockResolvedValue({outcome: 's3-disabled'})
+  vi.mocked(runAcknowledge).mockResolvedValue({
+    repo: 'owner/repo',
+    commentId: 99,
+    issueNumber: 42,
+    issueType: 'pr',
+    botLogin: 'fro-bot',
+  })
+  vi.mocked(runCacheRestore).mockResolvedValue({
+    cacheResult: {hit: false, key: 'cache-key', restoredPath: '', corrupted: false, source: 'cache'},
+    cacheStatus: 'miss',
+    serverHandle: {
+      client: {} as CacheRestorePhaseResult['serverHandle']['client'],
+      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+      shutdown: vi.fn().mockResolvedValue({quiesced: true}),
+    },
+  })
+  vi.mocked(runSessionPrep).mockResolvedValue({
+    recentSessions: [],
+    priorWorkContext: [],
+    attachmentResult: null,
+    normalizedWorkspace: '/workspace',
+    logicalKey: null,
+    continueSessionId: null,
+    isContinuation: false,
+    sessionTitle: null,
+  })
+  vi.mocked(runExecute).mockResolvedValue({
+    success: overrides?.executionSuccess ?? true,
+    exitCode: overrides?.executionSuccess === false ? 1 : 0,
+    sessionId: 'ses_root',
+    error: overrides?.executionSuccess === false ? 'boom' : null,
+    tokenUsage: null,
+    model: null,
+    cost: null,
+    prsCreated: [],
+    commitsCreated: [],
+    commentsPosted: 0,
+    llmError: null,
+    resolvedOutputMode: 'branch-pr',
+    outputModeMigration: {requested: 'omitted', resolved: 'branch-pr'},
+    observationGap: overrides?.observationGap ?? false,
+    recoveryBoundaryUnresolved: false,
+    executionDurationMs: 10,
+    ownershipLedger: {} as OwnershipLedger,
+  })
+  const unknownCount = overrides?.drainUnknownCount ?? 0
+  vi.mocked(runDrain).mockResolvedValue({
+    expired: unknownCount > 0,
+    cancelledCount: 0,
+    settledCount: 0,
+    unknownCount,
+  })
+  vi.mocked(runReviewReconciliation).mockResolvedValue({reconciled: false, reason: 'not-applicable'})
+  vi.mocked(runFinalizeWithResult).mockResolvedValue({
+    exitCode: overrides?.finalizeExitCode ?? (overrides?.executionSuccess === false ? 1 : 0),
+    deliveryKind: 'comment',
+  })
+  vi.mocked(runCleanup).mockResolvedValue(
+    overrides?.cleanupSafety ?? {quiescenceConfirmed: true, continuityUnverified: false},
+  )
+
+  return {saveDedupMarker, applyTerminalReaction, setInvocationOutcomeOutput}
+}
+
+describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('useful response + observation gap -> incomplete, no dedup marker, no success reaction', async () => {
+    // #given a clean, successful delivery, but the execution recorded an observation gap
+    const {saveDedupMarker, applyTerminalReaction, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      observationGap: true,
+    })
+
+    // #when the run executes end to end
+    const exitCode = await run()
+
+    // #then exit code is forced non-zero, dedup is withheld, and the reaction reflects
+    // incomplete -- not success, even though delivery itself succeeded
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(applyTerminalReaction)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'incomplete',
+      expect.anything(),
+    )
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+
+  it('useful response + unresolved ownership (drain unknownCount > 0) -> incomplete, no dedup, no success reaction', async () => {
+    // #given a clean, successful delivery, but drain could not confirm all owned work
+    const {saveDedupMarker, applyTerminalReaction, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      drainUnknownCount: 2,
+    })
+
+    const exitCode = await run()
+
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(applyTerminalReaction)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'incomplete',
+      expect.anything(),
+    )
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+
+  it('useful response + unconfirmed server quiescence (learned only from cleanup) -> incomplete, no dedup', async () => {
+    // #given every execution/drain fact clean, but cleanup could not confirm the OpenCode
+    // server actually quiesced before the checkpoint -- learned only AFTER finalize published
+    const {saveDedupMarker, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      cleanupSafety: {quiescenceConfirmed: false, continuityUnverified: false},
+    })
+
+    const exitCode = await run()
+
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+
+  it('useful response + unverified lease continuity (learned only from cleanup) -> incomplete, no dedup', async () => {
+    // #given every execution/drain fact clean, but the coordination lease's continuity was
+    // never verified for this invocation
+    const {saveDedupMarker, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      cleanupSafety: {quiescenceConfirmed: true, continuityUnverified: true},
+    })
+
+    const exitCode = await run()
+
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+
+  it('the same response with no uncertainty -> existing successful behavior, unchanged: dedup saved, success reaction, exit 0', async () => {
+    // #given every verification fact clean and delivery succeeded -- the complement of every
+    // incomplete case above
+    const {saveDedupMarker, applyTerminalReaction, setInvocationOutcomeOutput} = await mockHappyPathThrough({})
+
+    const exitCode = await run()
+
+    expect(exitCode).toBe(0)
+    expect(vi.mocked(saveDedupMarker)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(applyTerminalReaction)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'succeeded',
+      expect.anything(),
+    )
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('succeeded')
+  })
+
+  it('genuine failure + uncertainty -> failure preserved, incompleteness retained (still reports incomplete, not failed)', async () => {
+    // #given execution failed AND verification is also incomplete
+    const {saveDedupMarker, applyTerminalReaction, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      executionSuccess: false,
+      observationGap: true,
+      finalizeExitCode: 1,
+    })
+
+    const exitCode = await run()
+
+    // #then incomplete (the stricter axis) wins the reported outcome, exit stays non-zero
+    // either way, no dedup, no success reaction
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(applyTerminalReaction)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'incomplete',
+      expect.anything(),
+    )
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+
+  it('genuine failure with no verification uncertainty -> failed (not incomplete), no dedup, no success reaction', async () => {
+    // #given execution failed but every verification fact is clean -- the complement proving
+    // incompleteness (not mere failure) is what selects 'incomplete' above
+    const {saveDedupMarker, applyTerminalReaction, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      executionSuccess: false,
+      finalizeExitCode: 1,
+    })
+
+    const exitCode = await run()
+
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(applyTerminalReaction)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'failed',
+      expect.anything(),
+    )
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('failed')
   })
 })

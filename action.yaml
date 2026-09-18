@@ -184,6 +184,14 @@ outputs:
       this one IS retried from the post-action hook). Reports a result, not proof
       of durability. Only set from the main step; a value set from the post-action hook
       would arrive after every other step already ran, so it is not attempted there.
+  invocation-outcome:
+    description: >-
+      This invocation's final, verified outcome: succeeded (delivery succeeded and every
+      verification fact -- observation completeness, ownership resolution, server
+      quiescence, lease continuity -- checked out), incomplete (a useful result may exist,
+      but this invocation could not certify completion; no dedup marker was written and no
+      success reaction was posted), or failed (verification was complete but delivery did
+      not succeed). Only set from the main step.
   duration:
     description: Run duration in milliseconds
 

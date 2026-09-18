@@ -22,7 +22,7 @@ import {
   syncArtifactsToStore,
   syncMetadataToStore,
 } from '@fro-bot/runtime'
-import {completeAcknowledgment} from '../../features/agent/index.js'
+import {removeWorkingLabel} from '../../features/agent/index.js'
 import {cleanupTempFiles} from '../../features/attachments/index.js'
 import {writeCacheSaveResultSummary} from '../../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
@@ -46,7 +46,6 @@ export interface CleanupPhaseOptions {
   readonly bootstrapLogger: Logger
   readonly reactionCtx: ReactionContext | null
   readonly githubClient: Octokit | null
-  readonly agentSuccess: boolean
   readonly attachmentResult: AttachmentResult | null
   readonly serverHandle: OpenCodeServerHandle | null
   readonly sessionRetention: number | null
@@ -80,12 +79,35 @@ export interface CleanupPhaseOptions {
   readonly leaseRenewal?: LeaseController | null
 }
 
-export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
+/**
+ * Teardown safety evidence this phase learns that nothing before it could have known --
+ * whether the OpenCode server's shutdown confirmed the child actually quiesced, and
+ * whether the coordination lease's continuity was ever unverified during this invocation.
+ * Returned (not `void`) so `run.ts` can fold these two facts into the invocation's FINAL
+ * outcome assessment (`src/harness/outcome.ts`) after cleanup returns -- before this
+ * change, both facts were computed here and used only to gate the cache-save decision,
+ * then discarded; the run's reported outcome never saw them.
+ */
+export interface CleanupSafetyResult {
+  /**
+   * `false` when the OpenCode server's shutdown did not confirm the child process actually
+   * quiesced before the checkpoint that followed. `true` when there was no server handle to
+   * begin with (nothing to be unconfirmed about).
+   */
+  readonly quiescenceConfirmed: boolean
+  /**
+   * The coordination lease's latched `continuityUnverified()` reading at the end of this
+   * invocation -- `false` when no lease was ever held (S3 disabled, acquisition failed, or
+   * held-by-other already short-circuited the run).
+   */
+  readonly continuityUnverified: boolean
+}
+
+export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupSafetyResult> {
   const {
     bootstrapLogger,
     reactionCtx,
     githubClient,
-    agentSuccess,
     attachmentResult,
     serverHandle,
     sessionRetention,
@@ -100,15 +122,28 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     leaseRenewal,
   } = options
 
+  // Populated below (quiescence during the shutdown step; lease continuity at the very end,
+  // after `leaseRenewal.stop()` has had its last chance to latch it) and returned after the
+  // outer `try`/`catch`/`finally` completes (never a `return` inside `finally` itself --
+  // that would silently discard whatever the `try` or `catch` block was about to return, an
+  // ESLint `no-unsafe-finally` violation) so every exit path -- including a thrown cleanup
+  // error -- still reports the safety evidence it managed to establish.
+  let quiescenceConfirmed = true
+  let continuityUnverified = false
+
   try {
     if (attachmentResult != null) {
       const attachmentCleanupLogger = createLogger({phase: 'attachment-cleanup'})
       await cleanupTempFiles(attachmentResult.tempFiles, attachmentCleanupLogger)
     }
 
+    // Reaction (hooray/confused/no terminal reaction) is handled by the caller, strictly
+    // after the invocation's FINAL outcome is known (`applyTerminalReaction`, called from
+    // `run.ts` after this phase returns) -- this phase only ever removes the transient
+    // working label, which is unconditional on outcome.
     if (reactionCtx != null && githubClient != null) {
       const cleanupLogger = createLogger({phase: 'cleanup'})
-      await completeAcknowledgment(githubClient, reactionCtx, agentSuccess, cleanupLogger)
+      await removeWorkingLabel(githubClient, reactionCtx, cleanupLogger)
     }
 
     const pruneLogger = createLogger({phase: 'prune'})
@@ -145,7 +180,6 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     // unknown ownership-ledger entry -- persistence must decline rather than risk a
     // checkpoint racing a still-live writer. No server handle at all (e.g.
     // SKIP_AGENT_EXECUTION=true) has no writer to be unconfirmed about, so it stays true.
-    let quiescenceConfirmed = true
     if (serverHandle != null) {
       try {
         const shutdownResult = await serverHandle.shutdown()
@@ -237,21 +271,27 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     //      writing (unknown entries are not distinguishable from live writers -- see
     //      OwnershipLedger.isPersistenceSafe).
     //   2. Unconfirmed quiescence: the OpenCode server itself might still be writing.
-    //   3. A failed lease renewal: this run can no longer be certain no other surface
+    //   3. Unverified lease continuity: this run can no longer be certain no other surface
     //      (Discord gateway, or a retried Action run) has taken over the coordination lock
-    //      and is writing the same session state concurrently. Only checked when a lock was
-    //      actually held -- a lock-free run (S3 disabled, or acquisition failed/held-by-
-    //      other already short-circuited) never held a lease to lose, so it must persist
-    //      normally (see origin: R22a).
+    //      and is writing the same session state concurrently. Reads the LATCHED
+    //      `continuityUnverified()` (never cleared by a later successful renewal), not the
+    //      unlatched `hasFailed()` (which a later success resets) -- a tick that failed
+    //      earlier in this invocation and then recovered is still a coverage gap that
+    //      occurred, not health. Falls back to `hasFailed()` only for legacy hand-built
+    //      `LeaseController` test doubles that predate the latched accessor. Only checked
+    //      when a lock was actually held -- a lock-free run (S3 disabled, or acquisition
+    //      failed/held-by-other already short-circuited) never held a lease to lose, so it
+    //      must persist normally (see origin: R22a).
     const ownershipSafe = ownershipLedger === undefined || ownershipLedger.isPersistenceSafe()
-    const leaseFailed = leaseRenewal != null && leaseRenewal.hasFailed()
+    const continuityUnverifiedNow =
+      leaseRenewal != null && (leaseRenewal.continuityUnverified?.() ?? leaseRenewal.hasFailed())
     const declineReason =
       ownershipSafe === false
         ? 'background subagent work this run owns is still unresolved (the ownership ledger has entries that are outstanding or unknown), so persisting could race a live writer'
         : quiescenceConfirmed === false
           ? 'the OpenCode server did not confirm it had stopped writing before this point, so the checkpoint could not be trusted to see a quiet database'
-          : leaseFailed
-            ? 'the coordination lease could not be renewed, so this run can no longer be certain another surface has not taken over and is writing the same session state'
+          : continuityUnverifiedNow
+            ? 'the coordination lease could not verify uninterrupted coverage, so this run can no longer be certain another surface has not taken over and is writing the same session state'
             : null
 
     let cacheSaveResult: CacheSaveResult
@@ -359,5 +399,13 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
         })
       }
     }
+
+    // Read AFTER `stop()` above, not the earlier `continuityUnverifiedNow` used for the
+    // cache-save gate: `stop()` can itself latch this (an unresolved tick when the grace
+    // period elapses -- see `LeaseController.stop`'s doc), so this is the final, complete
+    // reading for the invocation, returned to `run.ts` for the FINAL outcome assessment.
+    continuityUnverified = leaseRenewal != null && (leaseRenewal.continuityUnverified?.() ?? leaseRenewal.hasFailed())
   }
+
+  return {quiescenceConfirmed, continuityUnverified}
 }

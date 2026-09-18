@@ -92,6 +92,7 @@ function createAgentResult(overrides: Partial<AgentResult> = {}): AgentResult {
     commitsCreated: [],
     commentsPosted: 0,
     llmError: null,
+    observationGap: false,
     ...overrides,
   }
 }

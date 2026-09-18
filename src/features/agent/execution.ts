@@ -90,6 +90,14 @@ export async function executeOpenCode(
   // consults; see its comment for why it never touches the clock itself. Governing invariant:
   // selecting an error never proves quiescence, and observing quiescence never erases an error.
   let stoppingCause: 'deadline' | 'other' | null = null
+  // Sticky across LLM retry attempts within this single executeOpenCode call: once any
+  // attempt's event stream records an unexpected discontinuity, a later attempt completing
+  // cleanly must not clear it -- selecting a clean result never proves the earlier gap
+  // didn't happen (see AgentResult.observationGap's doc). Read directly off each attempt's
+  // own eventStreamResult, not off `final` after mergeArtifactResults -- that merge spreads
+  // the latest attempt's own (possibly absent) discontinuity over `final`, which would
+  // silently drop an earlier attempt's gap.
+  let observationGap = false
   logger.info('Executing OpenCode agent (SDK mode)', {
     agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
@@ -110,6 +118,7 @@ export async function executeOpenCode(
     commentsPosted: final.commentsPosted,
     llmError: lastLlmError,
     classificationPath: final.classificationPath,
+    observationGap,
   })
 
   try {
@@ -235,6 +244,7 @@ export async function executeOpenCode(
       })()
 
       final = mergeArtifactResults(result.eventStreamResult, final)
+      if (result.eventStreamResult.discontinuity != null) observationGap = true
 
       if (result.success) {
         // Completion is never a deadline cause, regardless of the clock -- observing quiescence
@@ -254,6 +264,7 @@ export async function executeOpenCode(
           commentsPosted: final.commentsPosted,
           llmError: null,
           classificationPath: final.classificationPath,
+          observationGap,
         }
       }
 
@@ -352,6 +363,7 @@ export async function executeOpenCode(
       commentsPosted: final.commentsPosted,
       llmError: lastLlmError,
       classificationPath: final.classificationPath,
+      observationGap,
     }
   } catch (error) {
     // An explicit, tagged deadline rejection (deadline.run() losing its internal race during
@@ -389,6 +401,7 @@ export async function executeOpenCode(
       commentsPosted: 0,
       llmError: transportFailure ? createLLMFetchError(errorMessage) : null,
       classificationPath: transportFailure ? 'fallback' : 'unclassified',
+      observationGap,
     }
   } finally {
     // Finalizer rule: abort the root session if and only if the execution's selected stopping

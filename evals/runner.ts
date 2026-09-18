@@ -784,6 +784,7 @@ function createExecutionFailure(error: unknown): AgentResult {
     commitsCreated: [],
     commentsPosted: 0,
     llmError: null,
+    observationGap: false,
   }
 }
 

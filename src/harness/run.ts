@@ -7,13 +7,18 @@ import type {
 import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
 import type {AttachmentResult} from '../features/attachments/index.js'
+import type {TriggerContext} from '../features/triggers/types.js'
+import type {DeduplicationEntity} from '../services/cache/dedup.js'
 import type {Octokit} from '../services/github/types.js'
+import type {InvocationVerificationFacts} from './outcome.js'
 import * as core from '@actions/core'
-import {createMetricsCollector} from '../features/observability/index.js'
+import {applyTerminalReaction} from '../features/agent/index.js'
+import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {getGitHubRunAttempt} from '../shared/env.js'
 import {createLogger} from '../shared/logger.js'
-import {setActionOutputs} from './config/outputs.js'
+import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
+import {assessInvocationOutcome, isVerificationIncomplete} from './outcome.js'
 import {runAcknowledge} from './phases/acknowledge.js'
 import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
@@ -33,7 +38,6 @@ export async function run(): Promise<number> {
   metrics.start()
 
   let reactionCtx: ReactionContext | null = null
-  let agentSuccess = false
   let exitCode = 0
   let githubClient: Octokit | null = null
   let attachmentResult: AttachmentResult | null = null
@@ -63,6 +67,19 @@ export async function run(): Promise<number> {
     region: '',
     prefix: '',
   }
+
+  // --- Invocation-outcome state (src/harness/outcome.ts), hoisted for the same reason as
+  // the fields above: the FINAL assessment happens in the outer `finally` block, after
+  // `runCleanup` returns its teardown safety evidence, so everything it needs must be
+  // reachable there. Defaults are the "nothing happened yet" case -- every early-return
+  // skip path (bootstrap/routing/dedup/lock declines) leaves these at their defaults, which
+  // assess as verification-complete (no execution ran, nothing to be unverified about) and
+  // let `deliverySucceeded` (from `exitCode`) alone decide succeeded vs. failed, matching
+  // those paths' pre-existing exit codes exactly.
+  let observationGap = false
+  let ownershipUnresolved = false
+  let triggerContext: TriggerContext | null = null
+  let dedupEntity: DeduplicationEntity | null = null
 
   const createUnavailableOutputModeMigration = (): OutputModeMigrationState => ({
     requested: requestedOutputModeState,
@@ -106,6 +123,7 @@ export async function run(): Promise<number> {
       return 0
     }
     githubClient = routing.githubClient
+    triggerContext = routing.triggerResult.context
 
     repo = `${routing.triggerResult.context.repo.owner}/${routing.triggerResult.context.repo.repo}`
     runId = routing.agentContext.runId
@@ -114,6 +132,7 @@ export async function run(): Promise<number> {
       setUnavailableActionOutputs(Date.now() - startTime)
       return 0
     }
+    dedupEntity = dedup.entity
 
     const lockResult = await runAcquireLock({
       storeConfig,
@@ -160,8 +179,10 @@ export async function run(): Promise<number> {
     attachmentResult = sessionPrep.attachmentResult
 
     const execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
-    agentSuccess = execution.success
     ownershipLedger = execution.ownershipLedger
+    // Sticky, invocation-scoped facts -- feed the invocation-outcome assessment
+    // (src/harness/outcome.ts), never `execution.success` itself.
+    observationGap = execution.observationGap === true
 
     // Drain: owned background work settles before anything below this point
     // publishes, persists, or releases (Unit 10). `execution.ownershipLedger` is
@@ -183,25 +204,47 @@ export async function run(): Promise<number> {
         unknownCount: drainResult.unknownCount,
       })
     }
+    // Carries forward the overflow-recovery boundary's own unresolved ownership facts too
+    // (see ExecutePhaseResult.recoveryBoundaryUnresolved) -- the top-level drain above only
+    // ever observes the recovery session's own ledger, never the overflowed session's.
+    ownershipUnresolved = drainResult.unknownCount > 0 || execution.recoveryBoundaryUnresolved === true
+
+    // PROVISIONAL assessment: gates publication decisions (review reconciliation's
+    // automatic APPROVE, finalize's brokered push and formal-review downgrade) before
+    // anything publishes. Only execution and drain facts are known at this point --
+    // teardown (server quiescence, lease continuity) has not run yet, so this never
+    // consults the full three-way outcome, only whether verification is ALREADY known
+    // incomplete. See src/harness/outcome.ts's module doc for why this and the FINAL
+    // assessment below are the same pure function called at two points.
+    const provisionalVerification: InvocationVerificationFacts = {
+      observationGap,
+      ownershipUnresolved,
+      quiescenceConfirmed: true,
+      continuityUnverified: false,
+    }
+    const provisionallyIncomplete = isVerificationIncomplete(provisionalVerification)
 
     // Review reconciliation: after the agent session, check if a formal APPROVE
     // is needed to satisfy branch protection when the agent delivered a PASS
     // verdict as a comment instead of a review event. Fail-safe — never throws.
     const reconciliationLogger = createLogger({phase: 'review-reconciliation'})
-    const triggerContext = routing.triggerResult.context
-    const isPullRequestReviewTrigger = triggerContext.eventType === 'pull_request'
+    const reconciliationTriggerContext = routing.triggerResult.context
+    const isPullRequestReviewTrigger = reconciliationTriggerContext.eventType === 'pull_request'
     const prNumber =
-      triggerContext.target != null && triggerContext.target.kind === 'pr' ? triggerContext.target.number : null
+      reconciliationTriggerContext.target != null && reconciliationTriggerContext.target.kind === 'pr'
+        ? reconciliationTriggerContext.target.number
+        : null
     await runReviewReconciliation(
       {
         octokit: routing.githubClient,
         botLogin: routing.botLogin,
-        owner: triggerContext.repo.owner,
-        repo: triggerContext.repo.repo,
+        owner: reconciliationTriggerContext.repo.owner,
+        repo: reconciliationTriggerContext.repo.repo,
         prNumber,
         isPullRequestReviewTrigger,
         responseModeIsGithub: bootstrap.inputs.responseMode === 'github',
-        agentSucceeded: agentSuccess,
+        agentSucceeded: execution.success,
+        invocationVerified: provisionallyIncomplete === false,
         runStartMs: startTime,
         isFileConventionDelivery: bootstrap.delivery === 'file-convention',
       },
@@ -218,16 +261,15 @@ export async function run(): Promise<number> {
       metrics,
       startTime,
       bootstrap.logger,
+      {verificationIncomplete: provisionallyIncomplete},
     )
     exitCode = finalization.exitCode
 
-    // Dedup marker is saved only after a confirmed successful outcome (which,
-    // for file-convention runs, means finalize's delivery assertion passed —
-    // exitCode === 0). Saving it earlier (before finalize) risked a failed
-    // post followed by a retry being dedup-skipped and exiting 0 with no post.
-    if (exitCode === 0 && agentSuccess && dedup.entity != null) {
-      await saveDedupMarker(routing.triggerResult.context, dedup.entity, repo)
-    }
+    // Dedup marker and the terminal reaction both moved out of this try block -- they now
+    // happen in the `finally` block below, strictly after `runCleanup` returns and the
+    // FINAL invocation outcome is known. Saving the dedup marker here (before teardown had
+    // reported its own safety facts) risked marking an invocation deduplicated when its
+    // state was never actually verified.
   } catch (error) {
     exitCode = 1
     const duration = Date.now() - startTime
@@ -249,16 +291,10 @@ export async function run(): Promise<number> {
       core.setFailed('An unknown error occurred')
     }
   } finally {
-    // agentSuccess reflects execution.success only — it says nothing about
-    // whether finalize actually delivered the response. A non-zero exitCode
-    // means finalize failed to deliver (or the run otherwise failed), so the
-    // success reaction must not fire for that case.
-    const deliverySucceeded = agentSuccess && exitCode === 0
-    await runCleanup({
+    const cleanupResult = await runCleanup({
       bootstrapLogger,
       reactionCtx,
       githubClient,
-      agentSuccess: deliverySucceeded,
       attachmentResult,
       serverHandle,
       sessionRetention,
@@ -272,6 +308,47 @@ export async function run(): Promise<number> {
       ownershipLedger,
       leaseRenewal,
     })
+
+    // FINAL assessment: the same pure function as the provisional call above, now with the
+    // teardown facts `runCleanup` just returned. `deliverySucceeded` is derived from
+    // `exitCode` (0 at this point means finalize's own delivery-success decision, which
+    // already folds in execution facts -- including its existing allowance of exit 0 for a
+    // recoverable LLM error whose response was still delivered) -- never re-derived from
+    // `execution.success` directly, which is never cleared or second-guessed here.
+    const finalVerification: InvocationVerificationFacts = {
+      observationGap,
+      ownershipUnresolved,
+      quiescenceConfirmed: cleanupResult.quiescenceConfirmed,
+      continuityUnverified: cleanupResult.continuityUnverified,
+    }
+    const assessment = assessInvocationOutcome({deliverySucceeded: exitCode === 0, verification: finalVerification})
+
+    // Exit code contract: 1 for incomplete, same as failed -- no third numeric code. The
+    // structured `invocation-outcome` output and job-summary row are what distinguish "the
+    // harness contract was unmet" from "the agent was wrong". A `finish(1, ...)` (or
+    // exitCode already non-zero) path is left exactly as finalize decided it.
+    if (assessment.outcome === 'incomplete' && exitCode === 0) {
+      exitCode = 1
+    }
+
+    // Dedup marker: never written on an incomplete invocation, and only after cleanup has
+    // had its say -- moved here (was: right after finalize, before cleanup ran) per the
+    // same reasoning that moved the terminal reaction below.
+    if (assessment.outcome === 'succeeded' && dedupEntity != null && triggerContext != null) {
+      await saveDedupMarker(triggerContext, dedupEntity, repo)
+    }
+
+    // Terminal reaction: a distinct three-way projection (succeeded/incomplete/failed), not
+    // the boolean success/failure `completeAcknowledgment` used to receive -- moved here,
+    // strictly after cleanup, because passing a boolean derived from `exitCode` before
+    // teardown's own facts were known could select the success reaction for an invocation
+    // this assessment now calls incomplete.
+    if (reactionCtx != null && githubClient != null) {
+      await applyTerminalReaction(githubClient, reactionCtx, assessment.outcome, bootstrapLogger)
+    }
+
+    setInvocationOutcomeOutput(assessment.outcome)
+    await writeInvocationOutcomeSummary(assessment.outcome, assessment.incompleteReasons, bootstrapLogger)
   }
 
   return exitCode
