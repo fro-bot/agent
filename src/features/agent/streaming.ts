@@ -59,6 +59,138 @@ export interface ActivityTracker {
   genericError?: ErrorInfo
   /** Classification path for whichever failure (terminal or generic) is currently recorded. */
   classificationPath?: ClassificationPath
+  /**
+   * Root-freshness protocol state (Phase A). Optional so every existing caller that constructs an
+   * `ActivityTracker` literal directly (tests, characterization fixtures) keeps its exact prior
+   * behavior -- the sticky `sessionIdle`/`currentTurnTerminalSignalReceived` fields above remain
+   * meaningful on their own when this is absent. When present, consumers additionally require
+   * `hasFreshIdleCandidate()` before treating those sticky fields as current. See the tracker's own
+   * doc comment for the model.
+   */
+  rootFreshness?: RootFreshnessTracker
+}
+
+/**
+ * Whether idle/completion evidence recorded for the ROOT session is still current:
+ *
+ * - `unarmed` — before prompt submission; nothing has happened yet.
+ * - `awaiting-activity` — armed, no root activity or idle evidence observed yet for this generation.
+ * - `active` — root work is underway, or a new root user message was seen; any prior idle
+ *   candidate is invalid.
+ * - `idle-candidate` — the root reported idle for the CURRENT generation; still subject to the
+ *   pending-parent-turn barrier and the caller's own ownership-ledger gate.
+ *
+ * A "generation" is an observation boundary (advanced only by `invalidateRootFreshness`), not one
+ * model step -- polling the same stored message again must not itself advance it.
+ */
+export type RootFreshnessState = 'unarmed' | 'awaiting-activity' | 'active' | 'idle-candidate'
+
+/**
+ * Small tracker record for the root freshness protocol -- deliberately not a lifecycle framework
+ * or event bus. `revision` is a monotonic counter bumped every time renewed root activity is
+ * observed; any idle/completion evidence stamped with an older revision is stale by construction
+ * and must be re-derived. `pendingParentMessageId` is a barrier: set when a new root user message
+ * (including an injected background-task completion turn) is observed and not yet cleared until
+ * that message's own terminal assistant reply is seen -- while set, no completion may be admitted.
+ * `restConfirmationRequired` is set on an observation-channel discontinuity: a broken SSE stream
+ * cannot itself prove freshness, so retained idle evidence needs a REST revalidation before a
+ * consumer may rely on it again.
+ */
+export interface RootFreshnessTracker {
+  state: RootFreshnessState
+  revision: number
+  /** Most recent root user message id observed (including an injected task-completion turn). */
+  latestRootUserMessageId: string | null
+  /** The generation an idle candidate was stamped with; compared against `revision` at consumption. */
+  idleCandidateRevision: number | null
+  /** Barrier: a new root user message awaiting its terminal assistant reply. Null when clear. */
+  pendingParentMessageId: string | null
+  /** Set on SSE discontinuity; cleared once a REST check corroborates current state. */
+  restConfirmationRequired: boolean
+}
+
+export function createRootFreshnessTracker(): RootFreshnessTracker {
+  return {
+    state: 'unarmed',
+    revision: 0,
+    latestRootUserMessageId: null,
+    idleCandidateRevision: null,
+    pendingParentMessageId: null,
+    restConfirmationRequired: false,
+  }
+}
+
+/** Arm before submission, per the transition list in the module doc -- starts with no completion evidence. */
+export function armRootFreshness(tracker: RootFreshnessTracker): void {
+  tracker.state = 'awaiting-activity'
+  tracker.idleCandidateRevision = null
+}
+
+/**
+ * Invalidate on renewed root activity: root status busy/retry, a new root user message, root
+ * assistant creation/progress/text-deltas/tool-activity, or a newly discovered later root message
+ * via REST. Clears idle eligibility and advances the revision so any evidence stamped with the
+ * prior revision is stale. Never called for descendant activity -- callers must gate on
+ * `eventSessionID === sessionId` (root-only) before calling this; descendant activity must never
+ * change root lifecycle state.
+ */
+export function invalidateRootFreshness(tracker: RootFreshnessTracker, newRootUserMessageId?: string): void {
+  if (tracker.state === 'unarmed') return
+  tracker.state = 'active'
+  tracker.idleCandidateRevision = null
+  tracker.revision += 1
+  if (newRootUserMessageId != null) tracker.latestRootUserMessageId = newRootUserMessageId
+}
+
+/** Root idle creates an idle candidate for the CURRENT generation -- not permanent permission. */
+export function markRootIdleCandidate(tracker: RootFreshnessTracker): void {
+  if (tracker.state === 'unarmed') return
+  tracker.state = 'idle-candidate'
+  tracker.idleCandidateRevision = tracker.revision
+}
+
+/**
+ * True only when the tracker holds idle evidence for the CURRENT generation, with no unresolved
+ * newer parent turn and no unresolved SSE discontinuity requiring REST revalidation. Consumers
+ * combine this with their own ownership-ledger drain check -- this function knows nothing about
+ * ownership.
+ */
+export function hasFreshIdleCandidate(tracker: RootFreshnessTracker): boolean {
+  return (
+    tracker.state === 'idle-candidate' &&
+    tracker.idleCandidateRevision === tracker.revision &&
+    tracker.pendingParentMessageId == null &&
+    !tracker.restConfirmationRequired
+  )
+}
+
+/**
+ * Register a new root user message as pending (awaiting its own terminal assistant reply) and
+ * invalidate any current idle evidence. Correlates by message id: calling this again for the same
+ * still-pending id is a no-op, so duplicate/retried events for the same injected turn do not
+ * create a second phantom pending turn or spuriously re-advance the revision.
+ */
+export function registerPendingRootUserMessage(tracker: RootFreshnessTracker, messageId: string | null): void {
+  if (messageId != null && tracker.pendingParentMessageId === messageId) return
+  invalidateRootFreshness(tracker, messageId ?? undefined)
+  if (messageId != null) tracker.pendingParentMessageId = messageId
+}
+
+/** Clear the pending-parent-turn barrier once that message's own terminal assistant reply is observed. */
+export function resolvePendingRootUserMessage(tracker: RootFreshnessTracker, answeredParentId: string | null): void {
+  if (answeredParentId != null && tracker.pendingParentMessageId === answeredParentId) {
+    tracker.pendingParentMessageId = null
+  }
+}
+
+/** Observation-channel failure cannot preserve authoritative freshness -- require REST revalidation. */
+export function requireRootRevalidation(tracker: RootFreshnessTracker): void {
+  tracker.restConfirmationRequired = true
+}
+
+/** Clears the REST-revalidation requirement once a REST check has corroborated current state. */
+export function clearRootRevalidationRequirement(tracker: RootFreshnessTracker): void {
+  tracker.restConfirmationRequired = false
 }
 
 /** Shared provider-terminal classification for `session.status`/`retry`, used by both SSE and REST poll paths. */
@@ -285,8 +417,13 @@ function getSessionErrorField(primary: unknown, fallback: unknown, property: str
   return getBoundedStringProperty(primary, property) ?? getBoundedStringProperty(fallback, property)
 }
 
-/** Normalize an SDK session error without coercing or retaining its raw payload. */
-function normalizeSessionError(sessionError: unknown): string {
+/**
+ * Normalize an SDK session error without coercing or retaining its raw payload. Exported so
+ * `session-poll.ts`'s assistant-message error classifier (Phase B) can format a bounded,
+ * safe-to-log diagnostic the same way the SSE `session.error` branch below does, instead of
+ * reimplementing the bounding/truncation policy.
+ */
+export function normalizeSessionError(sessionError: unknown): string {
   if (typeof sessionError === 'string') return sessionError
   if (sessionError == null || typeof sessionError !== 'object') return GENERIC_SESSION_ERROR
 
@@ -484,8 +621,13 @@ export async function processEventStream(
 
       if (activityTracker != null && isStreamActivityEvent(eventType)) {
         const eventSessionID = getEventSessionID(event)
-        if (isOwnedSession(eventSessionID, sessionId, ownershipLedger))
+        if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
           activityTracker.firstMeaningfulEventReceived = true
+          // Root-only: descendant activity never changes root lifecycle state.
+          if (eventSessionID === sessionId && activityTracker.rootFreshness != null) {
+            invalidateRootFreshness(activityTracker.rootFreshness)
+          }
+        }
       }
 
       if (eventType === 'message.part.delta') {
@@ -493,6 +635,9 @@ export async function processEventStream(
         // delta may be an object {type:'text', text:string} or a plain string when field === 'text'.
         const eventSessionID = getEventSessionID(event)
         if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
+          if (eventSessionID === sessionId && activityTracker?.rootFreshness != null) {
+            invalidateRootFreshness(activityTracker.rootFreshness)
+          }
           const delta = getObjectProperty(eventPayload, 'delta')
           const deltaType = getStringProperty(delta, 'type')
           const deltaText = getStringProperty(delta, 'text')
@@ -506,6 +651,9 @@ export async function processEventStream(
         // Sync/session.next shape: delta is either a plain string or {type:'text', text:string}
         const eventSessionID = getEventSessionID(event)
         if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
+          if (eventSessionID === sessionId && activityTracker?.rootFreshness != null) {
+            invalidateRootFreshness(activityTracker.rootFreshness)
+          }
           const deltaRaw = getObjectProperty(eventPayload, 'delta')
           const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
           if (deltaText != null) lastText += deltaText
@@ -514,6 +662,9 @@ export async function processEventStream(
         // V2 sync tool lifecycle: cache call info for correlation with success event
         const eventSessionID = getEventSessionID(event)
         if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
+          if (eventSessionID === sessionId && activityTracker?.rootFreshness != null) {
+            invalidateRootFreshness(activityTracker.rootFreshness)
+          }
           const callID = getStringProperty(eventPayload, 'callID')
           const tool = getStringProperty(eventPayload, 'tool')
           const input = getObjectProperty(eventPayload, 'input')
@@ -526,6 +677,9 @@ export async function processEventStream(
         // V2 sync tool lifecycle: render output and detect artifacts using correlated call info
         const eventSessionID = getEventSessionID(event)
         if (isOwnedSession(eventSessionID, sessionId, ownershipLedger)) {
+          if (eventSessionID === sessionId && activityTracker?.rootFreshness != null) {
+            invalidateRootFreshness(activityTracker.rootFreshness)
+          }
           const callID = getStringProperty(eventPayload, 'callID')
           if (callID === null) continue
 
@@ -571,6 +725,15 @@ export async function processEventStream(
         const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
         if (!isOwnedSession(eventSessionID, sessionId, ownershipLedger)) continue
         if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
+        // Root-only invalidation for general part activity. The injected-completion branch below
+        // registers its own (barrier-setting) invalidation instead of this generic one, and must run
+        // BEFORE `ownershipLedger.settle()` -- see that branch.
+        if (eventSessionID === sessionId && activityTracker?.rootFreshness != null) {
+          const partMessageId = getStringProperty(part, 'messageID')
+          if (partMessageId == null || partMessageId !== activityTracker.rootFreshness.pendingParentMessageId) {
+            invalidateRootFreshness(activityTracker.rootFreshness)
+          }
+        }
 
         const partType = getStringProperty(part, 'type')
         if (partType === 'text') {
@@ -583,9 +746,21 @@ export async function processEventStream(
             // session when a background dispatch finishes (see `tool/task.ts`'s
             // `inject()`). A descendant emitting similar-looking text is not this
             // signal — only the parent session ever receives the injected turn.
+            //
+            // Upstream persists the injected turn's USER message (via `inject()`'s own
+            // `ops.prompt()` call) before the runner ever produces a reply to it -- so this text
+            // part is the injected turn's own content arriving. Register it as pending root work
+            // (barrier) BEFORE settling the ledger entry: a background completion injects another
+            // parent turn, and clearing/ignoring that fact here is exactly the exposure this
+            // freshness protocol closes. Correlated by message id so a duplicate/retried event for
+            // the same injected turn does not create a second phantom pending turn.
             if (ownershipLedger !== undefined && eventSessionID === sessionId && text != null) {
               const completion = parseInjectedTaskCompletion(text)
               if (completion !== null) {
+                if (activityTracker?.rootFreshness != null) {
+                  const messageId = getStringProperty(part, 'messageID')
+                  registerPendingRootUserMessage(activityTracker.rootFreshness, messageId)
+                }
                 ownershipLedger.settle(completion.childSessionId)
                 logger.info('Background task completion turn observed — settled ownership entry', {
                   sessionId,
@@ -647,6 +822,13 @@ export async function processEventStream(
           tokensData != null
         ) {
           if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
+          if (eventSessionID === sessionId && activityTracker?.rootFreshness != null) {
+            invalidateRootFreshness(activityTracker.rootFreshness)
+            // Clear the pending-parent-turn barrier once this assistant reply answers the message
+            // that set it -- e.g. the injected background-task-completion turn.
+            const parentId = getStringProperty(msg, 'parentID')
+            resolvePendingRootUserMessage(activityTracker.rootFreshness, parentId)
+          }
           const sessionTokens: TokenUsage = {
             input: getNumberProperty(tokensData, 'input') ?? 0,
             output: getNumberProperty(tokensData, 'output') ?? 0,
@@ -667,6 +849,18 @@ export async function processEventStream(
         const statusEventSessionID = getSessionID(eventPayload)
         if (isOwnedSession(statusEventSessionID, sessionId, ownershipLedger)) {
           const status = getObjectProperty(eventPayload, 'status')
+          // Root-scoped renewed-activity signal: `busy`/`retry` status invalidates prior idle
+          // evidence regardless of whether the status also classifies as a terminal provider
+          // error below -- a retry status is still renewed root activity even when it is not (yet)
+          // terminal.
+          const statusType = getStringProperty(status, 'type')
+          if (
+            statusEventSessionID === sessionId &&
+            (statusType === 'busy' || statusType === 'retry') &&
+            activityTracker?.rootFreshness != null
+          ) {
+            invalidateRootFreshness(activityTracker.rootFreshness)
+          }
           const terminalError = classifyRetryStatusError(status)
           if (terminalError != null) {
             // Root-scoped, mirroring `session.error` below for the same reason: a
@@ -809,6 +1003,11 @@ export async function processEventStream(
         if (activityTracker != null) {
           activityTracker.sessionIdle = true
           activityTracker.currentTurnTerminalSignalReceived = true
+          // Root idle creates an idle CANDIDATE for the current generation, not permanent
+          // permission: `markRootIdleCandidate` stamps it with the current revision, so any root
+          // activity observed afterward (including an injected completion turn) invalidates it
+          // again rather than leaving these sticky flags as unconditional permission to finish.
+          if (activityTracker.rootFreshness != null) markRootIdleCandidate(activityTracker.rootFreshness)
         }
         if (lastText.length > 0) {
           outputTextContent(lastText)
@@ -841,6 +1040,10 @@ export async function processEventStream(
         sessionId,
         error: message,
       })
+      // Observation-channel failure cannot preserve authoritative freshness: a broken SSE stream
+      // does not prove the root is quiescent. Require REST revalidation before any retained idle
+      // evidence may be consumed again -- failure evidence itself is untouched by this.
+      if (activityTracker?.rootFreshness != null) requireRootRevalidation(activityTracker.rootFreshness)
       if (ownershipLedger !== undefined) {
         const outstandingEntries = ownershipLedger.snapshot().filter(entry => entry.state === 'outstanding')
         for (const entry of outstandingEntries) {

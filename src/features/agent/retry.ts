@@ -13,7 +13,14 @@ import {
   waitForAbortableDelay,
   waitForEventProcessorShutdown,
 } from './session-poll.js'
-import {detectArtifactsFromMessageParts, getObservedFailure, processEventStream} from './streaming.js'
+import {
+  armRootFreshness,
+  createRootFreshnessTracker,
+  detectArtifactsFromMessageParts,
+  getObservedFailure,
+  hasFreshIdleCandidate,
+  processEventStream,
+} from './streaming.js'
 
 export type PromptStartResult = AttemptResult | null
 export type PromptStarter = () => Promise<PromptStartResult>
@@ -345,24 +352,32 @@ async function startV2SessionWait(
       })
       return {kind: 'fallback-to-poll'}
     }
-    // Only accept wait() as completion once the terminal signal is observed; poll briefly to
-    // absorb the async gap between wait() resolving and the event processor catching up.
+    // Only accept wait() as completion once the terminal signal is observed for the CURRENT
+    // generation; poll briefly to absorb the async gap between wait() resolving and the event
+    // processor catching up. `currentTurnTerminalSignalReceived` is a sticky flag that, once set
+    // by an earlier generation's idle, never resets on its own — reusing it directly here would let
+    // a stale idle from a prior generation authorize completion for a later one (e.g. after an
+    // injected parent-completion turn re-armed root activity). `hasFreshIdleCandidate` re-derives
+    // freshness from the revision-stamped tracker instead, so a generation invalidated after this
+    // wait() started correctly falls back to polling rather than reusing the old result.
+    const hasFreshTerminalSignal = (): boolean =>
+      activityTracker.rootFreshness == null
+        ? activityTracker.currentTurnTerminalSignalReceived === true
+        : hasFreshIdleCandidate(activityTracker.rootFreshness)
     const TERMINAL_GRACE_MS = 500
     const TERMINAL_POLL_INTERVAL_MS = 10
     const terminalDeadline = Date.now() + TERMINAL_GRACE_MS
-    while (
-      activityTracker.currentTurnTerminalSignalReceived !== true &&
-      Date.now() < terminalDeadline &&
-      signal.aborted !== true
-    ) {
+    while (!hasFreshTerminalSignal() && Date.now() < terminalDeadline && signal.aborted !== true) {
       const delay = async () => {
         await waitForAbortableDelay(TERMINAL_POLL_INTERVAL_MS, signal)
       }
       if (deadline == null) await delay()
       else await deadline.run(delay, 'v2 terminal grace wait')
     }
-    if (activityTracker.currentTurnTerminalSignalReceived !== true) {
-      logger.debug('v2.session.wait() resolved without terminal signal — deferring to poll watchdog', {sessionId})
+    if (!hasFreshTerminalSignal()) {
+      logger.debug('v2.session.wait() resolved without a fresh terminal signal — deferring to poll watchdog', {
+        sessionId,
+      })
       return {kind: 'fallback-to-poll'}
     }
     // Terminal provider errors must never be reported as wait() success: a failure observation
@@ -436,7 +451,13 @@ export async function runPromptAttempt(
     baselineMessageIds: undefined,
     sessionIdle: false,
     sessionError: null,
+    rootFreshness: createRootFreshnessTracker(),
   }
+  // When there is no separate prompt-submission step, the turn is armed immediately (see
+  // `currentTurnArmed` above) -- root freshness must be armed on the same schedule, or it stays
+  // `unarmed` forever (a no-op for every invalidation/idle-candidate call) and no completion
+  // evidence can ever become fresh for this call.
+  if (startPrompt == null && activityTracker.rootFreshness != null) armRootFreshness(activityTracker.rootFreshness)
 
   const subscriptionSignal =
     deadline == null ? attemptController.signal : AbortSignal.any([attemptController.signal, deadline.signal])
@@ -505,6 +526,9 @@ export async function runPromptAttempt(
       activityTracker.baselineMessageIds =
         (await listSessionMessageIds(client, sessionId, directory, logger, deadline)) ?? undefined
       activityTracker.currentTurnArmed = true
+      // Arm root freshness starting with no completion evidence — same ordering as the baseline
+      // capture and `currentTurnArmed` above, immediately before the prompt is actually submitted.
+      if (activityTracker.rootFreshness != null) armRootFreshness(activityTracker.rootFreshness)
       const promptStartResult =
         deadline == null ? await startPrompt() : await deadline.run(startPrompt, 'prompt submission')
       if (promptStartResult != null) {

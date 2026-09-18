@@ -6263,8 +6263,8 @@ describe('runPromptAttempt with v2.session.wait()', () => {
           .fn()
           .mockResolvedValueOnce({data: []}) // baseline: empty
           .mockResolvedValue({
-            // poll: new assistant message with time.completed
-            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}}}],
+            // poll: new assistant message with time.completed and a qualifying finish
+            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}, finish: 'stop'}}],
           }),
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },

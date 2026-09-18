@@ -23,7 +23,20 @@ import type {Event} from '@opencode-ai/sdk'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {processEventStream, type ActivityTracker, type PermissionAskedRequest} from './streaming.js'
+import {
+  armRootFreshness,
+  clearRootRevalidationRequirement,
+  createRootFreshnessTracker,
+  hasFreshIdleCandidate,
+  invalidateRootFreshness,
+  markRootIdleCandidate,
+  processEventStream,
+  registerPendingRootUserMessage,
+  requireRootRevalidation,
+  resolvePendingRootUserMessage,
+  type ActivityTracker,
+  type PermissionAskedRequest,
+} from './streaming.js'
 
 const consoleMocks = vi.hoisted(() => ({
   outputTextContent: vi.fn(),
@@ -1026,5 +1039,155 @@ describe('processEventStream — ownership check widens descendant events, no-le
     // #then the run's own activityTracker never observes idle from the descendant's idle
     expect(activityTracker.sessionIdle).toBe(false)
     expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+  })
+})
+
+describe('RootFreshnessTracker — Phase A scaffolding transitions (previously untested)', () => {
+  it('starts unarmed, and every mutator is a no-op before arming', () => {
+    // #given a freshly created tracker
+    const tracker = createRootFreshnessTracker()
+    expect(tracker.state).toBe('unarmed')
+
+    // #when invalidation/idle are attempted before arming
+    invalidateRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+
+    // #then nothing changed — state stays unarmed, revision stays 0
+    expect(tracker.state).toBe('unarmed')
+    expect(tracker.revision).toBe(0)
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+  })
+
+  it('arm -> idle-candidate -> fresh; a subsequent invalidation makes it stale at the OLD revision', () => {
+    // #given an armed tracker
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    expect(tracker.state).toBe('awaiting-activity')
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when it goes idle
+    markRootIdleCandidate(tracker)
+
+    // #then it is a fresh idle candidate at the current revision
+    expect(tracker.state).toBe('idle-candidate')
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+
+    // #when renewed activity is observed afterward
+    invalidateRootFreshness(tracker)
+
+    // #then the candidate is no longer fresh — revision advanced past idleCandidateRevision
+    expect(tracker.state).toBe('active')
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+  })
+
+  it('a new root user message sets the pending-parent barrier and blocks freshness until resolved', () => {
+    // #given an armed, idle tracker
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+
+    // #when a new root user message arrives (e.g. an injected background-task completion turn)
+    registerPendingRootUserMessage(tracker, 'msg_injected')
+
+    // #then the barrier blocks freshness even though nothing has gone idle again yet
+    expect(tracker.pendingParentMessageId).toBe('msg_injected')
+    expect(tracker.latestRootUserMessageId).toBe('msg_injected')
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when that message's own idle is observed while the barrier is still set
+    markRootIdleCandidate(tracker)
+
+    // #then still not fresh — the barrier alone blocks admission regardless of idle-candidate state
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when the barrier is resolved by the matching assistant reply
+    resolvePendingRootUserMessage(tracker, 'msg_injected')
+
+    // #then freshness is restored
+    expect(tracker.pendingParentMessageId).toBeNull()
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+  })
+
+  it('registering the same pending message id twice is a no-op — duplicate events do not create a phantom pending turn or re-advance the revision', () => {
+    // #given an armed, idle tracker with a pending parent message already registered
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+    registerPendingRootUserMessage(tracker, 'msg_injected')
+    const revisionAfterFirstRegister = tracker.revision
+
+    // #when the same message id is registered again (e.g. a duplicate/retried SSE event)
+    registerPendingRootUserMessage(tracker, 'msg_injected')
+
+    // #then the revision did not advance again, and the barrier is unchanged
+    expect(tracker.revision).toBe(revisionAfterFirstRegister)
+    expect(tracker.pendingParentMessageId).toBe('msg_injected')
+  })
+
+  it('resolving a barrier with a mismatched id is a no-op', () => {
+    // #given a tracker with a pending parent message
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    registerPendingRootUserMessage(tracker, 'msg_a')
+
+    // #when a DIFFERENT message id is resolved (e.g. a stale/out-of-order reply)
+    resolvePendingRootUserMessage(tracker, 'msg_b')
+
+    // #then the real barrier is untouched
+    expect(tracker.pendingParentMessageId).toBe('msg_a')
+  })
+
+  it('an SSE discontinuity requires REST revalidation before any retained idle evidence can be trusted again', () => {
+    // #given a fresh idle candidate
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+
+    // #when the observation channel breaks
+    requireRootRevalidation(tracker)
+
+    // #then the same idle evidence is no longer trusted, even though nothing else changed
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when a REST check corroborates current state
+    clearRootRevalidationRequirement(tracker)
+
+    // #then freshness is restored
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+  })
+
+  it('two consecutive injected parent-user-message barriers require BOTH to resolve before freshness returns', () => {
+    // #given an armed, idle tracker
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+
+    // #when a first injected turn arrives and resolves
+    registerPendingRootUserMessage(tracker, 'msg_first')
+    resolvePendingRootUserMessage(tracker, 'msg_first')
+    markRootIdleCandidate(tracker)
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+
+    // #when a second injected turn arrives (a second background dispatch completing)
+    registerPendingRootUserMessage(tracker, 'msg_second')
+
+    // #then it blocks freshness again, independently of the first
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+    expect(tracker.pendingParentMessageId).toBe('msg_second')
+
+    // #when only an unrelated id is resolved
+    resolvePendingRootUserMessage(tracker, 'msg_first')
+
+    // #then the second barrier still blocks
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when the actual second barrier resolves
+    resolvePendingRootUserMessage(tracker, 'msg_second')
+    markRootIdleCandidate(tracker)
+
+    // #then freshness returns
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
   })
 })
