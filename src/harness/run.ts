@@ -232,6 +232,29 @@ export async function run(): Promise<number> {
     // consults the full three-way outcome, only whether verification is ALREADY known
     // incomplete. See src/harness/outcome.ts's module doc for why this and the FINAL
     // assessment below are the same pure function called at two points.
+    //
+    // KNOWN LIMIT -- the two teardown facts below are hardcoded clean here, and that is
+    // an unresolved ordering gap, not a claim they hold. `runCleanup` is what learns
+    // them, and it runs after publication, so a run can submit a formal APPROVE or
+    // perform a brokered push and only then discover shutdown was not quiescent or
+    // lease continuity went unverified. It exits `incomplete` and withholds every
+    // REVERSIBLE certificate (exit code, dedup marker, reaction), but the approval and
+    // the push already happened and cannot be retracted. That matters: an APPROVE is
+    // the one review event that can satisfy branch protection (see
+    // src/features/reviews/review-guards.ts), so this is not merely cosmetic.
+    //
+    // The two facts that ARE known here -- the observation gap and drain's ownership
+    // resolution -- do gate publication correctly today.
+    //
+    // Closing it means shutting the producer down BEFORE delivering: publication needs
+    // no live OpenCode server (the response is a filesystem artifact posted via Octokit,
+    // and a brokered push reconstructs its contents and uses the GitHub API), so the
+    // sequence can become verify-then-deliver rather than deliver-then-verify. That
+    // reorder moves delivery past lock release, which requires stating explicitly that
+    // the lease protects PRODUCTION and persistence rather than delivery, and requires
+    // carrying the REVIEWED head SHA across the boundary so a delayed endorsement cannot
+    // silently approve a different commit. Deliberately deferred to its own change
+    // rather than grown onto this one.
     const provisionalVerification: InvocationVerificationFacts = {
       observationGap,
       ownershipUnresolved,
