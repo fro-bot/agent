@@ -103,6 +103,26 @@ export interface PermissionCoordinator {
   pending: () => readonly string[]
   /** Fail-close every open entry (called on run teardown). */
   dispose: (reason: string) => void
+  /**
+   * Register that this run owns the session identified by `sessionID` — the
+   * root session, or a descendant session this run's ownership ledger has
+   * adopted. Idempotent: adding an already-owned session is a no-op (backed
+   * by a `Set`).
+   *
+   * Called by run-core for the root session immediately after session
+   * creation. A later unit calls this for descendant sessions once the
+   * ownership ledger adopts them; nothing does so yet.
+   */
+  addOwnedSession: (sessionID: string) => void
+  /**
+   * `true` when `sessionID` is a session this run owns — the root session,
+   * or a descendant explicitly registered via `addOwnedSession` (or
+   * implicitly recorded because it already asked a permission through this
+   * coordinator). `false` for any other session, including one belonging to
+   * a different run — the check callers use to keep a stranger's event out
+   * of this run's event handling and Discord thread.
+   */
+  isOwned: (sessionID: string) => boolean
 }
 
 /** Dependencies injected at construction. */
@@ -346,5 +366,13 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     notifyDispose()
   }
 
-  return {onPermissionAsked, onPermissionReplied, pending, dispose}
+  function addOwnedSession(sessionID: string): void {
+    ownedSessionIDs.add(sessionID)
+  }
+
+  function isOwned(sessionID: string): boolean {
+    return ownedSessionIDs.has(sessionID)
+  }
+
+  return {onPermissionAsked, onPermissionReplied, pending, dispose, addOwnedSession, isOwned}
 }

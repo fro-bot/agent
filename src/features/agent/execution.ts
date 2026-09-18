@@ -1,5 +1,6 @@
-import type {ErrorInfo} from '@fro-bot/runtime'
+import type {ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
+import type {AttemptResult} from './prompt-sender.js'
 import type {OpenCodeServerHandle} from './server-adapter.js'
 import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
@@ -62,6 +63,7 @@ export async function executeOpenCode(
   logger: Logger,
   config?: ExecutionConfig,
   serverHandle?: OpenCodeServerHandle,
+  ownershipLedger?: OwnershipLedger,
 ): Promise<AgentResult> {
   const startTime = Date.now()
   const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -80,7 +82,14 @@ export async function executeOpenCode(
     llmError: null,
   }
   let lastLlmError: ErrorInfo | null = null
-  let shouldAbortRemoteOnTimeout = true
+  // The execution's selected stopping cause: 'deadline' when the shared deadline is what ended
+  // observation, 'other' for every other decided outcome (success, a failure the attempt itself
+  // selected, or an unexpected exception unrelated to the deadline). Set exactly once per decision
+  // point, immediately before or alongside the return/break it explains -- never re-derived later
+  // from a fresh clock read, and never cleared once set. This is the sole input the finalizer
+  // consults; see its comment for why it never touches the clock itself. Governing invariant:
+  // selecting an error never proves quiescence, and observing quiescence never erases an error.
+  let stoppingCause: 'deadline' | 'other' | null = null
   logger.info('Executing OpenCode agent (SDK mode)', {
     agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
@@ -187,7 +196,12 @@ export async function executeOpenCode(
       kind: 'initial',
     }
     for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
-      if (deadline.isExpired()) return timeoutResult()
+      // Deadline admission failure before another attempt: the deadline itself is what prevents
+      // this attempt from starting at all.
+      if (deadline.isExpired()) {
+        stoppingCause = 'deadline'
+        return timeoutResult()
+      }
       const retryDelay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[0]
 
       const prompt =
@@ -195,9 +209,9 @@ export async function executeOpenCode(
           ? initialPrompt
           : buildContinuationPrompt(nextPrompt.error, config?.credentialProvisioned === true)
       const files = allFileParts.length > 0 ? allFileParts : undefined
-      const result = await (async () => {
+      const result: AttemptResult = await (async (): Promise<AttemptResult> => {
         try {
-          const attemptResult = await sendPromptToSession(
+          return await sendPromptToSession(
             sessionClient,
             activeSessionId,
             prompt,
@@ -208,9 +222,8 @@ export async function executeOpenCode(
             serverUrl,
             deadline,
             onPermissionAsked,
+            ownershipLedger,
           )
-          shouldAbortRemoteOnTimeout = false
-          return attemptResult
         } finally {
           if (deadline.isExpired() === false)
             await reassertSessionTitle(sessionClient, activeSessionId, config?.sessionTitle, logger, {
@@ -224,6 +237,9 @@ export async function executeOpenCode(
       final = mergeArtifactResults(result.eventStreamResult, final)
 
       if (result.success) {
+        // Completion is never a deadline cause, regardless of the clock -- observing quiescence
+        // never erases an error, and here there is no error to erase.
+        stoppingCause = 'other'
         return {
           success: true,
           exitCode: 0,
@@ -241,8 +257,25 @@ export async function executeOpenCode(
         }
       }
 
+      // A bare deadline settlement with no failure to report (retry.ts's `AttemptOutcome ===
+      // 'timeout'`) is the canonical timed-out attempt: nothing was decided but the deadline
+      // itself, so this ends the execution immediately with the standard timeout result rather
+      // than surfacing the settlement's raw internal diagnostic text.
+      if (result.outcome === 'timeout') {
+        stoppingCause = 'deadline'
+        return timeoutResult()
+      }
+
       lastError = result.error
       lastLlmError = result.llmError
+      // The attempt itself states what ended it -- read here, never re-derived from a clock read
+      // taken after the fact. Only a `deadline` settlement authorizes teardown to abort; every other
+      // settlement (a selected failure, a cancellation, a watchdog) is 'other', regardless of
+      // whether the clock happens to show expired by the time control returns here. Replaces the old
+      // ledger-coupled heuristic; see 'preserves a pre-deadline retryable failure when cleanup
+      // crosses the deadline without retrying' (opencode.test.ts) for the regression this still
+      // covers -- for the right reason now.
+      stoppingCause = result.settlement.kind === 'deadline' ? 'deadline' : 'other'
       const promptWasAccepted = promptAccepted
       if (result.outcome !== 'submit_failed') promptAccepted = true
 
@@ -256,10 +289,18 @@ export async function executeOpenCode(
       const canResendOriginalPrompt =
         result.outcome === 'submit_failed' && promptWasAccepted === false && result.llmError?.retryable === true
       const canContinueTurn = result.outcome === 'turn_failed_retryable'
+      // Retry admission gate 1: an attempt whose own settlement was the deadline (captured above)
+      // never earns another attempt, regardless of outcome classification.
+      const settlementAdmitsRetry = stoppingCause !== 'deadline'
+      // Retry admission gate 2: owned work must finish draining before another attempt starts --
+      // an outstanding or unknown ledger entry means this run cannot yet prove it is safe to keep
+      // going, independent of what the last attempt's own outcome was.
+      const ledgerAdmitsRetry = ownershipLedger == null || ownershipLedger.isDrainComplete()
       if (
         (canResendOriginalPrompt === false && canContinueTurn === false) ||
         attempt >= MAX_LLM_RETRIES ||
-        deadline.isExpired()
+        settlementAdmitsRetry === false ||
+        ledgerAdmitsRetry === false
       )
         break
 
@@ -273,7 +314,6 @@ export async function executeOpenCode(
         nextPrompt = {kind: 'initial'}
       }
 
-      shouldAbortRemoteOnTimeout = true
       logger.warning('LLM fetch error detected, retrying with continuation prompt', {
         attempt,
         maxAttempts: MAX_LLM_RETRIES,
@@ -281,11 +321,23 @@ export async function executeOpenCode(
         delayMs: retryDelay,
         sessionId,
       })
+      // Admission control for the committed retry delay: if cleanup (inspectResponseFile, above)
+      // already exhausted the budget, the previous failure and its (non-deadline) cause stand as
+      // decided -- do not manufacture a deadline throw here, and do not let it become an abort
+      // cause on the previous attempt's behalf. Only a deadline that concludes the delay itself,
+      // once committed (below), ends the execution by deadline.
+      if (deadline.isExpired()) break
+
       await deadline.run(async () => {
         await waitForAbortableDelay(retryDelay, deadline.signal)
       }, 'retry delay')
     }
 
+    // The loop can only reach here via a decided failure (response file present, non-retryable, or
+    // retries exhausted -- the same post-loop path either way) or because the shared deadline
+    // admission checks above forced it to give up mid-retry. `stoppingCause` was already set,
+    // per attempt, at the point each failure settled (see attemptDeadlineExpiredAtSettle above) --
+    // nothing here re-derives it from a fresh clock read.
     return {
       success: false,
       exitCode: 1,
@@ -302,7 +354,23 @@ export async function executeOpenCode(
       classificationPath: final.classificationPath,
     }
   } catch (error) {
-    if (deadline.isTimedOut()) return timeoutResult()
+    // An explicit, tagged deadline rejection (deadline.run() losing its internal race during
+    // setup, submission, or a committed retry delay) is the one exception that IS a deadline cause
+    // -- identified by name, never by re-deriving it from clock state.
+    if (error instanceof Error && error.name === 'DeadlineExceededError') {
+      stoppingCause = 'deadline'
+      return timeoutResult()
+    }
+    // A genuine unexpected exception, untagged as a deadline rejection (already ruled out above by
+    // name): it never became an AttemptResult, so there is no settlement to read -- this is the one
+    // place in this function where a clock read is genuinely unavoidable rather than a re-derivation
+    // of a decision already made elsewhere. Nothing was decided for this attempt, so quiescence
+    // cannot be proven; selecting this error does not prove the remote session is done. Deliberate
+    // choice: if the deadline has already expired, default to deadline-caused so teardown aborts
+    // (an unexpected exception plus an expired clock still means nothing was decided, so this errs
+    // toward not leaving the remote session ownerless); if the deadline has not expired, 'other'
+    // leaves teardown with no abort authority, same as any other undecided failure.
+    stoppingCause = deadline.isExpired() ? 'deadline' : 'other'
     const duration = Date.now() - startTime
     const errorMessage = toErrorMessage(error)
     const transportFailure = isLlmFetchError(error)
@@ -323,7 +391,21 @@ export async function executeOpenCode(
       classificationPath: transportFailure ? 'fallback' : 'unclassified',
     }
   } finally {
-    if (shouldAbortRemoteOnTimeout && deadline.isTimedOut() && client != null && sessionId != null)
+    // Finalizer rule: abort the root session if and only if the execution's selected stopping
+    // cause is 'deadline', and a client and session exist. This never consults the clock -- no
+    // isExpired(), no isTimedOut() -- because that re-derivation-after-an-await is exactly the bug
+    // pattern seven review rounds kept reintroducing (each fix read the clock at a slightly
+    // different, still-wrong moment). `stoppingCause` is set exactly once per decision point,
+    // synchronously with the return/break it explains, so by the time teardown runs it is already
+    // final and cannot have gone stale from cleanup that ran afterward.
+    //
+    // This deliberately does not widen the narrow existing abort responsibility: a non-deadline
+    // provider failure, a watchdog failure, and a stream problem all set stoppingCause to 'other'
+    // and must not newly authorize a root abort here -- "do not abort here" means this run has no
+    // authority to cancel the session, not that the session is known to be quiescent. Local
+    // cancellation of a losing racer inside sendPromptToSession/runPromptAttempt is cleanup, not an
+    // execution settlement, and is never consulted here either.
+    if (stoppingCause === 'deadline' && client != null && sessionId != null)
       await abortRemoteSession(client, sessionId, logger)
     deadline.dispose()
     if (ownsServer) server?.close()

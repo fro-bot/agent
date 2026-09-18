@@ -232,6 +232,6 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 | Output | Description |
 | --- | --- |
 | `cache-status` | Cache restore status (`hit`, `miss`, `corrupted`) |
-| `cache-save-result` | Cache save outcome (`durable`, `store-only`, `skipped`, `not-persisted`); set from the main step — the post-action retry reports only to the job summary |
+| `cache-save-result` | Cache save outcome (`durable`, `store-only`, `skipped`, `declined-for-safety`, `not-persisted`); set from the main step — the post-action retry reports only to the job summary |
 
 See the full outputs table in the repository [README](../../README.md#outputs).

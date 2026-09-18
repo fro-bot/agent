@@ -194,6 +194,78 @@ export async function transitionRun(
   return ok({etag: writeResult.data.etag, state: nextState})
 }
 
+/**
+ * Merge a shallow patch into `details` without a phase transition.
+ *
+ * `transitionRun` refuses a same-phase write — `isTransitionAllowed` has no
+ * `EXECUTING -> EXECUTING` entry — so it cannot be used to persist ownership
+ * changes (the root session id, the set of owned session ids) as they happen
+ * mid-execution. This function exists for exactly that: a continuous,
+ * best-effort detail patch that leaves `phase` untouched.
+ *
+ * Unlike `transitionRun`, the caller does not supply an etag: the current
+ * object is read fresh on every call and the conditional PUT uses that read's
+ * etag. The alternative — threading a caller-tracked etag through a
+ * long-lived closure — would go stale the instant the heartbeat controller's
+ * own independent read-patch-write cycle (`heartbeat.ts`) commits a write,
+ * turning every ownership patch into a guaranteed 412. Reading fresh each
+ * call accepts a narrower race (this call vs. a heartbeat tick landing in the
+ * same instant) instead of a wide one (this call vs. any heartbeat tick since
+ * the caller's etag was captured). A lost race here is not fatal — ownership
+ * is persisted continuously, so the next adopt/settle retries the write with
+ * fresher data; the caller logs and moves on rather than retrying inline.
+ */
+export async function patchRunDetails(
+  config: CoordinationConfig,
+  identity: string,
+  repo: string,
+  runId: string,
+  patch: Record<string, unknown>,
+  logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+): Promise<Result<{etag: string; state: RunState}, Error>> {
+  const key = getRunKey(config, identity, repo, runId)
+  if (key.success === false) {
+    return err(key.error)
+  }
+
+  const getObject = resolveGetObject(config)
+  if (getObject.success === false) {
+    return err(getObject.error)
+  }
+
+  const conditionalPut = resolveConditionalPut(config)
+  if (conditionalPut.success === false) {
+    return err(conditionalPut.error)
+  }
+
+  const current = await getObject.data(key.data)
+  if (current.success === false) {
+    return err(current.error)
+  }
+
+  const parsedCurrent = parseRunState(current.data.data)
+  if (parsedCurrent.success === false) {
+    return err(parsedCurrent.error)
+  }
+
+  const nextState: RunState = {
+    ...parsedCurrent.data,
+    details: {...parsedCurrent.data.details, ...patch},
+  }
+
+  logger.debug('Patching run-state details', {key: key.data, repo, runId})
+
+  const writeResult = await conditionalPut.data(key.data, JSON.stringify(nextState), {
+    ifMatch: current.data.etag,
+    tagging: RUN_STATE_TAG,
+  })
+  if (writeResult.success === false) {
+    return err(writeResult.error)
+  }
+
+  return ok({etag: writeResult.data.etag, state: nextState})
+}
+
 export async function findStaleRuns(
   config: CoordinationConfig,
   identity: string,

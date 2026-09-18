@@ -261,6 +261,44 @@ export function buildCIConfig(
     ciConfig.plugin = [...rawPlugins, systematicPlugin]
   }
 
+  // R12: pin subagent_depth to one, unconditionally, across every mode below.
+  // Upstream checks depth before execution against real session ancestry
+  // (`.slim/clonedeps/repos/anomalyco__opencode/packages/opencode/src/tool/task.ts:104-117`)
+  // — a depth value this project supplied would be a guess a client is in no
+  // position to make, so we pin the upstream setting instead of building a
+  // depth check of our own.
+  //
+  // Verified evidence (the `.slim/clonedeps/` checkout this cites is not present
+  // in the CI checkout, so this is recorded here for a reader without the clone):
+  // `subagent_depth` is a top-level key in the v1 config schema, defined as
+  // `subagent_depth: Schema.optional(NonNegativeInt)` at
+  // `packages/core/src/v1/config/config.ts:84`, and read at the exact site this
+  // pin is defending against, `packages/opencode/src/tool/task.ts:111`, as
+  // `depth >= (cfg.subagent_depth ?? 1)`. Both confirmed against the clone at
+  // `base_version` (`packages/harness/harness.config.json`) as of this comment;
+  // re-verify against the pinned tag if `base_version` moves.
+  //
+  // Depth matters because upstream cancellation walks RUNNING jobs only: a
+  // completed child that links the root session to a still-running
+  // grandchild is never walked, so the grandchild can outlive the
+  // cancellation meant to stop it. Depth one makes that path unreachable
+  // rather than handled.
+  //
+  // This project's general convention (established by the file-watcher
+  // config work) is that an explicit operator value wins. That convention
+  // is deliberately NOT followed here: depth one is closing a specific,
+  // unsolved correctness gap (grandchild traversal), not a stylistic
+  // default, so an operator override is recorded via a warning rather than
+  // honored. Raising it requires solving that traversal gap on its own
+  // terms — see the plan's Scope Boundaries — which is out of scope here.
+  const operatorSubagentDepth: unknown = ciConfig.subagent_depth
+  ciConfig.subagent_depth = 1
+  if (operatorSubagentDepth != null && operatorSubagentDepth !== 1) {
+    logger.warning(
+      `OpenCode config subagent_depth overridden to 1 (operator supplied ${String(operatorSubagentDepth)}). Nested subagent depth is pinned to avoid an unreachable grandchild-cancellation gap; see plan docs/plans/2026-09-14-001-feat-background-subagent-ownership-plan.md.`,
+    )
+  }
+
   if (enableOmoSlim) {
     // Slim mode: strip OMO plugins, add slim plugin, pin orchestrator
     const currentPlugins: unknown[] = Array.isArray(ciConfig.plugin) ? (ciConfig.plugin as unknown[]) : []

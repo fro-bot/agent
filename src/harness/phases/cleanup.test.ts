@@ -1,8 +1,9 @@
+import type {LeaseController} from './acquire-lock.js'
 import type {CleanupPhaseOptions} from './cleanup.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {ok} from '../../shared/types.js'
+import {err, ok} from '../../shared/types.js'
 
 vi.mock('@actions/core', () => ({
   saveState: vi.fn(),
@@ -45,6 +46,7 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
     pruneSessions: vi.fn(async () => ({prunedCount: 0, remainingCount: 0})),
     syncArtifactsToStore: vi.fn(async () => ({uploaded: 0, failed: 0})),
     syncMetadataToStore: vi.fn(async () => ({success: true})),
+    releaseLock: vi.fn(async () => ok(undefined)),
   }
 })
 
@@ -472,5 +474,221 @@ describe('runCleanup', () => {
 
     // #then pruning is skipped
     expect(pruneSessions).not.toHaveBeenCalled()
+  })
+})
+
+describe('runCleanup persistence safety gate (plan Unit 12)', () => {
+  const createServerHandle = (quiesced = true): NonNullable<CleanupPhaseOptions['serverHandle']> => ({
+    client: {} as NonNullable<CleanupPhaseOptions['serverHandle']>['client'],
+    server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+    shutdown: vi.fn().mockResolvedValue({quiesced}),
+  })
+
+  const createLeaseController = (overrides?: Partial<LeaseController>): LeaseController => ({
+    hasFailed: () => false,
+    currentEtag: () => '"etag-initial"',
+    stop: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  })
+
+  const baseOptions = (overrides?: Partial<CleanupPhaseOptions>): CleanupPhaseOptions => ({
+    bootstrapLogger: createMockLogger(),
+    reactionCtx: null,
+    githubClient: null,
+    agentSuccess: true,
+    attachmentResult: null,
+    serverHandle: null,
+    sessionRetention: null,
+    detectedOpencodeVersion: '1.0.0',
+    storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+    metrics: createMetricsCollector(),
+    agentIdentity: 'github',
+    repo: 'owner/repo',
+    runId: 'run-123',
+    lockEtag: null,
+    ...overrides,
+  })
+
+  beforeEach(() => {
+    vi.resetModules()
+    vi.clearAllMocks()
+    process.env.GITHUB_WORKSPACE = '/tmp/workspace'
+    process.env.GITHUB_RUN_ID = '12345'
+    process.env.GITHUB_RUN_ATTEMPT = '1'
+  })
+
+  afterEach(() => {
+    delete process.env.GITHUB_WORKSPACE
+    delete process.env.GITHUB_RUN_ID
+    delete process.env.GITHUB_RUN_ATTEMPT
+  })
+
+  it('declines cache persistence when the ownership ledger has an unknown entry', async () => {
+    // #given a ledger with a session that was adopted and never confirmed settled
+    const {createOwnershipLedger} = await import('@fro-bot/runtime')
+    const {saveCache} = await import('../../services/cache/index.js')
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'reviewer')
+    ledger.markUnknown('ses_child')
+    expect(ledger.isPersistenceSafe()).toBe(false)
+
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(baseOptions({ownershipLedger: ledger}))
+
+    // #then saveCache is never attempted -- persistence is declined, not merely retried.
+    // 'declined-for-safety', not 'not-persisted': that value tells the post hook to honor
+    // the decline instead of silently retrying it (see cache-save-result.ts).
+    expect(saveCache).not.toHaveBeenCalled()
+    const {saveState, setOutput} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+    // #and the public cache-save-result Action output reflects the same decline, not just
+    // the internal CACHE_SAVED state handoff -- a caller watching only the output would
+    // otherwise never see a real safety decline happen
+    expect(setOutput).toHaveBeenCalledWith('cache-save-result', 'declined-for-safety')
+  })
+
+  it('persists normally when the ownership ledger is empty (every run today, unchanged behavior)', async () => {
+    // #given an empty ledger -- persistence-safe by definition
+    const {createOwnershipLedger} = await import('@fro-bot/runtime')
+    const {saveCache} = await import('../../services/cache/index.js')
+    const ledger = createOwnershipLedger()
+    expect(ledger.isPersistenceSafe()).toBe(true)
+
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(baseOptions({ownershipLedger: ledger}))
+
+    // #then saveCache proceeds as normal
+    expect(saveCache).toHaveBeenCalledTimes(1)
+  })
+
+  it('declines cache persistence when server shutdown could not confirm quiescence', async () => {
+    // #given shutdown() reports quiesced: false
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(baseOptions({serverHandle: createServerHandle(false)}))
+
+    // #then saveCache is never attempted, and the state is 'declined-for-safety' so the
+    // post hook honors the decline instead of retrying it
+    expect(saveCache).not.toHaveBeenCalled()
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+  })
+
+  it('declines cache persistence when the lease renewal has failed, without stopping renewal first', async () => {
+    // #given a coordination lease held by this run whose renewal has already failed --
+    // "fails closed": this run can no longer be certain no other surface is writing
+    const {saveCache} = await import('../../services/cache/index.js')
+    const lease = createLeaseController({hasFailed: () => true})
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: lease,
+      }),
+    )
+
+    // #then saveCache is never attempted, and the decline reason names the lease
+    expect(saveCache).not.toHaveBeenCalled()
+    const core = await import('@actions/core')
+    const remediationText = vi.mocked(core.summary.addRaw).mock.calls.flat().join(' ')
+    expect(remediationText).toContain('lease could not be renewed')
+    // #and the state is 'declined-for-safety' -- the post hook must honor this decline,
+    // not retry it, since a failed lease is exactly the case the process boundary can't help
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+    // #and stop() is still called exactly once, after the decision, not to make it
+    expect(lease.stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('persists normally when this run holds no lock (leaseRenewal is null) -- never fails for want of a lease it never held', async () => {
+    // #given S3 disabled or acquisition failed: no LeaseController at all
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(baseOptions({leaseRenewal: null}))
+
+    // #then saveCache proceeds as normal -- R22a
+    expect(saveCache).toHaveBeenCalledTimes(1)
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'durable')
+  })
+
+  it('surfaces a declined persistence as a visible, named reason in the job summary, not a silent skip', async () => {
+    // #given the review finding this unit exists to fix: an unknown ledger entry must not
+    // silently skip persistence
+    const {createOwnershipLedger} = await import('@fro-bot/runtime')
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'reviewer')
+    ledger.markUnknown('ses_child')
+
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(baseOptions({ownershipLedger: ledger}))
+
+    // #then a reader sees why, in the same 'Session Persistence' row writeCacheSaveResultSummary
+    // always writes -- not a second, separate channel
+    const core = await import('@actions/core')
+    expect(core.summary.addHeading).toHaveBeenCalledWith('Session Persistence', 3)
+    const remediationText = vi.mocked(core.summary.addRaw).mock.calls.flat().join(' ')
+    expect(remediationText).toContain('**Reason:**')
+    expect(remediationText).toContain('background subagent work')
+  })
+
+  it('releases the lock using the lease-renewed ETag, not the stale acquisition ETag', async () => {
+    // #given renewal ticked at least once and moved the lock record's ETag forward
+    const {releaseLock} = await import('@fro-bot/runtime')
+    const lease = createLeaseController({currentEtag: () => '"etag-renewed"'})
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs and releases the lock
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: lease,
+      }),
+    )
+
+    // #then release uses the renewed ETag, never the stale acquisition-time one
+    expect(lease.stop).toHaveBeenCalledTimes(1)
+    expect(releaseLock).toHaveBeenCalledWith(expect.any(Object), 'owner/repo', '"etag-renewed"', expect.any(Object))
+  })
+
+  it('still reaches lock release after a hung renewal, and a failed conditional delete does not throw out of cleanup', async () => {
+    // #given stop() returned after its grace period because the in-flight renewal never
+    // settled -- currentEtag() is therefore stale, so the conditional delete at release
+    // time is expected to fail its precondition (the safe direction: this run may no
+    // longer actually hold the lock)
+    const {releaseLock} = await import('@fro-bot/runtime')
+    vi.mocked(releaseLock).mockResolvedValueOnce(err(new Error('precondition failed')))
+    const lease = createLeaseController({currentEtag: () => '"etag-stale"'})
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs despite the hung renewal
+    await expect(
+      runCleanup(
+        baseOptions({
+          storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+          lockEtag: '"etag-initial"',
+          leaseRenewal: lease,
+        }),
+      ),
+    ).resolves.toBeUndefined()
+
+    // #then release is still attempted with the (stale) etag stop() settled on, and the
+    // failed conditional delete is swallowed -- non-fatal, matching every other release failure
+    expect(lease.stop).toHaveBeenCalledTimes(1)
+    expect(releaseLock).toHaveBeenCalledWith(expect.any(Object), 'owner/repo', '"etag-stale"', expect.any(Object))
   })
 })

@@ -16,9 +16,11 @@ import type {RunIndex} from './run-index.js'
 import {
   acquireLock,
   createHeartbeatController,
+  createOwnershipLedger,
   createRun,
   getRunKey,
   parseRunState,
+  patchRunDetails,
   releaseLock,
   transitionRun,
 } from '@fro-bot/runtime'
@@ -596,6 +598,50 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     let heartbeatStopped = false
 
+    // ── Ownership ledger — tracks background subagents this run dispatches ──
+    //
+    // Created fresh per run and handed to `runOpenCodeCore`, which adopts an
+    // entry when it observes a background dispatch and settles/unknowns entries
+    // via its own reconciliation. `runOpenCodeCore` does not return until the
+    // ledger drains (or the run's deadline expires) — so everything below that
+    // already runs after `runOpenCodeCore` resolves (heartbeat.stop, the
+    // COMPLETED/FAILED/CANCELLED transition, and the outer handoff finally)
+    // naturally runs only after drain, with no separate drain stage needed here.
+    const ownershipLedger = createOwnershipLedger()
+
+    // Persist ownership onto run state continuously as the ledger changes
+    // (adopt/settle/markUnknown), not only at completion — a restart can land
+    // at any point during the run. Shape matches what `recovery.ts`'s
+    // `readPersistedOwnership` reads: `details.rootSessionId` (string) and
+    // `details.ownedSessionIds` (string[]). Fire-and-forget and best-effort:
+    // a lost race against the heartbeat's own read-patch-write cycle just means
+    // the next ownership change retries with fresher data.
+    function persistOwnership(info: {
+      readonly rootSessionId: string
+      readonly ownedSessionIds: readonly string[]
+    }): void {
+      const write = async (): Promise<void> => {
+        const result = await patchRunDetails(
+          coordinationConfig,
+          identity,
+          repo,
+          runId,
+          {rootSessionId: info.rootSessionId, ownedSessionIds: [...info.ownedSessionIds]},
+          coordLogger,
+        )
+        if (result.success === false) {
+          logger.warn({repo, runId, err: result.error.message}, 'run: failed to persist ownership onto run state')
+        }
+      }
+      // eslint-disable-next-line no-void
+      void write().catch((error: unknown) => {
+        logger.warn(
+          {repo, runId, err: error instanceof Error ? error.message : String(error)},
+          'run: patchRunDetails threw while persisting ownership',
+        )
+      })
+    }
+
     const {statusSink, replySink} = request
 
     try {
@@ -794,6 +840,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           onBusy: (busy: boolean) => {
             statusSink.setBusy(busy)
           },
+          ownershipLedger,
+          onOwnershipChange: persistOwnership,
         })
       } finally {
         // Fail-closed: dispose any still-open coordinator entries so pending approvals
@@ -865,6 +913,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       const isCoreError = execError instanceof RunCoreError
       const isTimeout = isCoreError && execError.kind === 'timeout'
       const isInactivityTimeout = isCoreError && execError.kind === 'inactivity-timeout'
+      const isDrainTimeout = isCoreError && execError.kind === 'drain-timeout'
       const isStreamEnded = isCoreError && execError.kind === 'stream-ended'
       const isReachability = isCoreError && (execError.kind === 'unreachable' || execError.kind === 'auth')
       const isEmptyPrompt = execError instanceof EmptyPromptError
@@ -1083,13 +1132,17 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
               ? hasVisibleOutput === true
                 ? `The task stopped producing output for ${inactivityDuration} after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
                 : `The task stopped producing output for ${inactivityDuration}. Please try again.`
-              : isReachability === true
-                ? 'The workspace is not reachable right now. Please try again later.'
-                : isEmptyPrompt === true
-                  ? 'Nothing to do — please include a task in your message.'
-                  : isStreamEnded === true
-                    ? 'The task stream closed unexpectedly. Please try again.'
-                    : 'The task failed. Please try again.'
+              : isDrainTimeout === true
+                ? hasVisibleOutput === true
+                  ? `The task's background work did not finish within the ${timeoutDuration} time limit and was cancelled. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+                  : `The task's background work did not finish within the ${timeoutDuration} time limit and was cancelled. Please try again.`
+                : isReachability === true
+                  ? 'The workspace is not reachable right now. Please try again later.'
+                  : isEmptyPrompt === true
+                    ? 'Nothing to do — please include a task in your message.'
+                    : isStreamEnded === true
+                      ? 'The task stream closed unexpectedly. Please try again.'
+                      : 'The task failed. Please try again.'
 
         // ── Status controller failure transition ──────────────────────────────────────────────────
         // resolveToFailure returns:

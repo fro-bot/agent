@@ -1,3 +1,4 @@
+import type {CleanupPhaseOptions} from './cleanup.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -346,5 +347,226 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
       expect.any(Object),
     )
     expect(rejectedLogger.info).not.toHaveBeenCalledWith('Post-action: no cache content to save', expect.any(Object))
+  })
+})
+
+describe('the post hook honors a persistence-safety decline instead of retrying it (declined-for-safety)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.stateStore.clear()
+    process.env.GITHUB_WORKSPACE = '/tmp/workspace'
+    process.env.GITHUB_RUN_ID = '12345'
+    process.env.GITHUB_RUN_ATTEMPT = '1'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    process.env.GITHUB_REF_NAME = 'main'
+    process.env.RUNNER_OS = 'Linux'
+    delete process.env.OPENCODE_PROMPT_ARTIFACT
+    delete process.env.SKIP_CACHE
+  })
+
+  const runCleanupWithOverrides = async (overrides: Partial<CleanupPhaseOptions>): Promise<void> => {
+    const {runCleanup} = await import('./cleanup.js')
+    await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      agentSuccess: true,
+      attachmentResult: null,
+      serverHandle: null,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+      ...overrides,
+    })
+  }
+
+  it('a run declining for a failed lease renewal is not retried by the post step', async () => {
+    // #given a coordination lease this run held whose renewal has already failed -- another
+    // surface (the Discord gateway, or a retried Action run) may hold the lock now
+    const {saveCache} = await import('../../services/cache/index.js')
+    const lease = {
+      hasFailed: () => true,
+      currentEtag: () => '"etag-initial"',
+      stop: vi.fn().mockResolvedValue(undefined),
+    }
+
+    await runCleanupWithOverrides({lockEtag: '"etag-initial"', leaseRenewal: lease})
+
+    // #then cleanup declined and recorded declined-for-safety, not not-persisted
+    expect(saveCache).not.toHaveBeenCalled()
+    expect(mocks.stateStore.get('cacheSaved')).toBe('declined-for-safety')
+
+    // #when the post hook runs later
+    mocks.stateStore.set('shouldSaveCache', 'true')
+
+    const {runPost} = await import('../post.js')
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    // #then the post hook never calls saveCache -- the process boundary does not resolve a
+    // failed lease renewal, so it must not override cleanup's decline
+    expect(saveCache).not.toHaveBeenCalled()
+    expect(logger.info).toHaveBeenCalledWith(
+      'Skipping post-action: honoring persistence safety decline from main action, not retrying',
+      expect.any(Object),
+    )
+  })
+
+  it('a run declining for unconfirmed server quiescence is not retried by the post step', async () => {
+    // #given the OpenCode server's shutdown could not confirm it had stopped writing
+    const {saveCache} = await import('../../services/cache/index.js')
+    const serverHandle = {
+      client: {} as never,
+      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+      shutdown: vi.fn().mockResolvedValue({quiesced: false}),
+    }
+
+    await runCleanupWithOverrides({
+      serverHandle,
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+    })
+
+    expect(saveCache).not.toHaveBeenCalled()
+    expect(mocks.stateStore.get('cacheSaved')).toBe('declined-for-safety')
+
+    mocks.stateStore.set('shouldSaveCache', 'true')
+
+    const {runPost} = await import('../post.js')
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    // #then unconfirmed quiescence means the OpenCode child's exit was never verified -- a
+    // runner does not guarantee orphaned children are reaped between steps, so the post
+    // hook's own process-boundary argument cannot resolve this either
+    expect(saveCache).not.toHaveBeenCalled()
+    expect(logger.info).toHaveBeenCalledWith(
+      'Skipping post-action: honoring persistence safety decline from main action, not retrying',
+      expect.any(Object),
+    )
+  })
+
+  it('a run declining for unresolved background-subagent ownership is not retried by the post step', async () => {
+    // #given the ownership ledger has an entry that never settled
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {createOwnershipLedger} = await import('@fro-bot/runtime')
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'reviewer')
+    ledger.markUnknown('ses_child')
+
+    await runCleanupWithOverrides({
+      ownershipLedger: ledger,
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+    })
+
+    expect(saveCache).not.toHaveBeenCalled()
+    expect(mocks.stateStore.get('cacheSaved')).toBe('declined-for-safety')
+
+    mocks.stateStore.set('shouldSaveCache', 'true')
+
+    const {runPost} = await import('../post.js')
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    expect(saveCache).not.toHaveBeenCalled()
+    expect(logger.info).toHaveBeenCalledWith(
+      'Skipping post-action: honoring persistence safety decline from main action, not retrying',
+      expect.any(Object),
+    )
+  })
+
+  it('still retries a genuine not-persisted from an ordinary failed save -- this must not regress', async () => {
+    // #given an ordinary checkpoint decline, unrelated to persistence safety
+    const {saveCache} = await import('../../services/cache/index.js')
+    vi.mocked(saveCache).mockResolvedValueOnce({
+      cachePersisted: false,
+      storePersisted: false,
+      outcome: 'checkpoint-declined',
+    })
+
+    await runCleanupWithOverrides({storeConfig: {enabled: false, bucket: '', region: '', prefix: ''}})
+
+    expect(mocks.stateStore.get('cacheSaved')).toBe('not-persisted')
+
+    mocks.stateStore.set('shouldSaveCache', 'true')
+    vi.mocked(saveCache).mockResolvedValueOnce({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+    const {runPost} = await import('../post.js')
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    // #then the post hook retries -- an ordinary not-persisted must not be swept into the
+    // new safety-decline skip path (1 attempt at cleanup + 1 retry at post)
+    expect(saveCache).toHaveBeenCalledTimes(2)
+    expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
+  })
+
+  it('the job summary reports a safety-decline skip distinctly from an ordinary already-durable skip', async () => {
+    // #given a safety decline (lease renewal failed)
+    const {saveCache} = await import('../../services/cache/index.js')
+    const lease = {
+      hasFailed: () => true,
+      currentEtag: () => '"etag-initial"',
+      stop: vi.fn().mockResolvedValue(undefined),
+    }
+    await runCleanupWithOverrides({lockEtag: '"etag-initial"', leaseRenewal: lease})
+    mocks.stateStore.set('shouldSaveCache', 'true')
+
+    const core = await import('@actions/core')
+    const {runPost} = await import('../post.js')
+    await runPost({logger: createMockLogger()})
+
+    // #then the post step writes its own labeled job-summary row naming the safety skip --
+    // a silent skip would be as misleading as the silent retry this fix prevents
+    expect(core.summary.addHeading).toHaveBeenCalledWith(
+      'Session Persistence (post-action: safety decline honored, not retried)',
+      3,
+    )
+
+    // #when a different run already achieved durable persistence at cleanup time (an
+    // ordinary skip, not a safety decline)
+    vi.clearAllMocks()
+    mocks.stateStore.clear()
+    vi.mocked(saveCache).mockResolvedValueOnce({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+    await runCleanupWithOverrides({storeConfig: {enabled: false, bucket: '', region: '', prefix: ''}})
+    mocks.stateStore.set('shouldSaveCache', 'true')
+
+    // #and only the post hook's own summary calls are inspected below -- cleanup.ts writes
+    // its own 'Session Persistence' row for the durable save, which is a separate, correct
+    // row from a separate phase and not what this assertion is about
+    vi.mocked(core.summary.addHeading).mockClear()
+
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    // #then the post step never writes a 'Session Persistence' job-summary row at all for an
+    // ordinary already-durable skip -- distinct from the safety-decline row above, which
+    // always writes one. The log line alone names the ordinary case.
+    expect(core.summary.addHeading).not.toHaveBeenCalledWith(expect.stringContaining('Session Persistence'), 3)
+    expect(logger.info).toHaveBeenCalledWith('Skipping post-action: cache saved by main action', expect.any(Object))
+  })
+
+  it('an absent or unrecognized CACHE_SAVED state value still fails toward retrying (not toward the new safety skip)', async () => {
+    // #given a garbled/absent state value -- parseCacheSaveStateValue must keep mapping this
+    // to not-persisted, never to declined-for-safety, since declined-for-safety is written
+    // only deliberately by runCleanup and an unrecognized value carries no such guarantee.
+    // The post hook is the last chance to persist state, so the safe direction here is still
+    // "retry", not "skip" -- that direction is unchanged by this fix.
+    mocks.stateStore.set('shouldSaveCache', 'true')
+    mocks.stateStore.set('cacheSaved', 'garbled-value')
+
+    const {saveCache} = await import('../../services/cache/index.js')
+    vi.mocked(saveCache).mockResolvedValueOnce({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+    const {runPost} = await import('../post.js')
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    expect(saveCache).toHaveBeenCalledTimes(1)
+    expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
   })
 })
