@@ -43,8 +43,24 @@ export interface ActivityTracker {
   currentTurnTerminalSignalReceived: boolean
   currentTurnArmed?: boolean
   baselineMessageIds?: ReadonlySet<string>
-  /** Tracks last observed completed assistant message ID so the polling fallback can confirm it remains the latest across two polls before reporting completion — guards against races with the next agent loop step. */
-  completedAssistantMessageId?: string
+  /**
+   * Provisional, generation-scoped memory for the poll path's two-observation confirmation of a
+   * completed assistant message -- recording this is a provisional observation, NOT an
+   * authority-granting transition (see the invariant on `RootFreshnessTracker` below). It may only
+   * tighten a completion guard (require a second matching observation before a candidate is even
+   * returned to the caller) or carry evidence forward for a later, fully qualified admission to
+   * consume; recording or matching it must never itself release `pendingParentMessageId` or
+   * `restConfirmationRequired`, and must never authorize completion on its own.
+   *
+   * Keyed by (message id, revision), not by message id alone: confirmation belongs to a specific
+   * generation. A stored id that matches but whose stored revision no longer matches the current
+   * generation does not confirm -- it restarts the two-observation count for the new generation,
+   * exactly as a different id would. This also makes every inter-poll or outer-admission rejection
+   * that discards a candidate responsible for clearing this memory (not just the request-revision
+   * check inside the observation itself) so a later admission can never bridge across a rejected
+   * observation using memory left over from before it.
+   */
+  completedAssistantMessageId?: {readonly messageId: string; readonly revision: number | null}
   sessionIdle: boolean
   sessionError: string | null
   /** Set when a terminal provider ErrorInfo has been classified; first terminal signal wins. */
@@ -95,6 +111,24 @@ export type RootFreshnessState = 'unarmed' | 'awaiting-activity' | 'active' | 'i
  * `restConfirmationRequired` is set on an observation-channel discontinuity: a broken SSE stream
  * cannot itself prove freshness, so retained idle evidence needs a REST revalidation before a
  * consumer may rely on it again.
+ *
+ * **Governing invariant: generation-bound qualification before authorization.** A provisional
+ * observation (e.g. a poll-path candidate that merely matches this tracker's current
+ * `pendingParentMessageId`, or a REST response that merely matches its current `revision`) may
+ * record generation-scoped evidence, or tighten a completion guard -- it must never itself release
+ * a guard (`pendingParentMessageId`, `restConfirmationRequired`) or authorize completion. Any
+ * transition that grants authority -- clearing the barrier, clearing the revalidation requirement,
+ * writing a terminal signal, constructing a settlement -- must be justified by fully qualified
+ * evidence whose generation (`revision`) and parent identity still match this tracker's state AT
+ * THE COMMIT POINT, not at the moment the evidence was first observed. Qualification inspects the
+ * pre-transition state; it must never mutate that state merely to make its own predicate pass --
+ * that is exactly the circularity this tracker exists to prevent (a check that clears the barrier
+ * it is itself supposed to be gated by). Two corollaries fall out of this: confirmation memory
+ * belongs to a (message id, revision) pair, never to the message id alone (see
+ * `ActivityTracker.completedAssistantMessageId`'s doc comment for the provisional-memory
+ * exception this permits); and a REST response corroborates the SPECIFIC current completion
+ * evidence it was requested against -- it never grants blanket permission to trust an arbitrary
+ * future idle event for this generation.
  */
 export interface RootFreshnessTracker {
   state: RootFreshnessState
@@ -190,7 +224,18 @@ export function registerPendingRootUserMessage(tracker: RootFreshnessTracker, me
   if (messageId != null) tracker.pendingParentMessageId = messageId
 }
 
-/** Clear the pending-parent-turn barrier once that message's own terminal assistant reply is observed. */
+/**
+ * Clear the pending-parent-turn barrier once that message's own terminal assistant reply is
+ * observed. Narrow contract, per the invariant on `RootFreshnessTracker` above: callers must only
+ * invoke this at a commit point where `answeredParentId` is already fully qualified evidence (the
+ * SSE-observed reply itself, or a poll candidate already admitted at final completion admission)
+ * -- never merely because a provisional candidate's parent *matches* the pending id. Matching
+ * qualifies a candidate for admission; it does not by itself authorize this call. Safe to call
+ * speculatively in the sense that it is a no-op unless `answeredParentId` equals the tracker's
+ * CURRENT `pendingParentMessageId` -- but callers must not rely on that no-op behavior as a
+ * substitute for checking eligibility themselves before treating a candidate as satisfying the
+ * barrier.
+ */
 export function resolvePendingRootUserMessage(tracker: RootFreshnessTracker, answeredParentId: string | null): void {
   if (answeredParentId != null && tracker.pendingParentMessageId === answeredParentId) {
     tracker.pendingParentMessageId = null
@@ -202,7 +247,16 @@ export function requireRootRevalidation(tracker: RootFreshnessTracker): void {
   tracker.restConfirmationRequired = true
 }
 
-/** Clears the REST-revalidation requirement once a REST check has corroborated current state. */
+/**
+ * Clears the REST-revalidation requirement once a REST check has corroborated current state.
+ * Narrow contract, per the invariant on `RootFreshnessTracker` above: this must only be called at
+ * a commit point where the REST response has corroborated SPECIFIC current completion evidence
+ * (an admitted message candidate, or a retained current-revision idle candidate with no pending
+ * parent) -- never merely because the response's requested revision matched the tracker's
+ * revision. A revision match alone proves the response describes the current generation; it says
+ * nothing about whether that generation actually produced qualifying evidence, so it must not by
+ * itself clear this requirement.
+ */
 export function clearRootRevalidationRequirement(tracker: RootFreshnessTracker): void {
   tracker.restConfirmationRequired = false
 }
@@ -838,10 +892,15 @@ export async function processEventStream(
           if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
           if (eventSessionID === sessionId && activityTracker?.rootFreshness != null) {
             invalidateRootFreshness(activityTracker.rootFreshness)
-            // Clear the pending-parent-turn barrier once this assistant reply answers the message
-            // that set it -- e.g. the injected background-task-completion turn.
-            const parentId = getStringProperty(msg, 'parentID')
-            resolvePendingRootUserMessage(activityTracker.rootFreshness, parentId)
+            // Barrier resolution deliberately does NOT happen here. The SSE handler sees message
+            // metadata and token deltas, not the full message-and-parts predicate the poll path
+            // qualifies against (`detectMessageActivity` in session-poll.ts) -- a parent-id match on
+            // its own is not fully qualified evidence per the invariant on `RootFreshnessTracker`
+            // above, and upstream's prompt loop can still require another iteration even once
+            // `finish: 'stop'` is visible (tool parts, provider-executed exceptions, etc.). The
+            // barrier is REST-resolved only, committed at poll admission
+            // (`pollForSessionCompletionObservation` in session-poll.ts) -- an explicit availability
+            // tradeoff: a barrier-bearing turn cannot finish from SSE alone when REST is unavailable.
           }
           const sessionTokens: TokenUsage = {
             input: getNumberProperty(tokensData, 'input') ?? 0,

@@ -121,7 +121,16 @@ describe('pollForSessionCompletion — ownership ledger gating (Unit 9)', () => 
     vi.useFakeTimers()
     const ledger = createOwnershipLedger()
     ledger.adopt('ses_child', 'background task')
-    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
+    // REST reports busy while the stale candidate should still be refused; once the root genuinely
+    // goes idle again (below), REST is flipped to idle too -- this scenario supersedes a prior idle
+    // candidate (markRootIdleCandidate then invalidateRootFreshness), which raises
+    // `restConfirmationRequired` (see Finding 1): the SSE fast path alone cannot be trusted again
+    // for this generation until REST actually corroborates inactivity, so the fresh idle candidate
+    // genuinely needs a matching REST response to complete, not just a revision match.
+    let restReportsIdle = false
+    const statusFn = vi.fn().mockImplementation(async () => ({
+      data: {ses_123: restReportsIdle ? {type: 'idle'} : {type: 'busy'}},
+    }))
     const mockClient = {session: {status: statusFn}}
     const rootFreshness = createRootFreshnessTracker()
     armRootFreshness(rootFreshness)
@@ -157,8 +166,10 @@ describe('pollForSessionCompletion — ownership ledger gating (Unit 9)', () => 
     // never accepted, proven by the poll continuing to run
     expect(statusFn.mock.calls.length).toBeGreaterThan(1)
 
-    // #when the root genuinely goes idle again (fresh candidate at the current revision)
+    // #when the root genuinely goes idle again (fresh candidate at the current revision), with REST
+    // now corroborating that same generation as inactive
     markRootIdleCandidate(rootFreshness)
+    restReportsIdle = true
     await vi.advanceTimersByTimeAsync(1_000)
     const result = await pollPromise
 
@@ -1025,7 +1036,7 @@ describe('completion-observed snapshots pending failure evidence at the decision
       activityTracker,
     )
     await vi.advanceTimersByTimeAsync(500)
-    expect(activityTracker.completedAssistantMessageId).toBe('msg_new')
+    expect(activityTracker.completedAssistantMessageId).toEqual({messageId: 'msg_new', revision: null})
     await vi.advanceTimersByTimeAsync(500)
 
     // #when an SSE-accepted provider failure lands on the tracker while that request is pending,
@@ -2379,10 +2390,14 @@ describe('detectMessageActivity qualified-tuple predicate (Phase B)', () => {
 /**
  * A `session.messages()` mock that resolves the same stable qualified assistant message on every
  * call (arming `detectMessageActivity`'s two-poll stability check), paired with a `session.status()`
- * mock whose first call resolves `busy` and whose second call returns a promise the test controls
- * directly — the same in-flight shape as `pendingStatusClient` above, but paired with a
- * message-fallback candidate so the status-revision guard at session-poll.ts:655 can be exercised
- * through the real poll path instead of only the sticky-flag idle path.
+ * mock whose first call resolves `idle` (deliberately not `busy`: confirmation memory is keyed by
+ * (message id, revision) -- see `ActivityTracker.completedAssistantMessageId`'s doc comment -- so a
+ * `busy` reply on the first poll would itself bump the revision and reset the two-poll confirmation
+ * this helper exists to arm, before the deliberate mid-flight invalidation each test performs can be
+ * isolated) and whose second call returns a promise the test controls directly — the same in-flight
+ * shape as `pendingStatusClient` above, but paired with a message-fallback candidate so the
+ * status-revision guard at session-poll.ts:655 can be exercised through the real poll path instead
+ * of only the sticky-flag idle path.
  */
 function pendingStatusClientWithStableCandidate(stableInfo: Record<string, unknown>) {
   const messagesFn = vi.fn().mockResolvedValue({data: [{info: stableInfo}]})
@@ -2390,7 +2405,7 @@ function pendingStatusClientWithStableCandidate(stableInfo: Record<string, unkno
   let resolveSecond: ((value: {data: Record<string, {type: string}>}) => void) | undefined
   const statusFn = vi.fn().mockImplementation(async () => {
     callCount++
-    if (callCount === 1) return {data: {ses_123: {type: 'busy'}}}
+    if (callCount === 1) return {data: {ses_123: {type: 'idle'}}}
     return new Promise<{data: Record<string, {type: string}>}>(resolve => {
       resolveSecond = resolve
     })
@@ -2443,8 +2458,9 @@ describe('root-freshness revision guard through the poll path (session-poll.ts:6
     void observationPromise.then(() => {
       settled = true
     })
-    // First poll: the message is observed (unconfirmed) and status reports busy, which itself
-    // advances the revision — matching real event-driven invalidation.
+    // First poll: the message is observed (unconfirmed) and status reports idle (harmless here --
+    // no message candidate exists yet this poll to admit, and no SSE idle candidate was ever
+    // recorded for the plain-status path to admit on either).
     await vi.advanceTimersByTimeAsync(500)
     // Second poll: the same message confirms the candidate, and the corroborating status request
     // is issued and held pending.
@@ -2695,7 +2711,7 @@ describe('session.status() rejection racing a qualified completed-assistant cand
 
     // #then the first poll observed the candidate (unconfirmed) and the racing status request
     // failed without settling anything
-    expect(activityTracker.completedAssistantMessageId).toBe('msg_new')
+    expect(activityTracker.completedAssistantMessageId).toEqual({messageId: 'msg_new', revision: null})
 
     await vi.advanceTimersByTimeAsync(500)
     const observation = await observationPromise
@@ -2926,7 +2942,7 @@ describe("Finding 3 — the candidate's own revision is re-checked at final admi
     // itself also reads `.revision` once this poll (its own `statusRequestRevision` capture) --
     // arm the interception only afterward, so it targets the SECOND (confirming) poll's read.
     await vi.advanceTimersByTimeAsync(500)
-    expect(activityTracker.completedAssistantMessageId).toBe('msg_new')
+    expect(activityTracker.completedAssistantMessageId).toEqual({messageId: 'msg_new', revision: 0})
 
     let triggered = false
     let backing = rootFreshness.revision
