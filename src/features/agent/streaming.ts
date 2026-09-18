@@ -1139,29 +1139,16 @@ export async function processEventStream(
     // case happened: the transport ended the stream without anyone asking it to. That is exactly
     // as much an observation gap as a thrown discontinuity, so record it the same way.
     //
-    // Scoped to `ownershipLedger !== undefined` (deliberately, not an oversight): a fully
-    // synchronous, finite `AsyncIterable` -- which is what every array-backed test double for
-    // this stream is, throughout this codebase -- exhausts on its own microtask before any
-    // caller-driven abort can land, since real callers (see retry.ts) only abort *after*
-    // deciding the turn is over from the very events this loop just delivered. Without this
-    // scope, that ordinary, harmless race would be indistinguishable from a genuine silent
-    // transport drop for every such test double, not just a few -- exactly the "fabricated gap
-    // on every clean run" this function's own contract warns against. Gating on the ledger
-    // limits this to the evidence this fix can back with a real behavioral consequence today
-    // (unresolved background-dispatch entries get marked unknown instead of silently staying
-    // outstanding forever) without reaching into every other unaborted call site across the
-    // codebase. A ledger-less run gets no unexpected-EOF evidence from this branch; closing that
-    // gap needs either a non-local signal this function does not have, or updating those other
-    // call sites' stream doubles to model a caller-driven abort -- both out of this change's scope.
-    //
-    // Further scoped to the ledger actually having outstanding (unresolved) entries, not merely
-    // being supplied: an empty or fully-settled ledger has nothing this gap would protect, and
-    // `recordDiscontinuity` also forces REST revalidation of root freshness as a side effect --
-    // paying that cost when there is no owned work at risk is not this fix's job to force on
-    // every ledger-bearing caller today.
-    const hasOutstandingOwnedWork =
-      ownershipLedger !== undefined && ownershipLedger.snapshot().some(entry => entry.state === 'outstanding')
-    if (!signal.aborted && hasOutstandingOwnedWork) {
+    // Deliberately NOT scoped to ledger occupancy. The uncertainty this records is precisely
+    // "did an unobserved dispatch happen while we could not see the stream" -- requiring an
+    // already-outstanding ledger entry before recording that uncertainty assumes away the one
+    // failure mode this exists to catch: the stream closing *before* the dispatch-adoption event
+    // ever landed, leaving the ledger empty (or absent) with no record that anything was missed.
+    // Every real caller (see retry.ts) only aborts *after* deciding the turn is over from events
+    // this loop already delivered, so `!signal.aborted` reaching this line always means the
+    // transport ended the stream without anyone asking it to -- record it regardless of what the
+    // ledger currently holds (empty, fully settled, outstanding, or no ledger at all).
+    if (!signal.aborted) {
       recordDiscontinuity('Event stream ended unexpectedly')
     }
   } catch (error) {

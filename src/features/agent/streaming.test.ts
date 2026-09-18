@@ -472,6 +472,184 @@ describe('processEventStream — ownership ledger integration', () => {
     expect(ledger.unknown()).toBe(0)
   })
 
+  it('records a discontinuity on an unexpected end of stream with an empty ledger (the observation gap the check exists to catch)', async () => {
+    // #given a ledger supplied but with nothing adopted -- empty, not outstanding. This is exactly
+    // the case the old ownership-occupancy gate assumed away: the stream can close before the
+    // dispatch-adoption event is ever observed, leaving the ledger with nothing to show for it.
+    const ledger = createOwnershipLedger()
+    const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)])
+
+    // #when the stream is processed with a signal that is never aborted
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the gap is recorded even though the ledger held nothing to mark unknown -- an empty
+    // ledger is not proof that no unobserved dispatch happened, only that none was ever recorded
+    expect(result.discontinuity).toEqual({message: 'Event stream ended unexpectedly'})
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.unknown()).toBe(0)
+  })
+
+  it('records a discontinuity on an unexpected end of stream with a fully settled ledger', async () => {
+    // #given a ledger whose only entry already settled before the stream closed
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    ledger.settle(CHILD_SESSION_ID)
+    const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)])
+
+    // #when the stream is processed with a signal that is never aborted
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the gap is still recorded -- a settled entry does not retroactively prove no *other*
+    // unobserved dispatch happened while the channel was blind
+    expect(result.discontinuity).toEqual({message: 'Event stream ended unexpectedly'})
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'settled'}])
+  })
+
+  it('records a discontinuity on an unexpected end of stream with no ledger supplied at all', async () => {
+    // #given no ownershipLedger argument whatsoever -- the gap must not depend on ownership
+    // tracking being wired up at all
+    const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)])
+
+    // #when the stream is processed with a signal that is never aborted, and no ledger
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the gap is still recorded
+    expect(result.discontinuity).toEqual({message: 'Event stream ended unexpectedly'})
+  })
+
+  // #given four ledger states (no ledger, empty, fully settled, outstanding) each paired with a
+  // stream that runs dry only after the caller's own abort has already landed -- an intentional
+  // shutdown must never be recorded as a gap, regardless of what the ledger holds
+  it.each([
+    ['no ledger', undefined],
+    ['empty ledger', createOwnershipLedger()],
+    [
+      'fully settled ledger',
+      (() => {
+        const ledger = createOwnershipLedger()
+        ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+        ledger.settle(CHILD_SESSION_ID)
+        return ledger
+      })(),
+    ],
+    [
+      'outstanding ledger',
+      (() => {
+        const ledger = createOwnershipLedger()
+        ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+        return ledger
+      })(),
+    ],
+  ] satisfies [string, OwnershipLedger | undefined][])(
+    'does not record a discontinuity on an intentional caller-requested shutdown (%s)',
+    async (_label, ledger) => {
+      // #given a signal the caller aborts exactly when this scripted stream naturally runs dry
+      const abortController = new AbortController()
+      const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)], () => abortController.abort())
+
+      // #when processed
+      const result = await processEventStream(
+        eventStream,
+        ROOT_SESSION_ID,
+        abortController.signal,
+        createMockLogger(),
+        undefined,
+        undefined,
+        undefined,
+        ledger,
+      )
+
+      // #then no gap is fabricated for an intentional shutdown, in any ledger state
+      expect(result.discontinuity).toBeUndefined()
+    },
+  )
+
+  it('still records a discontinuity on a thrown transport failure regardless of ledger occupancy', async () => {
+    // #given a stream that throws mid-iteration with an empty (not outstanding) ledger -- pins that
+    // the thrown-error path was never gated on ledger occupancy and stays unaffected by the widening
+    const ledger = createOwnershipLedger()
+    const eventStream = createDiscontinuousEventStream([], new Error('connection reset'))
+
+    // #when processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the thrown discontinuity is still recorded
+    expect(result.discontinuity).toEqual({message: 'connection reset'})
+  })
+
+  it('an ordinary successful run records no discontinuity and still completes normally', async () => {
+    // #given a clean run: activity followed by the terminal signal, with the caller aborting only
+    // after that terminal signal is what drives the stream closed -- the production shape
+    const ledger = createOwnershipLedger()
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream(
+      [
+        {
+          type: 'message.part.delta',
+          properties: {sessionID: ROOT_SESSION_ID, delta: {type: 'text', text: 'hello'}},
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: ROOT_SESSION_ID}} as unknown as Event,
+      ],
+      () => abortController.abort(),
+    )
+
+    // #when processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the run completes normally with no fabricated gap
+    expect(result.discontinuity).toBeUndefined()
+    expect(activityTracker.sessionIdle).toBe(true)
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+    expect(result.llmError).toBeNull()
+  })
+
   it('behaves exactly as before when no background dispatch occurs and no ledger is supplied (integration)', async () => {
     // #given a single-session run with ordinary activity and no ledger — the byte-for-byte-unchanged path
     const activityTracker: ActivityTracker = {
