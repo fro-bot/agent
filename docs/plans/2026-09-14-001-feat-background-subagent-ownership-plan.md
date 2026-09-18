@@ -49,16 +49,16 @@ Unit checkboxes below record artifact existence, not requirement completion — 
 | R8 | partial | Unknown resolution and bounded cancellation ship; a discontinuity is recorded but never converted into an incomplete outcome, so polling can still report success (the gateway raises `stream-ended` on early stream close). |
 | R9 | partial | Implemented and ownership-gated, but unexercised — nothing in this codebase issues a background dispatch today. |
 | R10 | partial | Descendant activity resets inactivity, but the run's busy projection is set false on entering drain; the per-request registry also cannot stop upstream from settling every pending approval when one is rejected. |
-| R11 | shipped | Gateway retains slot, lease, and approval routing until drain completes. |
+| R11 | partial | An owned descendant's `session.error` throws immediately (`run-core.ts:947-958`), bypassing drain; the finally-block cleanup then disposes approval routing and releases the slot (`run.ts:846-850`, `:1166-1190`, `:1215-1275`) without settling the other owned entries. |
 | R12 | partial | Pinned for the Action (`src/services/setup/ci-config.ts`); the gateway's workspace container never sets `subagent_depth`, so it inherits the upstream default instead of enforcing it. |
 | R13 | cut | See Scope Boundaries. |
 | R14 | cut | See Scope Boundaries. |
 | R15 | cut | See Scope Boundaries; nothing replaces the dispatch-refusal safety clause — stream shutdown after the abort signal is not a dispatch refusal, so a dispatch during finalization is unlikely but not structurally prevented. |
 | R16 | shipped | Drain precedes finalization, pruning, shutdown, persistence, and lock release. |
-| R16a | shipped | Every named terminal path gates on outstanding work. |
+| R16a | partial | The gate exists at each named path, but no test isolates it as load-bearing: the completed-assistant test is independently blocked by busy status until after the ledger settles, and the racing-fixture test is rejected for a missing finish reason before the ledger check is reached. |
 | R17 | partial | One fixed execution deadline is never extended, but execution and drain do not share it — drain receives a derived remaining budget after execution returns. |
 | R18 | partial | Stop-admission, cancellation, and a separate teardown signal ship; no drain-path approval settlement exists, and expiry is not propagated into the invocation result. |
-| R19 | shipped | An unacknowledged `session.abort` is not treated as confirmation; unconfirmed entries become unknown. |
+| R19 | partial | Reconciliation also settles an entry on corroborated absence from the live (non-idle) status map (`ledger-reconcile.ts:198-200`) — a third signal the requirement does not name. Absence from that map confirms the session went idle, not that it terminated; upstream removes idle sessions from the map on their own. |
 | R19a | partial | Persistence correctly declines, but the run still finalizes, publishes, writes the dedup marker, emits a success reaction, and exits 0. |
 | R20 | shipped | Harness owns publication; no background-child publication path exists. |
 | R21 | shipped | Persistence declines on unresolved ownership or unconfirmed server quiescence, independent of lock ownership. |
@@ -409,7 +409,7 @@ That gap is also why R6 above is marked partial rather than shipped. R6's origin
 
 **Requirements:** R11, R16, R17, R18
 
-**Status:** Unticked — R17 and R18 are partial; see [Requirement Status](#requirement-status).
+**Status:** Unticked — R11, R17, and R18 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 4
 
@@ -506,11 +506,13 @@ That gap is also why R6 above is marked partial rather than shipped. R6's origin
 **Verification:**
 - Existing single-session runs show no behavioural change.
 
-- [x] **Unit 9: Gate every terminal path**
+- [ ] **Unit 9: Gate every terminal path**
 
 **Goal:** No path ends the invocation while owned work is outstanding.
 
 **Requirements:** R16a
+
+**Status:** Unticked — R16a is partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 8
 
@@ -538,13 +540,15 @@ That gap is also why R6 above is marked partial rather than shipped. R6's origin
 **Verification:**
 - Each of the four paths has a test proving it declines while work is outstanding.
 
+**Disproved during review.** Two of the four candidate proofs do not isolate the ledger gate: `session-poll.test.ts:181-245` is independently blocked by busy status until after the ledger settles, so the gate is never the operative guard in that test, and `retry.test.ts:368-433`'s racing fixture lacks the required finish reason, so the message-fallback path is rejected before the ledger check is reached. R16a is marked partial rather than shipped; see [Requirement Status](#requirement-status).
+
 - [ ] **Unit 10: Drain before finalize**
 
 **Goal:** Owned work settles before the Action publishes, persists, or releases anything.
 
 **Requirements:** R16, R17, R18, R19, R19a
 
-**Status:** Unticked — R17, R18, and R19a are partial; see [Requirement Status](#requirement-status).
+**Status:** Unticked — R17, R18, R19, and R19a are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 9
 
@@ -556,7 +560,7 @@ That gap is also why R6 above is marked partial rather than shipped. R6's origin
 **Approach:**
 - Finalize precedes cleanup (`run.ts:171-233`), so drain belongs ahead of finalize, not inside cleanup. A drain in cleanup would publish a response while children still modify the repository.
 - On expiry: stop admission, cancel owned work with a teardown signal distinct from the expired execution signal, settle approvals, report once.
-- Cancellation is confirmed only on an observable terminal signal — an injected completion or error turn, a server-acknowledged cancellation, or confirmed server termination. Anything else is unknown.
+- Cancellation is confirmed only on an observable terminal signal — an injected completion or error turn, or confirmed server termination. A server-acknowledged cancellation is not one: an acknowledgement proves the request was accepted, not that the child stopped writing. Anything else is unknown. (See R19, amended, and its `partial` status — reconciliation additionally settles on absence from the live non-idle status map, which confirms idle rather than termination.)
 - A known terminal outcome must survive drain. Cleanup running long must not rewrite a decided result into a timeout.
 
 **Test scenarios:**
@@ -729,7 +733,7 @@ That gap is also why R6 above is marked partial rather than shipped. R6's origin
 | Risk | Mitigation |
 |------|------------|
 | Overflow recovery leaves two sets of writers on one workspace | Cancel and settle owned work before archiving (Unit 11) |
-| A terminal path is left ungated and the run exits through it | One test per path, each proving it declines while work is outstanding (Unit 9) |
+| A terminal path is left ungated and the run exits through it | Open. The gate exists at each named path, but no test isolates it as load-bearing — see R16a in [Requirement Status](#requirement-status) |
 | Cache persists over a live writer | Persistence declines on unknown entries or unconfirmed quiescence, and the decline is a visible outcome, not a silent skip (Unit 12) |
 | A draining gateway run is swept as stale and its subagents killed | The heartbeat renews through drain (Unit 6) |
 | A descendant approval reaches nobody and hangs to the deadline | Terminal post failures auto-reject on the server, and the rejection is operator-visible (Unit 5) |
