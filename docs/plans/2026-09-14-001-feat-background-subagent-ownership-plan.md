@@ -191,7 +191,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 ### Phase 1 — Shared primitive
 
-- [ ] **Unit 1: Ownership ledger**
+- [x] **Unit 1: Ownership ledger**
 
 **Goal:** A reusable ledger that records the executions an invocation owns and settles each exactly once.
 
@@ -226,7 +226,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 **Disproved during implementation.** This unit originally specified that an unknown entry blocks persistence but not drain, so a failed reconciliation could not wedge a run. That was wrong, and review caught it across five call sites. Drain gates publication, session pruning, server shutdown, the checkpoint, cache save, and lock release — so letting it complete over an unconfirmable entry does not avoid a wedge, it ends the run while a writer may still be live, which is the hazard this plan exists to close. Unknown now blocks both, and the run deadline rather than the predicate is what bounds the wait.
 
-- [ ] **Unit 2: Pin subagent depth to one**
+- [x] **Unit 2: Pin subagent depth to one**
 
 **Goal:** Nesting stays at one level, enforced where it can actually be checked.
 
@@ -251,7 +251,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Verification:**
 - A generated config carries the depth pin, and nothing in this project re-implements a depth check against it.
 
-- [ ] **Unit 3: Ledger reconciliation**
+- [x] **Unit 3: Ledger reconciliation**
 
 **Goal:** The ledger recovers from events it never saw.
 
@@ -293,7 +293,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 
 ### Phase 2 — Gateway
 
-- [ ] **Unit 4: Descendant event handling and approval routing**
+- [x] **Unit 4: Descendant event handling and approval routing**
 
 **Goal:** Events from owned descendant sessions reach the gateway's handlers, and their approvals reach the existing coordinator.
 
@@ -328,7 +328,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - A descendant tool call passes the same fail-closed gate a foreground call does.
 
-- [ ] **Unit 5: Undeliverable approval auto-rejects**
+- [x] **Unit 5: Undeliverable approval auto-rejects**
 
 **Goal:** A descendant whose approval notification cannot be delivered is refused rather than left waiting.
 
@@ -355,7 +355,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - No descendant waits on an approval that reached nobody, and a delivery-failure rejection is visible to an operator rather than indistinguishable from a deliberate denial.
 
-- [ ] **Unit 6: Hold the run through drain**
+- [x] **Unit 6: Hold the run through drain**
 
 **Goal:** The gateway keeps its slot, lease, and approval routing until owned work settles.
 
@@ -388,7 +388,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - No two runs hold the same workspace concurrently, and no draining run is swept as stale.
 
-- [ ] **Unit 7: Startup reconciliation**
+- [x] **Unit 7: Startup reconciliation**
 
 **Goal:** A restarted gateway reconciles owned work surviving in the workspace server before admitting anything that would conflict.
 
@@ -421,7 +421,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 
 ### Phase 3 — Action
 
-- [ ] **Unit 8: Descendant event handling and ledger integration**
+- [x] **Unit 8: Descendant event handling and ledger integration**
 
 **Goal:** The Action observes owned descendant sessions and records dispatches as they occur.
 
@@ -452,7 +452,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - Existing single-session runs show no behavioural change.
 
-- [ ] **Unit 9: Gate every terminal path**
+- [x] **Unit 9: Gate every terminal path**
 
 **Goal:** No path ends the invocation while owned work is outstanding.
 
@@ -484,7 +484,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - Each of the four paths has a test proving it declines while work is outstanding.
 
-- [ ] **Unit 10: Drain before finalize**
+- [x] **Unit 10: Drain before finalize**
 
 **Goal:** Owned work settles before the Action publishes, persists, or releases anything.
 
@@ -514,7 +514,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - An ordering assertion pins drain ahead of finalize, matching the existing style in `cleanup.test.ts`.
 
-- [ ] **Unit 11: Ownership through retry and overflow**
+- [x] **Unit 11: Ownership through retry and overflow**
 
 **Goal:** Replacing a session does not orphan the work the previous one owned.
 
@@ -548,7 +548,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - A test proves the archived session has no outstanding work once recovery begins.
 
-- [ ] **Unit 12: Publication, persistence, and lease**
+- [x] **Unit 12: Publication, persistence, and lease**
 
 **Goal:** One response, no persistence over unconfirmed writers, and a lease that lasts the protected interval.
 
@@ -587,7 +587,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - The existing one-response invariant holds with background work present.
 
-- [ ] **Unit 13: Labelled reporting**
+- [x] **Unit 13: Labelled reporting**
 
 **Goal:** The response names what did not finish.
 
@@ -635,8 +635,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 - This phase gates Phases 1–3 rather than sitting beside them as a peer step: the flag flips only once every prior unit has merged with its tests passing.
 - Upstream has no background-job cap of its own, and this plan cut its attempt at one (see Scope Boundaries). Nothing bounds how many dispatches an invocation makes; what bounds the invocation is its deadline, and what keeps work from outliving it is drain. Do not flip this flag on the assumption a cap exists.
 - Before flipping, demonstrate terminal quiescence independently of any gate: a late completion notification and a dispatch racing finalization must both be handled correctly. Zero observed outstanding work is not proof that nothing can start more.
-- **Resolve the conflated lifecycle signals first.** An independent review of `runPromptAttempt` and `executeOpenCode` found that several facts are inferred from things that do not imply them, and the invariant they violate is one sentence: selecting an error never proves quiescence, and observing quiescence never erases an error. Specifically — a terminal provider classification is treated as an observed terminal turn signal even when it came from a retry status; root idle sets sticky flags that a later resumption never clears, which matters precisely because a background completion injects another parent turn; the completed-assistant fallback accepts two stable observations without checking idle status, message error, or finish reason, though upstream distinguishes `tool-calls` and `unknown` from a finished turn; and a deferred failure returns before poll-observed terminal errors are merged, so a poll-only terminal error can lose to a retryable saved one. These are not created by this plan and most are reachable today, but each one becomes materially worse once a descendant can produce the signal — descendant provider-status handling in particular is already ownership-widened while `session.error` is root-scoped.
-- Verify the umbrella empirically rather than by repository search. `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` resolves through `enabledByExperimental` (upstream `packages/opencode/src/effect/runtime-flags.ts:11-14,43`), so an unset specific flag inherits `OPENCODE_EXPERIMENTAL`. The umbrella is unset everywhere in this repository, but `deploy/.env` is not committed, so the gateway's deployed environment cannot be confirmed from the repository alone.
+- **Resolve the conflated lifecycle signals first — done.** An independent review of `runPromptAttempt` and `executeOpenCode` found that several facts were inferred from things that did not imply them, and the invariant they violated is one sentence: selecting an error never proves quiescence, and observing quiescence never erases an error. This precondition is now satisfied: a classified error no longer claims the turn ended; a descendant's retry status no longer writes root failure state; completion evidence is generation-scoped, so renewed root activity invalidates evidence from a superseded generation rather than letting it authorize a later turn; and the completed-assistant predicate now requires a finish reason present and not `tool-calls`/`unknown`, correlation to the latest root user message, qualification of any left-over tool part, `session.status()` corroboration, and a drained ownership ledger before admitting completion.
+- Verify the umbrella empirically rather than by repository search. `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` resolves through `enabledByExperimental` (upstream `packages/opencode/src/effect/runtime-flags.ts:11-14,43`), so an unset specific flag inherits `OPENCODE_EXPERIMENTAL`. The umbrella is unset everywhere in this repository, but `deploy/.env` is not committed, so the gateway's deployed environment cannot be confirmed from the repository alone. A repository search on 2026-09-18 confirmed both `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` and the `OPENCODE_EXPERIMENTAL` umbrella are unset everywhere in the repository, which settles the Action surface; it does not settle this item, since the gateway's deployed environment still cannot be confirmed from the repository.
 - **Weigh the unrecoverable dropped dispatch before flipping** (see Unit 3). A dispatch whose event is never observed cannot be recovered, because nothing available to a client distinguishes a background child session from a foreground one. The ledger reads zero and the run proceeds normally over work it does not know about. That is the plan's original central hazard, still open. It is bounded by the run deadline and cannot occur while dispatch is disabled, but enabling the flag is exactly what makes it reachable — decide deliberately whether that is acceptable, rather than inheriting the assumption that reconciliation covers it.
 - Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` on both surfaces, following the pattern established for the file watcher — default only when unset or empty, so an operator value wins.
 - Note the umbrella interaction: `OPENCODE_EXPERIMENTAL=true` enables background subagents independently, so the ownership machinery must hold whether or not this project sets the specific flag. The umbrella is unset everywhere in this repository today, so the interaction is latent rather than active; the rollout should assert it stays unset until Units 1–13 land, rather than assuming it.
