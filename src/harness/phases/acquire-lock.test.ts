@@ -302,6 +302,81 @@ describe('runAcquireLock lease renewal (plan Unit 12)', () => {
     await result.renewal.stop()
   })
 
+  it('latches continuityUnverified() on a renewal failure and does not clear it on a later success', async () => {
+    // #given a lock acquired successfully, but the first renewal tick fails
+    renewLeaseMock.mockResolvedValueOnce(err(new Error('precondition failed')))
+    const storeConfig = createStoreConfig()
+    const result = await runAcquireLock({
+      storeConfig,
+      repo: 'fro-bot/agent',
+      runId: '6666',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    if (result.outcome !== 'acquired') throw new Error('expected acquired outcome')
+
+    // #when the renewal interval fires and the tick fails
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #then the latched accessor records the uncertainty
+    expect(result.renewal.continuityUnverified?.()).toBe(true)
+
+    // #when a later tick succeeds
+    renewLeaseMock.mockResolvedValueOnce(ok({etag: '"etag-recovered"'}))
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #then hasFailed() (present-tick health) goes back to false, exactly as before ...
+    expect(result.renewal.hasFailed()).toBe(false)
+    // #then ... but continuityUnverified() stays latched -- the earlier gap in coverage is a
+    // fact about this invocation, not erased by a later confirmed renewal
+    expect(result.renewal.continuityUnverified?.()).toBe(true)
+    // #and the later success still advances the stored etag -- release needs the freshest one
+    expect(result.renewal.currentEtag()).toBe('"etag-recovered"')
+
+    await result.renewal.stop()
+  })
+
+  it('has no uncertainty at all when every renewal tick has succeeded', async () => {
+    // #given a lock acquired successfully and every renewal tick succeeding
+    const storeConfig = createStoreConfig()
+    const result = await runAcquireLock({
+      storeConfig,
+      repo: 'fro-bot/agent',
+      runId: '7777',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    if (result.outcome !== 'acquired') throw new Error('expected acquired outcome')
+
+    // #when a renewal tick fires and succeeds
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #then neither present-tick health nor the latched accessor report any problem
+    expect(result.renewal.hasFailed()).toBe(false)
+    expect(result.renewal.continuityUnverified?.()).toBe(false)
+
+    await result.renewal.stop()
+  })
+
+  it('a run that never acquired a lock has no renewal controller and therefore no uncertainty (fail-open)', async () => {
+    // #given the object store is disabled -- coordination is opt-in
+    const storeConfig = createStoreConfig({enabled: false})
+
+    // #when running acquire-lock phase
+    const result = await runAcquireLock({
+      storeConfig,
+      repo: 'fro-bot/agent',
+      runId: '8888',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+
+    // #then the phase short-circuits before any lease controller exists -- there is nothing to
+    // ask about renewal health or coverage uncertainty, and this must not be misread as either
+    expect(result).toEqual({outcome: 's3-disabled'})
+    expect('renewal' in result).toBe(false)
+  })
+
   it('stop() clears the timer so no further renewal ticks occur', async () => {
     // #given a lock acquired successfully
     const storeConfig = createStoreConfig()
@@ -346,6 +421,10 @@ describe('runAcquireLock lease renewal (plan Unit 12)', () => {
     // 10s timeout would otherwise bound it -- so cleanup never blocks on a stalled call
     await vi.advanceTimersByTimeAsync(5_000)
     await expect(stopPromise).resolves.toBeUndefined()
+
+    // #then returning with that tick still unresolved is itself uncertainty, not a pass --
+    // stop() cannot say whether the hung tick eventually would have succeeded or failed
+    expect(result.renewal.continuityUnverified?.()).toBe(true)
   })
 
   it('a renewal that exceeds its own timeout marks the controller failed', async () => {

@@ -1092,41 +1092,86 @@ export async function processEventStream(
 
   let discontinuity: {readonly message: string} | undefined
 
+  // Shared by both the thrown-discontinuity path and the unexpected-EOF path below so the
+  // freshness/ledger consequences of "we can no longer see this stream" are recorded exactly
+  // once, the same way, regardless of which exit triggered it.
+  function recordDiscontinuity(message: string): void {
+    // Unexpected discontinuity: the observation channel closed without an intentional
+    // shutdown and without a terminal signal. Selecting an error never proves quiescence,
+    // and observing quiescence never erases an error -- this must never be read as the turn
+    // concluding, only as "we can no longer see it." Preserve everything accumulated so far
+    // instead of throwing it away, and mark every currently-outstanding owned entry unknown
+    // -- reconciliation (triggered by the caller that owns the SDK client, since this
+    // function only has the stream) is how they later resolve to settled or cancelled.
+    discontinuity = {message}
+    logger.warning('Event stream discontinuity — observation channel closed unexpectedly', {
+      sessionId,
+      error: message,
+    })
+    // Observation-channel failure cannot preserve authoritative freshness: a broken SSE stream
+    // does not prove the root is quiescent. Require REST revalidation before any retained idle
+    // evidence may be consumed again -- failure evidence itself is untouched by this. Note also
+    // that this gap is never *erased* by a later successful poll: polling can legitimately learn
+    // the root session completed, but it cannot establish that no unobserved background dispatch
+    // occurred while this channel was blind, so the recorded gap must stand regardless.
+    if (activityTracker?.rootFreshness != null) requireRootRevalidation(activityTracker.rootFreshness)
+    if (ownershipLedger !== undefined) {
+      const outstandingEntries = ownershipLedger.snapshot().filter(entry => entry.state === 'outstanding')
+      for (const entry of outstandingEntries) {
+        ownershipLedger.markUnknown(entry.sessionId)
+      }
+      logger.warning('Event stream discontinuity — marked outstanding owned entries unknown', {
+        sessionId,
+        unknownCount: outstandingEntries.length,
+      })
+    }
+  }
+
   try {
     await consumeStream()
+    // The loop above only ever exits without throwing in two ways: the for-await iterator ran
+    // dry on its own, or the top-of-loop `if (signal.aborted) break` fired. The latter covers
+    // every intentional local shutdown this stream can observe -- including a deadline expiry,
+    // since the caller's signal here is a combined AbortSignal.any(...) that includes the
+    // deadline's own signal (see retry.ts's `eventSignal`), so bounded collection continuing
+    // past an already-decided attempt still exits through this same abort-triggered break, not
+    // through iterator exhaustion. A `signal.aborted` still false at this point means the first
+    // case happened: the transport ended the stream without anyone asking it to. That is exactly
+    // as much an observation gap as a thrown discontinuity, so record it the same way.
+    //
+    // Scoped to `ownershipLedger !== undefined` (deliberately, not an oversight): a fully
+    // synchronous, finite `AsyncIterable` -- which is what every array-backed test double for
+    // this stream is, throughout this codebase -- exhausts on its own microtask before any
+    // caller-driven abort can land, since real callers (see retry.ts) only abort *after*
+    // deciding the turn is over from the very events this loop just delivered. Without this
+    // scope, that ordinary, harmless race would be indistinguishable from a genuine silent
+    // transport drop for every such test double, not just a few -- exactly the "fabricated gap
+    // on every clean run" this function's own contract warns against. Gating on the ledger
+    // limits this to the evidence this fix can back with a real behavioral consequence today
+    // (unresolved background-dispatch entries get marked unknown instead of silently staying
+    // outstanding forever) without reaching into every other unaborted call site across the
+    // codebase. A ledger-less run gets no unexpected-EOF evidence from this branch; closing that
+    // gap needs either a non-local signal this function does not have, or updating those other
+    // call sites' stream doubles to model a caller-driven abort -- both out of this change's scope.
+    //
+    // Further scoped to the ledger actually having outstanding (unresolved) entries, not merely
+    // being supplied: an empty or fully-settled ledger has nothing this gap would protect, and
+    // `recordDiscontinuity` also forces REST revalidation of root freshness as a side effect --
+    // paying that cost when there is no owned work at risk is not this fix's job to force on
+    // every ledger-bearing caller today.
+    const hasOutstandingOwnedWork =
+      ownershipLedger !== undefined && ownershipLedger.snapshot().some(entry => entry.state === 'outstanding')
+    if (!signal.aborted && hasOutstandingOwnedWork) {
+      recordDiscontinuity('Event stream ended unexpectedly')
+    }
   } catch (error) {
     if (isIntentionalShutdown(error, signal)) {
       // The caller told us to stop (deadline expiry, attempt abort, etc.) -- this is not a
       // transport failure, it's the expected shape of a requested shutdown. Say nothing
       // about the turn: no diagnostic, no ledger churn, no fabricated failure.
     } else {
-      // Unexpected discontinuity: the observation channel closed without an intentional
-      // shutdown and without a terminal signal. Selecting an error never proves quiescence,
-      // and observing quiescence never erases an error -- this must never be read as the turn
-      // concluding, only as "we can no longer see it." Preserve everything accumulated so far
-      // instead of throwing it away, and mark every currently-outstanding owned entry unknown
-      // -- reconciliation (triggered by the caller that owns the SDK client, since this
-      // function only has the stream) is how they later resolve to settled or cancelled.
       const message = error instanceof Error ? error.message : String(error)
-      discontinuity = {message}
-      logger.warning('Event stream discontinuity — observation channel closed unexpectedly', {
-        sessionId,
-        error: message,
-      })
-      // Observation-channel failure cannot preserve authoritative freshness: a broken SSE stream
-      // does not prove the root is quiescent. Require REST revalidation before any retained idle
-      // evidence may be consumed again -- failure evidence itself is untouched by this.
-      if (activityTracker?.rootFreshness != null) requireRootRevalidation(activityTracker.rootFreshness)
-      if (ownershipLedger !== undefined) {
-        const outstandingEntries = ownershipLedger.snapshot().filter(entry => entry.state === 'outstanding')
-        for (const entry of outstandingEntries) {
-          ownershipLedger.markUnknown(entry.sessionId)
-        }
-        logger.warning('Event stream discontinuity — marked outstanding owned entries unknown', {
-          sessionId,
-          unknownCount: outstandingEntries.length,
-        })
-      }
+      recordDiscontinuity(message)
     }
   }
 
