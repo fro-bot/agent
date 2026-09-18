@@ -10,7 +10,7 @@ import type {AttachmentResult} from '../features/attachments/index.js'
 import type {TriggerContext} from '../features/triggers/types.js'
 import type {DeduplicationEntity} from '../services/cache/dedup.js'
 import type {Octokit} from '../services/github/types.js'
-import type {InvocationVerificationFacts} from './outcome.js'
+import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
 import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
@@ -80,6 +80,17 @@ export async function run(): Promise<number> {
   let ownershipUnresolved = false
   let triggerContext: TriggerContext | null = null
   let dedupEntity: DeduplicationEntity | null = null
+  // Tracks failure/skip explicitly, set at each early-return site below, rather than
+  // inferring delivery from `exitCode === 0` in the `finally` block. `return 1`/`return 0`
+  // inside the `try` block already fixes this invocation's returned number before `finally`
+  // runs -- mutating `exitCode` there cannot change what was already returned (JS evaluates
+  // a `return` expression before running `finally`) -- so `finally` must read a fact set
+  // BEFORE each return, not `exitCode` itself, to know whether that return was a genuine
+  // failure, an intentional skip, or (the 'pending' default) a normal in-progress run.
+  // 'failed': bootstrap or cache-restore could not even start (`return 1`). 'skipped':
+  // routing found no matching trigger, dedup suppressed a repeat, or the coordination lock
+  // was contended (`return 0`, but nothing was attempted -- not the same as delivered).
+  let deliveryOutcome: 'pending' | 'failed' | 'skipped' = 'pending'
 
   const createUnavailableOutputModeMigration = (): OutputModeMigrationState => ({
     requested: requestedOutputModeState,
@@ -110,6 +121,7 @@ export async function run(): Promise<number> {
     requestedOutputModeState = resolveRequestedOutputModeState()
     const bootstrap = await runBootstrap(bootstrapLogger)
     if (bootstrap == null) {
+      deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 1
     }
@@ -119,6 +131,7 @@ export async function run(): Promise<number> {
 
     const routing = await runRouting(bootstrap, startTime)
     if (routing == null) {
+      deliveryOutcome = 'skipped'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 0
     }
@@ -129,6 +142,7 @@ export async function run(): Promise<number> {
     runId = routing.agentContext.runId
     const dedup = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
     if (!dedup.shouldProceed) {
+      deliveryOutcome = 'skipped'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 0
     }
@@ -150,6 +164,7 @@ export async function run(): Promise<number> {
           heldBy: lockResult.holder?.holder_id ?? null,
           surface: lockResult.holder?.surface ?? null,
         })
+        deliveryOutcome = 'skipped'
         setUnavailableActionOutputs(Date.now() - startTime)
         return 0
       case 's3-disabled':
@@ -170,6 +185,7 @@ export async function run(): Promise<number> {
 
     const cacheRestore = await runCacheRestore(bootstrap, metrics)
     if (cacheRestore == null) {
+      deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 1
     }
@@ -311,30 +327,53 @@ export async function run(): Promise<number> {
 
     // FINAL assessment: the same pure function as the provisional call above, now with the
     // teardown facts `runCleanup` just returned. `deliverySucceeded` is derived from
-    // `exitCode` (0 at this point means finalize's own delivery-success decision, which
-    // already folds in execution facts -- including its existing allowance of exit 0 for a
-    // recoverable LLM error whose response was still delivered) -- never re-derived from
-    // `execution.success` directly, which is never cleared or second-guessed here.
-    const finalVerification: InvocationVerificationFacts = {
-      observationGap,
-      ownershipUnresolved,
-      quiescenceConfirmed: cleanupResult.quiescenceConfirmed,
-      continuityUnverified: cleanupResult.continuityUnverified,
-    }
-    const assessment = assessInvocationOutcome({deliverySucceeded: exitCode === 0, verification: finalVerification})
+    // `deliveryOutcome`/`exitCode`, never from `execution.success` directly, which is never
+    // cleared or second-guessed here.
+    //
+    // A 'skipped' run (routing/dedup/lock-contention early return) bypasses this assessment
+    // entirely rather than feeding it a synthesized `deliverySucceeded` -- it attempted no
+    // delivery and has no execution/drain/teardown facts to assess, so forcing it through
+    // `assessInvocationOutcome` would either mislabel it 'succeeded' (this action.yaml value
+    // means delivery succeeded, which did not happen) or, if mapped to 'incomplete', flip
+    // its exit code from 0 to 1 below and turn every routine skip into a failed job.
+    let finalOutcome: InvocationOutcome
+    let finalIncompleteReasons: readonly string[] = []
 
-    // Exit code contract: 1 for incomplete, same as failed -- no third numeric code. The
-    // structured `invocation-outcome` output and job-summary row are what distinguish "the
-    // harness contract was unmet" from "the agent was wrong". A `finish(1, ...)` (or
-    // exitCode already non-zero) path is left exactly as finalize decided it.
-    if (assessment.outcome === 'incomplete' && exitCode === 0) {
-      exitCode = 1
+    if (deliveryOutcome === 'skipped') {
+      finalOutcome = 'skipped'
+    } else {
+      const finalVerification: InvocationVerificationFacts = {
+        observationGap,
+        ownershipUnresolved,
+        quiescenceConfirmed: cleanupResult.quiescenceConfirmed,
+        continuityUnverified: cleanupResult.continuityUnverified,
+      }
+      // 'failed' (bootstrap/cache-restore could not start) forces deliverySucceeded false
+      // regardless of `exitCode`'s value -- the early `return 1` that already produced this
+      // invocation's actual exit code left `exitCode` itself untouched (see `deliveryOutcome`'s
+      // doc above), so it cannot be trusted here for that path. Every other (non-early-return)
+      // path keeps reading `exitCode === 0`, unchanged from before.
+      const deliverySucceeded = deliveryOutcome === 'failed' ? false : exitCode === 0
+      const assessment = assessInvocationOutcome({deliverySucceeded, verification: finalVerification})
+      finalOutcome = assessment.outcome
+      finalIncompleteReasons = assessment.incompleteReasons
+
+      // Exit code contract: 1 for incomplete, same as failed -- no third numeric code. The
+      // structured `invocation-outcome` output and job-summary row are what distinguish "the
+      // harness contract was unmet" from "the agent was wrong". A `finish(1, ...)` (or
+      // exitCode already non-zero) path is left exactly as finalize decided it.
+      if (finalOutcome === 'incomplete' && exitCode === 0) {
+        exitCode = 1
+      }
     }
 
-    // Dedup marker: never written on an incomplete invocation, and only after cleanup has
-    // had its say -- moved here (was: right after finalize, before cleanup ran) per the
-    // same reasoning that moved the terminal reaction below.
-    if (assessment.outcome === 'succeeded' && dedupEntity != null && triggerContext != null) {
+    // Dedup marker: never written on an incomplete or skipped invocation, and only after
+    // cleanup has had its say -- moved here (was: right after finalize, before cleanup ran)
+    // per the same reasoning that moved the terminal reaction below. A lock-contention skip
+    // reaches this point with both `dedupEntity` and `triggerContext` already populated (set
+    // before the lock is even acquired) -- `finalOutcome === 'succeeded'` is what stops a
+    // contended run, which delivered nothing, from marking itself deduplicated anyway.
+    if (finalOutcome === 'succeeded' && dedupEntity != null && triggerContext != null) {
       await saveDedupMarker(triggerContext, dedupEntity, repo)
     }
 
@@ -342,13 +381,16 @@ export async function run(): Promise<number> {
     // the boolean success/failure `completeAcknowledgment` used to receive -- moved here,
     // strictly after cleanup, because passing a boolean derived from `exitCode` before
     // teardown's own facts were known could select the success reaction for an invocation
-    // this assessment now calls incomplete.
-    if (reactionCtx != null && githubClient != null) {
-      await applyTerminalReaction(githubClient, reactionCtx, assessment.outcome, bootstrapLogger)
+    // this assessment now calls incomplete. `reactionCtx` is structurally always null on a
+    // 'skipped' run (acknowledgment happens after every skip's early return), so the
+    // `finalOutcome !== 'skipped'` guard here is belt-and-suspenders, not load-bearing --
+    // added because `applyTerminalReaction` is not typed to accept a fourth outcome value.
+    if (reactionCtx != null && githubClient != null && finalOutcome !== 'skipped') {
+      await applyTerminalReaction(githubClient, reactionCtx, finalOutcome, bootstrapLogger)
     }
 
-    setInvocationOutcomeOutput(assessment.outcome)
-    await writeInvocationOutcomeSummary(assessment.outcome, assessment.incompleteReasons, bootstrapLogger)
+    setInvocationOutcomeOutput(finalOutcome)
+    await writeInvocationOutcomeSummary(finalOutcome, finalIncompleteReasons, bootstrapLogger)
   }
 
   return exitCode

@@ -274,6 +274,8 @@ describe('run', () => {
     // #given bootstrap succeeds but routing intentionally declines the event
     const {runBootstrap} = await import('./phases/bootstrap.js')
     const {runRouting} = await import('./phases/routing.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+    const {saveDedupMarker} = await import('./phases/dedup.js')
 
     vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
     vi.mocked(runRouting).mockResolvedValue(null)
@@ -284,6 +286,11 @@ describe('run', () => {
     // #then the skip remains successful and publishes the stable empty contract
     expect(exitCode).toBe(0)
     expectUnavailableOutputs()
+    // #and this invocation attempted no delivery, so it is reported as 'skipped' -- not the
+    // 'succeeded' a stale exitCode===0 read would previously have produced, and not the
+    // 'incomplete' that would force the exit code to 1 for every routine skip
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('skipped')
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
   })
 
   it('emits the unavailable output contract when dedup suppresses execution', async () => {
@@ -292,6 +299,8 @@ describe('run', () => {
     const {runRouting} = await import('./phases/routing.js')
     const {runDedup} = await import('./phases/dedup.js')
     const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+    const {saveDedupMarker} = await import('./phases/dedup.js')
 
     vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
     vi.mocked(runRouting).mockResolvedValue(createRouting())
@@ -304,18 +313,25 @@ describe('run', () => {
     expect(exitCode).toBe(0)
     expectUnavailableOutputs()
     expect(runAcquireLock).not.toHaveBeenCalled()
+    // #and a deduplicated repeat is reported as 'skipped', not 'succeeded'
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('skipped')
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
   })
 
   it('emits the unavailable output contract when the coordination lock is held', async () => {
-    // #given routing and dedup succeed but another surface holds the coordination lock
+    // #given routing and dedup succeed but another surface holds the coordination lock --
+    // dedup succeeding first means both dedupEntity and triggerContext are already
+    // populated by the time the lock check short-circuits the run, so only the 'skipped'
+    // outcome (not a stale 'succeeded') stops the dedup marker from being saved below
     const {runBootstrap} = await import('./phases/bootstrap.js')
     const {runRouting} = await import('./phases/routing.js')
-    const {runDedup} = await import('./phases/dedup.js')
+    const {runDedup, saveDedupMarker} = await import('./phases/dedup.js')
     const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
 
     vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
     vi.mocked(runRouting).mockResolvedValue(createRouting())
-    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: null})
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
     vi.mocked(runAcquireLock).mockResolvedValue({outcome: 'held-by-other', holder: null})
 
     // #when the run reaches the coordination-lock skip
@@ -328,6 +344,65 @@ describe('run', () => {
     const {runExecute} = await import('./phases/execute.js')
     expect(runAcknowledge).not.toHaveBeenCalled()
     expect(runExecute).not.toHaveBeenCalled()
+    // #and a lock-contended run is reported as 'skipped', not 'succeeded' -- and, because a
+    // contended run delivered nothing, it must not mark itself deduplicated even though a
+    // dedup entity was already assigned before the lock check ran
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('skipped')
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+  })
+
+  it('emits failed (not succeeded) when bootstrap fails, matching the returned exit code', async () => {
+    // #given bootstrap fails -- an early `return 1` whose value `finally` cannot see or
+    // change (return expressions evaluate before `finally` runs)
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+    const {saveDedupMarker} = await import('./phases/dedup.js')
+
+    vi.mocked(runBootstrap).mockResolvedValue(null)
+
+    // #when the run fails to bootstrap
+    const exitCode = await run()
+
+    // #then the run reports failed -- not the 'succeeded' the stale exitCode===0 read in
+    // `finally` used to produce for this exact path
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('failed')
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+  })
+
+  it('emits failed (not succeeded) when cache restore fails', async () => {
+    // #given bootstrap, routing, dedup, and lock acquisition all succeed, but cache restore
+    // fails -- another early `return 1` with the same finally-cannot-see-the-return shape
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runRouting} = await import('./phases/routing.js')
+    const {runDedup} = await import('./phases/dedup.js')
+    const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {runAcknowledge} = await import('./phases/acknowledge.js')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+    const {saveDedupMarker} = await import('./phases/dedup.js')
+
+    vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
+    vi.mocked(runRouting).mockResolvedValue(createRouting())
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
+    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 's3-disabled'})
+    vi.mocked(runAcknowledge).mockResolvedValue({
+      repo: 'owner/repo',
+      commentId: 99,
+      issueNumber: 42,
+      issueType: 'pr',
+      botLogin: 'fro-bot',
+    })
+    vi.mocked(runCacheRestore).mockResolvedValue(null)
+
+    // #when the run fails to restore cache
+    const exitCode = await run()
+
+    // #then the run reports failed -- not 'succeeded', and no dedup marker is written for a
+    // run that never delivered anything
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('failed')
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
   })
 
   it('drains owned work after execution and strictly before review reconciliation, finalize (publish), and cleanup (prune/shutdown/persist/release)', async () => {

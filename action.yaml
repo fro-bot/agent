@@ -190,8 +190,10 @@ outputs:
       verification fact -- observation completeness, ownership resolution, server
       quiescence, lease continuity -- checked out), incomplete (a useful result may exist,
       but this invocation could not certify completion; no dedup marker was written and no
-      success reaction was posted), or failed (verification was complete but delivery did
-      not succeed). Only set from the main step.
+      success reaction was posted), failed (verification was complete but delivery did
+      not succeed), or skipped (this invocation intentionally attempted no delivery --
+      no matching trigger, a deduplicated repeat, or coordination-lock contention; no dedup
+      marker was written and no reaction was posted). Only set from the main step.
   duration:
     description: Run duration in milliseconds
 

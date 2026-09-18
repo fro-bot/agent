@@ -31,7 +31,16 @@
  * incomplete regardless of whether delivery also failed.
  */
 
-export type InvocationOutcome = 'succeeded' | 'incomplete' | 'failed'
+/**
+ * `'skipped'` is never produced by `assessInvocationOutcome` below -- it is assigned
+ * directly by `run.ts` for the routing/dedup/lock-contention early-return paths, which
+ * exit before execution, drain, or cleanup ever run and therefore have no delivery or
+ * verification facts to assess. Those paths attempted no delivery and found nothing wrong,
+ * which is a distinct condition from `succeeded` (delivered), `incomplete` (attempted but
+ * could not certify), and `failed` (attempted and did not succeed) -- forcing a skip into
+ * any of those three would misreport what actually happened.
+ */
+export type InvocationOutcome = 'succeeded' | 'incomplete' | 'failed' | 'skipped'
 
 /**
  * The verification axis: can this invocation vouch for its own state, independent of

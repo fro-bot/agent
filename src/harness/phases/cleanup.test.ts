@@ -25,6 +25,17 @@ vi.mock('../../features/attachments/index.js', () => ({
   cleanupTempFiles: vi.fn(),
 }))
 
+vi.mock('../../shared/env.js', async importOriginal => {
+  const original = await importOriginal<typeof import('../../shared/env.js')>()
+  return {
+    ...original,
+    // Wraps (not replaces) the real implementation so every existing test keeps reading
+    // process.env.GITHUB_WORKSPACE unchanged; only tests that explicitly override it via
+    // mockImplementationOnce see different behavior.
+    getGitHubWorkspace: vi.fn(original.getGitHubWorkspace),
+  }
+})
+
 vi.mock('../../services/artifact/index.js', () => ({
   uploadLogArtifact: vi.fn(),
 }))
@@ -393,6 +404,125 @@ describe('runCleanup', () => {
       'OpenCode server did not confirm shutdown within the quiescence window; the checkpoint that follows may race a still-live writer',
     )
     expect(logger.warning).not.toHaveBeenCalledWith('Server shutdown failed (non-fatal)', expect.any(Object))
+  })
+
+  it('defaults quiescenceConfirmed to false (not true) when a server handle exists but a pre-shutdown step throws before shutdown can run', async () => {
+    // #given getGitHubWorkspace throws synchronously before the shutdown block is ever
+    // reached -- the outer catch swallows it, so the ONLY thing that decides the reported
+    // value is the initial default. Before the fix this default was `true` (false
+    // certification of a server that was never even asked to shut down); after the fix a
+    // server handle existing at all means the default is the conservative `false`.
+    const {getGitHubWorkspace} = await import('../../shared/env.js')
+    vi.mocked(getGitHubWorkspace).mockImplementationOnce(() => {
+      throw new Error('workspace unavailable')
+    })
+    const serverHandle = createServerHandle()
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs and the pre-shutdown step throws
+    const result = await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: null,
+      serverHandle,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then shutdown was never reached, and the returned fact is the honest unconfirmed
+    // default, not a stale success
+    expect(serverHandle.shutdown).not.toHaveBeenCalled()
+    expect(result.quiescenceConfirmed).toBe(false)
+  })
+
+  it('shutdown still runs when an earlier best-effort cleanup step (attachment cleanup) throws', async () => {
+    // #given attachment temp-file cleanup throws
+    const {cleanupTempFiles} = await import('../../features/attachments/index.js')
+    vi.mocked(cleanupTempFiles).mockRejectedValueOnce(new Error('cleanup failed'))
+    const serverHandle = createServerHandle()
+    const logger = createMockLogger()
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    const result = await runCleanup({
+      bootstrapLogger: logger,
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: {processed: [], skipped: [], modifiedBody: '', fileParts: [], tempFiles: ['/tmp/a']},
+      serverHandle,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then shutdown still ran and confirmed quiescence despite the earlier throw, which
+    // was caught and logged locally rather than propagating past shutdown to the outer catch
+    expect(serverHandle.shutdown).toHaveBeenCalledTimes(1)
+    expect(result.quiescenceConfirmed).toBe(true)
+  })
+
+  it('complement: a clean cleanup with a confirming shutdown still reports confirmed', async () => {
+    // #given no earlier step throws and shutdown confirms quiescence
+    const serverHandle = createServerHandle()
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs end to end cleanly
+    const result = await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: null,
+      serverHandle,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then the ordinary happy path is unaffected by the conservative default
+    expect(result).toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+  })
+
+  it('complement: a run with no server handle at all is not forced unconfirmed', async () => {
+    // #given no server handle (e.g. SKIP_AGENT_EXECUTION=true) -- nothing to confirm
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    const result = await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: null,
+      serverHandle: null,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then the conservative default only applies when there is a writer to be unconfirmed
+    // about -- a run with no server at all must not be forced into a false 'incomplete'
+    expect(result.quiescenceConfirmed).toBe(true)
   })
 
   it('continues past a throwing cache-save-result output write to still upload artifacts and save state', async () => {

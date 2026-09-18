@@ -1,6 +1,7 @@
 import type {OutputModeMigrationState} from '@fro-bot/runtime'
 import type {CacheSaveStateValue} from '../../shared/cache-save-result.js'
 import type {ActionOutputs} from '../../shared/types.js'
+import type {InvocationOutcome} from '../outcome.js'
 import * as core from '@actions/core'
 import {serializeBrokeredPushAllowlist} from '../../features/delegated/brokered-push-validation.js'
 
@@ -34,12 +35,14 @@ export function setDeliveryKindOutput(deliveryKind: ActionOutputs['deliveryKind'
 
 /**
  * Sets the `invocation-outcome` output: `succeeded`, `incomplete` (a useful result may
- * exist, but this invocation could not certify completion), or `failed`. Standalone for the
- * same reason `setCacheSaveResultOutput` is: the FINAL outcome (`src/harness/outcome.ts`) is
- * only known after `runCleanup` returns its teardown safety evidence, which happens after
- * `runFinalizeWithResult` (which calls `setActionOutputs`) has already run.
+ * exist, but this invocation could not certify completion), `failed`, or `skipped` (this
+ * invocation intentionally attempted no delivery -- see `InvocationOutcome`'s doc).
+ * Standalone for the same reason `setCacheSaveResultOutput` is: the FINAL outcome
+ * (`src/harness/outcome.ts`) is only known after `runCleanup` returns its teardown safety
+ * evidence, which happens after `runFinalizeWithResult` (which calls `setActionOutputs`)
+ * has already run.
  */
-export function setInvocationOutcomeOutput(outcome: 'succeeded' | 'incomplete' | 'failed'): void {
+export function setInvocationOutcomeOutput(outcome: InvocationOutcome): void {
   core.setOutput('invocation-outcome', outcome)
 }
 

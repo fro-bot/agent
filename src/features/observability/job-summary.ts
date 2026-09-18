@@ -196,25 +196,29 @@ const UNFINISHED_ENTRY_STATE_LABELS: Readonly<Record<OwnershipEntryState, string
 
 /**
  * Table-cell text per invocation outcome (`src/harness/outcome.ts`'s `InvocationOutcome`),
- * mirroring `CACHE_SAVE_RESULT_LABELS` above.
+ * mirroring `CACHE_SAVE_RESULT_LABELS` above. Declared as its own local union (not imported)
+ * because this module lives in `features/`, which the four-layer import rule forbids from
+ * importing `harness/` -- kept in sync with `InvocationOutcome` by hand.
  */
-const INVOCATION_OUTCOME_LABELS: Readonly<Record<'succeeded' | 'incomplete' | 'failed', string>> = {
+const INVOCATION_OUTCOME_LABELS: Readonly<Record<'succeeded' | 'incomplete' | 'failed' | 'skipped', string>> = {
   succeeded: '✅ succeeded',
   incomplete: '⚠️ incomplete',
   failed: '❌ failed',
+  skipped: '⏭️ skipped',
 }
 
 /**
  * Writes a standalone job-summary row reporting this invocation's final, verified outcome
  * -- `succeeded`, `incomplete` (a useful result may exist, but this invocation could not
- * certify completion), or `failed`. Deliberately separate from `writeJobSummary`, the same
+ * certify completion), `failed`, or `skipped` (this invocation intentionally attempted no
+ * delivery). Deliberately separate from `writeJobSummary`, the same
  * way `writeCacheSaveResultSummary` is: the FINAL outcome is only known once `runCleanup`
  * returns its teardown safety evidence, which happens after `runFinalizeWithResult` (the
  * caller of `writeJobSummary`) has already written and flushed the main summary table.
  * Non-blocking: logs a warning on failure but never throws.
  */
 export async function writeInvocationOutcomeSummary(
-  outcome: 'succeeded' | 'incomplete' | 'failed',
+  outcome: 'succeeded' | 'incomplete' | 'failed' | 'skipped',
   incompleteReasons: readonly string[],
   logger: Logger,
 ): Promise<void> {
@@ -232,6 +236,12 @@ export async function writeInvocationOutcomeSummary(
         '\nA useful result may exist, but this invocation could not certify completion. Unresolved:\n',
       )
       core.summary.addList([...incompleteReasons])
+    }
+
+    if (outcome === 'skipped') {
+      core.summary.addRaw(
+        '\nThis invocation intentionally attempted no delivery (no matching trigger, a deduplicated repeat, or coordination-lock contention).\n',
+      )
     }
 
     await core.summary.write()

@@ -128,13 +128,35 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
   // that would silently discard whatever the `try` or `catch` block was about to return, an
   // ESLint `no-unsafe-finally` violation) so every exit path -- including a thrown cleanup
   // error -- still reports the safety evidence it managed to establish.
-  let quiescenceConfirmed = true
+  //
+  // `quiescenceConfirmed` starts conservative, not optimistic: `false` whenever a server
+  // handle exists (there is a writer whose quiescence has not yet been confirmed by
+  // anything), `true` only when there is no server handle at all (nothing to confirm --
+  // e.g. SKIP_AGENT_EXECUTION=true). A run whose attachment cleanup, label removal, or
+  // session pruning throws before the shutdown block below runs (and is therefore caught by
+  // the outer `catch`, never reaching the confirming assignment at `quiescenceConfirmed =
+  // shutdownResult.quiesced`) must report the unconfirmed default, not a stale optimistic
+  // `true` -- that was the false-certification bug this default exists to close. See also
+  // the individual try/catch around each best-effort step below, which keeps those failures
+  // from skipping the shutdown attempt itself in the first place.
+  let quiescenceConfirmed = serverHandle == null
   let continuityUnverified = false
 
   try {
+    // Attachment cleanup, working-label removal, and session pruning are all best-effort --
+    // none of them may prevent the server shutdown attempt below, which is the
+    // safety-relevant step `quiescenceConfirmed` reports on. Each gets its own try/catch
+    // (rather than relying on the outer one) so a throw here is logged and swallowed
+    // locally instead of skipping straight past shutdown to the outer catch.
     if (attachmentResult != null) {
       const attachmentCleanupLogger = createLogger({phase: 'attachment-cleanup'})
-      await cleanupTempFiles(attachmentResult.tempFiles, attachmentCleanupLogger)
+      try {
+        await cleanupTempFiles(attachmentResult.tempFiles, attachmentCleanupLogger)
+      } catch (attachmentError) {
+        attachmentCleanupLogger.warning('Attachment temp-file cleanup failed (non-fatal); shutdown still proceeds', {
+          error: attachmentError instanceof Error ? attachmentError.message : String(attachmentError),
+        })
+      }
     }
 
     // Reaction (hooray/confused/no terminal reaction) is handled by the caller, strictly
@@ -143,22 +165,39 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     // working label, which is unconditional on outcome.
     if (reactionCtx != null && githubClient != null) {
       const cleanupLogger = createLogger({phase: 'cleanup'})
-      await removeWorkingLabel(githubClient, reactionCtx, cleanupLogger)
+      try {
+        await removeWorkingLabel(githubClient, reactionCtx, cleanupLogger)
+      } catch (labelError) {
+        cleanupLogger.warning('Working-label removal failed (non-fatal); shutdown still proceeds', {
+          error: labelError instanceof Error ? labelError.message : String(labelError),
+        })
+      }
     }
 
     const pruneLogger = createLogger({phase: 'prune'})
     const finalWorkspace = getGitHubWorkspace()
     if (serverHandle != null) {
-      const normalizedFinalWorkspace = normalizeWorkspacePath(finalWorkspace)
-      const pruningConfig = {
-        ...DEFAULT_PRUNING_CONFIG,
-        maxSessions: sessionRetention == null ? DEFAULT_PRUNING_CONFIG.maxSessions : sessionRetention,
-      }
-      const pruneResult = await pruneSessions(serverHandle.client, normalizedFinalWorkspace, pruningConfig, pruneLogger)
-      if (pruneResult.prunedCount > 0) {
-        pruneLogger.info('Pruned old sessions', {
-          pruned: pruneResult.prunedCount,
-          remaining: pruneResult.remainingCount,
+      try {
+        const normalizedFinalWorkspace = normalizeWorkspacePath(finalWorkspace)
+        const pruningConfig = {
+          ...DEFAULT_PRUNING_CONFIG,
+          maxSessions: sessionRetention == null ? DEFAULT_PRUNING_CONFIG.maxSessions : sessionRetention,
+        }
+        const pruneResult = await pruneSessions(
+          serverHandle.client,
+          normalizedFinalWorkspace,
+          pruningConfig,
+          pruneLogger,
+        )
+        if (pruneResult.prunedCount > 0) {
+          pruneLogger.info('Pruned old sessions', {
+            pruned: pruneResult.prunedCount,
+            remaining: pruneResult.remainingCount,
+          })
+        }
+      } catch (pruneError) {
+        pruneLogger.warning('Session pruning failed (non-fatal); shutdown still proceeds', {
+          error: pruneError instanceof Error ? pruneError.message : String(pruneError),
         })
       }
     }
