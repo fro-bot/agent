@@ -255,7 +255,7 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 **Goal:** The ledger recovers from events it never saw.
 
-**Requirements:** R6, R8
+**Requirements:** R6 (tracked entries only), R8
 
 **Dependencies:** Unit 1
 
@@ -290,6 +290,8 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 **Disproved during implementation — and this one leaves a hazard open.** This unit originally specified adopting live untracked children, so that a dispatch whose event was dropped would still be recovered. That is not possible from this project's position. Upstream creates the child session before the background branch, so foreground `task` delegation produces one identically, and `background: true` is written only onto tool-part metadata, never onto the session record — `children()` and the status map carry no discriminant at all. Adoption therefore claimed ordinary foreground subagents as owned background work on every run, and with unknown blocking drain, one transient API failure could hold a successful run in drain until it timed out.
 
 The consequence: **a dispatch whose event is never observed is unrecoverable.** The ledger cannot know about work it never saw, and nothing available to a client can tell that work apart from a foreground subagent. This is a real gap, not a solved problem, and the release gate must weigh it — it is bounded by the run deadline, and nothing can dispatch in background today, but it does not close on its own. Closing it needs an upstream discriminant on the session record, or a server-side hook that sees the tool's actual arguments.
+
+That gap is also why R6 above is scoped to tracked entries. A live child this ledger already knows about settles to unknown, never zero, when reconciliation cannot confirm it — R6 holds there. A dispatch the ledger never learned about is outside its knowledge entirely, not a zero it resolved to; the ledger has no signal to resolve at all. R6 is satisfied for the first case and does not apply to the second, and the checkbox above should not be read as claiming otherwise.
 
 ### Phase 2 — Gateway
 
@@ -587,7 +589,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - The existing one-response invariant holds with background work present.
 
-- [x] **Unit 13: Labelled reporting**
+- [ ] **Unit 13: Labelled reporting**
 
 **Goal:** The response names what did not finish.
 
@@ -615,6 +617,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - A reader can tell from the output which work finished, which was cancelled, and which is unknown.
 
+**Shipped narrower than R23.** `runFinalizeWithResult()` passes `execution.ownershipLedger` to `writeJobSummary()` only (`src/harness/phases/finalize.ts:220`); the stable labels and the degraded-state note land in the Actions job summary and nowhere else. The invocation's actual single response — the comment or review the harness delivers, the invocation's response under this project's Response Protocol — carries no unfinished-work labels. R23 requires that the invocation's single response name any execution that did not finish by its label; job-summary-only reporting does not satisfy that. Narrowing R23 to job-summary-only reporting is an available decision, not one this unit has made — the unit stays open until either the published response carries the labels or that narrowing is decided deliberately.
+
 ### Phase 4 — Release gate
 
 - [ ] **Unit 14: Enable the flag and verify end to end**
@@ -635,7 +639,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 - This phase gates Phases 1–3 rather than sitting beside them as a peer step: the flag flips only once every prior unit has merged with its tests passing.
 - Upstream has no background-job cap of its own, and this plan cut its attempt at one (see Scope Boundaries). Nothing bounds how many dispatches an invocation makes; what bounds the invocation is its deadline, and what keeps work from outliving it is drain. Do not flip this flag on the assumption a cap exists.
 - Before flipping, demonstrate terminal quiescence independently of any gate: a late completion notification and a dispatch racing finalization must both be handled correctly. Zero observed outstanding work is not proof that nothing can start more.
-- **Resolve the conflated lifecycle signals first — done.** An independent review of `runPromptAttempt` and `executeOpenCode` found that several facts were inferred from things that did not imply them, and the invariant they violated is one sentence: selecting an error never proves quiescence, and observing quiescence never erases an error. This precondition is now satisfied: a classified error no longer claims the turn ended; a descendant's retry status no longer writes root failure state; completion evidence is generation-scoped, so renewed root activity invalidates evidence from a superseded generation rather than letting it authorize a later turn; and the completed-assistant predicate now requires a finish reason present and not `tool-calls`/`unknown`, correlation to the latest root user message, qualification of any left-over tool part, `session.status()` corroboration, and a drained ownership ledger before admitting completion.
+- **Resolve the conflated lifecycle signals first — done.** An independent review of `runPromptAttempt` and `executeOpenCode` found that several facts were inferred from things that did not imply them, and the invariant they violated is one sentence: selecting an error never proves quiescence, and observing quiescence never erases an error. This precondition is now satisfied: a classified error no longer claims the turn ended; a descendant's retry status no longer writes root failure state; completion evidence is generation-scoped, so renewed root activity invalidates evidence from a superseded generation rather than letting it authorize a later turn; and the completed-assistant predicate now requires a finish reason present and not `tool-calls`/`unknown`, correlation to the latest root user message once one has been observed (a no-op in the common single-turn case, where the pending-parent check remains the operative guard), qualification of any left-over tool part, `session.status()` corroboration, and a drained ownership ledger before admitting completion.
 - Verify the umbrella empirically rather than by repository search. `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` resolves through `enabledByExperimental` (upstream `packages/opencode/src/effect/runtime-flags.ts:11-14,43`), so an unset specific flag inherits `OPENCODE_EXPERIMENTAL`. The umbrella is unset everywhere in this repository, but `deploy/.env` is not committed, so the gateway's deployed environment cannot be confirmed from the repository alone. A repository search on 2026-09-18 confirmed both `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` and the `OPENCODE_EXPERIMENTAL` umbrella are unset everywhere in the repository, which settles the Action surface; it does not settle this item, since the gateway's deployed environment still cannot be confirmed from the repository.
 - **Weigh the unrecoverable dropped dispatch before flipping** (see Unit 3). A dispatch whose event is never observed cannot be recovered, because nothing available to a client distinguishes a background child session from a foreground one. The ledger reads zero and the run proceeds normally over work it does not know about. That is the plan's original central hazard, still open. It is bounded by the run deadline and cannot occur while dispatch is disabled, but enabling the flag is exactly what makes it reachable — decide deliberately whether that is acceptable, rather than inheriting the assumption that reconciliation covers it.
 - Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` on both surfaces, following the pattern established for the file watcher — default only when unset or empty, so an operator value wins.
