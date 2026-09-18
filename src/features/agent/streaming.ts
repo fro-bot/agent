@@ -133,12 +133,26 @@ export function armRootFreshness(tracker: RootFreshnessTracker): void {
  * prior revision is stale. Never called for descendant activity -- callers must gate on
  * `eventSessionID === sessionId` (root-only) before calling this; descendant activity must never
  * change root lifecycle state.
+ *
+ * Also raises `restConfirmationRequired` when this bump supersedes an existing idle candidate:
+ * SSE carries no sequence number or timestamp, so once the root has already reported idle once, a
+ * bump followed by another idle event cannot be distinguished from a stale/delayed idle for the
+ * SUPERSEDED generation arriving late -- `markRootIdleCandidate` would re-stamp either one as
+ * belonging to the new revision. Requiring a REST/status corroboration before the next idle
+ * candidate is trusted closes that gap. Scoped to this case (not every bump) because a plain
+ * single-generation turn -- arm, activity, one terminal idle -- never has a prior idle candidate to
+ * race against; only a second root user turn (e.g. an injected background-task-completion turn, or
+ * any other renewed activity after the root already went idle once) can replay this ambiguity.
+ * Cleared by `clearRootRevalidationRequirement` once a REST check proves the current generation --
+ * so this costs at most one extra corroboration per superseded generation, not one per idle event.
  */
 export function invalidateRootFreshness(tracker: RootFreshnessTracker, newRootUserMessageId?: string): void {
   if (tracker.state === 'unarmed') return
+  const supersededIdleCandidate = tracker.state === 'idle-candidate'
   tracker.state = 'active'
   tracker.idleCandidateRevision = null
   tracker.revision += 1
+  if (supersededIdleCandidate) tracker.restConfirmationRequired = true
   if (newRootUserMessageId != null) tracker.latestRootUserMessageId = newRootUserMessageId
 }
 

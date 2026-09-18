@@ -1104,8 +1104,17 @@ describe('RootFreshnessTracker — Phase A scaffolding transitions (previously u
     // #when the barrier is resolved by the matching assistant reply
     resolvePendingRootUserMessage(tracker, 'msg_injected')
 
-    // #then freshness is restored
+    // #then the barrier itself is clear, but the bump that registered this pending message
+    // superseded an existing idle candidate (Finding 1's fix, `invalidateRootFreshness`) -- SSE
+    // carries no sequence number, so the idle evidence for this new generation cannot be trusted
+    // until a REST/status check corroborates it, exactly as for a delayed idle race
     expect(tracker.pendingParentMessageId).toBeNull()
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when a REST check corroborates the current generation
+    clearRootRevalidationRequirement(tracker)
+
+    // #then freshness is restored
     expect(hasFreshIdleCandidate(tracker)).toBe(true)
   })
 
@@ -1168,6 +1177,11 @@ describe('RootFreshnessTracker — Phase A scaffolding transitions (previously u
     registerPendingRootUserMessage(tracker, 'msg_first')
     resolvePendingRootUserMessage(tracker, 'msg_first')
     markRootIdleCandidate(tracker)
+    // The bump that registered 'msg_first' superseded the initial idle candidate, so this
+    // generation's freshness needs REST corroboration (Finding 1) before it is trusted, even
+    // though the barrier itself is already resolved.
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+    clearRootRevalidationRequirement(tracker)
     expect(hasFreshIdleCandidate(tracker)).toBe(true)
 
     // #when a second injected turn arrives (a second background dispatch completing)
@@ -1187,7 +1201,10 @@ describe('RootFreshnessTracker — Phase A scaffolding transitions (previously u
     resolvePendingRootUserMessage(tracker, 'msg_second')
     markRootIdleCandidate(tracker)
 
-    // #then freshness returns
+    // #then the barrier is clear, but this generation (superseding the second idle candidate) also
+    // needs its own REST corroboration before freshness returns
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+    clearRootRevalidationRequirement(tracker)
     expect(hasFreshIdleCandidate(tracker)).toBe(true)
   })
 })

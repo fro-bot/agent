@@ -24,11 +24,13 @@ import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {
   classifyRetryStatusError,
+  clearRootRevalidationRequirement,
   getObservedFailure,
   hasFreshIdleCandidate,
   invalidateRootFreshness,
   mergeActivityError,
   normalizeSessionError,
+  resolvePendingRootUserMessage,
 } from './streaming.js'
 
 const POLL_INTERVAL_MS = 500
@@ -335,6 +337,14 @@ function classifyAssistantMessageError(
 /** A qualified, not-yet-admitted completion candidate -- see `detectMessageActivity`'s doc comment. */
 interface MessageCompletionCandidate {
   readonly messageId: string
+  /**
+   * The root-freshness revision this candidate was validated against, captured at the moment it
+   * qualified (not at request start) -- null when no tracker is present. The caller must re-check
+   * this against the CURRENT revision at final admission: the candidate and the later
+   * `session.status()` response are two separate observations, each capable of racing renewed
+   * root activity independently, so each needs its own generation checked.
+   */
+  readonly revision: number | null
 }
 
 /**
@@ -461,8 +471,17 @@ async function detectMessageActivity(
       return null
     }
     if (rootFreshness.pendingParentMessageId != null) {
-      activityTracker.completedAssistantMessageId = undefined
-      return null
+      // The barrier normally only clears via `resolvePendingRootUserMessage()` on the streaming
+      // path -- but that path is exactly what's unavailable when SSE has dropped. When the poll
+      // path itself observes the confirming reply (this candidate's parentID matches the pending
+      // id), resolve the barrier here too, via the same shared resolver, instead of leaving it
+      // dependent on a channel that may be dead.
+      if (parentId != null && parentId === rootFreshness.pendingParentMessageId) {
+        resolvePendingRootUserMessage(rootFreshness, parentId)
+      } else {
+        activityTracker.completedAssistantMessageId = undefined
+        return null
+      }
     }
   }
 
@@ -518,7 +537,7 @@ async function detectMessageActivity(
     messageId: latestAssistantMessageId,
   })
 
-  return {messageId: latestAssistantMessageId}
+  return {messageId: latestAssistantMessageId, revision: rootFreshness?.revision ?? null}
 }
 
 /**
@@ -662,17 +681,48 @@ export async function pollForSessionCompletionObservation(
       const statuses = statusResponse.data ?? {}
       const sessionStatus = statuses[sessionId]
       const rootFreshnessForStatus = activityTracker?.rootFreshness
+      // Deliberate defense-in-depth, not redundant with `detectMessageActivity`'s own barrier
+      // check (session-poll.ts:453-466 area, above): that inner check only runs for the
+      // message-fallback candidate path, and now resolves the barrier itself when it observes the
+      // matching reply. This outer `pendingParentMessageId` check is what actually guards the
+      // *plain* REST-status-idle path a few lines below (`sessionStatus.type === 'idle'` with no
+      // message candidate at all) -- that branch never calls `detectMessageActivity` and has no
+      // other barrier gate of its own. Removing this would let a pending parent turn's status-only
+      // idle admit completion with nothing left to block it.
       const staleAgainstRenewedActivity =
         rootFreshnessForStatus != null &&
         (rootFreshnessForStatus.revision !== statusRequestRevision ||
           rootFreshnessForStatus.pendingParentMessageId != null)
+      // This response reflects the same generation it was requested against -- a REST corroboration
+      // of the current state, regardless of what that state turns out to be. That's the missing
+      // half of the revision-bump guard in `invalidateRootFreshness`: clear the requirement here so
+      // idle evidence for this generation can be trusted again. If the status itself turns out to
+      // be busy/retry below, `invalidateRootFreshness` re-raises the requirement for the new bump it
+      // causes -- so this only stays cleared when the corroboration actually found quiescence.
+      if (rootFreshnessForStatus != null && rootFreshnessForStatus.revision === statusRequestRevision) {
+        clearRootRevalidationRequirement(rootFreshnessForStatus)
+      }
+      // The candidate's own revision was captured inside `detectMessageActivity()` at the moment it
+      // qualified -- a separate, earlier observation than `statusRequestRevision` above. Renewed
+      // root activity landing between that qualification and this admission point (including
+      // during the gap before `statusRequestRevision` was even captured) must invalidate the
+      // candidate independently of whatever the status response itself reports.
+      const candidateStaleAgainstRenewedActivity =
+        messageCandidate != null &&
+        rootFreshnessForStatus != null &&
+        messageCandidate.revision !== rootFreshnessForStatus.revision
       // Upstream removes idle sessions from the status map entirely, so a successful omission is
       // consistent with (but on its own does not prove) inactivity -- it may corroborate a
       // message-fallback candidate that has already independently confirmed the submission's own
       // baseline and two-poll stability, but is not itself treated as idle evidence below.
       const statusCorroboratesInactivity = sessionStatus == null || sessionStatus.type === 'idle'
 
-      if (messageCandidate != null && statusCorroboratesInactivity && !staleAgainstRenewedActivity) {
+      if (
+        messageCandidate != null &&
+        statusCorroboratesInactivity &&
+        !staleAgainstRenewedActivity &&
+        !candidateStaleAgainstRenewedActivity
+      ) {
         if (ledgerBlocksCompletion(ownershipLedger)) {
           logger.debug(
             'Qualified completed-assistant message observed but owned work outstanding — deferring completion',
