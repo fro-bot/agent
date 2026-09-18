@@ -2864,7 +2864,7 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {
+    const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: true,
       currentTurnTerminalSignalReceived: false,
       sessionIdle: false,
@@ -2882,10 +2882,15 @@ describe('pollForSessionCompletion', () => {
       activityTracker,
     )
 
-    // #then — fails on the very first poll tick, not after exhausting the full timeout
+    // #then — fails on the very first poll tick, not after exhausting the full timeout. Selecting
+    // this error never proves the turn ended: the fail-fast timing is pinned by `callCount === 1`,
+    // and the classification itself is pinned via `terminalProviderError`, not via the lifecycle
+    // flag — `mergeActivityError` no longer writes `currentTurnTerminalSignalReceived` (that flag
+    // is reserved for truly terminal signals: session.idle or a completed assistant message).
     expect(result.completed).toBe(false)
     expect(callCount).toBe(1)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('fails fast on a poll-only retry status with action.reason auth_unavailable (no SSE event at all)', async () => {
@@ -4233,7 +4238,9 @@ describe('processEventStream', () => {
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
     expect(result.llmError?.resetTime).toEqual(new Date(nextEpochMs))
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this retry status is not proof the turn ended -- that lifecycle flag is
+    // reserved for session.idle / a completed assistant message.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     expect(activityTracker.sessionError).not.toBeNull()
     expect(activityTracker.sessionError).not.toContain('https://opencode.ai')
     expect(activityTracker.sessionError).not.toContain('acme')
@@ -4284,7 +4291,8 @@ describe('processEventStream', () => {
       // #then — classification is fixed and terminal; provider-controlled values do not cross the boundary
       expect(result.llmError?.type).toBe('provider_auth_error')
       expect(result.llmError?.retryable).toBe(false)
-      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+      // Classifying this error is not proof the turn ended.
+      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
       expect(JSON.stringify(result)).not.toContain('sentinel-provider')
       expect(JSON.stringify(result)).not.toContain('sentinel-token')
     },
@@ -4378,7 +4386,8 @@ describe('processEventStream', () => {
       expect(result.llmError?.retryable).toBe(false)
       expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
       expect(activityTracker.sessionError).toBe(result.llmError?.message)
-      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+      // Classifying this error is not proof the turn ended.
+      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
       expect(JSON.stringify(result)).not.toContain('context-overflow-provider-message-sentinel')
       expect(JSON.stringify(result)).not.toContain('context-overflow-response-body-sentinel')
       expect(JSON.stringify(activityTracker)).not.toContain('context-overflow-provider-message-sentinel')
@@ -4420,7 +4429,8 @@ describe('processEventStream', () => {
     // #then
     expect(result.llmError?.type).toBe('provider_auth_error')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this retry status is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     expect(JSON.stringify(result)).not.toContain('sentinel-provider')
     expect(JSON.stringify(result)).not.toContain('sentinel-token')
   })
@@ -4919,7 +4929,8 @@ describe('processEventStream', () => {
     expect(result.llmError).not.toBeNull()
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('does not classify an ordinary structured 429 session.error as quota exceeded', async () => {
@@ -4992,7 +5003,8 @@ describe('processEventStream', () => {
     expect(result.llmError).not.toBeNull()
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('does not classify an ordinary plain-string session.error as quota_exceeded', async () => {
@@ -6251,8 +6263,8 @@ describe('runPromptAttempt with v2.session.wait()', () => {
           .fn()
           .mockResolvedValueOnce({data: []}) // baseline: empty
           .mockResolvedValue({
-            // poll: new assistant message with time.completed
-            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}}}],
+            // poll: new assistant message with time.completed and a qualifying finish
+            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}, finish: 'stop'}}],
           }),
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },

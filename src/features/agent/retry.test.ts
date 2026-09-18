@@ -220,6 +220,60 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
       expect(result.success).toBe(false)
       expect(result.error).toContain('Poll timeout')
     })
+
+    it('a wait() resolution stale against a later generation falls back to poll instead of reusing the old terminal signal', async () => {
+      // #given root session.idle fires (first generation), then renewed root activity for the SAME
+      // session arrives BEFORE wait() resolves (a new generation) -- `currentTurnTerminalSignalReceived`
+      // is a sticky flag that never resets on its own, so without generation-awareness wait() would
+      // still see it as `true` and report a stale success.
+      vi.useFakeTimers()
+      try {
+        let resolveWait!: () => void
+        const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+          async () =>
+            new Promise<TestWaitResponse>(resolve => {
+              resolveWait = () => resolve({data: undefined, error: undefined})
+            }),
+        )
+        vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+        const {runPromptAttempt} = await import('./retry.js')
+        const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
+        const mockClient = {session: {status: statusFn}}
+        const eventStream = (async function* (): AsyncIterable<Event> {
+          yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
+          yield {
+            type: 'message.part.delta',
+            properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'more'}},
+          } as unknown as Event
+          await new Promise<void>(() => undefined)
+        })()
+
+        // #when -- the event stream drains (idle, then renewed activity) before wait() resolves
+        const resultPromise = runPromptAttempt(
+          mockClient as unknown as Parameters<typeof runPromptAttempt>[0],
+          'ses_123',
+          '/workspace',
+          1_000,
+          mockLogger,
+          eventStream,
+          'http://localhost:1234',
+        )
+        await vi.advanceTimersByTimeAsync(0)
+        resolveWait()
+        // Poll's own timeout (1_000ms) plus the bounded event-processor shutdown wait
+        // (EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000ms, since the mock event stream never closes
+        // on its own) — matches the pattern other tests in this file use for the same reason.
+        await vi.advanceTimersByTimeAsync(3_500)
+        const result = await resultPromise
+
+        // #then -- wait() deferred to poll instead of reusing the stale idle; poll itself finds no
+        // fresh terminal evidence either (status stays busy) and times out
+        expect(result.success).toBe(false)
+        expect(result.error).toContain('Poll timeout')
+      } finally {
+        vi.useRealTimers()
+      }
+    })
   })
 
   describe('early prompt-start return', () => {

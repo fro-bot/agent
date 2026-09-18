@@ -31,6 +31,15 @@ import {
   pollForSessionCompletionObservation,
   toPollResult,
 } from './session-poll.js'
+import {
+  armRootFreshness,
+  createRootFreshnessTracker,
+  invalidateRootFreshness,
+  markRootIdleCandidate,
+  registerPendingRootUserMessage,
+  requireRootRevalidation,
+  resolvePendingRootUserMessage,
+} from './streaming.js'
 
 type MockClient = Awaited<ReturnType<typeof createOpencode>>['client']
 
@@ -102,19 +111,39 @@ describe('pollForSessionCompletion — ownership ledger gating (Unit 9)', () => 
     expect(result.completed).toBe(true)
   })
 
-  it('edge case: sticky terminal flags do not resolve complete while owned work is outstanding, and resolve once drained', async () => {
-    // #given a ledger with an outstanding background entry, and the sticky flags already set
-    // (mirrors a run whose root session went idle while its subagent is still running)
+  it('replaces: a stale idle-candidate is not revived by ledger drain once renewed root activity invalidated it — fresh idle after drain still completes', async () => {
+    // #given the OLD defect: `sessionIdle`/`currentTurnTerminalSignalReceived` are sticky flags
+    // that, once set, never reset — so any later ledger drain would resolve complete even if real
+    // root activity happened in between (REST reporting `busy` the whole time, ignored either way,
+    // since the event-idle shortcut never consulted it). `rootFreshness` closes this: idle evidence
+    // is stamped with a revision, and any renewed root activity invalidates it, so a ledger drain
+    // after that renewed activity must NOT be treated as authorizing the stale candidate.
     vi.useFakeTimers()
     const ledger = createOwnershipLedger()
     ledger.adopt('ses_child', 'background task')
-    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
+    // REST reports busy while the stale candidate should still be refused; once the root genuinely
+    // goes idle again (below), REST is flipped to idle too -- this scenario supersedes a prior idle
+    // candidate (markRootIdleCandidate then invalidateRootFreshness), which raises
+    // `restConfirmationRequired` (see Finding 1): the SSE fast path alone cannot be trusted again
+    // for this generation until REST actually corroborates inactivity, so the fresh idle candidate
+    // genuinely needs a matching REST response to complete, not just a revision match.
+    let restReportsIdle = false
+    const statusFn = vi.fn().mockImplementation(async () => ({
+      data: {ses_123: restReportsIdle ? {type: 'idle'} : {type: 'busy'}},
+    }))
     const mockClient = {session: {status: statusFn}}
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    markRootIdleCandidate(rootFreshness)
+    // Renewed root activity after the idle mark — a real run would see this via a subsequent
+    // event (a new tool call, text delta, or an injected parent turn); simulated directly here.
+    invalidateRootFreshness(rootFreshness)
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: true,
       currentTurnTerminalSignalReceived: true,
       sessionIdle: true,
       sessionError: null,
+      rootFreshness,
     }
 
     const pollPromise = pollForSessionCompletion(
@@ -129,31 +158,45 @@ describe('pollForSessionCompletion — ownership ledger gating (Unit 9)', () => 
       ledger,
     )
 
-    // #when several poll cycles pass with the entry still outstanding
+    // #when the outstanding work settles — under the old defect this alone would resolve complete
+    ledger.settle('ses_child')
     await vi.advanceTimersByTimeAsync(1_500)
 
-    // #then it has not resolved — the promise is still pending, proven by continuing to poll
+    // #then it has NOT resolved — the stale idle-candidate (invalidated by renewed activity) is
+    // never accepted, proven by the poll continuing to run
     expect(statusFn.mock.calls.length).toBeGreaterThan(1)
 
-    // #when the outstanding work settles
-    ledger.settle('ses_child')
+    // #when the root genuinely goes idle again (fresh candidate at the current revision), with REST
+    // now corroborating that same generation as inactive
+    markRootIdleCandidate(rootFreshness)
+    restReportsIdle = true
     await vi.advanceTimersByTimeAsync(1_000)
     const result = await pollPromise
 
-    // #then it now resolves complete
+    // #then — complement: a legitimate fresh completion still succeeds once drained
     expect(result.completed).toBe(true)
     expect(result.error).toBeNull()
   })
 
-  it('edge case: the stable completed-assistant poll does not resolve complete while owned work is outstanding, and resolves once drained', async () => {
-    // #given a ledger with an outstanding background entry, and a completed assistant message
-    // stable across consecutive polls (the signal `detectMessageActivity` treats as terminal)
+  it('replaces: the message-fallback candidate requires status corroboration and a qualified tuple, not just a stable completed assistant', async () => {
+    // #given the OLD defect: `detectMessageActivity` treated ANY completed-assistant message
+    // (missing `finish`/`parentID`, and never checked against `session.status()`) as terminal —
+    // so a stable message alone completed the run even while REST kept reporting `busy` the whole
+    // time. The fix requires `finish` (not `tool-calls`/`unknown`) plus REST status corroboration
+    // (idle or absent) before a candidate is admitted, in addition to the pre-existing ownership
+    // ledger gate this unit targets.
     vi.useFakeTimers()
     const ledger = createOwnershipLedger()
     ledger.adopt('ses_child', 'background task')
     const messagesFn = vi.fn().mockResolvedValue({
-      data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}}}],
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}, finish: 'stop'},
+        },
+      ],
     })
+    // REST reports busy for the whole run — under the fix this must block admission regardless of
+    // ledger state, since status no longer corroborates inactivity.
     const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
     const mockClient = {session: {messages: messagesFn, status: statusFn}}
     const activityTracker: ActivityTracker = {
@@ -177,22 +220,27 @@ describe('pollForSessionCompletion — ownership ledger gating (Unit 9)', () => 
     )
 
     // #when the same completed assistant message is observed across the two polls the stability
-    // check requires (reaching the point where, ungated, the function would already have returned)
+    // check requires
     await vi.advanceTimersByTimeAsync(1_000)
     const callsAtStability = messagesFn.mock.calls.length
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
     expect(callsAtStability).toBeGreaterThanOrEqual(2)
+    // #then — unlike the old behavior, the terminal flag is NOT mutated by the message-fallback
+    // candidate alone; only actual admission (status-corroborated, ledger-drained) sets it
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
 
-    // #then it keeps polling past that point instead of having returned — proof it did not resolve
+    // #when the outstanding work settles, but REST still reports busy
+    ledger.settle('ses_child')
     await vi.advanceTimersByTimeAsync(1_500)
+
+    // #then it still has NOT resolved — status never corroborated inactivity
     expect(messagesFn.mock.calls.length).toBeGreaterThan(callsAtStability)
 
-    // #when the outstanding work settles
-    ledger.settle('ses_child')
+    // #when status finally reports idle
+    statusFn.mockResolvedValue({data: {ses_123: {type: 'idle'}}})
     await vi.advanceTimersByTimeAsync(1_000)
     const result = await pollPromise
 
-    // #then it now resolves complete
+    // #then — complement: a legitimate, fully-qualified, status-corroborated completion succeeds
     expect(result.completed).toBe(true)
     expect(result.error).toBeNull()
   })
@@ -360,12 +408,13 @@ describe('pollForSessionCompletionObservation — settlement causes', () => {
   })
 
   it('completion-observed: stable completed-assistant message across two polls', async () => {
-    // #given a completed assistant message stable across the two polls the check requires
+    // #given a completed assistant message stable across the two polls the check requires,
+    // qualified with `finish` and corroborated by an idle status
     vi.useFakeTimers()
     const messagesFn = vi.fn().mockResolvedValue({
-      data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}}}],
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}, finish: 'stop'}}],
     })
-    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
     const mockClient = {session: {messages: messagesFn, status: statusFn}}
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
@@ -393,12 +442,12 @@ describe('pollForSessionCompletionObservation — settlement causes', () => {
   })
 
   it('complement: a completed assistant message first stable AFTER the deadline is still rejected', async () => {
-    // #given the identical stable-message setup, but the deadline is already expired
+    // #given the identical qualified stable-message setup, but the deadline is already expired
     vi.useFakeTimers()
     const messagesFn = vi.fn().mockResolvedValue({
-      data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}}}],
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}, finish: 'stop'}}],
     })
-    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
     const mockClient = {session: {messages: messagesFn, status: statusFn}}
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
@@ -410,7 +459,8 @@ describe('pollForSessionCompletionObservation — settlement causes', () => {
 
     // #when — the deadline is live for both top-of-loop checks (iteration 1 and 2) and expires
     // precisely at the completion-admission check on iteration 2, after the stability-confirming
-    // async session.messages() request has already run
+    // async session.messages() request and the corroborating session.status() request have
+    // already run
     const observationPromise = pollForSessionCompletionObservation(
       mockClient as unknown as MockClient,
       'ses_123',
@@ -424,9 +474,10 @@ describe('pollForSessionCompletionObservation — settlement causes', () => {
     await vi.advanceTimersByTimeAsync(1_000)
     const observation = await observationPromise
 
-    // #then — the stability check still ran and set the terminal signal, but admission is
-    // rejected because the deadline had already expired when the decision was made
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // #then — the qualified candidate was found and status-corroborated, but admission itself is
+    // rejected because the deadline had already expired at the decision point; the terminal flag
+    // (Phase B) is reserved for actual admission, never mutated by the candidate alone
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     expect(observation.settlement.kind).toBe('deadline')
   })
 
@@ -900,7 +951,10 @@ function pendingMessagesClient(stableInfo: Record<string, unknown>) {
       resolveSecond = resolve
     })
   })
-  const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
+  // Idle, not busy: the qualified-tuple predicate (Phase B) requires status to corroborate
+  // inactivity before a message-fallback candidate can be admitted, so these fixtures represent a
+  // session that has genuinely finished -- matching `stableInfo`'s own `finish`/`time.completed`.
+  const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
   return {
     client: {session: {messages: messagesFn, status: statusFn}},
     resolveSecond: async (): Promise<void> => {
@@ -958,7 +1012,13 @@ describe('completion-observed snapshots pending failure evidence at the decision
     // #given a completed-assistant message stable across two polls, with the confirming second
     // session.messages() request held in flight
     vi.useFakeTimers()
-    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const {client, resolveSecond} = pendingMessagesClient({
+      id: 'msg_new',
+      role: 'assistant',
+      time: {completed: 2},
+      finish: 'stop',
+      parentID: 'msg_parent',
+    })
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
@@ -976,7 +1036,7 @@ describe('completion-observed snapshots pending failure evidence at the decision
       activityTracker,
     )
     await vi.advanceTimersByTimeAsync(500)
-    expect(activityTracker.completedAssistantMessageId).toBe('msg_new')
+    expect(activityTracker.completedAssistantMessageId).toEqual({messageId: 'msg_new', revision: null})
     await vi.advanceTimersByTimeAsync(500)
 
     // #when an SSE-accepted provider failure lands on the tracker while that request is pending,
@@ -999,7 +1059,13 @@ describe('completion-observed snapshots pending failure evidence at the decision
     // #given the identical stable-message setup, but nothing lands on the tracker while the
     // confirming request is pending
     vi.useFakeTimers()
-    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const {client, resolveSecond} = pendingMessagesClient({
+      id: 'msg_new',
+      role: 'assistant',
+      time: {completed: 2},
+      finish: 'stop',
+      parentID: 'msg_parent',
+    })
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
@@ -1112,7 +1178,13 @@ describe('completion-observed snapshots pending failure evidence at the decision
     // landing while session.messages() is in flight -- pinning that the completion snapshot
     // applies the same provider-over-session precedence as every other producer in this module
     vi.useFakeTimers()
-    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const {client, resolveSecond} = pendingMessagesClient({
+      id: 'msg_new',
+      role: 'assistant',
+      time: {completed: 2},
+      finish: 'stop',
+      parentID: 'msg_parent',
+    })
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
@@ -1157,7 +1229,13 @@ describe('completion-observed snapshots pending failure evidence at the decision
   it('immutability: a failure delivered after the completion decision does not retroactively enter the returned snapshot', async () => {
     // #given a completion observation that already settled with no failure present
     vi.useFakeTimers()
-    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const {client, resolveSecond} = pendingMessagesClient({
+      id: 'msg_new',
+      role: 'assistant',
+      time: {completed: 2},
+      finish: 'stop',
+      parentID: 'msg_parent',
+    })
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
@@ -1615,7 +1693,13 @@ describe('pollForSessionCompletion adapter does not report success for a complet
     // #given the identical race as the modern-API fixture above: a stable completed-assistant
     // message with the confirming second session.messages() request held in flight
     vi.useFakeTimers()
-    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const {client, resolveSecond} = pendingMessagesClient({
+      id: 'msg_new',
+      role: 'assistant',
+      time: {completed: 2},
+      finish: 'stop',
+      parentID: 'msg_parent',
+    })
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
@@ -1648,7 +1732,13 @@ describe('pollForSessionCompletion adapter does not report success for a complet
     // #given the identical race, run through `pollForSessionCompletionObservation` directly —
     // this pins that fixing the adapter did not move or weaken the settlement cause itself
     vi.useFakeTimers()
-    const {client, resolveSecond} = pendingMessagesClient({id: 'msg_new', role: 'assistant', time: {completed: 2}})
+    const {client, resolveSecond} = pendingMessagesClient({
+      id: 'msg_new',
+      role: 'assistant',
+      time: {completed: 2},
+      finish: 'stop',
+      parentID: 'msg_parent',
+    })
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
@@ -1784,5 +1874,1135 @@ describe('pollForSessionCompletion adapter does not report success for a complet
 
     // #then
     expect(result).toEqual({completed: true, error: null})
+  })
+})
+
+function qualifiedPredicateBaseActivityTracker(): ActivityTracker {
+  return {
+    firstMeaningfulEventReceived: false,
+    currentTurnTerminalSignalReceived: false,
+    baselineMessageIds: new Set(),
+    sessionIdle: false,
+    sessionError: null,
+  }
+}
+
+describe('detectMessageActivity qualified-tuple predicate (Phase B)', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("a stable assistant with finish 'tool-calls' never completes — the prompt loop would still run another iteration", async () => {
+    // #given a completed-looking assistant message stable across polls, but finish is 'tool-calls'
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'tool-calls'}}],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then it times out rather than reporting a false completion
+    expect(observation.settlement.kind).toBe('watchdog')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+  })
+
+  it("a stable assistant with finish 'unknown' never completes", async () => {
+    // #given
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'unknown'}}],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('watchdog')
+  })
+
+  it('a stable assistant missing finish entirely never completes', async () => {
+    // #given — the exact fixture shape that used to be sufficient before Phase B
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {completed: 2}}}],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('watchdog')
+  })
+
+  it('a completed stop finish with a still-running tool part never completes — a non-provider-executed continuation is pending', async () => {
+    // #given finish is 'stop' but a tool part is still 'running' — the loop has not actually finished
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+          parts: [{type: 'tool', state: {status: 'running'}}],
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('watchdog')
+  })
+
+  it('a completed stop finish with a still-pending tool part never completes — a non-provider-executed continuation is pending', async () => {
+    // #given finish is 'stop' but a tool part is still 'pending' — symmetric with the 'running'
+    // case above; upstream does not distinguish pending from running here
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+          parts: [{type: 'tool', state: {status: 'pending'}}],
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('watchdog')
+  })
+
+  it('a completed stop finish with a completed, non-provider-executed tool part never completes — the model has not received the result yet (upstream divergence #1)', async () => {
+    // #given upstream (packages/opencode/src/session/prompt.ts hasToolCalls) does not filter on
+    // tool part status at all — a *completed* tool part still requires another prompt-loop
+    // iteration unless it is provider-executed or an orphaned interrupted tool. Admitting
+    // completion here would be the premature-completion defect class this subsystem exists to close.
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+          parts: [{type: 'tool', state: {status: 'completed'}}],
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('watchdog')
+  })
+
+  it('complement: a completed stop finish with only a provider-executed tool part DOES complete', async () => {
+    // #given a completed tool part carrying metadata.providerExecuted: true — the model never
+    // needs this result back, so it is not a continuation requirement regardless of status
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+          parts: [{type: 'tool', state: {status: 'completed'}, metadata: {providerExecuted: true}}],
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('completion-observed')
+  })
+
+  it('a pending, provider-executed tool part does NOT block completion — status is irrelevant once providerExecuted is true (upstream divergence #3)', async () => {
+    // #given a 'pending' tool part, but metadata.providerExecuted is true — upstream's hasToolCalls
+    // excludes provider-executed parts entirely, regardless of status. The old rule refused this
+    // (a false refusal, pushing a legitimate completion to the watchdog).
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+          parts: [{type: 'tool', state: {status: 'pending'}, metadata: {providerExecuted: true}}],
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('completion-observed')
+  })
+
+  it('a completed stop finish with an error tool part lacking interrupted: true never completes (upstream divergence #2)', async () => {
+    // #given an 'error' status tool part with no metadata.interrupted flag at all — this is NOT
+    // the orphaned-interrupted-tool case cleanup() produces; upstream's isOrphanedInterruptedTool
+    // requires interrupted === true specifically, so this part still counts toward hasToolCalls
+    // and still requires another prompt-loop iteration. The old rule treated any 'error' status as
+    // resolved, which swallowed this non-orphan case by accident.
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+          parts: [{type: 'tool', state: {status: 'error'}}],
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('watchdog')
+  })
+
+  it('complement: a completed stop finish with an error tool part carrying state.metadata.interrupted === true DOES complete', async () => {
+    // #given the actual orphaned-interrupted-tool shape cleanup() produces: 'error' status AND
+    // state.metadata.interrupted === true. This is not pending work and must not block completion.
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+          parts: [{type: 'tool', state: {status: 'error', metadata: {interrupted: true}}}],
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+  })
+
+  it.each([
+    ['missing state entirely', {type: 'tool'}],
+    ['error status with missing metadata', {type: 'tool', state: {status: 'error'}}],
+    [
+      'error status with interrupted present but not strictly true',
+      {type: 'tool', state: {status: 'error', metadata: {interrupted: 'true'}}},
+    ],
+    ['error status with interrupted false', {type: 'tool', state: {status: 'error', metadata: {interrupted: false}}}],
+  ])(
+    'a malformed or partial tool part (%s) does not qualify as an orphan and still blocks completion',
+    async (_label, malformedPart) => {
+      // #given the orphan check is the permissive branch, so any ambiguity in the wire payload
+      // must fall on the side of NOT qualifying as an orphan — a missing/malformed field must not
+      // accidentally admit a premature completion
+      vi.useFakeTimers()
+      const messagesFn = vi.fn().mockResolvedValue({
+        data: [
+          {
+            info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+            parts: [malformedPart],
+          },
+        ],
+      })
+      const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+      const mockClient = {session: {messages: messagesFn, status: statusFn}}
+      const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+      // #when
+      const observationPromise = pollForSessionCompletionObservation(
+        mockClient as unknown as MockClient,
+        'ses_123',
+        '/workspace',
+        new AbortController().signal,
+        mockLogger,
+        1_200,
+        activityTracker,
+      )
+      await vi.advanceTimersByTimeAsync(1_500)
+      const observation = await observationPromise
+
+      // #then
+      expect(observation.settlement.kind).toBe('watchdog')
+    },
+  )
+
+  it('an assistant message with no tool parts at all still completes', async () => {
+    // #given finish is 'stop' and the parts array carries no tool parts at all — the baseline case
+    // where the continuation check degrades to a no-op
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'},
+          parts: [{type: 'text', text: 'done'}],
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+  })
+
+  it('an assistant message carrying its own error field settles as a classified failure, not a generic timeout', async () => {
+    // #given a completed-looking assistant message whose `error` field reports a provider auth
+    // failure — this must be classified through the same bounded precedence as SSE session.error,
+    // not dropped and left to time out generically
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {
+            id: 'msg_new',
+            role: 'assistant',
+            time: {completed: 2},
+            finish: 'error',
+            error: {name: 'ProviderAuthError', message: 'invalid api key'},
+          },
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then — a failure, immediately, never a completion and never a generic watchdog timeout
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.failures).toHaveLength(1)
+    expect(observation.failures[0]?.llmError).not.toBeNull()
+  })
+
+  it('busy status invalidates a prior message-fallback candidate even though it carries no classifiable failure', async () => {
+    // #given a qualified stable candidate, but the CORROBORATING status poll comes back busy on
+    // this iteration and idle only afterward — renewed activity must invalidate the candidate
+    vi.useFakeTimers()
+    let statusCall = 0
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop'}}],
+    })
+    const statusFn = vi.fn().mockImplementation(async () => {
+      statusCall++
+      // Busy for the first several polls (covering both the stability-confirming poll and the
+      // first corroboration attempt), idle afterward.
+      return {data: {ses_123: {type: statusCall <= 3 ? 'busy' : 'idle'}}}
+    })
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(3_000)
+    const observation = await observationPromise
+
+    // #then it eventually completes once status genuinely corroborates inactivity, but not before
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(statusCall).toBeGreaterThan(3)
+  })
+})
+
+/**
+ * Coverage gap closed per code review: three qualified-tuple-adjacent guards had no test pinning
+ * that removing them changes behavior.
+ *  - `session-poll.ts:655/665-668` (the status-revision guard): captured before issuing the
+ *    corroborating `session.status()` request, so renewed root activity observed while that
+ *    request is in flight must invalidate the response even though the response itself reports
+ *    idle. Previously only exercised before any request started (`retry.test.ts`) or via the
+ *    sticky-flag idle path (`pendingStatusClient` above), never through the message-fallback
+ *    candidate this guard actually protects.
+ *  - `session-poll.ts:453-466` (the pending-parent barrier): previously only exercised via the
+ *    tracker's own unit tests (`streaming.test.ts`), never through the real poll path.
+ *  - The `session.status()`-rejects-with-a-qualified-candidate combination: the only status
+ *    rejection test (`session-poll.test.ts:611`) ran with no qualified candidate present.
+ */
+
+/**
+ * A `session.messages()` mock that resolves the same stable qualified assistant message on every
+ * call (arming `detectMessageActivity`'s two-poll stability check), paired with a `session.status()`
+ * mock whose first call resolves `idle` (deliberately not `busy`: confirmation memory is keyed by
+ * (message id, revision) -- see `ActivityTracker.completedAssistantMessageId`'s doc comment -- so a
+ * `busy` reply on the first poll would itself bump the revision and reset the two-poll confirmation
+ * this helper exists to arm, before the deliberate mid-flight invalidation each test performs can be
+ * isolated) and whose second call returns a promise the test controls directly — the same in-flight
+ * shape as `pendingStatusClient` above, but paired with a message-fallback candidate so the
+ * status-revision guard at session-poll.ts:655 can be exercised through the real poll path instead
+ * of only the sticky-flag idle path.
+ */
+function pendingStatusClientWithStableCandidate(stableInfo: Record<string, unknown>) {
+  const messagesFn = vi.fn().mockResolvedValue({data: [{info: stableInfo}]})
+  let callCount = 0
+  let resolveSecond: ((value: {data: Record<string, {type: string}>}) => void) | undefined
+  const statusFn = vi.fn().mockImplementation(async () => {
+    callCount++
+    if (callCount === 1) return {data: {ses_123: {type: 'idle'}}}
+    return new Promise<{data: Record<string, {type: string}>}>(resolve => {
+      resolveSecond = resolve
+    })
+  })
+  return {
+    client: {session: {messages: messagesFn, status: statusFn}},
+    resolveSecond: async (): Promise<void> => {
+      resolveSecond?.({data: {ses_123: {type: 'idle'}}})
+    },
+  }
+}
+
+describe('root-freshness revision guard through the poll path (session-poll.ts:655)', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('in-flight invalidation: renewed root activity while session.status() is pending refuses a candidate that would otherwise be admitted', async () => {
+    // #given a qualified completed-assistant candidate stable across two polls, with the
+    // corroborating session.status() request held in flight
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingStatusClientWithStableCandidate({
+      id: 'msg_new',
+      role: 'assistant',
+      time: {completed: 2},
+      finish: 'stop',
+      parentID: 'msg_parent',
+    })
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    let settled = false
+    // eslint-disable-next-line no-void
+    void observationPromise.then(() => {
+      settled = true
+    })
+    // First poll: the message is observed (unconfirmed) and status reports idle (harmless here --
+    // no message candidate exists yet this poll to admit, and no SSE idle candidate was ever
+    // recorded for the plain-status path to admit on either).
+    await vi.advanceTimersByTimeAsync(500)
+    // Second poll: the same message confirms the candidate, and the corroborating status request
+    // is issued and held pending.
+    await vi.advanceTimersByTimeAsync(500)
+
+    // #when renewed root activity is observed while that request is still in flight, then the
+    // request resolves idle
+    invalidateRootFreshness(rootFreshness)
+    await resolveSecond()
+
+    // #then the idle response is not honored on this cycle — completion is not admitted
+    expect(settled).toBe(false)
+
+    // #and the candidate never settles as completion-observed for this poll — it times out
+    // instead of being silently retried into a later false admission
+    await vi.advanceTimersByTimeAsync(500)
+    const observation = await observationPromise
+    expect(observation.settlement.kind).not.toBe('completion-observed')
+    expect(observation.settlement.kind).toBe('watchdog')
+  })
+
+  it('complement: no renewed root activity while session.status() is pending still admits the same candidate', async () => {
+    // #given the identical setup, but nothing invalidates freshness while the corroborating
+    // request is pending
+    vi.useFakeTimers()
+    const {client, resolveSecond} = pendingStatusClientWithStableCandidate({
+      id: 'msg_new',
+      role: 'assistant',
+      time: {completed: 2},
+      finish: 'stop',
+      parentID: 'msg_parent',
+    })
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+
+    // #when the in-flight request resolves idle with no renewed activity ever observed
+    await resolveSecond()
+    const observation = await observationPromise
+
+    // #then completion is admitted, exactly as the non-racing case does
+    expect(observation.settlement.kind).toBe('completion-observed')
+  })
+})
+
+describe('pending-parent barrier through the poll path (session-poll.ts:453-466)', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('the poll path resolves the barrier when it observes a candidate whose parentID matches the pending message, and completion proceeds (Findings 4/5)', async () => {
+    // #given a candidate answering the pending parent message itself. Before Findings 4/5, the
+    // barrier had no resolution path outside the (SSE-only) streaming path -- when SSE has dropped,
+    // the poll path could observe this exact confirming reply and still refuse forever. The fix
+    // reuses `resolvePendingRootUserMessage()` from inside `detectMessageActivity()` so the poll
+    // path can clear the barrier itself.
+    vi.useFakeTimers()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    registerPendingRootUserMessage(rootFreshness, 'msg_pending')
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_pending'}}],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then the barrier is resolved by the matching reply and completion is admitted, and the
+    // barrier itself is left clear for any later evidence
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(rootFreshness.pendingParentMessageId).toBeNull()
+  })
+
+  it('complement: the barrier still blocks a plain status-idle admission (no message candidate) until the matching reply is actually observed', async () => {
+    // #given no `session.messages()` available at all -- so `detectMessageActivity()` (and its new
+    // resolution path) never runs -- but the terminal signal was already observed some other way
+    // (e.g. an SSE `session.idle`), and `session.status()` corroborates idle. This isolates the
+    // OUTER `pendingParentMessageId` check (session-poll.ts, on the plain-status-idle path) which
+    // is the only guard left for this path once the barrier hasn't been resolved by anything
+    vi.useFakeTimers()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    registerPendingRootUserMessage(rootFreshness, 'msg_pending')
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {status: statusFn}}
+    const activityTracker: ActivityTracker = {
+      ...qualifiedPredicateBaseActivityTracker(),
+      currentTurnTerminalSignalReceived: true,
+      rootFreshness,
+    }
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then it times out rather than admitting completion while the barrier remains unresolved
+    expect(observation.settlement.kind).toBe('watchdog')
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_pending')
+  })
+
+  it('complement: once the pending-parent barrier is cleared, the same candidate is admitted', async () => {
+    // #given the identical setup, but the barrier is resolved before polling begins
+    vi.useFakeTimers()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    registerPendingRootUserMessage(rootFreshness, 'msg_pending')
+    resolvePendingRootUserMessage(rootFreshness, 'msg_pending')
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_pending'}}],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then completion is admitted once the barrier no longer blocks it
+    expect(observation.settlement.kind).toBe('completion-observed')
+  })
+
+  it('complement: a parentID that does not match the latest root user message is refused even with no pending barrier', async () => {
+    // #given the barrier is clear, but the candidate answers a different (stale) parent than the
+    // latest known root user message
+    vi.useFakeTimers()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    invalidateRootFreshness(rootFreshness, 'msg_actual_parent')
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_wrong_parent'},
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then it times out rather than admitting completion for the wrong parent
+    expect(observation.settlement.kind).toBe('watchdog')
+  })
+})
+
+describe('session.status() rejection racing a qualified completed-assistant candidate (session-poll.test.ts:611 gap)', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a stable qualified candidate does not admit completion when session.status() rejects — it keeps polling and completes only after a later successful corroboration', async () => {
+    // #given a stable qualified completed-assistant message available on every poll, and
+    // session.status() rejecting on its first call — an ordinary transport failure racing with an
+    // otherwise-ready candidate
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [{info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_parent'}}],
+    })
+    let statusCallCount = 0
+    const statusFn = vi.fn().mockImplementation(async () => {
+      statusCallCount++
+      if (statusCallCount === 1) throw new Error('transient network error')
+      return {data: {ses_123: {type: 'idle'}}}
+    })
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+
+    // #then the first poll observed the candidate (unconfirmed) and the racing status request
+    // failed without settling anything
+    expect(activityTracker.completedAssistantMessageId).toEqual({messageId: 'msg_new', revision: null})
+
+    await vi.advanceTimersByTimeAsync(500)
+    const observation = await observationPromise
+
+    // #then it never resolved on the failed attempt — it kept polling and completed only once
+    // session.status() corroborated inactivity on the following call
+    expect(statusCallCount).toBe(2)
+    expect(observation.settlement.kind).toBe('completion-observed')
+  })
+})
+
+describe('Finding 1 — a delayed idle re-stamped as current requires REST corroboration', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a delayed idle arriving after a revision bump does not authorize completion until REST corroborates', async () => {
+    // #given a root that already reported idle once (generation 1), then renewed activity bumped
+    // the generation (an injected turn, or any other renewed root activity) -- superseding that
+    // idle candidate. SSE carries no sequence number, so the idle re-observed for the new
+    // generation cannot be distinguished from the stale generation-1 idle arriving late.
+    vi.useFakeTimers()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    markRootIdleCandidate(rootFreshness)
+    invalidateRootFreshness(rootFreshness)
+    // The delayed/re-arriving idle event gets re-stamped as belonging to the new generation.
+    markRootIdleCandidate(rootFreshness)
+    const activityTracker: ActivityTracker = {
+      ...qualifiedPredicateBaseActivityTracker(),
+      currentTurnTerminalSignalReceived: true,
+      sessionIdle: true,
+      rootFreshness,
+    }
+    // REST never corroborates this generation as idle (a real run would eventually see this
+    // resolve, but this pins the gate while it doesn't).
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
+    const mockClient = {session: {status: statusFn}}
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then it times out rather than admitting completion for the unrevalidated idle
+    expect(observation.settlement.kind).toBe('watchdog')
+    expect(statusFn).toHaveBeenCalled()
+  })
+
+  it('complement: an idle arriving with no intervening bump still completes normally, with no extra corroboration required', async () => {
+    // #given a single-generation turn: armed, then idle -- no prior idle candidate was ever
+    // superseded, so `invalidateRootFreshness` never had reason to raise the revalidation
+    // requirement. `session.status()` is wired to reject if called at all, proving the SSE fast
+    // path admits completion without ever needing it.
+    vi.useFakeTimers()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    markRootIdleCandidate(rootFreshness)
+    const activityTracker: ActivityTracker = {
+      ...qualifiedPredicateBaseActivityTracker(),
+      currentTurnTerminalSignalReceived: true,
+      sessionIdle: true,
+      rootFreshness,
+    }
+    const statusFn = vi.fn().mockRejectedValue(new Error('should not be called on the fast path'))
+    const mockClient = {session: {status: statusFn}}
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    const observation = await observationPromise
+
+    // #then completion is admitted directly via the SSE-observed idle evidence
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(statusFn).not.toHaveBeenCalled()
+  })
+})
+
+describe('REST corroboration clears the revalidation requirement (Findings 1/4/5)', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a REST corroboration clears the revalidation requirement so a post-discontinuity run can still complete', async () => {
+    // #given an SSE discontinuity already required revalidation (the pre-existing trigger for
+    // `restConfirmationRequired`, e.g. a dropped observation channel) -- the terminal signal was
+    // observed before the drop, but is not yet trusted
+    vi.useFakeTimers()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    markRootIdleCandidate(rootFreshness)
+    requireRootRevalidation(rootFreshness)
+    const activityTracker: ActivityTracker = {
+      ...qualifiedPredicateBaseActivityTracker(),
+      currentTurnTerminalSignalReceived: true,
+      sessionIdle: true,
+      rootFreshness,
+    }
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {status: statusFn}}
+
+    // #when a REST poll corroborates the current generation
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    const observation = await observationPromise
+
+    // #then the run completes once REST corroborates, and the requirement is left clear
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(rootFreshness.restConfirmationRequired).toBe(false)
+  })
+
+  it('complement: the requirement stays set until corroboration actually happens', async () => {
+    // #given the identical post-discontinuity setup, but REST itself is also unavailable -- no
+    // successful `session.status()` response ever arrives to corroborate anything
+    vi.useFakeTimers()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    markRootIdleCandidate(rootFreshness)
+    requireRootRevalidation(rootFreshness)
+    const activityTracker: ActivityTracker = {
+      ...qualifiedPredicateBaseActivityTracker(),
+      currentTurnTerminalSignalReceived: true,
+      sessionIdle: true,
+      rootFreshness,
+    }
+    const statusFn = vi.fn().mockRejectedValue(new Error('REST unavailable'))
+    const mockClient = {session: {status: statusFn}}
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then it times out rather than admitting completion -- the requirement was never cleared
+    expect(observation.settlement.kind).toBe('watchdog')
+    expect(rootFreshness.restConfirmationRequired).toBe(true)
+  })
+})
+
+describe("Finding 3 — the candidate's own revision is re-checked at final admission", () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a candidate observed before a bump is refused when admission happens after it, even when the status() request itself never raced anything', async () => {
+    // #given a stable qualified candidate that reaches two-poll confirmation. Renewed root
+    // activity is injected deterministically into the gap between `detectMessageActivity()`
+    // returning the qualified candidate and the caller capturing `statusRequestRevision` a few
+    // lines later, by intercepting reads of `rootFreshness.revision` and bumping on the first read
+    // whose immediate caller is `pollForSessionCompletionObservation` itself (identified via the
+    // call stack) rather than `detectMessageActivity` or `hasFreshIdleCandidate` -- that is
+    // precisely the `statusRequestRevision = ...` line, so the bump lands strictly after the
+    // candidate already qualified but strictly before that snapshot is taken. `session.status()`
+    // itself is never in flight when the bump happens, and its own request-vs-response revision
+    // comparison (`staleAgainstRenewedActivity`) sees no drift -- only the candidate's own carried
+    // revision (Finding 3) proves this candidate is from the superseded generation.
+    vi.useFakeTimers()
+    const stableInfo = {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_parent'}
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+
+    const messagesFn = vi.fn().mockResolvedValue({data: [{info: stableInfo}]})
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      1_200,
+      activityTracker,
+    )
+
+    // First poll: the message is observed but not yet confirmed. `pollForSessionCompletionObservation`
+    // itself also reads `.revision` once this poll (its own `statusRequestRevision` capture) --
+    // arm the interception only afterward, so it targets the SECOND (confirming) poll's read.
+    await vi.advanceTimersByTimeAsync(500)
+    expect(activityTracker.completedAssistantMessageId).toEqual({messageId: 'msg_new', revision: 0})
+
+    let triggered = false
+    let backing = rootFreshness.revision
+    Object.defineProperty(rootFreshness, 'revision', {
+      configurable: true,
+      enumerable: true,
+      get(): number {
+        if (!triggered) {
+          const callerLine = (new Error('stack-probe').stack ?? '').split('\n')[2] ?? ''
+          if (
+            callerLine.includes('pollForSessionCompletionObservation') &&
+            !callerLine.includes('detectMessageActivity')
+          ) {
+            triggered = true
+            invalidateRootFreshness(rootFreshness)
+          }
+        }
+        return backing
+      },
+      set(value: number) {
+        backing = value
+      },
+    })
+
+    await vi.advanceTimersByTimeAsync(1_500)
+    const observation = await observationPromise
+
+    // #then the stale candidate is not admitted as a completion -- it times out rather than
+    // being silently retried into a later false admission
+    expect(observation.settlement.kind).toBe('watchdog')
+    expect(triggered).toBe(true)
+  })
+
+  it('complement: a candidate with no bump between observation and admission is admitted', async () => {
+    // #given the identical stable qualified candidate, with nothing invalidating freshness at any
+    // point during confirmation or admission
+    vi.useFakeTimers()
+    const stableInfo = {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_parent'}
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+    const messagesFn = vi.fn().mockResolvedValue({data: [{info: stableInfo}]})
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+
+    // #when
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+    const observation = await observationPromise
+
+    // #then completion is admitted exactly as the non-racing case does
+    expect(observation.settlement.kind).toBe('completion-observed')
   })
 })

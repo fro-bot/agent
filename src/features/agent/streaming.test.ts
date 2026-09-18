@@ -23,7 +23,20 @@ import type {Event} from '@opencode-ai/sdk'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {processEventStream, type ActivityTracker, type PermissionAskedRequest} from './streaming.js'
+import {
+  armRootFreshness,
+  clearRootRevalidationRequirement,
+  createRootFreshnessTracker,
+  hasFreshIdleCandidate,
+  invalidateRootFreshness,
+  markRootIdleCandidate,
+  processEventStream,
+  registerPendingRootUserMessage,
+  requireRootRevalidation,
+  resolvePendingRootUserMessage,
+  type ActivityTracker,
+  type PermissionAskedRequest,
+} from './streaming.js'
 
 const consoleMocks = vi.hoisted(() => ({
   outputTextContent: vi.fn(),
@@ -111,6 +124,16 @@ function contextOverflowErrorEvent(sessionID: string): Event {
   return {
     type: 'session.error',
     properties: {sessionID, error: {name: 'ContextOverflowError'}},
+  } as unknown as Event
+}
+
+function retryStatusEvent(sessionID: string): Event {
+  return {
+    type: 'session.status',
+    properties: {
+      sessionID,
+      status: {type: 'retry', action: {reason: 'account_rate_limit', provider: 'anthropic'}, message: 'quota'},
+    },
   } as unknown as Event
 }
 
@@ -485,6 +508,57 @@ describe('processEventStream — structured failure capture on the activity trac
     // #then still no terminal failure was ever observed
     expect(activityTracker.terminalProviderError).toBeUndefined()
   })
+
+  it('a classified root retry status no longer sets terminal lifecycle state, but its failure still merges with full precedence', async () => {
+    // #given an activity tracker and a root session.status retry classified as terminal (quota)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const result = await processEventStream(
+      createMockEventStream([retryStatusEvent(ROOT_SESSION_ID)]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the failure still merges with full precedence -- terminal, structured, retrievable
+    // immediately off the tracker -- exactly as before this change
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+    expect(activityTracker.classificationPath).toBe('structured')
+
+    // #then selecting this error is not proof the turn ended -- that lifecycle flag is reserved
+    // for truly terminal signals (session.idle, a completed assistant message)
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+  })
+
+  it("complement: the root's own retry status behaves exactly as before apart from the lifecycle write", async () => {
+    // #given a root session.status retry followed by the actual terminal signal (session.idle)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const idleEvent: Event = {type: 'session.idle', properties: {sessionID: ROOT_SESSION_ID}} as unknown as Event
+    const result = await processEventStream(
+      createMockEventStream([retryStatusEvent(ROOT_SESSION_ID), idleEvent]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the failure is still observed and returned, and the lifecycle flag is set -- by the
+    // session.idle signal that actually observed quiescence, not by the classification itself
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(activityTracker.sessionIdle).toBe(true)
+  })
 })
 
 describe('processEventStream — ownership check widens descendant events, no-ledger path unchanged', () => {
@@ -809,7 +883,9 @@ describe('processEventStream — ownership check widens descendant events, no-le
 
     // #then the root's own error still ends the turn and still surfaces as llmError, exactly as before ownership widening
     expect(result.llmError?.type).toBe('context_overflow')
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended -- that lifecycle flag is reserved for
+    // truly terminal signals (session.idle, a completed assistant message), which this test never emits.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     // #then the unrelated adopted descendant entry is untouched by the root's own error
     expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'outstanding'}])
   })
@@ -835,7 +911,103 @@ describe('processEventStream — ownership check widens descendant events, no-le
 
     // #then unchanged: the root session's own error still ends the turn and surfaces as llmError
     expect(result.llmError?.type).toBe('context_overflow')
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+  })
+
+  it("session.status: a descendant's retry status does not write root failure state, root llmError, or root lifecycle state", async () => {
+    // #given a ledger that has adopted the child session, an activity tracker, and a retry status on the CHILD
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([retryStatusEvent(CHILD_SESSION_ID)])
+
+    // #when processed with the ledger and tracker supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the descendant's retry status does not reach this run's llmError, root failure
+    // accumulator, or lifecycle state
+    expect(result.llmError).toBeNull()
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.sessionError).toBeNull()
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+
+    // #then it is still observed: the descendant's ledger entry no longer reads outstanding, and
+    // is left unresolved (marked unknown), not settled -- a retry status is not proof the
+    // descendant's own turn concluded either
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'unknown'}])
+  })
+
+  it("complement: the ROOT session's own retry status still ends the turn and still writes root failure state, unchanged", async () => {
+    // #given a ledger (present, but the retry status fires on the ROOT session id, not a descendant) and a tracker
+    const ledger: OwnershipLedger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([retryStatusEvent(ROOT_SESSION_ID)])
+
+    // #when processed with the ledger and tracker supplied
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the root's own retry status still merges into llmError and the tracker's failure state,
+    // exactly as before ownership widening -- only the lifecycle write is gone (see Finding A)
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+
+    // #then the unrelated adopted descendant entry is untouched by the root's own retry status
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'outstanding'}])
+  })
+
+  it('session.status: a run with no ledger is unaffected by the root-scoping change', async () => {
+    // #given no ledger at all, and a retry status on the root session (the only session a no-ledger run knows about)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const eventStream = createMockEventStream([retryStatusEvent(ROOT_SESSION_ID)])
+
+    // #when processed with no ledger
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then unchanged: the root session's own retry status still merges into llmError
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
   })
 
   it('session.idle stays root-scoped: a descendant idle never ends the run', async () => {
@@ -867,5 +1039,172 @@ describe('processEventStream — ownership check widens descendant events, no-le
     // #then the run's own activityTracker never observes idle from the descendant's idle
     expect(activityTracker.sessionIdle).toBe(false)
     expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
+  })
+})
+
+describe('RootFreshnessTracker — Phase A scaffolding transitions (previously untested)', () => {
+  it('starts unarmed, and every mutator is a no-op before arming', () => {
+    // #given a freshly created tracker
+    const tracker = createRootFreshnessTracker()
+    expect(tracker.state).toBe('unarmed')
+
+    // #when invalidation/idle are attempted before arming
+    invalidateRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+
+    // #then nothing changed — state stays unarmed, revision stays 0
+    expect(tracker.state).toBe('unarmed')
+    expect(tracker.revision).toBe(0)
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+  })
+
+  it('arm -> idle-candidate -> fresh; a subsequent invalidation makes it stale at the OLD revision', () => {
+    // #given an armed tracker
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    expect(tracker.state).toBe('awaiting-activity')
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when it goes idle
+    markRootIdleCandidate(tracker)
+
+    // #then it is a fresh idle candidate at the current revision
+    expect(tracker.state).toBe('idle-candidate')
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+
+    // #when renewed activity is observed afterward
+    invalidateRootFreshness(tracker)
+
+    // #then the candidate is no longer fresh — revision advanced past idleCandidateRevision
+    expect(tracker.state).toBe('active')
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+  })
+
+  it('a new root user message sets the pending-parent barrier and blocks freshness until resolved', () => {
+    // #given an armed, idle tracker
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+
+    // #when a new root user message arrives (e.g. an injected background-task completion turn)
+    registerPendingRootUserMessage(tracker, 'msg_injected')
+
+    // #then the barrier blocks freshness even though nothing has gone idle again yet
+    expect(tracker.pendingParentMessageId).toBe('msg_injected')
+    expect(tracker.latestRootUserMessageId).toBe('msg_injected')
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when that message's own idle is observed while the barrier is still set
+    markRootIdleCandidate(tracker)
+
+    // #then still not fresh — the barrier alone blocks admission regardless of idle-candidate state
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when the barrier is resolved by the matching assistant reply
+    resolvePendingRootUserMessage(tracker, 'msg_injected')
+
+    // #then the barrier itself is clear, but the bump that registered this pending message
+    // superseded an existing idle candidate (Finding 1's fix, `invalidateRootFreshness`) -- SSE
+    // carries no sequence number, so the idle evidence for this new generation cannot be trusted
+    // until a REST/status check corroborates it, exactly as for a delayed idle race
+    expect(tracker.pendingParentMessageId).toBeNull()
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when a REST check corroborates the current generation
+    clearRootRevalidationRequirement(tracker)
+
+    // #then freshness is restored
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+  })
+
+  it('registering the same pending message id twice is a no-op — duplicate events do not create a phantom pending turn or re-advance the revision', () => {
+    // #given an armed, idle tracker with a pending parent message already registered
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+    registerPendingRootUserMessage(tracker, 'msg_injected')
+    const revisionAfterFirstRegister = tracker.revision
+
+    // #when the same message id is registered again (e.g. a duplicate/retried SSE event)
+    registerPendingRootUserMessage(tracker, 'msg_injected')
+
+    // #then the revision did not advance again, and the barrier is unchanged
+    expect(tracker.revision).toBe(revisionAfterFirstRegister)
+    expect(tracker.pendingParentMessageId).toBe('msg_injected')
+  })
+
+  it('resolving a barrier with a mismatched id is a no-op', () => {
+    // #given a tracker with a pending parent message
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    registerPendingRootUserMessage(tracker, 'msg_a')
+
+    // #when a DIFFERENT message id is resolved (e.g. a stale/out-of-order reply)
+    resolvePendingRootUserMessage(tracker, 'msg_b')
+
+    // #then the real barrier is untouched
+    expect(tracker.pendingParentMessageId).toBe('msg_a')
+  })
+
+  it('an SSE discontinuity requires REST revalidation before any retained idle evidence can be trusted again', () => {
+    // #given a fresh idle candidate
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+
+    // #when the observation channel breaks
+    requireRootRevalidation(tracker)
+
+    // #then the same idle evidence is no longer trusted, even though nothing else changed
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when a REST check corroborates current state
+    clearRootRevalidationRequirement(tracker)
+
+    // #then freshness is restored
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+  })
+
+  it('two consecutive injected parent-user-message barriers require BOTH to resolve before freshness returns', () => {
+    // #given an armed, idle tracker
+    const tracker = createRootFreshnessTracker()
+    armRootFreshness(tracker)
+    markRootIdleCandidate(tracker)
+
+    // #when a first injected turn arrives and resolves
+    registerPendingRootUserMessage(tracker, 'msg_first')
+    resolvePendingRootUserMessage(tracker, 'msg_first')
+    markRootIdleCandidate(tracker)
+    // The bump that registered 'msg_first' superseded the initial idle candidate, so this
+    // generation's freshness needs REST corroboration (Finding 1) before it is trusted, even
+    // though the barrier itself is already resolved.
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+    clearRootRevalidationRequirement(tracker)
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
+
+    // #when a second injected turn arrives (a second background dispatch completing)
+    registerPendingRootUserMessage(tracker, 'msg_second')
+
+    // #then it blocks freshness again, independently of the first
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+    expect(tracker.pendingParentMessageId).toBe('msg_second')
+
+    // #when only an unrelated id is resolved
+    resolvePendingRootUserMessage(tracker, 'msg_first')
+
+    // #then the second barrier still blocks
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+
+    // #when the actual second barrier resolves
+    resolvePendingRootUserMessage(tracker, 'msg_second')
+    markRootIdleCandidate(tracker)
+
+    // #then the barrier is clear, but this generation (superseding the second idle candidate) also
+    // needs its own REST corroboration before freshness returns
+    expect(hasFreshIdleCandidate(tracker)).toBe(false)
+    clearRootRevalidationRequirement(tracker)
+    expect(hasFreshIdleCandidate(tracker)).toBe(true)
   })
 })
