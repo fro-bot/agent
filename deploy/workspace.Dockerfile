@@ -194,6 +194,12 @@ RUN set -euo pipefail \
 # events (see deploy/README.md).
 ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true
 
+# Enable OpenCode's background-subagent dispatch (task({background: true})) by
+# default: the ownership-ledger, drain, and descendant-event-routing machinery
+# this repo built for it is otherwise unreachable dead code. A deployer can
+# still override this through compose.
+ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
+
 # Base workspace OpenCode config: declare the Systematic plugin and disable
 # autoupdate. The model and provider block are NOT baked — the entrypoint
 # overlays them at runtime from WORKSPACE_OPENCODE_MODEL and

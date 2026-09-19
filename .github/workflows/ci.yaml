@@ -505,7 +505,10 @@ jobs:
           # The image bakes the file-watcher opt-out. Nothing else asserts it, and dropping
           # the ENV costs performance with no other signal, so pin it here.
           docker exec "$cid" sh -c '[ "$OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER" = "true" ]'
-          echo "OK: clone API up on :9100, opencode present, base config (no baked model), watcher disabled, auth fail-soft"
+          # The image bakes the background-subagents opt-in too -- same reasoning as the
+          # watcher assertion above: nothing else asserts it, so pin it here.
+          docker exec "$cid" sh -c '[ "$OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS" = "true" ]'
+          echo "OK: clone API up on :9100, opencode present, base config (no baked model), watcher disabled, background subagents enabled, auth fail-soft"
       - name: Smoke-test auth provisioning (valid blob → auth.json written 0600)
         run: |
           set -e

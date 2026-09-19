@@ -250,6 +250,97 @@ describe('bootstrapOpenCodeServer', () => {
     expect(capturedFilewatcherFlag).toBe('true')
   })
 
+  it('leaves OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS set in the parent process after bootstrap', async () => {
+    // #given the variable is unset, so bootstrap supplies the default
+    delete process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS
+    const logger = createMockLogger()
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then the value persists rather than being reverted, same reasoning as the watcher
+    // flag: any fallback spawn path with no assignment of its own must inherit this one.
+    expect(result.success).toBe(true)
+    expect(process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS).toBe('true')
+  })
+
+  it('sets OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true before spawn when the operator did not set it', async () => {
+    // #given
+    delete process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS
+    const logger = createMockLogger()
+    let capturedBackgroundSubagentsFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedBackgroundSubagentsFlag = process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedBackgroundSubagentsFlag).toBe('true')
+  })
+
+  it('does not override an operator-set OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS value', async () => {
+    // #given
+    process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = 'false'
+    const logger = createMockLogger()
+    let capturedBackgroundSubagentsFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedBackgroundSubagentsFlag = process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedBackgroundSubagentsFlag).toBe('false')
+  })
+
+  it('treats an empty-string OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS as unset and applies the default', async () => {
+    // #given an empty string, matching how GitHub Actions materializes an unset `env:` input
+    process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = ''
+    const logger = createMockLogger()
+    let capturedBackgroundSubagentsFlag: string | undefined
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      capturedBackgroundSubagentsFlag = process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const controller = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(controller.signal, logger, WORKSPACE_PATH)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(capturedBackgroundSubagentsFlag).toBe('true')
+  })
+
   it('fails the bootstrap when the actual server URL differs from the pinned port', async () => {
     // #given
     const logger = createMockLogger()
