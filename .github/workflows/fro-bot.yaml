@@ -277,6 +277,15 @@ jobs:
     # history: the longest genuine run observed is 43 minutes, nearly all are under ten.
     timeout-minutes: 75
     steps:
+      - name: Record job start time
+        id: job-start
+        # First step, before checkout, so "Compute action execution budget" below can measure
+        # everything this job did before the action ran -- the PR-head resolution, checkout,
+        # setup, App token mint, and (daily-schedule only) the #1598 runtime-verification
+        # collector, which makes real network calls across every roster owner and is the one
+        # most likely to run long.
+        run: echo "epoch-ms=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
+
       - name: Resolve same-repo PR-head ref
         id: prehead
         env:
@@ -361,6 +370,37 @@ jobs:
             cp "${RUNNER_TEMP}/runtime-verification.json" .context/dmr-runtime-verification/runtime-verification.json
           fi
 
+      - name: Compute action execution budget
+        id: budget
+        # Derives the action's execution deadline from the job-wide 75-minute cap minus an
+        # explicit 15-minute reserve for the action's own teardown (drain owned background
+        # work, cancel what will not settle, write a job summary, publish a response) --
+        # instead of a fixed 60-minute constant that assumes negligible pre-action time.
+        # Everything above this step (PR-head resolution, checkout, setup, App token mint,
+        # and on the daily schedule the #1598 collector's cross-owner network calls) runs
+        # BEFORE the action's `timeout:` clock starts, so an overrun there must shrink the
+        # execution budget, not eat into the reserve -- otherwise the job cap can still fire
+        # first and kill the run with none of the deadline's drain/cancel/report behavior.
+        # Floored well above zero so a large pre-action overrun degrades the budget instead
+        # of silently reproducing `timeout: '0'` (no action-internal deadline at all -- the
+        # exact failure mode this exists to close). Ceiling stays at the previous fixed
+        # value (60 minutes), sized against real run history: the longest genuine run
+        # observed is 43 minutes, nearly all are under ten, so nominal pre-action time never
+        # truncates real work.
+        run: |
+          set -euo pipefail
+          now_ms=$(date +%s%3N)
+          start_ms="${{ steps.job-start.outputs.epoch-ms }}"
+          elapsed_ms=$(( now_ms - start_ms ))
+          job_cap_ms=$(( 75 * 60 * 1000 ))
+          reserve_ms=$(( 15 * 60 * 1000 ))
+          max_budget_ms=3600000
+          min_budget_ms=300000
+          budget_ms=$(( job_cap_ms - reserve_ms - elapsed_ms ))
+          if [ "${budget_ms}" -gt "${max_budget_ms}" ]; then budget_ms=${max_budget_ms}; fi
+          if [ "${budget_ms}" -lt "${min_budget_ms}" ]; then budget_ms=${min_budget_ms}; fi
+          echo "timeout-ms=${budget_ms}" >> "$GITHUB_OUTPUT"
+
       - name: Run Fro Bot
         uses: ./
         env:
@@ -420,23 +460,23 @@ jobs:
           # GitHub: the narrator edits the release body directly, so suppression is
           # enforced here, not left to prompt compliance.
           response-mode: ${{ (github.event.inputs.correlation-id != '' && 'none') || inputs.response-mode || 'github' }}
-          # Release-notes narration runs get a tight bound so an unroutable model or
-          # provider stall fails fast (the successCmd then soft-warns) instead of
-          # hanging the run. Everything else gets 60 minutes.
+          # Release-notes narration runs get a tight, fixed bound so an unroutable model or
+          # provider stall fails fast (the successCmd then soft-warns) instead of hanging the
+          # run -- unrelated to the job-wide deadline math below and deliberately left as a
+          # literal. Everything else gets the dynamically computed budget from "Compute
+          # action execution budget" above: the job-wide 75-minute cap minus a 15-minute
+          # teardown reserve minus whatever this job already spent before this step, floored
+          # and ceilinged there.
           #
-          # That branch used to be `0` -- no action-internal deadline at all, with no job
-          # cap either, so a stalled run could hold a runner for GitHub's six-hour
-          # default. Harmless while background dispatch was disabled, since drain had
-          # nothing to wait for and returned immediately. It stops being harmless in the
-          # same change that enables background subagents: drain now blocks publication
-          # and persistence until owned work settles or this deadline expires, and a
-          # deadline of zero never expires.
-          #
-          # 60 minutes is sized above the longest genuine run in recent history (43
-          # minutes, a workflow_dispatch; nearly every other run finishes under ten), so
-          # it bounds the hang without truncating real work. It sits 15 minutes under the
-          # job cap so the action, not the runner, is what stops the run.
-          timeout: ${{ github.event.inputs.correlation-id != '' && '600000' || '3600000' }}
+          # This branch used to be a fixed `'3600000'` (60 minutes). Fixed was wrong: it
+          # assumed pre-action time (PR-head resolution, checkout, setup, App token mint, and
+          # on the daily schedule the #1598 collector's cross-owner network calls) was always
+          # negligible. If it ever exceeded 15 minutes, the 75-minute job cap fired before
+          # this deadline did, killing the run with none of the deadline's drain/cancel/report
+          # behavior -- the exact failure this deadline exists to prevent. Deriving the budget
+          # from elapsed job time closes that gap: pre-action overrun shrinks the budget
+          # instead of eating the reserve.
+          timeout: ${{ github.event.inputs.correlation-id != '' && '600000' || steps.budget.outputs.timeout-ms }}
 
       - name: Upload release-notes candidate
         # Only release-notes runs (both release-tag and correlation-id set) produce a

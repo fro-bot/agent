@@ -920,3 +920,114 @@ describe('fro-bot workflow — #1598 runtime-verification collector step', () =>
     expect(collector).toBeLessThan(runFroBot)
   })
 })
+
+// The action's execution deadline used to be a fixed literal ('3600000', 60 minutes) set
+// against a 75-minute job cap -- a fixed 15-minute gap that silently assumed pre-action work
+// (PR-head resolution, checkout, setup, App token mint, and on the daily schedule the #1598
+// collector's cross-owner network calls) was always negligible. If pre-action ever exceeded 15
+// minutes, the job cap fired before the action's own deadline, killing the run with none of the
+// deadline's drain/cancel/report behavior. These tests pin the fix: the budget is now derived
+// from the job-wide cap minus an explicit reserve minus elapsed pre-action time, so overrun
+// shrinks the budget instead of eating the reserve, and prove the relationship holds
+// structurally rather than trusting a hand-picked literal to stay correct.
+function budgetRunScript(): string {
+  const steps = stepsFor(WORKFLOW_PATH, 'fro-bot')
+  const budgetStep = steps.find(step => step.id === 'budget')
+  if (budgetStep === undefined) throw new TypeError('budget step is missing')
+  return String(budgetStep.run)
+}
+
+function extractIntLiteral(script: string, name: string): number {
+  const match = new RegExp(String.raw`${name}=(\d+)\b`).exec(script)
+  if (match?.[1] === undefined) throw new TypeError(`could not find integer literal for ${name}`)
+  return Number.parseInt(match[1], 10)
+}
+
+function extractArithmeticLiteral(script: string, name: string): number {
+  // Matches `name=$(( a * b * c ))`-shaped assignments used for job_cap_ms / reserve_ms.
+  const match = new RegExp(String.raw`${name}=\$\(\(\s*([\d\s*]+?)\s*\)\)`).exec(script)
+  if (match?.[1] === undefined) throw new TypeError(`could not find arithmetic literal for ${name}`)
+  return match[1]
+    .split('*')
+    .map(part => Number.parseInt(part.trim(), 10))
+    .reduce((product, factor) => product * factor, 1)
+}
+
+describe('fro-bot workflow — action execution budget derivation', () => {
+  it('records job start as the very first step, before any pre-action work', () => {
+    // #given
+    const job = loadFroBotJob()
+
+    // #then
+    expect(job.steps[0]?.id).toBe('job-start')
+  })
+
+  it('computes the budget after every pre-action step and before running the action', () => {
+    // #given
+    const job = loadFroBotJob()
+    const jobStart = stepIndex(job, step => step.id === 'job-start')
+    const prehead = stepIndex(job, step => step.id === 'prehead')
+    const mintAppToken = stepIndex(job, step => step.id === 'mint-app-token')
+    const collector = stepIndex(job, step => step.name === 'Gather #1598 runtime-verification evidence')
+    const budget = stepIndex(job, step => step.id === 'budget')
+    const runFroBot = stepIndex(job, step => step.uses === './')
+
+    // #then every pre-action step this budget accounts for -- including the daily-only
+    // collector, the one most likely to run long -- happens before the budget is computed,
+    // and the budget is computed immediately before the action runs
+    expect(jobStart).toBeLessThan(prehead)
+    expect(prehead).toBeLessThan(mintAppToken)
+    expect(mintAppToken).toBeLessThan(collector)
+    expect(collector).toBeLessThan(budget)
+    expect(budget).toBeLessThan(runFroBot)
+  })
+
+  it("derives job_cap_ms from the job's own timeout-minutes, not a re-typed literal", () => {
+    // #given the job's actual timeout-minutes and the budget step's job_cap_ms literal
+    const job = rawJob(WORKFLOW_PATH, 'fro-bot')
+    const timeoutMinutes = job['timeout-minutes']
+    const script = budgetRunScript()
+    const jobCapMs = extractArithmeticLiteral(script, 'job_cap_ms')
+
+    // #then they must agree, or a future edit to one silently invalidates the other
+    expect(jobCapMs).toBe(Number(timeoutMinutes) * 60 * 1000)
+  })
+
+  it('proves the effective action deadline is strictly less than the job cap, by the reserve', () => {
+    // #given the budget step's own constants
+    const script = budgetRunScript()
+    const jobCapMs = extractArithmeticLiteral(script, 'job_cap_ms')
+    const reserveMs = extractArithmeticLiteral(script, 'reserve_ms')
+    const maxBudgetMs = extractIntLiteral(script, 'max_budget_ms')
+    const minBudgetMs = extractIntLiteral(script, 'min_budget_ms')
+
+    // #then a positive reserve exists, the ceiling never exceeds job cap minus that reserve
+    // (so even at zero elapsed pre-action time the action's own deadline still expires with
+    // the full reserve intact), and the floor never disables the deadline (0) or exceeds the
+    // ceiling
+    expect(reserveMs).toBeGreaterThan(0)
+    expect(maxBudgetMs).toBeLessThanOrEqual(jobCapMs - reserveMs)
+    expect(maxBudgetMs + reserveMs).toBeLessThan(jobCapMs + reserveMs) // sanity: no double-count
+    expect(minBudgetMs).toBeGreaterThan(0)
+    expect(minBudgetMs).toBeLessThanOrEqual(maxBudgetMs)
+
+    // #then the worst case (pre-action overrun floors the budget) still leaves the job cap
+    // strictly later than the action's own deadline expiry, i.e. the action always loses its
+    // race to nothing before the runner would kill the job outright
+    expect(minBudgetMs).toBeLessThan(jobCapMs)
+  })
+
+  it('wires the computed budget into the action timeout, preserving the narration literal', () => {
+    // #given the Run Fro Bot step's timeout input
+    const steps = stepsFor(WORKFLOW_PATH, 'fro-bot')
+    const runFroBot = steps.find(step => step.uses === './')
+    if (runFroBot === undefined) throw new TypeError('Run Fro Bot step is missing')
+    const timeoutExpression = expressionFrom((runFroBot.with as Record<string, unknown>).timeout, 'action timeout')
+
+    // #then the release-notes narration branch keeps its own fixed, tighter bound...
+    expect(timeoutExpression).toContain("'600000'")
+    // #then ...and every other path uses the dynamically computed budget, not a re-typed literal
+    expect(timeoutExpression).toContain('steps.budget.outputs.timeout-ms')
+    expect(timeoutExpression).not.toContain("'3600000'")
+  })
+})
