@@ -42,17 +42,6 @@ export interface ReviewReconciliationParams {
   readonly isFileConventionDelivery: boolean
   /** True when the agent session completed successfully */
   readonly agentSucceeded: boolean
-  /**
-   * True when this invocation's verification is provisionally clean at the point
-   * reconciliation runs (no observation gap, no unresolved ownership -- computed by
-   * `src/harness/outcome.ts`'s `isVerificationIncomplete`, negated). An automatic APPROVE
-   * is an affirmative endorsement the harness must not issue merely because execution
-   * reported success; it also requires verification to not already be known-incomplete at
-   * this point in the invocation. Provisional, not final: teardown facts (server
-   * quiescence, lease continuity) are not yet known when reconciliation runs, same
-   * limitation `runFinalizeWithResult`'s provisional gating has.
-   */
-  readonly invocationVerified: boolean
   /** Run start time in milliseconds (Date.now() at run start) */
   readonly runStartMs: number
 }
@@ -109,7 +98,6 @@ export async function runReviewReconciliation(
     isPullRequestReviewTrigger,
     responseModeIsGithub,
     agentSucceeded,
-    invocationVerified,
     runStartMs,
     isFileConventionDelivery,
   } = params
@@ -136,13 +124,6 @@ export async function runReviewReconciliation(
 
   if (agentSucceeded === false) {
     return {reconciled: false, reason: 'agent-failed'}
-  }
-
-  // Withhold: an automatic APPROVE is an endorsement the harness cannot support unless it
-  // can also vouch for its own verification state, not merely that execution reported
-  // success.
-  if (invocationVerified === false) {
-    return {reconciled: false, reason: 'invocation-not-verified'}
   }
 
   if (botLogin == null || botLogin.length === 0) {

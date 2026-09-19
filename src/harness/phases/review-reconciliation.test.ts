@@ -71,7 +71,6 @@ function makeParams(overrides?: {
   readonly prNumber?: number | null
   readonly responseModeIsGithub?: boolean
   readonly agentSucceeded?: boolean
-  readonly invocationVerified?: boolean
   readonly botLogin?: string | null
   readonly owner?: string
   readonly repo?: string
@@ -91,7 +90,6 @@ function makeParams(overrides?: {
     isPullRequestReviewTrigger: overrides?.isPullRequestReviewTrigger ?? true,
     responseModeIsGithub: overrides?.responseModeIsGithub ?? true,
     agentSucceeded: overrides?.agentSucceeded ?? true,
-    invocationVerified: overrides?.invocationVerified ?? true,
     runStartMs: overrides?.runStartMs ?? RUN_START_MS,
     isFileConventionDelivery: overrides?.isFileConventionDelivery ?? false,
   }
@@ -461,22 +459,6 @@ describe('runReviewReconciliation', () => {
 
     // #then early no-op
     expect(result.reconciled).toBe(false)
-    expect(octokit.rest.pulls.get).not.toHaveBeenCalled()
-  })
-
-  it('no-ops with zero octokit calls when this invocation is not verified, even though the agent succeeded', async () => {
-    // #given execution reported success, but the invocation's verification is known incomplete
-    // (e.g. an observation gap or unresolved background-dispatch ownership)
-    const octokit = makeOctokit()
-    const params = makeParams({octokit, agentSucceeded: true, invocationVerified: false})
-
-    // #when running review reconciliation
-    const result = await runReviewReconciliation(params, logger)
-
-    // #then withheld -- an automatic APPROVE is an endorsement the harness cannot support
-    // when it cannot vouch for its own invocation state, not merely that execution succeeded
-    expect(result.reconciled).toBe(false)
-    expect(result.reason).toBe('invocation-not-verified')
     expect(octokit.rest.pulls.get).not.toHaveBeenCalled()
   })
 

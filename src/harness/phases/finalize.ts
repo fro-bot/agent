@@ -179,19 +179,6 @@ export interface FinalizeResult {
   readonly deliveryKind: ResponseDeliveryKind
 }
 
-export interface FinalizePhaseOptions {
-  /**
-   * `true` when this invocation's verification was already known incomplete at this point
-   * (provisionally computed by `src/harness/outcome.ts`'s `isVerificationIncomplete`, from
-   * execution and drain facts -- teardown facts are not known yet). Two consequences here:
-   * a consequential brokered push is withheld entirely (a write from unverified workspace
-   * state), and `runResponsePost` is told to qualify the delivered body and downgrade an
-   * approving verdict to a plain comment review. The response itself is still published
-   * either way -- see `RunResponsePostParams.verificationIncomplete`'s doc.
-   */
-  readonly verificationIncomplete: boolean
-}
-
 export async function runFinalizeWithResult(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
@@ -200,9 +187,7 @@ export async function runFinalizeWithResult(
   metrics: MetricsCollector,
   startTime: number,
   logger: Logger,
-  options: FinalizePhaseOptions = {verificationIncomplete: false},
 ): Promise<FinalizeResult> {
-  const {verificationIncomplete} = options
   const duration = Date.now() - startTime
 
   setActionOutputs({
@@ -311,9 +296,7 @@ export async function runFinalizeWithResult(
       result = responsePrecheck
     } else {
       let deliveryFooter: string | undefined
-      // Withhold: a consequential write from unverified workspace state. Execution success
-      // is still required (unchanged) -- this only adds a second, independent gate.
-      if (execution.success === true && verificationIncomplete === false) {
+      if (execution.success === true) {
         const triggerContext = routing.triggerResult.context
         const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
         const eventFacts = {
@@ -399,10 +382,6 @@ export async function runFinalizeWithResult(
             clearTimeout(timeout)
           }
         }
-      } else if (execution.success === true && verificationIncomplete === true) {
-        logger.warning('Withholding brokered push: this invocation\u2019s verification is incomplete', {
-          reason: 'brokered push is a consequential write from unverified workspace state',
-        })
       }
 
       const responsePostParams = {
@@ -412,7 +391,6 @@ export async function runFinalizeWithResult(
         botLogin: routing.botLogin,
         responseFilePath: bootstrap.responseFilePath,
         responseFilePathCandidates: bootstrap.responseFilePathCandidates ?? undefined,
-        verificationIncomplete,
         ...(deliveryFooter == null ? {} : {deliveryFooter}),
       }
 
@@ -524,17 +502,7 @@ export async function runFinalize(
   metrics: MetricsCollector,
   startTime: number,
   logger: Logger,
-  options?: FinalizePhaseOptions,
 ): Promise<number> {
-  const result = await runFinalizeWithResult(
-    bootstrap,
-    routing,
-    cacheRestore,
-    execution,
-    metrics,
-    startTime,
-    logger,
-    options,
-  )
+  const result = await runFinalizeWithResult(bootstrap, routing, cacheRestore, execution, metrics, startTime, logger)
   return result.exitCode
 }

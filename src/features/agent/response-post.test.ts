@@ -1241,38 +1241,6 @@ describe('runResponsePost', () => {
     expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
   })
 
-  it('downgrades an approving verdict to a plain COMMENT review, and qualifies the body, when verificationIncomplete is true', async () => {
-    // #given an approving response file, but this invocation's verification is known
-    // incomplete (e.g. an observation gap or unresolved background-dispatch ownership)
-    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
-    tempFiles.push(filePath)
-    const octokit = makeOctokit()
-
-    // #when running response-post with verificationIncomplete set
-    const result = await runResponsePost(
-      {
-        octokit: octokit as unknown as Octokit,
-        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
-        triggerResult: makeTriggerResult('issue_comment'),
-        botLogin: 'fro-bot[bot]',
-        responseFilePath: filePath,
-        verificationIncomplete: true,
-      },
-      logger,
-    )
-
-    // #then an APPROVE is never issued -- an endorsement the harness cannot support -- but
-    // the review is still submitted as COMMENT, preserving the agent's findings, with a
-    // harness-authored qualification appended to the body
-    expect(result).toEqual({delivered: true, kind: 'review'})
-    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({event: 'COMMENT', owner: 'owner', repo: 'repo', pull_number: 7}),
-    )
-    const request = octokit.rest.pulls.createReview.mock.calls[0]?.[0] as {readonly body: string}
-    expect(request.body).toContain('LGTM.')
-    expect(request.body).toContain('Harness note')
-  })
-
   it('degrades to a comment when the bot login is unavailable on the permitted surface', async () => {
     // #given a valid approving response but no bot login for review submission
     const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')

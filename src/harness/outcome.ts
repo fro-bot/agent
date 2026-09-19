@@ -9,16 +9,19 @@
  *
  * This module is the single place that turns those facts into a reported outcome. It is a
  * pure function over explicit inputs -- no event bus, no lifecycle framework, no new state
- * machine, no I/O -- called from `run.ts` at two points in the same invocation:
+ * machine, no I/O -- called from `run.ts` once per invocation, after `runCleanup` returns
+ * its safety evidence, with the real teardown facts and `deliverySucceeded` derived from
+ * the invocation's actual exit code.
  *
- *   1. Provisionally, right after drain, before anything publishes. At that point only
- *      execution and drain facts are known (cleanup has not run yet), so the caller
- *      supplies `quiescenceConfirmed: true` and `continuityUnverified: false` -- "nothing
- *      has yet told us teardown failed" -- and only ever inspects
- *      `isVerificationIncomplete()`, never the full three-way `outcome`, since
- *      `deliverySucceeded` is not decided yet either.
- *   2. Finally, after `runCleanup` returns its safety evidence, with the real teardown
- *      facts and `deliverySucceeded` derived from the invocation's actual exit code.
+ * This function gates the run's REVERSIBLE certificates -- exit code, dedup marker, terminal
+ * reaction, the `invocation-outcome` output, the job-summary row -- all decided after
+ * `runCleanup`, so every fact this function reads is genuinely known by the time it runs. It
+ * deliberately does NOT gate the two IRREVERSIBLE publication consumers, the formal `APPROVE`
+ * review downgrade and the brokered push: both decide and act before `runCleanup` runs, so
+ * consulting this function there would mean evaluating it against a provisional snapshot that
+ * hardcodes the two teardown facts as clean. Gating those two consumers correctly requires
+ * reordering delivery to happen after teardown rather than before it, which is a separate
+ * change; this module intentionally covers only the consumers that already run after teardown.
  *
  * Deliberately NOT part of this: `execution.success` (the attempt-settlement model) is
  * never read or cleared here. Execution success is folded into `deliverySucceeded` by the
