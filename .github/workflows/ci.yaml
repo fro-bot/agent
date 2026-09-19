@@ -222,6 +222,19 @@ jobs:
           model: ${{ vars.FRO_BOT_MODEL }}
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           prompt: ${{ env.PROMPT }}
+          # 20 minutes, against this job's 30-minute cap. The action's own default is
+          # also 30 minutes, which means the job clock -- running since checkout, well
+          # before this step -- always expires first. The action's deadline was therefore
+          # unreachable: a stalled run died as a cancelled job with no review, no job
+          # summary, and no structured outcome, because every path that reports those
+          # lives after the deadline it never hit. Verified on run 35414403157, killed at
+          # 30m05s with its last log line 24 minutes earlier.
+          #
+          # Raising the job cap instead would just move the inversion. The action needs to
+          # lose its race to nothing, so it can drain owned background work, cancel what
+          # will not settle, and publish what it found. The ten-minute gap covers setup
+          # before this step plus teardown after it.
+          timeout: '1200000'
 
       - if: always()
         name: Introspect main action execution
