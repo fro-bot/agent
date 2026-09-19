@@ -8925,7 +8925,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const pendingMessage = makeMessage()
       const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue})
       const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
-      ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValue(pendingTask)
+      ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
       const deps = makeDeps({concurrency: sharedConcurrency, queue})
       const message = makeMessage()
@@ -8935,11 +8935,13 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
       await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 1_000)
 
-      // #then — the queued task started on the freed slot; no bare release was needed
-      // because ownership transferred directly (same atomic hand-off the ordinary path uses).
+      // #then — the queued task started on the freed slot, taking ownership directly via the
+      // same atomic hand-off the ordinary path uses, so the quarantined run never released
+      // on its own. The single release belongs to the handed-off run: when IT finishes and
+      // its own queue drain finds nothing waiting, it gives the slot back.
       expect(mockRunOpenCodeCore).toHaveBeenCalledTimes(2)
       const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
-      expect(releaseFn).not.toHaveBeenCalled()
+      expect(releaseFn).toHaveBeenCalledTimes(1)
     })
 
     it('after the quarantine FAILED transition succeeds, no further conditional write (transitionRun or releaseLock) occurs before the hold window elapses', async () => {
