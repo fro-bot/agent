@@ -69,6 +69,22 @@ export interface LeaseController {
    */
   readonly continuityUnverified?: () => boolean
   /**
+   * Waits for any renewal tick that is currently in flight to settle -- WITHOUT stopping the
+   * timer, unlike `stop()`. A caller that is about to make a persistence decision based on
+   * `continuityUnverified()`/`hasFailed()` right now, but must keep renewal running through
+   * the save that follows, calls this first so that reading is authoritative for the tick that
+   * was in flight at decision time -- otherwise a tick that resolves unverified moments after
+   * the gate already read clean would leave the save proceeding uncovered (see `cleanup.ts`'s
+   * persistence safety gate). Bounded by the in-flight tick's own `RENEWAL_TIMEOUT_MS` (the
+   * tick's promise always settles, never rejects, once that timeout elapses) -- no extra grace
+   * period of its own. A no-op when nothing is in flight.
+   *
+   * Optional for the same reason `continuityUnverified` is optional: existing hand-built
+   * `LeaseController` test doubles that predate this accessor keep compiling without it. The
+   * real controller returned by `createLeaseController` below always implements it.
+   */
+  readonly settle?: () => Promise<void>
+  /**
    * The most recently confirmed lock ETag (the initial acquisition ETag if no renewal has
    * succeeded yet). A caller releasing the lock after renewal has run must use this, not
    * the original acquisition ETag -- the lock record's ETag changes on every successful
@@ -195,6 +211,15 @@ function createLeaseController(
     hasFailed: () => failed,
     continuityUnverified: () => continuityUnverified,
     currentEtag: () => currentEtag,
+    settle: async (): Promise<void> => {
+      // Unlike `stop()`, this never clears `intervalHandle` -- renewal keeps ticking on its
+      // normal schedule after this resolves. `pending` already settles within its own
+      // `RENEWAL_TIMEOUT_MS` (via `withTimeout` in `tick()`'s `.then`/`.catch`/`.finally`
+      // chain) and never rejects, so there is nothing further to bound here.
+      const pending = inFlight
+      if (pending == null) return
+      await pending
+    },
     stop: async (): Promise<void> => {
       clearInterval(intervalHandle)
       const pending = inFlight

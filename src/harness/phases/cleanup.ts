@@ -350,6 +350,16 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     //      when a lock was actually held -- a lock-free run (S3 disabled, or acquisition
     //      failed/held-by-other already short-circuited) never held a lease to lose, so it
     //      must persist normally (see origin: R22a).
+    // Settle any renewal tick that is currently in flight BEFORE reading continuity below --
+    // WITHOUT stopping renewal (that stays active through the save this gate is about to
+    // allow). Without this, a tick in flight at gate time has not failed yet, so the gate
+    // below reads clean and the save proceeds, and only then does the tick resolve unverified
+    // -- a real race, since renewal ticks on a 30s interval and this gate runs far more often
+    // than that. `settle()` makes the reading final for the tick that was in flight at
+    // decision time, while leaving the timer running for the persistence step itself. Optional
+    // chained for the same legacy-test-double reason as `continuityUnverified` below.
+    await leaseRenewal?.settle?.()
+
     const ownershipSafe = ownershipLedger === undefined || ownershipLedger.isPersistenceSafe()
     const continuityUnverifiedNow =
       leaseRenewal != null && (leaseRenewal.continuityUnverified?.() ?? leaseRenewal.hasFailed())

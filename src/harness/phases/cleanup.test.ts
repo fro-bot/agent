@@ -739,6 +739,116 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     expect(lease.stop).toHaveBeenCalledTimes(1)
   })
 
+  it('declines persistence when a renewal tick in flight at gate time resolves unverified (the race the fix closes)', async () => {
+    // #given a lease whose renewal health looks clean right now, but has a tick in flight at
+    // gate time -- settle() simulates that tick resolving unverified while the gate awaits it,
+    // exactly the race described in acquire-lock.ts's `LeaseController.settle` doc: without
+    // settling first, the gate would read the clean pre-tick state and let the save proceed
+    const {saveCache} = await import('../../services/cache/index.js')
+    let unverified = false
+    const lease = createLeaseController({
+      continuityUnverified: () => unverified,
+      settle: vi.fn().mockImplementation(async () => {
+        unverified = true
+      }),
+    })
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: lease,
+      }),
+    )
+
+    // #then settle() was awaited before the decision, and the now-latched continuity failure
+    // declines the save -- the race is closed, not merely narrowed
+    expect(lease.settle).toHaveBeenCalledTimes(1)
+    expect(saveCache).not.toHaveBeenCalled()
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+  })
+
+  it('complement: a renewal tick in flight at gate time that resolves cleanly still persists', async () => {
+    // #given the same in-flight-at-gate-time shape as above, but the tick settle() awaits
+    // resolves cleanly -- without this complement, a fix that simply always declines after
+    // settling would pass the race test above for the wrong reason
+    const {saveCache} = await import('../../services/cache/index.js')
+    const unverified = false
+    const lease = createLeaseController({
+      continuityUnverified: () => unverified,
+      settle: vi.fn().mockImplementation(async () => {
+        // tick resolves cleanly -- continuity stays verified
+      }),
+    })
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: lease,
+      }),
+    )
+
+    // #then settle() was awaited, and the clean reading lets persistence proceed normally
+    expect(lease.settle).toHaveBeenCalledTimes(1)
+    expect(saveCache).toHaveBeenCalledTimes(1)
+  })
+
+  it('persists normally when the lease has no renewal trouble at all (no in-flight tick, nothing latched)', async () => {
+    // #given a fully healthy lease -- settle() is a no-op no-in-flight-tick case
+    const {saveCache} = await import('../../services/cache/index.js')
+    const lease = createLeaseController({
+      continuityUnverified: () => false,
+      settle: vi.fn().mockResolvedValue(undefined),
+    })
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: lease,
+      }),
+    )
+
+    // #then persistence proceeds as normal
+    expect(lease.settle).toHaveBeenCalledTimes(1)
+    expect(saveCache).toHaveBeenCalledTimes(1)
+  })
+
+  it('still declines when continuity was already latched before the gate, and still works for the legacy hasFailed()-only test double with no settle()', async () => {
+    // #given a legacy hand-built LeaseController double that predates continuityUnverified()
+    // and settle() -- neither is provided, only the required hasFailed()
+    const {saveCache} = await import('../../services/cache/index.js')
+    const legacyLease: LeaseController = {
+      hasFailed: () => true,
+      currentEtag: () => '"etag-initial"',
+      stop: vi.fn().mockResolvedValue(undefined),
+    }
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs -- the optional-chained `leaseRenewal?.settle?.()` must not throw for
+    // a double that has no settle() at all
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: legacyLease,
+      }),
+    )
+
+    // #then the fallback to hasFailed() still declines, exactly as before this change
+    expect(saveCache).not.toHaveBeenCalled()
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+  })
+
   it('persists normally when this run holds no lock (leaseRenewal is null) -- never fails for want of a lease it never held', async () => {
     // #given S3 disabled or acquisition failed: no LeaseController at all
     const {saveCache} = await import('../../services/cache/index.js')
