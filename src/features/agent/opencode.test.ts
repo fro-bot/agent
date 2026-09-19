@@ -406,6 +406,7 @@ describe('executeOpenCode', () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
+    vi.unstubAllEnvs()
   })
 
   it('uses createOpencode SDK function', async () => {
@@ -1461,8 +1462,11 @@ describe('executeOpenCode', () => {
     )
   })
 
-  it('materializes reference files into the log directory and merges file parts', async () => {
-    // #given
+  it('materializes reference files into the log directory when RUNNER_TEMP is unset (fail-safe fallback)', async () => {
+    // #given RUNNER_TEMP is explicitly unset -- pins the fallback path deliberately rather than
+    // relying on whatever the ambient test environment happens to have (a real GitHub Actions
+    // runner always sets RUNNER_TEMP, so this must not depend on that being absent by accident)
+    vi.stubEnv('RUNNER_TEMP', undefined)
     const mockClient = createMockClient({
       promptResponse: {parts: [{type: 'text', text: 'Response'}]},
     })
@@ -1502,6 +1506,41 @@ describe('executeOpenCode', () => {
       imageFilePart,
       {type: 'file', mime: 'text/plain', url: 'file:///tmp/opencode/log/pr-context.txt', filename: 'pr-context.txt'},
     ])
+  })
+
+  it('materializes reference files into a dedicated run-scoped attachment directory under RUNNER_TEMP, not the log directory, when RUNNER_TEMP is set', async () => {
+    // #given RUNNER_TEMP is set (the real-CI case) -- reference files must NOT land in the log
+    // directory here, since that directory is not granted `external_directory` access (it holds
+    // more than just attachments; see `attachment-dir.ts`)
+    vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+    vi.stubEnv('GITHUB_RUN_ID', '4242')
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '3')
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+    vi.spyOn(envUtils, 'getOpenCodeLogPath').mockReturnValue('/tmp/opencode/log')
+    const {buildAgentPrompt} = await import('./prompt.js')
+    vi.mocked(buildAgentPrompt).mockReturnValue({
+      text: 'Built prompt with sessionId',
+      referenceFiles: [{filename: 'pr-context.txt', content: 'context'}],
+    })
+    const {materializeReferenceFiles} = await import('./reference-files.js')
+    vi.mocked(materializeReferenceFiles).mockResolvedValue([])
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then the attachment directory is under RUNNER_TEMP, run-scoped, and distinct from the log
+    // directory -- and is created before use
+    const expectedAttachmentDir = '/home/runner/work/_temp/fro-bot-attachments/4242-3'
+    expect(fs.mkdir).toHaveBeenCalledWith(expectedAttachmentDir, {recursive: true})
+    expect(materializeReferenceFiles).toHaveBeenCalledWith(
+      [{filename: 'pr-context.txt', content: 'context'}],
+      expectedAttachmentDir,
+      mockLogger,
+    )
   })
 
   it('does not write prompt artifact when OPENCODE_PROMPT_ARTIFACT is disabled', async () => {
@@ -3452,8 +3491,9 @@ describe('processEventStream', () => {
     expect(responder).not.toHaveBeenCalledWith(expect.objectContaining({requestID: 'envelope-id'}))
   })
 
-  it('ignores permission asks for other sessions', async () => {
-    // #given a permission ask for a different session
+  it('answers a permission ask from another session — ownership is not required for permission.asked (foreground subagents are never adopted, so gating on ownership hung every dispatched review)', async () => {
+    // #given a permission ask for a session that is neither the root nor ledger-tracked (e.g. a
+    // foreground subagent's own session)
     const responder = vi.fn().mockResolvedValue(undefined)
     const eventStream = createMockEventStream([
       {
@@ -3469,7 +3509,7 @@ describe('processEventStream', () => {
       } as unknown as Event,
     ])
 
-    // #when the permission ask is processed
+    // #when the permission ask is processed with no ledger at all
     await processEventStream(
       eventStream.stream,
       'ses_123',
@@ -3480,8 +3520,13 @@ describe('processEventStream', () => {
       responder,
     )
 
-    // #then the other session's ask is ignored
-    expect(responder).not.toHaveBeenCalled()
+    // #then the ask is answered anyway, targeting its own session id
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: 'ses_other',
+      permission: 'read',
+      patterns: ['*.env'],
+    })
   })
 
   it('catches responder failures, logs a warning, and continues stream processing', async () => {

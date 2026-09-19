@@ -7,10 +7,23 @@ import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import {createLLMFetchError, isLlmFetchError, reassertSessionTitle, withScrubbedEnv} from '@fro-bot/runtime'
+import process from 'node:process'
+import {
+  buildAttachmentDir,
+  createLLMFetchError,
+  isLlmFetchError,
+  reassertSessionTitle,
+  withScrubbedEnv,
+} from '@fro-bot/runtime'
 import {createOpencode} from '@opencode-ai/sdk'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
-import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../shared/env.js'
+import {
+  getGitHubRunAttempt,
+  getGitHubRunId,
+  getGitHubWorkspace,
+  getOpenCodeLogPath,
+  isOpenCodePromptArtifactEnabled,
+} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
@@ -185,8 +198,29 @@ export async function executeOpenCode(
       }
     }
 
+    // Reference files (PR description, prior review bodies) are materialized into a
+    // DEDICATED run-scoped directory under RUNNER_TEMP, not the OpenCode log directory --
+    // see `buildAttachmentDir`'s doc comment for why the log directory cannot be granted
+    // `external_directory` access. `scopeAttachmentDirectoryPermission` in
+    // `src/services/setup/ci-config.ts` grants exactly this directory. Fail-safe: when
+    // RUNNER_TEMP is unset (e.g. local/non-Actions runs), fall back to the log directory --
+    // matching `scopeExternalDirectoryPermission`'s own RUNNER_TEMP-unset fail-safe, which
+    // in that case grants nothing new, so this fallback location gets the same (unscoped)
+    // treatment reference files always got before this fix.
+    const runnerTemp = process.env.RUNNER_TEMP
+    const attachmentDir =
+      runnerTemp != null && runnerTemp.trim().length > 0
+        ? buildAttachmentDir({
+            runnerTemp: runnerTemp.trim(),
+            runId: getGitHubRunId(),
+            runAttempt: getGitHubRunAttempt(),
+          })
+        : logPath
+    if (attachmentDir !== logPath) {
+      await deadline.run(async () => fs.mkdir(attachmentDir, {recursive: true}), 'attachment directory creation')
+    }
     const referenceFileParts = await deadline.run(
-      async () => materializeReferenceFiles(referenceFiles, logPath, logger),
+      async () => materializeReferenceFiles(referenceFiles, attachmentDir, logger),
       'reference file materialization',
     )
     const allFileParts = [...(promptOptions.fileParts ?? []), ...referenceFileParts]
