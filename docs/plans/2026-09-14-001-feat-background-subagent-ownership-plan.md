@@ -56,7 +56,7 @@ One split runs through several rows and is worth reading first, because the requ
 | R13 | cut | See Scope Boundaries. |
 | R14 | cut | See Scope Boundaries. |
 | R15 | cut | See Scope Boundaries; nothing replaces the dispatch-refusal safety clause — stream shutdown after the abort signal is not a dispatch refusal, so a dispatch during finalization is unlikely but not structurally prevented. |
-| R16 | partial | Holds on the file-convention path: drain precedes finalization, pruning, shutdown, persistence, and lock release. Not on `model-gh` (`schedule`, `workflow_dispatch`), where the model posts its own response with `gh` during Execute — `runDrain()` only starts after `runExecute()` returns, so that response publishes before drain. |
+| R16 | partial | Holds on the file-convention path: drain precedes finalization, pruning, shutdown, persistence, and lock release. Not on the `model-gh` path (see the delivery-path split above), where the model posts its own response with `gh` during Execute — `runDrain()` only starts after `runExecute()` returns, so that response publishes before drain. |
 | R16a | partial | The gate exists at each named path, but no test isolates it as load-bearing: the completed-assistant test is independently blocked by busy status until after the ledger settles, and the racing-fixture test is rejected for a missing finish reason before the ledger check is reached. |
 | R17 | partial | One fixed execution deadline is never extended, but execution and drain do not share it — drain receives a derived remaining budget after execution returns. |
 | R18 | partial | Stop-admission, cancellation, and a separate teardown signal ship; no drain-path approval settlement exists, and expiry is not propagated into the invocation result. |
