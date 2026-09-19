@@ -269,6 +269,13 @@ jobs:
       )
     name: Fro Bot
     runs-on: ubuntu-latest
+    # Backstop only: the action's own `timeout:` below is the deadline that matters,
+    # because it is the one that can still drain owned background work, cancel what
+    # will not settle, write a job summary, and publish a response. This cap must stay
+    # comfortably above it so the action always expires first -- when the job cap wins
+    # instead, the run is killed with none of that reported. Sized against real run
+    # history: the longest genuine run observed is 43 minutes, nearly all are under ten.
+    timeout-minutes: 75
     steps:
       - name: Resolve same-repo PR-head ref
         id: prehead
@@ -413,10 +420,23 @@ jobs:
           # GitHub: the narrator edits the release body directly, so suppression is
           # enforced here, not left to prompt compliance.
           response-mode: ${{ (github.event.inputs.correlation-id != '' && 'none') || inputs.response-mode || 'github' }}
-          # Release-notes narration runs are bounded so an unroutable model or
+          # Release-notes narration runs get a tight bound so an unroutable model or
           # provider stall fails fast (the successCmd then soft-warns) instead of
-          # hanging the run; all other runs remain unbounded.
-          timeout: ${{ github.event.inputs.correlation-id != '' && '600000' || '0' }}
+          # hanging the run. Everything else gets 60 minutes.
+          #
+          # That branch used to be `0` -- no action-internal deadline at all, with no job
+          # cap either, so a stalled run could hold a runner for GitHub's six-hour
+          # default. Harmless while background dispatch was disabled, since drain had
+          # nothing to wait for and returned immediately. It stops being harmless in the
+          # same change that enables background subagents: drain now blocks publication
+          # and persistence until owned work settles or this deadline expires, and a
+          # deadline of zero never expires.
+          #
+          # 60 minutes is sized above the longest genuine run in recent history (43
+          # minutes, a workflow_dispatch; nearly every other run finishes under ten), so
+          # it bounds the hang without truncating real work. It sits 15 minutes under the
+          # job cap so the action, not the runner, is what stops the run.
+          timeout: ${{ github.event.inputs.correlation-id != '' && '600000' || '3600000' }}
 
       - name: Upload release-notes candidate
         # Only release-notes runs (both release-tag and correlation-id set) produce a
