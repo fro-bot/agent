@@ -18,10 +18,15 @@
  * `runCleanup`, so every fact this function reads is genuinely known by the time it runs. It
  * deliberately does NOT gate the two IRREVERSIBLE publication consumers, the formal `APPROVE`
  * review downgrade and the brokered push: both decide and act before `runCleanup` runs, so
- * consulting this function there would mean evaluating it against a provisional snapshot that
- * hardcodes the two teardown facts as clean. Gating those two consumers correctly requires
- * reordering delivery to happen after teardown rather than before it, which is a separate
- * change; this module intentionally covers only the consumers that already run after teardown.
+ * consulting this function there would mean evaluating it against a snapshot that hardcodes
+ * the two teardown facts as clean -- exactly the mistake af0b155d0 made. Those two consumers
+ * are instead gated separately, in `run.ts`, by a narrower boolean (`knownExecutionVeto`)
+ * derived from only the two facts that genuinely are known before publication
+ * (`observationGap` and `ownershipUnresolved`); it never reads the teardown facts and never
+ * feeds into, or is fed by, this module. A full reorder of delivery to happen after teardown
+ * -- which would let this function gate all four consumers uniformly -- was designed and
+ * deliberately deferred; this module and `knownExecutionVeto` are the two halves of the
+ * interim answer.
  *
  * Deliberately NOT part of this: `execution.success` (the attempt-settlement model) is
  * never read or cleared here. Execution success is folded into `deliverySucceeded` by the
@@ -67,15 +72,16 @@ export interface InvocationVerificationFacts {
   readonly ownershipUnresolved: boolean
   /**
    * `false` when the OpenCode server's shutdown did not confirm the child process actually
-   * quiesced before the checkpoint that follows (`runCleanup`'s `quiescenceConfirmed`).
-   * Defaults to `true` for the provisional (pre-cleanup) call -- nothing has reported
-   * otherwise yet.
+   * quiesced before the checkpoint that follows (`runCleanup`'s `quiescenceConfirmed`). Only
+   * knowable once `runCleanup` returns -- this module is called exactly once, after that, so
+   * there is no earlier value to default.
    */
   readonly quiescenceConfirmed: boolean
   /**
    * `true` when the coordination lease's latched `continuityUnverified()` fired at any
    * point during this invocation -- a renewal tick failed, threw, or was still unresolved
-   * when `stop()` returned. Defaults to `false` for the provisional (pre-cleanup) call.
+   * when `stop()` returned. Only knowable once `runCleanup` returns, same as
+   * `quiescenceConfirmed` above.
    */
   readonly continuityUnverified: boolean
 }
@@ -102,7 +108,7 @@ function incompleteVerificationReasons(verification: InvocationVerificationFacts
   return reasons
 }
 
-/** `true` when any verification gap is present -- the provisional call's only question. */
+/** `true` when any verification gap is present. */
 export function isVerificationIncomplete(verification: InvocationVerificationFacts): boolean {
   return incompleteVerificationReasons(verification).length > 0
 }

@@ -7,6 +7,7 @@
  * throws out, NEVER fails the run.
  */
 
+import type {ReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../../features/reviews/review-guards.js'
@@ -44,6 +45,26 @@ export interface ReviewReconciliationParams {
   readonly agentSucceeded: boolean
   /** Run start time in milliseconds (Date.now() at run start) */
   readonly runStartMs: number
+  /**
+   * Injected publication-receipt operations (`services/github/review-delivery-receipt.js`),
+   * threaded into this phase's own `submitReviewWithHeadGuard` call below. Optional only so
+   * tests that do not exercise the receipt keep compiling unmodified; `run.ts` always
+   * provides it in production.
+   */
+  readonly reviewDeliveryReceiptOps?: ReviewDeliveryReceiptOperations
+  /** `GITHUB_RUN_ID` -- paired with `reviewDeliveryReceiptOps` to identify the receipt. */
+  readonly runId?: string
+  /** `GITHUB_RUN_ATTEMPT` -- paired with `reviewDeliveryReceiptOps`; stored in the record, never in the key. */
+  readonly runAttempt?: number
+  /**
+   * `true` when `run.ts` already knows, before this phase submits anything, that this
+   * invocation's own execution was not fully observed (an event-stream observation gap or
+   * unresolved background-dispatch ownership -- see `run.ts`'s `knownExecutionVeto` for the
+   * exact two facts). A formal APPROVE is the one review event that can satisfy branch
+   * protection, so it is the write this veto exists to stop: an early no-op here, before any
+   * PR facts are even fetched, rather than deciding to approve and then declining to submit.
+   */
+  readonly knownExecutionVeto: boolean
 }
 
 export interface ReviewReconciliationOutcome {
@@ -100,6 +121,10 @@ export async function runReviewReconciliation(
     agentSucceeded,
     runStartMs,
     isFileConventionDelivery,
+    knownExecutionVeto,
+    reviewDeliveryReceiptOps,
+    runId,
+    runAttempt,
   } = params
 
   // -------------------------------------------------------------------------
@@ -128,6 +153,11 @@ export async function runReviewReconciliation(
 
   if (botLogin == null || botLogin.length === 0) {
     return {reconciled: false, reason: 'no-bot-login'}
+  }
+
+  if (knownExecutionVeto === true) {
+    logger.info('Review reconciliation: skipping, known execution veto', {prNumber})
+    return {reconciled: false, reason: 'known-execution-veto'}
   }
 
   // -------------------------------------------------------------------------
@@ -231,6 +261,13 @@ export async function runReviewReconciliation(
         event: 'APPROVE',
         body: 'Approving to match the review verdict above.',
         currentHeadSha,
+        ...(reviewDeliveryReceiptOps == null || runId == null || runAttempt == null
+          ? {}
+          : {
+              reservationOps: reviewDeliveryReceiptOps,
+              receiptIdentity: {repo: `${owner}/${repo}`, runId, prNumber},
+              attempt: runAttempt,
+            }),
       },
       logger,
     )

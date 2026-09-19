@@ -14,6 +14,7 @@ import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
 import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
+import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
 import {getGitHubRunAttempt} from '../shared/env.js'
 import {createLogger} from '../shared/logger.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
@@ -61,7 +62,6 @@ export async function run(): Promise<number> {
   let ownershipLedger: OwnershipLedger | undefined
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
-  let irreversiblyDelivered = false
   let storeConfig: ObjectStoreConfig = {
     enabled: false,
     bucket: '',
@@ -141,6 +141,15 @@ export async function run(): Promise<number> {
 
     repo = `${routing.triggerResult.context.repo.owner}/${routing.triggerResult.context.repo.repo}`
     runId = routing.agentContext.runId
+    // Built once per invocation and threaded to every review-submission seam (review
+    // reconciliation below, and finalize -> response-post -> submitReviewWithHeadGuard) so
+    // all of them reserve against the identical receipt identity. See
+    // services/github/review-delivery-receipt.ts for the fail-closed guarantee this backs.
+    const reviewDeliveryReceiptOps = createReviewDeliveryReceiptOperations(
+      storeConfig,
+      createLogger({phase: 'review-delivery-receipt'}),
+    )
+    const runAttempt = getGitHubRunAttempt()
     const dedup = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
     if (!dedup.shouldProceed) {
       deliveryOutcome = 'skipped'
@@ -226,6 +235,21 @@ export async function run(): Promise<number> {
     // ever observes the recovery session's own ledger, never the overflowed session's.
     ownershipUnresolved = drainResult.unknownCount > 0 || execution.recoveryBoundaryUnresolved === true
 
+    // `true` when this invocation already knows, before publication, that its own execution
+    // was not fully observed -- computed from exactly the two facts above, both genuinely
+    // known at this point: `observationGap` (the event stream that watched execution closed
+    // without an intentional shutdown or terminal signal) and `ownershipUnresolved` (drain
+    // ended with unsettled or unconfirmed background-dispatch ownership, including an
+    // unresolved context-overflow recovery boundary). Deliberately excludes the two teardown
+    // facts `InvocationVerificationFacts` also tracks -- server quiescence and coordination-
+    // lease continuity: those are not knowable until `runCleanup` returns, which happens
+    // after publication, so folding them in here would gate an irreversible write against a
+    // snapshot that hardcodes them as clean (the mistake af0b155d0 made and baa96477d
+    // removed). A known defect can veto an endorsement without the absence of that defect
+    // certifying the invocation -- this flag is the veto, never a certificate, and it never
+    // feeds `assessInvocationOutcome` or the final `InvocationVerificationFacts` below.
+    const knownExecutionVeto = observationGap || ownershipUnresolved
+
     // Review reconciliation: after the agent session, check if a formal APPROVE
     // is needed to satisfy branch protection when the agent delivered a PASS
     // verdict as a comment instead of a review event. Fail-safe — never throws.
@@ -248,6 +272,10 @@ export async function run(): Promise<number> {
         agentSucceeded: execution.success,
         runStartMs: startTime,
         isFileConventionDelivery: bootstrap.delivery === 'file-convention',
+        knownExecutionVeto,
+        reviewDeliveryReceiptOps,
+        runId,
+        runAttempt,
       },
       reconciliationLogger,
     )
@@ -262,12 +290,9 @@ export async function run(): Promise<number> {
       metrics,
       startTime,
       bootstrap.logger,
+      {knownExecutionVeto, reviewDeliveryReceiptOps},
     )
     exitCode = finalization.exitCode
-    // A review is the one delivery this harness cannot take back: there is no marker-based
-    // find-and-update path for reviews the way there is for comments, so a second run that
-    // reaches the same point submits a second review rather than recognizing the first.
-    irreversiblyDelivered = finalization.deliveryKind === 'review'
 
     // Dedup marker and the terminal reaction both moved out of this try block -- they now
     // happen in the `finally` block below, strictly after `runCleanup` returns and the
@@ -313,10 +338,11 @@ export async function run(): Promise<number> {
       leaseRenewal,
     })
 
-    // FINAL assessment: the same pure function as the provisional call above, now with the
-    // teardown facts `runCleanup` just returned. `deliverySucceeded` is derived from
+    // FINAL assessment: the single call to this pure function, made only now that
+    // `runCleanup` has returned the real teardown facts. `deliverySucceeded` is derived from
     // `deliveryOutcome`/`exitCode`, never from `execution.success` directly, which is never
-    // cleared or second-guessed here.
+    // cleared or second-guessed here. `knownExecutionVeto` above is a separate, earlier gate
+    // on irreversible publication and is never folded into this assessment or its inputs.
     //
     // A 'skipped' run (routing/dedup/lock-contention early return) bypasses this assessment
     // entirely rather than feeding it a synthesized `deliverySucceeded` -- it attempted no
@@ -362,14 +388,15 @@ export async function run(): Promise<number> {
     // outcome check is what stops a contended run, which delivered nothing, from marking
     // itself deduplicated anyway.
     //
-    // An incomplete invocation that already delivered a REVIEW is the deliberate exception.
-    // Withholding the marker there invites the rerun that the non-zero exit already signals,
-    // and a rerun cannot recognize the review this run submitted -- so it submits a second
-    // one. Between a missed retry and a duplicated review, the duplicate is worse and
-    // irreversible. The marker records that delivery happened; it is not a claim the
-    // invocation completed, which `invocation-outcome` and the job summary still report
-    // honestly.
-    const deduplicatable = finalOutcome === 'succeeded' || (finalOutcome === 'incomplete' && irreversiblyDelivered)
+    // No exception for an incomplete invocation that already delivered a review: that used
+    // to be a deliberate carve-out here (writing the marker anyway, to discourage a rerun
+    // that could not recognize the earlier review and would submit a second one). It is
+    // removed now that `services/github/review-delivery-receipt.ts` independently protects
+    // every irreversible review submission with its own at-most-once reservation -- keeping
+    // this carve-out would only obscure that receipt as the actual authority, while this
+    // ordinary marker returns to its ordinary purpose: recording routine completion, not
+    // standing in for review idempotency.
+    const deduplicatable = finalOutcome === 'succeeded'
     if (deduplicatable && dedupEntity != null && triggerContext != null) {
       await saveDedupMarker(triggerContext, dedupEntity, repo)
     }

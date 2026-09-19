@@ -89,6 +89,17 @@ vi.mock('./phases/review-reconciliation.js', () => ({
   runReviewReconciliation: vi.fn().mockResolvedValue(undefined),
 }))
 
+const reviewDeliveryReceiptOpsMocks = vi.hoisted(() => ({
+  createReviewDeliveryReceiptOperations: vi.fn(() => ({
+    reserve: vi.fn(),
+    recordDelivered: vi.fn(),
+  })),
+}))
+
+vi.mock('../services/github/review-delivery-receipt.js', () => ({
+  createReviewDeliveryReceiptOperations: reviewDeliveryReceiptOpsMocks.createReviewDeliveryReceiptOperations,
+}))
+
 vi.mock('./phases/routing.js', () => ({
   runRouting: vi.fn(),
 }))
@@ -795,11 +806,12 @@ describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
   })
 
-  it('incomplete + review already delivered -> dedup marker IS written, exit code and invocation-outcome still report incomplete', async () => {
+  it('incomplete + review already delivered -> NO dedup marker (the old review carve-out is removed now that the receipt independently protects review delivery)', async () => {
     // #given an incomplete outcome (observation gap) whose finalize call already delivered a
-    // review -- reviews have no marker-based find-and-update path the way comments do, so a
-    // rerun invited by the non-zero exit would submit a second review rather than recognize
-    // the first
+    // review -- this case used to write the dedup marker anyway (a carve-out this repo has
+    // since removed: services/github/review-delivery-receipt.ts now independently protects
+    // every irreversible review submission with its own at-most-once reservation, so this
+    // ordinary marker no longer needs to stand in for review idempotency)
     const {saveDedupMarker, applyTerminalReaction, setInvocationOutcomeOutput} = await mockHappyPathThrough({
       observationGap: true,
       deliveryKind: 'review',
@@ -808,10 +820,11 @@ describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
     // #when the run executes end to end
     const exitCode = await run()
 
-    // #then the marker IS written -- the deliberate exception -- but the exit code and the
-    // invocation-outcome/reaction still report 'incomplete', not a completion claim
+    // #then the marker is withheld like any other incomplete outcome -- deduplicatable is
+    // strictly 'succeeded' now -- while the exit code and invocation-outcome/reaction still
+    // report 'incomplete'
     expect(exitCode).toBe(1)
-    expect(vi.mocked(saveDedupMarker)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
     expect(vi.mocked(applyTerminalReaction)).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
@@ -821,9 +834,8 @@ describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
   })
 
-  it('incomplete + comment already delivered (not review) -> no dedup marker, complement of the review exception', async () => {
-    // #given the same incomplete outcome, but finalize delivered only a comment -- comments
-    // have a marker-based find-and-update path, so the review exception must not apply
+  it('incomplete + comment already delivered (not review) -> no dedup marker, same withholding as the review case above (both now follow the ordinary rule)', async () => {
+    // #given the same incomplete outcome, but finalize delivered only a comment
     const {saveDedupMarker, setInvocationOutcomeOutput} = await mockHappyPathThrough({
       observationGap: true,
       deliveryKind: 'comment',
@@ -910,5 +922,211 @@ describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
       expect.anything(),
     )
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('failed')
+  })
+})
+
+describe('knownExecutionVeto threading (src/harness/run.ts)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // The four-row matrix: knownExecutionVeto = observationGap || ownershipUnresolved
+  // (ownershipUnresolved here is driven by drain's unknownCount > 0, its only lever in this
+  // scaffolding). Each row asserts what BOTH consumers received, in one test per row.
+  it.each([
+    {observationGap: false, drainUnknownCount: 0, expectedVeto: false, label: 'false/false -> no veto'},
+    {observationGap: true, drainUnknownCount: 0, expectedVeto: true, label: 'true/false -> veto'},
+    {observationGap: false, drainUnknownCount: 1, expectedVeto: true, label: 'false/true -> veto'},
+    {observationGap: true, drainUnknownCount: 1, expectedVeto: true, label: 'true/true -> veto'},
+  ])(
+    '$label: reconciliation and finalize both receive knownExecutionVeto=$expectedVeto',
+    async ({observationGap, drainUnknownCount, expectedVeto}) => {
+      // #given execution/drain produce the given observationGap/ownershipUnresolved combination
+      const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
+      const {runFinalizeWithResult} = await import('./phases/finalize.js')
+      await mockHappyPathThrough({observationGap, drainUnknownCount})
+
+      // #when the run executes end to end
+      await run()
+
+      // #then both consumers receive the identical derived boolean
+      expect(vi.mocked(runReviewReconciliation)).toHaveBeenCalledWith(
+        expect.objectContaining({knownExecutionVeto: expectedVeto}),
+        expect.anything(),
+      )
+      expect(vi.mocked(runFinalizeWithResult)).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({knownExecutionVeto: expectedVeto}),
+      )
+    },
+  )
+
+  it('an unresolved recovery boundary (execution.recoveryBoundaryUnresolved) alone reaches the veto', async () => {
+    // #given drain itself settles cleanly (unknownCount: 0), but the overflow-recovery
+    // boundary carries its own unresolved ownership fact forward -- run.ts ORs this into
+    // ownershipUnresolved separately from drain's own unknownCount
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runRouting} = await import('./phases/routing.js')
+    const {runDedup} = await import('./phases/dedup.js')
+    const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {runAcknowledge} = await import('./phases/acknowledge.js')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {runSessionPrep} = await import('./phases/session-prep.js')
+    const {runExecute, runDrain} = await import('./phases/execute.js')
+    const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+
+    vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
+    vi.mocked(runRouting).mockResolvedValue(createRouting())
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
+    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 's3-disabled'})
+    vi.mocked(runAcknowledge).mockResolvedValue({
+      repo: 'owner/repo',
+      commentId: 99,
+      issueNumber: 42,
+      issueType: 'pr',
+      botLogin: 'fro-bot',
+    })
+    vi.mocked(runCacheRestore).mockResolvedValue({
+      cacheResult: {hit: false, key: 'cache-key', restoredPath: '', corrupted: false, source: 'cache'},
+      cacheStatus: 'miss',
+      serverHandle: {
+        client: {} as CacheRestorePhaseResult['serverHandle']['client'],
+        server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+        shutdown: vi.fn().mockResolvedValue({quiesced: true}),
+      },
+    })
+    vi.mocked(runSessionPrep).mockResolvedValue({
+      recentSessions: [],
+      priorWorkContext: [],
+      attachmentResult: null,
+      normalizedWorkspace: '/workspace',
+      logicalKey: null,
+      continueSessionId: null,
+      isContinuation: false,
+      sessionTitle: null,
+    })
+    vi.mocked(runExecute).mockResolvedValue({
+      success: true,
+      exitCode: 0,
+      sessionId: 'ses_root',
+      error: null,
+      tokenUsage: null,
+      model: null,
+      cost: null,
+      prsCreated: [],
+      commitsCreated: [],
+      commentsPosted: 0,
+      llmError: null,
+      resolvedOutputMode: 'branch-pr',
+      outputModeMigration: {requested: 'omitted', resolved: 'branch-pr'},
+      observationGap: false,
+      recoveryBoundaryUnresolved: true,
+      executionDurationMs: 10,
+      ownershipLedger: {} as OwnershipLedger,
+    })
+    vi.mocked(runDrain).mockResolvedValue({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0})
+    vi.mocked(runReviewReconciliation).mockResolvedValue({reconciled: false, reason: 'not-applicable'})
+    vi.mocked(runFinalizeWithResult).mockResolvedValue({exitCode: 0, deliveryKind: 'comment'})
+    vi.mocked(runCleanup).mockResolvedValue({quiescenceConfirmed: true, continuityUnverified: false})
+
+    // #when the run executes end to end
+    await run()
+
+    // #then the veto fires even though drain's own unknownCount was 0
+    expect(vi.mocked(runReviewReconciliation)).toHaveBeenCalledWith(
+      expect.objectContaining({knownExecutionVeto: true}),
+      expect.anything(),
+    )
+    expect(vi.mocked(runFinalizeWithResult)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({knownExecutionVeto: true}),
+    )
+  })
+
+  it('a later cleanup-reported teardown failure (quiescence/continuity) is not attributed to this earlier veto', async () => {
+    // #given knownExecutionVeto is false (both observationGap and ownershipUnresolved clean),
+    // but cleanup, which runs strictly AFTER this veto was computed and consumed, later
+    // reports unconfirmed quiescence -- proving the earlier veto neither caused nor prevented
+    // this final outcome
+    const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const {setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      cleanupSafety: {quiescenceConfirmed: false, continuityUnverified: false},
+    })
+
+    // #when the run executes end to end
+    const exitCode = await run()
+
+    // #then the earlier veto was false (both consumers ran/were offered normally) --
+    // this test does not, and must not, claim that veto prevented the later-discovered
+    // teardown failure; the FINAL outcome (computed only after cleanup) is what reports it
+    expect(vi.mocked(runReviewReconciliation)).toHaveBeenCalledWith(
+      expect.objectContaining({knownExecutionVeto: false}),
+      expect.anything(),
+    )
+    expect(vi.mocked(runFinalizeWithResult)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({knownExecutionVeto: false}),
+    )
+    // The final outcome (a separate, later assessment) still correctly reports incomplete --
+    // this is `assessInvocationOutcome`'s job, never the earlier veto's.
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+})
+
+describe('reviewDeliveryReceiptOps construction and threading (src/harness/run.ts)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('builds the receipt operations once and threads the SAME instance into both review reconciliation and finalize', async () => {
+    // #given a normal happy-path run
+    const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const sentinelOps = {reserve: vi.fn(), recordDelivered: vi.fn()}
+    reviewDeliveryReceiptOpsMocks.createReviewDeliveryReceiptOperations.mockReturnValue(sentinelOps)
+    await mockHappyPathThrough({})
+
+    // #when the run executes end to end
+    await run()
+
+    // #then both consumers receive the exact same injected instance -- built once per
+    // invocation, not reconstructed per call site
+    expect(reviewDeliveryReceiptOpsMocks.createReviewDeliveryReceiptOperations).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(runReviewReconciliation)).toHaveBeenCalledWith(
+      expect.objectContaining({reviewDeliveryReceiptOps: sentinelOps}),
+      expect.anything(),
+    )
+    expect(vi.mocked(runFinalizeWithResult)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({reviewDeliveryReceiptOps: sentinelOps}),
+    )
   })
 })
