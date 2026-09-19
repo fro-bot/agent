@@ -26,6 +26,11 @@ const OUTCOME_EXPECTATIONS = {
     description: 'the SQLite write-ahead log could not be checkpointed before the save could proceed',
     backendsAttempted: false,
   },
+  'ownership-declined': {
+    description:
+      'persistence safety could not be confirmed -- unresolved ownership, unconfirmed server quiescence, or a failed coordination lease renewal',
+    backendsAttempted: false,
+  },
   'cache-rejected': {
     description:
       'the Actions cache write returned its -1 sentinel; an inference covering both a denial and a collision, never distinguished',
@@ -48,6 +53,7 @@ describe('CacheSaveOutcome', () => {
       'cache-error',
       'cache-rejected',
       'checkpoint-declined',
+      'ownership-declined',
       'persisted',
       'skipped-by-configuration',
       'skipped-empty',
@@ -61,6 +67,7 @@ describe('CacheSaveOutcome', () => {
       'skipped-by-configuration',
       'skipped-empty',
       'checkpoint-declined',
+      'ownership-declined',
     ]
 
     for (const outcome of skippedOutcomes) {
@@ -70,7 +77,12 @@ describe('CacheSaveOutcome', () => {
 })
 
 describe('CacheSaveResult', () => {
-  it('is constructible with every outcome and both persistence axes independent of each other', () => {
+  // 'ownership-declined' is deliberately not in this fixture: it is exhaustively covered
+  // by OUTCOME_EXPECTATIONS above and the toCacheSaveStateValue case table below. This
+  // fixture exists to demonstrate the two persistence axes varying independently (see the
+  // duplicated 'persisted' entries), not to enumerate every CacheSaveOutcome -- that
+  // guarantee is the compile-time satisfies-pinned tables, not this array.
+  it('constructs representative outcomes with both persistence axes independent of each other', () => {
     const results: readonly CacheSaveResult[] = [
       {cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'},
       {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'},
@@ -114,6 +126,13 @@ describe('toCacheSaveStateValue', () => {
     // constant, so an empty save must retry rather than fold into the deliberate skip.
     {result: {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'}, expected: 'not-persisted'},
     {result: {cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'}, expected: 'not-persisted'},
+    // Deliberately NOT 'not-persisted': a retry here would silently override the
+    // persistence safety gate runCleanup just applied -- the review finding this state
+    // value exists to fix. See OUTCOME_TO_STATE_VALUE's 'ownership-declined' case.
+    {
+      result: {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'},
+      expected: 'declined-for-safety',
+    },
     // The case the whole plan exists for: the object store persisted independently of a
     // rejected cache write, so the state is durable through the other backend.
     {result: {cachePersisted: false, storePersisted: true, outcome: 'cache-rejected'}, expected: 'store-only'},
@@ -131,10 +150,28 @@ describe('toCacheSaveStateValue', () => {
   }
 })
 
+// Compile-time exhaustiveness pin, mirroring OUTCOME_EXPECTATIONS above:
+// `satisfies Record<CacheSaveStateValue, true>` makes adding a value to the
+// CacheSaveStateValue union without updating this object fail check-types. Deliberately
+// NOT derived from CACHE_SAVE_STATE_VALUES (the array parseCacheSaveStateValue itself
+// reads) -- a round-trip test built from that array would be tautological with exactly
+// the blind spot it needs to catch: if 'declined-for-safety' (or a future value) were
+// ever dropped from CACHE_SAVE_STATE_VALUES, parseCacheSaveStateValue would silently
+// fall back to 'not-persisted' (the value that re-enables the unsafe post retry this
+// whole change closed), and a test sourced from that same array would drop the value
+// too and never notice. Pinning against the type instead means this test still lists
+// every value even if the array quietly loses one.
+const ALL_STATE_VALUES = {
+  durable: true,
+  'store-only': true,
+  skipped: true,
+  'declined-for-safety': true,
+  'not-persisted': true,
+} as const satisfies Record<CacheSaveStateValue, true>
+
 describe('parseCacheSaveStateValue', () => {
   it('round-trips every valid CacheSaveStateValue', () => {
-    const values: readonly CacheSaveStateValue[] = ['durable', 'store-only', 'skipped', 'not-persisted']
-    for (const value of values) {
+    for (const value of Object.keys(ALL_STATE_VALUES) as CacheSaveStateValue[]) {
       expect(parseCacheSaveStateValue(value)).toBe(value)
     }
   })

@@ -6,7 +6,7 @@ This document maps the repository's directory layout and explains where code liv
 
 ```text
 fro-bot/agent/
-├── src/                        # GitHub Action logic — 4-layer architecture (~61.7k lines, 61,706 including tests)
+├── src/                        # GitHub Action logic — 4-layer architecture (~70.6k lines, 70,586 including tests)
 │   ├── shared/                 # Layer 0: pure types, utils, constants (only @bfra.me/es Result; no heavy deps)
 │   ├── services/               # Layer 1: external adapters (GitHub, cache, setup, object-store, artifact)
 │   │   ├── github/             # Octokit client, context parsing, NormalizedEvent

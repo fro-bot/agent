@@ -144,6 +144,7 @@ function createExecution(overrides: Partial<ExecutePhaseResult> = {}): ExecutePh
       requested: 'explicit',
       resolved: 'branch-pr',
     },
+    executionDurationMs: 0,
     ...overrides,
   }
 }

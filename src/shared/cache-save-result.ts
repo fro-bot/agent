@@ -8,6 +8,12 @@
  * - `skipped-empty`: no cacheable content existed. Neither backend was attempted.
  * - `checkpoint-declined`: the SQLite write-ahead log could not be checkpointed before
  *   the save could proceed. Neither backend was attempted.
+ * - `ownership-declined`: the save was never attempted because persistence safety could
+ *   not be confirmed -- background subagent work this run owns was still unresolved
+ *   (unknown ledger entries), the OpenCode server's shutdown quiescence poll could not
+ *   confirm the writer had stopped, or the coordination lease could not be renewed.
+ *   Neither backend was attempted. See `runCleanup` (`src/harness/phases/cleanup.ts`)
+ *   for which of the three conditions produced it.
  * - `cache-rejected`: the Actions cache write returned its `-1` failure sentinel. `@actions/cache@6.2.0`
  *   distinguishes a policy denial (`CacheWriteDeniedError`) from a reservation collision
  *   (`ReserveCacheError`) internally, but neither survives the `saveCache()` call
@@ -31,7 +37,13 @@
  *   present under that key regardless of which run wrote it.
  */
 export type CacheSaveOutcome =
-  'skipped-by-configuration' | 'skipped-empty' | 'checkpoint-declined' | 'cache-rejected' | 'cache-error' | 'persisted'
+  | 'skipped-by-configuration'
+  | 'skipped-empty'
+  | 'checkpoint-declined'
+  | 'ownership-declined'
+  | 'cache-rejected'
+  | 'cache-error'
+  | 'persisted'
 
 /**
  * Structured result of a `saveCache` attempt. `cachePersisted` and `storePersisted` are
@@ -49,7 +61,7 @@ export interface CacheSaveResult {
 /**
  * The `CACHE_SAVED` state-key value the harness layer (`cleanup.ts`, `post.ts`) hands off
  * across the main step/post-hook process boundary. Widened from a boolean to this
- * four-value enum so the post hook can gate its retry on durability actually achieved
+ * five-value enum so the post hook can gate its retry on durability actually achieved
  * (`durable`, `store-only`) rather than on cache-write success alone — the boolean
  * conflated a store-only save with total failure and caused a redundant object-store
  * upload (see the cache-save-result-contract plan).
@@ -64,6 +76,16 @@ export interface CacheSaveResult {
  *   Decisions reject.
  * - `skipped`: `SKIP_CACHE=true`. A deliberate configuration opt-out; retry would just
  *   repeat the same no-op.
+ * - `declined-for-safety`: cleanup's persistence safety gate declined the save
+ *   (`ownership-declined`) because it could not confirm no other writer could still be
+ *   touching this session's state. The post hook must NOT retry this one: it runs with
+ *   strictly less information than cleanup had (no server handle, no ownership ledger, no
+ *   lease), so it cannot be more confident that persisting now is safe than the step that
+ *   just declined. This is the one case in this enum where the usual "absent/unrecognized
+ *   fails toward retry" default would be wrong if it applied here — it does not apply,
+ *   because this value is only ever written deliberately by `runCleanup`, never inferred
+ *   from an absent or garbled state string (see `parseCacheSaveStateValue` below, which
+ *   still maps those to `not-persisted`).
  * - `not-persisted`: nothing durable happened (checkpoint declined, no cacheable content
  *   existed, cache rejected/errored with no store persistence) — or the state value was
  *   absent or unrecognized. The post hook must retry here: an absent/garbled value must
@@ -73,13 +95,14 @@ export interface CacheSaveResult {
  *   not a configuration constant — a repeated attempt re-runs the checkpoint before
  *   re-checking content, a small cost against losing a session.
  */
-export type CacheSaveStateValue = 'durable' | 'store-only' | 'skipped' | 'not-persisted'
+export type CacheSaveStateValue = 'durable' | 'store-only' | 'skipped' | 'declined-for-safety' | 'not-persisted'
 
 /** Every valid `CacheSaveStateValue`, used to validate a state string read back from `core.getState`. */
 export const CACHE_SAVE_STATE_VALUES: readonly CacheSaveStateValue[] = [
   'durable',
   'store-only',
   'skipped',
+  'declined-for-safety',
   'not-persisted',
 ]
 
@@ -96,6 +119,12 @@ const OUTCOME_TO_STATE_VALUE = {
   // observation, not a configuration constant, so this must retry rather than skip.
   'skipped-empty': () => 'not-persisted',
   'checkpoint-declined': () => 'not-persisted',
+  // Deliberately NOT 'not-persisted': that value tells the post hook to retry, and a
+  // retry here would silently override the safety gate runCleanup just applied (the
+  // review finding this branch exists to fix -- see the CacheSaveStateValue doc above).
+  // The post hook has strictly less information than cleanup did (no server handle, no
+  // ownership ledger, no lease), so it must honor the decline rather than second-guess it.
+  'ownership-declined': () => 'declined-for-safety',
   // A rejected or errored cache write is not-persisted UNLESS the object store already
   // achieved durability independently — the double-sync bug this plan exists to fix.
   'cache-rejected': result => (result.storePersisted ? 'store-only' : 'not-persisted'),

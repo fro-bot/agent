@@ -1,10 +1,37 @@
+import type {ClassificationPath, ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
+/**
+ * Settlement vocabulary from Step 1 of this restructure — see that module's doc comment for the
+ * governing invariant ("selecting an error never proves quiescence, and observing quiescence
+ * never erases an error"). This step establishes the cause inside the branch that decides to
+ * return, instead of the caller inferring it from a post-hoc clock read.
+ */
+import type {AttemptObservation, FailureObservation} from './attempt-outcome.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
+import {
+  classifyContextOverflowError,
+  classifyProviderAuthError,
+  classifyQuotaError,
+  createAgentError,
+  createErrorInfo,
+  createLLMFetchError,
+  createRetryableApiError,
+  isLlmFetchError,
+} from '@fro-bot/runtime'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {classifyRetryStatusError, mergeActivityError} from './streaming.js'
+import {
+  classifyRetryStatusError,
+  clearRootRevalidationRequirement,
+  getObservedFailure,
+  hasFreshIdleCandidate,
+  invalidateRootFreshness,
+  mergeActivityError,
+  normalizeSessionError,
+  resolvePendingRootUserMessage,
+} from './streaming.js'
 
 const POLL_INTERVAL_MS = 500
 const POLL_REQUEST_TIMEOUT_MS = 5_000
@@ -12,9 +39,165 @@ const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
 const ERROR_GRACE_CYCLES = 3
 export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 
-interface PollResult {
+/**
+ * Public return shape, unchanged from before this step. `pollForSessionCompletion` stays a thin
+ * adapter over `pollForSessionCompletionObservation` (below) so `retry.ts` and existing tests
+ * compile and behave exactly as before — the settlement cause is available to callers that ask
+ * for it via `pollForSessionCompletionObservation`, without forcing every existing caller to
+ * consume it yet.
+ */
+export interface PollResult {
   readonly completed: boolean
   readonly error: string | null
+}
+
+/**
+ * Single snapshot point for whatever failure evidence the SSE processor has already recorded on
+ * `activityTracker` at the exact moment a producer below is deciding to return -- never read by a
+ * delayed continuation after that producer has already settled. Every observation constructor
+ * that can legitimately carry failure evidence funnels through this so there is exactly one place
+ * that knows how to read the tracker, matching `startV2SessionWait`'s completion branch in
+ * retry.ts (the pre-existing correct reference implementation this mirrors).
+ */
+function snapshotObservedFailure(
+  activityTracker: ActivityTracker | undefined,
+): ReturnType<typeof getObservedFailure> | null {
+  return activityTracker == null ? null : getObservedFailure(activityTracker)
+}
+
+/**
+ * `activityTracker` is a required parameter, not optional: a completion observation snapshots
+ * whatever failure evidence is already recorded on the tracker at this exact decision point, so a
+ * producer cannot compile a `completion-observed` observation while silently discarding pending
+ * failure evidence (the bug pattern this closes off -- see attempt-outcome.ts's module doc for the
+ * governing invariant). The settlement still reports `completion-observed` even when a failure is
+ * snapshotted here: the cause is what stopped observation, the failure is what
+ * `reduceAttemptOutcome` reports -- see that function's precedence rules.
+ */
+/**
+ * Shared by every observation constructor below that can legitimately carry pending failure
+ * evidence: reads whatever `snapshotObservedFailure` finds at this exact decision point and
+ * shapes it into the single-element (or empty) `failures` array each settlement returns.
+ */
+function snapshotFailures(activityTracker: ActivityTracker | undefined): FailureObservation[] {
+  const observedFailure = snapshotObservedFailure(activityTracker)
+  return observedFailure == null
+    ? []
+    : [
+        {
+          source: 'session',
+          message: observedFailure.error.message,
+          llmError: observedFailure.error,
+          classificationPath: observedFailure.classificationPath,
+        },
+      ]
+}
+
+function completionObservation(activityTracker: ActivityTracker | undefined): AttemptObservation {
+  return {settlement: {kind: 'completion-observed'}, failures: snapshotFailures(activityTracker)}
+}
+
+function providerFailureObservation(error: ErrorInfo): AttemptObservation {
+  const failure: FailureObservation = {source: 'provider', message: error.message, llmError: error}
+  return {settlement: {kind: 'failure-observed'}, failures: [failure]}
+}
+
+/**
+ * Captures classified failure evidence (llmError + classificationPath) at construction time, via
+ * `snapshotObservedFailure` above. `activityTracker` is required (not optional) for the same
+ * reason as `completionObservation`: a producer that forgets to pass it does not compile.
+ */
+function sessionFailureObservation(message: string, activityTracker: ActivityTracker | undefined): AttemptObservation {
+  const observedFailure = snapshotObservedFailure(activityTracker)
+  const failure: FailureObservation = {
+    source: 'session',
+    message,
+    llmError: observedFailure?.error ?? null,
+    classificationPath: observedFailure?.classificationPath,
+  }
+  return {settlement: {kind: 'failure-observed'}, failures: [failure]}
+}
+
+/**
+ * `deadline`/`cancelled`/`watchdog` settlements can never be misreported as success --
+ * `reduceAttemptOutcome`'s success gate requires `settlement.kind === 'completion-observed'` --
+ * but success was never the hazard here. Without a snapshot, a pending session failure sitting on
+ * the tracker (e.g. still inside `ERROR_GRACE_CYCLES`) was silently discarded when one of these
+ * fired first, and `reduceAttemptOutcome` fell through to `settlementFallback`'s generic
+ * diagnostic instead -- the exact "expiry replaced the known error with a generic timeout" defect
+ * this restructure exists to close. `activityTracker` is required (not optional) for the same
+ * reason as `completionObservation`/`sessionFailureObservation` above: a call site that forgets
+ * to pass it does not compile. The settlement cause is unchanged by this -- these three still
+ * report `deadline`/`cancelled`/`watchdog` respectively; only the evidence attached to that cause
+ * changes. Call sites that explicitly check `terminalProviderError` before reaching one of these
+ * are deciding the settlement cause itself (provider-failure-observed vs. deadline/cancelled) and
+ * are preserved as-is; `snapshotFailures` independently applies the same provider-over-session
+ * precedence for whatever evidence remains once that decision has already gone the other way.
+ */
+function deadlineObservation(activityTracker: ActivityTracker | undefined): AttemptObservation {
+  return {settlement: {kind: 'deadline'}, failures: snapshotFailures(activityTracker)}
+}
+
+function cancelledObservation(activityTracker: ActivityTracker | undefined): AttemptObservation {
+  return {settlement: {kind: 'cancelled', reason: 'Aborted'}, failures: snapshotFailures(activityTracker)}
+}
+
+function watchdogObservation(message: string, activityTracker: ActivityTracker | undefined): AttemptObservation {
+  return {settlement: {kind: 'watchdog', message}, failures: snapshotFailures(activityTracker)}
+}
+
+/**
+ * Precedence-ordered failure pick for the adapter, mirroring `selectWinningFailure` in
+ * attempt-outcome.ts (provider beats session beats anything else). The constructors in this file
+ * only ever snapshot a single failure, so in practice this degrades to `failures[0]` for real
+ * call sites -- the explicit ordering exists so a `completion-observed` settlement carrying a
+ * failure (a request in flight when the failure landed) is judged by the same rule a
+ * `failure-observed` settlement would be, not by array position.
+ */
+function selectAdapterFailure(failures: readonly FailureObservation[]): FailureObservation | null {
+  const providerFailure = failures.find(failure => failure.source === 'provider')
+  if (providerFailure != null) return providerFailure
+
+  const sessionFailure = failures.find(failure => failure.source === 'session')
+  if (sessionFailure != null) return sessionFailure
+
+  return failures[0] ?? null
+}
+
+/**
+ * Adapter preserving the pre-existing `{completed, error}` shape for callers that have not been
+ * rewired to consume `AttemptObservation` yet (`retry.ts`'s `pollResult.completed`/`.error`, and
+ * characterization tests asserting exact `{completed, error}` equality). Diagnostic text is
+ * unchanged from what each branch returned before this step.
+ *
+ * The failure snapshot is considered before the settlement cause: a `completion-observed`
+ * settlement whose snapshot carries a failure (evidence recorded while a request was still in
+ * flight) is not a legacy success -- it projects the same way a `failure-observed` settlement
+ * would, via `selectAdapterFailure`'s provider-over-session precedence. The settlement itself is
+ * untouched; only this legacy projection changes.
+ */
+export function toPollResult(observation: AttemptObservation): PollResult {
+  const failure = selectAdapterFailure(observation.failures)
+  if (failure != null) return {completed: false, error: failure.message}
+
+  if (observation.settlement.kind === 'completion-observed') return {completed: true, error: null}
+
+  if (observation.settlement.kind === 'watchdog') return {completed: false, error: observation.settlement.message}
+
+  // 'deadline' and 'cancelled' both preserve the original undifferentiated 'Aborted' diagnostic
+  // text at this adapter boundary — the differentiation is in `observation.settlement.kind`.
+  return {completed: false, error: 'Aborted'}
+}
+
+/**
+ * `true` when a supplied ledger still has owned work outstanding — the gate every
+ * terminal completion path in this module (and in `retry.ts`) consults before
+ * reporting `completed: true`. Absent ledger means single-session behavior:
+ * never blocks (backward-compatible no-op), matching `isOwnedSession` in
+ * `streaming.ts`.
+ */
+export function ledgerBlocksCompletion(ledger?: OwnershipLedger): boolean {
+  return ledger !== undefined && ledger.isDrainComplete() === false
 }
 
 function getStringProperty(value: unknown, property: string): string | null {
@@ -27,6 +210,12 @@ function getNumberProperty(value: unknown, property: string): number | null {
   if (value == null || typeof value !== 'object') return null
   const descriptor = Object.getOwnPropertyDescriptor(value, property)
   return typeof descriptor?.value === 'number' ? descriptor.value : null
+}
+
+function getBooleanProperty(value: unknown, property: string): boolean | null {
+  if (value == null || typeof value !== 'object') return null
+  const descriptor = Object.getOwnPropertyDescriptor(value, property)
+  return typeof descriptor?.value === 'boolean' ? descriptor.value : null
 }
 
 function getObjectProperty(value: unknown, property: string): unknown {
@@ -101,6 +290,89 @@ async function runPollRequest<T>(
   return deadline == null ? request() : deadline.run(request, label)
 }
 
+/**
+ * Classifies an assistant message's own `error` field through the same bounded provider/generic
+ * precedence the SSE `session.error` branch uses (`streaming.ts`'s `mergeActivityError` callers) --
+ * an assistant carrying an error is failure evidence, never a clean completion candidate, and must
+ * not be dropped into a generic timeout. Deliberately self-contained rather than reusing that
+ * branch inline: the SSE branch also owns `continue`-based deadline handling scoped to its own
+ * event loop, which does not translate to this poll-driven call site. A shared extraction of just
+ * the classification precedence (not the loop control) is a reasonable follow-up.
+ */
+function classifyAssistantMessageError(
+  messageError: unknown,
+  model: string | null,
+): {readonly error: ErrorInfo; readonly classificationPath: ClassificationPath} {
+  const errorData = getObjectProperty(messageError, 'data')
+  const status =
+    getNumberProperty(messageError, 'status') ??
+    getNumberProperty(messageError, 'statusCode') ??
+    getNumberProperty(errorData, 'status') ??
+    getNumberProperty(errorData, 'statusCode')
+  const code = getStringProperty(messageError, 'code') ?? getStringProperty(errorData, 'code')
+  const name = getStringProperty(messageError, 'name') ?? getStringProperty(errorData, 'name')
+
+  const terminalError =
+    classifyProviderAuthError({kind: 'session-error', name}) ??
+    classifyContextOverflowError({kind: 'session-error', name}) ??
+    classifyQuotaError({kind: 'session-error', status: status ?? undefined, code: code ?? undefined})
+  if (terminalError != null) return {error: terminalError, classificationPath: 'structured'}
+
+  const errorStr = normalizeSessionError(messageError)
+  if (isLlmFetchError(errorStr))
+    return {error: createLLMFetchError(errorStr, model ?? undefined), classificationPath: 'fallback'}
+  if (status === 429) return {error: createErrorInfo('rate_limit', errorStr, true), classificationPath: 'name'}
+
+  const isRetryable = getBooleanProperty(messageError, 'isRetryable') ?? getBooleanProperty(errorData, 'isRetryable')
+  if (isRetryable === true)
+    return {error: createRetryableApiError(errorStr, model ?? undefined), classificationPath: 'structured'}
+  if (isRetryable === false) return {error: createAgentError(errorStr), classificationPath: 'structured'}
+
+  return {
+    error: createAgentError(errorStr),
+    classificationPath: name != null || status != null || code != null ? 'name' : 'unclassified',
+  }
+}
+
+/** A qualified, not-yet-admitted completion candidate -- see `detectMessageActivity`'s doc comment. */
+interface MessageCompletionCandidate {
+  readonly messageId: string
+  /**
+   * The root-freshness revision this candidate was validated against, captured at the moment it
+   * qualified (not at request start) -- null when no tracker is present. The caller must re-check
+   * this against the CURRENT revision at final admission: the candidate and the later
+   * `session.status()` response are two separate observations, each capable of racing renewed
+   * root activity independently, so each needs its own generation checked.
+   */
+  readonly revision: number | null
+  /**
+   * The parent message id this candidate answered (`parentID` off the assistant message), carried
+   * forward so final admission can decide whether it satisfies the CURRENT `pendingParentMessageId`
+   * barrier -- by matching it, not by this constructor having cleared it. Qualification here only
+   * ever checked the barrier as it stood at qualification time; the barrier itself may have moved
+   * (new pending parent, or resolved and re-armed) by the time admission runs, so admission
+   * re-compares against the CURRENT tracker state rather than trusting this field as pre-authorized.
+   * `null` when the assistant message carried no `parentID`.
+   */
+  readonly answeredParentId: string | null
+}
+
+/**
+ * Locates the latest new (post-baseline) assistant message and validates it against the
+ * qualified-tuple predicate: new relative to the attempt baseline; answers the latest known root
+ * user message with no newer unanswered one (the pending-parent barrier); `time.completed`
+ * present; `finish` present and not `tool-calls`/`unknown`; no non-provider-executed tool call left
+ * pending/running (a continuation the upstream prompt loop would still run another iteration for);
+ * and no renewed root activity since the request was issued (revision check). Confirms the same
+ * qualified candidate remains latest across two consecutive polls before returning it.
+ *
+ * Returns a CANDIDATE, not a settlement, and never mutates `currentTurnTerminalSignalReceived` --
+ * the caller (`pollForSessionCompletionObservation`) still validates it against live `session.status()`
+ * and the ownership ledger before admitting a completion, exactly like every other completion path
+ * in that function. An assistant carrying its own `error` field is failure evidence and is returned
+ * as an `AttemptObservation` failure settlement directly (never eligible to become a candidate, and
+ * never silently dropped into a generic timeout).
+ */
 async function detectMessageActivity(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
   sessionId: string,
@@ -109,13 +381,18 @@ async function detectMessageActivity(
   logger: Logger,
   signal: AbortSignal,
   deadline?: ExecutionDeadline,
-): Promise<PollResult | null> {
+): Promise<MessageCompletionCandidate | AttemptObservation | null> {
   if (activityTracker?.baselineMessageIds == null) return null
 
   if (typeof client.session.messages !== 'function') {
     logger.debug('session.messages() unavailable; skipping message activity poll', {sessionId})
     return null
   }
+
+  const rootFreshness = activityTracker.rootFreshness
+  // Captured before the request: renewed root activity observed while this request was in
+  // flight must invalidate whatever the response describes, not just what happens afterward.
+  const requestRevision = rootFreshness?.revision
 
   const messagesResponse = await runPollRequest(
     async () => client.session.messages({path: {id: sessionId}, query: {directory}, signal}),
@@ -124,6 +401,7 @@ async function detectMessageActivity(
     deadline,
   )
   const messages = Array.isArray(messagesResponse.data) ? messagesResponse.data : []
+  let latestAssistantMessage: unknown = null
   let latestAssistantMessageInfo: unknown = null
   for (const message of messages) {
     const info = getObjectProperty(message, 'info')
@@ -133,42 +411,169 @@ async function detectMessageActivity(
     const role = getStringProperty(info, 'role')
     if (role !== 'assistant') continue
 
+    latestAssistantMessage = message
     latestAssistantMessageInfo = info
   }
 
-  if (latestAssistantMessageInfo == null) return null
-
-  activityTracker.firstMeaningfulEventReceived = true
-  const latestAssistantMessageId = getStringProperty(latestAssistantMessageInfo, 'id')
-  const completedAt = getNumberProperty(getObjectProperty(latestAssistantMessageInfo, 'time'), 'completed')
-
-  if (latestAssistantMessageId == null || completedAt == null) {
+  if (latestAssistantMessageInfo == null) {
+    // No new assistant message this observation -- the observation sequence is interrupted, not
+    // merely inconclusive. A failed/empty observation must not let a stale confirmation memory
+    // bridge across it into a later observation that only looks consecutive.
     activityTracker.completedAssistantMessageId = undefined
     return null
   }
 
-  // Confirm the same completed assistant remains the latest across two consecutive polls
+  activityTracker.firstMeaningfulEventReceived = true
+  const latestAssistantMessageId = getStringProperty(latestAssistantMessageInfo, 'id')
+  if (latestAssistantMessageId == null) {
+    activityTracker.completedAssistantMessageId = undefined
+    return null
+  }
+
+  // An assistant carrying an error is failure evidence, never a clean candidate -- classified
+  // through the same bounded precedence as SSE `session.error`, so it settles as a failure
+  // instead of silently falling through to a generic timeout.
+  const messageError = getObjectProperty(latestAssistantMessageInfo, 'error')
+  if (messageError != null) {
+    activityTracker.completedAssistantMessageId = undefined
+    const model = getStringProperty(latestAssistantMessageInfo, 'modelID')
+    const classified = classifyAssistantMessageError(messageError, model)
+    logger.error('Completed assistant message carries an error — classified as failure evidence', {
+      sessionId,
+      messageId: latestAssistantMessageId,
+      type: classified.error.type,
+    })
+    const existing = getObservedFailure(activityTracker)?.error ?? null
+    const merged = mergeActivityError(
+      existing,
+      classified.error,
+      activityTracker,
+      classified.error.message,
+      classified.classificationPath,
+    )
+    const failure: FailureObservation = {
+      source: 'session',
+      message: merged.message,
+      llmError: merged,
+      classificationPath: activityTracker.classificationPath,
+    }
+    return {settlement: {kind: 'failure-observed'}, failures: [failure]}
+  }
+
+  const completedAt = getNumberProperty(getObjectProperty(latestAssistantMessageInfo, 'time'), 'completed')
+  if (completedAt == null) {
+    activityTracker.completedAssistantMessageId = undefined
+    return null
+  }
+
+  // `time.completed` alone is not a success certificate (upstream assigns it during processor
+  // cleanup including failed/intermediate processing) -- `finish` must also be present and not
+  // one of the two values the prompt loop itself treats as "needs another iteration"
+  // (`tool-calls`) or as not-yet-meaningful (`unknown`).
+  const finish = getStringProperty(latestAssistantMessageInfo, 'finish')
+  if (finish == null || finish === 'tool-calls' || finish === 'unknown') {
+    activityTracker.completedAssistantMessageId = undefined
+    return null
+  }
+
+  // Answers the latest root user message, with no newer unanswered one: `latestRootUserMessageId`
+  // is only positively known once a new root user turn has been observed (e.g. an injected
+  // background-task-completion turn) -- null in the common single-turn case, where this check
+  // degrades to a no-op and the pending-parent barrier below is the operative guard.
+  const parentId = getStringProperty(latestAssistantMessageInfo, 'parentID')
+  if (rootFreshness != null) {
+    if (rootFreshness.latestRootUserMessageId != null && parentId !== rootFreshness.latestRootUserMessageId) {
+      activityTracker.completedAssistantMessageId = undefined
+      return null
+    }
+    if (
+      rootFreshness.pendingParentMessageId != null &&
+      (parentId == null || parentId !== rootFreshness.pendingParentMessageId)
+    ) {
+      // A pending parent turn is still unanswered by this candidate. Per the invariant on
+      // `RootFreshnessTracker`, qualification only ever CHECKS the barrier here -- it must never
+      // clear it, even when the candidate does match (handled just below): matching makes a
+      // candidate eligible for admission to satisfy the barrier, it does not itself authorize
+      // release. `answeredParentId` is carried forward on the returned candidate so final admission
+      // (`pollForSessionCompletionObservation`) can commit that release against the CURRENT tracker
+      // state, not this stale qualification-time snapshot.
+      activityTracker.completedAssistantMessageId = undefined
+      return null
+    }
+  }
+
+  // Upstream (packages/opencode/src/session/prompt.ts) does not filter tool parts on status at
+  // all: ANY tool part -- pending, running, or completed -- requires another prompt-loop
+  // iteration unless it is provider-executed (the model never needs the result back) or an
+  // orphaned interrupted tool (cleanup() marks abandoned tool_use blocks 'error' with
+  // metadata.interrupted === true after retries/aborts; those are not pending work). A
+  // *completed*, non-provider-executed tool part still blocks completion -- the model has not
+  // yet received the result and will produce another turn. `providerExecuted` is read from
+  // `part.metadata`; the orphan condition reads `part.state.status` and
+  // `part.state.metadata.interrupted` -- two different metadata locations. The orphan check is
+  // the permissive branch, so it uses the strictest reading: a missing/malformed `state` or
+  // `metadata`, or `interrupted` present but not strictly `true`, must not qualify as an orphan.
+  const parts = getObjectProperty(latestAssistantMessage, 'parts')
+  if (Array.isArray(parts)) {
+    const hasBlockingTool = parts.some((part: unknown) => {
+      if (getStringProperty(part, 'type') !== 'tool') return false
+      const providerExecuted = getBooleanProperty(getObjectProperty(part, 'metadata'), 'providerExecuted')
+      if (providerExecuted === true) return false
+      const state = getObjectProperty(part, 'state')
+      const status = getStringProperty(state, 'status')
+      const interrupted = getBooleanProperty(getObjectProperty(state, 'metadata'), 'interrupted')
+      const isOrphanedInterruptedTool = status === 'error' && interrupted === true
+      return !isOrphanedInterruptedTool
+    })
+    if (hasBlockingTool) {
+      activityTracker.completedAssistantMessageId = undefined
+      return null
+    }
+  }
+
+  // Renewed root activity observed while this request was in flight invalidates the response.
+  if (rootFreshness != null && rootFreshness.revision !== requestRevision) {
+    activityTracker.completedAssistantMessageId = undefined
+    return null
+  }
+
+  // Confirm the same qualified candidate remains the latest across two consecutive polls
   // before reporting completion — guards against the race where one agent loop step has
   // completed but the next step has not yet produced its in-progress assistant message.
-  if (activityTracker.completedAssistantMessageId !== latestAssistantMessageId) {
-    activityTracker.completedAssistantMessageId = latestAssistantMessageId
+  // Confirmation memory is keyed by (message id, revision), not id alone (see
+  // `ActivityTracker.completedAssistantMessageId`'s doc comment) -- a stored id whose stored
+  // revision no longer matches the CURRENT generation does not confirm; it restarts the
+  // two-observation count exactly as a different id would.
+  const currentRevision = rootFreshness?.revision ?? null
+  const storedConfirmationMemory = activityTracker.completedAssistantMessageId
+  if (
+    storedConfirmationMemory == null ||
+    storedConfirmationMemory.messageId !== latestAssistantMessageId ||
+    storedConfirmationMemory.revision !== currentRevision
+  ) {
+    activityTracker.completedAssistantMessageId = {messageId: latestAssistantMessageId, revision: currentRevision}
     logger.debug('Completed assistant message observed; waiting for confirmation poll', {
       sessionId,
       messageId: latestAssistantMessageId,
+      revision: currentRevision,
     })
     return null
   }
 
-  activityTracker.currentTurnTerminalSignalReceived = true
-  logger.debug('Session completion detected via stable completed assistant message', {
+  logger.debug('Qualified completed assistant message observed — awaiting status corroboration', {
     sessionId,
     messageId: latestAssistantMessageId,
   })
 
-  return {completed: true, error: null}
+  return {messageId: latestAssistantMessageId, revision: rootFreshness?.revision ?? null, answeredParentId: parentId}
 }
 
-export async function pollForSessionCompletion(
+/**
+ * Core implementation: each branch establishes its own settlement cause at the point it decides
+ * to return, per the invariant in `attempt-outcome.ts`. `pollForSessionCompletion` (below) is a
+ * thin `{completed, error}` adapter over this for callers not yet rewired to consume the cause.
+ */
+export async function pollForSessionCompletionObservation(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
   sessionId: string,
   directory: string,
@@ -177,7 +582,8 @@ export async function pollForSessionCompletion(
   maxPollTimeMs: number = DEFAULT_TIMEOUT_MS,
   activityTracker?: ActivityTracker,
   deadline?: ExecutionDeadline,
-): Promise<PollResult> {
+  ownershipLedger?: OwnershipLedger,
+): Promise<AttemptObservation> {
   const pollStart = Date.now()
   let errorGraceCycles = 0
   let firstSessionError: string | null = null
@@ -185,9 +591,12 @@ export async function pollForSessionCompletion(
   while (!signal.aborted) {
     const terminalProviderError = activityTracker?.terminalProviderError
     if (terminalProviderError != null) {
-      return {completed: false, error: terminalProviderError.message}
+      // Preserved producer policy: an already-accepted provider error wins here even if the
+      // deadline has since expired (checked next) — this is a legitimate provider-terminal result
+      // winning at the boundary, not a deadline conclusion. See attempt-outcome.ts module doc.
+      return providerFailureObservation(terminalProviderError)
     }
-    if (deadline?.isExpired() === true) return {completed: false, error: 'Aborted'}
+    if (deadline?.isExpired() === true) return deadlineObservation(activityTracker)
     try {
       const delay = async () => {
         await waitForAbortableDelay(POLL_INTERVAL_MS, signal)
@@ -195,14 +604,20 @@ export async function pollForSessionCompletion(
       if (deadline == null) await delay()
       else await deadline.run(delay, 'poll interval')
     } catch {
+      // waitForAbortableDelay() itself never rejects; deadline.run() rejects here exclusively via
+      // deadline exhaustion. A terminal error already accepted still wins per the preserved policy.
       const terminalError = activityTracker?.terminalProviderError
-      if (terminalError != null) return {completed: false, error: terminalError.message}
-      return {completed: false, error: 'Aborted'}
+      if (terminalError != null) return providerFailureObservation(terminalError)
+      return deadlineObservation(activityTracker)
     }
     if (signal.aborted) {
+      // `signal` may be a combined AbortSignal.any([..., deadline.signal]) (see retry.ts), so an
+      // abort here can be deadline-caused as well as externally cancelled — ask the deadline
+      // itself rather than assuming cancellation.
       const terminalError = activityTracker?.terminalProviderError
-      if (terminalError != null) return {completed: false, error: terminalError.message}
-      return {completed: false, error: 'Aborted'}
+      if (terminalError != null) return providerFailureObservation(terminalError)
+      if (deadline?.isExpired() === true) return deadlineObservation(activityTracker)
+      return cancelledObservation(activityTracker)
     }
 
     const observedSessionError = activityTracker?.sessionError
@@ -210,7 +625,7 @@ export async function pollForSessionCompletion(
       firstSessionError = observedSessionError
     }
     const terminalError = activityTracker?.terminalProviderError
-    if (terminalError != null) return {completed: false, error: terminalError.message}
+    if (terminalError != null) return providerFailureObservation(terminalError)
     const sessionError = firstSessionError
 
     if (sessionError == null) {
@@ -223,34 +638,79 @@ export async function pollForSessionCompletion(
           error: sessionError,
           graceCycles: errorGraceCycles,
         })
-        return {completed: false, error: `Session error: ${sessionError}`}
+        return sessionFailureObservation(`Session error: ${sessionError}`, activityTracker)
       }
       continue
     }
 
-    if (activityTracker?.sessionIdle === true && activityTracker.currentTurnTerminalSignalReceived) {
-      logger.debug('Session idle detected via event stream', {sessionId})
-      return {completed: true, error: null}
+    // A root-freshness tracker (when present) is authoritative over the raw sticky flags: those
+    // flags never reset once set, so "idle happened sometime earlier" must not be accepted on its
+    // own. `hasFreshIdleCandidate` requires idle evidence for the CURRENT generation with no
+    // unresolved newer parent turn. Trackers built without one (tests/fixtures constructing
+    // `ActivityTracker` literals directly) keep the prior sticky-flag behavior exactly.
+    const rootFreshness = activityTracker?.rootFreshness
+    const hasIdleEvidence =
+      rootFreshness == null
+        ? activityTracker?.sessionIdle === true && activityTracker.currentTurnTerminalSignalReceived === true
+        : hasFreshIdleCandidate(rootFreshness)
+    if (hasIdleEvidence) {
+      if (ledgerBlocksCompletion(ownershipLedger)) {
+        logger.debug('Session idle detected via event stream but owned work outstanding — deferring completion', {
+          sessionId,
+          outstanding: ownershipLedger?.outstanding(),
+        })
+      } else if (deadline?.isExpired() === true) {
+        // Checked at the completion decision itself, not re-derived later: a completion first
+        // observed after the deadline is rejected, matching the deadline check every other branch
+        // performs at its own return point.
+        return deadlineObservation(activityTracker)
+      } else {
+        logger.debug('Session idle detected via event stream', {sessionId})
+        return completionObservation(activityTracker)
+      }
     }
 
     const elapsed = Date.now() - pollStart
     if (deadline == null && maxPollTimeMs > 0 && elapsed >= maxPollTimeMs) {
       logger.warning('Poll timeout reached', {elapsedMs: elapsed, maxPollTimeMs})
-      return {completed: false, error: `Poll timeout after ${elapsed}ms`}
+      return watchdogObservation(`Poll timeout after ${elapsed}ms`, activityTracker)
     }
 
     try {
-      const messageResult = await detectMessageActivity(
-        client,
-        sessionId,
-        directory,
-        activityTracker,
-        logger,
-        signal,
-        deadline,
-      )
-      if (messageResult != null) return messageResult
+      let messageCandidate: MessageCompletionCandidate | AttemptObservation | null
+      try {
+        messageCandidate = await detectMessageActivity(
+          client,
+          sessionId,
+          directory,
+          activityTracker,
+          logger,
+          signal,
+          deadline,
+        )
+      } catch (messageActivityError) {
+        // A failed session.messages() request is an interrupted observation, not a missed one --
+        // it must not let confirmation memory bridge across it into a later poll that only looks
+        // consecutive. Reset here, before the outer catch's generic debug log, then let that same
+        // outer catch handle the logging/continue policy exactly as it already does for every other
+        // poll-request failure in this loop.
+        if (activityTracker != null) activityTracker.completedAssistantMessageId = undefined
+        throw messageActivityError
+      }
+      // An assistant carrying its own error settles as a failure observation immediately, exactly
+      // like every other failure observation in this loop -- it never waits behind the completion
+      // admission gates (ledger/status/deadline) below, which exist to protect a *completion*
+      // decision, not a failure one.
+      if (messageCandidate != null && 'settlement' in messageCandidate) {
+        return messageCandidate
+      }
 
+      // Captured before issuing the request: a status response that started before renewed root
+      // activity cannot authorize completion after it, even though the response itself reports
+      // idle -- the root may have moved on while the request was in flight. Shared by both the
+      // message-fallback candidate (below) and the plain REST-idle path, so this request is issued
+      // exactly once per iteration regardless of which completion evidence is under evaluation.
+      const statusRequestRevision = activityTracker?.rootFreshness?.revision
       const statusResponse = await runPollRequest(
         async () => client.session.status({query: {directory}, signal}),
         'session.status()',
@@ -259,22 +719,148 @@ export async function pollForSessionCompletion(
       )
       const statuses = statusResponse.data ?? {}
       const sessionStatus = statuses[sessionId]
+      const rootFreshnessForStatus = activityTracker?.rootFreshness
+      // Split per the qualification-before-authorization invariant: revision drift is evidence the
+      // response itself may be stale, and rejects BOTH completion paths below equally. An
+      // unresolved pending-parent barrier is a DIFFERENT kind of gate -- it rejects the plain
+      // status-only idle path outright (that path has no other way to satisfy it), but a fully
+      // qualified message candidate may satisfy the barrier by matching it (`barrierSatisfiedByCandidate`
+      // below), without this check itself ever clearing it. Combining these into one flag (as a
+      // prior revision of this function did) made admission require an already-clear barrier while
+      // only admission itself could clear it -- a deadlock. Keeping them separate breaks that cycle.
+      const revisionDriftAgainstRenewedActivity =
+        rootFreshnessForStatus != null && rootFreshnessForStatus.revision !== statusRequestRevision
+      const unresolvedBarrier = rootFreshnessForStatus != null && rootFreshnessForStatus.pendingParentMessageId != null
+      // The candidate's own revision was captured inside `detectMessageActivity()` at the moment it
+      // qualified -- a separate, earlier observation than `statusRequestRevision` above. Renewed
+      // root activity landing between that qualification and this admission point (including
+      // during the gap before `statusRequestRevision` was even captured) must invalidate the
+      // candidate independently of whatever the status response itself reports.
+      const candidateStaleAgainstRenewedActivity =
+        messageCandidate != null &&
+        rootFreshnessForStatus != null &&
+        messageCandidate.revision !== rootFreshnessForStatus.revision
+      // A fully qualified candidate satisfies (but does not itself clear) the barrier by matching
+      // the parent it answered against the barrier's CURRENT pending id -- re-checked here, at
+      // admission, against the tracker's present state rather than trusting the qualification-time
+      // snapshot carried on the candidate.
+      const barrierSatisfiedByCandidate =
+        messageCandidate != null &&
+        rootFreshnessForStatus != null &&
+        rootFreshnessForStatus.pendingParentMessageId != null &&
+        messageCandidate.answeredParentId === rootFreshnessForStatus.pendingParentMessageId
+      // Upstream removes idle sessions from the status map entirely, so a successful omission is
+      // consistent with (but on its own does not prove) inactivity -- it may corroborate a
+      // message-fallback candidate that has already independently confirmed the submission's own
+      // baseline and two-poll stability, but is not itself treated as idle evidence below.
+      const statusCorroboratesInactivity = sessionStatus == null || sessionStatus.type === 'idle'
+
+      const messageCandidateQualifiesForAdmission =
+        messageCandidate != null &&
+        statusCorroboratesInactivity &&
+        !revisionDriftAgainstRenewedActivity &&
+        !candidateStaleAgainstRenewedActivity &&
+        (!unresolvedBarrier || barrierSatisfiedByCandidate)
+
+      if (messageCandidateQualifiesForAdmission && messageCandidate != null) {
+        if (ledgerBlocksCompletion(ownershipLedger)) {
+          logger.debug(
+            'Qualified completed-assistant message observed but owned work outstanding — deferring completion',
+            {sessionId, outstanding: ownershipLedger?.outstanding()},
+          )
+        } else if (deadline?.isExpired() === true) {
+          // The completed-assistant message itself may have been produced (and its two-poll
+          // stability confirmed, via the async session.messages() requests above) after the
+          // deadline expired -- admission is checked here, at the decision, not inferred later.
+          return deadlineObservation(activityTracker)
+        } else {
+          // Commit point: every guard release, the terminal-evidence write, and settlement
+          // construction happen synchronously here, with no intervening `await` -- per the
+          // invariant, authority is only granted once evidence is fully qualified AND re-checked
+          // against the CURRENT tracker state at this exact commit point (above), never before it.
+          if (rootFreshnessForStatus != null) {
+            resolvePendingRootUserMessage(rootFreshnessForStatus, messageCandidate.answeredParentId)
+            clearRootRevalidationRequirement(rootFreshnessForStatus)
+          }
+          if (activityTracker != null) activityTracker.currentTurnTerminalSignalReceived = true
+          logger.debug('Session completion detected via qualified completed assistant message', {
+            sessionId,
+            messageId: messageCandidate.messageId,
+          })
+          return completionObservation(activityTracker)
+        }
+      } else if (messageCandidate != null && activityTracker != null) {
+        // Outer admission rejected this candidate (stale revision, unsatisfied barrier, or no REST
+        // corroboration) -- confirmation memory must not bridge across the rejection into a later
+        // poll that only looks consecutive. A stable candidate in a stable generation will simply
+        // re-qualify and re-confirm across two fresh observations; it is not quarantined forever.
+        activityTracker.completedAssistantMessageId = undefined
+      }
 
       if (sessionStatus == null) {
+        // Idle sessions are removed from upstream's status map entirely (served from a map that
+        // only carries non-idle entries) -- so a successful omission is consistent with inactivity
+        // for a known accepted root, but on its own it cannot prove this submission ran at all
+        // (e.g. a session id that was never accepted). Not treated as idle evidence by itself here;
+        // it corroborates other completion evidence (see the message-fallback path above).
         logger.debug('Session status not found in poll response', {sessionId})
       } else if (sessionStatus.type === 'idle') {
-        if (activityTracker != null && activityTracker.currentTurnTerminalSignalReceived !== true) {
-          logger.debug('Session idle detected before terminal signal; continuing watchdog', {sessionId})
+        // Generation-scoped terminal evidence, not the sticky `currentTurnTerminalSignalReceived`
+        // flag alone: that flag never resets on a revision bump, so a terminal signal accepted in a
+        // PREVIOUS generation (e.g. a message-candidate admission attempt deferred by the ownership
+        // ledger, or an SSE idle event later superseded by renewed activity) must not be trusted to
+        // corroborate a REST idle report for a DIFFERENT, later generation. `rootFreshness.state ===
+        // 'idle-candidate'` is itself generation-scoped (cleared to `'active'` by
+        // `invalidateRootFreshness` on every revision bump), so it names the current generation's
+        // own terminal evidence directly instead of relying on a flag that outlives the generation
+        // it was set in. Tracker-less callers (no `rootFreshness`) keep the prior sticky-flag
+        // behavior exactly, for backward compatibility.
+        const hasCurrentGenerationTerminalSignal =
+          rootFreshnessForStatus == null
+            ? // No freshness tracker to name a generation with: replicate the pre-existing gate
+              // exactly -- `activityTracker != null && flag !== true` skipped straight past this
+              // branch when NO activityTracker was supplied at all (single-session/no-tracking
+              // callers), so an absent tracker must bypass this gate, not require the flag `true`.
+              activityTracker == null || activityTracker.currentTurnTerminalSignalReceived === true
+            : rootFreshnessForStatus.state === 'idle-candidate' &&
+              rootFreshnessForStatus.idleCandidateRevision === rootFreshnessForStatus.revision
+        if (hasCurrentGenerationTerminalSignal) {
+          if (revisionDriftAgainstRenewedActivity || unresolvedBarrier) {
+            logger.debug(
+              'Session idle observed via polling but invalidated by renewed root activity since the request was issued',
+              {sessionId},
+            )
+          } else if (ledgerBlocksCompletion(ownershipLedger)) {
+            logger.debug('Session idle detected via polling but owned work outstanding — deferring completion', {
+              sessionId,
+              outstanding: ownershipLedger?.outstanding(),
+            })
+          } else if (deadline?.isExpired() === true) {
+            // The idle status itself was fetched via an async session.status() request (above) that
+            // may have crossed the deadline -- checked here, at admission, not re-derived later.
+            return deadlineObservation(activityTracker)
+          } else {
+            // Commit point for this path too: this REST response corroborates SPECIFIC current
+            // completion evidence (a retained current-revision idle candidate with no pending
+            // parent), so the revalidation requirement may be released here -- never merely because
+            // the response's requested revision matched (see `clearRootRevalidationRequirement`'s
+            // contract).
+            if (rootFreshnessForStatus != null) clearRootRevalidationRequirement(rootFreshnessForStatus)
+            logger.debug('Session idle detected via polling', {sessionId})
+            return completionObservation(activityTracker)
+          }
         } else {
-          logger.debug('Session idle detected via polling', {sessionId})
-          return {completed: true, error: null}
+          logger.debug('Session idle detected before terminal signal; continuing watchdog', {sessionId})
         }
       } else if (sessionStatus.type === 'retry') {
+        // Renewed root activity regardless of whether it also classifies as terminal below --
+        // invalidate any prior completion evidence even when classification returns null.
+        if (activityTracker?.rootFreshness != null) invalidateRootFreshness(activityTracker.rootFreshness)
         // Poll-only terminal provider signals fail fast instead of waiting out the full timeout.
         const terminalError = classifyRetryStatusError(sessionStatus)
         if (terminalError != null) {
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null)
-            return {completed: false, error: 'Aborted'}
+            return deadlineObservation(activityTracker)
           logger.error('Session status retry classified as terminal provider error via poll', {
             sessionId,
             type: sessionStatus.type,
@@ -282,10 +868,15 @@ export async function pollForSessionCompletion(
           if (activityTracker != null) {
             mergeActivityError(null, terminalError, activityTracker)
           }
-          return {completed: false, error: activityTracker?.terminalProviderError?.message ?? terminalError.message}
+          return providerFailureObservation(activityTracker?.terminalProviderError ?? terminalError)
         }
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       } else {
+        // Covers 'busy' (and any other non-idle/non-retry status): renewed root activity that
+        // invalidates prior completion evidence even though it carries no classifiable failure.
+        if (sessionStatus.type === 'busy' && activityTracker?.rootFreshness != null) {
+          invalidateRootFreshness(activityTracker.rootFreshness)
+        }
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       }
 
@@ -296,10 +887,10 @@ export async function pollForSessionCompletion(
             elapsedMs: activityElapsed,
             sessionId,
           })
-          return {
-            completed: false,
-            error: `No agent activity detected after ${activityElapsed}ms — server may have crashed during prompt processing`,
-          }
+          return watchdogObservation(
+            `No agent activity detected after ${activityElapsed}ms — server may have crashed during prompt processing`,
+            activityTracker,
+          )
         }
       }
     } catch (pollError) {
@@ -307,7 +898,37 @@ export async function pollForSessionCompletion(
     }
   }
 
-  return {completed: false, error: 'Aborted'}
+  // Loop exited because `signal` was already aborted at the top-of-loop check — same
+  // deadline-vs-cancellation distinction as the mid-loop abort check above.
+  const terminalError = activityTracker?.terminalProviderError
+  if (terminalError != null) return providerFailureObservation(terminalError)
+  if (deadline?.isExpired() === true) return deadlineObservation(activityTracker)
+  return cancelledObservation(activityTracker)
+}
+
+export async function pollForSessionCompletion(
+  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  sessionId: string,
+  directory: string,
+  signal: AbortSignal,
+  logger: Logger,
+  maxPollTimeMs: number = DEFAULT_TIMEOUT_MS,
+  activityTracker?: ActivityTracker,
+  deadline?: ExecutionDeadline,
+  ownershipLedger?: OwnershipLedger,
+): Promise<PollResult> {
+  const observation = await pollForSessionCompletionObservation(
+    client,
+    sessionId,
+    directory,
+    signal,
+    logger,
+    maxPollTimeMs,
+    activityTracker,
+    deadline,
+    ownershipLedger,
+  )
+  return toPollResult(observation)
 }
 
 export async function waitForEventProcessorShutdown(
