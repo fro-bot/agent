@@ -113,6 +113,13 @@ function idleEvent(sessionID: string): Event {
   return {type: 'session.idle', properties: {sessionID}} as unknown as Event
 }
 
+function permissionAskedEvent(sessionID: string, requestID = 'request-id'): Event {
+  return {
+    type: 'permission.asked',
+    properties: {id: requestID, sessionID, permission: 'bash', patterns: ['*']},
+  } as unknown as Event
+}
+
 /** Yields `events` only once `promptAsync` has actually been called -- mirrors opencode.test.ts's timing fixture. */
 function createPromptStartedEventStream(
   promptAsync: ReturnType<typeof vi.fn>,
@@ -800,5 +807,73 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
     expect(result.success).toBe(false)
     expect(result.exitCode).toBe(130)
     expect(client.session.abort).toHaveBeenCalledOnce()
+  })
+})
+
+describe('executeOpenCode — permission reply validation and bounded retry (review fix)', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('detects a permission reply whose SDK response carries an embedded error, retries once, and logs the confirmed failure (not a silently-swallowed success)', async () => {
+    // #given the SDK's own HTTP client resolving with an embedded `error` field on every
+    // attempt — exactly the shape a genuinely failed reply takes upstream (mirrors
+    // `sendPromptToSession`'s `response.error` check on the same client), which a naive
+    // `await` without inspecting the response would previously have treated as success
+    const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({data: undefined, error: 'denied: boom'})
+    const mockClient = {
+      ...createMockClient([activityEvent('ses_root'), permissionAskedEvent('ses_root'), idleEvent('ses_root')]),
+      postSessionIdPermissionsPermissionId,
+    }
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+    })
+
+    // #when executeOpenCode runs the real chain end to end
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then the run itself is unaffected (the reply is fire-and-continue, Finding 3) --
+    expect(result.success).toBe(true)
+    // #then the reply was retried up to the bounded attempt limit, not accepted on the first
+    // resolved-but-failed response
+    expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledTimes(2)
+    // #then the failure actually reached the log — the embedded `error` was inspected, not
+    // discarded the way a bare `await` on the SDK call would
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'Failed to reject OpenCode permission request',
+      expect.objectContaining({eventSessionID: 'ses_root', error: expect.stringContaining('denied: boom') as string}),
+    )
+  })
+
+  it('complement: an ordinary successful reply still settles and is not reported as a failure', async () => {
+    // #given the SDK resolving with real data and no embedded error — the ordinary case
+    const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({data: {}, error: undefined})
+    const mockClient = {
+      ...createMockClient([activityEvent('ses_root'), permissionAskedEvent('ses_root'), idleEvent('ses_root')]),
+      postSessionIdPermissionsPermissionId,
+    }
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+    })
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then exactly one attempt, no failure logged
+    expect(result.success).toBe(true)
+    expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledTimes(1)
+    expect(mockLogger.warning).not.toHaveBeenCalledWith(
+      'Failed to reject OpenCode permission request',
+      expect.anything(),
+    )
   })
 })

@@ -1533,9 +1533,12 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then the attachment directory is under RUNNER_TEMP, run-scoped, and distinct from the log
-    // directory -- and is created before use
+    // directory -- and is created before use. Leaf creation is exclusive (no `recursive` option --
+    // see `createAttachmentDirExclusive`'s doc comment in `attachment-dir.ts`: a recursive mkdir's
+    // EEXIST fallback follows symlinks via `stat`, which is exactly what this leaf must not do),
+    // not the plain recursive `fs.mkdir` this pins used to assert.
     const expectedAttachmentDir = '/home/runner/work/_temp/fro-bot-attachments/4242-3'
-    expect(fs.mkdir).toHaveBeenCalledWith(expectedAttachmentDir, {recursive: true})
+    expect(fs.mkdir).toHaveBeenCalledWith(expectedAttachmentDir)
     expect(materializeReferenceFiles).toHaveBeenCalledWith(
       [{filename: 'pr-context.txt', content: 'context'}],
       expectedAttachmentDir,

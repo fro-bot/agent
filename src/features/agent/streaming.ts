@@ -689,25 +689,34 @@ export async function processEventStream(
           logger.warning('OpenCode permission request observed but no responder is configured', context)
         } else {
           logger.warning('Rejecting OpenCode permission request', context)
-          try {
-            await onPermissionAsked(request)
-          } catch (error) {
-            // Failure policy: logged-and-continued, not escalated. A failed reply means this one
-            // ask may go unanswered (the child hangs until the run's own deadline cancels it — the
-            // same outcome as if this fix did not exist), but throwing here would abort
-            // `consumeStream` for every OTHER in-flight ask and event this loop is still
-            // responsible for, trading one stuck child for the whole run's observability. Escalating
-            // is also unjustified because the caller has no retry or fallback path to escalate
-            // into — `onPermissionAsked` is a single best-effort HTTP round-trip, not a queue.
-            // Note this does NOT mean the ask was settled: the responder does not inspect the SDK
-            // result for an embedded `error` field (`execution.ts`), so even a *resolved* call
-            // above only proves the round-trip completed, not that OpenCode's permission store
-            // recorded the reject. This log line is the only evidence of that gap.
+          // Fire-and-continue: do NOT await -- a slow or hung reply must never block this loop from
+          // draining subsequent events. This is the same failure shape the previous fix closed one
+          // layer up (an unanswered ask hanging a child forever): a stalled reply here would
+          // otherwise stall every LATER event this loop observes, for every session, until the run's
+          // global deadline. Mirrors the gateway's `packages/gateway/src/execute/run-core.ts`
+          // permission.asked handling (`void coordinator.onPermissionAsked(req)`), which fires the
+          // same way and documents the same reason: awaiting would starve the SSE drain.
+          //
+          // Failure policy is otherwise unchanged from the synchronous version this replaces:
+          // logged-and-continued, not escalated. A failed reply means this one ask may go unanswered
+          // (the child hangs until the run's own deadline cancels it — the same outcome as if this
+          // fix did not exist), but throwing here would abort `consumeStream` for every OTHER
+          // in-flight ask and event this loop is still responsible for, trading one stuck child for
+          // the whole run's observability. Escalating is also unjustified because the caller has no
+          // retry or fallback path to escalate into — `onPermissionAsked` is a single best-effort
+          // round-trip (now with its own internal timeout and bounded retry, see `execution.ts`'s
+          // `replyToPermissionAsk`), not a queue.
+          //
+          // Unlike the version this replaces, a rejection reaching this `.catch` IS now a confirmed
+          // failure: the responder validates the SDK response for an embedded `error` field before
+          // resolving, so this no longer merely proves the round-trip completed.
+          // eslint-disable-next-line no-void
+          void onPermissionAsked(request).catch(error => {
             logger.warning('Failed to reject OpenCode permission request', {
               ...context,
               error: error instanceof Error ? error.message : String(error),
             })
-          }
+          })
         }
         continue
       }

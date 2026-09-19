@@ -508,11 +508,16 @@ describe('processEventStream — ownership ledger integration', () => {
       responder,
     )
 
-    // #then the failure is logged and swallowed — stream processing continues to completion
-    expect(logger.warning).toHaveBeenCalledWith(
-      'Failed to reject OpenCode permission request',
-      expect.objectContaining({eventSessionID: UNOWNED_SESSION_ID, error: 'reply failed'}),
-    )
+    // #then the failure is logged and swallowed — stream processing continues to completion.
+    // The reply is now fire-and-continue (Finding 3), so its failure is no longer guaranteed to be
+    // logged by the time `processEventStream` itself resolves -- `vi.waitFor` polls until the
+    // detached `.catch` handler has actually run.
+    await vi.waitFor(() => {
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Failed to reject OpenCode permission request',
+        expect.objectContaining({eventSessionID: UNOWNED_SESSION_ID, error: 'reply failed'}),
+      )
+    })
     expect(result).toBeDefined()
   })
 
