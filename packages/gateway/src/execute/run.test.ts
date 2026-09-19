@@ -8833,4 +8833,241 @@ describe('termination barrier — quarantine (Unit 8)', () => {
     const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
   })
+
+  describe('bounded quarantine hold', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('a quarantined run keeps holding the lock and slot for the duration of the hold window (complement of the deadlock)', async () => {
+      // #given — this is the load-bearing complement: without a bound, nothing would ever
+      // release these resources. Advancing time short of the window must still change nothing.
+      vi.useFakeTimers()
+      const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      const stopFn = vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          runEtag: 'run-etag-after-heartbeat',
+          lockEtag: 'lock-etag-after-heartbeat',
+          runState: buildMockRunState(),
+        },
+      })
+      setupHappyPath({stop: stopFn})
+      mockRunOpenCodeCore.mockRejectedValue(
+        new RunCoreError('session-error', 'Session error: LLM quota exceeded', true),
+      )
+
+      const sharedConcurrency = makeDefaultConcurrency()
+      const queue = makeDefaultQueue()
+      const deps = makeDeps({concurrency: sharedConcurrency, queue})
+      const message = makeMessage()
+
+      // #when — the run settles (quarantined) and time advances short of the hold window.
+      await runMention(message, makeBinding(), deps)
+      await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS - 1_000)
+
+      // #then — still held: no premature release, exactly what the barrier exists to prevent.
+      expect(stopFn).not.toHaveBeenCalled()
+      expect(mockRuntime.releaseLock).not.toHaveBeenCalled()
+      const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
+      expect(releaseFn).not.toHaveBeenCalled()
+    })
+
+    it('a quarantined run stops renewing after the hold window and releases the concurrency slot — becoming recoverable without an operator or restart', async () => {
+      // #given
+      vi.useFakeTimers()
+      const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      const stopFn = vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          runEtag: 'run-etag-after-heartbeat',
+          lockEtag: 'lock-etag-after-heartbeat',
+          runState: buildMockRunState(),
+        },
+      })
+      setupHappyPath({stop: stopFn})
+      mockRunOpenCodeCore.mockRejectedValue(
+        new RunCoreError('session-error', 'Session error: LLM quota exceeded', true),
+      )
+
+      const sharedConcurrency = makeDefaultConcurrency()
+      const queue = makeDefaultQueue()
+      const deps = makeDeps({concurrency: sharedConcurrency, queue})
+      const message = makeMessage()
+
+      // #when — the run settles quarantined, then the full hold window elapses.
+      await runMention(message, makeBinding(), deps)
+      await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 1_000)
+
+      // #then — the heartbeat is stopped (the lease stops renewing) and the concurrency slot
+      // is released: the gateway's capacity is not burned forever.
+      expect(stopFn).toHaveBeenCalledOnce()
+      const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
+      expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+
+      // #and — the repo lock is still never force-released directly by this module; it is
+      // left to decay via its own lease TTL now that the heartbeat has stopped renewing it.
+      expect(mockRuntime.releaseLock).not.toHaveBeenCalled()
+    })
+
+    it('a quarantined run hands the freed slot to a queued task once the hold window elapses', async () => {
+      // #given — a second task is queued for the same channel.
+      vi.useFakeTimers()
+      const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockRunOpenCodeCore.mockRejectedValueOnce(new RunCoreError('stream-ended', 'stream closed', true))
+
+      const sharedConcurrency = makeDefaultConcurrency()
+      const queue = makeDefaultQueue()
+      const pendingMessage = makeMessage()
+      const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue})
+      const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
+      ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValue(pendingTask)
+
+      const deps = makeDeps({concurrency: sharedConcurrency, queue})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 1_000)
+
+      // #then — the queued task started on the freed slot; no bare release was needed
+      // because ownership transferred directly (same atomic hand-off the ordinary path uses).
+      expect(mockRunOpenCodeCore).toHaveBeenCalledTimes(2)
+      const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
+      expect(releaseFn).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('quarantine FAILED transition failure — record must not silently stay unquarantined', () => {
+    it('retries the FAILED (quarantine) transition with a fresh etag after a conditional-write conflict', async () => {
+      // #given — the first quarantine FAILED write 412s (e.g. a heartbeat tick landed a write
+      // in between); a re-read returns a fresh etag and the retry succeeds.
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      const executingState = buildMockRunState({phase: 'EXECUTING'})
+      const failedState = buildMockRunState({phase: 'FAILED', details: {quarantined: true}})
+      const getObjectMock = vi.fn().mockResolvedValue({
+        success: true as const,
+        data: {data: JSON.stringify(executingState), etag: 'fresh-etag-after-quarantine-412'},
+      })
+      const coordinationConfig = {
+        storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+        storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+        lockTtlSeconds: 900,
+        heartbeatIntervalMs: 30_000,
+        staleThresholdMs: 60_000,
+        pendingStaleThresholdMs: 30 * 60_000,
+      } as unknown as CoordinationConfig
+
+      mockRuntime.acquireLock.mockResolvedValue({
+        success: true as const,
+        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      })
+      mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+      mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+      let failedAttempts = 0
+      mockRuntime.transitionRun.mockImplementation(async (..._args: unknown[]) => {
+        const phase = _args[4] as string
+        if (phase === 'FAILED') {
+          failedAttempts += 1
+          if (failedAttempts === 1) {
+            return {success: false as const, error: new Error('quarantine FAILED conditional write conflict')}
+          }
+          return {success: true as const, data: {etag: 'failed-etag-v2', state: failedState}}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: executingState}}
+      })
+      mockRuntime.createHeartbeatController.mockReturnValue({
+        start: vi.fn(),
+        stop: vi.fn().mockResolvedValue({
+          success: true,
+          data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: failedState},
+        }),
+        isRunning: false,
+      })
+      vi.mocked(attachModule.attachOpencode).mockReturnValue({
+        server: {url: 'http://workspace:9200'},
+        session: {create: vi.fn(), prompt: vi.fn()},
+      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
+
+      const deps = makeDeps({coordinationConfig})
+      const message = makeMessage()
+
+      // #when — must not throw despite the initial 412.
+      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — two FAILED attempts observed: the initial 412 and the retry with a fresh etag.
+      expect(failedAttempts).toBe(2)
+      const failedCalls = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'FAILED')
+      expect(failedCalls[1]?.[5]).toBe('fresh-etag-after-quarantine-412')
+    })
+
+    it('logs clearly and still applies the bounded hold when both the transition and its retry fail', async () => {
+      // #given — the re-read succeeds but the retried write also fails. The run must not
+      // throw, and the bounded hold must still be scheduled regardless of the persisted record.
+      vi.useFakeTimers()
+      const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      const executingState = buildMockRunState({phase: 'EXECUTING'})
+      const getObjectMock = vi.fn().mockResolvedValue({
+        success: true as const,
+        data: {data: JSON.stringify(executingState), etag: 'fresh-etag-that-also-conflicts'},
+      })
+      const coordinationConfig = {
+        storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+        storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+        lockTtlSeconds: 900,
+        heartbeatIntervalMs: 30_000,
+        staleThresholdMs: 60_000,
+        pendingStaleThresholdMs: 30 * 60_000,
+      } as unknown as CoordinationConfig
+
+      mockRuntime.acquireLock.mockResolvedValue({
+        success: true as const,
+        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      })
+      mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+      mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+      mockRuntime.transitionRun.mockImplementation(async (..._args: unknown[]) => {
+        const phase = _args[4] as string
+        if (phase === 'FAILED') {
+          return {success: false as const, error: new Error('quarantine FAILED conditional write conflict')}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: executingState}}
+      })
+      const stopFn = vi.fn().mockResolvedValue({
+        success: true,
+        data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: executingState},
+      })
+      mockRuntime.createHeartbeatController.mockReturnValue({start: vi.fn(), stop: stopFn, isRunning: false})
+      vi.mocked(attachModule.attachOpencode).mockReturnValue({
+        server: {url: 'http://workspace:9200'},
+        session: {create: vi.fn(), prompt: vi.fn()},
+      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
+
+      const sharedConcurrency = makeDefaultConcurrency()
+      const queue = makeDefaultQueue()
+      const deps = makeDeps({coordinationConfig, concurrency: sharedConcurrency, queue})
+      const message = makeMessage()
+
+      // #when — must not throw even though both the transition and its retry failed.
+      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — the bounded hold is scheduled regardless of the persisted record's fate, and
+      // still fires the deferred release once the window elapses.
+      await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 1_000)
+      expect(stopFn).toHaveBeenCalledOnce()
+      const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
+      expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    })
+  })
 })
