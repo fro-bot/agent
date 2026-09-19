@@ -90,11 +90,11 @@ Separately, the OpenCode file watcher runs in both surfaces and nothing in this 
 
 **Lifecycle and termination**
 
-- R16. Drain completes before execution returns, ahead of finalization, session pruning, server shutdown, cache persistence, and lock release.
+- R16. Drain completes before anything publishes, persists, prunes, shuts down, or releases the lock. **Amended from "before execution returns":** the original phrasing named an implementation shape — drain sequenced after the `runExecute()` await returns — that carries no safety meaning of its own; this restates the invariant the audit actually verified.
 - R16a. Every path that can terminate an invocation applies the outstanding-work check, not the idle branch alone. This includes the stable completed-assistant poll, the session-wait success path, and the sticky terminal flags, each of which can currently end a run independently.
 - R17. Each invocation has a single deadline covering execution and drain, reserving time for cancellation and teardown, and it is not extended by a completion notification, retry, or extension.
 - R18. On deadline expiry the harness stops admission, cancels owned work with a teardown signal separate from the expired execution signal, settles approvals, and reports once.
-- R19. Cancellation counts as confirmed for an owned entry only on an observable terminal signal: an injected completion or error turn, a cancellation the server acknowledged, or confirmed termination of the server process itself. Absent one of those, the entry is unknown.
+- R19. Cancellation counts as confirmed for an owned entry only on an observable terminal signal: an injected completion or error turn, or confirmed termination of the server process itself. Absent one of those, the entry is unknown. **Amended, deliberately stricter than originally drafted:** the original text also counted a server-acknowledged `session.abort()` as confirming on its own; an acknowledgement proves only that the request was accepted, not that the child stopped writing, so it no longer counts as a terminal signal by itself — the entry stays unknown until a later observation settles it.
 - R19a. Unfinished child work is non-fatal only for entries whose cancellation is confirmed; an unknown entry, an unconfirmed live writer, or a lease lost while held is not reported as success.
 - R20. The harness owns publication: exactly one response is published after drain, and a background subagent never publishes an invocation response.
 - R21. The harness declines cache persistence when it cannot confirm that writers have terminated.

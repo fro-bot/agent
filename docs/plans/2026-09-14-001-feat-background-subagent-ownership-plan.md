@@ -24,7 +24,7 @@ See origin: `docs/brainstorms/2026-09-13-opencode-background-subagents-requireme
 
 ## Requirements Trace
 
-R3–R24 of the origin document. R1 and R2 (the file watcher) shipped separately and are not in scope.
+Scope only — not a completion claim. R3–R24 of the origin document map to the units below; see [Requirement Status](#requirement-status) for per-requirement verdicts. R1 and R2 (the file watcher) shipped separately and are not in scope.
 
 - R3–R8. Ownership ledger, descendant event handling, retry survival, unknown-not-zero, subscription readiness, discontinuity handling
 - R9–R11. Descendant approval routing, tree-aware activity, run ownership through drain
@@ -32,6 +32,44 @@ R3–R24 of the origin document. R1 and R2 (the file watcher) shipped separately
 - R13–R15. Dispatch caps, pre-execution enforcement, no dispatch after finalization — **cut**, see Scope Boundaries
 - R16–R22a. Drain before terminal steps, every terminal path, single deadline, expiry behaviour, confirmed cancellation, publication ownership, persistence declining, lock lease
 - R23–R24. Labelled reporting, gateway startup reconciliation
+
+## Requirement Status
+
+Unit checkboxes below record artifact existence, not requirement completion — two review rounds surfaced units whose artifacts existed but whose stated requirements were not fully met. A full audit checked every requirement against the code; this table is authoritative for completion. A ticked unit claims only that all of its requirements are `shipped`.
+
+One split runs through several rows and is worth reading first, because the requirements were written as though it did not exist. The Action has two response-delivery paths (`packages/runtime/src/agent/response-delivery.ts`), chosen by delivery classification rather than by a fixed trigger list. On the **file-convention** path — the `affected` classification (`pull_request`, `issue_comment`, `issues`) — the harness posts, so it can sequence publication against drain and own the one-response rule. Everything else resolves to the **`model-gh`** path: the `autonomous` classification (`workflow_dispatch`, `schedule`) and the `deferred-or-unknown` classification, which covers `pull_request_review_comment`, `discussion_comment`, and any event name the classifier does not recognize — an unrecognized event defaults into `model-gh`, so the set is open-ended rather than fixed. On `model-gh`, the model posts its own response with `gh` during Execute, before drain has run and outside harness control. Requirements phrased as "the harness owns publication" or "drain completes before anything publishes" therefore hold on one path and not the other, and are marked `partial` for that reason rather than because the file-convention implementation is incomplete.
+
+| Requirement | Status | Note |
+|---|---|---|
+| R1 | out of scope | Shipped separately (PR #1608, file watcher). |
+| R2 | out of scope | Shipped separately (PR #1608, file watcher). |
+| R3 | partial | Ledger is keyed on child session id and idempotent; the extension and promotion paths have no implementation, and no promotion path exists at all. |
+| R4 | shipped | Descendant events are handled and unowned sessions are rejected, on both surfaces. |
+| R5 | partial | Ownership survives retry by refusing to retry until drain-complete, not by cancelling or settling the prior tree; no gateway retry path exists. |
+| R6 | partial | Holds for tracked entries, which resolve to unknown and never zero; an unobserved dispatch reads as zero, indistinguishable from "no work dispatched." |
+| R7 | partial | Subscription is ordered before submission on both surfaces, but neither confirms it is live; no readiness handshake exists. |
+| R8 | partial | Unknown resolution and bounded cancellation ship; a discontinuity is recorded but never converted into an incomplete outcome, so polling can still report success (the gateway raises `stream-ended` on early stream close). |
+| R9 | partial | Implemented and ownership-gated, but unexercised — nothing in this codebase issues a background dispatch today. |
+| R10 | partial | Descendant activity resets inactivity, but the run's busy projection is set false on entering drain; the per-request registry also cannot stop upstream from settling every pending approval when one is rejected. |
+| R11 | partial | An owned descendant's `session.error` throws immediately (`run-core.ts:947-958`), bypassing drain; the finally-block cleanup then disposes approval routing and releases the slot (`run.ts:846-850`, `:1166-1190`, `:1215-1275`) without settling the other owned entries. |
+| R12 | partial | Pinned for the Action (`src/services/setup/ci-config.ts`); the gateway's workspace container never sets `subagent_depth`, so it inherits the upstream default instead of enforcing it. |
+| R13 | cut | See Scope Boundaries. |
+| R14 | cut | See Scope Boundaries. |
+| R15 | cut | See Scope Boundaries; nothing replaces the dispatch-refusal safety clause — stream shutdown after the abort signal is not a dispatch refusal, so a dispatch during finalization is unlikely but not structurally prevented. |
+| R16 | partial | Holds on the file-convention path: drain precedes finalization, pruning, shutdown, persistence, and lock release. Not on the `model-gh` path (see the delivery-path split above), where the model posts its own response with `gh` during Execute — `runDrain()` only starts after `runExecute()` returns, so that response publishes before drain. |
+| R16a | partial | The gate exists at each named path, but no test isolates it as load-bearing: the completed-assistant test is independently blocked by busy status until after the ledger settles, and the racing-fixture test is rejected for a missing finish reason before the ledger check is reached. |
+| R17 | partial | One fixed execution deadline is never extended, but execution and drain do not share it — drain receives a derived remaining budget after execution returns. |
+| R18 | partial | Stop-admission, cancellation, and a separate teardown signal ship; no drain-path approval settlement exists, and expiry is not propagated into the invocation result. |
+| R19 | partial | Reconciliation also settles an entry on corroborated absence from the live (non-idle) status map (`ledger-reconcile.ts:198-200`) — a third signal the requirement does not name. Absence from that map confirms the session went idle, not that it terminated; upstream removes idle sessions from the map on their own. |
+| R19a | partial | Persistence correctly declines, but the run still finalizes, publishes, writes the dedup marker, emits a success reaction, and exits 0. |
+| R20 | partial | Holds on the file-convention path, where the harness posts. On `model-gh` the model owns publication, so nothing structurally prevents a credentialed descendant from posting, and finalize accepts any positive comment count rather than proving a single harness-owned publisher. |
+| R21 | partial | Declines persistence when ownership or quiescence can't be confirmed, but the `held-by-other` lock skip (`run.ts:124-135`) reaches cleanup with no lease at all, so its persistence-safety check runs exactly as it would for a lock-free run — it cannot decline on the writer it just detected. |
+| R22 | partial | Renewal spans execution, drain, and persistence and protects persistence, but does not fail the invocation closed, and `hasFailed()` reflects only the latest tick. |
+| R22a | partial | No-lock fail-open is scoped to runs that proceed without a lock (S3 unconfigured, or acquisition errored); it does not authorize fail-open for a run that declined to proceed because another surface already holds the lock, but the `held-by-other` skip (`run.ts:124-135`) is treated identically by cleanup. |
+| R23 | partial | Labels and the degraded-state note land in the job summary only; the invocation's published response carries no unfinished-work labels (see Unit 13). |
+| R24 | partial | Reconciliation and cancel-or-unknown ship; nothing gates admission on reconciliation completing, so a run can reach `PENDING` and only later collide with the durable lock. |
+
+**Cross-cutting finding.** Three independent paths — drain expiry with unknown work, stream discontinuity, and lease-renewal failure — each detect a safety condition, log it, and then fail to propagate it into the run's reported outcome: the run still publishes, dedups, reacts success, and exits 0. The dedup marker is the sharpest edge, because a deduped incomplete run is never retried. A fourth instance is the `held-by-other` lock skip (R21, R22a): it detects that another surface holds the coordination lock, logs it, and returns before the persistence gate can see that context, so cleanup persists as though no conflicting writer existed. Fixing this is code work, not a documentation change, and it is a prerequisite for the release gate (Unit 14).
 
 ## Scope Boundaries
 
@@ -197,6 +235,8 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 **Requirements:** R3, R6
 
+**Status:** Unticked — R3 and R6 are partial; see [Requirement Status](#requirement-status).
+
 **Dependencies:** None
 
 **Files:**
@@ -232,6 +272,8 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 **Requirements:** R12
 
+**Status:** Unticked — R12 is partial; see [Requirement Status](#requirement-status).
+
 **Dependencies:** None
 
 **Files:**
@@ -255,7 +297,9 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 **Goal:** The ledger recovers from events it never saw.
 
-**Requirements:** R6, R8
+**Requirements:** R6 (tracked entries only), R8
+
+**Status:** Unticked — R6 and R8 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1
 
@@ -291,6 +335,8 @@ The ledger distinguishes three states per entry — outstanding, settled, unknow
 
 The consequence: **a dispatch whose event is never observed is unrecoverable.** The ledger cannot know about work it never saw, and nothing available to a client can tell that work apart from a foreground subagent. This is a real gap, not a solved problem, and the release gate must weigh it — it is bounded by the run deadline, and nothing can dispatch in background today, but it does not close on its own. Closing it needs an upstream discriminant on the session record, or a server-side hook that sees the tool's actual arguments.
 
+That gap is also why R6 above is marked partial rather than shipped. R6's origin text covers a missing, ambiguous, or unobservable signal — an unobserved dispatch falls squarely inside that scope, not outside it. The distinction worth keeping is in how R6 is unmet, not whether it applies: a live child this ledger already knows about settles to unknown, never zero, when reconciliation cannot confirm it; a dispatch the ledger never learned about leaves no entry at all, which reads as zero — indistinguishable from no work dispatched. R6 holds for tracked entries and fails for the untracked case, and the checkbox above records exactly that partial state.
+
 ### Phase 2 — Gateway
 
 - [ ] **Unit 4: Descendant event handling and approval routing**
@@ -298,6 +344,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Goal:** Events from owned descendant sessions reach the gateway's handlers, and their approvals reach the existing coordinator.
 
 **Requirements:** R4, R9, R10
+
+**Status:** Unticked — R9 and R10 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1
 
@@ -334,6 +382,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 
 **Requirements:** R9
 
+**Status:** Unticked — R9 is partial; see [Requirement Status](#requirement-status).
+
 **Dependencies:** Unit 4
 
 **Files:**
@@ -360,6 +410,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Goal:** The gateway keeps its slot, lease, and approval routing until owned work settles.
 
 **Requirements:** R11, R16, R17, R18
+
+**Status:** Unticked — R11, R16, R17, and R18 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 4
 
@@ -394,6 +446,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 
 **Requirements:** R24
 
+**Status:** Unticked — R24 is partial; see [Requirement Status](#requirement-status).
+
 **Dependencies:** Unit 1, Unit 3
 
 **Files:**
@@ -427,6 +481,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 
 **Requirements:** R4, R7, R8
 
+**Status:** Unticked — R7 and R8 are partial; see [Requirement Status](#requirement-status).
+
 **Dependencies:** Unit 1, Unit 3
 
 **Files:**
@@ -458,6 +514,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 
 **Requirements:** R16a
 
+**Status:** Unticked — R16a is partial; see [Requirement Status](#requirement-status).
+
 **Dependencies:** Unit 1, Unit 8
 
 **Files:**
@@ -484,11 +542,15 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - Each of the four paths has a test proving it declines while work is outstanding.
 
+**Disproved during review.** Two of the four candidate proofs do not isolate the ledger gate: `session-poll.test.ts:181-245` is independently blocked by busy status until after the ledger settles, so the gate is never the operative guard in that test, and `retry.test.ts:368-433`'s racing fixture lacks the required finish reason, so the message-fallback path is rejected before the ledger check is reached. R16a is marked partial rather than shipped; see [Requirement Status](#requirement-status).
+
 - [ ] **Unit 10: Drain before finalize**
 
 **Goal:** Owned work settles before the Action publishes, persists, or releases anything.
 
 **Requirements:** R16, R17, R18, R19, R19a
+
+**Status:** Unticked — R16, R17, R18, R19, and R19a are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 9
 
@@ -500,7 +562,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Approach:**
 - Finalize precedes cleanup (`run.ts:171-233`), so drain belongs ahead of finalize, not inside cleanup. A drain in cleanup would publish a response while children still modify the repository.
 - On expiry: stop admission, cancel owned work with a teardown signal distinct from the expired execution signal, settle approvals, report once.
-- Cancellation is confirmed only on an observable terminal signal — an injected completion or error turn, a server-acknowledged cancellation, or confirmed server termination. Anything else is unknown.
+- Cancellation is confirmed only on an observable terminal signal — an injected completion or error turn, or confirmed server termination. A server-acknowledged cancellation is not one: an acknowledgement proves the request was accepted, not that the child stopped writing. Anything else is unknown. (See R19, amended, and its `partial` status — reconciliation additionally settles on absence from the live non-idle status map, which confirms idle rather than termination.)
 - A known terminal outcome must survive drain. Cleanup running long must not rewrite a decided result into a timeout.
 
 **Test scenarios:**
@@ -519,6 +581,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Goal:** Replacing a session does not orphan the work the previous one owned.
 
 **Requirements:** R5
+
+**Status:** Unticked — R5 is partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 10
 
@@ -553,6 +617,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Goal:** One response, no persistence over unconfirmed writers, and a lease that lasts the protected interval.
 
 **Requirements:** R19a, R20, R21, R22, R22a
+
+**Status:** Unticked — R19a, R20, R21, R22, and R22a are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 10
 
@@ -615,6 +681,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 **Verification:**
 - A reader can tell from the output which work finished, which was cancelled, and which is unknown.
 
+**Shipped narrower than R23.** `runFinalizeWithResult()` passes `execution.ownershipLedger` to `writeJobSummary()` only (`src/harness/phases/finalize.ts:220`); the stable labels and the degraded-state note land in the Actions job summary and nowhere else. The invocation's actual single response — the comment or review the harness delivers, the invocation's response under this project's Response Protocol — carries no unfinished-work labels. R23 requires that the invocation's single response name any execution that did not finish by its label; job-summary-only reporting does not satisfy that. Narrowing R23 to job-summary-only reporting is an available decision, not one this unit has made — the unit stays open until either the published response carries the labels or that narrowing is decided deliberately.
+
 ### Phase 4 — Release gate
 
 - [ ] **Unit 14: Enable the flag and verify end to end**
@@ -635,8 +703,8 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 - This phase gates Phases 1–3 rather than sitting beside them as a peer step: the flag flips only once every prior unit has merged with its tests passing.
 - Upstream has no background-job cap of its own, and this plan cut its attempt at one (see Scope Boundaries). Nothing bounds how many dispatches an invocation makes; what bounds the invocation is its deadline, and what keeps work from outliving it is drain. Do not flip this flag on the assumption a cap exists.
 - Before flipping, demonstrate terminal quiescence independently of any gate: a late completion notification and a dispatch racing finalization must both be handled correctly. Zero observed outstanding work is not proof that nothing can start more.
-- **Resolve the conflated lifecycle signals first.** An independent review of `runPromptAttempt` and `executeOpenCode` found that several facts are inferred from things that do not imply them, and the invariant they violate is one sentence: selecting an error never proves quiescence, and observing quiescence never erases an error. Specifically — a terminal provider classification is treated as an observed terminal turn signal even when it came from a retry status; root idle sets sticky flags that a later resumption never clears, which matters precisely because a background completion injects another parent turn; the completed-assistant fallback accepts two stable observations without checking idle status, message error, or finish reason, though upstream distinguishes `tool-calls` and `unknown` from a finished turn; and a deferred failure returns before poll-observed terminal errors are merged, so a poll-only terminal error can lose to a retryable saved one. These are not created by this plan and most are reachable today, but each one becomes materially worse once a descendant can produce the signal — descendant provider-status handling in particular is already ownership-widened while `session.error` is root-scoped.
-- Verify the umbrella empirically rather than by repository search. `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` resolves through `enabledByExperimental` (upstream `packages/opencode/src/effect/runtime-flags.ts:11-14,43`), so an unset specific flag inherits `OPENCODE_EXPERIMENTAL`. The umbrella is unset everywhere in this repository, but `deploy/.env` is not committed, so the gateway's deployed environment cannot be confirmed from the repository alone.
+- **Resolve the conflated lifecycle signals first — done.** An independent review of `runPromptAttempt` and `executeOpenCode` found that several facts were inferred from things that did not imply them, and the invariant they violated is one sentence: selecting an error never proves quiescence, and observing quiescence never erases an error. This precondition is now satisfied: a classified error no longer claims the turn ended; a descendant's retry status no longer writes root failure state; completion evidence is generation-scoped, so renewed root activity invalidates evidence from a superseded generation rather than letting it authorize a later turn; and the completed-assistant predicate now requires a finish reason present and not `tool-calls`/`unknown`, correlation to the latest root user message once one has been observed (a no-op in the common single-turn case, where the pending-parent check remains the operative guard), qualification of any left-over tool part, `session.status()` corroboration, and a drained ownership ledger before admitting completion.
+- Verify the umbrella empirically rather than by repository search. `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` resolves through `enabledByExperimental` (upstream `packages/opencode/src/effect/runtime-flags.ts:11-14,43`), so an unset specific flag inherits `OPENCODE_EXPERIMENTAL`. The umbrella is unset everywhere in this repository, but `deploy/.env` is not committed, so the gateway's deployed environment cannot be confirmed from the repository alone. A repository search on 2026-09-18 confirmed both `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` and the `OPENCODE_EXPERIMENTAL` umbrella are unset everywhere in the repository, which settles only the Action's repository-configured defaults — `filterAgentEnv`'s `OPENCODE_` allow-prefix (`packages/runtime/src/agent/filter-env.ts:61`) passes any operator-set `OPENCODE_`-prefixed variable through from the consuming workflow's or runner's environment, and neither is visible to a repository search, so the Action surface is not settled outright; it does not settle this item at all, since the gateway's deployed environment still cannot be confirmed from the repository.
 - **Weigh the unrecoverable dropped dispatch before flipping** (see Unit 3). A dispatch whose event is never observed cannot be recovered, because nothing available to a client distinguishes a background child session from a foreground one. The ledger reads zero and the run proceeds normally over work it does not know about. That is the plan's original central hazard, still open. It is bounded by the run deadline and cannot occur while dispatch is disabled, but enabling the flag is exactly what makes it reachable — decide deliberately whether that is acceptable, rather than inheriting the assumption that reconciliation covers it.
 - Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` on both surfaces, following the pattern established for the file watcher — default only when unset or empty, so an operator value wins.
 - Note the umbrella interaction: `OPENCODE_EXPERIMENTAL=true` enables background subagents independently, so the ownership machinery must hold whether or not this project sets the specific flag. The umbrella is unset everywhere in this repository today, so the interaction is latent rather than active; the rollout should assert it stays unset until Units 1–13 land, rather than assuming it.
@@ -667,7 +735,7 @@ The consequence: **a dispatch whose event is never observed is unrecoverable.** 
 | Risk | Mitigation |
 |------|------------|
 | Overflow recovery leaves two sets of writers on one workspace | Cancel and settle owned work before archiving (Unit 11) |
-| A terminal path is left ungated and the run exits through it | One test per path, each proving it declines while work is outstanding (Unit 9) |
+| A terminal path is left ungated and the run exits through it | Open. The gate exists at each named path, but no test isolates it as load-bearing — see R16a in [Requirement Status](#requirement-status) |
 | Cache persists over a live writer | Persistence declines on unknown entries or unconfirmed quiescence, and the decline is a visible outcome, not a silent skip (Unit 12) |
 | A draining gateway run is swept as stale and its subagents killed | The heartbeat renews through drain (Unit 6) |
 | A descendant approval reaches nobody and hangs to the deadline | Terminal post failures auto-reject on the server, and the rejection is operator-visible (Unit 5) |
