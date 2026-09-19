@@ -8941,6 +8941,38 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
       expect(releaseFn).not.toHaveBeenCalled()
     })
+
+    it('after the quarantine FAILED transition succeeds, no further conditional write (transitionRun or releaseLock) occurs before the hold window elapses', async () => {
+      // #given — pins the invariant behind removing the dead `runEtag = quarantineResult.data.etag`
+      // assignments: the quarantine path performs exactly one terminal write (the FAILED
+      // transition itself) and then nothing else touches the coordination store until the
+      // bounded hold window elapses. If a future change adds a conditional write here, it
+      // would reach for a captured etag that is now stale/absent — this test catches the
+      // extra write landing at all, independent of which etag it used.
+      vi.useFakeTimers()
+      const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockRunOpenCodeCore.mockRejectedValue(
+        new RunCoreError('session-error', 'Session error: LLM quota exceeded', true),
+      )
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when — the run settles quarantined, then time advances past the hold window.
+      await runMention(message, makeBinding(), deps)
+      await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 1_000)
+
+      // #then — exactly the three writes the ordinary path makes on its way into quarantine
+      // (ACKNOWLEDGED, EXECUTING, the quarantine FAILED transition) and nothing else — neither
+      // a synchronous extra write in the quarantine branch nor a deferred one from the bounded-
+      // release callback once the hold window elapses. Exact-sequence assertion (not just a
+      // count) so an extra write is caught regardless of where in the sequence it lands.
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toEqual(['ACKNOWLEDGED', 'EXECUTING', 'FAILED'])
+      expect(mockRuntime.releaseLock).not.toHaveBeenCalled()
+    })
   })
 
   describe('quarantine FAILED transition failure — record must not silently stay unquarantined', () => {

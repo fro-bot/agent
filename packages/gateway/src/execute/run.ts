@@ -1143,13 +1143,19 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
                 'run: quarantine FAILED transition retry also failed — record may misrepresent this run as non-terminal; the bounded hold below still applies regardless',
               )
             } else {
-              runEtag = retryResult.data.etag
+              // Not `runEtag = retryResult.data.etag`: the quarantine path performs no
+              // further conditional write after this point (scheduleQuarantineRelease's
+              // heartbeat.stop() below reads its own fresh etags and never consults this
+              // one) — the lease is deliberately left to expire into stale-run recovery.
+              // If a future change adds a conditional write here, capture the etag fresh
+              // from that call's own result rather than reaching for this stale binding.
               quarantineStateForNotify = retryResult.data.state
               logger.warn({repo, runId}, 'run: quarantine FAILED transition recovered on retry with a fresh etag')
             }
           }
         } else {
-          runEtag = quarantineResult.data.etag
+          // Not `runEtag = quarantineResult.data.etag`: see the comment in the retry
+          // branch above — no further conditional write follows on this path.
           quarantineStateForNotify = quarantineResult.data.state
         }
 
