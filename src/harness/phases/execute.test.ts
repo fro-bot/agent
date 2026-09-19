@@ -95,6 +95,7 @@ function createAgentResult(overrides: Partial<AgentResult> = {}): AgentResult {
       message: 'The model context window was exceeded.',
       retryable: false,
     },
+    observationGap: false,
     ...overrides,
   }
 }

@@ -49,11 +49,18 @@ const ROOT_SESSION_ID = 'ses_root'
 const CHILD_SESSION_ID = 'ses_child'
 const UNOWNED_SESSION_ID = 'ses_stranger'
 
-function createMockEventStream(events: readonly Event[]): AsyncIterable<Event> {
+function createMockEventStream(events: readonly Event[], onExhausted?: () => void): AsyncIterable<Event> {
   return (async function* () {
     for (const event of events) {
       yield event
     }
+    // Models a caller that has already decided to stop watching by the time the transport's
+    // own stream naturally ends -- e.g. an abort issued in response to a terminal signal this
+    // same scripted event list just delivered. Without this, every finite, synchronously-yielding
+    // test stream would otherwise look identical to a genuinely silent, unrequested transport
+    // drop (Fix 1's new unexpected-EOF detection), which is not what these particular
+    // ownership/classification-focused tests are modeling.
+    onExhausted?.()
   })()
 }
 
@@ -146,17 +153,20 @@ function toolSuccessEvent(sessionID: string): Event {
 
 describe('processEventStream — ownership ledger integration', () => {
   it('opens a ledger entry when a background dispatch on an owned session is observed', async () => {
-    // #given a ledger and a background dispatch event on the root session
+    // #given a ledger and a background dispatch event on the root session; the caller aborts
+    // once the scripted stream is exhausted, the same as retry.ts does after deciding completion
     const ledger = createOwnershipLedger()
-    const eventStream = createMockEventStream([
-      backgroundDispatchEvent(ROOT_SESSION_ID, CHILD_SESSION_ID, 'do the thing'),
-    ])
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream(
+      [backgroundDispatchEvent(ROOT_SESSION_ID, CHILD_SESSION_ID, 'do the thing')],
+      () => abortController.abort(),
+    )
 
     // #when the stream is processed with the ledger supplied
     await processEventStream(
       eventStream,
       ROOT_SESSION_ID,
-      new AbortController().signal,
+      abortController.signal,
       createMockLogger(),
       undefined,
       undefined,
@@ -196,15 +206,17 @@ describe('processEventStream — ownership ledger integration', () => {
     // #given a ledger with an outstanding child, and a stray text part carrying the same marker but on the CHILD's own session
     const ledger = createOwnershipLedger()
     ledger.adopt(CHILD_SESSION_ID, 'do the thing')
-    const eventStream = createMockEventStream([
-      injectedCompletionEvent(CHILD_SESSION_ID, CHILD_SESSION_ID, 'completed'),
-    ])
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream(
+      [injectedCompletionEvent(CHILD_SESSION_ID, CHILD_SESSION_ID, 'completed')],
+      () => abortController.abort(),
+    )
 
     // #when the stream is processed
     await processEventStream(
       eventStream,
       ROOT_SESSION_ID,
-      new AbortController().signal,
+      abortController.signal,
       createMockLogger(),
       undefined,
       undefined,
@@ -220,14 +232,15 @@ describe('processEventStream — ownership ledger integration', () => {
     // #given a ledger that owns only the root and one adopted child, and an event from a third, unrelated session
     const ledger = createOwnershipLedger()
     ledger.adopt(CHILD_SESSION_ID, 'do the thing')
-    const eventStream = createMockEventStream([toolSuccessEvent(UNOWNED_SESSION_ID)])
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([toolSuccessEvent(UNOWNED_SESSION_ID)], () => abortController.abort())
     const logger = createMockLogger()
 
     // #when the stream is processed
     const result = await processEventStream(
       eventStream,
       ROOT_SESSION_ID,
-      new AbortController().signal,
+      abortController.signal,
       logger,
       undefined,
       undefined,
@@ -305,6 +318,238 @@ describe('processEventStream — ownership ledger integration', () => {
     })
   })
 
+  it("answers an untracked foreground subagent's ask — the defect this fix closes: a foreground dispatch is never adopted into the ledger, so the old ownership gate silently dropped its ask and the child hung forever", async () => {
+    // #given no ledger entry for this session at all (a foreground `task` dispatch is never
+    // adopted — only background dispatches are, per `ownershipLedger.adopt` on the `task` tool's
+    // completed part with `metadata.background === true`)
+    const ledger = createOwnershipLedger()
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', sessionID: UNOWNED_SESSION_ID, permission: 'read', patterns: ['*.env']},
+      } as unknown as Event,
+    ])
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      responder,
+      ledger,
+    )
+
+    // #then the ask is answered anyway, targeting the foreground subagent's own session id
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: UNOWNED_SESSION_ID,
+      permission: 'read',
+      patterns: ['*.env'],
+    })
+  })
+
+  it("answers a pre-adoption background ask — the ask can arrive before the task tool's completed part adopts the child", async () => {
+    // #given a ledger that has not yet adopted the child (the adoption event has not been observed
+    // yet), and a permission ask already arriving from that not-yet-adopted session
+    const ledger = createOwnershipLedger()
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream(
+      [
+        {
+          type: 'permission.asked',
+          properties: {id: 'request-id', sessionID: CHILD_SESSION_ID, permission: 'bash', patterns: ['*']},
+        } as unknown as Event,
+        backgroundDispatchEvent(ROOT_SESSION_ID, CHILD_SESSION_ID, 'do the thing'),
+      ],
+      () => abortController.abort(),
+    )
+
+    // #when the stream is processed — the ask arrives strictly before the adoption event. The
+    // caller aborts once the scripted stream is exhausted (mirroring retry.ts) so a natural
+    // end-of-stream isn't itself recorded as a discontinuity that would mark the freshly-adopted
+    // entry unknown before this assertion runs.
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      responder,
+      ledger,
+    )
+
+    // #then the ask is answered even though the ledger had not adopted the child yet
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: CHILD_SESSION_ID,
+      permission: 'bash',
+      patterns: ['*'],
+    })
+    // #then adoption still proceeds normally afterward, unaffected by permission handling
+    expect(ledger.outstanding()).toBe(1)
+  })
+
+  it("still answers the root's own ask exactly as before — removing the ownership requirement does not change root behavior", async () => {
+    // #given no ledger, and an ask from the root session (the only case that worked pre-fix)
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', sessionID: ROOT_SESSION_ID, permission: 'edit', patterns: ['*']},
+      } as unknown as Event,
+    ])
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then the root's ask is answered, targeting the root's own session id
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: ROOT_SESSION_ID,
+      permission: 'edit',
+      patterns: ['*'],
+    })
+  })
+
+  it('handles a permission ask with no session id without throwing and without issuing a reply', async () => {
+    // #given a malformed ask event carrying no session id at all
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const logger = createMockLogger()
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', permission: 'bash', patterns: ['*']},
+      } as unknown as Event,
+      messageUpdatedEvent(ROOT_SESSION_ID),
+    ])
+
+    // #when the stream is processed — must not throw, and must reach the later event
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then no reply is issued for a session-less ask, and the stream still completes
+    expect(responder).not.toHaveBeenCalled()
+    expect(result).toBeDefined()
+  })
+
+  it('handles a permission ask with no request id without throwing and without issuing a reply', async () => {
+    // #given a malformed ask event carrying a session id but no request id
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const logger = createMockLogger()
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {sessionID: UNOWNED_SESSION_ID, permission: 'bash', patterns: ['*']},
+      } as unknown as Event,
+      messageUpdatedEvent(ROOT_SESSION_ID),
+    ])
+
+    // #when the stream is processed — must not throw
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then no reply is issued for a request-id-less ask, and the missing-id warning still fires
+    expect(responder).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalledWith(
+      'OpenCode permission request missing request id',
+      expect.objectContaining({eventSessionID: UNOWNED_SESSION_ID}),
+    )
+    expect(result).toBeDefined()
+  })
+
+  it('logs and continues — never throws — when the responder rejects for an untracked session, per the documented failure policy', async () => {
+    // #given an untracked session's ask, and a responder whose reply fails
+    const logger = createMockLogger()
+    const responder = vi.fn().mockRejectedValue(new Error('reply failed'))
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', sessionID: UNOWNED_SESSION_ID, permission: 'bash', patterns: ['*']},
+      } as unknown as Event,
+      messageUpdatedEvent(ROOT_SESSION_ID),
+    ])
+
+    // #when the stream is processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then the failure is logged and swallowed — stream processing continues to completion.
+    // The reply is now fire-and-continue (Finding 3), so its failure is no longer guaranteed to be
+    // logged by the time `processEventStream` itself resolves -- `vi.waitFor` polls until the
+    // detached `.catch` handler has actually run.
+    await vi.waitFor(() => {
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Failed to reject OpenCode permission request',
+        expect.objectContaining({eventSessionID: UNOWNED_SESSION_ID, error: 'reply failed'}),
+      )
+    })
+    expect(result).toBeDefined()
+  })
+
+  it("complement: a foreign session's non-permission events are still ignored — only permission.asked stopped requiring ownership", async () => {
+    // #given events of every other ownership-gated type from a session neither root nor ledger-tracked
+    const ledger = createOwnershipLedger()
+    const logger = createMockLogger()
+    const eventStream = createMockEventStream([
+      messageUpdatedEvent(UNOWNED_SESSION_ID),
+      toolSuccessEvent(UNOWNED_SESSION_ID),
+      sessionErrorEvent(UNOWNED_SESSION_ID),
+    ])
+
+    // #when the stream is processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then none of it is attributed to this run: no tokens recorded, no error surfaced, ledger untouched
+    expect(result.tokens).toBeNull()
+    expect(result.llmError).toBeNull()
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.snapshot()).toEqual([])
+  })
+
   it('marks outstanding entries unknown on a stream discontinuity and returns a partial result instead of throwing', async () => {
     // #given a ledger with an outstanding child, and a stream that throws mid-iteration
     const ledger = createOwnershipLedger()
@@ -360,6 +605,280 @@ describe('processEventStream — ownership ledger integration', () => {
 
     // #then no termination metadata and no llmError are fabricated from an intentional shutdown
     expect(result.discontinuity).toBeUndefined()
+    expect(result.llmError).toBeNull()
+  })
+
+  it('marks outstanding entries unknown and records a discontinuity when the stream ends without a thrown error or an aborted signal', async () => {
+    // #given a ledger with an outstanding child, and a stream that simply runs dry -- no throw,
+    // no abort. This models a transport that closes the connection without ever signaling why.
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)])
+
+    // #when the stream is processed with a signal that is never aborted
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then this is treated exactly like a thrown discontinuity: outstanding entries go unknown
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.unknown()).toBe(1)
+
+    // #then termination metadata says the channel closed unexpectedly -- an unobserved end of
+    // stream is exactly as much a gap as a thrown one, not silent success
+    expect(result.discontinuity).toEqual({message: 'Event stream ended unexpectedly'})
+  })
+
+  it('does not record a discontinuity when the stream runs dry because the caller already aborted (intentional shutdown, no throw)', async () => {
+    // #given a ledger with an outstanding child, and an already-aborted signal -- the loop's own
+    // `if (signal.aborted) break` exits the stream without ever throwing
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const abortController = new AbortController()
+    abortController.abort()
+    const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)])
+
+    // #when the stream is processed with the pre-aborted signal
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then nothing is marked unknown and no discontinuity is fabricated -- this was requested
+    expect(ledger.outstanding()).toBe(1)
+    expect(ledger.unknown()).toBe(0)
+    expect(result.discontinuity).toBeUndefined()
+  })
+
+  it('does not record a discontinuity when the stream runs dry after the attempt was already decided by deadline expiry (bounded collection, signal aborted)', async () => {
+    // #given a deadline that has already expired, whose expiry is reflected in the combined
+    // signal being aborted -- mirroring retry.ts's `AbortSignal.any([eventAbortController.signal,
+    // deadline.signal])`. The event stream still yields a couple more events (bounded collection
+    // continuing past the decided attempt) before running dry.
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const abortController = new AbortController()
+    abortController.abort()
+    const deadline = {
+      timeoutMs: 0,
+      signal: abortController.signal,
+      isExpired: () => true,
+      isTimedOut: () => true,
+      remainingMs: () => 0,
+      run: async <T>(operation: () => Promise<T>) => operation(),
+      dispose: () => {},
+    }
+    const eventStream = createMockEventStream([
+      messageUpdatedEvent(ROOT_SESSION_ID),
+      messageUpdatedEvent(ROOT_SESSION_ID),
+    ])
+
+    // #when the stream is processed with the deadline-aborted signal
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      undefined,
+      deadline,
+      undefined,
+      ledger,
+    )
+
+    // #then a decided-attempt's bounded collection running dry is not an observation gap
+    expect(result.discontinuity).toBeUndefined()
+    expect(ledger.outstanding()).toBe(1)
+    expect(ledger.unknown()).toBe(0)
+  })
+
+  it('records a discontinuity on an unexpected end of stream with an empty ledger (the observation gap the check exists to catch)', async () => {
+    // #given a ledger supplied but with nothing adopted -- empty, not outstanding. This is exactly
+    // the case the old ownership-occupancy gate assumed away: the stream can close before the
+    // dispatch-adoption event is ever observed, leaving the ledger with nothing to show for it.
+    const ledger = createOwnershipLedger()
+    const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)])
+
+    // #when the stream is processed with a signal that is never aborted
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the gap is recorded even though the ledger held nothing to mark unknown -- an empty
+    // ledger is not proof that no unobserved dispatch happened, only that none was ever recorded
+    expect(result.discontinuity).toEqual({message: 'Event stream ended unexpectedly'})
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.unknown()).toBe(0)
+  })
+
+  it('records a discontinuity on an unexpected end of stream with a fully settled ledger', async () => {
+    // #given a ledger whose only entry already settled before the stream closed
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    ledger.settle(CHILD_SESSION_ID)
+    const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)])
+
+    // #when the stream is processed with a signal that is never aborted
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the gap is still recorded -- a settled entry does not retroactively prove no *other*
+    // unobserved dispatch happened while the channel was blind
+    expect(result.discontinuity).toEqual({message: 'Event stream ended unexpectedly'})
+    expect(ledger.snapshot()).toEqual([{sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'settled'}])
+  })
+
+  it('records a discontinuity on an unexpected end of stream with no ledger supplied at all', async () => {
+    // #given no ownershipLedger argument whatsoever -- the gap must not depend on ownership
+    // tracking being wired up at all
+    const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)])
+
+    // #when the stream is processed with a signal that is never aborted, and no ledger
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the gap is still recorded
+    expect(result.discontinuity).toEqual({message: 'Event stream ended unexpectedly'})
+  })
+
+  // #given four ledger states (no ledger, empty, fully settled, outstanding) each paired with a
+  // stream that runs dry only after the caller's own abort has already landed -- an intentional
+  // shutdown must never be recorded as a gap, regardless of what the ledger holds
+  it.each([
+    ['no ledger', undefined],
+    ['empty ledger', createOwnershipLedger()],
+    [
+      'fully settled ledger',
+      (() => {
+        const ledger = createOwnershipLedger()
+        ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+        ledger.settle(CHILD_SESSION_ID)
+        return ledger
+      })(),
+    ],
+    [
+      'outstanding ledger',
+      (() => {
+        const ledger = createOwnershipLedger()
+        ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+        return ledger
+      })(),
+    ],
+  ] satisfies [string, OwnershipLedger | undefined][])(
+    'does not record a discontinuity on an intentional caller-requested shutdown (%s)',
+    async (_label, ledger) => {
+      // #given a signal the caller aborts exactly when this scripted stream naturally runs dry
+      const abortController = new AbortController()
+      const eventStream = createMockEventStream([messageUpdatedEvent(ROOT_SESSION_ID)], () => abortController.abort())
+
+      // #when processed
+      const result = await processEventStream(
+        eventStream,
+        ROOT_SESSION_ID,
+        abortController.signal,
+        createMockLogger(),
+        undefined,
+        undefined,
+        undefined,
+        ledger,
+      )
+
+      // #then no gap is fabricated for an intentional shutdown, in any ledger state
+      expect(result.discontinuity).toBeUndefined()
+    },
+  )
+
+  it('still records a discontinuity on a thrown transport failure regardless of ledger occupancy', async () => {
+    // #given a stream that throws mid-iteration with an empty (not outstanding) ledger -- pins that
+    // the thrown-error path was never gated on ledger occupancy and stays unaffected by the widening
+    const ledger = createOwnershipLedger()
+    const eventStream = createDiscontinuousEventStream([], new Error('connection reset'))
+
+    // #when processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the thrown discontinuity is still recorded
+    expect(result.discontinuity).toEqual({message: 'connection reset'})
+  })
+
+  it('an ordinary successful run records no discontinuity and still completes normally', async () => {
+    // #given a clean run: activity followed by the terminal signal, with the caller aborting only
+    // after that terminal signal is what drives the stream closed -- the production shape
+    const ledger = createOwnershipLedger()
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream(
+      [
+        {
+          type: 'message.part.delta',
+          properties: {sessionID: ROOT_SESSION_ID, delta: {type: 'text', text: 'hello'}},
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: ROOT_SESSION_ID}} as unknown as Event,
+      ],
+      () => abortController.abort(),
+    )
+
+    // #when processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the run completes normally with no fabricated gap
+    expect(result.discontinuity).toBeUndefined()
+    expect(activityTracker.sessionIdle).toBe(true)
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
     expect(result.llmError).toBeNull()
   })
 
@@ -867,13 +1386,16 @@ describe('processEventStream — ownership check widens descendant events, no-le
       sessionIdle: false,
       sessionError: null,
     }
-    const eventStream = createMockEventStream([contextOverflowErrorEvent(ROOT_SESSION_ID)])
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([contextOverflowErrorEvent(ROOT_SESSION_ID)], () =>
+      abortController.abort(),
+    )
 
     // #when processed with the ledger and tracker supplied
     const result = await processEventStream(
       eventStream,
       ROOT_SESSION_ID,
-      new AbortController().signal,
+      abortController.signal,
       createMockLogger(),
       activityTracker,
       undefined,
@@ -962,13 +1484,14 @@ describe('processEventStream — ownership check widens descendant events, no-le
       sessionIdle: false,
       sessionError: null,
     }
-    const eventStream = createMockEventStream([retryStatusEvent(ROOT_SESSION_ID)])
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([retryStatusEvent(ROOT_SESSION_ID)], () => abortController.abort())
 
     // #when processed with the ledger and tracker supplied
     const result = await processEventStream(
       eventStream,
       ROOT_SESSION_ID,
-      new AbortController().signal,
+      abortController.signal,
       createMockLogger(),
       activityTracker,
       undefined,

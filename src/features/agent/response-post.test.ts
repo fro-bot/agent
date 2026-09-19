@@ -1603,3 +1603,266 @@ describe('runResponsePost', () => {
     expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
   })
 })
+
+describe('runResponsePost knownExecutionVeto', () => {
+  let logger: Logger
+  let tempFiles: string[] = []
+
+  beforeEach(() => {
+    logger = createMockLogger()
+    tempFiles = []
+    if (fsMocks.actualReadFile !== undefined) {
+      fsMocks.readFile.mockReset().mockImplementation(fsMocks.actualReadFile)
+    }
+  })
+
+  afterEach(async () => {
+    for (const filePath of tempFiles) {
+      await fs.rm(path.dirname(filePath), {recursive: true, force: true})
+    }
+  })
+
+  it('control: keeps a primary-sourced approving verdict as APPROVE when knownExecutionVeto is false (executes normally)', async () => {
+    // #given an approving response and no known execution veto
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when posting with knownExecutionVeto: false
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+        knownExecutionVeto: false,
+      },
+      logger,
+    )
+
+    // #then a formal APPROVE is submitted, unqualified
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'APPROVE', pull_number: 7}),
+    )
+    const request = octokit.rest.pulls.createReview.mock.calls[0]?.[0] as {readonly body: string}
+    expect(request.body).not.toContain('Harness note')
+  })
+
+  it('downgrades an approving verdict to a plain COMMENT review, and qualifies the body, when knownExecutionVeto is true (blocked)', async () => {
+    // #given an approving response file, but this invocation carries a known execution veto
+    // (an observation gap or unresolved background-dispatch ownership)
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when running response-post with knownExecutionVeto: true
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+        knownExecutionVeto: true,
+      },
+      logger,
+    )
+
+    // #then an APPROVE is never issued -- an endorsement the harness cannot support -- but
+    // the review is still submitted as COMMENT, preserving the agent's findings, with a
+    // harness-authored qualification appended to the body
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'COMMENT', owner: 'owner', repo: 'repo', pull_number: 7}),
+    )
+    const request = octokit.rest.pulls.createReview.mock.calls[0]?.[0] as {readonly body: string}
+    expect(request.body).toContain('LGTM.')
+    expect(request.body).toContain('Harness note')
+  })
+
+  it('rEQUEST_CHANGES is unchanged by knownExecutionVeto (policy is not widened)', async () => {
+    // #given a REQUEST_CHANGES verdict and a known execution veto
+    const filePath = await writeFixture('---\nverdict: request-changes\n---\n\nFix this.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when posting with knownExecutionVeto: true
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+        knownExecutionVeto: true,
+      },
+      logger,
+    )
+
+    // #then REQUEST_CHANGES is submitted exactly as before -- only an approving verdict is
+    // ever downgraded by this veto
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'REQUEST_CHANGES', pull_number: 7}),
+    )
+    const request = octokit.rest.pulls.createReview.mock.calls[0]?.[0] as {readonly body: string}
+    expect(request.body).not.toContain('Harness note')
+  })
+
+  it('a review that degrades to a comment for an unrelated reason (no bot login) still permits the one response, with no veto qualification bleeding into ordinary comment delivery', async () => {
+    // #given a review-permitted mention surface with no bot login available -- an existing,
+    // veto-unrelated degrade-to-comment path -- combined with a known execution veto
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+
+    // #when posting on a mention surface (review-permitted, not required) with the veto set
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: null,
+        responseFilePath: filePath,
+        knownExecutionVeto: true,
+      },
+      logger,
+    )
+
+    // #then it degrades to a plain comment (the pre-existing missing-bot-login behavior,
+    // unrelated to the veto), and that comment carries the agent's original body -- never the
+    // veto's review-only qualification, and no review is ever attempted
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    const request = octokit.rest.issues.createComment.mock.calls[0]?.[0] as {readonly body: string}
+    expect(request.body).toContain('LGTM.')
+    expect(request.body).not.toContain('Harness note')
+  })
+})
+
+describe('runResponsePost review delivery receipt threading', () => {
+  let logger: Logger
+  let tempFiles: string[] = []
+  const originalRunId = process.env.GITHUB_RUN_ID
+  const originalRunAttempt = process.env.GITHUB_RUN_ATTEMPT
+
+  beforeEach(() => {
+    logger = createMockLogger()
+    tempFiles = []
+    process.env.GITHUB_RUN_ID = 'run-42'
+    process.env.GITHUB_RUN_ATTEMPT = '3'
+    if (fsMocks.actualReadFile !== undefined) {
+      fsMocks.readFile.mockReset().mockImplementation(fsMocks.actualReadFile)
+    }
+  })
+
+  afterEach(async () => {
+    for (const filePath of tempFiles) {
+      await fs.rm(path.dirname(filePath), {recursive: true, force: true})
+    }
+    if (originalRunId === undefined) delete process.env.GITHUB_RUN_ID
+    else process.env.GITHUB_RUN_ID = originalRunId
+    if (originalRunAttempt === undefined) delete process.env.GITHUB_RUN_ATTEMPT
+    else process.env.GITHUB_RUN_ATTEMPT = originalRunAttempt
+  })
+
+  it('threads reviewDeliveryReceiptOps into the review submission with the owner/repo/pr/runId/attempt identity', async () => {
+    // #given an approving response and injected receipt operations
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const recordDelivered = vi.fn(async () => undefined)
+
+    // #when posting with reviewDeliveryReceiptOps injected
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+        reviewDeliveryReceiptOps: {reserve, recordDelivered},
+      },
+      logger,
+    )
+
+    // #then reserve was called with the exact identity built from routing + env, and
+    // recordDelivered was called after the successful POST with the returned review id
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(reserve).toHaveBeenCalledExactlyOnceWith({repo: 'owner/repo', runId: 'run-42', prNumber: 7}, 3)
+    expect(recordDelivered).toHaveBeenCalledExactlyOnceWith(
+      {repo: 'owner/repo', runId: 'run-42', prNumber: 7},
+      'reservation-etag',
+      3,
+      expect.any(Number),
+    )
+  })
+
+  it('a receipt-blocked reservation performs zero review POSTs and fails the response-post call closed', async () => {
+    // #given the receipt blocks (e.g. a rerun that already delivered)
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+    const reserve = vi.fn(async () => ({
+      kind: 'blocked' as const,
+      reason: 'already-reserved' as const,
+      detail: 'existing receipt',
+    }))
+    const recordDelivered = vi.fn(async () => undefined)
+
+    // #when posting
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+        reviewDeliveryReceiptOps: {reserve, recordDelivered},
+      },
+      logger,
+    )
+
+    // #then zero POSTs and a fail-closed result -- required review surfaces never degrade to
+    // a comment for a receipt block, since content is not stale (that's the head-guard's
+    // job) but delivery cannot be safely attempted again
+    expect(result.delivered).toBe(false)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(recordDelivered).not.toHaveBeenCalled()
+  })
+
+  it('ordinary comment delivery (no verdict) never consults the receipt at all', async () => {
+    // #given a plain comment response (no verdict) and injected receipt operations that
+    // would fail the test if ever called
+    const filePath = await writeFixture('Just a comment, no verdict.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+    const reserve = vi.fn(async () => {
+      throw new Error('reserve must not be called for comment delivery')
+    })
+    const recordDelivered = vi.fn(async () => {
+      throw new Error('recordDelivered must not be called for comment delivery')
+    })
+
+    // #when posting a comment-only response
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext(),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+        reviewDeliveryReceiptOps: {reserve, recordDelivered},
+      },
+      logger,
+    )
+
+    // #then delivered as an ordinary comment, and the receipt was never touched
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    expect(reserve).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledTimes(1)
+  })
+})

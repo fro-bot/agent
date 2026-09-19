@@ -1,3 +1,7 @@
+import type {
+  ReviewDeliveryReceiptIdentity,
+  ReviewDeliveryReceiptOperations,
+} from '../../services/github/review-delivery-receipt.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
@@ -212,5 +216,153 @@ describe('submitReviewWithHeadGuard', () => {
     // #then submission is blocked and no review is created
     expect(outcome).toEqual({submitted: false, reason: 'head-moved-before-submit'})
     expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+})
+
+function makeReservationOps(overrides?: {
+  readonly reserve?: ReviewDeliveryReceiptOperations['reserve']
+  readonly recordDelivered?: ReviewDeliveryReceiptOperations['recordDelivered']
+}): ReviewDeliveryReceiptOperations {
+  return {
+    reserve: overrides?.reserve ?? vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'})),
+    recordDelivered: overrides?.recordDelivered ?? vi.fn(async () => undefined),
+  }
+}
+
+describe('submitReviewWithHeadGuard publication receipt', () => {
+  let logger: Logger
+  const IDENTITY: ReviewDeliveryReceiptIdentity = {repo: 'owner/repo', runId: 'run-1', prNumber: 1}
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  it('reserves after the head check and before the POST, then records delivery with the returned review id', async () => {
+    // #given a reservation that succeeds
+    const octokit = makeOctokit() as unknown as Octokit
+    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const recordDelivered = vi.fn(async () => undefined)
+    const reservationOps = makeReservationOps({reserve, recordDelivered})
+
+    // #when submitting with reservationOps injected
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'APPROVE',
+        body: 'lgtm',
+        currentHeadSha: 'head-sha-abc',
+        reservationOps,
+        receiptIdentity: IDENTITY,
+        attempt: 1,
+      },
+      logger,
+    )
+
+    // #then reserve is called before the POST, the POST happens, and delivery is recorded
+    // afterward with the review id the POST returned
+    expect(outcome.submitted).toBe(true)
+    expect(reserve).toHaveBeenCalledExactlyOnceWith(IDENTITY, 1)
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'APPROVE'}),
+    )
+    expect(recordDelivered).toHaveBeenCalledExactlyOnceWith(IDENTITY, 'reservation-etag', 1, 999)
+  })
+
+  it('head guard rejects before reservation is ever attempted -- no receipt consumed', async () => {
+    // #given the head moved since the caller's fork/self check
+    const octokit = makeOctokit({
+      getPR: () => ({
+        data: {
+          head: {sha: 'new-head-sha', repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      }),
+    }) as unknown as Octokit
+    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const reservationOps = makeReservationOps({reserve})
+
+    // #when submitting with the stale head SHA
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'APPROVE',
+        body: 'lgtm',
+        currentHeadSha: 'head-sha-abc',
+        reservationOps,
+        receiptIdentity: IDENTITY,
+        attempt: 1,
+      },
+      logger,
+    )
+
+    // #then blocked by the head guard, and the reservation was never attempted -- no receipt
+    // slot was consumed for a submission that was never going to happen
+    expect(outcome).toEqual({submitted: false, reason: 'head-moved-before-submit'})
+    expect(reserve).not.toHaveBeenCalled()
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('a blocked reservation performs zero POSTs (covers rerun-after-cleanup-failure, ambiguous-timeout-retry, and conflict cases uniformly)', async () => {
+    // #given the receipt blocks (any reason -- the guard treats them uniformly)
+    const octokit = makeOctokit() as unknown as Octokit
+    const reserve = vi.fn(async () => ({
+      kind: 'blocked' as const,
+      reason: 'already-reserved' as const,
+      detail: 'existing receipt',
+    }))
+    const reservationOps = makeReservationOps({reserve})
+
+    // #when submitting
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'APPROVE',
+        body: 'lgtm',
+        currentHeadSha: 'head-sha-abc',
+        reservationOps,
+        receiptIdentity: IDENTITY,
+        attempt: 2,
+      },
+      logger,
+    )
+
+    // #then zero POSTs, and the block surfaces the receipt's own reason
+    expect(outcome).toEqual({submitted: false, reason: 'receipt-blocked', receiptReason: 'already-reserved'})
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('omitting reservationOps preserves the pre-receipt behavior unchanged (no receipt call site exists to skip)', async () => {
+    // #given a caller that does not inject reservationOps at all
+    const octokit = makeOctokit() as unknown as Octokit
+
+    // #when submitting without reservationOps/receiptIdentity/attempt
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'APPROVE',
+        body: 'lgtm',
+        currentHeadSha: 'head-sha-abc',
+      },
+      logger,
+    )
+
+    // #then it submits exactly as it did before this feature existed
+    expect(outcome.submitted).toBe(true)
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'APPROVE'}),
+    )
   })
 })

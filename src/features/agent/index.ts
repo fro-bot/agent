@@ -26,9 +26,11 @@ export {
   acknowledgeReceipt,
   addEyesReaction,
   addWorkingLabel,
+  applyTerminalReaction,
   completeAcknowledgment,
   removeWorkingLabel,
   updateReactionOnFailure,
+  updateReactionOnIncomplete,
   updateReactionOnSuccess,
 } from './reactions.js'
 

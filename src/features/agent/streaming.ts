@@ -642,7 +642,26 @@ export async function processEventStream(
 
       if (eventType === 'permission.asked') {
         const eventSessionID = getEventSessionID(event)
-        if (!isOwnedSession(eventSessionID, sessionId, ownershipLedger)) continue
+        // Ownership is deliberately NOT required here, unlike every other filter in this loop.
+        // Every well-formed ask this subscription observes gets answered, regardless of which
+        // session raised it (root, an owned/adopted descendant, or a descendant this run's ledger
+        // has not adopted yet). `isOwnedSession`'s null check is still needed -- an ask with no
+        // session id has nowhere to target a reply -- so it is inlined below rather than gated
+        // through the ownership predicate.
+        //
+        // This is safe ONLY because the Action starts its own loopback OpenCode server per run
+        // (`packages/runtime/src/agent/server.ts`) and wires an unconditional-reject responder to
+        // it (`src/features/agent/execution.ts`): every ask this process observes belongs to this
+        // run's own process tree. This assumes an Action-owned server, not a shared/interactive
+        // instance -- on a server shared across runs, or one with a real human approval path (see
+        // the gateway's `run-core.ts`, deliberately NOT changed this way), answering every ask
+        // regardless of ownership would leak into unrelated work.
+        //
+        // This also incidentally fixes an ask arriving before background adoption completes
+        // (`ownershipLedger.adopt` runs off the `task` tool's completed part, which can race a
+        // pre-adoption ask from the same dispatch) without making permission handling depend on
+        // adoption timing at all -- ownership is no longer consulted here.
+        if (eventSessionID === null) continue
 
         const requestID = getStringProperty(eventPayload, 'id')
         const permission = getStringProperty(eventPayload, 'permission') ?? 'unknown'
@@ -657,11 +676,9 @@ export async function processEventStream(
           continue
         }
 
-        // A descendant's request is denied exactly like the root's — there is no
-        // human approval path on this surface, and widening ownership only means
-        // the denial now also covers owned descendants. `sessionID` must be the
-        // event's own session id (not the root's) so the reply targets the
-        // session that actually asked.
+        // Every ask is denied exactly the same way regardless of which session raised it — see
+        // the ownership note above. `sessionID` must be the event's own session id (not the
+        // root's) so the reply targets the session that actually asked.
         const request: PermissionAskedRequest = {
           requestID,
           sessionID: eventSessionID,
@@ -672,14 +689,34 @@ export async function processEventStream(
           logger.warning('OpenCode permission request observed but no responder is configured', context)
         } else {
           logger.warning('Rejecting OpenCode permission request', context)
-          try {
-            await onPermissionAsked(request)
-          } catch (error) {
+          // Fire-and-continue: do NOT await -- a slow or hung reply must never block this loop from
+          // draining subsequent events. This is the same failure shape the previous fix closed one
+          // layer up (an unanswered ask hanging a child forever): a stalled reply here would
+          // otherwise stall every LATER event this loop observes, for every session, until the run's
+          // global deadline. Mirrors the gateway's `packages/gateway/src/execute/run-core.ts`
+          // permission.asked handling (`void coordinator.onPermissionAsked(req)`), which fires the
+          // same way and documents the same reason: awaiting would starve the SSE drain.
+          //
+          // Failure policy is otherwise unchanged from the synchronous version this replaces:
+          // logged-and-continued, not escalated. A failed reply means this one ask may go unanswered
+          // (the child hangs until the run's own deadline cancels it — the same outcome as if this
+          // fix did not exist), but throwing here would abort `consumeStream` for every OTHER
+          // in-flight ask and event this loop is still responsible for, trading one stuck child for
+          // the whole run's observability. Escalating is also unjustified because the caller has no
+          // retry or fallback path to escalate into — `onPermissionAsked` is a single best-effort
+          // round-trip (now with its own internal timeout and bounded retry, see `execution.ts`'s
+          // `replyToPermissionAsk`), not a queue.
+          //
+          // Unlike the version this replaces, a rejection reaching this `.catch` IS now a confirmed
+          // failure: the responder validates the SDK response for an embedded `error` field before
+          // resolving, so this no longer merely proves the round-trip completed.
+          // eslint-disable-next-line no-void
+          void onPermissionAsked(request).catch(error => {
             logger.warning('Failed to reject OpenCode permission request', {
               ...context,
               error: error instanceof Error ? error.message : String(error),
             })
-          }
+          })
         }
         continue
       }
@@ -1092,41 +1129,73 @@ export async function processEventStream(
 
   let discontinuity: {readonly message: string} | undefined
 
+  // Shared by both the thrown-discontinuity path and the unexpected-EOF path below so the
+  // freshness/ledger consequences of "we can no longer see this stream" are recorded exactly
+  // once, the same way, regardless of which exit triggered it.
+  function recordDiscontinuity(message: string): void {
+    // Unexpected discontinuity: the observation channel closed without an intentional
+    // shutdown and without a terminal signal. Selecting an error never proves quiescence,
+    // and observing quiescence never erases an error -- this must never be read as the turn
+    // concluding, only as "we can no longer see it." Preserve everything accumulated so far
+    // instead of throwing it away, and mark every currently-outstanding owned entry unknown
+    // -- reconciliation (triggered by the caller that owns the SDK client, since this
+    // function only has the stream) is how they later resolve to settled or cancelled.
+    discontinuity = {message}
+    logger.warning('Event stream discontinuity — observation channel closed unexpectedly', {
+      sessionId,
+      error: message,
+    })
+    // Observation-channel failure cannot preserve authoritative freshness: a broken SSE stream
+    // does not prove the root is quiescent. Require REST revalidation before any retained idle
+    // evidence may be consumed again -- failure evidence itself is untouched by this. Note also
+    // that this gap is never *erased* by a later successful poll: polling can legitimately learn
+    // the root session completed, but it cannot establish that no unobserved background dispatch
+    // occurred while this channel was blind, so the recorded gap must stand regardless.
+    if (activityTracker?.rootFreshness != null) requireRootRevalidation(activityTracker.rootFreshness)
+    if (ownershipLedger !== undefined) {
+      const outstandingEntries = ownershipLedger.snapshot().filter(entry => entry.state === 'outstanding')
+      for (const entry of outstandingEntries) {
+        ownershipLedger.markUnknown(entry.sessionId)
+      }
+      logger.warning('Event stream discontinuity — marked outstanding owned entries unknown', {
+        sessionId,
+        unknownCount: outstandingEntries.length,
+      })
+    }
+  }
+
   try {
     await consumeStream()
+    // The loop above only ever exits without throwing in two ways: the for-await iterator ran
+    // dry on its own, or the top-of-loop `if (signal.aborted) break` fired. The latter covers
+    // every intentional local shutdown this stream can observe -- including a deadline expiry,
+    // since the caller's signal here is a combined AbortSignal.any(...) that includes the
+    // deadline's own signal (see retry.ts's `eventSignal`), so bounded collection continuing
+    // past an already-decided attempt still exits through this same abort-triggered break, not
+    // through iterator exhaustion. A `signal.aborted` still false at this point means the first
+    // case happened: the transport ended the stream without anyone asking it to. That is exactly
+    // as much an observation gap as a thrown discontinuity, so record it the same way.
+    //
+    // Deliberately NOT scoped to ledger occupancy. The uncertainty this records is precisely
+    // "did an unobserved dispatch happen while we could not see the stream" -- requiring an
+    // already-outstanding ledger entry before recording that uncertainty assumes away the one
+    // failure mode this exists to catch: the stream closing *before* the dispatch-adoption event
+    // ever landed, leaving the ledger empty (or absent) with no record that anything was missed.
+    // Every real caller (see retry.ts) only aborts *after* deciding the turn is over from events
+    // this loop already delivered, so `!signal.aborted` reaching this line always means the
+    // transport ended the stream without anyone asking it to -- record it regardless of what the
+    // ledger currently holds (empty, fully settled, outstanding, or no ledger at all).
+    if (!signal.aborted) {
+      recordDiscontinuity('Event stream ended unexpectedly')
+    }
   } catch (error) {
     if (isIntentionalShutdown(error, signal)) {
       // The caller told us to stop (deadline expiry, attempt abort, etc.) -- this is not a
       // transport failure, it's the expected shape of a requested shutdown. Say nothing
       // about the turn: no diagnostic, no ledger churn, no fabricated failure.
     } else {
-      // Unexpected discontinuity: the observation channel closed without an intentional
-      // shutdown and without a terminal signal. Selecting an error never proves quiescence,
-      // and observing quiescence never erases an error -- this must never be read as the turn
-      // concluding, only as "we can no longer see it." Preserve everything accumulated so far
-      // instead of throwing it away, and mark every currently-outstanding owned entry unknown
-      // -- reconciliation (triggered by the caller that owns the SDK client, since this
-      // function only has the stream) is how they later resolve to settled or cancelled.
       const message = error instanceof Error ? error.message : String(error)
-      discontinuity = {message}
-      logger.warning('Event stream discontinuity — observation channel closed unexpectedly', {
-        sessionId,
-        error: message,
-      })
-      // Observation-channel failure cannot preserve authoritative freshness: a broken SSE stream
-      // does not prove the root is quiescent. Require REST revalidation before any retained idle
-      // evidence may be consumed again -- failure evidence itself is untouched by this.
-      if (activityTracker?.rootFreshness != null) requireRootRevalidation(activityTracker.rootFreshness)
-      if (ownershipLedger !== undefined) {
-        const outstandingEntries = ownershipLedger.snapshot().filter(entry => entry.state === 'outstanding')
-        for (const entry of outstandingEntries) {
-          ownershipLedger.markUnknown(entry.sessionId)
-        }
-        logger.warning('Event stream discontinuity — marked outstanding owned entries unknown', {
-          sessionId,
-          unknownCount: outstandingEntries.length,
-        })
-      }
+      recordDiscontinuity(message)
     }
   }
 

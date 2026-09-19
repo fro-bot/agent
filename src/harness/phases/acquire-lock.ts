@@ -37,8 +37,37 @@ export interface LeaseController {
    * moment -- a caller about to persist state right after a failed tick must treat
    * this the same as an unconfirmed writer -- but that protection does not survive
    * a subsequent confirmed success.
+   *
+   * This reflects present renewal health only. For whether uninterrupted coverage was
+   * ever in doubt during this invocation, see `continuityUnverified()` below -- the two
+   * answer different questions and a caller that needs the latched one must not
+   * substitute this for it.
    */
   readonly hasFailed: () => boolean
+  /**
+   * Latches to `true` the first time this invocation cannot vouch for uninterrupted lock
+   * coverage, and never clears -- unlike `hasFailed()`, a later successful renewal does
+   * NOT reset it. Two things can set it:
+   *   1. A renewal tick fails or throws. A successful renewal IS meaningful evidence, not
+   *      a mere heartbeat -- it is a conditional write against the previously confirmed
+   *      ETag (`packages/runtime/src/coordination/lock.ts`'s `renewLease`), so an
+   *      intervening takeover would make it fail its condition. But what a failed tick
+   *      proves is only that THAT tick could not confirm coverage -- not that the lock was
+   *      lost, and not that another writer took over. Hence "continuity was not verified",
+   *      not "lease lost".
+   *   2. `stop()` returns with a renewal tick still unresolved (see `stop()` below) -- an
+   *      unresolved tick is itself a gap in coverage, not a pass.
+   * A later successful renewal after either case still advances `currentEtag()` (see
+   * below) -- that part must keep working, since release needs the freshest ETag -- but it
+   * does not erase the fact that coverage was, at some point, unverified for this
+   * invocation.
+   *
+   * Optional (not `hasFailed`'s peer in strictness) only so existing hand-built
+   * `LeaseController` test doubles elsewhere in the codebase, which predate this accessor and
+   * are out of this change's scope, keep compiling without modification. The real controller
+   * returned by `createLeaseController` below always implements it.
+   */
+  readonly continuityUnverified?: () => boolean
   /**
    * The most recently confirmed lock ETag (the initial acquisition ETag if no renewal has
    * succeeded yet). A caller releasing the lock after renewal has run must use this, not
@@ -52,7 +81,9 @@ export interface LeaseController {
    * on them. A renewal that is still in flight past the grace period is left to finish on its
    * own (bounded by `RENEWAL_TIMEOUT_MS`) and `stop()` returns anyway -- cleanup's budget takes
    * priority over an up-to-the-tick `currentEtag()`. In that case `currentEtag()` may be stale,
-   * which makes the caller's conditional release fail safely rather than block. Idempotent.
+   * which makes the caller's conditional release fail safely rather than block. An unresolved
+   * tick at this point also latches `continuityUnverified()` -- returning without knowing
+   * whether that tick succeeded or failed is itself coverage uncertainty, not a pass. Idempotent.
    */
   readonly stop: () => Promise<void>
 }
@@ -106,6 +137,11 @@ function createLeaseController(
 ): LeaseController {
   let currentEtag = initialEtag
   let failed = false
+  // Latches true the first time this invocation cannot vouch for uninterrupted lock coverage;
+  // never reset by a later success. See `LeaseController.continuityUnverified`'s doc for why a
+  // failed tick means "continuity not verified", not "lease lost", and why `stop()` returning
+  // with a tick unresolved sets this too.
+  let continuityUnverified = false
   let inFlight: Promise<void> | null = null
 
   const tick = (): void => {
@@ -128,6 +164,7 @@ function createLeaseController(
       .then(renewed => {
         if (renewed.success === false) {
           failed = true
+          continuityUnverified = true
           logger.warning('Coordination lease renewal failed', {repo, holderId, error: renewed.error.message})
           return
         }
@@ -136,6 +173,7 @@ function createLeaseController(
       })
       .catch((error: unknown) => {
         failed = true
+        continuityUnverified = true
         logger.warning('Coordination lease renewal threw', {
           repo,
           holderId,
@@ -155,13 +193,20 @@ function createLeaseController(
 
   return {
     hasFailed: () => failed,
+    continuityUnverified: () => continuityUnverified,
     currentEtag: () => currentEtag,
     stop: async (): Promise<void> => {
       clearInterval(intervalHandle)
-      if (inFlight == null) return
+      const pending = inFlight
+      if (pending == null) return
       // A tick still in flight past the grace period is left to finish on its own (bounded by
       // RENEWAL_TIMEOUT_MS); stop() does not wait for it further.
-      await Promise.race([inFlight, delay(STOP_GRACE_PERIOD_MS)])
+      await Promise.race([pending, delay(STOP_GRACE_PERIOD_MS)])
+      // `pending`'s own `.finally()` nulls `inFlight` once it settles -- if `inFlight` still
+      // points at the same promise, the grace period elapsed first and we genuinely don't know
+      // whether that tick succeeded or failed. That is coverage uncertainty, not confirmed
+      // health, regardless of what `failed` last said.
+      if (inFlight === pending) continuityUnverified = true
     },
   }
 }

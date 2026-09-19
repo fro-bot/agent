@@ -7,6 +7,11 @@
  * calling submitReview with an APPROVE or REQUEST_CHANGES event.
  */
 
+import type {
+  ReviewDeliveryReceiptIdentity,
+  ReviewDeliveryReceiptOperations,
+  ReviewDeliveryReservationBlockedReason,
+} from '../../services/github/review-delivery-receipt.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ReviewEvent, ReviewResult} from './types.js'
@@ -96,13 +101,28 @@ export interface SubmitReviewWithHeadGuardParams {
   readonly body: string
   /** Head SHA observed by the caller's prior fork/self guard check. */
   readonly currentHeadSha: string
+  /**
+   * Injected publication-receipt operations (`services/github/review-delivery-receipt.js`).
+   * When provided, a reservation is acquired immediately after the head check below and
+   * before the review POST -- see that module's doc for the full at-most-once guarantee.
+   * Optional so this shared guard keeps working, unprotected, for any caller that has not
+   * been wired to a receipt yet; every production caller in this codebase always provides
+   * it (see `response-post.ts` and `review-reconciliation.ts`).
+   */
+  readonly reservationOps?: ReviewDeliveryReceiptOperations
+  /** Required together with `reservationOps` -- identifies the receipt this call reserves. */
+  readonly receiptIdentity?: ReviewDeliveryReceiptIdentity
+  /** Required together with `reservationOps` -- `GITHUB_RUN_ATTEMPT`, stored inside the receipt record, never in its key. */
+  readonly attempt?: number
 }
 
-export type HeadGuardBlockReason = 'head-moved-before-submit'
+export type HeadGuardBlockReason = 'head-moved-before-submit' | 'receipt-blocked'
 
 export interface SubmitReviewWithHeadGuardBlocked {
   readonly submitted: false
   readonly reason: HeadGuardBlockReason
+  /** Present only when `reason === 'receipt-blocked'` -- the receipt's own block reason. */
+  readonly receiptReason?: ReviewDeliveryReservationBlockedReason
 }
 
 export interface SubmitReviewWithHeadGuardSubmitted {
@@ -123,7 +143,7 @@ export async function submitReviewWithHeadGuard(
   params: SubmitReviewWithHeadGuardParams,
   logger: Logger,
 ): Promise<SubmitReviewWithHeadGuardOutcome> {
-  const {octokit, owner, repo, prNumber, event, body, currentHeadSha} = params
+  const {octokit, owner, repo, prNumber, event, body, currentHeadSha, reservationOps, receiptIdentity, attempt} = params
 
   const freshPrResponse = await octokit.rest.pulls.get({owner, repo, pull_number: prNumber})
   const freshHeadSha: string = freshPrResponse.data.head.sha
@@ -135,6 +155,25 @@ export async function submitReviewWithHeadGuard(
       freshHead: freshHeadSha,
     })
     return {submitted: false, reason: 'head-moved-before-submit'}
+  }
+
+  // Publication receipt reservation -- placed here, immediately before the submit call
+  // below, and strictly after the head-moved guard above: a head-guard rejection must never
+  // consume a reservation slot for a review that was never going to be submitted anyway.
+  // Only the caller that acquires this reservation may proceed to submit.
+  let reservationEtag: string | null = null
+  if (reservationOps != null && receiptIdentity != null && attempt != null) {
+    const reservation = await reservationOps.reserve(receiptIdentity, attempt)
+    if (reservation.kind === 'blocked') {
+      logger.warning('Review guard: publication receipt blocked submission', {
+        prNumber,
+        event,
+        reason: reservation.reason,
+        detail: reservation.detail,
+      })
+      return {submitted: false, reason: 'receipt-blocked', receiptReason: reservation.reason}
+    }
+    reservationEtag = reservation.etag
   }
 
   logger.info('Review guard: submitting review', {prNumber, event, currentHeadSha})
@@ -152,6 +191,10 @@ export async function submitReviewWithHeadGuard(
     },
     logger,
   )
+
+  if (reservationOps != null && receiptIdentity != null && attempt != null && reservationEtag != null) {
+    await reservationOps.recordDelivered(receiptIdentity, reservationEtag, attempt, review.reviewId)
+  }
 
   return {submitted: true, review, commitSha: currentHeadSha}
 }

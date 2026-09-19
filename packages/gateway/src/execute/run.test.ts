@@ -95,9 +95,11 @@ vi.mock('./run-core.js', () => ({
   runOpenCodeCore: vi.fn().mockResolvedValue(undefined),
   RunCoreError: class RunCoreError extends Error {
     readonly kind: string
-    constructor(kind: string, message: string) {
+    readonly quarantined: boolean
+    constructor(kind: string, message: string, quarantined = false) {
       super(message)
       this.kind = kind
+      this.quarantined = quarantined
       this.name = 'RunCoreError'
     }
   },
@@ -8731,5 +8733,104 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
     // #then — the second run started only AFTER the first fully resolved
     expect(callOrder).toEqual(['run-1-start', 'run-1-drain-complete', 'run-2-start'])
     expect(releaseFn).toHaveBeenCalledExactlyOnceWith(CHANNEL_ID)
+  })
+})
+
+describe('termination barrier — quarantine (Unit 8)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('a quarantined RunCoreError skips heartbeat.stop, releaseLock, and hand-off entirely', async () => {
+    // #given — runOpenCodeCore rejects with a RunCoreError whose termination barrier could
+    // NOT confirm this run's owned background sessions actually stopped. This is the load-
+    // bearing complement the brief calls for: setupHappyPath's heartbeat.stop/releaseLock/
+    // handoff would all fire immediately on ANY other rejection (see the plain
+    // 'run-core error handling' describe block above) — only sibling liveness (represented
+    // here by `quarantined: true`) should hold them back.
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    const stopFn = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: buildMockRunState()},
+    })
+    setupHappyPath({stop: stopFn})
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'Session error: LLM quota exceeded', true))
+
+    const sharedConcurrency = makeDefaultConcurrency()
+    const queue = makeDefaultQueue()
+    const deps = makeDeps({concurrency: sharedConcurrency, queue})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — heartbeat is never stopped: the lease must keep renewing so the reservation
+    // cannot silently lapse via TTL expiry while owned background work is unconfirmed.
+    expect(stopFn).not.toHaveBeenCalled()
+
+    // #and — the repository lock is never released.
+    expect(mockRuntime.releaseLock).not.toHaveBeenCalled()
+
+    // #and — the concurrency slot is never released, and no queued task is started on it.
+    const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
+    expect(releaseFn).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce() // only this run — no hand-off dispatch
+
+    // #and — the run still reports failure (never success): a FAILED transition still lands.
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+  })
+
+  it('a quarantined run does not hand off to a queued task even though one is waiting', async () => {
+    // #given — a second task is queued for the same channel; without the quarantine gate,
+    // the outer handoff finally would start it on the still-held slot.
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValueOnce(new RunCoreError('stream-ended', 'stream closed', true))
+
+    const sharedConcurrency = makeDefaultConcurrency()
+    const queue = makeDefaultQueue()
+    const pendingMessage = makeMessage()
+    const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue})
+    const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
+    ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValue(pendingTask)
+
+    const deps = makeDeps({concurrency: sharedConcurrency, queue})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — runOpenCodeCore was called exactly once: the queued task was never started.
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
+    expect(releaseFn).not.toHaveBeenCalled()
+  })
+
+  it('an unquarantined RunCoreError (quarantined: false, the default) behaves exactly as before — heartbeat stops, lock releases, hand-off proceeds', async () => {
+    // #given — regression guard: the new quarantine branch must not swallow the ordinary
+    // failure path for every other RunCoreError.
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    const stopFn = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: buildMockRunState()},
+    })
+    setupHappyPath({stop: stopFn})
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'Session error: LLM quota exceeded'))
+
+    const deps = makeDeps()
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then
+    expect(stopFn).toHaveBeenCalledOnce()
+    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+    const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
   })
 })

@@ -38,6 +38,7 @@ import {
 } from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 import {formatToolPart} from './format-part.js'
+import {settleOwnedSessions} from './settle-owned-sessions.js'
 
 // ---------------------------------------------------------------------------
 // Typed error
@@ -60,14 +61,26 @@ export type RunCoreErrorKind =
  *
  * The `message` field is for internal logging only — never post it to Discord.
  * `run.ts` maps `kind` to coarse user-visible replies.
+ *
+ * `quarantined` is `true` only when this failure passed through the
+ * termination barrier (`throwWithBarrier`, see below) and the barrier could
+ * NOT confirm that this run's owned background sessions actually stopped.
+ * `kind` and `message` are never altered by quarantine — they always
+ * describe the ORIGINAL causal failure; quarantine is additional safety
+ * evidence layered on top, never a replacement explanation. `run.ts` must
+ * treat a quarantined error as a signal to hold the lock, keep the heartbeat
+ * renewing it, and refuse hand-off — never release or hand off resources for
+ * a run whose owned work could not be confirmed settled.
  */
 export class RunCoreError extends Error {
   readonly kind: RunCoreErrorKind
+  readonly quarantined: boolean
 
-  constructor(kind: RunCoreErrorKind, internalMessage: string) {
+  constructor(kind: RunCoreErrorKind, internalMessage: string, quarantined = false) {
     super(internalMessage)
     this.name = 'RunCoreError'
     this.kind = kind
+    this.quarantined = quarantined
   }
 }
 
@@ -580,6 +593,38 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           logger: runtimeLogger,
         })
 
+  // ── 1d. Termination barrier ─────────────────────────────────────────────────
+  // Every RunCoreError thrown from this point on (session create/ledger creation
+  // already happened above — a throw before this point has no owned work to settle)
+  // is routed through here instead of escaping directly. Pass-through (zero remote
+  // calls, unchanged kind/message) when the ledger has no unsettled owned work.
+  // Otherwise cancels and confirms settlement (`settleOwnedSessions`) BEFORE letting
+  // the causal error escape to run.ts — run.ts must never stop the heartbeat, release
+  // the lock, or hand off the slot while a sibling of this run's failed session is
+  // still alive and writing. If settlement cannot be confirmed within its bound, the
+  // SAME kind and message re-throw with `quarantined: true` (never a different kind —
+  // quarantine is additional evidence, not a replacement explanation).
+  async function throwWithBarrier(kind: RunCoreErrorKind, message: string): Promise<never> {
+    if (ledger === undefined || ledger.isDrainComplete() === true) {
+      throw new RunCoreError(kind, message)
+    }
+    const settlement = await settleOwnedSessions({
+      client,
+      directory,
+      rootSessionId: sessionId,
+      ledger,
+      logger,
+    })
+    if (settlement.settled === true) {
+      throw new RunCoreError(kind, message)
+    }
+    logger.error(
+      {sessionId, kind, detail: settlement.reason},
+      'run-core: owned work could not be confirmed settled before this failure — quarantining run',
+    )
+    throw new RunCoreError(kind, message, true)
+  }
+
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
   // Subscribe BEFORE prompt to eliminate the race where permission.asked fires
   // before the SSE listener exists.
@@ -591,14 +636,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     logger.error({sessionId, detail: message}, 'run-core: event.subscribe threw')
-    throw new RunCoreError('unreachable', `Event subscribe threw: ${message}`)
+    throw await throwWithBarrier('unreachable', `Event subscribe threw: ${message}`)
   }
 
   // ── 2b. Post-subscribe abort check ────────────────────────────────────────
   if (combinedSignal.aborted) {
     clearInactivity()
     logger.warn({sessionId}, 'run-core: signal aborted after event subscribe')
-    throw new RunCoreError('timeout', 'Run timed out: signal aborted after event subscribe')
+    throw await throwWithBarrier('timeout', 'Run timed out: signal aborted after event subscribe')
   }
 
   // ── 3. Send prompt — directory threaded to query ───────────────────────────
@@ -613,10 +658,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       const errMsg = String(promptResponse.error)
       if (isAuthError(promptResponse)) {
         logger.error({sessionId, detail: 'promptAsync 401'}, 'run-core: workspace proxy rejected bearer token')
-        throw new RunCoreError('auth', `PromptAsync rejected: ${errMsg}`)
+        throw await throwWithBarrier('auth', `PromptAsync rejected: ${errMsg}`)
       }
       logger.error({sessionId, detail: errMsg}, 'run-core: promptAsync returned error')
-      throw new RunCoreError('prompt-error', `PromptAsync error: ${errMsg}`)
+      throw await throwWithBarrier('prompt-error', `PromptAsync error: ${errMsg}`)
     }
     logger.info({sessionId, directory}, 'run-core: prompt sent')
     // Signal busy: work has started — drive typing indicator in the status controller.
@@ -627,14 +672,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     if (error instanceof RunCoreError) throw error
     const message = error instanceof Error ? error.message : String(error)
     logger.error({sessionId, detail: message}, 'run-core: promptAsync threw (server unreachable?)')
-    throw new RunCoreError('unreachable', `PromptAsync threw: ${message}`)
+    throw await throwWithBarrier('unreachable', `PromptAsync threw: ${message}`)
   }
 
   // ── 3b. Post-prompt abort check ────────────────────────────────────────────
   if (combinedSignal.aborted) {
     clearInactivity()
     logger.warn({sessionId}, 'run-core: signal aborted after prompt send')
-    throw new RunCoreError('timeout', 'Run timed out: signal aborted after prompt send')
+    throw await throwWithBarrier('timeout', 'Run timed out: signal aborted after prompt send')
   }
 
   // ── 4. Consume event stream ────────────────────────────────────────────────
@@ -954,7 +999,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const errorDetail = getStringProperty(eventPayload, 'error') ?? 'unknown session error'
           logger.error({sessionId, detail: errorDetail}, 'run-core: session.error received')
           clearInactivity()
-          throw new RunCoreError('session-error', `Session error: ${errorDetail}`)
+          throw await throwWithBarrier('session-error', `Session error: ${errorDetail}`)
         }
       } else {
         // Unrecognized event type — log at debug so a lost-event/routing gap (events arriving
@@ -988,42 +1033,18 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // NOTE: this block runs AFTER the finally above, so clearInactivity() has already fired.
   if (combinedSignal.aborted) {
     if (ledger !== undefined && draining === true) {
-      // The run's own deadline covers execution AND drain — there is no
-      // separate drain budget to extend, and a completion notification never
-      // resets `combinedSignal`. Cancel every entry that is not confirmed
-      // settled — outstanding AND unknown — individually (a completed entry
-      // linking to a running one is never the gateway's problem at depth one,
-      // but cancelling per-entry rather than a single tree-cancel means raising
-      // the depth later does not silently reintroduce that gap). An `unknown`
-      // entry is exactly the one most likely still live (a dropped event or a
-      // failed reconciliation call, not a confirmed finish) — it needs the
-      // explicit abort at least as much as an `outstanding` one does. Each
-      // entry is downgraded to `unknown` — the cancellation request was sent,
-      // but nothing here confirms the child actually stopped, so `unknown`
-      // (not `settled`) is the honest state.
-      const unsettledEntries = ledger.snapshot().filter(entry => entry.state !== 'settled')
-      await Promise.allSettled(
-        unsettledEntries.map(async entry => {
-          try {
-            await client.session.abort({
-              path: {id: entry.sessionId},
-              query: {directory},
-              signal: AbortSignal.timeout(5_000),
-            })
-          } catch (error) {
-            logger.warn(
-              {sessionId: entry.sessionId, detail: error instanceof Error ? error.message : String(error)},
-              'run-core: failed to abort owned session during drain-deadline cancellation',
-            )
-          }
-          ledger.markUnknown(entry.sessionId)
-        }),
-      )
+      // The run's own deadline covers execution AND drain — there is no separate drain
+      // budget to extend, and a completion notification never resets `combinedSignal`.
+      // Cancellation + confirmation of every unsettled entry (outstanding AND unknown)
+      // now lives in `throwWithBarrier` → `settleOwnedSessions` — a completed entry
+      // linking to a running one is never the gateway's problem at depth one, but the
+      // barrier cancels per-entry rather than a single tree-cancel, so raising the depth
+      // later does not silently reintroduce that gap.
       logger.warn(
-        {sessionId, cancelledCount: unsettledEntries.length, totalEvents, activityEvents},
-        'run-core: drain deadline expired — cancelled unsettled owned work, run reports incomplete',
+        {sessionId, outstanding: ledger.outstanding(), unknown: ledger.unknown(), totalEvents, activityEvents},
+        'run-core: drain deadline expired — cancelling unsettled owned work, run reports incomplete',
       )
-      throw new RunCoreError('drain-timeout', 'Run timed out while draining outstanding owned work')
+      throw await throwWithBarrier('drain-timeout', 'Run timed out while draining outstanding owned work')
     }
 
     // Inactivity is the tighter bound (always < hard ceiling), so on the rare both-aborted
@@ -1033,10 +1054,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         {sessionId, totalEvents, activityEvents, lastEventType},
         'run-core: stream ended due to inactivity timeout',
       )
-      throw new RunCoreError('inactivity-timeout', 'Run timed out: no activity within the inactivity window')
+      throw await throwWithBarrier('inactivity-timeout', 'Run timed out: no activity within the inactivity window')
     }
     logger.warn({sessionId, totalEvents, activityEvents, lastEventType}, 'run-core: stream ended due to timeout signal')
-    throw new RunCoreError('timeout', 'Run timed out: event stream aborted by timeout signal')
+    throw await throwWithBarrier('timeout', 'Run timed out: event stream aborted by timeout signal')
   }
 
   // Stream closed without session.idle and not aborted by us → OpenCode
@@ -1045,7 +1066,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     {sessionId, totalEvents, activityEvents, lastEventType},
     'run-core: event stream closed before session.idle',
   )
-  throw new RunCoreError('stream-ended', 'Event stream closed before session.idle was received')
+  throw await throwWithBarrier('stream-ended', 'Event stream closed before session.idle was received')
 }
 
 // ---------------------------------------------------------------------------
