@@ -37,7 +37,7 @@ Scope only — not a completion claim. R3–R24 of the origin document map to th
 
 Unit checkboxes below record artifact existence, not requirement completion — two review rounds surfaced units whose artifacts existed but whose stated requirements were not fully met. A full audit checked every requirement against the code; this table is authoritative for completion. A ticked unit claims only that all of its requirements are `shipped`.
 
-One split runs through several rows and is worth reading first, because the requirements were written as though it did not exist. The Action has two response-delivery paths (`packages/runtime/src/agent/response-delivery.ts`). On the **file-convention** path the harness posts, so it can sequence publication against drain and own the one-response rule. On the **`model-gh`** path — `schedule` and `workflow_dispatch` — the model posts its own response with `gh` during Execute, before drain has run and outside harness control. Requirements phrased as "the harness owns publication" or "drain completes before anything publishes" therefore hold on one path and not the other, and are marked `partial` for that reason rather than because the file-convention implementation is incomplete.
+One split runs through several rows and is worth reading first, because the requirements were written as though it did not exist. The Action has two response-delivery paths (`packages/runtime/src/agent/response-delivery.ts`), chosen by delivery classification rather than by a fixed trigger list. On the **file-convention** path — the `affected` classification (`pull_request`, `issue_comment`, `issues`) — the harness posts, so it can sequence publication against drain and own the one-response rule. Everything else resolves to the **`model-gh`** path: the `autonomous` classification (`workflow_dispatch`, `schedule`) and the `deferred-or-unknown` classification, which covers `pull_request_review_comment`, `discussion_comment`, and any event name the classifier does not recognize — an unrecognized event defaults into `model-gh`, so the set is open-ended rather than fixed. On `model-gh`, the model posts its own response with `gh` during Execute, before drain has run and outside harness control. Requirements phrased as "the harness owns publication" or "drain completes before anything publishes" therefore hold on one path and not the other, and are marked `partial` for that reason rather than because the file-convention implementation is incomplete.
 
 | Requirement | Status | Note |
 |---|---|---|
@@ -63,13 +63,13 @@ One split runs through several rows and is worth reading first, because the requ
 | R19 | partial | Reconciliation also settles an entry on corroborated absence from the live (non-idle) status map (`ledger-reconcile.ts:198-200`) — a third signal the requirement does not name. Absence from that map confirms the session went idle, not that it terminated; upstream removes idle sessions from the map on their own. |
 | R19a | partial | Persistence correctly declines, but the run still finalizes, publishes, writes the dedup marker, emits a success reaction, and exits 0. |
 | R20 | partial | Holds on the file-convention path, where the harness posts. On `model-gh` the model owns publication, so nothing structurally prevents a credentialed descendant from posting, and finalize accepts any positive comment count rather than proving a single harness-owned publisher. |
-| R21 | shipped | Persistence declines on unresolved ownership or unconfirmed server quiescence, independent of lock ownership. |
+| R21 | partial | Declines persistence when ownership or quiescence can't be confirmed, but the `held-by-other` lock skip (`run.ts:124-135`) reaches cleanup with no lease at all, so its persistence-safety check runs exactly as it would for a lock-free run — it cannot decline on the writer it just detected. |
 | R22 | partial | Renewal spans execution, drain, and persistence and protects persistence, but does not fail the invocation closed, and `hasFailed()` reflects only the latest tick. |
-| R22a | shipped | No-lock behaviour stays fail-open as specified. |
+| R22a | partial | No-lock fail-open is scoped to runs that proceed without a lock (S3 unconfigured, or acquisition errored); it does not authorize fail-open for a run that declined to proceed because another surface already holds the lock, but the `held-by-other` skip (`run.ts:124-135`) is treated identically by cleanup. |
 | R23 | partial | Labels and the degraded-state note land in the job summary only; the invocation's published response carries no unfinished-work labels (see Unit 13). |
 | R24 | partial | Reconciliation and cancel-or-unknown ship; nothing gates admission on reconciliation completing, so a run can reach `PENDING` and only later collide with the durable lock. |
 
-**Cross-cutting finding.** Three independent paths — drain expiry with unknown work, stream discontinuity, and lease-renewal failure — each detect a safety condition, log it, and then fail to propagate it into the run's reported outcome: the run still publishes, dedups, reacts success, and exits 0. The dedup marker is the sharpest edge, because a deduped incomplete run is never retried. Fixing this is code work, not a documentation change, and it is a prerequisite for the release gate (Unit 14).
+**Cross-cutting finding.** Three independent paths — drain expiry with unknown work, stream discontinuity, and lease-renewal failure — each detect a safety condition, log it, and then fail to propagate it into the run's reported outcome: the run still publishes, dedups, reacts success, and exits 0. The dedup marker is the sharpest edge, because a deduped incomplete run is never retried. A fourth instance is the `held-by-other` lock skip (R21, R22a): it detects that another surface holds the coordination lock, logs it, and returns before the persistence gate can see that context, so cleanup persists as though no conflicting writer existed. Fixing this is code work, not a documentation change, and it is a prerequisite for the release gate (Unit 14).
 
 ## Scope Boundaries
 
@@ -411,7 +411,7 @@ That gap is also why R6 above is marked partial rather than shipped. R6's origin
 
 **Requirements:** R11, R16, R17, R18
 
-**Status:** Unticked — R11, R17, and R18 are partial; see [Requirement Status](#requirement-status).
+**Status:** Unticked — R11, R16, R17, and R18 are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 1, Unit 4
 
@@ -550,7 +550,7 @@ That gap is also why R6 above is marked partial rather than shipped. R6's origin
 
 **Requirements:** R16, R17, R18, R19, R19a
 
-**Status:** Unticked — R17, R18, R19, and R19a are partial; see [Requirement Status](#requirement-status).
+**Status:** Unticked — R16, R17, R18, R19, and R19a are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 9
 
@@ -618,7 +618,7 @@ That gap is also why R6 above is marked partial rather than shipped. R6's origin
 
 **Requirements:** R19a, R20, R21, R22, R22a
 
-**Status:** Unticked — R19a and R22 are partial; see [Requirement Status](#requirement-status).
+**Status:** Unticked — R19a, R20, R21, R22, and R22a are partial; see [Requirement Status](#requirement-status).
 
 **Dependencies:** Unit 10
 
