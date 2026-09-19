@@ -217,7 +217,7 @@ export async function runFinalizeWithResult(
         `Recovered from context overflow (fresh review session; archived ${execution.overflowRecovery.archivedSessionId})\n`,
       )
     }
-    await writeJobSummary({...baseSummaryOptions, deliveryKind}, logger)
+    await writeJobSummary({...baseSummaryOptions, deliveryKind}, logger, execution.ownershipLedger)
     return {exitCode, deliveryKind}
   }
 

@@ -484,6 +484,7 @@ describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCo
       'inactivity-timeout',
       'stream-ended',
       'missing-coordinator',
+      'drain-timeout',
     ] as const
 
     const validOperatorFailureKinds = new Set<OperatorFailureKind>([

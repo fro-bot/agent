@@ -30,12 +30,15 @@
  * registered (the permission can still be POSTed when it settles).
  */
 
+import type {Result} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 
 import type {GatewayLogger} from '../discord/client.js'
 import type {PostReplyFactory, ReplySink} from '../execute/launch-types.js'
 import type {PermissionReply, PermissionRequest, SettlementReason} from './coordinator.js'
 import type {ApprovalActor, ApprovalRegistry} from './registry.js'
+
+import {DiscordAPIError, RESTJSONErrorCodes} from 'discord.js'
 
 import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
 import {editMessage} from '../discord/io.js'
@@ -82,6 +85,46 @@ export interface DiscordApprovalTransportDeps {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal vs retryable delivery-failure classification
+// ---------------------------------------------------------------------------
+
+/**
+ * Discord REST error codes that mean "retrying cannot help" for an approval
+ * notification post: the thread/channel the embed would be posted into is
+ * gone, or the bot has lost access to it.
+ *
+ * Deliberately narrow and numeric-code-based (not a message-string match) —
+ * these codes are part of Discord's documented REST error contract and are
+ * stable across client library versions, unlike free-text error messages.
+ *
+ * - `UnknownChannel` (10003): the thread/channel was deleted.
+ * - `MissingAccess` (50001): the bot no longer has access to the channel
+ *   (e.g. removed from the guild/channel).
+ *
+ * Everything else — rate limits (`RateLimitError`, not a `DiscordAPIError`),
+ * 5xx `DiscordAPIError`/`HTTPError` responses, and network failures — is
+ * retryable and must NOT trigger an auto-reject.
+ */
+const TERMINAL_DISCORD_ERROR_CODES: ReadonlySet<number> = new Set([
+  RESTJSONErrorCodes.UnknownChannel,
+  RESTJSONErrorCodes.MissingAccess,
+])
+
+/**
+ * `true` when `error` is a Discord API error whose numeric code identifies a
+ * terminal delivery failure (see `TERMINAL_DISCORD_ERROR_CODES`).
+ *
+ * Classifies on `error instanceof DiscordAPIError` + a stable numeric code —
+ * never on `error.message` — so a wording change in Discord's API responses
+ * cannot silently reclassify a retryable failure as terminal (or vice versa).
+ */
+function isTerminalDeliveryFailure(error: unknown): boolean {
+  return (
+    error instanceof DiscordAPIError && typeof error.code === 'number' && TERMINAL_DISCORD_ERROR_CODES.has(error.code)
+  )
+}
+
+// ---------------------------------------------------------------------------
 // createDiscordApprovalOnPending
 // ---------------------------------------------------------------------------
 
@@ -113,6 +156,52 @@ export function createDiscordApprovalOnPending(
     postReplyFactory,
     logger,
   } = deps
+
+  /**
+   * Called from both the embed-post failure branch and its `.catch()` on
+   * every notification-post failure. No-ops for a retryable failure — the
+   * entry stays `open` (via `markMessagePostFailed`) so a later settlement
+   * can still POST the reply once a human decides.
+   *
+   * For a terminal failure: rejects the permission on the server via
+   * `applySettlement` (which also settles/deletes the registry entry —
+   * exactly once, since the entry is deleted inside `applySettlement` and a
+   * second call for the same `requestID` is a no-op), and posts a best-effort
+   * operator-visible note to the run's thread — the run's output channel this
+   * transport already uses — worded distinctly from a human denial or a
+   * deadline timeout so a pattern of delivery failures is diagnosable rather
+   * than reading as arbitrary refusals.
+   */
+  function handleUndeliverable(requestID: string, error: unknown): void {
+    if (!isTerminalDeliveryFailure(error)) return
+
+    const code = error instanceof DiscordAPIError ? error.code : undefined
+    logger.error(
+      {requestID, code, err: error instanceof Error ? error.message : String(error)},
+      'discord-transport: approval notification undeliverable (terminal Discord error) — auto-rejecting on the server',
+    )
+
+    // eslint-disable-next-line no-void
+    void approvalRegistry
+      .applySettlement({requestID, decision: 'reject', reason: 'disposed'})
+      .catch((settleError: unknown) => {
+        logger.error(
+          {requestID, err: settleError instanceof Error ? settleError.message : String(settleError)},
+          'discord-transport: applySettlement threw while auto-rejecting an undeliverable approval',
+        )
+      })
+
+    // Best-effort operator-visible note. If the thread itself is gone this
+    // send will also fail — that failure is swallowed here; the logger.error
+    // above is the durable signal that always reaches an operator.
+    // eslint-disable-next-line no-void
+    void replySink
+      .send('thread', {
+        content:
+          'A tool approval could not be delivered and was automatically denied (Discord notification failed to send).',
+      })
+      .catch(() => {})
+  }
 
   return function onPending(req: PermissionRequest): void {
     const {requestID, sessionID} = req
@@ -194,7 +283,7 @@ export function createDiscordApprovalOnPending(
     void replySink
       .send('thread', {embeds: [buildApprovalEmbed(req)], components: [buildApprovalButtons(requestID)]})
       .then(result => {
-        const r = result as {success?: boolean; data?: Message; error?: {message: string}} | undefined
+        const r = result as Result<Message, Error> | undefined
         if (r?.success === true) {
           // Embed send succeeded — settle pending claim as delivered so
           // flush() does not add a misleading _(no output)_.
@@ -235,11 +324,13 @@ export function createDiscordApprovalOnPending(
           }
         } else {
           settleEmbed(false)
+          const failureError = r?.success === false ? r.error : undefined
           logger.warn(
-            {requestID, err: r?.error?.message ?? 'unknown'},
+            {requestID, err: failureError?.message ?? 'unknown'},
             'discord-transport: failed to post approval embed',
           )
           approvalRegistry.markMessagePostFailed(requestID)
+          handleUndeliverable(requestID, failureError)
         }
       })
       .catch((error: unknown) => {
@@ -252,6 +343,7 @@ export function createDiscordApprovalOnPending(
           'discord-transport: approval embed send rejected unexpectedly',
         )
         approvalRegistry.markMessagePostFailed(requestID)
+        handleUndeliverable(requestID, error)
       })
   }
 }

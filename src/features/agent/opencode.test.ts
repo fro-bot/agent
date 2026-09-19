@@ -606,7 +606,9 @@ describe('executeOpenCode', () => {
       await vi.advanceTimersByTimeAsync(2_500)
       const result = await resultPromise
 
-      // #then — cleanup may consume the remaining budget, but cannot rewrite terminal success
+      // #then — cleanup may consume the remaining budget, but cannot rewrite terminal success. The
+      // shared deadline did expire while SSE shutdown was bounded-waiting, but the success was
+      // already accepted before that -- teardown must not abort an already-completed session.
       expect(result).toMatchObject({success: true, exitCode: 0})
       expect(mockClient.session.messages).toHaveBeenCalledOnce()
       expect(mockClient.session.update).not.toHaveBeenCalled()
@@ -642,7 +644,9 @@ describe('executeOpenCode', () => {
       await vi.advanceTimersByTimeAsync(10_000)
       const result = await resultPromise
 
-      // #then — primary failure survives cleanup and cannot open a continuation attempt
+      // #then — primary failure survives cleanup and cannot open a continuation attempt. The shared
+      // deadline did expire during cleanup, but the failure was already accepted (not deferred past
+      // an ownership-ledger gate) before that happened -- teardown must not abort the session over it.
       expect(result).toMatchObject({success: false, exitCode: 1})
       expect(result.error).toContain('fetch failed')
       expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
@@ -699,7 +703,9 @@ describe('executeOpenCode', () => {
       await vi.advanceTimersByTimeAsync(1_000)
       const result = await resultPromise
 
-      // #then — the terminal result survives a timed-out best-effort artifact read
+      // #then — the terminal result survives a timed-out best-effort artifact read. The shared
+      // deadline expired while the artifact read was hanging, but success was already accepted
+      // before that -- teardown must not abort the already-completed session.
       expect(result).toMatchObject({success: true, exitCode: 0})
       expect(mockClient.session.messages).toHaveBeenCalledTimes(2)
       expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
@@ -2858,7 +2864,7 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {
+    const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: true,
       currentTurnTerminalSignalReceived: false,
       sessionIdle: false,
@@ -2876,10 +2882,15 @@ describe('pollForSessionCompletion', () => {
       activityTracker,
     )
 
-    // #then — fails on the very first poll tick, not after exhausting the full timeout
+    // #then — fails on the very first poll tick, not after exhausting the full timeout. Selecting
+    // this error never proves the turn ended: the fail-fast timing is pinned by `callCount === 1`,
+    // and the classification itself is pinned via `terminalProviderError`, not via the lifecycle
+    // flag — `mergeActivityError` no longer writes `currentTurnTerminalSignalReceived` (that flag
+    // is reserved for truly terminal signals: session.idle or a completed assistant message).
     expect(result.completed).toBe(false)
     expect(callCount).toBe(1)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('fails fast on a poll-only retry status with action.reason auth_unavailable (no SSE event at all)', async () => {
@@ -4227,7 +4238,9 @@ describe('processEventStream', () => {
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
     expect(result.llmError?.resetTime).toEqual(new Date(nextEpochMs))
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this retry status is not proof the turn ended -- that lifecycle flag is
+    // reserved for session.idle / a completed assistant message.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     expect(activityTracker.sessionError).not.toBeNull()
     expect(activityTracker.sessionError).not.toContain('https://opencode.ai')
     expect(activityTracker.sessionError).not.toContain('acme')
@@ -4278,7 +4291,8 @@ describe('processEventStream', () => {
       // #then — classification is fixed and terminal; provider-controlled values do not cross the boundary
       expect(result.llmError?.type).toBe('provider_auth_error')
       expect(result.llmError?.retryable).toBe(false)
-      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+      // Classifying this error is not proof the turn ended.
+      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
       expect(JSON.stringify(result)).not.toContain('sentinel-provider')
       expect(JSON.stringify(result)).not.toContain('sentinel-token')
     },
@@ -4372,7 +4386,8 @@ describe('processEventStream', () => {
       expect(result.llmError?.retryable).toBe(false)
       expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
       expect(activityTracker.sessionError).toBe(result.llmError?.message)
-      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+      // Classifying this error is not proof the turn ended.
+      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
       expect(JSON.stringify(result)).not.toContain('context-overflow-provider-message-sentinel')
       expect(JSON.stringify(result)).not.toContain('context-overflow-response-body-sentinel')
       expect(JSON.stringify(activityTracker)).not.toContain('context-overflow-provider-message-sentinel')
@@ -4414,7 +4429,8 @@ describe('processEventStream', () => {
     // #then
     expect(result.llmError?.type).toBe('provider_auth_error')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this retry status is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     expect(JSON.stringify(result)).not.toContain('sentinel-provider')
     expect(JSON.stringify(result)).not.toContain('sentinel-token')
   })
@@ -4913,7 +4929,8 @@ describe('processEventStream', () => {
     expect(result.llmError).not.toBeNull()
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('does not classify an ordinary structured 429 session.error as quota exceeded', async () => {
@@ -4986,7 +5003,8 @@ describe('processEventStream', () => {
     expect(result.llmError).not.toBeNull()
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('does not classify an ordinary plain-string session.error as quota_exceeded', async () => {
@@ -5892,7 +5910,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
   })
 
-  it('rejects a terminal result when wall-clock expiry precedes the timeout callback', async () => {
+  it('returns a typed timeout result when wall-clock expiry precedes the timeout callback', async () => {
     // #given — the poll result resolves after deadlineAt, while the timeout callback remains unlatched
     vi.useFakeTimers()
     try {
@@ -5930,15 +5948,18 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         undefined,
         deadline,
       )
-      const rejection = (async () => {
-        await expect(resultPromise).rejects.toMatchObject({name: 'DeadlineExceededError'})
-      })()
       await vi.advanceTimersByTimeAsync(0)
       vi.setSystemTime(deadlineAt + 1)
       await vi.advanceTimersByTimeAsync(500)
+      const result = await resultPromise
 
-      // #then — wall-clock expiry is authoritative even though isTimedOut() is still false
-      await rejection
+      // #then — wall-clock expiry is authoritative even though isTimedOut() is still false; the
+      // post-race ladder's `throw createDeadlineExceededError(...)` is gone (Steps 3b/5 of the
+      // restructure) — a bare `deadline` settlement with no preserved failure now reduces to a
+      // typed timeout result instead
+      expect(result.success).toBe(false)
+      expect(result.outcome).toBe('timeout')
+      expect(result.error).toBe('Attempt did not settle before the execution deadline')
     } finally {
       vi.useRealTimers()
     }
@@ -5966,20 +5987,25 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       } as unknown as Event,
     ])
 
-    // #when / #then
-    await expect(
-      runPromptAttempt(
-        {session: {status: vi.fn()}} as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-        'ses_123',
-        '/workspace',
-        30_000,
-        mockLogger,
-        eventStream.stream,
-        undefined,
-        undefined,
-        deadline,
-      ),
-    ).rejects.toMatchObject({name: 'DeadlineExceededError'})
+    // #when
+    const result = await runPromptAttempt(
+      {session: {status: vi.fn()}} as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+      undefined,
+      undefined,
+      deadline,
+    )
+
+    // #then — a bare `deadline` settlement (the auth event was never classified because
+    // `deadline.isExpired()` was already true when it arrived, so no failure survives to be
+    // preserved) now reduces to a typed timeout result instead of a thrown DeadlineExceededError
+    expect(result.success).toBe(false)
+    expect(result.outcome).toBe('timeout')
+    expect(result.error).toBe('Attempt did not settle before the execution deadline')
   })
 
   it('removes the poll interval abort listener when the timer wins', async () => {
@@ -6237,8 +6263,8 @@ describe('runPromptAttempt with v2.session.wait()', () => {
           .fn()
           .mockResolvedValueOnce({data: []}) // baseline: empty
           .mockResolvedValue({
-            // poll: new assistant message with time.completed
-            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}}}],
+            // poll: new assistant message with time.completed and a qualifying finish
+            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}, finish: 'stop'}}],
           }),
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },

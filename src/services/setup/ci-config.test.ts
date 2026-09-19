@@ -43,7 +43,7 @@ describe('buildCIConfig', () => {
 
       // #then
       expect(result.error).toBeNull()
-      expect(result.config).toEqual({autoupdate: false, plugin: ['@fro.bot/systematic@2.1.0']})
+      expect(result.config).toEqual({autoupdate: false, plugin: ['@fro.bot/systematic@2.1.0'], subagent_depth: 1})
     })
 
     it('merges user config keys and appends systematic plugin', () => {
@@ -62,6 +62,7 @@ describe('buildCIConfig', () => {
         autoupdate: true,
         model: 'claude-opus-4-5',
         plugin: ['@fro.bot/systematic@2.1.0'],
+        subagent_depth: 1,
       })
     })
 
@@ -80,6 +81,7 @@ describe('buildCIConfig', () => {
       expect(result.config).toEqual({
         autoupdate: false,
         plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'],
+        subagent_depth: 1,
       })
     })
 
@@ -102,6 +104,7 @@ describe('buildCIConfig', () => {
       expect(result.config).toEqual({
         autoupdate: false,
         plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@9.9.9'],
+        subagent_depth: 1,
       })
     })
 
@@ -154,6 +157,7 @@ describe('buildCIConfig', () => {
         autoupdate: false,
         plugin: ['@fro.bot/systematic@2.1.0'],
         default_agent: 'build',
+        subagent_depth: 1,
         agent: {
           build: {
             permission: {
@@ -1048,6 +1052,90 @@ describe('buildCIConfig', () => {
 
       // #then
       expect(result.error).toBeNull()
+    })
+  })
+
+  describe('R12 subagent_depth pin', () => {
+    it('pins subagent_depth to 1 when no user config is supplied', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: true}, logger)
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config.subagent_depth).toBe(1)
+    })
+
+    it('overrides an operator-supplied subagent_depth and records a warning', () => {
+      // #given - operator config sets a deeper subagent_depth
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {opencodeConfig: '{"subagent_depth":3}', systematicVersion: '2.1.0', enableOmo: true},
+        logger,
+      )
+
+      // #then - pinned to 1 rather than silently honoring the operator value, and the override is recorded
+      expect(result.error).toBeNull()
+      expect(result.config.subagent_depth).toBe(1)
+      expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('subagent_depth'))
+    })
+
+    it('does not warn when the operator already supplied 1', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {opencodeConfig: '{"subagent_depth":1}', systematicVersion: '2.1.0', enableOmo: true},
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config.subagent_depth).toBe(1)
+      const warningCalls = (logger.warning as ReturnType<typeof import('vitest').vi.fn>).mock.calls
+      const depthWarning = warningCalls.find(
+        (call: unknown[]) => typeof call[0] === 'string' && call[0].includes('subagent_depth'),
+      )
+      expect(depthWarning).toBeUndefined()
+    })
+
+    it('pins subagent_depth to 1 in disabled mode (enableOmo: false)', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config.subagent_depth).toBe(1)
+    })
+
+    it('pins subagent_depth to 1 in slim mode (enableOmoSlim: true)', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config.subagent_depth).toBe(1)
     })
   })
 })
