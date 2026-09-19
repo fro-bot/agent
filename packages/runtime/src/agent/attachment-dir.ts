@@ -49,43 +49,54 @@ function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
 }
 
 /**
- * Create the run-scoped attachment directory (`buildAttachmentDir`) refusing to follow anything
- * already occupying that exact path.
+ * Create a single directory segment exclusively, refusing to follow anything already occupying
+ * that exact path.
  *
- * `fs.mkdir(dir, {recursive: true})` is NOT safe here: libuv's recursive-mkdir treats an `EEXIST`
- * at any path segment -- including the leaf -- as "already there" by `stat`-ing it (which FOLLOWS
- * symlinks) and accepting anything that stats as a directory. A pre-planted symlink at this
- * exact, predictable (`<runId>-<runAttempt>`) leaf path, pointing at a real directory elsewhere,
- * would therefore be silently accepted as "the" attachment directory -- and every reference file
- * this run materializes (`materializeReferenceFiles`) would land at the symlink's target instead.
- *
- * `fs.mkdir(dir)` (no `recursive`) has no such gap for the leaf component: the underlying
- * `mkdir(2)` syscall fails with `EEXIST` if ANYTHING already occupies that exact path --
- * symlink, file, or directory -- without ever resolving/following it. On `EEXIST`, this function
- * then `lstat`s (never `stat`s) the path itself to see what is actually there, and refuses a
- * symlink (or any other non-directory) outright instead of writing through it.
+ * `fs.mkdir(dir)` (no `recursive`) has no follow-a-symlink gap: the underlying `mkdir(2)` syscall
+ * fails with `EEXIST` if ANYTHING already occupies that exact path -- symlink, file, or directory
+ * -- without ever resolving/following it. On `EEXIST`, this function then `lstat`s (never `stat`s)
+ * the path itself to see what is actually there, and refuses a symlink (or any other
+ * non-directory) outright instead of writing through it.
  */
-export async function createAttachmentDirExclusive(attachmentDir: string): Promise<void> {
-  // The shared parent segment (`<runnerTemp>/fro-bot-attachments`) is not run-scoped or
-  // per-run-predictable the way the leaf is -- every run shares it -- so an ordinary recursive
-  // create for everything ABOVE the leaf is fine; only the leaf itself needs the exclusive,
-  // no-follow treatment.
-  await fs.mkdir(path.dirname(attachmentDir), {recursive: true})
-
+async function mkdirExclusiveNoFollow(dir: string): Promise<void> {
   try {
-    await fs.mkdir(attachmentDir)
+    await fs.mkdir(dir)
     return
   } catch (error) {
     if (!isErrnoException(error) || error.code !== 'EEXIST') throw error
   }
 
-  const stats = await fs.lstat(attachmentDir)
+  const stats = await fs.lstat(dir)
   if (stats.isSymbolicLink()) {
-    throw new Error(`Refusing to use attachment directory ${attachmentDir}: a symlink already exists at this path`)
+    throw new Error(`Refusing to use attachment directory ${dir}: a symlink already exists at this path`)
   }
   if (!stats.isDirectory()) {
-    throw new Error(
-      `Refusing to use attachment directory ${attachmentDir}: a non-directory entry already exists at this path`,
-    )
+    throw new Error(`Refusing to use attachment directory ${dir}: a non-directory entry already exists at this path`)
   }
+}
+
+/**
+ * Create the run-scoped attachment directory (`buildAttachmentDir`), refusing to follow a symlink
+ * at EITHER path segment this call controls: the shared `fro-bot-attachments` segment AND the
+ * run-attempt leaf beneath it.
+ *
+ * The segment name is a fixed, predictable string and the leaf name (`<runId>-<runAttempt>`) is
+ * predictable too, so a plain recursive `fs.mkdir(dirname(attachmentDir), {recursive: true})` for
+ * everything above the leaf is NOT safe: libuv's recursive-mkdir treats an `EEXIST` at any
+ * intermediate segment as "already there" by `stat`-ing it (which FOLLOWS symlinks) and accepting
+ * anything that stats as a directory. A symlink planted at the segment directory -- pointing at an
+ * attacker-controlled real directory elsewhere -- would be followed there, the leaf would then be
+ * created for real *inside the attacker's target*, and the leaf's own no-follow guard would pass
+ * cleanly because the leaf genuinely does not exist at the (attacker's) resolved location. The
+ * guard looked complete but validated only the last of two attacker-reachable segments.
+ *
+ * This validates both controlled segments individually with `mkdirExclusiveNoFollow`, each via a
+ * plain (non-recursive) `mkdir` plus an `lstat`-on-`EEXIST` fallback, so a symlink at either one is
+ * refused before anything is created through it. It deliberately does NOT walk further up to
+ * `RUNNER_TEMP` (or beyond): `RUNNER_TEMP` is runner-provisioned and pre-existing, not a path
+ * segment this code names or creates, so it is outside this guard's trust boundary.
+ */
+export async function createAttachmentDirExclusive(attachmentDir: string): Promise<void> {
+  await mkdirExclusiveNoFollow(path.dirname(attachmentDir))
+  await mkdirExclusiveNoFollow(attachmentDir)
 }

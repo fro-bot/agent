@@ -79,4 +79,32 @@ describe('createAttachmentDirExclusive', () => {
     // #when / #then
     await expect(createAttachmentDirExclusive(attachmentDir)).rejects.toThrow(/non-directory/)
   })
+
+  it('refuses a symlink planted at the PARENT segment directory rather than following it into an attacker target (the bypass this test pins)', async () => {
+    // #given an attacker-controlled real directory elsewhere, and a symlink planted at the shared
+    // `fro-bot-attachments` segment directory -- one level above the leaf, but still a fixed,
+    // predictable path this code names before the leaf is ever touched
+    const root = await createTempRoot()
+    const attackerTarget = await createTempRoot()
+    const attachmentDir = buildAttachmentDir({runnerTemp: root, runId: 1, runAttempt: 1})
+    await fs.symlink(attackerTarget, path.dirname(attachmentDir), 'dir')
+
+    // #when / #then -- refused before any leaf creation is attempted through the symlink
+    await expect(createAttachmentDirExclusive(attachmentDir)).rejects.toThrow(/symlink/)
+
+    // #then the symlink itself is untouched, and nothing was created inside the attacker's target
+    const segmentStats = await fs.lstat(path.dirname(attachmentDir))
+    expect(segmentStats.isSymbolicLink()).toBe(true)
+    await expect(fs.lstat(path.join(attackerTarget, `${1}-${1}`))).rejects.toThrow(/ENOENT/)
+  })
+
+  it('refuses a pre-existing non-directory entry (a plain file) at the PARENT segment directory', async () => {
+    // #given a plain file sitting at the shared segment path instead of a directory
+    const root = await createTempRoot()
+    const attachmentDir = buildAttachmentDir({runnerTemp: root, runId: 1, runAttempt: 1})
+    await fs.writeFile(path.dirname(attachmentDir), 'not a directory')
+
+    // #when / #then
+    await expect(createAttachmentDirExclusive(attachmentDir)).rejects.toThrow(/non-directory/)
+  })
 })
