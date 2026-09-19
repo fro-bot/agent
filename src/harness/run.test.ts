@@ -632,6 +632,7 @@ async function mockHappyPathThrough(overrides?: {
   readonly observationGap?: boolean
   readonly drainUnknownCount?: number
   readonly finalizeExitCode?: number
+  readonly deliveryKind?: 'none' | 'comment' | 'review'
   readonly cleanupSafety?: {readonly quiescenceConfirmed: boolean; readonly continuityUnverified: boolean}
 }): Promise<{
   readonly saveDedupMarker: typeof import('./phases/dedup.js').saveDedupMarker
@@ -711,7 +712,7 @@ async function mockHappyPathThrough(overrides?: {
   vi.mocked(runReviewReconciliation).mockResolvedValue({reconciled: false, reason: 'not-applicable'})
   vi.mocked(runFinalizeWithResult).mockResolvedValue({
     exitCode: overrides?.finalizeExitCode ?? (overrides?.executionSuccess === false ? 1 : 0),
-    deliveryKind: 'comment',
+    deliveryKind: overrides?.deliveryKind ?? 'comment',
   })
   vi.mocked(runCleanup).mockResolvedValue(
     overrides?.cleanupSafety ?? {quiescenceConfirmed: true, continuityUnverified: false},
@@ -785,6 +786,61 @@ describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
     // never verified for this invocation
     const {saveDedupMarker, setInvocationOutcomeOutput} = await mockHappyPathThrough({
       cleanupSafety: {quiescenceConfirmed: true, continuityUnverified: true},
+    })
+
+    const exitCode = await run()
+
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+
+  it('incomplete + review already delivered -> dedup marker IS written, exit code and invocation-outcome still report incomplete', async () => {
+    // #given an incomplete outcome (observation gap) whose finalize call already delivered a
+    // review -- reviews have no marker-based find-and-update path the way comments do, so a
+    // rerun invited by the non-zero exit would submit a second review rather than recognize
+    // the first
+    const {saveDedupMarker, applyTerminalReaction, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      observationGap: true,
+      deliveryKind: 'review',
+    })
+
+    // #when the run executes end to end
+    const exitCode = await run()
+
+    // #then the marker IS written -- the deliberate exception -- but the exit code and the
+    // invocation-outcome/reaction still report 'incomplete', not a completion claim
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(applyTerminalReaction)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'incomplete',
+      expect.anything(),
+    )
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+
+  it('incomplete + comment already delivered (not review) -> no dedup marker, complement of the review exception', async () => {
+    // #given the same incomplete outcome, but finalize delivered only a comment -- comments
+    // have a marker-based find-and-update path, so the review exception must not apply
+    const {saveDedupMarker, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      observationGap: true,
+      deliveryKind: 'comment',
+    })
+
+    const exitCode = await run()
+
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+  })
+
+  it('incomplete + nothing delivered -> no dedup marker, complement of the review exception', async () => {
+    // #given the same incomplete outcome, but finalize delivered nothing at all
+    const {saveDedupMarker, setInvocationOutcomeOutput} = await mockHappyPathThrough({
+      observationGap: true,
+      deliveryKind: 'none',
     })
 
     const exitCode = await run()

@@ -61,6 +61,7 @@ export async function run(): Promise<number> {
   let ownershipLedger: OwnershipLedger | undefined
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
+  let irreversiblyDelivered = false
   let storeConfig: ObjectStoreConfig = {
     enabled: false,
     bucket: '',
@@ -263,6 +264,10 @@ export async function run(): Promise<number> {
       bootstrap.logger,
     )
     exitCode = finalization.exitCode
+    // A review is the one delivery this harness cannot take back: there is no marker-based
+    // find-and-update path for reviews the way there is for comments, so a second run that
+    // reaches the same point submits a second review rather than recognizing the first.
+    irreversiblyDelivered = finalization.deliveryKind === 'review'
 
     // Dedup marker and the terminal reaction both moved out of this try block -- they now
     // happen in the `finally` block below, strictly after `runCleanup` returns and the
@@ -350,13 +355,22 @@ export async function run(): Promise<number> {
       }
     }
 
-    // Dedup marker: never written on an incomplete or skipped invocation, and only after
-    // cleanup has had its say -- moved here (was: right after finalize, before cleanup ran)
-    // per the same reasoning that moved the terminal reaction below. A lock-contention skip
-    // reaches this point with both `dedupEntity` and `triggerContext` already populated (set
-    // before the lock is even acquired) -- `finalOutcome === 'succeeded'` is what stops a
-    // contended run, which delivered nothing, from marking itself deduplicated anyway.
-    if (finalOutcome === 'succeeded' && dedupEntity != null && triggerContext != null) {
+    // Dedup marker, written only after cleanup has had its say -- moved here (was: right
+    // after finalize, before cleanup ran) per the same reasoning that moved the terminal
+    // reaction below. A lock-contention skip reaches this point with both `dedupEntity` and
+    // `triggerContext` already populated (set before the lock is even acquired), so the
+    // outcome check is what stops a contended run, which delivered nothing, from marking
+    // itself deduplicated anyway.
+    //
+    // An incomplete invocation that already delivered a REVIEW is the deliberate exception.
+    // Withholding the marker there invites the rerun that the non-zero exit already signals,
+    // and a rerun cannot recognize the review this run submitted -- so it submits a second
+    // one. Between a missed retry and a duplicated review, the duplicate is worse and
+    // irreversible. The marker records that delivery happened; it is not a claim the
+    // invocation completed, which `invocation-outcome` and the job summary still report
+    // honestly.
+    const deduplicatable = finalOutcome === 'succeeded' || (finalOutcome === 'incomplete' && irreversiblyDelivered)
+    if (deduplicatable && dedupEntity != null && triggerContext != null) {
       await saveDedupMarker(triggerContext, dedupEntity, repo)
     }
 
