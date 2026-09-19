@@ -2,7 +2,13 @@ import type {OmoSlimPreset} from '../../shared/types.js'
 import type {Logger} from './types.js'
 import * as path from 'node:path'
 import process from 'node:process'
-import {ATTACHMENT_DIR_SEGMENT, buildResponseFileFallbackRoots, RESPONSE_FILE_DIR_SEGMENT} from '@fro-bot/runtime'
+import {
+  buildAttachmentDir,
+  buildResponseFileFallbackRoots,
+  getGitHubRunAttempt,
+  getGitHubRunId,
+  RESPONSE_FILE_DIR_SEGMENT,
+} from '@fro-bot/runtime'
 import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 
 export interface CIConfigResult {
@@ -183,14 +189,22 @@ function scopeExternalDirectoryPermission(
     // (the model could in principle edit its own already-consumed attachment copies) is
     // accepted: the SDK reads file content once when building the message, so a later edit
     // cannot retroactively change what was already injected.
-    const attachmentPattern = path.join(runnerTemp, ATTACHMENT_DIR_SEGMENT, '*')
+    // Run-attempt-scoped, not segment-wide: `path.join(runnerTemp, ATTACHMENT_DIR_SEGMENT, '*')`
+    // would match every OTHER run's subdirectory too (`*` compiles to regex `.*`, which matches
+    // `/`; see the pattern-semantics note above) -- on a persistent or self-hosted runner, that
+    // let a sibling run read this run's attachments (and, since `external_directory` gates edit
+    // too, plant a symlink for a later run's write to follow). `buildAttachmentDir` includes this
+    // run's own `<runId>-<runAttempt>` segment, so only that run's own subdirectory matches.
+    const attachmentPattern = path.join(
+      buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
+      '*',
+    )
 
     externalDirectory = {
       '*': 'deny',
       [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',
-      // Same segment-level pattern shape as the response-file grant above: `*` compiles to
-      // regex `.*`, which matches the run-scoped subdirectory the ask is actually raised
-      // against (`<attachmentDir>/*`) without needing a separate per-run pattern. This is
+      // `*` compiles to regex `.*`, which matches the file(s) directly inside this run's own
+      // attachment subdirectory (`<attachmentDir>/*`) without needing anything deeper. This is
       // ALSO layered onto the top-level, global `permission.external_directory` key by
       // `scopeAttachmentDirectoryPermission` below -- that global grant is what reaches a
       // dispatched subagent or an oMo/OMO-Slim orchestrator session, neither of which is the
@@ -290,13 +304,43 @@ function scopeAttachmentDirectoryPermission(
   }
 
   const trimmedRunnerTemp = runnerTemp.trim()
-  const attachmentPattern = path.join(trimmedRunnerTemp, ATTACHMENT_DIR_SEGMENT, '*')
+  // Run-attempt-scoped, not segment-wide -- see the matching note in
+  // `scopeExternalDirectoryPermission` above. This is the GLOBAL grant a dispatched subagent
+  // actually inherits, so leaving it segment-wide here is the more exploitable of the two copies:
+  // it is reachable from every mode that dispatches subagents at all.
+  const attachmentPattern = path.join(
+    buildAttachmentDir({runnerTemp: trimmedRunnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
+    '*',
+  )
   const existingPermission = isRecord(config.permission) ? config.permission : {}
-  const existingExternalDirectory: Record<string, unknown> = isRecord(existingPermission.external_directory)
-    ? {...existingPermission.external_directory}
-    : typeof existingPermission.external_directory === 'string'
-      ? {'*': existingPermission.external_directory}
-      : {}
+  const existingExternalDirectoryRaw = existingPermission.external_directory
+  let existingExternalDirectory: Record<string, unknown>
+  if (isRecord(existingExternalDirectoryRaw)) {
+    existingExternalDirectory = {...existingExternalDirectoryRaw}
+  } else if (typeof existingExternalDirectoryRaw === 'string') {
+    existingExternalDirectory = {'*': existingExternalDirectoryRaw}
+  } else if (existingExternalDirectoryRaw == null) {
+    existingExternalDirectory = {}
+  } else {
+    // Genuinely incompatible shape (e.g. an array or number), not merely absent -- there is no
+    // way to merge this into the object form the grant below needs, so it is rejected explicitly
+    // instead of silently discarded. (Previously, anything that was neither a record nor a string
+    // fell through to `{}` with no record of what was lost.)
+    logger.warning(
+      'Ignoring operator-supplied permission.external_directory: expected a string or an object, got a shape that cannot be merged; operator rules for this key are not preserved',
+      {receivedType: Array.isArray(existingExternalDirectoryRaw) ? 'array' : typeof existingExternalDirectoryRaw},
+    )
+    existingExternalDirectory = {}
+  }
+
+  // Preserve the operator's own '*' rule instead of silently replacing it with a hardcoded
+  // 'deny' -- an operator who configured their own wildcard (e.g. 'allow', or a stricter 'ask')
+  // keeps that rule; only the ABSENCE of one falls back to the fail-closed 'deny' default.
+  // `Permission.evaluate`'s `findLast` (see the pattern-semantics note above) means the wildcard
+  // must still sort BEFORE the specific attachment allow below, or the attachment grant would be
+  // shadowed by it -- unchanged from before, just no longer clobbering the operator's own value.
+  const operatorWildcard = existingExternalDirectory['*']
+  const wildcard = operatorWildcard ?? 'deny'
 
   delete existingExternalDirectory['*']
   delete existingExternalDirectory[attachmentPattern]
@@ -307,7 +351,7 @@ function scopeAttachmentDirectoryPermission(
   config.permission = {
     ...existingPermission,
     external_directory: {
-      '*': 'deny',
+      '*': wildcard,
       ...existingExternalDirectory,
       [attachmentPattern]: 'allow',
     },

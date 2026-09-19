@@ -1,4 +1,4 @@
-export {ATTACHMENT_DIR_SEGMENT, buildAttachmentDir} from './attachment-dir.js'
+export {ATTACHMENT_DIR_SEGMENT, buildAttachmentDir, createAttachmentDirExclusive} from './attachment-dir.js'
 export {
   createAgentError,
   createErrorInfo,

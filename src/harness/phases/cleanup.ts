@@ -8,9 +8,12 @@ import type {CacheSaveResult} from '../../shared/cache-save-result.js'
 import type {Logger} from '../../shared/logger.js'
 import type {AgentIdentity} from '../../shared/types.js'
 import type {LeaseController} from './acquire-lock.js'
+import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
+import process from 'node:process'
 import * as core from '@actions/core'
 import {
+  buildAttachmentDir,
   createS3Adapter,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_LOCK_TTL_SECONDS,
@@ -155,6 +158,32 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       } catch (attachmentError) {
         attachmentCleanupLogger.warning('Attachment temp-file cleanup failed (non-fatal); shutdown still proceeds', {
           error: attachmentError instanceof Error ? attachmentError.message : String(attachmentError),
+        })
+      }
+    }
+
+    // Remove the run-scoped reference-file ATTACHMENT directory (see
+    // `packages/runtime/src/agent/attachment-dir.ts`'s `buildAttachmentDir` -- outside the
+    // checkout, under RUNNER_TEMP). Nothing else ever removes it: without this, a persistent or
+    // self-hosted runner accumulates one directory per run indefinitely, and the CI-config
+    // `external_directory` grant this run installed (`scopeAttachmentDirectoryPermission`) would
+    // keep pointing at real, readable content long after this run ends. Best-effort and
+    // independent of `attachmentResult` above (a different mechanism, `response-file.ts`'s
+    // temp files) -- a failure here must never fail the run, and must not skip anything after it,
+    // matching the pattern of every other best-effort step in this block.
+    const runnerTemp = process.env.RUNNER_TEMP
+    if (runnerTemp != null && runnerTemp.trim().length > 0) {
+      const attachmentDirCleanupLogger = createLogger({phase: 'attachment-dir-cleanup'})
+      try {
+        const attachmentDir = buildAttachmentDir({
+          runnerTemp: runnerTemp.trim(),
+          runId: getGitHubRunId(),
+          runAttempt: getGitHubRunAttempt(),
+        })
+        await fs.rm(attachmentDir, {recursive: true, force: true})
+      } catch (attachmentDirError) {
+        attachmentDirCleanupLogger.warning('Attachment directory cleanup failed (non-fatal); shutdown still proceeds', {
+          error: attachmentDirError instanceof Error ? attachmentDirError.message : String(attachmentDirError),
         })
       }
     }

@@ -11,6 +11,12 @@ const ORIGINAL_RUNNER_TEMP = process.env.RUNNER_TEMP
 
 beforeEach(() => {
   delete process.env.RUNNER_TEMP
+  // Fixed, deterministic run identity for every test in this file -- the attachment directory
+  // pattern is now run-attempt-scoped (Finding 1), so leaving GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT
+  // to whatever the actual environment happens to hold (a real value when this suite runs inside
+  // an actual GitHub Actions job) would make the literal patterns asserted below flaky.
+  vi.stubEnv('GITHUB_RUN_ID', '12345')
+  vi.stubEnv('GITHUB_RUN_ATTEMPT', '1')
 })
 
 afterEach(() => {
@@ -589,13 +595,13 @@ describe('buildCIConfig', () => {
       expect(externalDirectory).toEqual({
         '*': 'deny',
         '/home/runner/work/_temp/fro-bot-response/*': 'allow',
-        '/home/runner/work/_temp/fro-bot-attachments/*': 'allow',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
         '/home/runner/work/_temp/harness-integrate-work/*': 'allow',
       })
       expect(Object.keys(externalDirectory)).toEqual([
         '*',
         '/home/runner/work/_temp/fro-bot-response/*',
-        '/home/runner/work/_temp/fro-bot-attachments/*',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*',
         '/home/runner/work/_temp/harness-integrate-work/*',
       ])
     })
@@ -681,7 +687,7 @@ describe('buildCIConfig', () => {
       expect(config.agent.build.permission.external_directory).toEqual({
         '*': 'deny',
         '/home/runner/work/_temp/fro-bot-response/*': 'allow',
-        '/home/runner/work/_temp/fro-bot-attachments/*': 'allow',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
       })
       expect(logger.warning).toHaveBeenCalledWith('Ignoring integration workdir outside RUNNER_TEMP', {
         integrationWorkDir: '/home/runner/work/_temp/../../etc',
@@ -710,7 +716,7 @@ describe('buildCIConfig', () => {
       expect(config.agent.build.permission.external_directory).toEqual({
         '*': 'deny',
         '/home/runner/work/_temp/fro-bot-response/*': 'allow',
-        '/home/runner/work/_temp/fro-bot-attachments/*': 'allow',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
       })
       expect(logger.warning).toHaveBeenCalledWith('Ignoring integration workdir outside RUNNER_TEMP', {
         integrationWorkDir: '/home/runner/work/_tempevil/harness-integrate-work',
@@ -799,7 +805,7 @@ describe('buildCIConfig', () => {
         permission: {
           external_directory: {
             '*': 'deny',
-            '/home/runner/work/_temp/fro-bot-attachments/*': 'allow',
+            '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
           },
         },
       })
@@ -819,7 +825,7 @@ describe('buildCIConfig', () => {
         permission: {
           external_directory: {
             '*': 'deny',
-            '/home/runner/work/_temp/fro-bot-attachments/*': 'allow',
+            '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
           },
         },
       })
@@ -853,7 +859,7 @@ describe('buildCIConfig', () => {
         permission: {
           external_directory: {
             '*': 'deny',
-            '/home/runner/work/_temp/fro-bot-attachments/*': 'allow',
+            '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
           },
         },
       })
@@ -880,7 +886,7 @@ describe('buildCIConfig', () => {
       expect(permission.bash).toBe('allow')
       expect(permission.external_directory).toEqual({
         '*': 'deny',
-        '/home/runner/work/_temp/fro-bot-attachments/*': 'allow',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
       })
     })
 

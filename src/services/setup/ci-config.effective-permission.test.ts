@@ -88,14 +88,18 @@ function deriveSubagentSessionPermission(parentSessionPermission: readonly Rule[
   return parentSessionPermission.filter(rule => rule.permission === 'external_directory' || rule.action === 'deny')
 }
 
-function attachmentPattern(runnerTemp: string): string {
-  return `${runnerTemp}/fro-bot-attachments/*`
+function attachmentPattern(runnerTemp: string, runId: string, runAttempt: string): string {
+  return `${runnerTemp}/fro-bot-attachments/${runId}-${runAttempt}/*`
 }
 
 const RUNNER_TEMP = '/home/runner/work/_temp'
+const RUN_ID = '4242'
+const RUN_ATTEMPT = '1'
 
 beforeEach(() => {
   vi.stubEnv('RUNNER_TEMP', RUNNER_TEMP)
+  vi.stubEnv('GITHUB_RUN_ID', RUN_ID)
+  vi.stubEnv('GITHUB_RUN_ATTEMPT', RUN_ATTEMPT)
 })
 
 afterEach(() => {
@@ -130,7 +134,11 @@ describe('effective child permission for the reference-file attachment directory
 
     // #then the attachment directory ask resolves to allow for the SUBAGENT's own session --
     // not merely present somewhere in the generated JSON
-    const resolved = evaluate('external_directory', attachmentPattern(RUNNER_TEMP), subagentSessionPermission)
+    const resolved = evaluate(
+      'external_directory',
+      attachmentPattern(RUNNER_TEMP, RUN_ID, RUN_ATTEMPT),
+      subagentSessionPermission,
+    )
     expect(resolved.action).toBe('allow')
   })
 
@@ -151,7 +159,11 @@ describe('effective child permission for the reference-file attachment directory
     const agentOwnRuleset = fromConfig({external_directory: {'*': 'ask'}})
     const rootSessionPermission = merge(agentOwnRuleset, globalUser)
 
-    const resolved = evaluate('external_directory', attachmentPattern(RUNNER_TEMP), rootSessionPermission)
+    const resolved = evaluate(
+      'external_directory',
+      attachmentPattern(RUNNER_TEMP, RUN_ID, RUN_ATTEMPT),
+      rootSessionPermission,
+    )
     expect(resolved.action).toBe('allow')
   })
 
@@ -175,7 +187,11 @@ describe('effective child permission for the reference-file attachment directory
     const pluginAgentSpecificOverride = fromConfig({external_directory: 'deny'})
     const agentSessionPermission = merge(agentOwnRuleset, globalUser, pluginAgentSpecificOverride)
 
-    const resolved = evaluate('external_directory', attachmentPattern(RUNNER_TEMP), agentSessionPermission)
+    const resolved = evaluate(
+      'external_directory',
+      attachmentPattern(RUNNER_TEMP, RUN_ID, RUN_ATTEMPT),
+      agentSessionPermission,
+    )
     expect(resolved.action).toBe('deny')
   })
 
@@ -200,16 +216,89 @@ describe('effective child permission for the reference-file attachment directory
     // #then the build agent's OWN re-asserted pattern is what actually grants it -- proving the
     // build-agent-scoped duplicate in `scopeExternalDirectoryPermission` is load-bearing, not
     // redundant, exactly as its doc comment claims
-    const resolved = evaluate('external_directory', attachmentPattern(RUNNER_TEMP), buildSessionPermission)
+    const resolved = evaluate(
+      'external_directory',
+      attachmentPattern(RUNNER_TEMP, RUN_ID, RUN_ATTEMPT),
+      buildSessionPermission,
+    )
     expect(resolved.action).toBe('allow')
 
     // #then removing just the build-agent-specific entry (simulating the global grant alone)
     // would NOT have been enough for the build agent -- its own '*' deny still wins
     const withoutBuildOwnAttachmentEntry = buildAgentOverride.filter(
-      rule => !(rule.permission === 'external_directory' && rule.pattern === attachmentPattern(RUNNER_TEMP)),
+      rule =>
+        !(
+          rule.permission === 'external_directory' &&
+          rule.pattern === attachmentPattern(RUNNER_TEMP, RUN_ID, RUN_ATTEMPT)
+        ),
     )
     const withoutOwnEntry = merge(buildAgentDefaults, globalUser, withoutBuildOwnAttachmentEntry)
-    const resolvedWithoutOwnEntry = evaluate('external_directory', attachmentPattern(RUNNER_TEMP), withoutOwnEntry)
+    const resolvedWithoutOwnEntry = evaluate(
+      'external_directory',
+      attachmentPattern(RUNNER_TEMP, RUN_ID, RUN_ATTEMPT),
+      withoutOwnEntry,
+    )
     expect(resolvedWithoutOwnEntry.action).toBe('deny')
+  })
+
+  it("does NOT grant a sibling run-attempt's attachment subdirectory under the same segment -- the disclosure this fix closes", () => {
+    // #given the harness's own generated OMO Slim config for THIS run (RUN_ID/RUN_ATTEMPT)
+    const result = buildCIConfig(
+      {
+        opencodeConfig: null,
+        systematicVersion: '1.0.0',
+        enableOmo: false,
+        enableOmoSlim: true,
+        omoSlimVersion: '1.1.1',
+      },
+      createMockLogger(),
+    )
+    const permission = (result.config as {permission?: Record<string, unknown>}).permission
+    if (permission == null) throw new Error('expected buildCIConfig to have set a top-level permission key')
+    const globalUser = fromConfig(permission)
+    const agentOwnRuleset = fromConfig({external_directory: {'*': 'ask'}})
+    const rootSessionPermission = merge(agentOwnRuleset, globalUser)
+    const subagentSessionPermission = deriveSubagentSessionPermission(rootSessionPermission)
+
+    // #when a DIFFERENT run-attempt's attachment subdirectory (same segment, sibling directory
+    // name) is checked against THIS run's grant
+    const siblingRunPattern = attachmentPattern(RUNNER_TEMP, RUN_ID, '2')
+
+    // #then it resolves to 'deny' (the global fail-closed default this run's grant never
+    // touches), not 'allow' -- a segment-wide `<runnerTemp>/fro-bot-attachments/*` pattern would
+    // have matched this too and resolved it to 'allow' instead
+    const resolved = evaluate('external_directory', siblingRunPattern, subagentSessionPermission)
+    expect(resolved.action).toBe('deny')
+  })
+
+  it("preserves an operator's own external_directory wildcard instead of overwriting it, appending the attachment rule after it", () => {
+    // #given an operator-supplied opencode-config with its own external_directory wildcard
+    const result = buildCIConfig(
+      {
+        opencodeConfig: JSON.stringify({permission: {external_directory: {'*': 'allow'}}}),
+        systematicVersion: '1.0.0',
+        enableOmo: false,
+        enableOmoSlim: true,
+        omoSlimVersion: '1.1.1',
+      },
+      createMockLogger(),
+    )
+    const permission = (result.config as {permission?: Record<string, unknown>}).permission
+    if (permission == null) throw new Error('expected buildCIConfig to have set a top-level permission key')
+    const externalDirectory = permission.external_directory as Record<string, unknown>
+
+    // #then the operator's own wildcard survives verbatim rather than being replaced with 'deny'
+    expect(externalDirectory['*']).toBe('allow')
+
+    // #then the specific attachment rule is still present, appended after the wildcard so
+    // `findLast` still resolves the attachment path itself to 'allow'
+    const globalUser = fromConfig(permission)
+    const resolved = evaluate('external_directory', attachmentPattern(RUNNER_TEMP, RUN_ID, RUN_ATTEMPT), globalUser)
+    expect(resolved.action).toBe('allow')
+
+    // #then an unrelated pattern still resolves through the operator's preserved wildcard, not a
+    // reintroduced hardcoded deny
+    const unrelatedResolved = evaluate('external_directory', '/some/other/path/*', globalUser)
+    expect(unrelatedResolved.action).toBe('allow')
   })
 })

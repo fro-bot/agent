@@ -25,6 +25,10 @@ vi.mock('../../features/attachments/index.js', () => ({
   cleanupTempFiles: vi.fn(),
 }))
 
+vi.mock('node:fs/promises', () => ({
+  rm: vi.fn().mockResolvedValue(undefined),
+}))
+
 vi.mock('../../shared/env.js', async importOriginal => {
   const original = await importOriginal<typeof import('../../shared/env.js')>()
   return {
@@ -75,6 +79,11 @@ describe('runCleanup', () => {
     process.env.GITHUB_RUN_ID = '12345'
     process.env.GITHUB_RUN_ATTEMPT = '2'
     delete process.env.OPENCODE_PROMPT_ARTIFACT
+    // Deleted, not merely left alone: the attachment-directory cleanup step reads this directly
+    // (not through a mocked env helper), so an ambient real value from an actual GitHub Actions
+    // runner running this suite would make it attempt a real `fs.rm` against a real path. Tests
+    // that need it set do so explicitly.
+    delete process.env.RUNNER_TEMP
   })
 
   afterEach(() => {
@@ -82,6 +91,7 @@ describe('runCleanup', () => {
     delete process.env.GITHUB_RUN_ID
     delete process.env.GITHUB_RUN_ATTEMPT
     delete process.env.OPENCODE_PROMPT_ARTIFACT
+    delete process.env.RUNNER_TEMP
   })
 
   it('uploads artifacts and metadata with metrics when storeConfig is enabled', async () => {
@@ -633,12 +643,14 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     process.env.GITHUB_WORKSPACE = '/tmp/workspace'
     process.env.GITHUB_RUN_ID = '12345'
     process.env.GITHUB_RUN_ATTEMPT = '1'
+    delete process.env.RUNNER_TEMP
   })
 
   afterEach(() => {
     delete process.env.GITHUB_WORKSPACE
     delete process.env.GITHUB_RUN_ID
     delete process.env.GITHUB_RUN_ATTEMPT
+    delete process.env.RUNNER_TEMP
   })
 
   it('declines cache persistence when the ownership ledger has an unknown entry', async () => {
@@ -808,5 +820,83 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     // failed conditional delete is swallowed -- non-fatal, matching every other release failure
     expect(lease.stop).toHaveBeenCalledTimes(1)
     expect(releaseLock).toHaveBeenCalledWith(expect.any(Object), 'owner/repo', '"etag-stale"', expect.any(Object))
+  })
+})
+
+describe('runCleanup attachment directory removal', () => {
+  const minimalOptions = (): CleanupPhaseOptions => ({
+    bootstrapLogger: createMockLogger(),
+    reactionCtx: null,
+    githubClient: null,
+    attachmentResult: null,
+    serverHandle: null,
+    sessionRetention: null,
+    detectedOpencodeVersion: '1.0.0',
+    storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+    metrics: createMetricsCollector(),
+    agentIdentity: 'github',
+    repo: 'owner/repo',
+    runId: 'run-123',
+    lockEtag: null,
+  })
+
+  beforeEach(() => {
+    vi.resetModules()
+    vi.clearAllMocks()
+    process.env.GITHUB_WORKSPACE = '/tmp/workspace'
+    process.env.GITHUB_RUN_ID = '4242'
+    process.env.GITHUB_RUN_ATTEMPT = '3'
+  })
+
+  afterEach(() => {
+    delete process.env.GITHUB_WORKSPACE
+    delete process.env.GITHUB_RUN_ID
+    delete process.env.GITHUB_RUN_ATTEMPT
+    delete process.env.RUNNER_TEMP
+  })
+
+  it('removes the run-scoped attachment directory when RUNNER_TEMP is set', async () => {
+    // #given RUNNER_TEMP is set (the real-CI case) -- this run materialized attachments under it
+    process.env.RUNNER_TEMP = '/home/runner/work/_temp'
+    const {rm} = await import('node:fs/promises')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(minimalOptions())
+
+    // #then the exact run-attempt-scoped directory this run's own grant covers is removed
+    expect(rm).toHaveBeenCalledWith('/home/runner/work/_temp/fro-bot-attachments/4242-3', {
+      recursive: true,
+      force: true,
+    })
+  })
+
+  it('does not attempt removal when RUNNER_TEMP is unset', async () => {
+    // #given RUNNER_TEMP is unset (deleted by afterEach/local, non-Actions runs)
+    delete process.env.RUNNER_TEMP
+    const {rm} = await import('node:fs/promises')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(minimalOptions())
+
+    // #then nothing is guessed -- matches `scopeAttachmentDirectoryPermission`'s own fail-safe
+    expect(rm).not.toHaveBeenCalled()
+  })
+
+  it('does not fail the run when attachment directory removal fails, and later cleanup steps still run', async () => {
+    // #given removal itself fails (e.g. permission denied on a self-hosted runner)
+    process.env.RUNNER_TEMP = '/home/runner/work/_temp'
+    const {rm} = await import('node:fs/promises')
+    vi.mocked(rm).mockRejectedValueOnce(new Error('EACCES'))
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs -- must not throw, and must still reach the rest of the phase
+    const result = await runCleanup(minimalOptions())
+
+    // #then the run's own safety evidence is still produced normally
+    expect(result).toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', expect.any(String))
   })
 })
