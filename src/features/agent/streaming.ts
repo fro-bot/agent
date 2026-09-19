@@ -642,7 +642,26 @@ export async function processEventStream(
 
       if (eventType === 'permission.asked') {
         const eventSessionID = getEventSessionID(event)
-        if (!isOwnedSession(eventSessionID, sessionId, ownershipLedger)) continue
+        // Ownership is deliberately NOT required here, unlike every other filter in this loop.
+        // Every well-formed ask this subscription observes gets answered, regardless of which
+        // session raised it (root, an owned/adopted descendant, or a descendant this run's ledger
+        // has not adopted yet). `isOwnedSession`'s null check is still needed -- an ask with no
+        // session id has nowhere to target a reply -- so it is inlined below rather than gated
+        // through the ownership predicate.
+        //
+        // This is safe ONLY because the Action starts its own loopback OpenCode server per run
+        // (`packages/runtime/src/agent/server.ts`) and wires an unconditional-reject responder to
+        // it (`src/features/agent/execution.ts`): every ask this process observes belongs to this
+        // run's own process tree. This assumes an Action-owned server, not a shared/interactive
+        // instance -- on a server shared across runs, or one with a real human approval path (see
+        // the gateway's `run-core.ts`, deliberately NOT changed this way), answering every ask
+        // regardless of ownership would leak into unrelated work.
+        //
+        // This also incidentally fixes an ask arriving before background adoption completes
+        // (`ownershipLedger.adopt` runs off the `task` tool's completed part, which can race a
+        // pre-adoption ask from the same dispatch) without making permission handling depend on
+        // adoption timing at all -- ownership is no longer consulted here.
+        if (eventSessionID === null) continue
 
         const requestID = getStringProperty(eventPayload, 'id')
         const permission = getStringProperty(eventPayload, 'permission') ?? 'unknown'
@@ -657,11 +676,9 @@ export async function processEventStream(
           continue
         }
 
-        // A descendant's request is denied exactly like the root's — there is no
-        // human approval path on this surface, and widening ownership only means
-        // the denial now also covers owned descendants. `sessionID` must be the
-        // event's own session id (not the root's) so the reply targets the
-        // session that actually asked.
+        // Every ask is denied exactly the same way regardless of which session raised it — see
+        // the ownership note above. `sessionID` must be the event's own session id (not the
+        // root's) so the reply targets the session that actually asked.
         const request: PermissionAskedRequest = {
           requestID,
           sessionID: eventSessionID,
@@ -675,6 +692,17 @@ export async function processEventStream(
           try {
             await onPermissionAsked(request)
           } catch (error) {
+            // Failure policy: logged-and-continued, not escalated. A failed reply means this one
+            // ask may go unanswered (the child hangs until the run's own deadline cancels it — the
+            // same outcome as if this fix did not exist), but throwing here would abort
+            // `consumeStream` for every OTHER in-flight ask and event this loop is still
+            // responsible for, trading one stuck child for the whole run's observability. Escalating
+            // is also unjustified because the caller has no retry or fallback path to escalate
+            // into — `onPermissionAsked` is a single best-effort HTTP round-trip, not a queue.
+            // Note this does NOT mean the ask was settled: the responder does not inspect the SDK
+            // result for an embedded `error` field (`execution.ts`), so even a *resolved* call
+            // above only proves the round-trip completed, not that OpenCode's permission store
+            // recorded the reject. This log line is the only evidence of that gap.
             logger.warning('Failed to reject OpenCode permission request', {
               ...context,
               error: error instanceof Error ? error.message : String(error),

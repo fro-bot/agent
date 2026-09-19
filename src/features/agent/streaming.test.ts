@@ -318,6 +318,233 @@ describe('processEventStream — ownership ledger integration', () => {
     })
   })
 
+  it("answers an untracked foreground subagent's ask — the defect this fix closes: a foreground dispatch is never adopted into the ledger, so the old ownership gate silently dropped its ask and the child hung forever", async () => {
+    // #given no ledger entry for this session at all (a foreground `task` dispatch is never
+    // adopted — only background dispatches are, per `ownershipLedger.adopt` on the `task` tool's
+    // completed part with `metadata.background === true`)
+    const ledger = createOwnershipLedger()
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', sessionID: UNOWNED_SESSION_ID, permission: 'read', patterns: ['*.env']},
+      } as unknown as Event,
+    ])
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      responder,
+      ledger,
+    )
+
+    // #then the ask is answered anyway, targeting the foreground subagent's own session id
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: UNOWNED_SESSION_ID,
+      permission: 'read',
+      patterns: ['*.env'],
+    })
+  })
+
+  it("answers a pre-adoption background ask — the ask can arrive before the task tool's completed part adopts the child", async () => {
+    // #given a ledger that has not yet adopted the child (the adoption event has not been observed
+    // yet), and a permission ask already arriving from that not-yet-adopted session
+    const ledger = createOwnershipLedger()
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream(
+      [
+        {
+          type: 'permission.asked',
+          properties: {id: 'request-id', sessionID: CHILD_SESSION_ID, permission: 'bash', patterns: ['*']},
+        } as unknown as Event,
+        backgroundDispatchEvent(ROOT_SESSION_ID, CHILD_SESSION_ID, 'do the thing'),
+      ],
+      () => abortController.abort(),
+    )
+
+    // #when the stream is processed — the ask arrives strictly before the adoption event. The
+    // caller aborts once the scripted stream is exhausted (mirroring retry.ts) so a natural
+    // end-of-stream isn't itself recorded as a discontinuity that would mark the freshly-adopted
+    // entry unknown before this assertion runs.
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      responder,
+      ledger,
+    )
+
+    // #then the ask is answered even though the ledger had not adopted the child yet
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: CHILD_SESSION_ID,
+      permission: 'bash',
+      patterns: ['*'],
+    })
+    // #then adoption still proceeds normally afterward, unaffected by permission handling
+    expect(ledger.outstanding()).toBe(1)
+  })
+
+  it("still answers the root's own ask exactly as before — removing the ownership requirement does not change root behavior", async () => {
+    // #given no ledger, and an ask from the root session (the only case that worked pre-fix)
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', sessionID: ROOT_SESSION_ID, permission: 'edit', patterns: ['*']},
+      } as unknown as Event,
+    ])
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then the root's ask is answered, targeting the root's own session id
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: ROOT_SESSION_ID,
+      permission: 'edit',
+      patterns: ['*'],
+    })
+  })
+
+  it('handles a permission ask with no session id without throwing and without issuing a reply', async () => {
+    // #given a malformed ask event carrying no session id at all
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const logger = createMockLogger()
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', permission: 'bash', patterns: ['*']},
+      } as unknown as Event,
+      messageUpdatedEvent(ROOT_SESSION_ID),
+    ])
+
+    // #when the stream is processed — must not throw, and must reach the later event
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then no reply is issued for a session-less ask, and the stream still completes
+    expect(responder).not.toHaveBeenCalled()
+    expect(result).toBeDefined()
+  })
+
+  it('handles a permission ask with no request id without throwing and without issuing a reply', async () => {
+    // #given a malformed ask event carrying a session id but no request id
+    const responder = vi.fn().mockResolvedValue(undefined)
+    const logger = createMockLogger()
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {sessionID: UNOWNED_SESSION_ID, permission: 'bash', patterns: ['*']},
+      } as unknown as Event,
+      messageUpdatedEvent(ROOT_SESSION_ID),
+    ])
+
+    // #when the stream is processed — must not throw
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then no reply is issued for a request-id-less ask, and the missing-id warning still fires
+    expect(responder).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalledWith(
+      'OpenCode permission request missing request id',
+      expect.objectContaining({eventSessionID: UNOWNED_SESSION_ID}),
+    )
+    expect(result).toBeDefined()
+  })
+
+  it('logs and continues — never throws — when the responder rejects for an untracked session, per the documented failure policy', async () => {
+    // #given an untracked session's ask, and a responder whose reply fails
+    const logger = createMockLogger()
+    const responder = vi.fn().mockRejectedValue(new Error('reply failed'))
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', sessionID: UNOWNED_SESSION_ID, permission: 'bash', patterns: ['*']},
+      } as unknown as Event,
+      messageUpdatedEvent(ROOT_SESSION_ID),
+    ])
+
+    // #when the stream is processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then the failure is logged and swallowed — stream processing continues to completion
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Failed to reject OpenCode permission request',
+      expect.objectContaining({eventSessionID: UNOWNED_SESSION_ID, error: 'reply failed'}),
+    )
+    expect(result).toBeDefined()
+  })
+
+  it("complement: a foreign session's non-permission events are still ignored — only permission.asked stopped requiring ownership", async () => {
+    // #given events of every other ownership-gated type from a session neither root nor ledger-tracked
+    const ledger = createOwnershipLedger()
+    const logger = createMockLogger()
+    const eventStream = createMockEventStream([
+      messageUpdatedEvent(UNOWNED_SESSION_ID),
+      toolSuccessEvent(UNOWNED_SESSION_ID),
+      sessionErrorEvent(UNOWNED_SESSION_ID),
+    ])
+
+    // #when the stream is processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then none of it is attributed to this run: no tokens recorded, no error surfaced, ledger untouched
+    expect(result.tokens).toBeNull()
+    expect(result.llmError).toBeNull()
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.snapshot()).toEqual([])
+  })
+
   it('marks outstanding entries unknown on a stream discontinuity and returns a partial result instead of throwing', async () => {
     // #given a ledger with an outstanding child, and a stream that throws mid-iteration
     const ledger = createOwnershipLedger()
