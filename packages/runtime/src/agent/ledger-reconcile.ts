@@ -24,9 +24,15 @@
  * therefore have no discriminant between an ordinary foreground subagent and
  * a background dispatch. Adopting on that basis meant an unrelated foreground
  * subagent, mid-run at a reconcile tick, could be adopted as this run's owned
- * background work — making every run's drain depend on a classification that
- * cannot be made. That adoption path has been removed. See "Known gap" below
- * for what this leaves unrecoverable.
+ * background work — making every run's drain depend on a classification
+ * THESE TWO CALLS cannot make. That adoption path has been removed.
+ *
+ * Read that as a statement about `children()`/`liveSessionIds()`, not about
+ * the server as a whole. A discriminant does exist elsewhere: the same
+ * `background: true` the session record lacks is written to the tool part's
+ * `state.metadata` before the job starts, persisted with the rest of the part,
+ * and returned by the message read API. See "Known gap" below — what is
+ * missing here is a discriminant on THIS module's inputs, not one anywhere.
  *
  * Two upstream questions, both still needed to settle tracked entries safely:
  * - `children(parentSessionId)` — DISCOVERY. A bare `parent_id` lookup with
@@ -86,16 +92,34 @@
  *
  * Known gap: a background dispatch whose *dispatch* event (not settlement
  * event) never reaches the ledger — dropped mid-stream, or during a
- * reconnect gap before the ledger ever learns the session id — is now
- * unrecoverable by reconciliation. There is no discriminant this module can
- * use to discover it after the fact (see above), so it is never adopted and
- * never counted toward drain. This is bounded by the run's own deadline (an
- * unrecoverable dispatch does not hang a run forever, it is just silently
- * excluded from the drain wait), and nothing in this codebase can currently
- * issue a background dispatch at all, so the gap has no live exposure today.
- * If background dispatch ships, recovering a dropped dispatch event needs a
- * real discriminant upstream (e.g. a `background` flag on the session record
- * itself) — this module must not paper over that absence by guessing again.
+ * reconnect gap before the ledger ever learns the session id — is not
+ * recovered by THIS module. Its two inputs cannot tell such a child from an
+ * ordinary foreground subagent, so it is never adopted and never counted
+ * toward drain. The run's own deadline bounds the consequence: an
+ * unrecovered dispatch does not hang a run forever, it is silently excluded
+ * from the drain wait. Background dispatch is now enabled, so this is live
+ * exposure rather than a latent one.
+ *
+ * It is NOT, however, unrecoverable in principle, and an earlier version of
+ * this comment said so wrongly. Verified against the pinned base version:
+ * `tool/task.ts` records `{parentSessionId, sessionId, background: true}`
+ * through `ctx.metadata()` BEFORE the background job starts, `session/tools.ts`
+ * stores it at the tool part's `state.metadata`, and `core/session/projector.ts`
+ * persists the whole part, stripping only ids. `GET /session/{id}/message`
+ * returns it, and the SDK types declare `metadata` on both running and
+ * completed tool states — so `part.tool === 'task' && part.state.metadata
+ * .background === true` distinguishes a background dispatch from a foreground
+ * delegation, which returns no `background` key at all.
+ *
+ * Recovering a dropped dispatch therefore means reading persisted task parts,
+ * not waiting for upstream to add a session-record flag. Two things such a
+ * reader must handle, neither of which this module does today: correlating by
+ * `part.messageID` and tool start time so a resumed session's historical
+ * dispatches are not adopted as this invocation's, and keeping observation
+ * separate from execution — upstream's background-job registry is explicitly
+ * process-local, so a restarted server can learn a dispatch existed while
+ * being unable to recover its in-process status. Conflating those two is
+ * most likely how the original "unrecoverable" claim arose.
  */
 
 import type {Result} from '@bfra.me/es/result'

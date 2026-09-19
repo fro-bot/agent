@@ -675,9 +675,12 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
   // whose adoption event itself was never observed: reconciliation settles
   // what the ledger already tracks, it never adopts an untracked session (see
   // `packages/runtime/src/agent/ledger-reconcile.ts`'s module doc for why that
-  // was tried and removed -- there is no discriminant between an ordinary
-  // foreground subagent and a background dispatch once the adoption event
-  // itself is lost).
+  // was tried and removed -- reconciliation's two inputs, `children()` and
+  // `liveSessionIds()`, cannot tell an ordinary foreground subagent from a
+  // background dispatch once the adoption event itself is lost). A
+  // discriminant does exist on the persisted tool part, which nothing here
+  // reads today -- see that module doc for the verified shape and for what a
+  // reader of it would additionally have to get right.
   await reconcileLedgerOnce(reconcileOptions)
 
   if (ledger.isDrainComplete()) return {...NO_DRAIN_OUTCOME, unknownCount: ledger.unknown()}
