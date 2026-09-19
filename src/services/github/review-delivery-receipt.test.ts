@@ -176,18 +176,53 @@ describe('createReviewDeliveryReceiptOperations', () => {
     expect(conditionalPutSpy).not.toHaveBeenCalled()
   })
 
-  it('fails closed when the object store is unconfigured (storeConfig.enabled: false) -- reserve always blocks, never falls back', async () => {
-    // #given an unconfigured store
+  it('an unconfigured store (storeConfig.enabled: false) submits unprotected, not blocked -- the status quo, and a warning names the weakened guarantee', async () => {
+    // #given an unconfigured store (the default `s3-backup: 'false'`, or the fork-PR force-disable)
     const ops = createReviewDeliveryReceiptOperations(createStoreConfig({enabled: false}), logger)
 
     // #when reserve is attempted
     const outcome = await ops.reserve(IDENTITY, 1)
 
-    // #then blocked with the store-unavailable reason -- no Actions-cache fallback exists
+    // #then it succeeds unprotected -- refusing to submit here would turn every
+    // default-configured consumer's review delivery into an outage, which is worse than the
+    // pre-existing rerun-duplication risk this accepts
+    expect(outcome.kind).toBe('reserved')
+    expect(logger.warning).toHaveBeenCalledWith(
+      expect.stringContaining('without at-most-once'),
+      expect.objectContaining({identity: IDENTITY, attempt: 1}),
+    )
+  })
+
+  it('complement: a rerun with no store configured submits again -- the accepted status-quo risk, not silently pretended away', async () => {
+    // #given an unconfigured store, and a first attempt that already "reserved" (i.e. submitted unprotected)
+    const ops = createReviewDeliveryReceiptOperations(createStoreConfig({enabled: false}), logger)
+    const first = await ops.reserve(IDENTITY, 1)
+    expect(first.kind).toBe('reserved')
+
+    // #when a rerun (same runId, incremented attempt) reserves again
+    const second = await ops.reserve(IDENTITY, 2)
+
+    // #then it ALSO succeeds unprotected -- with no durable store there is no record of the
+    // first attempt to block against, so a rerun can duplicate the review. This is the
+    // accepted status-quo risk, documented here rather than silently assumed
+    expect(second.kind).toBe('reserved')
+  })
+
+  it('complement: a configured store still fails closed on read failure -- unconfigured and failing are not the same case', async () => {
+    // #given a CONFIGURED store whose read fails ambiguously (not genuinely absent)
+    const {adapter} = createInMemoryAdapter()
+    const getObject = vi.fn(async () => err(new Error('ServiceUnavailable')))
+    const brokenAdapter: ObjectStoreAdapter = {...adapter, getObject}
+    const ops = createReviewDeliveryReceiptOperations(createStoreConfig({enabled: true}), logger, brokenAdapter)
+
+    // #when reserve is attempted
+    const outcome = await ops.reserve(IDENTITY, 1)
+
+    // #then still blocked -- a configured-but-failing store must never be treated like an
+    // unconfigured one
     expect(outcome.kind).toBe('blocked')
     if (outcome.kind !== 'blocked') throw new Error('expected blocked')
-    expect(outcome.reason).toBe('store-unavailable')
-    expect(typeof outcome.detail).toBe('string')
+    expect(outcome.reason).toBe('read-failed')
   })
 
   it('fails closed when the adapter lacks conditional operations', async () => {

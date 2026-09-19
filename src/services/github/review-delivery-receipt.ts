@@ -29,11 +29,18 @@
  * Report that state as "delivery uncertain, operator reconciliation required", never as
  * "already delivered".
  *
- * Fail-closed by construction: when the object store is unavailable or unconfigured, or the
- * adapter lacks conditional operations, `reserve` always blocks. This guarantee is mandatory,
- * not best-effort -- it does not fall back to the Actions cache, and it does not expire
- * receipts inside the supported rerun horizon (receipts are never given a TTL or opportunistically
- * cleaned up by this module).
+ * Fail-closed on a CONFIGURED store: when the object store is configured but unavailable (a
+ * read fails ambiguously, a reservation conflicts, an existing record is malformed, or the
+ * adapter lacks conditional operations), `reserve` always blocks. This guarantee is
+ * mandatory, not best-effort -- it does not fall back to the Actions cache, and it does not
+ * expire receipts inside the supported rerun horizon (receipts are never given a TTL or
+ * opportunistically cleaned up by this module).
+ *
+ * An UNCONFIGURED store (`storeConfig.enabled === false` -- the default, and the case forced
+ * for every fork PR) is a different situation, not a degenerate case of the above: there is
+ * no durable store to fail against, so `reserve` proceeds unprotected rather than blocking
+ * every default-configured consumer's review delivery. See `createReviewDeliveryReceiptOperations`'s
+ * doc for the full split.
  *
  * `release` is the one narrow, deliberate exception to "never deleted": it exists solely for a
  * caller (`submitReviewWithHeadGuard`) that reserved and then, before the POST, positively
@@ -200,13 +207,26 @@ function parseReceiptRecord(data: string): ReviewDeliveryReceiptRecord | null {
 /**
  * Builds the injected reservation/delivery operations for the review-delivery receipt.
  *
- * Fail-closed by construction: when `storeConfig.enabled === false`, or the resolved
- * adapter lacks `getObject`/`conditionalPut`, `reserve` always returns
- * `{kind: 'blocked', reason: 'store-unavailable'}` and `recordDelivered` is a no-op. This
- * mirrors the harness-wide rule that the object store's own persistence safety predicate
- * stays independent (see `AGENTS.md`'s "Must not move" list) -- this receipt does not fall
- * back to the Actions cache when S3 is unavailable; it withholds formal review submission
- * instead.
+ * TWO DISTINCT cases, deliberately not collapsed:
+ *
+ * 1. Store NOT CONFIGURED (`storeConfig.enabled === false`, e.g. the default `s3-backup:
+ *    'false'`, or the store force-disabled for fork PRs). There is no durable backing store
+ *    to reserve against at all, so at-most-once protection cannot be provided. This is the
+ *    status-quo rerun-duplication risk that predates this receipt -- it must not be turned
+ *    into total review non-delivery. `reserve` always succeeds unprotected (never blocks)
+ *    and logs a `warning` naming the weakened guarantee on every call, so operators see it
+ *    in their own run logs rather than discovering it only when a duplicate review lands.
+ *    `recordDelivered`/`release` are no-ops (nothing was reserved to update).
+ *
+ * 2. Store CONFIGURED but the adapter lacks `getObject`/`conditionalPut`, or a reserve call
+ *    hits a read failure, conflict, or malformed record: `reserve` returns
+ *    `{kind: 'blocked', reason: ...}` and submission is withheld. This is the case the
+ *    receipt exists for -- an operator opted into the durable-store guarantee and it is
+ *    failing, so this fails closed exactly as before. This mirrors the harness-wide rule
+ *    that the object store's own persistence safety predicate stays independent (see
+ *    `AGENTS.md`'s "Must not move" list) -- this receipt does not fall back to the Actions
+ *    cache when a configured S3 store is unavailable; it withholds formal review submission
+ *    instead.
  */
 export function createReviewDeliveryReceiptOperations(
   storeConfig: ObjectStoreConfig,
@@ -219,9 +239,22 @@ export function createReviewDeliveryReceiptOperations(
     detail,
   })
 
+  // Store NOT configured (default `s3-backup: 'false'`, or force-disabled for fork PRs --
+  // see `src/harness/config/inputs.ts`). Distinct from "configured but failing" below: there
+  // is nothing to reserve against, so at-most-once cannot be provided at all. Submitting
+  // unprotected here is the pre-existing rerun-duplication risk, not a new hazard -- refusing
+  // to submit would instead turn every default-configured run and every fork PR into total
+  // review non-delivery, which is strictly worse. See this function's doc, case 1.
   if (storeConfig.enabled === false) {
     return {
-      reserve: async () => blockedUnavailable('object store is not configured'),
+      reserve: async (identity, attempt) => {
+        logger.warning(
+          'Review delivery receipt: object store not configured -- submitting without at-most-once ' +
+            'protection; a rerun of this invocation could duplicate this review',
+          {identity, attempt},
+        )
+        return {kind: 'reserved', etag: 'unconfigured'}
+      },
       recordDelivered: async () => {
         logger.debug('Review delivery receipt: recordDelivered skipped, object store not configured')
       },
