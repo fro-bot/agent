@@ -92,6 +92,24 @@ export async function checkForkOrSelfGuard(
   return {allowed: true, currentHeadSha}
 }
 
+/**
+ * Publication-receipt configuration for a single `submitReviewWithHeadGuard` call
+ * (`services/github/review-delivery-receipt.js`). Collapsed into one sub-object rather than
+ * three independently optional sibling fields: `ops`, `identity`, and `attempt` are all-or-
+ * nothing at the receipt's own gate (`reserve` only ever protects when all three are known),
+ * so a caller that supplies a partial configuration is a type error here instead of a
+ * silent, unprotected review submission. Optional at the `receipt` level so this shared
+ * guard keeps working, unprotected, for any caller that has not been wired to a receipt yet;
+ * every production caller in this codebase always provides it (see `response-post.ts` and
+ * `review-reconciliation.ts`).
+ */
+export interface ReviewDeliveryReceiptConfig {
+  readonly ops: ReviewDeliveryReceiptOperations
+  readonly identity: ReviewDeliveryReceiptIdentity
+  /** `GITHUB_RUN_ATTEMPT`, stored inside the receipt record, never in its key. */
+  readonly attempt: number
+}
+
 export interface SubmitReviewWithHeadGuardParams {
   readonly octokit: Octokit
   readonly owner: string
@@ -102,18 +120,12 @@ export interface SubmitReviewWithHeadGuardParams {
   /** Head SHA observed by the caller's prior fork/self guard check. */
   readonly currentHeadSha: string
   /**
-   * Injected publication-receipt operations (`services/github/review-delivery-receipt.js`).
-   * When provided, a reservation is acquired immediately after the head check below and
-   * before the review POST -- see that module's doc for the full at-most-once guarantee.
-   * Optional so this shared guard keeps working, unprotected, for any caller that has not
-   * been wired to a receipt yet; every production caller in this codebase always provides
-   * it (see `response-post.ts` and `review-reconciliation.ts`).
+   * Injected publication-receipt configuration. When provided, a reservation is acquired
+   * immediately after the head check below and before the review POST -- see
+   * `ReviewDeliveryReceiptConfig`'s doc and `services/github/review-delivery-receipt.js`'s
+   * doc for the full at-most-once guarantee.
    */
-  readonly reservationOps?: ReviewDeliveryReceiptOperations
-  /** Required together with `reservationOps` -- identifies the receipt this call reserves. */
-  readonly receiptIdentity?: ReviewDeliveryReceiptIdentity
-  /** Required together with `reservationOps` -- `GITHUB_RUN_ATTEMPT`, stored inside the receipt record, never in its key. */
-  readonly attempt?: number
+  readonly receipt?: ReviewDeliveryReceiptConfig
 }
 
 export type HeadGuardBlockReason = 'head-moved-before-submit' | 'receipt-blocked'
@@ -138,12 +150,21 @@ export type SubmitReviewWithHeadGuardOutcome = SubmitReviewWithHeadGuardBlocked 
  * window (mirrors review-reconciliation.ts ~230-247), aborting if the head
  * moved since `currentHeadSha` was observed. On success, submits the review
  * pinned to `currentHeadSha` (mirrors ~252-264).
+ *
+ * A second TOCTOU window sits inside the reservation itself: `receipt.ops.reserve` is an
+ * awaited object-store round trip, during which the PR head can still move between the
+ * check above and the POST below. After a successful reservation, the head is re-checked a
+ * THIRD time; a move detected here also aborts, but -- unlike the pre-reservation check --
+ * the reservation now exists and must be resolved, not just walked away from. This is a
+ * stale-head abort, not a delivery and not an ambiguous crash, so the reservation is
+ * released (best-effort) rather than left to permanently block a later legitimate review
+ * for this `runId` (see `release`'s doc in `review-delivery-receipt.ts`).
  */
 export async function submitReviewWithHeadGuard(
   params: SubmitReviewWithHeadGuardParams,
   logger: Logger,
 ): Promise<SubmitReviewWithHeadGuardOutcome> {
-  const {octokit, owner, repo, prNumber, event, body, currentHeadSha, reservationOps, receiptIdentity, attempt} = params
+  const {octokit, owner, repo, prNumber, event, body, currentHeadSha, receipt} = params
 
   const freshPrResponse = await octokit.rest.pulls.get({owner, repo, pull_number: prNumber})
   const freshHeadSha: string = freshPrResponse.data.head.sha
@@ -162,8 +183,8 @@ export async function submitReviewWithHeadGuard(
   // consume a reservation slot for a review that was never going to be submitted anyway.
   // Only the caller that acquires this reservation may proceed to submit.
   let reservationEtag: string | null = null
-  if (reservationOps != null && receiptIdentity != null && attempt != null) {
-    const reservation = await reservationOps.reserve(receiptIdentity, attempt)
+  if (receipt != null) {
+    const reservation = await receipt.ops.reserve(receipt.identity, receipt.attempt)
     if (reservation.kind === 'blocked') {
       logger.warning('Review guard: publication receipt blocked submission', {
         prNumber,
@@ -174,6 +195,21 @@ export async function submitReviewWithHeadGuard(
       return {submitted: false, reason: 'receipt-blocked', receiptReason: reservation.reason}
     }
     reservationEtag = reservation.etag
+
+    // Close the race window the reservation call itself opens: `reserve` above was an
+    // awaited round trip, during which the head could have moved. Re-check now, with the
+    // reservation already held.
+    const postReservationPrResponse = await octokit.rest.pulls.get({owner, repo, pull_number: prNumber})
+    const postReservationHeadSha: string = postReservationPrResponse.data.head.sha
+    if (postReservationHeadSha !== currentHeadSha) {
+      logger.info('Review guard: head moved during reservation, releasing and aborting', {
+        prNumber,
+        originalHead: currentHeadSha,
+        freshHead: postReservationHeadSha,
+      })
+      await receipt.ops.release(receipt.identity, reservationEtag)
+      return {submitted: false, reason: 'head-moved-before-submit'}
+    }
   }
 
   logger.info('Review guard: submitting review', {prNumber, event, currentHeadSha})
@@ -192,8 +228,8 @@ export async function submitReviewWithHeadGuard(
     logger,
   )
 
-  if (reservationOps != null && receiptIdentity != null && attempt != null && reservationEtag != null) {
-    await reservationOps.recordDelivered(receiptIdentity, reservationEtag, attempt, review.reviewId)
+  if (receipt != null && reservationEtag != null) {
+    await receipt.ops.recordDelivered(receipt.identity, reservationEtag, receipt.attempt, review.reviewId)
   }
 
   return {submitted: true, review, commitSha: currentHeadSha}

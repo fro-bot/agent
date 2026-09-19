@@ -221,6 +221,131 @@ describe('createReviewDeliveryReceiptOperations', () => {
     expect(typeof warningCall?.[1]?.key).toBe('string')
   })
 
+  it('a corrupted `delivered` record missing `reviewId` is rejected and blocks submission (fail-closed, not treated as genuine delivery)', async () => {
+    // #given an existing object whose status claims 'delivered' but is missing reviewId --
+    // a partial write, not a genuine delivery
+    const {adapter, store} = createInMemoryAdapter()
+    const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
+    store.set('fro-bot-state/github/owner/repo/metadata/review-delivery-receipt-pr-42-run-run-1.json', {
+      data: JSON.stringify({status: 'delivered', attempt: 1, reservedAt: new Date().toISOString()}),
+      etag: 'etag-seed',
+    })
+    const conditionalPutSpy = vi.spyOn(adapter, 'conditionalPut' as never)
+
+    // #when reserve is attempted
+    const outcome = await ops.reserve(IDENTITY, 2)
+
+    // #then blocked -- the corrupted record fails validation exactly like any other
+    // malformed record and must not be treated as evidence the review already went out
+    expect(outcome.kind).toBe('blocked')
+    expect(outcome.kind === 'blocked' ? outcome.reason : null).toBe('read-failed')
+    expect(conditionalPutSpy).not.toHaveBeenCalled()
+  })
+
+  it('a corrupted `delivered` record missing `deliveredAt` is rejected and blocks submission', async () => {
+    // #given an existing object whose status claims 'delivered' but is missing deliveredAt
+    const {adapter, store} = createInMemoryAdapter()
+    const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
+    store.set('fro-bot-state/github/owner/repo/metadata/review-delivery-receipt-pr-42-run-run-1.json', {
+      data: JSON.stringify({status: 'delivered', attempt: 1, reservedAt: new Date().toISOString(), reviewId: 999}),
+      etag: 'etag-seed',
+    })
+    const conditionalPutSpy = vi.spyOn(adapter, 'conditionalPut' as never)
+
+    // #when reserve is attempted
+    const outcome = await ops.reserve(IDENTITY, 2)
+
+    // #then blocked -- same fail-closed treatment as any other malformed record
+    expect(outcome.kind).toBe('blocked')
+    expect(outcome.kind === 'blocked' ? outcome.reason : null).toBe('read-failed')
+    expect(conditionalPutSpy).not.toHaveBeenCalled()
+  })
+
+  it('a genuine `reserved` record (no delivery fields at all) still parses and blocks as before', async () => {
+    // #given a well-formed reserved record, with neither deliveredAt nor reviewId -- this
+    // must keep parsing and blocking exactly as it did before the record was tightened into
+    // a discriminated union
+    const {adapter, store} = createInMemoryAdapter()
+    const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
+    store.set('fro-bot-state/github/owner/repo/metadata/review-delivery-receipt-pr-42-run-run-1.json', {
+      data: JSON.stringify({status: 'reserved', attempt: 1, reservedAt: new Date().toISOString()}),
+      etag: 'etag-seed',
+    })
+
+    // #when reserve is attempted
+    const outcome = await ops.reserve(IDENTITY, 2)
+
+    // #then blocked with 'already-reserved' -- a genuine, well-formed reserved record is
+    // still recognized and protective, not swept up by the tightened validation
+    expect(outcome.kind).toBe('blocked')
+    if (outcome.kind !== 'blocked') throw new Error('expected blocked')
+    expect(outcome.reason).toBe('already-reserved')
+    expect(outcome.detail).toContain('reserved')
+  })
+
+  it('a genuine `delivered` record with both required fields still parses and blocks as before', async () => {
+    // #given a well-formed delivered record with deliveredAt and reviewId present
+    const {adapter, store} = createInMemoryAdapter()
+    const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
+    store.set('fro-bot-state/github/owner/repo/metadata/review-delivery-receipt-pr-42-run-run-1.json', {
+      data: JSON.stringify({
+        status: 'delivered',
+        attempt: 1,
+        reservedAt: new Date().toISOString(),
+        deliveredAt: new Date().toISOString(),
+        reviewId: 999,
+      }),
+      etag: 'etag-seed',
+    })
+
+    // #when reserve is attempted
+    const outcome = await ops.reserve(IDENTITY, 2)
+
+    // #then blocked with 'already-reserved', carrying the delivered status in its detail
+    expect(outcome.kind).toBe('blocked')
+    if (outcome.kind !== 'blocked') throw new Error('expected blocked')
+    expect(outcome.reason).toBe('already-reserved')
+    expect(outcome.detail).toContain('delivered')
+  })
+
+  it('release deletes the reservation (conditioned on its etag) so a later attempt can re-reserve', async () => {
+    // #given a reservation acquired but never delivered (mirrors a stale-head abort)
+    const {adapter, store} = createInMemoryAdapter()
+    const conditionalDelete = vi.fn(async (key: string) => {
+      store.delete(key)
+      return ok(undefined)
+    })
+    const adapterWithDelete: ObjectStoreAdapter = {...adapter, conditionalDelete}
+    const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapterWithDelete)
+    const reservation = await ops.reserve(IDENTITY, 1)
+    if (reservation.kind !== 'reserved') throw new Error('expected reserved')
+
+    // #when release is called with the reservation's own etag
+    await ops.release(IDENTITY, reservation.etag)
+
+    // #then the object is gone, and a later attempt can reserve again -- a stale-head abort
+    // is not a delivery, so it must not permanently suppress a later legitimate review
+    expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith(expect.any(String), {ifMatch: reservation.etag})
+    const retry = await ops.reserve(IDENTITY, 2)
+    expect(retry.kind).toBe('reserved')
+  })
+
+  it('release is best-effort: when the adapter lacks conditionalDelete, it never throws and the reservation remains', async () => {
+    // #given an adapter with no conditionalDelete support
+    const {adapter} = createInMemoryAdapter()
+    const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
+    const reservation = await ops.reserve(IDENTITY, 1)
+    if (reservation.kind !== 'reserved') throw new Error('expected reserved')
+
+    // #when release is called anyway
+    await expect(ops.release(IDENTITY, reservation.etag)).resolves.toBeUndefined()
+
+    // #then the reservation remains in place and still blocks -- the same accepted trade-off
+    // as a crash between reserve and POST, never a correctness regression
+    const retry = await ops.reserve(IDENTITY, 2)
+    expect(retry.kind).toBe('blocked')
+  })
+
   it('a different workflow run id is eligible for a new submission (distinct receipt identity)', async () => {
     // #given attempt 1 of run-1 already reserved and delivered
     const {adapter} = createInMemoryAdapter()

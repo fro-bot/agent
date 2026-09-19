@@ -621,13 +621,15 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
         ...(reviewDeliveryReceiptOps == null
           ? {}
           : {
-              reservationOps: reviewDeliveryReceiptOps,
-              receiptIdentity: {
-                repo: `${target.owner}/${target.repo}`,
-                runId: process.env.GITHUB_RUN_ID ?? 'local',
-                prNumber: target.number,
+              receipt: {
+                ops: reviewDeliveryReceiptOps,
+                identity: {
+                  repo: `${target.owner}/${target.repo}`,
+                  runId: process.env.GITHUB_RUN_ID ?? 'local',
+                  prNumber: target.number,
+                },
+                attempt: Number.parseInt(process.env.GITHUB_RUN_ATTEMPT ?? '1', 10),
               },
-              attempt: Number.parseInt(process.env.GITHUB_RUN_ATTEMPT ?? '1', 10),
             }),
       },
       logger,

@@ -164,54 +164,71 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
   return withBound(
     timeoutMs,
     async () => {
-      // Fresh teardown signal — run-core's own `combinedSignal` is already aborted by
-      // the time a failure reaches this barrier and cannot carry a new cancellation
-      // request; this one is scoped solely to this settle attempt.
-      const teardownSignal = AbortSignal.timeout(timeoutMs)
+      // Structural, not incidental: the barrier's contract is that this always resolves to a
+      // settlement decision so the caller can re-throw the original causal error — that
+      // must hold even when a callee misbehaves, not just when every callee happens to be
+      // disciplined (abortSession already catches its own throws; this catches anything else
+      // in the bounded work below, e.g. an unexpected throw from the reconciliation call or
+      // its adapter construction).
+      try {
+        // Fresh teardown signal — run-core's own `combinedSignal` is already aborted by
+        // the time a failure reaches this barrier and cannot carry a new cancellation
+        // request; this one is scoped solely to this settle attempt.
+        const teardownSignal = AbortSignal.timeout(timeoutMs)
 
-      // Stop the root from producing more work. Best-effort safety net — the root has
-      // usually already failed (that is why this barrier is running at all).
-      await abortSession(client, rootSessionId, directory, teardownSignal, logger, 'root')
+        // Stop the root from producing more work. Best-effort safety net — the root has
+        // usually already failed (that is why this barrier is running at all).
+        await abortSession(client, rootSessionId, directory, teardownSignal, logger, 'root')
 
-      await Promise.allSettled(
-        unsettled.map(async entry => abortSession(client, entry.sessionId, directory, teardownSignal, logger, 'owned')),
-      )
-
-      // Confirm — an abort call succeeding is a delivery receipt, not proof the child
-      // actually stopped. Reuse the same reconciliation primitive the drain loop uses.
-      const adapter = createSdkLedgerReconcileAdapter(client)
-      const reconcileResult = await reconcileLedgerOnce({
-        ledger,
-        adapter,
-        parentSessionId: rootSessionId,
-        logger: toRuntimeLogger(logger),
-      })
-      if (reconcileResult.success === false) {
-        logger.warn(
-          {rootSessionId, detail: reconcileResult.error.message},
-          'settle-owned-sessions: reconciliation call failed while confirming settlement',
+        await Promise.allSettled(
+          unsettled.map(async entry =>
+            abortSession(client, entry.sessionId, directory, teardownSignal, logger, 'owned'),
+          ),
         )
-      }
 
-      if (ledger.isDrainComplete() === true) {
-        logger.info({rootSessionId}, 'settle-owned-sessions: owned work confirmed settled')
-        return {settled: true}
-      }
+        // Confirm — an abort call succeeding is a delivery receipt, not proof the child
+        // actually stopped. Reuse the same reconciliation primitive the drain loop uses.
+        const adapter = createSdkLedgerReconcileAdapter(client)
+        const reconcileResult = await reconcileLedgerOnce({
+          ledger,
+          adapter,
+          parentSessionId: rootSessionId,
+          logger: toRuntimeLogger(logger),
+        })
+        if (reconcileResult.success === false) {
+          logger.warn(
+            {rootSessionId, detail: reconcileResult.error.message},
+            'settle-owned-sessions: reconciliation call failed while confirming settlement',
+          )
+        }
 
-      // Still not confirmed — cancellation was requested but nothing here confirms the
-      // child actually stopped. Explicitly downgrade every remaining entry to `unknown`
-      // (idempotent for one already `unknown`) rather than leaving it `outstanding`,
-      // which would misrepresent "we gave up waiting" as "we never tried".
-      const stillUnresolved = ledger.snapshot().filter(entry => entry.state !== 'settled')
-      for (const entry of stillUnresolved) {
-        ledger.markUnknown(entry.sessionId)
+        if (ledger.isDrainComplete() === true) {
+          logger.info({rootSessionId}, 'settle-owned-sessions: owned work confirmed settled')
+          return {settled: true}
+        }
+
+        // Still not confirmed — cancellation was requested but nothing here confirms the
+        // child actually stopped. Explicitly downgrade every remaining entry to `unknown`
+        // (idempotent for one already `unknown`) rather than leaving it `outstanding`,
+        // which would misrepresent "we gave up waiting" as "we never tried".
+        const stillUnresolved = ledger.snapshot().filter(entry => entry.state !== 'settled')
+        for (const entry of stillUnresolved) {
+          ledger.markUnknown(entry.sessionId)
+        }
+        const stillUnresolvedIds = stillUnresolved.map(entry => entry.sessionId)
+        logger.error(
+          {rootSessionId, stillUnresolvedIds},
+          'settle-owned-sessions: owned work could not be confirmed settled',
+        )
+        return {settled: false, reason: `owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`}
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.error(
+          {rootSessionId, detail: message},
+          'settle-owned-sessions: unexpected error during settle attempt — quarantining rather than letting it escape',
+        )
+        return {settled: false, reason: `settle attempt threw unexpectedly: ${message}`}
       }
-      const stillUnresolvedIds = stillUnresolved.map(entry => entry.sessionId)
-      logger.error(
-        {rootSessionId, stillUnresolvedIds},
-        'settle-owned-sessions: owned work could not be confirmed settled',
-      )
-      return {settled: false, reason: `owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`}
     },
     () => {
       logger.error(

@@ -46,16 +46,21 @@ export interface ReviewReconciliationParams {
   /** Run start time in milliseconds (Date.now() at run start) */
   readonly runStartMs: number
   /**
-   * Injected publication-receipt operations (`services/github/review-delivery-receipt.js`),
-   * threaded into this phase's own `submitReviewWithHeadGuard` call below. Optional only so
-   * tests that do not exercise the receipt keep compiling unmodified; `run.ts` always
-   * provides it in production.
+   * Injected publication-receipt configuration, threaded into this phase's own
+   * `submitReviewWithHeadGuard` call below. Collapsed into one sub-object rather than three
+   * independently optional sibling fields (`ops`/`runId`/`runAttempt`) -- all three are
+   * needed together to build the receipt identity this phase reserves against, so a partial
+   * configuration is a type error here instead of a silent, unprotected APPROVE. Optional
+   * only so tests that do not exercise the receipt keep compiling unmodified; `run.ts`
+   * always provides it in production.
    */
-  readonly reviewDeliveryReceiptOps?: ReviewDeliveryReceiptOperations
-  /** `GITHUB_RUN_ID` -- paired with `reviewDeliveryReceiptOps` to identify the receipt. */
-  readonly runId?: string
-  /** `GITHUB_RUN_ATTEMPT` -- paired with `reviewDeliveryReceiptOps`; stored in the record, never in the key. */
-  readonly runAttempt?: number
+  readonly receipt?: {
+    readonly ops: ReviewDeliveryReceiptOperations
+    /** `GITHUB_RUN_ID` -- identifies the receipt. */
+    readonly runId: string
+    /** `GITHUB_RUN_ATTEMPT` -- stored in the record, never in the key. */
+    readonly runAttempt: number
+  }
   /**
    * `true` when `run.ts` already knows, before this phase submits anything, that this
    * invocation's own execution was not fully observed (an event-stream observation gap or
@@ -122,9 +127,7 @@ export async function runReviewReconciliation(
     runStartMs,
     isFileConventionDelivery,
     knownExecutionVeto,
-    reviewDeliveryReceiptOps,
-    runId,
-    runAttempt,
+    receipt,
   } = params
 
   // -------------------------------------------------------------------------
@@ -261,12 +264,14 @@ export async function runReviewReconciliation(
         event: 'APPROVE',
         body: 'Approving to match the review verdict above.',
         currentHeadSha,
-        ...(reviewDeliveryReceiptOps == null || runId == null || runAttempt == null
+        ...(receipt == null
           ? {}
           : {
-              reservationOps: reviewDeliveryReceiptOps,
-              receiptIdentity: {repo: `${owner}/${repo}`, runId, prNumber},
-              attempt: runAttempt,
+              receipt: {
+                ops: receipt.ops,
+                identity: {repo: `${owner}/${repo}`, runId: receipt.runId, prNumber},
+                attempt: receipt.runAttempt,
+              },
             }),
       },
       logger,

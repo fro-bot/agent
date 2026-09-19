@@ -93,6 +93,7 @@ const reviewDeliveryReceiptOpsMocks = vi.hoisted(() => ({
   createReviewDeliveryReceiptOperations: vi.fn(() => ({
     reserve: vi.fn(),
     recordDelivered: vi.fn(),
+    release: vi.fn(),
   })),
 }))
 
@@ -1104,7 +1105,7 @@ describe('reviewDeliveryReceiptOps construction and threading (src/harness/run.t
     // #given a normal happy-path run
     const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
     const {runFinalizeWithResult} = await import('./phases/finalize.js')
-    const sentinelOps = {reserve: vi.fn(), recordDelivered: vi.fn()}
+    const sentinelOps = {reserve: vi.fn(), recordDelivered: vi.fn(), release: vi.fn()}
     reviewDeliveryReceiptOpsMocks.createReviewDeliveryReceiptOperations.mockReturnValue(sentinelOps)
     await mockHappyPathThrough({})
 
@@ -1114,10 +1115,8 @@ describe('reviewDeliveryReceiptOps construction and threading (src/harness/run.t
     // #then both consumers receive the exact same injected instance -- built once per
     // invocation, not reconstructed per call site
     expect(reviewDeliveryReceiptOpsMocks.createReviewDeliveryReceiptOperations).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(runReviewReconciliation)).toHaveBeenCalledWith(
-      expect.objectContaining({reviewDeliveryReceiptOps: sentinelOps}),
-      expect.anything(),
-    )
+    const reconciliationCallArgs = vi.mocked(runReviewReconciliation).mock.calls[0]?.[0]
+    expect(reconciliationCallArgs?.receipt?.ops).toBe(sentinelOps)
     expect(vi.mocked(runFinalizeWithResult)).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),

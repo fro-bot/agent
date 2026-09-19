@@ -222,10 +222,12 @@ describe('submitReviewWithHeadGuard', () => {
 function makeReservationOps(overrides?: {
   readonly reserve?: ReviewDeliveryReceiptOperations['reserve']
   readonly recordDelivered?: ReviewDeliveryReceiptOperations['recordDelivered']
+  readonly release?: ReviewDeliveryReceiptOperations['release']
 }): ReviewDeliveryReceiptOperations {
   return {
     reserve: overrides?.reserve ?? vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'})),
     recordDelivered: overrides?.recordDelivered ?? vi.fn(async () => undefined),
+    release: overrides?.release ?? vi.fn(async () => undefined),
   }
 }
 
@@ -242,9 +244,10 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
     const octokit = makeOctokit() as unknown as Octokit
     const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
     const recordDelivered = vi.fn(async () => undefined)
-    const reservationOps = makeReservationOps({reserve, recordDelivered})
+    const release = vi.fn(async () => undefined)
+    const ops = makeReservationOps({reserve, recordDelivered, release})
 
-    // #when submitting with reservationOps injected
+    // #when submitting with receipt injected
     const outcome = await submitReviewWithHeadGuard(
       {
         octokit,
@@ -254,21 +257,21 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         event: 'APPROVE',
         body: 'lgtm',
         currentHeadSha: 'head-sha-abc',
-        reservationOps,
-        receiptIdentity: IDENTITY,
-        attempt: 1,
+        receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,
     )
 
     // #then reserve is called before the POST, the POST happens, and delivery is recorded
-    // afterward with the review id the POST returned
+    // afterward with the review id the POST returned -- and the head not having moved since
+    // reservation means release is never consulted
     expect(outcome.submitted).toBe(true)
     expect(reserve).toHaveBeenCalledExactlyOnceWith(IDENTITY, 1)
     expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({event: 'APPROVE'}),
     )
     expect(recordDelivered).toHaveBeenCalledExactlyOnceWith(IDENTITY, 'reservation-etag', 1, 999)
+    expect(release).not.toHaveBeenCalled()
   })
 
   it('head guard rejects before reservation is ever attempted -- no receipt consumed', async () => {
@@ -283,7 +286,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
       }),
     }) as unknown as Octokit
     const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
-    const reservationOps = makeReservationOps({reserve})
+    const ops = makeReservationOps({reserve})
 
     // #when submitting with the stale head SHA
     const outcome = await submitReviewWithHeadGuard(
@@ -295,9 +298,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         event: 'APPROVE',
         body: 'lgtm',
         currentHeadSha: 'head-sha-abc',
-        reservationOps,
-        receiptIdentity: IDENTITY,
-        attempt: 1,
+        receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,
     )
@@ -317,7 +318,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
       reason: 'already-reserved' as const,
       detail: 'existing receipt',
     }))
-    const reservationOps = makeReservationOps({reserve})
+    const ops = makeReservationOps({reserve})
 
     // #when submitting
     const outcome = await submitReviewWithHeadGuard(
@@ -329,9 +330,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         event: 'APPROVE',
         body: 'lgtm',
         currentHeadSha: 'head-sha-abc',
-        reservationOps,
-        receiptIdentity: IDENTITY,
-        attempt: 2,
+        receipt: {ops, identity: IDENTITY, attempt: 2},
       },
       logger,
     )
@@ -341,11 +340,11 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
     expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
   })
 
-  it('omitting reservationOps preserves the pre-receipt behavior unchanged (no receipt call site exists to skip)', async () => {
-    // #given a caller that does not inject reservationOps at all
+  it('omitting receipt preserves the pre-receipt behavior unchanged (no receipt call site exists to skip)', async () => {
+    // #given a caller that does not inject a receipt at all
     const octokit = makeOctokit() as unknown as Octokit
 
-    // #when submitting without reservationOps/receiptIdentity/attempt
+    // #when submitting without a receipt
     const outcome = await submitReviewWithHeadGuard(
       {
         octokit,
@@ -364,5 +363,57 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
     expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({event: 'APPROVE'}),
     )
+  })
+
+  it('the head moving DURING the reservation call aborts after reserving, releases the reservation, and never submits', async () => {
+    // #given the head reads as unchanged on the guard's pre-reservation check, but has
+    // moved by the time the post-reservation re-check runs. `makeOctokit`'s getPR override
+    // is captured once at mock-creation time (`mockResolvedValue`), so a per-call sequence
+    // is set up directly with `mockImplementation` on the already-built mock instead: the
+    // first call (pre-reservation check) returns the original SHA, every call after (the
+    // post-reservation re-check) returns the moved one.
+    const octokitBase = makeOctokit()
+    let callCount = 0
+    octokitBase.rest.pulls.get.mockImplementation(async () => {
+      callCount += 1
+      const sha = callCount <= 1 ? 'head-sha-abc' : 'moved-during-reservation-sha'
+      return {
+        data: {
+          head: {sha, repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      }
+    })
+    const octokit = octokitBase as unknown as Octokit
+    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const recordDelivered = vi.fn(async () => undefined)
+    const release = vi.fn(async () => undefined)
+    const ops = makeReservationOps({reserve, recordDelivered, release})
+
+    // #when submitting with a receipt injected
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'APPROVE',
+        body: 'lgtm',
+        currentHeadSha: 'head-sha-abc',
+        receipt: {ops, identity: IDENTITY, attempt: 1},
+      },
+      logger,
+    )
+
+    // #then the reservation was acquired (the race window is INSIDE the reserve call), but
+    // the post-reservation re-check catches the move: submission is aborted, the reservation
+    // is released (a stale-head abort is not a delivery -- it must not permanently suppress a
+    // later legitimate review for this run), and delivery is never recorded
+    expect(outcome).toEqual({submitted: false, reason: 'head-moved-before-submit'})
+    expect(reserve).toHaveBeenCalledExactlyOnceWith(IDENTITY, 1)
+    expect(release).toHaveBeenCalledExactlyOnceWith(IDENTITY, 'reservation-etag')
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(recordDelivered).not.toHaveBeenCalled()
   })
 })

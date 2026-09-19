@@ -79,9 +79,11 @@ function makeParams(overrides?: {
   readonly runStartMs?: number
   readonly isFileConventionDelivery?: boolean
   readonly knownExecutionVeto?: boolean
-  readonly reviewDeliveryReceiptOps?: ReviewDeliveryReceiptOperations
-  readonly runId?: string
-  readonly runAttempt?: number
+  readonly receipt?: {
+    readonly ops: ReviewDeliveryReceiptOperations
+    readonly runId: string
+    readonly runAttempt: number
+  }
 }) {
   return {
     octokit: (overrides?.octokit ?? makeOctokit()) as unknown as Octokit,
@@ -98,9 +100,7 @@ function makeParams(overrides?: {
     runStartMs: overrides?.runStartMs ?? RUN_START_MS,
     isFileConventionDelivery: overrides?.isFileConventionDelivery ?? false,
     knownExecutionVeto: overrides?.knownExecutionVeto ?? false,
-    reviewDeliveryReceiptOps: overrides?.reviewDeliveryReceiptOps,
-    runId: overrides?.runId,
-    runAttempt: overrides?.runAttempt,
+    receipt: overrides?.receipt,
   }
 }
 
@@ -111,7 +111,7 @@ function makeParams(overrides?: {
 /**
  * Builds an octokit fixture that genuinely qualifies for approval -- a bot COMMENTED review
  * carrying a PASS verdict at the current head. Shared by the `knownExecutionVeto` and
- * `reviewDeliveryReceiptOps` describe blocks below so their "blocked" assertions are never
+ * `receipt` describe blocks below so their "blocked" assertions are never
  * vacuous: without a fixture that would otherwise approve, a no-op for an unrelated reason
  * (e.g. isFileConventionDelivery or no qualifying review) would "pass" even with no gate at all.
  */
@@ -858,10 +858,10 @@ describe('runReviewReconciliation knownExecutionVeto', () => {
 })
 
 // ---------------------------------------------------------------------------
-// reviewDeliveryReceiptOps: threaded into this phase's own submitReviewWithHeadGuard call
+// receipt: threaded into this phase's own submitReviewWithHeadGuard call
 // ---------------------------------------------------------------------------
 
-describe('runReviewReconciliation reviewDeliveryReceiptOps', () => {
+describe('runReviewReconciliation receipt', () => {
   let logger: Logger
 
   beforeEach(() => {
@@ -874,11 +874,10 @@ describe('runReviewReconciliation reviewDeliveryReceiptOps', () => {
     const octokit = makeQualifyingOctokit()
     const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
     const recordDelivered = vi.fn(async () => undefined)
+    const release = vi.fn(async () => undefined)
     const params = makeParams({
       octokit,
-      reviewDeliveryReceiptOps: {reserve, recordDelivered},
-      runId: 'run-9',
-      runAttempt: 2,
+      receipt: {ops: {reserve, recordDelivered, release}, runId: 'run-9', runAttempt: 2},
     })
 
     // #when running review reconciliation
@@ -899,11 +898,10 @@ describe('runReviewReconciliation reviewDeliveryReceiptOps', () => {
       detail: 'existing receipt',
     }))
     const recordDelivered = vi.fn(async () => undefined)
+    const release = vi.fn(async () => undefined)
     const params = makeParams({
       octokit,
-      reviewDeliveryReceiptOps: {reserve, recordDelivered},
-      runId: 'run-9',
-      runAttempt: 2,
+      receipt: {ops: {reserve, recordDelivered, release}, runId: 'run-9', runAttempt: 2},
     })
 
     // #when running review reconciliation

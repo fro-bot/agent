@@ -1775,6 +1775,7 @@ describe('runResponsePost review delivery receipt threading', () => {
     const octokit = makeOctokit()
     const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
     const recordDelivered = vi.fn(async () => undefined)
+    const release = vi.fn(async () => undefined)
 
     // #when posting with reviewDeliveryReceiptOps injected
     const result = await runResponsePost(
@@ -1784,7 +1785,7 @@ describe('runResponsePost review delivery receipt threading', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
-        reviewDeliveryReceiptOps: {reserve, recordDelivered},
+        reviewDeliveryReceiptOps: {reserve, recordDelivered, release},
       },
       logger,
     )
@@ -1812,6 +1813,7 @@ describe('runResponsePost review delivery receipt threading', () => {
       detail: 'existing receipt',
     }))
     const recordDelivered = vi.fn(async () => undefined)
+    const release = vi.fn(async () => undefined)
 
     // #when posting
     const result = await runResponsePost(
@@ -1821,7 +1823,7 @@ describe('runResponsePost review delivery receipt threading', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
-        reviewDeliveryReceiptOps: {reserve, recordDelivered},
+        reviewDeliveryReceiptOps: {reserve, recordDelivered, release},
       },
       logger,
     )
@@ -1846,6 +1848,9 @@ describe('runResponsePost review delivery receipt threading', () => {
     const recordDelivered = vi.fn(async () => {
       throw new Error('recordDelivered must not be called for comment delivery')
     })
+    const release = vi.fn(async () => {
+      throw new Error('release must not be called for comment delivery')
+    })
 
     // #when posting a comment-only response
     const result = await runResponsePost(
@@ -1855,7 +1860,7 @@ describe('runResponsePost review delivery receipt threading', () => {
         triggerResult: makeTriggerResult('issue_comment'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
-        reviewDeliveryReceiptOps: {reserve, recordDelivered},
+        reviewDeliveryReceiptOps: {reserve, recordDelivered, release},
       },
       logger,
     )

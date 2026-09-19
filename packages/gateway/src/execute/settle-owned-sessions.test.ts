@@ -3,7 +3,7 @@
  * `throwWithBarrier` calls before letting a causal error escape.
  */
 
-import type {SessionClient} from '@fro-bot/runtime'
+import type {OwnershipLedger, SessionClient} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
 import {createOwnershipLedger} from '@fro-bot/runtime'
@@ -270,6 +270,109 @@ describe('settleOwnedSessions', () => {
       // #then — quarantined, and resolved close to the bound (not hung indefinitely).
       expect(result.settled).toBe(false)
       expect(elapsedMs).toBeLessThan(1_000)
+    })
+
+    it('an unexpected throw inside the bounded work (e.g. from reconciliation) is caught -- the barrier still returns a settlement decision instead of rejecting', async () => {
+      // #given the ledger looks normal on the FIRST snapshot() call (computing `unsettled`
+      // before the bounded work starts), but throws on every call after that -- simulating
+      // an unexpected failure inside `reconcileLedgerOnce`, which calls `ledger.snapshot()`
+      // as part of its own bookkeeping. This is NOT one of the already-caught paths
+      // (`abortSession` has its own try/catch, and the SDK adapter itself catches transport
+      // errors from `session.children`/`session.status`) -- it is a genuinely unexpected
+      // throw from code the barrier's own try/catch must still contain.
+      let snapshotCalls = 0
+      const entries = [{sessionId: CHILD, label: 'background task', state: 'outstanding' as const}]
+      const throwingLedger: OwnershipLedger = {
+        adopt: () => {},
+        settle: () => {},
+        markUnknown: () => {},
+        outstanding: () => 1,
+        unknown: () => 0,
+        isDrainComplete: () => false,
+        isPersistenceSafe: () => false,
+        isTracked: () => true,
+        snapshot: () => {
+          snapshotCalls += 1
+          if (snapshotCalls > 1) {
+            throw new Error('boom: unexpected ledger failure')
+          }
+          return entries
+        },
+      }
+      const client = makeClient({
+        abort: async () => ({data: {}, error: null}),
+        children: async () => ({data: [{id: CHILD}], error: null}),
+        status: async () => ({data: {}, error: null}),
+      })
+      const logger = makeLogger()
+
+      // #when / #then -- never rejects, even though reconciliation threw unexpectedly
+      const result = await settleOwnedSessions({
+        client,
+        directory: '/workspace/repo',
+        rootSessionId: ROOT,
+        ledger: throwingLedger,
+        logger,
+      })
+      expect(result).toEqual({
+        settled: false,
+        reason: 'settle attempt threw unexpectedly: boom: unexpected ledger failure',
+      })
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({detail: 'boom: unexpected ledger failure'}),
+        expect.stringContaining('unexpected error during settle attempt'),
+      )
+    })
+
+    it('the causal error a caller re-throws after a barrier failure survives unchanged, even when settlement itself threw', async () => {
+      // #given the same throwing-ledger setup as above, wrapped exactly as `run-core.ts`'s
+      // `throwWithBarrier` wraps it: await the barrier, then re-throw the ORIGINAL causal
+      // error regardless of what settlement reports. This is the property the barrier's
+      // contract exists to protect -- an unexpected throw from inside settlement must never
+      // replace or mask the causal error the caller is about to (re-)throw.
+      let snapshotCalls = 0
+      const entries = [{sessionId: CHILD, label: 'background task', state: 'outstanding' as const}]
+      const throwingLedger: OwnershipLedger = {
+        adopt: () => {},
+        settle: () => {},
+        markUnknown: () => {},
+        outstanding: () => 1,
+        unknown: () => 0,
+        isDrainComplete: () => false,
+        isPersistenceSafe: () => false,
+        isTracked: () => true,
+        snapshot: () => {
+          snapshotCalls += 1
+          if (snapshotCalls > 1) {
+            throw new Error('boom: unexpected ledger failure')
+          }
+          return entries
+        },
+      }
+      const client = makeClient({
+        abort: async () => ({data: {}, error: null}),
+        children: async () => ({data: [{id: CHILD}], error: null}),
+        status: async () => ({data: {}, error: null}),
+      })
+      const logger = makeLogger()
+      const causalError = new Error('session error: the ORIGINAL failure this run is reporting')
+
+      // #when -- a `throwWithBarrier`-shaped caller: await settlement, then always re-throw
+      // the causal error
+      const throwWithBarrier = async (): Promise<never> => {
+        await settleOwnedSessions({
+          client,
+          directory: '/workspace/repo',
+          rootSessionId: ROOT,
+          ledger: throwingLedger,
+          logger,
+        })
+        throw causalError
+      }
+
+      // #then the exact causal error escapes, unchanged -- never replaced by the settlement
+      // barrier's own internal failure
+      await expect(throwWithBarrier()).rejects.toThrow(causalError)
     })
 
     it('a hung confirmation call (reconciliation) still resolves into quarantine within the bound', async () => {

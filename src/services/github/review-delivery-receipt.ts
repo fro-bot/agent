@@ -32,8 +32,18 @@
  * Fail-closed by construction: when the object store is unavailable or unconfigured, or the
  * adapter lacks conditional operations, `reserve` always blocks. This guarantee is mandatory,
  * not best-effort -- it does not fall back to the Actions cache, and it does not expire
- * receipts inside the supported rerun horizon (receipts are never given a TTL or deleted by
- * this module).
+ * receipts inside the supported rerun horizon (receipts are never given a TTL or opportunistically
+ * cleaned up by this module).
+ *
+ * `release` is the one narrow, deliberate exception to "never deleted": it exists solely for a
+ * caller (`submitReviewWithHeadGuard`) that reserved and then, before the POST, positively
+ * confirmed the head moved during the reservation call itself -- a stale-head abort, not a
+ * crash and not an ambiguous outcome. That is not a delivery, so leaving the reservation in
+ * place would permanently suppress a later legitimate review for this `runId` even though
+ * nothing was ever submitted. `release` is conditioned on the exact reservation etag (never a
+ * blind delete) and is best-effort: if the adapter lacks `conditionalDelete`, or the delete
+ * fails, the reservation simply remains -- the same accepted "stuck reserved" trade-off as a
+ * crash between reserve and POST, never a correctness regression.
  */
 
 import type {Result} from '@bfra.me/es/result'
@@ -60,17 +70,32 @@ export interface ReviewDeliveryReceiptIdentity {
   readonly prNumber: number
 }
 
-interface ReviewDeliveryReceiptRecord {
-  readonly status: 'reserved' | 'delivered'
-  /**
-   * `GITHUB_RUN_ATTEMPT` of the invocation that holds (or held) this receipt. Lives inside
-   * the record, never in the key -- see `RECEIPT_OPERATION_SEGMENT`'s doc.
-   */
+/**
+ * `GITHUB_RUN_ATTEMPT` of the invocation that holds (or held) this receipt. Lives inside
+ * the record, never in the key -- see `RECEIPT_OPERATION_SEGMENT`'s doc.
+ */
+interface ReviewDeliveryReceiptRecordBase {
   readonly attempt: number
   readonly reservedAt: string
-  readonly deliveredAt?: string
-  readonly reviewId?: number
 }
+
+/** Reservation is in flight or may already have produced a POST -- never proof of delivery. */
+interface ReviewDeliveryReceiptReservedRecord extends ReviewDeliveryReceiptRecordBase {
+  readonly status: 'reserved'
+}
+
+/**
+ * Acknowledged delivery. `deliveredAt` and `reviewId` are REQUIRED, not optional -- a
+ * record claiming `status: 'delivered'` without both fields is corrupt, not a genuine
+ * delivery, and must fail parsing (see `parseReceiptRecord`).
+ */
+interface ReviewDeliveryReceiptDeliveredRecord extends ReviewDeliveryReceiptRecordBase {
+  readonly status: 'delivered'
+  readonly deliveredAt: string
+  readonly reviewId: number
+}
+
+type ReviewDeliveryReceiptRecord = ReviewDeliveryReceiptReservedRecord | ReviewDeliveryReceiptDeliveredRecord
 
 export type ReviewDeliveryReservationBlockedReason =
   'already-reserved' | 'conflict' | 'store-unavailable' | 'read-failed'
@@ -103,6 +128,14 @@ export interface ReviewDeliveryReceiptOperations {
     attempt: number,
     reviewId: number,
   ) => Promise<void>
+  /**
+   * Releases a reservation that was acquired but positively confirmed to be a stale-head
+   * abort, never a delivery -- see the module doc's `release` paragraph. Best-effort and
+   * conditioned on `reservationEtag`: never throws, and if the adapter lacks
+   * `conditionalDelete` or the delete fails, the reservation simply remains (the caller has
+   * already decided not to submit; a failed release does not change that).
+   */
+  readonly release: (identity: ReviewDeliveryReceiptIdentity, reservationEtag: string) => Promise<void>
 }
 
 function isNotFound(error: Error): boolean {
@@ -133,15 +166,32 @@ function parseReceiptRecord(data: string): ReviewDeliveryReceiptRecord | null {
       return null
     }
 
-    const candidate = parsed as Partial<ReviewDeliveryReceiptRecord>
-    if (candidate.status !== 'reserved' && candidate.status !== 'delivered') {
-      return null
-    }
+    const candidate = parsed as Record<string, unknown>
     if (typeof candidate.attempt !== 'number' || typeof candidate.reservedAt !== 'string') {
       return null
     }
 
-    return candidate as ReviewDeliveryReceiptRecord
+    // Each branch is validated independently -- a `delivered` status with a missing or
+    // wrong-typed `deliveredAt`/`reviewId` is a corrupted record, not a genuine delivery,
+    // and must fall through to `null` (fail-closed: the caller blocks submission on a
+    // malformed record exactly as it does on any other unparseable one).
+    if (candidate.status === 'reserved') {
+      return {status: 'reserved', attempt: candidate.attempt, reservedAt: candidate.reservedAt}
+    }
+    if (candidate.status === 'delivered') {
+      if (typeof candidate.deliveredAt !== 'string' || typeof candidate.reviewId !== 'number') {
+        return null
+      }
+      return {
+        status: 'delivered',
+        attempt: candidate.attempt,
+        reservedAt: candidate.reservedAt,
+        deliveredAt: candidate.deliveredAt,
+        reviewId: candidate.reviewId,
+      }
+    }
+
+    return null
   } catch {
     return null
   }
@@ -174,6 +224,9 @@ export function createReviewDeliveryReceiptOperations(
       reserve: async () => blockedUnavailable('object store is not configured'),
       recordDelivered: async () => {
         logger.debug('Review delivery receipt: recordDelivered skipped, object store not configured')
+      },
+      release: async () => {
+        logger.debug('Review delivery receipt: release skipped, object store not configured')
       },
     }
   }
@@ -274,6 +327,35 @@ export function createReviewDeliveryReceiptOperations(
           {key: key.data, error: put.error.message},
         )
       }
+    },
+
+    async release(identity, reservationEtag) {
+      if (adapter.conditionalDelete == null) {
+        logger.warning(
+          'Review delivery receipt: release skipped, object store adapter does not support conditional delete; reservation remains and will block future attempts for this run',
+          {identity},
+        )
+        return
+      }
+
+      const key = buildReceiptKey(storeConfig, identity)
+      if (key.success === false) {
+        return
+      }
+
+      const deleted = await adapter.conditionalDelete(key.data, {ifMatch: reservationEtag})
+      if (deleted.success === false) {
+        // Best-effort, matching recordDelivered's style: the caller has already decided not
+        // to submit, so a failed release only means the reservation remains -- the same
+        // accepted "stuck reserved" trade-off as a crash between reserve and POST.
+        logger.warning(
+          'Review delivery receipt: release failed after a stale-head abort; reservation remains and will block future attempts for this run',
+          {key: key.data, error: deleted.error.message},
+        )
+        return
+      }
+
+      logger.info('Review delivery receipt: reservation released after stale-head abort', {key: key.data})
     },
   }
 }

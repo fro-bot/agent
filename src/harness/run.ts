@@ -273,9 +273,7 @@ export async function run(): Promise<number> {
         runStartMs: startTime,
         isFileConventionDelivery: bootstrap.delivery === 'file-convention',
         knownExecutionVeto,
-        reviewDeliveryReceiptOps,
-        runId,
-        runAttempt,
+        receipt: {ops: reviewDeliveryReceiptOps, runId, runAttempt},
       },
       reconciliationLogger,
     )
