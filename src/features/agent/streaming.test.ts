@@ -521,6 +521,63 @@ describe('processEventStream — ownership ledger integration', () => {
     expect(result).toBeDefined()
   })
 
+  it('keeps draining later events while a permission reply is still pending — the reply must not block the SSE loop (regression: awaiting it stalled the loop, see streaming.ts fire-and-continue)', async () => {
+    // #given a permission reply we control (stays pending until we resolve it), and a later
+    // tool-call pair on the same stream whose success render is directly observable
+    let resolveReply: (() => void) | undefined
+    let replyResolved = false
+    const replyPromise = new Promise<void>(resolve => {
+      resolveReply = () => {
+        replyResolved = true
+        resolve()
+      }
+    })
+    const responder = vi.fn().mockImplementation(async () => replyPromise)
+    consoleMocks.outputToolExecution.mockClear()
+    const eventStream = createMockEventStream([
+      {
+        type: 'permission.asked',
+        properties: {id: 'request-id', sessionID: ROOT_SESSION_ID, permission: 'bash', patterns: ['*']},
+      } as unknown as Event,
+      {
+        type: 'session.next.tool.called',
+        properties: {sessionID: ROOT_SESSION_ID, callID: 'call-1', tool: 'bash', input: {command: 'echo hi'}},
+      } as unknown as Event,
+      {
+        type: 'session.next.tool.success',
+        properties: {sessionID: ROOT_SESSION_ID, callID: 'call-1'},
+      } as unknown as Event,
+    ])
+
+    // #when the stream is processed — deliberately not awaited yet, so the later event's effect
+    // can be observed while the reply promise above is still unresolved
+    const resultPromise = processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      responder,
+    )
+
+    // #then the later tool-call event is processed and rendered before the reply resolves — an
+    // awaited reply would never let this render while `replyResolved` is still false, so this is
+    // the ordering assertion that pins the fire-and-continue property
+    await vi.waitFor(() => {
+      expect(consoleMocks.outputToolExecution).toHaveBeenCalledWith('bash', 'echo hi')
+    })
+    expect(responder).toHaveBeenCalled()
+    expect(replyResolved).toBe(false)
+
+    // #when the reply is finally allowed to resolve
+    resolveReply?.()
+    const result = await resultPromise
+
+    // #then the stream still completes cleanly
+    expect(result).toBeDefined()
+  })
+
   it("complement: a foreign session's non-permission events are still ignored — only permission.asked stopped requiring ownership", async () => {
     // #given events of every other ownership-gated type from a session neither root nor ledger-tracked
     const ledger = createOwnershipLedger()
