@@ -68,6 +68,14 @@ import {buildObjectStoreKey, createS3Adapter} from '@fro-bot/runtime'
  */
 const RECEIPT_OPERATION_SEGMENT = 'review-delivery-receipt'
 
+/**
+ * Sentinel etag returned by an UNCONFIGURED store's `reserve` (case 1 below). Never a real
+ * store etag -- callers (`submitReviewWithHeadGuard`) use it to detect that `reserve`
+ * returned synchronously without any reservation round-trip actually happening, so there is
+ * no post-reservation race window to re-check the head against.
+ */
+export const UNCONFIGURED_RESERVATION_ETAG = 'unconfigured'
+
 export interface ReviewDeliveryReceiptIdentity {
   /** Trusted "owner/repo" -- never derived from an untrusted event payload field. */
   readonly repo: string
@@ -253,7 +261,7 @@ export function createReviewDeliveryReceiptOperations(
             'protection; a rerun of this invocation could duplicate this review',
           {identity, attempt},
         )
-        return {kind: 'reserved', etag: 'unconfigured'}
+        return {kind: 'reserved', etag: UNCONFIGURED_RESERVATION_ETAG}
       },
       recordDelivered: async () => {
         logger.debug('Review delivery receipt: recordDelivered skipped, object store not configured')

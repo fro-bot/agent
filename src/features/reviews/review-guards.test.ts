@@ -1,3 +1,4 @@
+import type {ObjectStoreAdapter, ObjectStoreConfig} from '@fro-bot/runtime'
 import type {
   ReviewDeliveryReceiptIdentity,
   ReviewDeliveryReceiptOperations,
@@ -5,8 +6,13 @@ import type {
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {createReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from './review-guards.js'
+
+function createStoreConfig(overrides: Partial<ObjectStoreConfig> = {}): ObjectStoreConfig {
+  return {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'fro-bot-state', ...overrides}
+}
 
 function makeOctokit(overrides?: {readonly getPR?: () => unknown; readonly createReview?: () => unknown}) {
   const defaultPR = {
@@ -415,5 +421,119 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
     expect(release).toHaveBeenCalledExactlyOnceWith(IDENTITY, 'reservation-etag')
     expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
     expect(recordDelivered).not.toHaveBeenCalled()
+  })
+
+  // Every test above builds `ReviewDeliveryReceiptOperations` with `makeReservationOps`, a
+  // hand-rolled stub that returns whatever the test expects. That leaves the real
+  // `createReviewDeliveryReceiptOperations` (review-delivery-receipt.ts) never composed with
+  // this guard at all -- exactly the seam an unconfigured store's `reserve` regressed
+  // through and shipped broken (fixed in 64bcae354): it made every default-configured
+  // consumer and every fork PR fail closed with nothing posted. These next three tests build
+  // the real operations from real `ObjectStoreConfig`s, not a stub of the caller's own
+  // assumption.
+
+  it('end to end: real operations built from a disabled store (default s3-backup: false) submit the review, unprotected but not blocked', async () => {
+    // #given the REAL operations, built from an unconfigured store config -- not a stub
+    const octokit = makeOctokit() as unknown as Octokit
+    const storeConfig = createStoreConfig({enabled: false})
+    const ops = createReviewDeliveryReceiptOperations(storeConfig, logger)
+
+    // #when submitting through the head guard with those real operations
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'APPROVE',
+        body: 'lgtm',
+        currentHeadSha: 'head-sha-abc',
+        receipt: {ops, identity: IDENTITY, attempt: 1},
+      },
+      logger,
+    )
+
+    // #then the review IS submitted. Against the reverted fail-closed behavior (reserve
+    // always blocking when storeConfig.enabled === false), this assertion fails with
+    // `outcome.submitted === false` -- the exact shape of the shipped regression.
+    expect(outcome.submitted).toBe(true)
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'APPROVE', commit_id: 'head-sha-abc'}),
+    )
+    // The unconfigured-store `reserve` above returned synchronously without any reservation
+    // round trip, so the post-reservation head re-check (review-guards.ts ~202) must be
+    // skipped: only the one pre-reservation `pulls.get` call happens, not a wasted second one.
+    expect((octokit as unknown as MockOctokit).rest.pulls.get).toHaveBeenCalledOnce()
+  })
+
+  it('complement, end to end: real operations built from a CONFIGURED but failing store still block submission', async () => {
+    // #given the REAL operations, built from a configured store whose adapter lacks
+    // conditional operations -- the case the receipt exists to fail closed against
+    const octokit = makeOctokit() as unknown as Octokit
+    const storeConfig = createStoreConfig({enabled: true})
+    const bareAdapter: ObjectStoreAdapter = {upload: vi.fn(), download: vi.fn(), list: vi.fn()}
+    const ops = createReviewDeliveryReceiptOperations(storeConfig, logger, bareAdapter)
+
+    // #when submitting through the head guard with those real operations
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'APPROVE',
+        body: 'lgtm',
+        currentHeadSha: 'head-sha-abc',
+        receipt: {ops, identity: IDENTITY, attempt: 1},
+      },
+      logger,
+    )
+
+    // #then still blocked -- a configured-but-failing store must never be treated like an
+    // unconfigured one, unlike the disabled-store case above
+    expect(outcome).toEqual({submitted: false, reason: 'receipt-blocked', receiptReason: 'store-unavailable'})
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('a fork PR (store force-disabled per inputs.ts ~332-338) delivers a REQUEST_CHANGES review via the real disabled-store operations', async () => {
+    // #given a fork PR -- inputs.ts forces storeConfig.enabled = false for forks regardless of
+    // configuration -- and REQUEST_CHANGES specifically, since APPROVE has its own separate
+    // fork/self gating (checkForkOrSelfGuard) that would pass or fail this test for unrelated
+    // reasons. This is the plain delivery path forks actually depend on.
+    const octokit = makeOctokit({
+      getPR: () => ({
+        data: {
+          head: {sha: 'head-sha-abc', repo: {full_name: 'attacker/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      }),
+      createReview: () => ({
+        data: {id: 111, state: 'CHANGES_REQUESTED', html_url: 'https://github.com/pr/1/reviews/111'},
+      }),
+    }) as unknown as Octokit
+    const storeConfig = createStoreConfig({enabled: false})
+    const ops = createReviewDeliveryReceiptOperations(storeConfig, logger)
+
+    // #when submitting a REQUEST_CHANGES review through the head guard
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'REQUEST_CHANGES',
+        body: 'please address these issues',
+        currentHeadSha: 'head-sha-abc',
+        receipt: {ops, identity: IDENTITY, attempt: 1},
+      },
+      logger,
+    )
+
+    // #then the review is submitted, pinned to the observed head SHA
+    expect(outcome.submitted).toBe(true)
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'REQUEST_CHANGES', commit_id: 'head-sha-abc'}),
+    )
   })
 })
