@@ -115,7 +115,12 @@ await new Promise<void>(resolve => {
 expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
 ```
 
-Removing the flush and inducing a real regression makes this fail in under a second with a clear assertion error, which is how it was verified to be load-bearing rather than ceremony.
+Two experiments together are what prove the flush carries weight, and it is the contrast between them that matters:
+
+- regression induced, flush **present** → fails in under a second with a clear assertion error
+- regression induced, flush **removed** → passes silently
+
+Running only the second would look like the test was fine.
 
 **The direction matters.** A *positive* assertion placed too early (`toHaveBeenCalledTimes(2)` before the second call can occur) fails loudly — annoying, but visible. A *negative* assertion placed too early passes silently, and goes on passing after the behaviour it forbids has regressed. Only the second is a vacuous test. When auditing for this, look at assertions claiming something did **not** happen.
 
