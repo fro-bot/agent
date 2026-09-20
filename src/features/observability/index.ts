@@ -1,4 +1,4 @@
-export {writeJobSummary} from './job-summary.js'
+export {writeInvocationOutcomeSummary, writeJobSummary} from './job-summary.js'
 
 export {createMetricsCollector} from './metrics.js'
 

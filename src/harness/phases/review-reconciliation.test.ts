@@ -5,6 +5,7 @@
  * They should fail (RED) until review-reconciliation.ts is created.
  */
 
+import type {ReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
@@ -77,6 +78,12 @@ function makeParams(overrides?: {
   readonly octokit?: MockOctokit
   readonly runStartMs?: number
   readonly isFileConventionDelivery?: boolean
+  readonly knownExecutionVeto?: boolean
+  readonly receipt?: {
+    readonly ops: ReviewDeliveryReceiptOperations
+    readonly runId: string
+    readonly runAttempt: number
+  }
 }) {
   return {
     octokit: (overrides?.octokit ?? makeOctokit()) as unknown as Octokit,
@@ -92,12 +99,43 @@ function makeParams(overrides?: {
     agentSucceeded: overrides?.agentSucceeded ?? true,
     runStartMs: overrides?.runStartMs ?? RUN_START_MS,
     isFileConventionDelivery: overrides?.isFileConventionDelivery ?? false,
+    knownExecutionVeto: overrides?.knownExecutionVeto ?? false,
+    receipt: overrides?.receipt,
   }
 }
 
 // ---------------------------------------------------------------------------
 // Helper: build a bot review object
 // ---------------------------------------------------------------------------
+
+/**
+ * Builds an octokit fixture that genuinely qualifies for approval -- a bot COMMENTED review
+ * carrying a PASS verdict at the current head. Shared by the `knownExecutionVeto` and
+ * `receipt` describe blocks below so their "blocked" assertions are never
+ * vacuous: without a fixture that would otherwise approve, a no-op for an unrelated reason
+ * (e.g. isFileConventionDelivery or no qualifying review) would "pass" even with no gate at all.
+ */
+function makeQualifyingOctokit(): MockOctokit {
+  const octokit = makeOctokit()
+  octokit.rest.pulls.get.mockResolvedValue({
+    data: {
+      head: {sha: HEAD_SHA, repo: {full_name: 'owner/repo'}},
+      base: {repo: {full_name: 'owner/repo'}},
+      user: {login: 'pr-author'},
+    },
+  })
+  octokit.rest.pulls.listReviews.mockResolvedValue({
+    data: [
+      makeBotReview({
+        state: 'COMMENTED',
+        body: '## Verdict: PASS\n\nLooks good.',
+        commitId: HEAD_SHA,
+        submittedAt: AFTER_START,
+      }),
+    ],
+  })
+  return octokit
+}
 
 function makeBotReview(opts: {
   readonly state: string
@@ -739,5 +777,139 @@ describe('runReviewReconciliation', () => {
     // #then bot's PASS review is found and approve is submitted
     expect(result.reconciled).toBe(true)
     expect(octokit.rest.pulls.createReview).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// knownExecutionVeto: early no-op before any approval submission
+// ---------------------------------------------------------------------------
+
+describe('runReviewReconciliation knownExecutionVeto', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  it('control: the qualifying fixture approves when knownExecutionVeto is false (sanity check against vacuous gating)', async () => {
+    // #given a fixture that genuinely qualifies for approval, and no veto
+    const octokit = makeQualifyingOctokit()
+    const params = makeParams({octokit, knownExecutionVeto: false})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then it approves -- proving the fixture is not vacuous before the veto is asserted
+    expect(result.reconciled).toBe(true)
+    expect(result.reason).toBe('approved')
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledOnce()
+  })
+
+  it('blocks the otherwise-qualifying approval when knownExecutionVeto is true, before any PR fact is even fetched', async () => {
+    // #given the identical qualifying fixture, but a known execution veto
+    const octokit = makeQualifyingOctokit()
+    const params = makeParams({octokit, knownExecutionVeto: true})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then it no-ops with the specific reason, and never makes a single octokit call --
+    // the guard runs before checkForkOrSelfGuard, listReviews, or submitReview
+    expect(result.reconciled).toBe(false)
+    expect(result.reason).toBe('known-execution-veto')
+    expect(octokit.rest.pulls.get).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.listReviews).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('rEQUEST_CHANGES-equivalent skip path is untouched by the veto (decideReconciliation policy is not widened)', async () => {
+    // #given a bot review carrying a FAIL verdict (decideReconciliation's existing skip
+    // path for non-approving verdicts), combined with no veto
+    const octokit = makeOctokit()
+    octokit.rest.pulls.get.mockResolvedValue({
+      data: {
+        head: {sha: HEAD_SHA, repo: {full_name: 'owner/repo'}},
+        base: {repo: {full_name: 'owner/repo'}},
+        user: {login: 'pr-author'},
+      },
+    })
+    octokit.rest.pulls.listReviews.mockResolvedValue({
+      data: [
+        makeBotReview({
+          state: 'COMMENTED',
+          body: '## Verdict: FAIL\n\nNeeds work.',
+          commitId: HEAD_SHA,
+          submittedAt: AFTER_START,
+        }),
+      ],
+    })
+    const params = makeParams({octokit, knownExecutionVeto: false})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then this phase never submits REQUEST_CHANGES itself (only ever APPROVE) -- the
+    // FAIL verdict already skips via decideReconciliation, unrelated to knownExecutionVeto,
+    // and that policy is not widened by this change
+    expect(result.reconciled).toBe(false)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// receipt: threaded into this phase's own submitReviewWithHeadGuard call
+// ---------------------------------------------------------------------------
+
+describe('runReviewReconciliation receipt', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  it('reserves with the identity built from owner/repo/prNumber/runId/runAttempt before submitting the formal APPROVE', async () => {
+    // #given a qualifying fixture and injected receipt operations that succeed
+    const octokit = makeQualifyingOctokit()
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'reservation-etag'}))
+    const recordDelivered = vi.fn(async () => undefined)
+    const release = vi.fn(async () => undefined)
+    const params = makeParams({
+      octokit,
+      receipt: {ops: {reserve, recordDelivered, release}, runId: 'run-9', runAttempt: 2},
+    })
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then reserve is called with the reconciliation identity, and it still approves
+    expect(result.reconciled).toBe(true)
+    expect(reserve).toHaveBeenCalledExactlyOnceWith({repo: 'owner/repo', runId: 'run-9', prNumber: 42}, 2)
+    expect(recordDelivered).toHaveBeenCalledOnce()
+  })
+
+  it('a receipt-blocked reservation prevents the APPROVE from ever being submitted', async () => {
+    // #given a qualifying fixture, but the receipt blocks
+    const octokit = makeQualifyingOctokit()
+    const reserve = vi.fn(async () => ({
+      kind: 'blocked' as const,
+      reason: 'already-reserved' as const,
+      detail: 'existing receipt',
+    }))
+    const recordDelivered = vi.fn(async () => undefined)
+    const release = vi.fn(async () => undefined)
+    const params = makeParams({
+      octokit,
+      receipt: {ops: {reserve, recordDelivered, release}, runId: 'run-9', runAttempt: 2},
+    })
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then reconciled is false and no review was ever created
+    expect(result.reconciled).toBe(false)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(recordDelivered).not.toHaveBeenCalled()
   })
 })

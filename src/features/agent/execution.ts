@@ -2,15 +2,29 @@ import type {ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {OpenCodeServerHandle} from './server-adapter.js'
-import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
+import type {EventStreamResult, PermissionAskedRequest, PermissionAskedResponder} from './streaming.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import {createLLMFetchError, isLlmFetchError, reassertSessionTitle, withScrubbedEnv} from '@fro-bot/runtime'
+import process from 'node:process'
+import {
+  buildAttachmentDir,
+  createAttachmentDirExclusive,
+  createLLMFetchError,
+  isLlmFetchError,
+  reassertSessionTitle,
+  withScrubbedEnv,
+} from '@fro-bot/runtime'
 import {createOpencode} from '@opencode-ai/sdk'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
-import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../shared/env.js'
+import {
+  getGitHubRunAttempt,
+  getGitHubRunId,
+  getGitHubWorkspace,
+  getOpenCodeLogPath,
+  isOpenCodePromptArtifactEnabled,
+} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
@@ -26,6 +40,58 @@ import {
 import {waitForAbortableDelay} from './session-poll.js'
 
 const SESSION_ABORT_TIMEOUT_MS = 2_000
+const PERMISSION_REPLY_TIMEOUT_MS = 5_000
+const PERMISSION_REPLY_MAX_ATTEMPTS = 2
+
+/**
+ * Answer a single `permission.asked` event with a reject, validating that the SDK's response
+ * actually recorded it rather than trusting a resolved promise. Upstream's HTTP client resolves
+ * with an embedded `error` field on a failed request rather than throwing (mirrors
+ * `sendPromptToSession`'s `response.error` check on the same client), so a resolved call here
+ * previously looked identical to a successful one even when the permission store never recorded
+ * the reject.
+ *
+ * Bounded by its own short timeout and a small retry budget, independent of the run's overall
+ * deadline: `streaming.ts`'s `processEventStream` now fires this without awaiting it (fire-and-
+ * continue, so a stalled reply never blocks the SSE drain), so a single slow or hung reply must
+ * resolve -- or definitively fail -- on its own within a few seconds rather than riding along
+ * with however much of the run's own deadline happens to remain.
+ */
+async function replyToPermissionAsk(
+  sessionClient: Awaited<ReturnType<typeof createOpencode>>['client'],
+  request: PermissionAskedRequest,
+  directory: string,
+): Promise<void> {
+  let lastError: string | null = null
+  for (let attempt = 1; attempt <= PERMISSION_REPLY_MAX_ATTEMPTS; attempt++) {
+    const attemptController = new AbortController()
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
+    try {
+      const reply = sessionClient.postSessionIdPermissionsPermissionId({
+        path: {id: request.sessionID, permissionID: request.requestID},
+        body: {response: 'reject'},
+        query: {directory},
+        signal: attemptController.signal,
+      })
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          attemptController.abort()
+          reject(new Error(`Permission reply timed out after ${PERMISSION_REPLY_TIMEOUT_MS}ms`))
+        }, PERMISSION_REPLY_TIMEOUT_MS)
+      })
+      const response = await Promise.race([reply, timeout])
+      if (response.error != null) {
+        throw new Error(`Permission reply rejected by server: ${String(response.error)}`)
+      }
+      return
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error)
+    } finally {
+      if (timeoutId != null) clearTimeout(timeoutId)
+    }
+  }
+  throw new Error(`Permission reply failed after ${PERMISSION_REPLY_MAX_ATTEMPTS} attempt(s): ${lastError}`)
+}
 
 async function abortRemoteSession(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
@@ -90,6 +156,14 @@ export async function executeOpenCode(
   // consults; see its comment for why it never touches the clock itself. Governing invariant:
   // selecting an error never proves quiescence, and observing quiescence never erases an error.
   let stoppingCause: 'deadline' | 'other' | null = null
+  // Sticky across LLM retry attempts within this single executeOpenCode call: once any
+  // attempt's event stream records an unexpected discontinuity, a later attempt completing
+  // cleanly must not clear it -- selecting a clean result never proves the earlier gap
+  // didn't happen (see AgentResult.observationGap's doc). Read directly off each attempt's
+  // own eventStreamResult, not off `final` after mergeArtifactResults -- that merge spreads
+  // the latest attempt's own (possibly absent) discontinuity over `final`, which would
+  // silently drop an earlier attempt's gap.
+  let observationGap = false
   logger.info('Executing OpenCode agent (SDK mode)', {
     agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
@@ -110,6 +184,7 @@ export async function executeOpenCode(
     commentsPosted: final.commentsPosted,
     llmError: lastLlmError,
     classificationPath: final.classificationPath,
+    observationGap,
   })
 
   try {
@@ -176,18 +251,37 @@ export async function executeOpenCode(
       }
     }
 
+    // Reference files (PR description, prior review bodies) are materialized into a
+    // DEDICATED run-scoped directory under RUNNER_TEMP, not the OpenCode log directory --
+    // see `buildAttachmentDir`'s doc comment for why the log directory cannot be granted
+    // `external_directory` access. `scopeAttachmentDirectoryPermission` in
+    // `src/services/setup/ci-config.ts` grants exactly this directory. Fail-safe: when
+    // RUNNER_TEMP is unset (e.g. local/non-Actions runs), fall back to the log directory --
+    // matching `scopeExternalDirectoryPermission`'s own RUNNER_TEMP-unset fail-safe, which
+    // in that case grants nothing new, so this fallback location gets the same (unscoped)
+    // treatment reference files always got before this fix.
+    const runnerTemp = process.env.RUNNER_TEMP
+    const attachmentDir =
+      runnerTemp != null && runnerTemp.trim().length > 0
+        ? buildAttachmentDir({
+            runnerTemp: runnerTemp.trim(),
+            runId: getGitHubRunId(),
+            runAttempt: getGitHubRunAttempt(),
+          })
+        : logPath
+    if (attachmentDir !== logPath) {
+      // `createAttachmentDirExclusive`, not a plain recursive `fs.mkdir`: this leaf path is
+      // predictable (`<runId>-<runAttempt>`) and run-scoped, so a pre-planted symlink here must be
+      // refused rather than followed -- see its doc comment in `attachment-dir.ts`.
+      await deadline.run(async () => createAttachmentDirExclusive(attachmentDir), 'attachment directory creation')
+    }
     const referenceFileParts = await deadline.run(
-      async () => materializeReferenceFiles(referenceFiles, logPath, logger),
+      async () => materializeReferenceFiles(referenceFiles, attachmentDir, logger),
       'reference file materialization',
     )
     const allFileParts = [...(promptOptions.fileParts ?? []), ...referenceFileParts]
     const onPermissionAsked: PermissionAskedResponder = async request => {
-      await sessionClient.postSessionIdPermissionsPermissionId({
-        path: {id: request.sessionID, permissionID: request.requestID},
-        body: {response: 'reject'},
-        query: {directory},
-        signal: deadline.signal,
-      })
+      await replyToPermissionAsk(sessionClient, request, directory)
     }
 
     let lastError: string | null = null
@@ -235,6 +329,7 @@ export async function executeOpenCode(
       })()
 
       final = mergeArtifactResults(result.eventStreamResult, final)
+      if (result.eventStreamResult.discontinuity != null) observationGap = true
 
       if (result.success) {
         // Completion is never a deadline cause, regardless of the clock -- observing quiescence
@@ -254,6 +349,7 @@ export async function executeOpenCode(
           commentsPosted: final.commentsPosted,
           llmError: null,
           classificationPath: final.classificationPath,
+          observationGap,
         }
       }
 
@@ -352,6 +448,7 @@ export async function executeOpenCode(
       commentsPosted: final.commentsPosted,
       llmError: lastLlmError,
       classificationPath: final.classificationPath,
+      observationGap,
     }
   } catch (error) {
     // An explicit, tagged deadline rejection (deadline.run() losing its internal race during
@@ -389,6 +486,7 @@ export async function executeOpenCode(
       commentsPosted: 0,
       llmError: transportFailure ? createLLMFetchError(errorMessage) : null,
       classificationPath: transportFailure ? 'fallback' : 'unclassified',
+      observationGap,
     }
   } finally {
     // Finalizer rule: abort the root session if and only if the execution's selected stopping

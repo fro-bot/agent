@@ -11,6 +11,12 @@ const ORIGINAL_RUNNER_TEMP = process.env.RUNNER_TEMP
 
 beforeEach(() => {
   delete process.env.RUNNER_TEMP
+  // Fixed, deterministic run identity for every test in this file -- the attachment directory
+  // pattern is now run-attempt-scoped (Finding 1), so leaving GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT
+  // to whatever the actual environment happens to hold (a real value when this suite runs inside
+  // an actual GitHub Actions job) would make the literal patterns asserted below flaky.
+  vi.stubEnv('GITHUB_RUN_ID', '12345')
+  vi.stubEnv('GITHUB_RUN_ATTEMPT', '1')
 })
 
 afterEach(() => {
@@ -589,11 +595,13 @@ describe('buildCIConfig', () => {
       expect(externalDirectory).toEqual({
         '*': 'deny',
         '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
         '/home/runner/work/_temp/harness-integrate-work/*': 'allow',
       })
       expect(Object.keys(externalDirectory)).toEqual([
         '*',
         '/home/runner/work/_temp/fro-bot-response/*',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*',
         '/home/runner/work/_temp/harness-integrate-work/*',
       ])
     })
@@ -679,6 +687,7 @@ describe('buildCIConfig', () => {
       expect(config.agent.build.permission.external_directory).toEqual({
         '*': 'deny',
         '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
       })
       expect(logger.warning).toHaveBeenCalledWith('Ignoring integration workdir outside RUNNER_TEMP', {
         integrationWorkDir: '/home/runner/work/_temp/../../etc',
@@ -707,6 +716,7 @@ describe('buildCIConfig', () => {
       expect(config.agent.build.permission.external_directory).toEqual({
         '*': 'deny',
         '/home/runner/work/_temp/fro-bot-response/*': 'allow',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
       })
       expect(logger.warning).toHaveBeenCalledWith('Ignoring integration workdir outside RUNNER_TEMP', {
         integrationWorkDir: '/home/runner/work/_tempevil/harness-integrate-work',
@@ -777,6 +787,131 @@ describe('buildCIConfig', () => {
       expect(result.error).toBeNull()
       const config = result.config as {agent: {build: {permission: Record<string, unknown>}}}
       expect(config.agent.build.permission.external_directory).toBe('deny')
+    })
+  })
+
+  describe('scopeAttachmentDirectoryPermission (top-level, mode-agnostic grant)', () => {
+    it('grants the attachment directory at the top-level permission key in disabled mode', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+
+      // #then the global grant exists independently of the build-agent-scoped one
+      expect(result.error).toBeNull()
+      expect(result.config).toMatchObject({
+        permission: {
+          external_directory: {
+            '*': 'deny',
+            '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
+          },
+        },
+      })
+    })
+
+    it('grants the attachment directory at the top-level permission key in oMo mode (enableOmo: true) -- the mode where subagent dispatch actually happens', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: true}, logger)
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config).toMatchObject({
+        permission: {
+          external_directory: {
+            '*': 'deny',
+            '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
+          },
+        },
+      })
+      // #then this is the mechanism that reaches an orchestrator/subagent -- there is no
+      // `agent.build` block at all in this mode, unlike disabled mode
+      expect(result.config).not.toHaveProperty('agent.build')
+    })
+
+    it('grants the attachment directory at the top-level permission key in OMO Slim mode (enableOmoSlim: true) -- the mode where subagent dispatch actually happens', () => {
+      // #given
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config.default_agent).toBe('orchestrator')
+      expect(result.config).toMatchObject({
+        permission: {
+          external_directory: {
+            '*': 'deny',
+            '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
+          },
+        },
+      })
+    })
+
+    it('preserves an existing user-supplied top-level permission key alongside the grant', () => {
+      // #given a user config that already sets an unrelated top-level permission entry
+      const logger = createLogger()
+      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: '{"permission":{"bash":"allow"}}',
+          systematicVersion: '2.1.0',
+          enableOmo: true,
+        },
+        logger,
+      )
+
+      // #then the user's unrelated entry survives, and the grant is layered in
+      expect(result.error).toBeNull()
+      const permission = (result.config as {permission: Record<string, unknown>}).permission
+      expect(permission.bash).toBe('allow')
+      expect(permission.external_directory).toEqual({
+        '*': 'deny',
+        '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
+      })
+    })
+
+    it('fail-safe: does not add a top-level permission key at all when RUNNER_TEMP is unset, in any mode', () => {
+      // #given RUNNER_TEMP is unset (deleted by beforeEach) in every mode
+      const logger = createLogger()
+
+      // #when
+      const disabled = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const omo = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: true}, logger)
+      const omoSlim = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+        },
+        logger,
+      )
+
+      // #then no broad allow pattern is guessed in any mode
+      expect(disabled.config).not.toHaveProperty('permission')
+      expect(omo.config).not.toHaveProperty('permission')
+      expect(omoSlim.config).not.toHaveProperty('permission')
     })
   })
 

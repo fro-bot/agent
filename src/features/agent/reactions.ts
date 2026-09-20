@@ -112,6 +112,55 @@ export async function updateReactionOnFailure(client: Octokit, ctx: ReactionCont
   }
 }
 
+/**
+ * Leaves the acknowledgment reaction in a neutral, non-final state for an invocation whose
+ * verification could not be completed -- a useful result may exist, but this run cannot
+ * certify it. Removes the transient 'eyes' acknowledgment (so the thread does not look
+ * permanently "in progress") without adding 'hooray' or 'confused': neither claims
+ * something this invocation is not entitled to claim, and GitHub's reaction vocabulary has
+ * no dedicated "uncertain" content -- reusing 'confused' would read as a report about the
+ * agent's work, not about the harness's own inability to verify its state, so no reaction
+ * is added rather than pick a misleading one.
+ */
+export async function updateReactionOnIncomplete(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<void> {
+  if (ctx.commentId == null || ctx.botLogin == null) {
+    logger.debug('Missing comment ID or bot login, skipping reaction update')
+    return
+  }
+
+  try {
+    await removeEyesReaction(client, ctx, logger)
+    logger.info('Invocation could not be verified complete; leaving no terminal reaction', {commentId: ctx.commentId})
+  } catch (error) {
+    logger.warning('Failed to update reaction for an incomplete invocation (non-fatal)', {
+      error: toErrorMessage(error),
+    })
+  }
+}
+
+/**
+ * Terminal-reaction projection for the harness's three-way invocation outcome
+ * (`src/harness/outcome.ts`). Deliberately separate from acknowledgment/working-label
+ * cleanup (`removeWorkingLabel`, called unconditionally from `runCleanup` regardless of
+ * outcome) -- this call happens strictly after the invocation's FINAL outcome is known,
+ * which is only after `runCleanup` itself has returned its teardown safety evidence, so it
+ * cannot live inside `runCleanup`.
+ */
+export async function applyTerminalReaction(
+  client: Octokit,
+  ctx: ReactionContext,
+  outcome: 'succeeded' | 'incomplete' | 'failed',
+  logger: Logger,
+): Promise<void> {
+  if (outcome === 'succeeded') {
+    await updateReactionOnSuccess(client, ctx, logger)
+  } else if (outcome === 'failed') {
+    await updateReactionOnFailure(client, ctx, logger)
+  } else {
+    await updateReactionOnIncomplete(client, ctx, logger)
+  }
+}
+
 export async function removeWorkingLabel(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<void> {
   if (ctx.issueNumber == null) {
     logger.debug('No issue number, skipping label removal')

@@ -51,11 +51,19 @@ function makeV2Module(waitFn: TestWaitFn) {
   }
 }
 
+// Models the real upstream endpoint: a continuing queue-and-heartbeat stream that ends only on
+// instance disposal, never on its own once the given events are exhausted. Callers that want to
+// exercise drop-detection (the stream vanishing on its own) should build their own iterable that
+// actually returns, and say so in the test name -- this helper is for clean-run fixtures only.
+// `runPromptAttempt` has no externally-observable signal to release this on when `eventStream` is
+// supplied directly (bypassing `client.event.subscribe`), so this blocks forever after the given
+// events; `waitForEventProcessorShutdown`'s bounded cleanup window is what lets callers proceed.
 function createMockEventStream(events: Event[] = []): AsyncIterable<Event> {
   return (async function* () {
     for (const event of events) {
       yield event
     }
+    await new Promise<never>(() => undefined)
   })()
 }
 
@@ -69,6 +77,8 @@ function createArmedEventStream(events: Event[] = []): AsyncIterable<Event> {
     for (const event of events) {
       yield event
     }
+    // Clean-run fixture: stays open past the given events, same as createMockEventStream above.
+    await new Promise<never>(() => undefined)
   })()
 }
 
@@ -612,6 +622,11 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
         await vi.advanceTimersByTimeAsync(0)
         vi.setSystemTime(deadlineAt + 1)
         await vi.advanceTimersByTimeAsync(1_500)
+        // The clean-run event stream fixture never closes on its own (it models a continuing
+        // transport) -- `collectEventResults()`'s bounded cleanup (EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS
+        // = 2_000ms) is what lets it proceed, matching the pattern other tests in this file use for
+        // the same reason.
+        await vi.advanceTimersByTimeAsync(2_000)
         const result = await resultPromise
 
         // #then — the deferred submission failure is reported as itself; the deadline settlement
@@ -741,6 +756,8 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
         await vi.advanceTimersByTimeAsync(0)
         vi.setSystemTime(deadlineAt + 1)
         await vi.advanceTimersByTimeAsync(1_500)
+        // Bounded cleanup: the clean-run stream fixture never closes on its own.
+        await vi.advanceTimersByTimeAsync(2_000)
         const result = await resultPromise
 
         // #then — the failure (and its honest shouldRetry: true) is reported, but the shared deadline
@@ -799,6 +816,8 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
         await vi.advanceTimersByTimeAsync(0)
         vi.setSystemTime(deadlineAt + 1)
         await vi.advanceTimersByTimeAsync(1_500)
+        // Bounded cleanup: the clean-run stream fixture never closes on its own.
+        await vi.advanceTimersByTimeAsync(2_000)
         const result = await resultPromise
 
         // #then — a deferred success with no other completion signal times out, now as a typed
@@ -877,6 +896,8 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
           startPrompt,
         )
         await vi.advanceTimersByTimeAsync(50)
+        // Bounded cleanup: the clean-run stream fixture never closes on its own.
+        await vi.advanceTimersByTimeAsync(2_000)
         const result = await resultPromise
 
         // #then — the provider failure wins the reducer's precedence even though the turn was
@@ -948,6 +969,8 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
           startPrompt,
         )
         await vi.advanceTimersByTimeAsync(50)
+        // Bounded cleanup: the clean-run stream fixture never closes on its own.
+        await vi.advanceTimersByTimeAsync(2_000)
         const result = await resultPromise
 
         // #then
@@ -1067,6 +1090,8 @@ describe('runPromptAttempt — settlement causality matrix (Steps 3b/5)', () => 
       // The race has settled on completion by now; only now does the clock latch, simulating
       // expiry occurring purely during `collectEventResults()`'s bounded cleanup.
       expired = true
+      // Bounded cleanup: the clean-run stream fixture never closes on its own.
+      await vi.advanceTimersByTimeAsync(2_000)
       const result = await resultPromise
 
       // #then — the winner (completion-observed) is retained unchanged regardless of what the
@@ -1159,6 +1184,8 @@ describe('runPromptAttempt — settlement causality matrix (Steps 3b/5)', () => 
       // failure ahead of the now-expired deadline.
       expired = true
       await vi.advanceTimersByTimeAsync(500)
+      // Bounded cleanup: the clean-run stream fixture never closes on its own.
+      await vi.advanceTimersByTimeAsync(2_000)
       const result = await resultPromise
 
       // #then — the winning failure-observed settlement is retained; the deadline does not
@@ -1196,6 +1223,8 @@ describe('runPromptAttempt — settlement causality matrix (Steps 3b/5)', () => 
         deadline,
       )
       await vi.advanceTimersByTimeAsync(200)
+      // Bounded cleanup: the clean-run stream fixture never closes on its own.
+      await vi.advanceTimersByTimeAsync(2_000)
       const result = await resultPromise
 
       // #then — settlement: deadline, no failures → typed timeout, not a false completion
@@ -1335,6 +1364,8 @@ describe('runPromptAttempt — settlement causality matrix (Steps 3b/5)', () => 
       // elapse once so it re-checks and observes the now-expired deadline.
       expired = true
       await vi.advanceTimersByTimeAsync(500)
+      // Bounded cleanup: the clean-run stream fixture never closes on its own.
+      await vi.advanceTimersByTimeAsync(2_000)
       const result = await resultPromise
 
       // #then — the preserved submission failure is reported as itself, not overridden into a bare

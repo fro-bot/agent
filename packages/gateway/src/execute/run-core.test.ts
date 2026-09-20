@@ -3279,6 +3279,164 @@ describe('runOpenCodeCore', () => {
     })
   })
 
+  describe('termination barrier (Unit 8) — settling owned work before a failure escapes', () => {
+    const CHILD = 'sess-child-barrier'
+
+    it('fast path: a child already settled before the failure — no abort call, error surfaces promptly with quarantined:false', async () => {
+      // #given — the child settled BEFORE the root's session.error fires (the "same fixture
+      // with B already settled" case): the barrier's fast path must not send any request.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      ownershipLedger.settle(CHILD)
+
+      const abortSpy = vi.fn().mockResolvedValue({data: {}, error: null})
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([sessionErrorEvent('sess-123', 'LLM quota exceeded')]),
+        sessionAbort: abortSpy,
+      })
+      const params = {...buildParams(handle), coordinator, ownershipLedger}
+
+      // #when
+      const thrown = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — the original causal error, promptly, unquarantined, and no wasted request.
+      expect(thrown).toBeInstanceOf(RunCoreError)
+      expect((thrown as RunCoreError).kind).toBe('session-error')
+      expect((thrown as RunCoreError).quarantined).toBe(false)
+      expect(abortSpy).not.toHaveBeenCalled()
+    })
+
+    it('outstanding child: cancelled and confirmed settled before the causal error escapes — quarantined:false', async () => {
+      // #given — root dispatches child A (root) and B (CHILD); A errors while B is still
+      // live. The barrier must cancel B (root too, as a safety net) and confirm it actually
+      // stopped via reconciliation before letting the session-error escape.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+
+      const abortSpy = vi.fn().mockResolvedValue({data: {}, error: null})
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([sessionErrorEvent('sess-123', 'LLM quota exceeded')]),
+        sessionAbort: abortSpy,
+        sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
+        // Confirmed gone after the abort round — reconciliation settles it.
+        sessionStatus: async () => ({data: {}, error: null}),
+      })
+      const params = {...buildParams(handle), coordinator, ownershipLedger}
+
+      // #when
+      const thrown = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — the causal error is unchanged and unquarantined once settlement is confirmed.
+      expect((thrown as RunCoreError).kind).toBe('session-error')
+      expect((thrown as RunCoreError).quarantined).toBe(false)
+      // #and — both the root AND the outstanding child were cancelled before the error escaped.
+      expect(abortSpy).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'sess-123'}}))
+      expect(abortSpy).toHaveBeenCalledWith(expect.objectContaining({path: {id: CHILD}}))
+      // #and — confirmed settled, not merely marked unknown.
+      expect(ownershipLedger.snapshot().find(entry => entry.sessionId === CHILD)?.state).toBe('settled')
+    })
+
+    it('outstanding child cannot be confirmed settled — the causal error escapes quarantined:true, entry downgraded to unknown', async () => {
+      // #given — the abort call succeeds (no envelope error, nothing thrown) but
+      // reconciliation still reports the child live — confirmation, not delivery, is
+      // what this barrier requires.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+
+      const abortSpy = vi.fn().mockResolvedValue({data: {}, error: null})
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([sessionErrorEvent('sess-123', 'LLM quota exceeded')]),
+        sessionAbort: abortSpy,
+        sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
+        sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}), // still live
+      })
+      const params = {...buildParams(handle), coordinator, ownershipLedger}
+
+      // #when
+      const thrown = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — SAME kind and message as the original causal failure — quarantine is
+      // additional evidence, never a replacement explanation.
+      expect((thrown as RunCoreError).kind).toBe('session-error')
+      expect((thrown as RunCoreError).message).toContain('LLM quota exceeded')
+      expect((thrown as RunCoreError).quarantined).toBe(true)
+      expect(ownershipLedger.snapshot().find(entry => entry.sessionId === CHILD)?.state).toBe('unknown')
+    })
+
+    it('an SDK error envelope on abort (no thrown exception) still results in quarantine when confirmation cannot proceed', async () => {
+      // #given — session.abort resolves successfully at the transport level but carries an
+      // error envelope (`{error: ...}`) — must be checked, not just a thrown exception.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+
+      const abortSpy = vi.fn().mockResolvedValue({data: null, error: 'session not found'})
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([sessionErrorEvent('sess-123')]),
+        sessionAbort: abortSpy,
+        sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
+        sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}),
+      })
+      const params = {...buildParams(handle), coordinator, ownershipLedger}
+
+      // #when / #then
+      const thrown = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect((thrown as RunCoreError).quarantined).toBe(true)
+      expect(abortSpy).toHaveBeenCalled()
+    })
+
+    it('a non-session-error failure (stream-ended) with outstanding owned work also traverses the barrier', async () => {
+      // #given — the stream closes before session.idle (no session.error at all) while a
+      // child is still outstanding and unconfirmable — the barrier is not special-cased to
+      // session.error; every failure path after ledger creation routes through it.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+
+      const abortSpy = vi.fn().mockResolvedValue({data: {}, error: null})
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([]),
+        sessionAbort: abortSpy,
+        sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
+        sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}),
+      })
+      const params = {...buildParams(handle), coordinator, ownershipLedger}
+
+      // #when / #then
+      const thrown = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect((thrown as RunCoreError).kind).toBe('stream-ended')
+      expect((thrown as RunCoreError).quarantined).toBe(true)
+      expect(abortSpy).toHaveBeenCalledWith(expect.objectContaining({path: {id: CHILD}}))
+    })
+
+    it('an unowned session error is ignored and never reaches the barrier (regression guard — also covered above)', async () => {
+      // #given — a stranger session's error must not cancel or quarantine THIS run's owned
+      // work; the run continues to its own session.idle undisturbed.
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      ownershipLedger.settle(CHILD)
+
+      const abortSpy = vi.fn().mockResolvedValue({data: {}, error: null})
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            sessionErrorEvent('sess-someone-elses-session', 'unrelated failure'),
+            sessionIdleEvent('sess-123'),
+          ]),
+        sessionAbort: abortSpy,
+      })
+      const params = {...buildParams(handle), coordinator, ownershipLedger}
+
+      // #when / #then — resolves normally; the barrier never runs at all.
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+      expect(abortSpy).not.toHaveBeenCalled()
+    })
+  })
+
   describe('reconciliation settles what it tracks; it does not adopt what it cannot identify', () => {
     const CHILD = 'sess-reconciled-child'
 

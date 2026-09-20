@@ -358,6 +358,129 @@ function extractRunCoreKind(execError: unknown): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Quarantine — bounded hold
+// ---------------------------------------------------------------------------
+
+/**
+ * Upper bound, in milliseconds, on how long a quarantined run's lock lease and
+ * concurrency slot are held past the failure that quarantined it.
+ *
+ * The termination barrier (`settle-owned-sessions.ts`) already spends up to
+ * `DEFAULT_SETTLE_TIMEOUT_MS` (15 s) trying to confirm settlement before giving
+ * up and quarantining. This window is deliberately much larger than that bound —
+ * roughly 20x — so a background child that is genuinely still finishing a write
+ * after being cancelled (a slow git operation, a large diff) is not abandoned
+ * mid-write, while still being short enough that a wedged concurrency slot
+ * recovers unattended rather than needing an operator to notice and intervene.
+ *
+ * Only the concurrency slot is released deterministically at this boundary (see
+ * `scheduleQuarantineRelease`). The repo lock is left to decay via its own
+ * lease TTL (`CoordinationConfig.lockTtlSeconds`, 900 s / 15 min by default) —
+ * once this window stops renewing it, `acquireLock`'s existing stale-lease
+ * takeover (a plain TTL comparison already exercised by ordinary crash
+ * recovery) reclaims it the next time the repo is mentioned, and
+ * `force-release-lock` becomes usable for an operator once both its lease and
+ * heartbeat signals go stale. Neither path requires this module to force a
+ * delete it cannot itself verify is safe — that direct-release call is exactly
+ * the race the termination barrier exists to prevent.
+ */
+export const QUARANTINE_HOLD_WINDOW_MS = 5 * 60_000
+
+interface ScheduleQuarantineReleaseOpts {
+  readonly heartbeat: ReturnType<typeof createHeartbeatController>
+  readonly repo: string
+  readonly runId: string
+  readonly channelId: string
+  readonly queue: ChannelQueue<RunTask>
+  readonly concurrency: ConcurrencyRegistry
+  readonly deps: RunMentionDeps
+  readonly logger: GatewayLogger
+}
+
+/**
+ * Give a quarantined run's hold a bounded end.
+ *
+ * `executeWorkOnHeldSlot`'s finally blocks skip `heartbeat.stop`, `releaseLock`,
+ * and slot hand-off entirely while `quarantined` is `true` (see the gate
+ * comments there) — the heartbeat keeps renewing the lock lease so the
+ * reservation cannot silently lapse via TTL while settlement is unconfirmed.
+ * Left unbounded that hold is permanent and unreachable: `force-release-lock`
+ * requires BOTH an expired lease AND a stale/absent heartbeat, and a
+ * still-renewing heartbeat means neither condition can ever become true.
+ *
+ * This schedules the deferred other half. After `QUARANTINE_HOLD_WINDOW_MS`:
+ *  1. Stops the heartbeat (best-effort) — the lease stops renewing and the
+ *     run-state heartbeat goes stale, starting both signals `force-release-lock`
+ *     checks toward becoming true.
+ *  2. Releases the concurrency slot — via the same atomic hand-off-or-release
+ *     logic the ordinary completion path uses, so a queued task is never made
+ *     to wait out this window behind a run that already finished failing.
+ *
+ * Does NOT call `releaseLock`: see `QUARANTINE_HOLD_WINDOW_MS` for why the lock
+ * itself is left to the existing TTL-takeover / force-release-lock paths
+ * instead of an explicit delete this module cannot verify is safe.
+ */
+function scheduleQuarantineRelease(opts: ScheduleQuarantineReleaseOpts): void {
+  const {heartbeat, repo, runId, channelId, queue, concurrency, deps, logger} = opts
+
+  setTimeout((): void => {
+    // eslint-disable-next-line no-void
+    void (async (): Promise<void> => {
+      logger.warn(
+        {repo, runId, windowMs: QUARANTINE_HOLD_WINDOW_MS},
+        'run: quarantine hold window elapsed — stopping heartbeat and releasing the concurrency slot',
+      )
+
+      const stopResult = await heartbeat.stop().catch((error: unknown) => {
+        logger.warn(
+          {repo, runId, err: error instanceof Error ? error.message : String(error)},
+          'run: heartbeat.stop threw at quarantine-window expiry',
+        )
+        return null
+      })
+      if (stopResult !== null && stopResult.success === false) {
+        logger.warn(
+          {repo, runId, err: stopResult.error.message},
+          'run: heartbeat.stop failed at quarantine-window expiry — lease will still lapse via TTL',
+        )
+      }
+
+      if (deps.isShuttingDown?.() === true) {
+        try {
+          concurrency.release(channelId)
+        } catch (releaseError: unknown) {
+          logger.warn(
+            {channelId, err: releaseError instanceof Error ? releaseError.message : String(releaseError)},
+            'run: concurrency.release threw at quarantine-window expiry during shutdown — slot may leak',
+          )
+        }
+        return
+      }
+
+      const nextTask = queue.takeNext(channelId)
+      if (nextTask === undefined) {
+        try {
+          concurrency.release(channelId)
+        } catch (releaseError: unknown) {
+          logger.warn(
+            {channelId, err: releaseError instanceof Error ? releaseError.message : String(releaseError)},
+            'run: concurrency.release threw at quarantine-window expiry — slot may leak',
+          )
+        }
+      } else {
+        // eslint-disable-next-line no-void
+        void executeWorkOnHeldSlot(nextTask).catch((error: unknown) => {
+          logger.error(
+            {channelId, err: error instanceof Error ? error.message : String(error)},
+            'run: quarantine-window hand-off startRun failed',
+          )
+        })
+      }
+    })()
+  }, QUARANTINE_HOLD_WINDOW_MS)
+}
+
+// ---------------------------------------------------------------------------
 // executeWorkOnHeldSlot — the private slot-holding execution pipeline
 // ---------------------------------------------------------------------------
 
@@ -423,6 +546,16 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   // must NOT run after a successful ACK (it only wraps the pre-ACK section).
   let preAckCompleted = false
   let lockEtag: string | null = null
+  // ── Quarantine — set only when `runOpenCodeCore` throws a `RunCoreError` with
+  // `quarantined: true`: its termination barrier could NOT confirm that this run's
+  // owned background sessions actually stopped. Declared at this (outer-try-spanning)
+  // scope, not inside the inner try, because BOTH the inner finally (heartbeat/lock)
+  // AND the outer handoff finally must read it. While `true`, those finally blocks
+  // skip heartbeat.stop, releaseLock, and slot hand-off entirely — releasing any of
+  // those while a sibling of this run's failed session may still be live and writing
+  // is exactly the bug this barrier exists to close. The run stays reserved until a
+  // later reconciliation pass confirms settlement or an operator intervenes.
+  let quarantined = false
 
   try {
     // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
@@ -935,7 +1068,138 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         wasCancelled === true ? 'run: execution aborted by operator cancel' : 'run: execution failed',
       )
 
-      if (wasCancelled === true) {
+      const isQuarantined = isCoreError && execError.quarantined === true
+
+      if (isQuarantined) {
+        // ── Quarantine path ─────────────────────────────────────────────────────────
+        // run-core's termination barrier could NOT confirm this run's owned background
+        // sessions actually stopped. Report failure, but do NOT stop the heartbeat, do
+        // NOT release the lock, and do NOT hand off the slot below — a live writer may
+        // still be mutating the workspace. The heartbeat keeps renewing the lock lease
+        // so this reservation cannot silently lapse via TTL expiry. This is a failed run
+        // with an additional unresolved condition, never a success.
+        quarantined = true
+
+        statusSink.setReaction('failed')
+
+        const quarantineFailureKind = extractRunCoreKind(execError)
+        const quarantineDetailsPatch: Record<string, unknown> = {quarantined: true}
+        if (quarantineFailureKind !== undefined) {
+          quarantineDetailsPatch.failureKind = quarantineFailureKind
+        }
+        const quarantineResult = await transitionRun(
+          coordinationConfig,
+          identity,
+          repo,
+          runId,
+          'FAILED',
+          runEtag,
+          coordLogger,
+          {detailsPatch: quarantineDetailsPatch},
+        )
+        let quarantineStateForNotify: RunState | undefined
+        if (quarantineResult.success === false) {
+          logger.error(
+            {repo, runId, err: quarantineResult.error.message},
+            'run: transitionRun FAILED (quarantine) failed — retrying with a fresh etag so the quarantine flag is not silently lost',
+          )
+
+          // Retry once with a freshly-read etag — mirrors the CANCELLED→FAILED fallback
+          // pattern below. A 412 here is almost always a stale caller etag (e.g. this
+          // run's own heartbeat tick landed a write between our last read and this
+          // call), not a structural failure. Losing this write silently would leave
+          // the persisted record misrepresenting this run as non-terminal, with
+          // nothing recorded that this run is quarantined — a future reader has no
+          // way to learn the bounded hold below is in effect.
+          const reReadResult = await readCurrentRunStateWithEtag(deps, repo, runId)
+          if (reReadResult === null) {
+            logger.error(
+              {repo, runId},
+              'run: quarantine FAILED transition retry skipped — run-state re-read also failed; record may misrepresent this run as non-terminal',
+            )
+          } else if (
+            reReadResult.phase === 'COMPLETED' ||
+            reReadResult.phase === 'FAILED' ||
+            reReadResult.phase === 'CANCELLED'
+          ) {
+            logger.warn(
+              {repo, runId, phase: reReadResult.phase},
+              'run: quarantine FAILED transition failed but a concurrent writer already terminalized the run — skipping retry',
+            )
+          } else {
+            const retryResult = await transitionRun(
+              coordinationConfig,
+              identity,
+              repo,
+              runId,
+              'FAILED',
+              reReadResult.etag,
+              coordLogger,
+              {detailsPatch: quarantineDetailsPatch},
+            )
+            if (retryResult.success === false) {
+              logger.error(
+                {repo, runId, err: retryResult.error.message},
+                'run: quarantine FAILED transition retry also failed — record may misrepresent this run as non-terminal; the bounded hold below still applies regardless',
+              )
+            } else {
+              // Not `runEtag = retryResult.data.etag`: the quarantine path performs no
+              // further conditional write after this point (scheduleQuarantineRelease's
+              // heartbeat.stop() below reads its own fresh etags and never consults this
+              // one) — the lease is deliberately left to expire into stale-run recovery.
+              // If a future change adds a conditional write here, capture the etag fresh
+              // from that call's own result rather than reaching for this stale binding.
+              quarantineStateForNotify = retryResult.data.state
+              logger.warn({repo, runId}, 'run: quarantine FAILED transition recovered on retry with a fresh etag')
+            }
+          }
+        } else {
+          // Not `runEtag = quarantineResult.data.etag`: see the comment in the retry
+          // branch above — no further conditional write follows on this path.
+          quarantineStateForNotify = quarantineResult.data.state
+        }
+
+        // Best-effort flush of partial output — mirrors the existing failure-path ordering.
+        await replySink.flush().catch((flushError: unknown) => {
+          logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in quarantine path')
+        })
+
+        if (quarantineStateForNotify !== undefined) {
+          notifyObserverBestEffort(deps, quarantineStateForNotify)
+          // eslint-disable-next-line no-void
+          void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(quarantineFailureKind))
+        }
+
+        const quarantineMessage =
+          'The task failed and its background work could not be confirmed stopped. This repository stays reserved for a bounded window while that resolves — please contact an operator if it persists.'
+        const quarantineReplyResult = await statusSink.resolveToFailure(quarantineMessage).catch((error: unknown) => {
+          logger.warn(
+            {repo, runId, err: String(error)},
+            'run: statusController.resolveToFailure failed in quarantine path — delegating',
+          )
+          return {transition: 'delegated' as const}
+        })
+        if (quarantineReplyResult.transition === 'delegated') {
+          const quarantineSendResult = await replySink.send('thread', {content: quarantineMessage})
+          if (quarantineSendResult !== undefined) {
+            const result = quarantineSendResult as {success?: boolean; error?: {message: string}}
+            if (result.success === false && result.error !== undefined) {
+              logger.warn({repo, runId, err: result.error.message}, 'run: failed to send quarantine reply to thread')
+            }
+          }
+        }
+
+        // Bounded hold — see QUARANTINE_HOLD_WINDOW_MS. Scheduled, not awaited: this run
+        // settles promptly like any other failure; the deferred callback stops the
+        // heartbeat and releases the concurrency slot once the window elapses, reading
+        // fresh state at that time rather than anything captured now.
+        scheduleQuarantineRelease({heartbeat, repo, runId, channelId, queue, concurrency, deps, logger})
+
+        logger.error(
+          {repo, runId, holdWindowMs: QUARANTINE_HOLD_WINDOW_MS},
+          'run: run quarantined — lock and slot held for a bounded window pending settlement or operator intervention',
+        )
+      } else if (wasCancelled === true) {
         // ── Operator-cancel settlement path ──────────────────────────────────────────
         // Distinct from the generic FAILED path below: settles CANCELLED, suppresses the
         // user-facing failure reply (the cancellation thread notice is the communication), and
@@ -1169,23 +1433,33 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // abort() call after this point becomes the documented unknown-runId no-op.
       abortRegistry.delete(runId)
 
-      // Stop heartbeat if not yet stopped (defensive — should not normally happen)
-      if (heartbeatStopped === false) {
+      // Stop heartbeat if not yet stopped (defensive — should not normally happen).
+      // SKIPPED when quarantined: the lease must keep renewing so the reservation cannot
+      // silently lapse via TTL expiry while owned background work is still unconfirmed.
+      if (quarantined === false && heartbeatStopped === false) {
         await heartbeat.stop().catch(() => {
           /* best-effort */
         })
       }
 
       // Dispose status controller — guaranteed cleanup of typing interval and debounce timer.
-      // Must run in finally so timers never leak regardless of success or failure.
+      // Must run in finally so timers never leak regardless of success or failure. Unrelated
+      // to the resource claim (lock/heartbeat/slot), so this runs even when quarantined.
       await statusSink.dispose().catch((error: unknown) => {
         logger.warn({repo, runId, err: String(error)}, 'run: statusController.dispose failed')
       })
 
-      // Release lock (best-effort)
-      const releaseResult = await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
-      if (releaseResult.success === false) {
-        logger.warn({repo, runId, err: releaseResult.error.message}, 'run: releaseLock failed')
+      // Release lock (best-effort) — SKIPPED when quarantined: releasing the lock while a
+      // sibling of this run's failed session may still be live and writing is exactly the
+      // bug this barrier exists to close. The run stays reserved until reconciliation
+      // confirms settlement or an operator intervenes.
+      if (quarantined === true) {
+        logger.warn({repo, runId}, 'run: quarantined — lock retained, heartbeat left running')
+      } else {
+        const releaseResult = await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
+        if (releaseResult.success === false) {
+          logger.warn({repo, runId, err: releaseResult.error.message}, 'run: releaseLock failed')
+        }
       }
     }
   } catch (gateError: unknown) {
@@ -1230,7 +1504,18 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // The handed-off executeWorkOnHeldSlot is fire-and-forget from this run's perspective so
     // cleanup completes, but its own outer finally runs the same handoff/release
     // logic — so the chain continues and a thrown handoff still releases.
-    if (deps.isShuttingDown?.() === true) {
+    //
+    // Quarantine gate: a quarantined run's background work could not be confirmed
+    // stopped — the resource claim (lock, held via the still-running heartbeat, and
+    // this concurrency slot) must be retained, never released or handed off, even on
+    // shutdown. Capacity staying unavailable past the execution deadline is the
+    // accepted cost of never handing a live-writer workspace to the next run.
+    if (quarantined === true) {
+      logger.warn(
+        {channelId, repo, runId},
+        'run: quarantined — concurrency slot retained, no hand-off to the next queued task',
+      )
+    } else if (deps.isShuttingDown?.() === true) {
       // Shutdown in progress — drop pending queued tasks; release the slot.
       //
       // Queued tasks that are dropped here each have an admitted PENDING run-state

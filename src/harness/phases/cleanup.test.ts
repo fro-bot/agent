@@ -25,6 +25,21 @@ vi.mock('../../features/attachments/index.js', () => ({
   cleanupTempFiles: vi.fn(),
 }))
 
+vi.mock('node:fs/promises', () => ({
+  rm: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('../../shared/env.js', async importOriginal => {
+  const original = await importOriginal<typeof import('../../shared/env.js')>()
+  return {
+    ...original,
+    // Wraps (not replaces) the real implementation so every existing test keeps reading
+    // process.env.GITHUB_WORKSPACE unchanged; only tests that explicitly override it via
+    // mockImplementationOnce see different behavior.
+    getGitHubWorkspace: vi.fn(original.getGitHubWorkspace),
+  }
+})
+
 vi.mock('../../services/artifact/index.js', () => ({
   uploadLogArtifact: vi.fn(),
 }))
@@ -64,6 +79,11 @@ describe('runCleanup', () => {
     process.env.GITHUB_RUN_ID = '12345'
     process.env.GITHUB_RUN_ATTEMPT = '2'
     delete process.env.OPENCODE_PROMPT_ARTIFACT
+    // Deleted, not merely left alone: the attachment-directory cleanup step reads this directly
+    // (not through a mocked env helper), so an ambient real value from an actual GitHub Actions
+    // runner running this suite would make it attempt a real `fs.rm` against a real path. Tests
+    // that need it set do so explicitly.
+    delete process.env.RUNNER_TEMP
   })
 
   afterEach(() => {
@@ -71,6 +91,7 @@ describe('runCleanup', () => {
     delete process.env.GITHUB_RUN_ID
     delete process.env.GITHUB_RUN_ATTEMPT
     delete process.env.OPENCODE_PROMPT_ARTIFACT
+    delete process.env.RUNNER_TEMP
   })
 
   it('uploads artifacts and metadata with metrics when storeConfig is enabled', async () => {
@@ -95,7 +116,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: null,
@@ -157,7 +177,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: null,
@@ -183,7 +202,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: null,
@@ -217,7 +235,6 @@ describe('runCleanup', () => {
         bootstrapLogger: createMockLogger(),
         reactionCtx: null,
         githubClient: null,
-        agentSuccess: true,
         attachmentResult: null,
         serverHandle: null,
         sessionRetention: null,
@@ -253,7 +270,6 @@ describe('runCleanup', () => {
         bootstrapLogger: createMockLogger(),
         reactionCtx: null,
         githubClient: null,
-        agentSuccess: true,
         attachmentResult: null,
         serverHandle: null,
         sessionRetention: null,
@@ -270,7 +286,7 @@ describe('runCleanup', () => {
         runId: 'run-123',
         lockEtag: null,
       }),
-    ).resolves.toBeUndefined()
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
 
     expect(syncMetadataToStore).toHaveBeenCalled()
   })
@@ -285,7 +301,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: createServerHandle(),
       sessionRetention: 10,
@@ -317,7 +332,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: createServerHandle(),
       sessionRetention: 50,
@@ -346,7 +360,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: createServerHandle(),
       sessionRetention: null,
@@ -381,7 +394,6 @@ describe('runCleanup', () => {
       bootstrapLogger: logger,
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle,
       sessionRetention: null,
@@ -402,6 +414,125 @@ describe('runCleanup', () => {
       'OpenCode server did not confirm shutdown within the quiescence window; the checkpoint that follows may race a still-live writer',
     )
     expect(logger.warning).not.toHaveBeenCalledWith('Server shutdown failed (non-fatal)', expect.any(Object))
+  })
+
+  it('defaults quiescenceConfirmed to false (not true) when a server handle exists but a pre-shutdown step throws before shutdown can run', async () => {
+    // #given getGitHubWorkspace throws synchronously before the shutdown block is ever
+    // reached -- the outer catch swallows it, so the ONLY thing that decides the reported
+    // value is the initial default. Before the fix this default was `true` (false
+    // certification of a server that was never even asked to shut down); after the fix a
+    // server handle existing at all means the default is the conservative `false`.
+    const {getGitHubWorkspace} = await import('../../shared/env.js')
+    vi.mocked(getGitHubWorkspace).mockImplementationOnce(() => {
+      throw new Error('workspace unavailable')
+    })
+    const serverHandle = createServerHandle()
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs and the pre-shutdown step throws
+    const result = await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: null,
+      serverHandle,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then shutdown was never reached, and the returned fact is the honest unconfirmed
+    // default, not a stale success
+    expect(serverHandle.shutdown).not.toHaveBeenCalled()
+    expect(result.quiescenceConfirmed).toBe(false)
+  })
+
+  it('shutdown still runs when an earlier best-effort cleanup step (attachment cleanup) throws', async () => {
+    // #given attachment temp-file cleanup throws
+    const {cleanupTempFiles} = await import('../../features/attachments/index.js')
+    vi.mocked(cleanupTempFiles).mockRejectedValueOnce(new Error('cleanup failed'))
+    const serverHandle = createServerHandle()
+    const logger = createMockLogger()
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    const result = await runCleanup({
+      bootstrapLogger: logger,
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: {processed: [], skipped: [], modifiedBody: '', fileParts: [], tempFiles: ['/tmp/a']},
+      serverHandle,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then shutdown still ran and confirmed quiescence despite the earlier throw, which
+    // was caught and logged locally rather than propagating past shutdown to the outer catch
+    expect(serverHandle.shutdown).toHaveBeenCalledTimes(1)
+    expect(result.quiescenceConfirmed).toBe(true)
+  })
+
+  it('complement: a clean cleanup with a confirming shutdown still reports confirmed', async () => {
+    // #given no earlier step throws and shutdown confirms quiescence
+    const serverHandle = createServerHandle()
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs end to end cleanly
+    const result = await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: null,
+      serverHandle,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then the ordinary happy path is unaffected by the conservative default
+    expect(result).toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+  })
+
+  it('complement: a run with no server handle at all is not forced unconfirmed', async () => {
+    // #given no server handle (e.g. SKIP_AGENT_EXECUTION=true) -- nothing to confirm
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    const result = await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: null,
+      serverHandle: null,
+      sessionRetention: null,
+      detectedOpencodeVersion: '1.0.0',
+      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    })
+
+    // #then the conservative default only applies when there is a writer to be unconfirmed
+    // about -- a run with no server at all must not be forced into a false 'incomplete'
+    expect(result.quiescenceConfirmed).toBe(true)
   })
 
   it('continues past a throwing cache-save-result output write to still upload artifacts and save state', async () => {
@@ -425,7 +556,6 @@ describe('runCleanup', () => {
         bootstrapLogger: logger,
         reactionCtx: null,
         githubClient: null,
-        agentSuccess: true,
         attachmentResult: null,
         serverHandle: null,
         sessionRetention: null,
@@ -437,7 +567,7 @@ describe('runCleanup', () => {
         runId: 'run-123',
         lockEtag: null,
       }),
-    ).resolves.toBeUndefined()
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
 
     // #then the throw is caught and logged via cacheLogger (core.warning), not left to
     // crash cleanup
@@ -459,7 +589,6 @@ describe('runCleanup', () => {
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: 10,
@@ -495,7 +624,6 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     bootstrapLogger: createMockLogger(),
     reactionCtx: null,
     githubClient: null,
-    agentSuccess: true,
     attachmentResult: null,
     serverHandle: null,
     sessionRetention: null,
@@ -515,12 +643,14 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     process.env.GITHUB_WORKSPACE = '/tmp/workspace'
     process.env.GITHUB_RUN_ID = '12345'
     process.env.GITHUB_RUN_ATTEMPT = '1'
+    delete process.env.RUNNER_TEMP
   })
 
   afterEach(() => {
     delete process.env.GITHUB_WORKSPACE
     delete process.env.GITHUB_RUN_ID
     delete process.env.GITHUB_RUN_ATTEMPT
+    delete process.env.RUNNER_TEMP
   })
 
   it('declines cache persistence when the ownership ledger has an unknown entry', async () => {
@@ -600,13 +730,123 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     expect(saveCache).not.toHaveBeenCalled()
     const core = await import('@actions/core')
     const remediationText = vi.mocked(core.summary.addRaw).mock.calls.flat().join(' ')
-    expect(remediationText).toContain('lease could not be renewed')
+    expect(remediationText).toContain('lease could not verify uninterrupted coverage')
     // #and the state is 'declined-for-safety' -- the post hook must honor this decline,
     // not retry it, since a failed lease is exactly the case the process boundary can't help
     const {saveState} = await import('@actions/core')
     expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
     // #and stop() is still called exactly once, after the decision, not to make it
     expect(lease.stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('declines persistence when a renewal tick in flight at gate time resolves unverified (the race the fix closes)', async () => {
+    // #given a lease whose renewal health looks clean right now, but has a tick in flight at
+    // gate time -- settle() simulates that tick resolving unverified while the gate awaits it,
+    // exactly the race described in acquire-lock.ts's `LeaseController.settle` doc: without
+    // settling first, the gate would read the clean pre-tick state and let the save proceed
+    const {saveCache} = await import('../../services/cache/index.js')
+    let unverified = false
+    const lease = createLeaseController({
+      continuityUnverified: () => unverified,
+      settle: vi.fn().mockImplementation(async () => {
+        unverified = true
+      }),
+    })
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: lease,
+      }),
+    )
+
+    // #then settle() was awaited before the decision, and the now-latched continuity failure
+    // declines the save -- the race is closed, not merely narrowed
+    expect(lease.settle).toHaveBeenCalledTimes(1)
+    expect(saveCache).not.toHaveBeenCalled()
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+  })
+
+  it('complement: a renewal tick in flight at gate time that resolves cleanly still persists', async () => {
+    // #given the same in-flight-at-gate-time shape as above, but the tick settle() awaits
+    // resolves cleanly -- without this complement, a fix that simply always declines after
+    // settling would pass the race test above for the wrong reason
+    const {saveCache} = await import('../../services/cache/index.js')
+    const unverified = false
+    const lease = createLeaseController({
+      continuityUnverified: () => unverified,
+      settle: vi.fn().mockImplementation(async () => {
+        // tick resolves cleanly -- continuity stays verified
+      }),
+    })
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: lease,
+      }),
+    )
+
+    // #then settle() was awaited, and the clean reading lets persistence proceed normally
+    expect(lease.settle).toHaveBeenCalledTimes(1)
+    expect(saveCache).toHaveBeenCalledTimes(1)
+  })
+
+  it('persists normally when the lease has no renewal trouble at all (no in-flight tick, nothing latched)', async () => {
+    // #given a fully healthy lease -- settle() is a no-op no-in-flight-tick case
+    const {saveCache} = await import('../../services/cache/index.js')
+    const lease = createLeaseController({
+      continuityUnverified: () => false,
+      settle: vi.fn().mockResolvedValue(undefined),
+    })
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: lease,
+      }),
+    )
+
+    // #then persistence proceeds as normal
+    expect(lease.settle).toHaveBeenCalledTimes(1)
+    expect(saveCache).toHaveBeenCalledTimes(1)
+  })
+
+  it('still declines when continuity was already latched before the gate, and still works for the legacy hasFailed()-only test double with no settle()', async () => {
+    // #given a legacy hand-built LeaseController double that predates continuityUnverified()
+    // and settle() -- neither is provided, only the required hasFailed()
+    const {saveCache} = await import('../../services/cache/index.js')
+    const legacyLease: LeaseController = {
+      hasFailed: () => true,
+      currentEtag: () => '"etag-initial"',
+      stop: vi.fn().mockResolvedValue(undefined),
+    }
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs -- the optional-chained `leaseRenewal?.settle?.()` must not throw for
+    // a double that has no settle() at all
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: legacyLease,
+      }),
+    )
+
+    // #then the fallback to hasFailed() still declines, exactly as before this change
+    expect(saveCache).not.toHaveBeenCalled()
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
   })
 
   it('persists normally when this run holds no lock (leaseRenewal is null) -- never fails for want of a lease it never held', async () => {
@@ -684,11 +924,89 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
           leaseRenewal: lease,
         }),
       ),
-    ).resolves.toBeUndefined()
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
 
     // #then release is still attempted with the (stale) etag stop() settled on, and the
     // failed conditional delete is swallowed -- non-fatal, matching every other release failure
     expect(lease.stop).toHaveBeenCalledTimes(1)
     expect(releaseLock).toHaveBeenCalledWith(expect.any(Object), 'owner/repo', '"etag-stale"', expect.any(Object))
+  })
+})
+
+describe('runCleanup attachment directory removal', () => {
+  const minimalOptions = (): CleanupPhaseOptions => ({
+    bootstrapLogger: createMockLogger(),
+    reactionCtx: null,
+    githubClient: null,
+    attachmentResult: null,
+    serverHandle: null,
+    sessionRetention: null,
+    detectedOpencodeVersion: '1.0.0',
+    storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
+    metrics: createMetricsCollector(),
+    agentIdentity: 'github',
+    repo: 'owner/repo',
+    runId: 'run-123',
+    lockEtag: null,
+  })
+
+  beforeEach(() => {
+    vi.resetModules()
+    vi.clearAllMocks()
+    process.env.GITHUB_WORKSPACE = '/tmp/workspace'
+    process.env.GITHUB_RUN_ID = '4242'
+    process.env.GITHUB_RUN_ATTEMPT = '3'
+  })
+
+  afterEach(() => {
+    delete process.env.GITHUB_WORKSPACE
+    delete process.env.GITHUB_RUN_ID
+    delete process.env.GITHUB_RUN_ATTEMPT
+    delete process.env.RUNNER_TEMP
+  })
+
+  it('removes the run-scoped attachment directory when RUNNER_TEMP is set', async () => {
+    // #given RUNNER_TEMP is set (the real-CI case) -- this run materialized attachments under it
+    process.env.RUNNER_TEMP = '/home/runner/work/_temp'
+    const {rm} = await import('node:fs/promises')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(minimalOptions())
+
+    // #then the exact run-attempt-scoped directory this run's own grant covers is removed
+    expect(rm).toHaveBeenCalledWith('/home/runner/work/_temp/fro-bot-attachments/4242-3', {
+      recursive: true,
+      force: true,
+    })
+  })
+
+  it('does not attempt removal when RUNNER_TEMP is unset', async () => {
+    // #given RUNNER_TEMP is unset (deleted by afterEach/local, non-Actions runs)
+    delete process.env.RUNNER_TEMP
+    const {rm} = await import('node:fs/promises')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(minimalOptions())
+
+    // #then nothing is guessed -- matches `scopeAttachmentDirectoryPermission`'s own fail-safe
+    expect(rm).not.toHaveBeenCalled()
+  })
+
+  it('does not fail the run when attachment directory removal fails, and later cleanup steps still run', async () => {
+    // #given removal itself fails (e.g. permission denied on a self-hosted runner)
+    process.env.RUNNER_TEMP = '/home/runner/work/_temp'
+    const {rm} = await import('node:fs/promises')
+    vi.mocked(rm).mockRejectedValueOnce(new Error('EACCES'))
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs -- must not throw, and must still reach the rest of the phase
+    const result = await runCleanup(minimalOptions())
+
+    // #then the run's own safety evidence is still produced normally
+    expect(result).toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+    const {saveState} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', expect.any(String))
   })
 })

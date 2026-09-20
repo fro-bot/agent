@@ -222,6 +222,19 @@ jobs:
           model: ${{ vars.FRO_BOT_MODEL }}
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           prompt: ${{ env.PROMPT }}
+          # 20 minutes, against this job's 30-minute cap. The action's own default is
+          # also 30 minutes, which means the job clock -- running since checkout, well
+          # before this step -- always expires first. The action's deadline was therefore
+          # unreachable: a stalled run died as a cancelled job with no review, no job
+          # summary, and no structured outcome, because every path that reports those
+          # lives after the deadline it never hit. Verified on run 35414403157, killed at
+          # 30m05s with its last log line 24 minutes earlier.
+          #
+          # Raising the job cap instead would just move the inversion. The action needs to
+          # lose its race to nothing, so it can drain owned background work, cancel what
+          # will not settle, and publish what it found. The ten-minute gap covers setup
+          # before this step plus teardown after it.
+          timeout: '1200000'
 
       - if: always()
         name: Introspect main action execution
@@ -505,7 +518,10 @@ jobs:
           # The image bakes the file-watcher opt-out. Nothing else asserts it, and dropping
           # the ENV costs performance with no other signal, so pin it here.
           docker exec "$cid" sh -c '[ "$OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER" = "true" ]'
-          echo "OK: clone API up on :9100, opencode present, base config (no baked model), watcher disabled, auth fail-soft"
+          # The image bakes the background-subagents opt-in too -- same reasoning as the
+          # watcher assertion above: nothing else asserts it, so pin it here.
+          docker exec "$cid" sh -c '[ "$OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS" = "true" ]'
+          echo "OK: clone API up on :9100, opencode present, base config (no baked model), watcher disabled, background subagents enabled, auth fail-soft"
       - name: Smoke-test auth provisioning (valid blob → auth.json written 0600)
         run: |
           set -e

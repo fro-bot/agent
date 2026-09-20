@@ -66,6 +66,28 @@ export interface ExecutePhaseResult {
    */
   readonly ownershipLedger?: OwnershipLedger
   /**
+   * `true` when any event stream observing this phase's execution -- including a
+   * context-overflow recovery restart -- recorded an unexpected discontinuity
+   * (`AgentResult.observationGap`). Sticky across the recovery boundary: a fresh recovery
+   * ledger starts a clean dispatch budget, but it must not erase an observation gap the
+   * overflowed session already recorded for this same invocation (see
+   * `recoverFromContextOverflow` below). Feeds `InvocationVerificationFacts.observationGap`
+   * in `src/harness/outcome.ts`.
+   */
+  readonly observationGap: boolean
+  /**
+   * `true` when the OVERFLOWED session's own drain (run internally by
+   * `recoverFromContextOverflow` before archiving it) still had unresolved (outstanding or
+   * unknown) ownership-ledger entries. The recovery session gets a fresh ledger with a
+   * clean dispatch budget (see `recoveryLedger` below) -- that reset is about dispatch
+   * accounting, not a claim that the session it replaces left nothing unresolved. This
+   * field is how that fact survives the ledger boundary and reaches
+   * `InvocationVerificationFacts.ownershipUnresolved` in `src/harness/outcome.ts`, since the
+   * top-level drain in `run.ts` only ever observes `ownershipLedger` (the recovery
+   * session's), never the overflowed session's. `false` on every non-recovery result.
+   */
+  readonly recoveryBoundaryUnresolved: boolean
+  /**
    * Wall-clock time spent inside this phase (including a context-overflow
    * recovery restart), in milliseconds. `runDrain`'s caller subtracts this
    * from the invocation's total timeout to compute the remaining drain
@@ -144,13 +166,16 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
   // cancellation rather than a second implementation; `deadlineMs: 0` skips straight
   // from the unconditional first reconciliation pass to cancellation for anything
   // reconciliation did not already resolve.
-  await runDrain({
+  const overflowedDrainOutcome = await runDrain({
     ledger: overflowedLedger,
     client: cacheRestore.serverHandle.client,
     parentSessionId: overflowedSessionId,
     deadlineMs: 0,
     logger: execLogger,
   })
+  // Carried forward on the recovery result below (recoveryBoundaryUnresolved) -- the fresh
+  // ledger recovery constructs next resets dispatch accounting only, not this fact.
+  const recoveryBoundaryUnresolved = overflowedDrainOutcome.unknownCount > 0
 
   const archiveSucceeded = await archiveSession(cacheRestore.serverHandle.server.url, overflowedSessionId, execLogger)
   if (archiveSucceeded === false) {
@@ -181,7 +206,11 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
   }
 
   const remainingMs = bootstrap.inputs.timeoutMs - (Date.now() - executionStartTime)
-  if (remainingMs <= 0) return overflowedResult
+  if (remainingMs <= 0)
+    return {
+      ...overflowedResult,
+      recoveryBoundaryUnresolved: overflowedResult.recoveryBoundaryUnresolved || recoveryBoundaryUnresolved,
+    }
 
   const recoveryPromptOptions: PromptOptions = {
     ...promptOptions,
@@ -240,6 +269,10 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     resolvedOutputMode: overflowedResult.resolvedOutputMode,
     outputModeMigration: overflowedResult.outputModeMigration,
     ownershipLedger: recoveryLedger,
+    // The overflowed session's own observation gap and unresolved ownership facts must not
+    // be erased by this boundary -- see this field's doc comment and recoveryBoundaryUnresolved's.
+    observationGap: overflowedResult.observationGap || recoveryExecResult.observationGap,
+    recoveryBoundaryUnresolved,
     overflowRecovery: {
       recovered: recoveryExecResult.success,
       archivedSessionId: overflowedSessionId,
@@ -306,6 +339,8 @@ export async function runExecute(
       llmError: null,
       resolvedOutputMode,
       outputModeMigration,
+      observationGap: false,
+      recoveryBoundaryUnresolved: false,
       executionDurationMs: 0,
     }
   } else {
@@ -367,6 +402,7 @@ export async function runExecute(
       resolvedOutputMode,
       outputModeMigration,
       ownershipLedger: ledger,
+      recoveryBoundaryUnresolved: false,
       // Overwritten by the final return below once the whole phase has finished.
       executionDurationMs: 0,
     }
@@ -632,10 +668,19 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
   const reconcileOptions: ReconcileLedgerOptions = {ledger, adapter, parentSessionId, logger}
 
   // Unconditional first pass, regardless of the ledger's current outstanding
-  // count: reconciliation is the only way this ledger can learn about a
-  // dispatch whose event was never observed -- a dropped event with no
-  // detected discontinuity has nothing else to trigger a re-check (plan's
-  // central hazard, Unit 3).
+  // count: reconciliation is the only way this ledger can learn that a
+  // TRACKED entry's completion/settlement event was dropped -- a stream that
+  // stays silent about an already-adopted entry has nothing else to trigger a
+  // re-check (plan's central hazard, Unit 3). This does NOT cover a dispatch
+  // whose adoption event itself was never observed: reconciliation settles
+  // what the ledger already tracks, it never adopts an untracked session (see
+  // `packages/runtime/src/agent/ledger-reconcile.ts`'s module doc for why that
+  // was tried and removed -- reconciliation's two inputs, `children()` and
+  // `liveSessionIds()`, cannot tell an ordinary foreground subagent from a
+  // background dispatch once the adoption event itself is lost). A
+  // discriminant does exist on the persisted tool part, which nothing here
+  // reads today -- see that module doc for the verified shape and for what a
+  // reader of it would additionally have to get right.
   await reconcileLedgerOnce(reconcileOptions)
 
   if (ledger.isDrainComplete()) return {...NO_DRAIN_OUTCOME, unknownCount: ledger.unknown()}
