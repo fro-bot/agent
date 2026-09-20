@@ -47,7 +47,7 @@ Drop the ownership gate on this one branch, keeping only a well-formedness check
 // before — src/features/agent/streaming.ts
 if (eventType === 'permission.asked') {
   const eventSessionID = getEventSessionID(event)
-  if (!isOwnedSession(eventSessionID, sessionId, ownershipLedger)) continue
+  if (isOwnedSession(eventSessionID, sessionId, ownershipLedger) === false) continue
 
 // after
 if (eventType === 'permission.asked') {
@@ -84,7 +84,7 @@ Concretely:
 - Test it directly: inject a child-session `permission.asked` *before* the session is adopted into the ownership ledger, and assert the responder still fires. That test fails against the old code.
 - When a run dies by clock with no error, look for the last event that expected a response. A hang is usually an unanswered request, not slow work.
 
-Anchor points: `src/features/agent/streaming.ts:643-725`, `src/features/agent/execution.ts:46-94,254-277`.
+Anchor points: `src/features/agent/streaming.ts:643-725`, `src/features/agent/execution.ts:46-94` (the bounded responder), `:283-284` (the `PermissionAskedResponder` wiring), `:318` (where it is threaded into the stream call).
 
 ## Related Issues
 

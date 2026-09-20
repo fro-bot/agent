@@ -99,20 +99,25 @@ The file split was kept, because splitting a 9,000-line test file has independen
 
 ### Asserting before the work can happen
 
-```ts
-// passes whether or not the hand-off occurred
-await runMention(message, makeBinding(), deps)
-expect(mockRunOpenCodeCore).toHaveBeenCalledTimes(2)
+The assertion here is a **negative** one — the test claims a hand-off never happened — and that is what makes the missing settle point dangerous:
 
-// observes the settled state — run.quarantine.test.ts:103-122
+```ts
+// passes whether or not the hand-off occurred: the second call has not been
+// dispatched yet, so "called once" is trivially true either way
+await runMention(message, makeBinding(), deps)
+expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+
+// observes the settled state — run.quarantine.test.ts:103-125
 await runMention(message, makeBinding(), deps)
 await new Promise<void>(resolve => {
   setImmediate(resolve)
 })
-expect(mockRunOpenCodeCore).toHaveBeenCalledTimes(2)
+expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
 ```
 
-Reintroducing the bare form makes the second test fail in under a second with a clear assertion error, which is how it was verified to be load-bearing rather than ceremony.
+Removing the flush and inducing a real regression makes this fail in under a second with a clear assertion error, which is how it was verified to be load-bearing rather than ceremony.
+
+**The direction matters.** A *positive* assertion placed too early (`toHaveBeenCalledTimes(2)` before the second call can occur) fails loudly — annoying, but visible. A *negative* assertion placed too early passes silently, and goes on passing after the behaviour it forbids has regressed. Only the second is a vacuous test. When auditing for this, look at assertions claiming something did **not** happen.
 
 ### The diagnosis
 
