@@ -100,6 +100,27 @@ describe('termination barrier — quarantine (Unit 8)', () => {
     // #when
     await runMention(message, makeBinding(), deps)
 
+    // LOAD-BEARING FLUSH — do not delete. A correctly-quarantined run never even calls
+    // queue.takeNext (the outer finally's quarantine gate is synchronous and skips hand-off
+    // entirely before runMention resolves), so there is nothing to settle in the passing
+    // case. But the hand-off dispatch this test guards against (`void
+    // executeWorkOnHeldSlot(nextTask)` in run.ts's outer finally) is fire-and-forget from
+    // runMention's perspective: if quarantine ever regresses and the gate is skipped, that
+    // promise chain (ensureClone → readyz → acquireLock → ACK/EXECUTING transitions →
+    // runOpenCodeCore) is still queued on the microtask queue the instant runMention
+    // resolves — nowhere near far enough along to have called runOpenCodeCore a second
+    // time yet. A bare assertion right after `await runMention(...)` would therefore pass
+    // whether or not the hand-off actually happened, which is exactly the defect this test
+    // exists to catch. Flushing across a macrotask boundary (setImmediate) drains the
+    // microtask queue fully first, so the assertions below observe the settled state
+    // instead of an artificially-early snapshot. The sibling test in 'bounded quarantine
+    // hold' below sidesteps this by using fake timers + advanceTimersByTimeAsync, which
+    // pumps microtasks as a side effect — this test uses real timers, so it needs an
+    // explicit flush instead.
+    await new Promise<void>(resolve => {
+      setImmediate(resolve)
+    })
+
     // #then — runOpenCodeCore was called exactly once: the queued task was never started.
     expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
     const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
