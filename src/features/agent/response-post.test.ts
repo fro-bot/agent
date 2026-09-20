@@ -1773,7 +1773,7 @@ describe('runResponsePost review delivery receipt threading', () => {
     const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
     tempFiles.push(filePath)
     const octokit = makeOctokit()
-    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'reservation-etag'}))
     const recordDelivered = vi.fn(async () => undefined)
     const release = vi.fn(async () => undefined)
 

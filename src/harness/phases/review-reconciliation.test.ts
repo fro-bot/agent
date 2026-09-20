@@ -872,7 +872,7 @@ describe('runReviewReconciliation receipt', () => {
   it('reserves with the identity built from owner/repo/prNumber/runId/runAttempt before submitting the formal APPROVE', async () => {
     // #given a qualifying fixture and injected receipt operations that succeed
     const octokit = makeQualifyingOctokit()
-    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'reservation-etag'}))
     const recordDelivered = vi.fn(async () => undefined)
     const release = vi.fn(async () => undefined)
     const params = makeParams({

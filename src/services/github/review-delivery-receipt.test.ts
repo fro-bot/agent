@@ -68,7 +68,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     const outcome = await ops.reserve(IDENTITY, 1)
 
     // #then it succeeds
-    expect(outcome.kind).toBe('reserved')
+    expect(outcome.kind).toBe('reserved-configured')
   })
 
   it('attempt 1 reserves and delivers; attempt 2 (rerun, same runId) performs zero POSTs -- reserve is blocked', async () => {
@@ -76,7 +76,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     const {adapter} = createInMemoryAdapter()
     const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
     const first = await ops.reserve(IDENTITY, 1)
-    if (first.kind !== 'reserved') throw new Error('expected reserved')
+    if (first.kind !== 'reserved-configured') throw new Error('expected reserved-configured')
     await ops.recordDelivered(IDENTITY, first.etag, 1, 999)
 
     // #when a rerun (same runId, incremented GITHUB_RUN_ATTEMPT) reserves again
@@ -186,7 +186,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     // #then it succeeds unprotected -- refusing to submit here would turn every
     // default-configured consumer's review delivery into an outage, which is worse than the
     // pre-existing rerun-duplication risk this accepts
-    expect(outcome.kind).toBe('reserved')
+    expect(outcome.kind).toBe('reserved-unconfigured')
     expect(logger.warning).toHaveBeenCalledWith(
       expect.stringContaining('without at-most-once'),
       expect.objectContaining({identity: IDENTITY, attempt: 1}),
@@ -197,7 +197,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     // #given an unconfigured store, and a first attempt that already "reserved" (i.e. submitted unprotected)
     const ops = createReviewDeliveryReceiptOperations(createStoreConfig({enabled: false}), logger)
     const first = await ops.reserve(IDENTITY, 1)
-    expect(first.kind).toBe('reserved')
+    expect(first.kind).toBe('reserved-unconfigured')
 
     // #when a rerun (same runId, incremented attempt) reserves again
     const second = await ops.reserve(IDENTITY, 2)
@@ -205,7 +205,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     // #then it ALSO succeeds unprotected -- with no durable store there is no record of the
     // first attempt to block against, so a rerun can duplicate the review. This is the
     // accepted status-quo risk, documented here rather than silently assumed
-    expect(second.kind).toBe('reserved')
+    expect(second.kind).toBe('reserved-unconfigured')
   })
 
   it('complement: a configured store still fails closed on read failure -- unconfigured and failing are not the same case', async () => {
@@ -244,7 +244,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     const {adapter} = createInMemoryAdapter()
     const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
     const reservation = await ops.reserve(IDENTITY, 1)
-    if (reservation.kind !== 'reserved') throw new Error('expected reserved')
+    if (reservation.kind !== 'reserved-configured') throw new Error('expected reserved-configured')
 
     // #when recordDelivered is called with a stale etag
     await expect(ops.recordDelivered(IDENTITY, 'stale-etag', 1, 999)).resolves.toBeUndefined()
@@ -353,7 +353,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     const adapterWithDelete: ObjectStoreAdapter = {...adapter, conditionalDelete}
     const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapterWithDelete)
     const reservation = await ops.reserve(IDENTITY, 1)
-    if (reservation.kind !== 'reserved') throw new Error('expected reserved')
+    if (reservation.kind !== 'reserved-configured') throw new Error('expected reserved-configured')
 
     // #when release is called with the reservation's own etag
     await ops.release(IDENTITY, reservation.etag)
@@ -362,7 +362,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     // is not a delivery, so it must not permanently suppress a later legitimate review
     expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith(expect.any(String), {ifMatch: reservation.etag})
     const retry = await ops.reserve(IDENTITY, 2)
-    expect(retry.kind).toBe('reserved')
+    expect(retry.kind).toBe('reserved-configured')
   })
 
   it('release is best-effort: when the adapter lacks conditionalDelete, it never throws and the reservation remains', async () => {
@@ -370,7 +370,7 @@ describe('createReviewDeliveryReceiptOperations', () => {
     const {adapter} = createInMemoryAdapter()
     const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
     const reservation = await ops.reserve(IDENTITY, 1)
-    if (reservation.kind !== 'reserved') throw new Error('expected reserved')
+    if (reservation.kind !== 'reserved-configured') throw new Error('expected reserved-configured')
 
     // #when release is called anyway
     await expect(ops.release(IDENTITY, reservation.etag)).resolves.toBeUndefined()
@@ -386,13 +386,13 @@ describe('createReviewDeliveryReceiptOperations', () => {
     const {adapter} = createInMemoryAdapter()
     const ops = createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter)
     const first = await ops.reserve(IDENTITY, 1)
-    if (first.kind !== 'reserved') throw new Error('expected reserved')
+    if (first.kind !== 'reserved-configured') throw new Error('expected reserved-configured')
     await ops.recordDelivered(IDENTITY, first.etag, 1, 999)
 
     // #when a genuinely NEW workflow run (different GITHUB_RUN_ID) targets the same PR
     const outcome = await ops.reserve({...IDENTITY, runId: 'run-2'}, 1)
 
     // #then it is a distinct identity/key and reserves cleanly
-    expect(outcome.kind).toBe('reserved')
+    expect(outcome.kind).toBe('reserved-configured')
   })
 })

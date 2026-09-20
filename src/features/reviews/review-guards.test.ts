@@ -231,7 +231,8 @@ function makeReservationOps(overrides?: {
   readonly release?: ReviewDeliveryReceiptOperations['release']
 }): ReviewDeliveryReceiptOperations {
   return {
-    reserve: overrides?.reserve ?? vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'})),
+    reserve:
+      overrides?.reserve ?? vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'reservation-etag'})),
     recordDelivered: overrides?.recordDelivered ?? vi.fn(async () => undefined),
     release: overrides?.release ?? vi.fn(async () => undefined),
   }
@@ -248,7 +249,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
   it('reserves after the head check and before the POST, then records delivery with the returned review id', async () => {
     // #given a reservation that succeeds
     const octokit = makeOctokit() as unknown as Octokit
-    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'reservation-etag'}))
     const recordDelivered = vi.fn(async () => undefined)
     const release = vi.fn(async () => undefined)
     const ops = makeReservationOps({reserve, recordDelivered, release})
@@ -291,7 +292,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         },
       }),
     }) as unknown as Octokit
-    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'reservation-etag'}))
     const ops = makeReservationOps({reserve})
 
     // #when submitting with the stale head SHA
@@ -392,7 +393,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
       }
     })
     const octokit = octokitBase as unknown as Octokit
-    const reserve = vi.fn(async () => ({kind: 'reserved' as const, etag: 'reservation-etag'}))
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'reservation-etag'}))
     const recordDelivered = vi.fn(async () => undefined)
     const release = vi.fn(async () => undefined)
     const ops = makeReservationOps({reserve, recordDelivered, release})
@@ -431,6 +432,55 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
   // consumer and every fork PR fail closed with nothing posted. These next three tests build
   // the real operations from real `ObjectStoreConfig`s, not a stub of the caller's own
   // assumption.
+
+  it('a CONFIGURED reservation whose etag happens to equal the unconfigured sentinel literal still gets its post-reservation head re-check, and still refuses to submit against a moved head', async () => {
+    // #given a CONFIGURED store's reservation that happens to carry the same etag string the
+    // unconfigured path used to use as a sentinel -- provenance, not etag spelling, must
+    // decide whether the post-reservation re-check runs. The head reads as unchanged on the
+    // pre-reservation check but has moved by the time the post-reservation re-check runs.
+    const octokitBase = makeOctokit()
+    let callCount = 0
+    octokitBase.rest.pulls.get.mockImplementation(async () => {
+      callCount += 1
+      const sha = callCount <= 1 ? 'head-sha-abc' : 'moved-during-reservation-sha'
+      return {
+        data: {
+          head: {sha, repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      }
+    })
+    const octokit = octokitBase as unknown as Octokit
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'unconfigured'}))
+    const recordDelivered = vi.fn(async () => undefined)
+    const release = vi.fn(async () => undefined)
+    const ops = makeReservationOps({reserve, recordDelivered, release})
+
+    // #when submitting with a receipt injected
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'APPROVE',
+        body: 'lgtm',
+        currentHeadSha: 'head-sha-abc',
+        receipt: {ops, identity: IDENTITY, attempt: 1},
+      },
+      logger,
+    )
+
+    // #then the re-check runs because the reservation is CONFIGURED (provenance), not because
+    // of what its etag spells -- the move is caught, submission is refused, and the
+    // reservation is released
+    expect(outcome).toEqual({submitted: false, reason: 'head-moved-before-submit'})
+    expect(reserve).toHaveBeenCalledExactlyOnceWith(IDENTITY, 1)
+    expect(release).toHaveBeenCalledExactlyOnceWith(IDENTITY, 'unconfigured')
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(recordDelivered).not.toHaveBeenCalled()
+  })
 
   it('end to end: real operations built from a disabled store (default s3-backup: false) submit the review, unprotected but not blocked', async () => {
     // #given the REAL operations, built from an unconfigured store config -- not a stub

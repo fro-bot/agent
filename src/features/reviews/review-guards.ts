@@ -15,7 +15,6 @@ import type {
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ReviewEvent, ReviewResult} from './types.js'
-import {UNCONFIGURED_RESERVATION_ETAG} from '../../services/github/review-delivery-receipt.js'
 import {submitReview} from './reviewer.js'
 
 export interface ForkOrSelfGuardParams {
@@ -195,19 +194,21 @@ export async function submitReviewWithHeadGuard(
       })
       return {submitted: false, reason: 'receipt-blocked', receiptReason: reservation.reason}
     }
-    reservationEtag = reservation.etag
 
     // Close the race window the reservation call itself opens: `reserve` above was an
     // awaited round trip, during which the head could have moved. Re-check now, with the
     // reservation already held.
     //
-    // Skipped when `reservationEtag` is the UNCONFIGURED_RESERVATION_ETAG sentinel: an
-    // unconfigured store's `reserve` (review-delivery-receipt.ts) returns synchronously
-    // without any await on a remote call, so no reservation round trip happened and there is
-    // no extra race window here to close -- this re-check would be a wasted authenticated API
-    // call on every review submitted under the default (`s3-backup: 'false'`) configuration.
-    // The pre-reservation head check above still applies unconditionally.
-    if (reservationEtag !== UNCONFIGURED_RESERVATION_ETAG) {
+    // Gated on the reservation's own PROVENANCE (`reserved-configured` vs
+    // `reserved-unconfigured`), never on what its etag spells: an unconfigured store's
+    // `reserve` (review-delivery-receipt.ts) returns synchronously without any await on a
+    // remote call, so no reservation round trip happened and there is no extra race window
+    // here to close -- this re-check would be a wasted authenticated API call on every review
+    // submitted under the default (`s3-backup: 'false'`) configuration. The pre-reservation
+    // head check above still applies unconditionally on every path.
+    if (reservation.kind === 'reserved-configured') {
+      reservationEtag = reservation.etag
+
       const postReservationPrResponse = await octokit.rest.pulls.get({owner, repo, pull_number: prNumber})
       const postReservationHeadSha: string = postReservationPrResponse.data.head.sha
       if (postReservationHeadSha !== currentHeadSha) {

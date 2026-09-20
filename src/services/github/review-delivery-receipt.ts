@@ -68,14 +68,6 @@ import {buildObjectStoreKey, createS3Adapter} from '@fro-bot/runtime'
  */
 const RECEIPT_OPERATION_SEGMENT = 'review-delivery-receipt'
 
-/**
- * Sentinel etag returned by an UNCONFIGURED store's `reserve` (case 1 below). Never a real
- * store etag -- callers (`submitReviewWithHeadGuard`) use it to detect that `reserve`
- * returned synchronously without any reservation round-trip actually happening, so there is
- * no post-reservation race window to re-check the head against.
- */
-export const UNCONFIGURED_RESERVATION_ETAG = 'unconfigured'
-
 export interface ReviewDeliveryReceiptIdentity {
   /** Trusted "owner/repo" -- never derived from an untrusted event payload field. */
   readonly repo: string
@@ -115,8 +107,16 @@ type ReviewDeliveryReceiptRecord = ReviewDeliveryReceiptReservedRecord | ReviewD
 export type ReviewDeliveryReservationBlockedReason =
   'already-reserved' | 'conflict' | 'store-unavailable' | 'read-failed'
 
+/**
+ * Provenance is part of the type, not inferred from the etag's contents: an UNCONFIGURED
+ * store's `reserve` does no I/O and has no etag to carry, so `reserved-unconfigured` carries
+ * none -- there is no field a caller could misread as "safe to skip the re-check" and no
+ * value that could coincidentally collide with a real store etag (see `submitReviewWithHeadGuard`
+ * in `review-guards.ts`, which branches on this discriminant instead of comparing strings).
+ */
 export type ReviewDeliveryReservationOutcome =
-  | {readonly kind: 'reserved'; readonly etag: string}
+  | {readonly kind: 'reserved-configured'; readonly etag: string}
+  | {readonly kind: 'reserved-unconfigured'}
   | {readonly kind: 'blocked'; readonly reason: ReviewDeliveryReservationBlockedReason; readonly detail: string}
 
 export interface ReviewDeliveryReceiptOperations {
@@ -261,7 +261,7 @@ export function createReviewDeliveryReceiptOperations(
             'protection; a rerun of this invocation could duplicate this review',
           {identity, attempt},
         )
-        return {kind: 'reserved', etag: UNCONFIGURED_RESERVATION_ETAG}
+        return {kind: 'reserved-unconfigured'}
       },
       recordDelivered: async () => {
         logger.debug('Review delivery receipt: recordDelivered skipped, object store not configured')
@@ -339,7 +339,7 @@ export function createReviewDeliveryReceiptOperations(
       }
 
       logger.info('Review delivery receipt: reservation acquired', {key: key.data, attempt})
-      return {kind: 'reserved', etag: put.data.etag}
+      return {kind: 'reserved-configured', etag: put.data.etag}
     },
 
     async recordDelivered(identity, reservationEtag, attempt, reviewId) {
