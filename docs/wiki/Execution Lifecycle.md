@@ -1,11 +1,18 @@
 ---
 type: architecture
-last-updated: "2026-09-07"
-updated-by: "schedule-d7190410-34062354146"
+last-updated: "2026-09-20"
+updated-by: "schedule-d7190410-35540552880"
 sources:
   - src/harness/config/state-keys.ts
+  - src/harness/config/outputs.ts
+  - src/harness/outcome.ts
   - src/shared/cache-save-result.ts
   - src/features/observability/job-summary.ts
+  - src/features/agent/attempt-outcome.ts
+  - src/features/agent/execution.ts
+  - packages/runtime/src/agent/ownership-ledger.ts
+  - packages/runtime/src/agent/ledger-reconcile.ts
+  - action.yaml
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
   - src/harness/phases/routing.ts
@@ -44,7 +51,7 @@ sources:
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
   - RFCs/RFC-017-Post-Action-Cache-Hook.md
   - RFCs/RFC-019-S3-Storage-Backend.md
-summary: "Phase-by-phase walkthrough of a single action run, including review reconciliation and brokered push"
+summary: "Phase-by-phase walkthrough of a single action run, from bootstrap through drain, review reconciliation, brokered push, and the final invocation outcome"
 ---
 
 # Execution Lifecycle
@@ -64,9 +71,10 @@ main.ts
        ├─  6. Cache Restore
        ├─  7. Session Prep
        ├─  8. Execute
-       ├─  9. Review Reconciliation
-       ├─ 10. Finalize
-       └─ 11. Cleanup (always, via finally)
+       ├─  9. Drain
+       ├─ 10. Review Reconciliation
+       ├─ 11. Finalize
+       └─ 12. Cleanup (always, via finally)
 
 post.ts
   └─ runPost()
@@ -108,7 +116,7 @@ The lock result is a discriminated union with four outcomes:
 
 The shared coordination layer (`packages/runtime/src/coordination/types.ts`) also names a run's lifecycle phases as a closed union — `PENDING`, `ACKNOWLEDGED`, `EXECUTING`, and the three **terminal phases** `COMPLETED`, `FAILED`, and `CANCELLED` (the last modeled as a `TerminalPhase` type so that gateway cancellation and the operator cancel route agree on one closed set instead of hand-writing the same literals). The Action harness itself does not expose these phases directly, but they are the vocabulary the [[Operator Web Control Surface]] and Discord gateway use for the runs that share this same per-repo lock.
 
-The lock has a 15-minute TTL. `runAcquireLock()` now pairs an `acquired` outcome with a `LeaseController` (`src/harness/phases/acquire-lock.ts:239-242`) that starts a renewal timer and ticks on an interval for as long as the lock is held (`:150-166`), rather than relying on the TTL alone to outlive the run — the original v1 no-heartbeat design sized the TTL for the median ~2-minute Action run, and drain (see §8 below and the background-subagent-ownership plan) can push a run's protected interval well past that (`:201-205`). Each successful renewal captures the lock record's new etag, and cleanup releases with that renewed etag rather than the acquisition etag — a stale etag fails the conditional delete and leaks the lock for the next surface — while `stop()` clears the interval and waits up to a five-second grace period for any in-flight tick to settle (`:50-73`, `:159-165`) — well under the renewal call's own ten-second timeout, so `stop()` can return with a renewal still unresolved and `currentEtag()` stale. Release then reads that stale etag. Whether the conditional delete succeeds depends on whether the unresolved renewal goes on to succeed and advance the record's etag before release runs: if it does, release's precondition fails against the newer etag, which is safe — it declines to delete a lock this run may no longer hold — and leaves the lock held until its TTL expires rather than freed for the next surface. If the renewal instead fails or times out without changing the record, the retained etag can still match, and release can succeed normally. A failed renewal fails persistence closed: the run declines to checkpoint and save session state rather than write over what may be a lost lease. It does not fail the invocation itself — the Action still finalizes, publishes, and reports its result on a renewal failure; only the cache save is what's withheld.
+The lock has a 15-minute TTL. `runAcquireLock()` now pairs an `acquired` outcome with a `LeaseController` (`src/harness/phases/acquire-lock.ts:239-242`) that starts a renewal timer and ticks on an interval for as long as the lock is held (`:150-166`), rather than relying on the TTL alone to outlive the run — the original v1 no-heartbeat design sized the TTL for the median ~2-minute Action run, and the drain phase (§9 below, and [[Background Subagents and Ownership]]) can push a run's protected interval well past that (`:201-205`). Each successful renewal captures the lock record's new etag, and cleanup releases with that renewed etag rather than the acquisition etag — a stale etag fails the conditional delete and leaks the lock for the next surface — while `stop()` clears the interval and waits up to a five-second grace period for any in-flight tick to settle (`:50-73`, `:159-165`) — well under the renewal call's own ten-second timeout, so `stop()` can return with a renewal still unresolved and `currentEtag()` stale. Release then reads that stale etag. Whether the conditional delete succeeds depends on whether the unresolved renewal goes on to succeed and advance the record's etag before release runs: if it does, release's precondition fails against the newer etag, which is safe — it declines to delete a lock this run may no longer hold — and leaves the lock held until its TTL expires rather than freed for the next surface. If the renewal instead fails or times out without changing the record, the retained etag can still match, and release can succeed normally. A failed renewal fails persistence closed: the run declines to checkpoint and save session state rather than write over what may be a lost lease. It does not fail the invocation itself — the Action still finalizes, publishes, and reports its result on a renewal failure; only the cache save is what's withheld.
 
 ## 5. Acknowledge
 
@@ -130,7 +138,9 @@ The core phase. Calls `executeOpenCode()` which creates (or continues) an SDK se
 
 If a turn fails with a retryable error, the system retries up to three times with a continuation prompt. A configurable timeout (default: 30 minutes) bounds execution if the agent runs too long — but that bound is an internal execution deadline, not the whole GitHub Actions job timeout. The distinction matters: the deadline aborts only the agent's own work so that Finalize and Cleanup still get a bounded budget to preserve outcomes and persist state (`action.yaml` documents this boundary, and the job's own `timeout-minutes` remains the outer backstop). A run that hits the deadline is reported as a genuine terminal failure rather than a silent hang, and a pre-deadline terminal result is kept distinct from the bounded post-result teardown that follows it, so cleanup can never overwrite the real outcome.
 
-A permission ask raised mid-run no longer blocks until that deadline. OpenCode can emit an interactive permission request during a turn — a shell command, an out-of-tree file write — and in CI there is no operator to answer it, so an unanswered ask would previously pin the run open until the execution deadline elapsed. The streaming consumer (`src/features/agent/streaming.ts`) now **denies and logs** any such ask as it arrives, and the two native ask defaults that are actually reachable in CI are denied at config time (see [[Setup and Configuration]]). A permission reply is issued only when the SDK's v1 route can act on it — the route no-ops without a `query.directory`, so replies that could never take effect are not attempted. The result is that a run which trips a permission gate fails or continues promptly on its own terms rather than stalling to the deadline.
+A permission ask raised mid-run no longer blocks until that deadline. OpenCode can emit an interactive permission request during a turn — a shell command, an out-of-tree file write — and in CI there is no operator to answer it, so an unanswered ask would previously pin the run open until the execution deadline elapsed. The streaming consumer (`src/features/agent/streaming.ts`) **denies and logs** any such ask as it arrives, and the two native ask defaults that are actually reachable in CI are denied at config time (see [[Setup and Configuration]]).
+
+Two properties of that branch are load-bearing, and both were learned the hard way. First, the ask is answered **regardless of which session raised it** — the branch checks only that the event names a session at all, and targets the reply at that session rather than the root. Routing asks through the same ownership filter used for activity events meant a background subagent's ask was silently skipped, so the child blocked forever, the root blocked on the child, and the run died at its CI job cap having delivered nothing observable. Second, the reply is **not awaited inside the stream loop**: awaiting it reproduced the same stall one layer up, where a single slow reply holds every subsequent event behind it. A failed reply is logged and execution continues, because throwing would abort the stream for every other in-flight ask and event. This is safe on the Action specifically because the harness starts its own loopback OpenCode server per run and wires an unconditional-reject responder to it, so every well-formed ask on that subscription belongs to this run's own process tree. The gateway deliberately keeps its ownership check on the same branch — it has a real human-answerable approval path, where answering everything would leak one run's approval into another run's thread. See [[Background Subagents and Ownership]].
 
 Each attempt now resolves to a **classified outcome** rather than a bare "retry or not" boolean (`src/features/agent/retry.ts`). The outcome distinguishes a submission that never reached the server (`submit_failed`) from a turn that actually ran and then failed, and among failed turns it separates retryable from terminal. The retry decision is _derived_ from that outcome — only a retryable turn failure retries — which keeps the classification, not a side-effect flag, as the authoritative signal. One subtlety this guards against: the event stream is subscribed _before_ the prompt is submitted, so if submission returns a transport error while the server has already accepted the prompt and begun working, the attempt is reclassified from `submit_failed` to a turn failure rather than resending the original prompt into a session that is already running it.
 
@@ -142,7 +152,17 @@ The continuation prompt sent on a retry is no longer a fixed string that asserte
 
 When a terminal failure reaches the user, its diagnostics are handled carefully: provider-controlled error text is kept out of the trusted failure summary the action delivers, so a hostile or noisy provider message cannot smuggle content into the run's authoritative outcome. The structured session error is preserved through teardown rather than being swallowed by the cleanup path, which is what lets a failed run deliver an accurate, trustworthy failure notice instead of a generic one.
 
-## 9. Review Reconciliation
+## 9. Drain
+
+Execute can finish while work it started is still running. OpenCode's background subagent dispatch returns immediately and leaves the child running as a detached fiber, and the parent session reports idle without consulting it — so the root's turn ending is no longer the same event as the run's work ending. The drain phase (`runDrain`, `src/harness/phases/execute.ts`) exists to reconcile those two.
+
+Its position in the sequence is the design. Drain sits after Execute returns and strictly before Review Reconciliation, Finalize, and Cleanup, because everything below it either publishes a result, persists state, or releases the coordination lock — and each of those is wrong to do on top of a live writer. Folding drain into Cleanup would have been simpler and would have published a response describing work still changing underneath it.
+
+Drain reconciles the run's ownership ledger once unconditionally, even when nothing appears outstanding — that single pass is the only way to learn that a tracked entry's settlement event was dropped by the event stream. If the ledger is drained, the phase returns immediately. Otherwise it polls until the ledger drains or its deadline expires, at which point every entry not confirmed settled is individually aborted and then re-checked, and anything still unconfirmed is recorded as unknown rather than assumed finished. The drain budget is carved out of the same wall-clock budget as execution — the total timeout minus a teardown reserve minus what execution already spent — so one deadline covers both rather than letting drain extend a run indefinitely.
+
+When there is no ledger, or when execution never ran, the phase is a complete no-op. [[Background Subagents and Ownership]] covers the ledger's states, the reconciliation rules, and the parallel design on the gateway.
+
+## 10. Review Reconciliation
 
 Runs after Execute, before Finalize, only for `pull_request` review triggers on the model-`gh` posting path (`workflow_dispatch`/`schedule`). Calls `decideReconciliation()` in `src/features/reviews/review-reconciliation.ts` to inspect the agent's posted review body for a verdict signal. If the verdict warrants a formal GitHub APPROVE, the phase submits one automatically via the GitHub review API through the shared review guards (fork/self/head-SHA/TOCTOU). This removes the manual step of having the agent issue the `gh pr review --approve` command itself on approve-verdicts.
 
@@ -150,7 +170,7 @@ For comment/review flows that post through the file convention (see Finalize), t
 
 The phase is **fail-safe**: any error logs a warning and no-ops. It never throws and never fails the run. It also checks the bot login before acting — an empty or null `botLogin` triggers an immediate no-op.
 
-## 10. Finalize
+## 11. Finalize
 
 Writes a synthetic summary message into the session history so future runs can discover what this run accomplished. Prunes old sessions based on dual-condition retention (age OR count). Collects metrics and sets action outputs (session ID, cache status, duration).
 
@@ -166,11 +186,21 @@ The step is a fail-closed state machine where every stage re-derives trust from 
 
 The whole step runs under a 120-second wall-clock ceiling enforced by a `Promise.race`. The `AbortSignal` cancels the Octokit calls promptly, but the reconstruction `git` subprocess cannot observe an abort signal, so the race is the hard bound for a stalled subprocess; the abandoned promise never leaks because the process exits once `run()` resolves. Delivery is deliberately **non-atomic**: the commit lands before the response comment is posted, and a timeout firing after `updateRef` already succeeded reports failure for a commit that may exist. This self-heals — a re-run reconstructs the now-updated branch to _nothing-to-deliver_ rather than double-pushing. On success, Finalize appends a "Brokered push delivered" footer (branch, changed paths, commit SHA) to the delivered comment; on failure it fails the run with a generic error and posts no push.
 
-## 11. Cleanup (Always)
+## 12. Cleanup (Always)
 
 Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server. Shutdown does not itself checkpoint SQLite — it sends the child's kill signal and then waits, bounded and best-effort, for the child to stop answering, so the checkpoint that follows is not racing a writer that is still alive but idle. Merging the write-ahead log into the main database file is `checkpointDatabase`'s job, called inside `saveCache`. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]), and `saveCache` writes session state to S3 before the Actions cache. Saves the cache, then optionally uploads a prompt log artifact for observability.
 
+The save is not unconditional. Cleanup first applies a **persistence safety gate** that can decline it outright, checking three independently sufficient reasons in a fixed order and reporting only the first match: unresolved background-subagent ownership, an OpenCode server shutdown that never confirmed the writer had quiesced, or a coordination lease whose continuity could not be verified. Declining yields the `ownership-declined` outcome rather than a failed save — the difference matters downstream, because a declined save must not be retried by a process holding less evidence than the one that declined it. See [[Background Subagents and Ownership]] for the gate and [[Session Persistence]] for the outcome contract.
+
 The cleanup phase has its own `finally` block for lock release: if a coordination lock was acquired in phase 4, it is released after all S3 sync and cache save operations complete. This ordering ensures the next surface sees a coherent state. Lock release is always attempted, even if earlier cleanup steps failed.
+
+## Invocation Outcome
+
+After Cleanup returns, `run()` assesses the invocation once (`src/harness/outcome.ts`) and publishes the result as the `invocation-outcome` action output: `succeeded`, `incomplete`, `failed`, or `skipped`. The assessment reduces delivery success together with four verification facts — whether the event stream was observed without a gap, whether background ownership resolved, whether the server confirmed quiescence, and whether lease continuity held.
+
+`incomplete` is the outcome that did not previously exist, and it names a case the harness could not previously express: a useful result may well exist, but this invocation cannot certify that it finished. It forces a non-zero exit code rather than introducing a third numeric code — the structured output is what distinguishes "the harness contract was not met" from "the agent was wrong" — and it withholds the reversible certificates, writing no dedup marker and posting no success reaction, so a re-run is not dedup-skipped into a silent success. `skipped` bypasses the assessment entirely.
+
+The irreversible consumers are gated more narrowly than the outcome itself. Brokered push and the formal review-approve downgrade key off a *known execution veto* — an observation gap or unresolved ownership — rather than the full assessment, on the reasoning that a known defect can veto an endorsement without the absence of that defect certifying the invocation. It is a veto, never a certificate.
 
 ## Post-Action Hook
 

@@ -1,8 +1,12 @@
 ---
 type: subsystem
-last-updated: "2026-09-07"
-updated-by: "schedule-d7190410-34062354146"
+last-updated: "2026-09-20"
+updated-by: "schedule-d7190410-35540552880"
 sources:
+  - src/harness/config/outputs.ts
+  - packages/runtime/src/agent/attachment-dir.ts
+  - deploy/scripts/merge-config.mjs
+  - deploy/workspace.Dockerfile
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
   - src/services/setup/systematic-config.ts
@@ -161,6 +165,12 @@ The CI config built by `buildCIConfig()` ensures OpenCode operates correctly in 
 - **Auto-update disabled** — Prevents OpenCode from trying to update itself mid-run.
 - **Systematic plugin injected** — Ensures `@fro.bot/systematic@{version}` is registered as an OpenCode plugin. The version is pinned to prevent drift.
 - **Permission defaults hardened** — The config bakes in deny rules so the run never stalls on an interactive permission prompt it cannot answer. The `doom_loop` native ask defaults to `deny`, secret-shaped file reads (`*.env`, `*.env.*`) are denied while `*.env.example` stays readable, and edits are scoped to the workspace and any designated external directory. These defaults pair with the runtime's ask-answering behavior described in [[Execution Lifecycle]]: an ask that still reaches the agent is denied and logged rather than left to block until the execution deadline.
+- **Subagent depth pinned to one** — Set unconditionally in every mode, overriding any operator value with a logged warning. This is the project's one deliberate exception to "an explicit operator value wins," and the reason is structural rather than stylistic: upstream cancellation walks only *running* jobs, so at depth greater than one a completed child linking the root to a still-running grandchild is never walked, and the grandchild can outlive a cancellation meant to stop it. Depth one makes that path unreachable instead of requiring the harness to build a session-tree traversal of its own. The workspace container applies the same pin through its own config merge (`deploy/scripts/merge-config.mjs`), so both surfaces agree.
+- **Attachment directory granted** — A permission entry admits reads and writes under this run attempt's attachment directory. It is applied at the *top-level global* permission key, not only on the `build` agent, because a dispatched subagent inherits its parent session's resolved rules and would otherwise be unable to reach materialized files; the `build` agent's own block re-asserts the same pattern, since its catch-all deny would shadow the global grant under upstream's flattened evaluation. The grant names the specific run-attempt directory rather than the shared parent segment — a wildcard compiles to a pattern that matches path separators, so a segment-wide grant would let a sibling run on a persistent or self-hosted runner read this run's attachments and plant symlinks there.
+
+Two experimental OpenCode behaviors are set through the environment at server spawn (`packages/runtime/src/agent/server.ts`) rather than through config, because there is no config-file equivalent for either. Background subagent dispatch is enabled — the single switch that makes detached `task` dispatch reachable at all, and the reason the drain phase exists (see [[Background Subagents and Ownership]]). The file watcher is disabled, because nothing in this project consumes file-change events; both surfaces read only message and tool lifecycle events, so the watcher is pure overhead. The accepted tradeoff is that OpenCode caches the VCS branch and refreshes that cache from watcher events, so the cached branch can go stale after a checkout — more visible on the long-lived workspace container than in short-lived CI.
+
+Both flags follow the same defaulting convention: set the default only when the variable is **unset or empty**, so an operator who set it explicitly — including to `false` — always wins. Treating empty as unset is not pedantry here. GitHub Actions materializes an unset `env:` input as an empty string rather than an absent key, and OpenCode's boolean parsing does not read an empty string as true, so a presence-only check would silently leave the old behavior in place. The workspace image bakes the same two flags as container `ENV` values, overridable per deployment, and a CI smoke test asserts they survive in the built image — nothing else would catch their removal.
 
 The final config is the result of merging:
 
@@ -233,5 +243,6 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 | --- | --- |
 | `cache-status` | Cache restore status (`hit`, `miss`, `corrupted`) |
 | `cache-save-result` | Cache save outcome (`durable`, `store-only`, `skipped`, `declined-for-safety`, `not-persisted`); set from the main step — the post-action retry reports only to the job summary |
+| `invocation-outcome` | The run's final verified outcome (`succeeded`, `incomplete`, `failed`, `skipped`). `incomplete` means a useful result may exist but this invocation could not certify completion, so no dedup marker was written and no success reaction was posted (see [[Execution Lifecycle]]). Main step only |
 
 See the full outputs table in the repository [README](../../README.md#outputs).

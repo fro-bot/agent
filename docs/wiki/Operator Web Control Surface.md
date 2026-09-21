@@ -1,8 +1,11 @@
 ---
 type: subsystem
-last-updated: "2026-08-30"
-updated-by: "schedule-d7190410-33338713321"
+last-updated: "2026-09-20"
+updated-by: "schedule-d7190410-35540552880"
 sources:
+  - packages/gateway/src/execute/run.ts
+  - packages/gateway/src/execute/run-core.ts
+  - packages/gateway/src/execute/recovery.ts
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/web/operator-route.ts
   - packages/gateway/src/web/operator-route-smoke.ts
@@ -179,6 +182,12 @@ The projection helper (`sse/projection.ts`) enforces redaction structurally: it 
 The run-listing surface uses a deliberately leaner shape, `RunSummary` (`run-summary.ts`), which carries the `owner/repo` resolved from the binding rather than the internal entity reference. Both projections are pure and total: each returns nothing — rather than a partially-redacted record — whenever a repository is denylisted or a run's stored identity contradicts its binding, so callers skip the null and never render leaked or inconsistent data.
 
 When a run fails, both projections may carry a `failureKind` — a coarse, sanitized reason drawn from a small closed vocabulary (`OperatorFailureKind` in `run-status.ts`): the two timeout variants (`inactivity-timeout`, `max-duration-timeout`), `stream-ended`, `workspace-unreachable`, `session-error`, and an `unknown` fallback. The mapping from the engine's richer internal error kinds is an explicit allowlist, so any unrecognized or unmapped internal kind collapses to `unknown` rather than leaking implementation detail. A pre-acknowledgement startup failure surfaces as `workspace-unreachable`. The kind is persisted on the `FAILED` run-state transition and projected onto the operator surface, giving operators a stable, non-sensitive signal about _why_ a run ended without exposing stack traces or internal vocabulary.
+
+The engine's newer `drain-timeout` kind — a run whose deadline expired while it was still waiting for background subagent work to settle — is mapped onto the existing `max-duration-timeout` rather than given a vocabulary entry of its own. That is a judgment about what the operator surface is for: a run's deadline covers execution and drain together, so from an operator's point of view it is the same wall-clock story, and the distinction only matters to someone reading the engine's logs. The internal-to-operator mapping table is exhaustiveness-checked against the internal kind union, so a future kind added without a mapping decision fails the type check rather than silently collapsing to `unknown`.
+
+### Quarantined runs
+
+A gateway run that fails while it may still own live background work is held rather than released. Instead of stopping its heartbeat and handing the channel's concurrency slot to the next queued run, it transitions to `FAILED` with a quarantine flag recorded on its run details, and a bounded hold window elapses before the heartbeat stops and the slot is freed. The lock is deliberately *not* released on that path — lock takeover and force-release both require a stale heartbeat, which is precisely why the hold has to be bounded rather than indefinite. Operators see an ordinary failed run; what they will notice is that the channel does not immediately accept the next run. Run details also carry the run's persisted ownership claim (its root session and not-yet-settled child sessions), which the gateway reads back on restart before deciding whether a stale run's lock is safe to release. See [[Background Subagents and Ownership]].
 
 ## Audit
 

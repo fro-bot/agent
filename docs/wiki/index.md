@@ -1,6 +1,6 @@
 ---
 type: index
-last-updated: "2026-09-07"
+last-updated: "2026-09-20"
 summary: "Navigable entry point for the Fro Bot Agent project wiki"
 ---
 
@@ -17,13 +17,14 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | Page | Type | Summary |
 | --- | --- | --- |
 | [Architecture Overview](Architecture%20Overview.md) | architecture | Monorepo structure, action + harness + gateway + workspace-agent packages, and module map |
-| [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Phase-by-phase walkthrough of a single action run, including review reconciliation and brokered push |
+| [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Phase-by-phase walkthrough of a single action run, from bootstrap through drain, review reconciliation, brokered push, and the final invocation outcome |
 
 ### Subsystems
 
 | Page | Type | Summary |
 | --- | --- | --- |
 | [Session Persistence](Session%20Persistence.md) | subsystem | How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning |
+| [Background Subagents and Ownership](Background%20Subagents%20and%20Ownership.md) | subsystem | How the harness tracks, drains, and settles background subagent work that outlives the turn that dispatched it |
 | [Prompt Architecture](Prompt%20Architecture.md) | subsystem | How the multi-section XML-tagged prompt is assembled and why each section exists |
 | [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Tool installation, configuration assembly, credential management, cache strategy, and oMo opt-in |
 | [Operator Web Control Surface](Operator%20Web%20Control%20Surface.md) | subsystem | Authenticated browser surface that lets operators launch, dispatch, observe, and approve gateway agent runs over HTTP and SSE |
@@ -38,7 +39,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 | Page | Type | Summary |
 | --- | --- | --- |
-| [Troubleshooting](Troubleshooting.md) | guide | Diagnosing common Fro Bot Agent failures — no response, cache persistence, setup and install errors, timeouts, brokered push, and a known gateway test flake |
+| [Troubleshooting](Troubleshooting.md) | guide | Diagnosing common Fro Bot Agent failures — no response, cache persistence, setup and install errors, timeouts, incomplete invocations, brokered push, and a known gateway test flake |
 
 ## About This Wiki
 
