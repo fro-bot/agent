@@ -332,8 +332,102 @@ test('merge output contains no unexpected top-level keys beyond known safe set',
     'theme',
     'keybinds',
     'mcp',
+    'subagent_depth',
   ])
   const outputKeys = Object.keys(result.config)
   const unexpectedKeys = outputKeys.filter(k => !KNOWN_SAFE_KEYS.has(k) && !Object.keys(BASE).includes(k))
   assert.deepEqual(unexpectedKeys, [], `merge introduced unexpected top-level keys: ${unexpectedKeys.join(', ')}`)
+})
+
+// ─── Unit 6: subagent_depth pin (workspace-layer mirror of ci-config.ts R12) ─
+
+test('subagent_depth: no depth anywhere → forced to numeric 1, no warning', () => {
+  const result = mergeConfig(BASE, '', '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.deepEqual(result.warnings, [])
+})
+
+test('subagent_depth: base depth greater than one → forced to 1, warning emitted', () => {
+  const base = {...BASE, subagent_depth: 3}
+  const result = mergeConfig(base, '', '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.equal(result.warnings.length, 1)
+  assert.ok(result.warnings[0].includes('subagent_depth'), `got: ${result.warnings[0]}`)
+})
+
+test('subagent_depth: overlay 0 forced to numeric 1, warning emitted', () => {
+  const overlay = JSON.stringify({subagent_depth: 0})
+  const result = mergeConfig(BASE, overlay, '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.equal(result.warnings.length, 1)
+})
+
+test('subagent_depth: overlay 2 forced to numeric 1, warning emitted', () => {
+  const overlay = JSON.stringify({subagent_depth: 2})
+  const result = mergeConfig(BASE, overlay, '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.equal(result.warnings.length, 1)
+})
+
+test('subagent_depth: overlay "1" (string) forced to numeric 1, warning emitted', () => {
+  const overlay = JSON.stringify({subagent_depth: '1'})
+  const result = mergeConfig(BASE, overlay, '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.strictEqual(result.config.subagent_depth, 1)
+  assert.equal(result.warnings.length, 1)
+})
+
+test('subagent_depth: overlay null forced to numeric 1, warning emitted', () => {
+  const overlay = JSON.stringify({subagent_depth: null})
+  const result = mergeConfig(BASE, overlay, '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.equal(result.warnings.length, 1)
+})
+
+test('subagent_depth: overlay numeric 1 → no warning', () => {
+  const overlay = JSON.stringify({subagent_depth: 1})
+  const result = mergeConfig(BASE, overlay, '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.deepEqual(result.warnings, [])
+})
+
+test('subagent_depth: hostile overlay changes an unrelated field but not depth', () => {
+  // Load-bearing complement: proves the pin enforces depth specifically,
+  // rather than the merger rejecting overlays wholesale.
+  const overlay = JSON.stringify({subagent_depth: 99, theme: 'hostile-theme'})
+  const result = mergeConfig(BASE, overlay, '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1, 'subagent_depth must stay pinned to 1')
+  assert.equal(result.config.theme, 'hostile-theme', 'unrelated overlay field must still merge')
+  assert.equal(result.warnings.length, 1)
+})
+
+test('subagent_depth: permission config preserved, no injected pre-grants', () => {
+  const overlay = JSON.stringify({
+    subagent_depth: 5,
+    permissions: [{permission: 'read', pattern: '/workspace/**', action: 'allow'}],
+  })
+  const result = mergeConfig(BASE, overlay, '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.deepEqual(result.config.permissions, [{permission: 'read', pattern: '/workspace/**', action: 'allow'}])
+})
+
+test('subagent_depth: neither base nor overlay object is mutated', () => {
+  const base = {...BASE, subagent_depth: 4}
+  const baseSnapshot = JSON.parse(JSON.stringify(base))
+  const overlayObj = {subagent_depth: 7}
+  const overlaySnapshot = JSON.parse(JSON.stringify(overlayObj))
+  const result = mergeConfig(base, JSON.stringify(overlayObj), '')
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.subagent_depth, 1)
+  assert.deepEqual(base, baseSnapshot, 'base object must not be mutated')
+  assert.deepEqual(overlayObj, overlaySnapshot, 'overlay object must not be mutated')
 })

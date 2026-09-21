@@ -281,6 +281,36 @@ export async function bootstrapOpenCodeServer(
     ) {
       process.env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER = 'true'
     }
+    // Same unset-or-empty-string default as the watcher flag above, and for the same
+    // reason: an operator-set value (including 'false') always wins, and GitHub Actions
+    // materializes an unset `env:` input as '' rather than an absent key. This is the
+    // single switch that makes `task({background: true})` reachable at all -- every piece
+    // of ownership-ledger, drain, and descendant-routing machinery this repo built for it
+    // is otherwise dead code no invocation can trigger. OPENCODE_ is allowlisted by
+    // filterAgentEnv, so it survives the scrub below without a change to that file.
+    //
+    // Hazard this flag makes reachable: a dispatch whose adoption event is never observed
+    // is not recovered today. `background: true` lives on tool-part metadata and never on
+    // the session record, so the ledger's reconciliation -- which reads session records --
+    // cannot spot it after the fact, and the ownership ledger reads zero while the run proceeds
+    // over work it does not know about, bounded only by the run deadline. The mitigation
+    // here is detection, not recovery: an unexpected end of the event stream now records an
+    // observation gap regardless of whether the ledger holds anything, so the run reports
+    // `incomplete` instead of claiming success. The work is still lost; the false success
+    // is not.
+    //
+    // That mitigation is detection, and it is not the only option available -- an earlier
+    // version of this comment claimed recovery was impossible, which is wrong. The metadata
+    // IS persisted on the tool part and readable through the message API, so a reader of
+    // persisted task parts could recover a dispatch whose event was missed. See
+    // `ledger-reconcile.ts`'s module doc for the verified chain and the two things such a
+    // reader must handle.
+    if (
+      process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS === undefined ||
+      process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS === ''
+    ) {
+      process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = 'true'
+    }
     const spawnOptions = {signal, hostname: '127.0.0.1', port, timeout: timeoutMs}
     // Measured separately from the total: timeoutMs bounds this call alone, so comparing
     // it against time that also covers port acquisition would misreport the real margin.

@@ -1,6 +1,7 @@
 import type {CacheSaveResult} from '../../shared/cache-save-result.js'
 import type {CommentSummaryOptions, RunMetrics} from './types.js'
 import * as core from '@actions/core'
+import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createLogger} from '../../shared/logger.js'
@@ -286,6 +287,142 @@ describe('writeJobSummary', () => {
     expect(logger.warning).toHaveBeenCalledWith('Failed to write job summary', {error: 'Write failed'})
     expect(core.warning).toHaveBeenCalledWith('Failed to write job summary: Write failed')
   })
+
+  describe('Background Work section', () => {
+    it('omits the section entirely when no ledger is supplied (byte-identical to today)', async () => {
+      // #given a run with no ownership ledger at all -- every run in production before this unit
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger)
+
+      // #then nothing about background work is added
+      expect(core.summary.addHeading).not.toHaveBeenCalledWith('Background Work', 3)
+    })
+
+    it('omits the section entirely when the ledger is empty (byte-identical to today)', async () => {
+      // #given a ledger that adopted nothing this run
+      const ledger = createOwnershipLedger()
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then nothing about background work is added -- an empty ledger must not add an empty section
+      expect(core.summary.addHeading).not.toHaveBeenCalledWith('Background Work', 3)
+    })
+
+    it('happy path: a fully drained run reports no unfinished work', async () => {
+      // #given two entries, both settled
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.adopt('session-2', 'linter-subagent')
+      ledger.settle('session-1')
+      ledger.settle('session-2')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then the section confirms nothing is missing, without naming anything as unfinished
+      expect(core.summary.addHeading).toHaveBeenCalledWith('Background Work', 3)
+      expect(core.summary.addRaw).toHaveBeenCalledWith('All background work finished.\n')
+      expect(core.summary.addRaw).not.toHaveBeenCalledWith(expect.stringContaining('Did not finish'))
+    })
+
+    it('edge case: one unfinished execution is named by label, cancelled at the deadline', async () => {
+      // #given a run that cancelled two reviewer subagents at the deadline: reconciliation
+      // confirmed one stopped (settled) and could not confirm the other (unknown)
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent-a')
+      ledger.adopt('session-2', 'reviewer-subagent-b')
+      ledger.settle('session-1')
+      ledger.markUnknown('session-2')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then the unconfirmed one is named by label, not folded into a bare count -- and
+      // the settled one is not named as unfinished (the array is exact, not a superset)
+      expect(core.summary.addRaw).toHaveBeenCalledWith('**Did not finish:**\n')
+      expect(core.summary.addList).toHaveBeenCalledWith(['reviewer-subagent-b (unconfirmed)'])
+    })
+
+    it('edge case: an unknown entry is reported as unknown rather than finished', async () => {
+      // #given a single entry the drain could not confirm
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'linter-subagent')
+      ledger.markUnknown('session-1')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then it is listed with its unconfirmed state, never claimed as finished
+      expect(core.summary.addList).toHaveBeenCalledWith(['linter-subagent (unconfirmed)'])
+      expect(core.summary.addRaw).not.toHaveBeenCalledWith('All background work finished.\n')
+    })
+
+    it('edge case: a run finishing with unknown entries explicitly reports the degraded state', async () => {
+      // #given one settled entry and one unknown entry
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.adopt('session-2', 'linter-subagent')
+      ledger.settle('session-1')
+      ledger.markUnknown('session-2')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then a distinct degraded-state banner is written, not just an unfinished-work list
+      expect(core.summary.addRaw).toHaveBeenCalledWith(
+        expect.stringContaining('could not be confirmed finished or cancelled'),
+      )
+    })
+
+    it('renders whatever label the dispatch site supplied, unmodified', async () => {
+      // #given an entry adopted with an arbitrary caller-supplied label (the summary never
+      // rewrites it -- reconciliation itself never adopts an entry, so there is no separate
+      // reconciliation-only label path to preserve; see `writeBackgroundWorkSummary`'s doc comment)
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reconciled')
+      ledger.markUnknown('session-1')
+      const options = createMockOptions()
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then the label is rendered exactly as supplied
+      expect(core.summary.addList).toHaveBeenCalledWith(['reconciled (unconfirmed)'])
+    })
+
+    it('integration: descendant token usage appears alongside the ledger section', async () => {
+      // #given a run whose metrics.tokenUsage reflects an owned descendant's usage
+      // (streaming.ts routes message.updated events from adopted descendants into the
+      // same token accounting as the root session -- see isOwnedSession) and a ledger
+      // naming that descendant
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.settle('session-1')
+      const options = createMockOptions({
+        metrics: createMockMetrics({
+          tokenUsage: {input: 1000, output: 500, reasoning: 0, cache: {read: 0, write: 0}},
+          model: 'claude-sonnet-4-20250514',
+          cost: 0.01,
+        }),
+      })
+
+      // #when
+      await writeJobSummary(options, logger, ledger)
+
+      // #then both the token accounting and the background-work section are present --
+      // the ledger section does not suppress or replace the existing Token Usage table
+      expect(core.summary.addHeading).toHaveBeenCalledWith('Token Usage', 3)
+      expect(core.summary.addHeading).toHaveBeenCalledWith('Background Work', 3)
+    })
+  })
 })
 
 describe('writeCacheSaveResultSummary', () => {
@@ -308,6 +445,11 @@ describe('writeCacheSaveResultSummary', () => {
     cachePersisted: false,
     storePersisted: false,
     outcome: 'checkpoint-declined',
+  }
+  const ownershipDeclinedResult: CacheSaveResult = {
+    cachePersisted: false,
+    storePersisted: false,
+    outcome: 'ownership-declined',
   }
 
   beforeEach(() => {
@@ -447,6 +589,55 @@ describe('writeCacheSaveResultSummary', () => {
     const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
     expect(remediationText).toContain('could not be checkpointed')
     expect(remediationText).not.toContain('post-action step retries')
+  })
+
+  it('reports a declined persistence distinctly from a rejected write, and names why via declineReason', async () => {
+    // #given persistence safety could not be confirmed (unresolved ownership, unconfirmed
+    // quiescence, or a failed lease renewal) -- the review finding this unit exists to fix:
+    // a decline must be visible with a reason, not silent
+    // #when
+    await writeCacheSaveResultSummary(
+      ownershipDeclinedResult,
+      'main',
+      logger,
+      'the coordination lease could not be renewed',
+    )
+
+    // #then the base sentence names persistence safety, distinct from a rejected write,
+    // and the specific declineReason is appended so a reader does not need the logs
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('persistence safety could not be confirmed')
+    expect(remediationText).toContain('**Reason:** the coordination lease could not be renewed')
+    expect(remediationText).not.toContain('did not accept the write')
+    expect(remediationText).not.toContain('s3-backup')
+  })
+
+  it('states plainly that the post-action step will not retry an ownership decline, from the main-phase row', async () => {
+    // #given the review finding this unit fixes: cleanup.ts's main-phase row used to
+    // claim "the post-action step retries once that condition clears", but post.ts's
+    // `declined-for-safety` branch deliberately never retries -- it honors the decline.
+    // Both rows must tell the same story about the same decision.
+    // #when
+    await writeCacheSaveResultSummary(ownershipDeclinedResult, 'main', logger)
+
+    // #then the sentence says the post-action step will not retry it, and makes no retry
+    // promise of any kind (no "once that condition clears", no bare "retries" clause)
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('the post-action step will not retry it')
+    expect(remediationText).not.toContain('post-action step retries')
+    expect(remediationText).not.toContain('once that condition clears')
+  })
+
+  it('omits the Reason line when declineReason is not supplied for an ownership-declined result', async () => {
+    // #given a caller that (incorrectly, or in a future refactor) omits the reason --
+    // the base sentence must still render rather than throwing
+    // #when
+    await writeCacheSaveResultSummary(ownershipDeclinedResult, 'main', logger)
+
+    // #then
+    const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
+    expect(remediationText).toContain('persistence safety could not be confirmed')
+    expect(remediationText).not.toContain('**Reason:**')
   })
 
   it('does not fail the run when the summary write throws', async () => {

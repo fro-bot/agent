@@ -111,6 +111,10 @@ export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND = {
   'session-error': 'session-error',
   'prompt-error': 'session-error',
   'missing-coordinator': undefined, // → 'unknown' at the projection (no operator-meaningful mapping)
+  // A run's deadline covers execution AND drain (Unit 6) — draining is still
+  // bounded by the same wall-clock budget, so this is operator-facing exactly
+  // the same deadline-expiry outcome as 'timeout', not a distinct concept.
+  'drain-timeout': 'max-duration-timeout',
 } satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>
 
 /**

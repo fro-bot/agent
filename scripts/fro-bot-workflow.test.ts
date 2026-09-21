@@ -1,4 +1,8 @@
-import {readFileSync} from 'node:fs'
+import type {Buffer} from 'node:buffer'
+import {execFileSync} from 'node:child_process'
+import {mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {parse} from 'yaml'
 
@@ -918,5 +922,254 @@ describe('fro-bot workflow — #1598 runtime-verification collector step', () =>
 
     // #then
     expect(collector).toBeLessThan(runFroBot)
+  })
+})
+
+// The action's execution deadline used to be a fixed literal ('3600000', 60 minutes) set
+// against a 75-minute job cap -- a fixed 15-minute gap that silently assumed pre-action work
+// (PR-head resolution, checkout, setup, App token mint, and on the daily schedule the #1598
+// collector's cross-owner network calls) was always negligible. If pre-action ever exceeded 15
+// minutes, the job cap fired before the action's own deadline, killing the run with none of the
+// deadline's drain/cancel/report behavior. These tests pin the fix: the budget is now derived
+// from the job-wide cap minus an explicit reserve minus elapsed pre-action time, so overrun
+// shrinks the budget instead of eating the reserve, and prove the relationship holds
+// structurally rather than trusting a hand-picked literal to stay correct.
+function budgetRunScript(): string {
+  const steps = stepsFor(WORKFLOW_PATH, 'fro-bot')
+  const budgetStep = steps.find(step => step.id === 'budget')
+  if (budgetStep === undefined) throw new TypeError('budget step is missing')
+  return String(budgetStep.run)
+}
+
+function extractIntLiteral(script: string, name: string): number {
+  const match = new RegExp(String.raw`${name}=(\d+)\b`).exec(script)
+  if (match?.[1] === undefined) throw new TypeError(`could not find integer literal for ${name}`)
+  return Number.parseInt(match[1], 10)
+}
+
+function extractArithmeticLiteral(script: string, name: string): number {
+  // Matches `name=$(( a * b * c ))`-shaped assignments used for job_cap_ms / reserve_ms.
+  const match = new RegExp(String.raw`${name}=\$\(\(\s*([\d\s*]+?)\s*\)\)`).exec(script)
+  if (match?.[1] === undefined) throw new TypeError(`could not find arithmetic literal for ${name}`)
+  return match[1]
+    .split('*')
+    .map(part => Number.parseInt(part.trim(), 10))
+    .reduce((product, factor) => product * factor, 1)
+}
+
+describe('fro-bot workflow — action execution budget derivation', () => {
+  it('records job start as the very first step, before any pre-action work', () => {
+    // #given
+    const job = loadFroBotJob()
+
+    // #then
+    expect(job.steps[0]?.id).toBe('job-start')
+  })
+
+  it('computes the budget after every pre-action step and before running the action', () => {
+    // #given
+    const job = loadFroBotJob()
+    const jobStart = stepIndex(job, step => step.id === 'job-start')
+    const prehead = stepIndex(job, step => step.id === 'prehead')
+    const mintAppToken = stepIndex(job, step => step.id === 'mint-app-token')
+    const collector = stepIndex(job, step => step.name === 'Gather #1598 runtime-verification evidence')
+    const budget = stepIndex(job, step => step.id === 'budget')
+    const runFroBot = stepIndex(job, step => step.uses === './')
+
+    // #then every pre-action step this budget accounts for -- including the daily-only
+    // collector, the one most likely to run long -- happens before the budget is computed,
+    // and the budget is computed immediately before the action runs
+    expect(jobStart).toBeLessThan(prehead)
+    expect(prehead).toBeLessThan(mintAppToken)
+    expect(mintAppToken).toBeLessThan(collector)
+    expect(collector).toBeLessThan(budget)
+    expect(budget).toBeLessThan(runFroBot)
+  })
+
+  it("derives job_cap_ms from the job's own timeout-minutes, not a re-typed literal", () => {
+    // #given the job's actual timeout-minutes and the budget step's job_cap_ms literal
+    const job = rawJob(WORKFLOW_PATH, 'fro-bot')
+    const timeoutMinutes = job['timeout-minutes']
+    const script = budgetRunScript()
+    const jobCapMs = extractArithmeticLiteral(script, 'job_cap_ms')
+
+    // #then they must agree, or a future edit to one silently invalidates the other
+    expect(jobCapMs).toBe(Number(timeoutMinutes) * 60 * 1000)
+  })
+
+  it('proves the effective action deadline is strictly less than the job cap, by the reserve', () => {
+    // #given the budget step's own constants
+    const script = budgetRunScript()
+    const jobCapMs = extractArithmeticLiteral(script, 'job_cap_ms')
+    const reserveMs = extractArithmeticLiteral(script, 'reserve_ms')
+    const maxBudgetMs = extractIntLiteral(script, 'max_budget_ms')
+    const minBudgetMs = extractIntLiteral(script, 'min_budget_ms')
+
+    // #then a positive reserve exists, the ceiling never exceeds job cap minus that reserve
+    // (so even at zero elapsed pre-action time the action's own deadline still expires with
+    // the full reserve intact), and the floor never disables the deadline (0) or exceeds the
+    // ceiling
+    expect(reserveMs).toBeGreaterThan(0)
+    expect(maxBudgetMs).toBeLessThanOrEqual(jobCapMs - reserveMs)
+    expect(maxBudgetMs + reserveMs).toBeLessThan(jobCapMs + reserveMs) // sanity: no double-count
+    expect(minBudgetMs).toBeGreaterThan(0)
+    expect(minBudgetMs).toBeLessThanOrEqual(maxBudgetMs)
+
+    // #then the worst case (pre-action overrun floors the budget) still leaves the job cap
+    // strictly later than the action's own deadline expiry, i.e. the action always loses its
+    // race to nothing before the runner would kill the job outright
+    expect(minBudgetMs).toBeLessThan(jobCapMs)
+  })
+
+  it('wires the computed budget into the action timeout for both the narration and non-narration paths', () => {
+    // #given the Run Fro Bot step's timeout input
+    const steps = stepsFor(WORKFLOW_PATH, 'fro-bot')
+    const runFroBot = steps.find(step => step.uses === './')
+    if (runFroBot === undefined) throw new TypeError('Run Fro Bot step is missing')
+    const timeoutExpression = expressionFrom((runFroBot.with as Record<string, unknown>).timeout, 'action timeout')
+
+    // #then the release-notes narration branch now uses its own computed output -- still
+    // ceilinged at 10 minutes inside the budget step, but no longer blind to how much job
+    // lifetime is actually left -- instead of a re-typed fixed literal
+    expect(timeoutExpression).toContain('steps.budget.outputs.narration-timeout-ms')
+    expect(timeoutExpression).not.toContain("'600000'")
+    // #then ...and every other path uses the dynamically computed budget, not a re-typed literal
+    expect(timeoutExpression).toContain('steps.budget.outputs.timeout-ms')
+    expect(timeoutExpression).not.toContain("'3600000'")
+  })
+
+  it("derives the exact admission boundary from the script's own literals: 55 minutes elapsed", () => {
+    // #given the budget step's own job_cap_ms, reserve_ms, and min_budget_ms literals
+    const script = budgetRunScript()
+    const jobCapMs = extractArithmeticLiteral(script, 'job_cap_ms')
+    const reserveMs = extractArithmeticLiteral(script, 'reserve_ms')
+    const minBudgetMs = extractIntLiteral(script, 'min_budget_ms')
+
+    // #when the boundary elapsed time is the point where available_ms == min_budget_ms exactly
+    const boundaryElapsedMs = jobCapMs - reserveMs - minBudgetMs
+
+    // #then it must land at exactly 55 minutes, derived from the literals rather than hardcoded
+    // independently in this test -- so a future edit to any one of the three literals is caught
+    // here instead of silently moving the boundary
+    expect(boundaryElapsedMs).toBe(55 * 60 * 1000)
+  })
+})
+
+// These tests actually execute the budget step's `run:` script under bash, with `now_ms` and
+// `start_ms` substituted for fixed literals in place of `date` and the GitHub Actions template
+// expression -- so they exercise the real arithmetic and the real fail-before-launch guard, not
+// a re-implementation of it in TypeScript that could silently drift from the script.
+interface BudgetScriptResult {
+  readonly exitCode: number
+  readonly stderr: string
+  readonly outputs: Record<string, string>
+}
+
+function runBudgetScript(elapsedMs: number): BudgetScriptResult {
+  const script = budgetRunScript()
+  const nowMs = 10_000_000_000_000
+  const startMs = nowMs - elapsedMs
+  // The GHA template expression is built via concatenation, not a literal `${{ ... }}`
+  // substring, to avoid tripping the no-template-curly-in-string lint rule on text that is
+  // intentionally not a JS template literal.
+  const jobStartTemplateExpression = ['start_ms="', '$', '{{ steps.job-start.outputs.epoch-ms }}"'].join('')
+  const fixedScript = script
+    .replace('now_ms=$(date +%s%3N)', `now_ms=${nowMs}`)
+    .replace(jobStartTemplateExpression, `start_ms=${startMs}`)
+  if (fixedScript === script) {
+    throw new TypeError('budget script substitution did not match -- script text changed shape')
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'fro-bot-budget-'))
+  const outputPath = join(dir, 'github-output')
+  writeFileSync(outputPath, '')
+  try {
+    let exitCode = 0
+    let stderr = ''
+    try {
+      execFileSync('bash', ['-c', fixedScript], {env: {...process.env, GITHUB_OUTPUT: outputPath}})
+    } catch (error) {
+      const execError = error as {status?: number | null; stderr?: Buffer}
+      exitCode = execError.status ?? 1
+      stderr = execError.stderr === undefined ? '' : execError.stderr.toString('utf8')
+    }
+    const outputs: Record<string, string> = {}
+    for (const line of readFileSync(outputPath, 'utf8').split('\n')) {
+      if (line === '') continue
+      const eq = line.indexOf('=')
+      if (eq === -1) continue
+      outputs[line.slice(0, eq)] = line.slice(eq + 1)
+    }
+    return {exitCode, stderr, outputs}
+  } finally {
+    rmSync(dir, {recursive: true, force: true})
+  }
+}
+
+describe('fro-bot workflow — action execution budget: boundary execution', () => {
+  it('at 0 minutes elapsed, admits the run at the full 60-minute ceiling and 10-minute narration ceiling', () => {
+    // #given no pre-action time spent
+    const result = runBudgetScript(0)
+
+    // #then the run is admitted and both ceilings apply unclipped by elapsed time
+    expect(result.exitCode).toBe(0)
+    expect(result.outputs['timeout-ms']).toBe('3600000')
+    expect(result.outputs['narration-timeout-ms']).toBe('600000')
+  })
+
+  it('at 54 minutes elapsed, admits the run with 6 minutes of budget left (below both ceilings)', () => {
+    // #given 54 minutes of pre-action time, one minute inside the admission boundary
+    const result = runBudgetScript(54 * 60 * 1000)
+
+    // #then available_ms = 75 - 15 - 54 = 6 minutes, under both the 60- and 10-minute ceilings,
+    // so both outputs equal the raw available budget rather than either ceiling
+    expect(result.exitCode).toBe(0)
+    expect(result.outputs['timeout-ms']).toBe('360000')
+    expect(result.outputs['narration-timeout-ms']).toBe('360000')
+  })
+
+  it('at exactly 55 minutes elapsed, admits the run at precisely the 5-minute admission floor', () => {
+    // #given the exact admission boundary: available_ms == min_budget_ms
+    const result = runBudgetScript(55 * 60 * 1000)
+
+    // #then the boundary is inclusive -- "below the minimum" fails, "at the minimum" is admitted
+    expect(result.exitCode).toBe(0)
+    expect(result.outputs['timeout-ms']).toBe('300000')
+    expect(result.outputs['narration-timeout-ms']).toBe('300000')
+  })
+
+  it('at 56 minutes elapsed, one minute past the boundary, refuses to launch instead of flooring upward', () => {
+    // #given one minute less than the admission boundary
+    const result = runBudgetScript(56 * 60 * 1000)
+
+    // #then the step fails outright -- under the old upward-clamping bug this would have
+    // succeeded with a 5-minute budget and zero teardown reserve left in the job cap
+    expect(result.exitCode).not.toBe(0)
+    expect(result.outputs['timeout-ms']).toBeUndefined()
+    expect(result.outputs['narration-timeout-ms']).toBeUndefined()
+    expect(result.stderr).toContain('56m')
+    expect(result.stderr).toContain('75m')
+    expect(result.stderr).toContain('15m')
+  })
+
+  it('at 60 minutes elapsed (the full pre-reserve budget), refuses to launch', () => {
+    // #given pre-action work has consumed the entire 60-minute non-reserve portion of the cap
+    const result = runBudgetScript(60 * 60 * 1000)
+
+    // #then available_ms is exactly 0 -- strictly below the minimum -- so the run is refused
+    expect(result.exitCode).not.toBe(0)
+    expect(result.outputs['timeout-ms']).toBeUndefined()
+  })
+
+  it('at 70 minutes elapsed, refuses to launch instead of handing out a deadline with no reserve left', () => {
+    // #given the exact scenario from the bug report: 75 - 15 - 70 goes negative
+    const result = runBudgetScript(70 * 60 * 1000)
+
+    // #then under the old bug this silently clamped up to a 5-minute deadline with zero
+    // teardown reserve remaining in the job cap -- and could exceed the cap entirely at higher
+    // elapsed values. The fix refuses to launch instead.
+    expect(result.exitCode).not.toBe(0)
+    expect(result.outputs['timeout-ms']).toBeUndefined()
+    expect(result.stderr).toContain('70m')
   })
 })

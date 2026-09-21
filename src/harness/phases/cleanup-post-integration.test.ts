@@ -116,7 +116,6 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
       bootstrapLogger: createMockLogger(),
       reactionCtx: null,
       githubClient: null,
-      agentSuccess: true,
       attachmentResult: null,
       serverHandle: null,
       sessionRetention: null,

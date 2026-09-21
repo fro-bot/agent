@@ -144,6 +144,9 @@ function createExecution(overrides: Partial<ExecutePhaseResult> = {}): ExecutePh
       requested: 'explicit',
       resolved: 'branch-pr',
     },
+    observationGap: false,
+    recoveryBoundaryUnresolved: false,
+    executionDurationMs: 0,
     ...overrides,
   }
 }
@@ -1884,5 +1887,140 @@ describe('runFinalize quota_exceeded llmError handling', () => {
     // #then the ordinary recoverable-LLM-error path is preserved: returns 0, no setFailed
     expect(exitCode).toBe(0)
     expect(mocks.setFailed).not.toHaveBeenCalled()
+  })
+})
+
+describe('runFinalize knownExecutionVeto gating of brokered push', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.readAndParseResponseFile.mockResolvedValue({
+      success: true,
+      data: {surface: 'pr-comment', parsed: {body: 'prechecked response'}},
+    })
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
+  })
+
+  it('runs the brokered push normally when knownExecutionVeto is false (executes normally)', async () => {
+    // #given a successful trusted PR mention eligible for brokered push, and no veto
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'pushed',
+      branch: 'feature/brokered-fix',
+      paths: ['src/fix.ts'],
+      commit: {sha: 'commit-sha', url: 'https://example.com/commit-sha', message: 'fix'},
+    })
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs with knownExecutionVeto: false
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+      {knownExecutionVeto: false},
+    )
+
+    // #then the brokered push runs and its footer reaches response-post
+    expect(exitCode).toBe(0)
+    expect(mocks.runBrokeredPush).toHaveBeenCalledTimes(1)
+    expect(mocks.runResponsePost).toHaveBeenCalledWith(
+      expect.objectContaining({deliveryFooter: expect.stringContaining('feature/brokered-fix') as unknown as string}),
+      expect.anything(),
+    )
+  })
+
+  it('withholds the brokered push when knownExecutionVeto is true (blocked)', async () => {
+    // #given the same otherwise-eligible trusted PR mention, but a known execution veto
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs with knownExecutionVeto: true
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+      {knownExecutionVeto: true},
+    )
+
+    // #then the push is never attempted, the response is still delivered, and response-post
+    // sees the veto but no "push delivered" footer
+    expect(exitCode).toBe(0)
+    expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
+    expect(mocks.runResponsePost).toHaveBeenCalledWith(
+      expect.objectContaining({knownExecutionVeto: true}),
+      expect.anything(),
+    )
+    expect(mocks.runResponsePost.mock.calls[0]?.[0]).not.toHaveProperty('deliveryFooter')
+  })
+
+  it('withholds the brokered push when only observationGap-style knownExecutionVeto is set (asymmetry check: ownershipUnresolved-only case is exercised the same way by the caller in run.ts)', async () => {
+    // #given the veto boolean itself is opaque to finalize -- it only receives the final OR
+    // of the two facts computed in run.ts. This test pins that a bare `true` (regardless of
+    // which of the two underlying facts produced it) blocks the push, matching the four-row
+    // matrix's "any true blocks" contract.
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs with knownExecutionVeto: true
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+      {knownExecutionVeto: true},
+    )
+
+    // #then blocked, same as the dedicated test above
+    expect(exitCode).toBe(0)
+    expect(mocks.runBrokeredPush).not.toHaveBeenCalled()
+  })
+
+  it('defaults knownExecutionVeto to false for callers that omit the options object entirely', async () => {
+    // #given an existing caller shape (no trailing options argument)
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const routing = createEligibleRouting()
+    const execution = createExecution({success: true, commentsPosted: 0})
+    const metrics = createMetrics()
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'pushed',
+      branch: 'feature/brokered-fix',
+      paths: ['src/fix.ts'],
+      commit: {sha: 'commit-sha', url: 'https://example.com/commit-sha', message: 'fix'},
+    })
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when runFinalize runs without a trailing options argument
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      execution,
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then behavior is unchanged: the push still runs
+    expect(exitCode).toBe(0)
+    expect(mocks.runBrokeredPush).toHaveBeenCalledTimes(1)
   })
 })

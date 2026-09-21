@@ -1,12 +1,19 @@
 ---
 type: architecture
-last-updated: "2026-09-07"
-updated-by: "schedule-d7190410-34062354146"
+last-updated: "2026-09-20"
+updated-by: "schedule-d7190410-35540552880"
 sources:
   - src/main.ts
   - src/post.ts
   - src/harness/run.ts
+  - src/harness/outcome.ts
   - src/harness/post.ts
+  - packages/runtime/src/agent/ownership-ledger.ts
+  - packages/runtime/src/agent/ledger-reconcile.ts
+  - packages/runtime/src/coordination/run-state.ts
+  - packages/gateway/src/execute/run-core.ts
+  - packages/gateway/src/execute/settle-owned-sessions.ts
+  - packages/gateway/src/execute/recovery.ts
   - src/harness/config/state-keys.ts
   - src/services/cache/save.ts
   - src/shared/cache-save-result.ts
@@ -98,6 +105,8 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 
 **Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention or a web launch. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits via a serial queue (`queue.ts`), and `recovery.ts` handles interrupted runs. An in-memory abort registry (`abort-registry.ts`) plus `cancel.ts` back operator-initiated cancellation: a run registered under its `runId` can be aborted mid-flight and settles as `CANCELLED` rather than `FAILED` (see [[Operator Web Control Surface]]). `run-core.ts` also counts inbound events so a stalled run can be distinguished from a lost-event timeout. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
 
+The gateway has no separate drain stage because it does not need one: `run-core.ts` does not return until the run's ownership ledger drains, so the heartbeat stop, terminal transition, and concurrency-slot handoff in `run.ts` all happen after owned background work has settled. `settle-owned-sessions.ts` is the termination barrier every post-ledger error passes through — it aborts unsettled sessions, confirms by reconciliation rather than trusting the abort response, and re-raises the original error marked *quarantined* when it cannot confirm. A quarantined failure holds the channel's slot for a bounded window instead of handing the workspace to the next queued run. `recovery.ts` reads persisted ownership back on restart and refuses to release a stale run's lock when the claim names work it cannot verify is finished. See [[Background Subagents and Ownership]].
+
 **Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
 
 **HTTP** (`http/`) — The signed announce webhook server. Handles control-plane presence messages with HMAC signature verification (`hmac.ts`), replay protection (`replay-cache.ts`), rate limiting (`rate-limit.ts`), and schema validation (`announce-schema.ts`).
@@ -124,11 +133,13 @@ The runtime package exports five module groups:
 
 **Agent** (`agent/`) — Prompt construction, output-mode and response-delivery resolution, server bootstrapping, and reference file management (see [[Prompt Architecture]]). The runtime supplies the _primitives_ an execution needs; it no longer owns an execution orchestrator. A `refactor(agent)` pass (commit `f5b8d69`) collapsed a previously duplicated execution stack — the runtime once exported its own `executeOpenCode`, retry, and prompt-sender modules that ran in parallel with the action layer's — down to a single owning implementation in `src/features/agent/`. That layer now drives the SDK session, retry policy, and continuation prompt itself, calling the runtime for the lower-level pieces below; the retry backoff constants live beside the retry logic that consumes them rather than being declared in two places. Spawns of the OpenCode child are wrapped in a deny-by-default environment filter (`filter-env.ts` / `with-scrubbed-env.ts`) so credential-shaped variables never reach the agent process (see [[Setup and Configuration]]). Error classification lives in a dedicated `error-format/` submodule that canonically owns the `ErrorType` union and `ErrorInfo` shape (re-exported from `types.ts` for callers), so the action and gateway format agent failures identically and the terminal-vs-transient distinction stays in one place (see [[Execution Lifecycle]]). The terminal kinds are a closed set — quota exhaustion and provider authentication failures — and their classifiers accept only bounded, provider-neutral fields, keeping provider-controlled text out of the trusted failure summary. Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
 
+**Ownership** (`agent/ownership-ledger.ts`, `agent/ledger-reconcile.ts`) — A per-invocation, three-state ledger tracking background subagent executions the run owns, plus the reconciler that settles entries whose completion event the SSE stream never delivered. Both surfaces share it: the Action drains against it before publishing or persisting, and the gateway holds its concurrency slot against it. It is keyed on the child session id rather than the dispatch job id, because upstream reuses job ids and a job-keyed entry could be settled by a notification for a different execution. See [[Background Subagents and Ownership]].
+
 **Session** (`session/`) — SDK-backed session storage, search, pruning, writeback, and mapper layers (see [[Session Persistence]]).
 
 **Object Store** (`object-store/`) — S3-compatible persistence: adapter, key builder, content sync, and endpoint/key validation (see [[Session Persistence]]).
 
-**Coordination** (`coordination/`) — S3-backed distributed lock, heartbeat controller, and run-state primitives for cross-surface mutual exclusion (see [[Execution Lifecycle]]).
+**Coordination** (`coordination/`) — S3-backed distributed lock, heartbeat controller, and run-state primitives for cross-surface mutual exclusion (see [[Execution Lifecycle]]). Run state gained a details-patch primitive alongside the phase-transition helper, because the transition helper refuses a same-phase write and background ownership changes occur mid-execution, with no phase change to hang them on. It re-reads the record on every call rather than threading a caller-held etag — a caller's etag goes stale the moment the heartbeat's own read-modify-write commits — and treats a lost race as non-fatal, since the next ownership change retries with fresher data.
 
 **Shared** (`shared/`) — Logger with credential redaction, Result types, constants, environment helpers, async utilities, and formatting.
 
@@ -140,7 +151,7 @@ The runtime package exports five module groups:
 
 **Features** — `agent/` bridges the runtime prompt builder with GitHub-specific context and the output-mode resolver (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic, including the PR review opt-out label handled in `skip-conditions-pr.ts` (see [[Execution Lifecycle]]). `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` (RFC-010) manages branch, commit, and PR operations via the GitHub Git Data API, and hosts the **brokered push** state machine that commits an agent's fix directly to a same-repo PR head branch on a trusted comment trigger, without ever handing the agent a credential (see [[Execution Lifecycle]] and [[Setup and Configuration]]).
 
-**Harness** — `run.ts` orchestrates the full execution lifecycle through discrete phases, including the new lock acquisition phase. `post.ts` handles the post-action cache save, gated on the persistence outcome and metadata flags that cleanup wrote to action state. `config/` parses action inputs, publishes outputs, and manages the state keys that cross the main-step/post-hook process boundary (see [[Execution Lifecycle]]).
+**Harness** — `run.ts` orchestrates the full execution lifecycle through discrete phases, including the lock acquisition phase and the drain step that holds teardown open until owned background work settles. `post.ts` handles the post-action cache save, gated on the persistence outcome and metadata flags that cleanup wrote to action state. `outcome.ts` reduces delivery success plus four verification facts into the run's final `invocation-outcome`, which is where the `incomplete` state — a useful result may exist, but this invocation cannot certify completion — is decided. `config/` parses action inputs, publishes outputs, and manages the state keys that cross the main-step/post-hook process boundary (see [[Execution Lifecycle]]).
 
 ## Design Decisions
 

@@ -176,11 +176,24 @@ outputs:
     description: >-
       Session persistence outcome for this run: durable (the Actions cache write
       persisted), store-only (the object store persisted the state but the Actions
-      cache write did not), skipped (SKIP_CACHE was set), or not-persisted (nothing
-      durable happened -- a rejected write, a declined checkpoint, or no cacheable
-      content found; the job summary names which). Reports a result, not proof
+      cache write did not), skipped (SKIP_CACHE was set), declined-for-safety (the
+      save was deliberately refused because persistence safety could not be
+      confirmed -- a live writer may still exist; this run will not retry it), or
+      not-persisted (nothing durable happened -- a rejected write, a declined
+      checkpoint, or no cacheable content found; the job summary names which --
+      this one IS retried from the post-action hook). Reports a result, not proof
       of durability. Only set from the main step; a value set from the post-action hook
       would arrive after every other step already ran, so it is not attempted there.
+  invocation-outcome:
+    description: >-
+      This invocation's final, verified outcome: succeeded (delivery succeeded and every
+      verification fact -- observation completeness, ownership resolution, server
+      quiescence, lease continuity -- checked out), incomplete (a useful result may exist,
+      but this invocation could not certify completion; no dedup marker was written and no
+      success reaction was posted), failed (verification was complete but delivery did
+      not succeed), or skipped (this invocation intentionally attempted no delivery --
+      no matching trigger, a deduplicated repeat, or coordination-lock contention; no dedup
+      marker was written and no reaction was posted). Only set from the main step.
   duration:
     description: Run duration in milliseconds
 

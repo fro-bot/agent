@@ -1,9 +1,13 @@
 ---
 type: convention
-last-updated: "2026-09-07"
-updated-by: "schedule-d7190410-34062354146"
+last-updated: "2026-09-20"
+updated-by: "schedule-d7190410-35540552880"
 sources:
   - AGENTS.md
+  - src/harness/outcome.ts
+  - src/features/agent/streaming.ts
+  - packages/runtime/src/agent/ownership-ledger.ts
+  - packages/runtime/src/agent/server.ts
   - src/shared/cache-save-result.ts
   - src/services/cache/checkpoint.ts
   - scripts/module-taxonomy.test.ts
@@ -103,6 +107,16 @@ This pattern means the setup, cache, and execution modules can be tested without
 ## Readonly Interfaces
 
 All interface properties use `readonly`. This is enforced project-wide and prevents accidental mutation of shared state. Combined with the functional style (no classes, no mutable instance state), this makes data flow through the system predictable.
+
+The rule carries one named exception, and naming it explicitly is the point — a silent exception invites a second one. Per-invocation mutable trackers threaded through the SSE event loop (the activity tracker and its root-freshness tracker in `src/features/agent/streaming.ts`) hold mutable fields, because a functional update would allocate a fresh object on every token delta. The exception is bounded by scope rather than convention: these objects live for one invocation, never escape the event loop, and are never shared across runs. Anything outside that scope stays `readonly`.
+
+## Veto, Not Certificate
+
+A recurring distinction in the harness's safety logic is worth stating on its own, because it shapes several unrelated gates: a known defect may *veto* an action, but the absence of that defect does not *certify* the action is safe. The invocation-outcome assessment gates reversible certificates (the dedup marker, the success reaction) on the full verification picture, while irreversible ones (a brokered push, a formal review approval) are gated on a narrower "known execution veto" — an observation gap or unresolved background ownership. Reading a passing veto check as proof of correctness is precisely the inversion the comments in those modules guard against. The related habit shows up in the ownership ledger, where an `unknown` state is never collapsed into `settled`: not knowing is a reason to keep waiting, not a reason to proceed. See [[Background Subagents and Ownership]].
+
+## Defaulting on Unset or Empty
+
+Environment-driven defaults in this project check for **unset or empty**, never presence alone, and let an explicit operator value win in either direction. The reason is specific to the deployment surface: GitHub Actions materializes an unset `env:` input as an empty string rather than an absent key, so a presence-only check sees a variable that "exists" and skips its own default, while the downstream consumer's boolean parsing does not read an empty string as true. The result is a default that silently never applies. The convention was established for the OpenCode file-watcher flag and reused verbatim for background subagents (see [[Setup and Configuration]]).
 
 ## Testing Conventions
 

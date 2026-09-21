@@ -207,3 +207,27 @@ describe('outputs written by this module are declared in action.yaml', () => {
     }
   })
 })
+
+describe('cache-save-result output description documents every CacheSaveStateValue', () => {
+  // The type, the action.yaml declaration, and runtime behaviour have already drifted
+  // apart once in this change set (see CacheSaveStateValue's doc comment). Pinned to
+  // CACHE_SAVE_STATE_VALUES -- the type's own value set -- rather than a hand-written list
+  // here, which would carry the same blind spot the type itself has: a list maintained
+  // alongside the type can go stale exactly the way the type did.
+  it('mentions every CacheSaveStateValue in the cache-save-result output description', () => {
+    const actionYaml = parse(readFileSync(join(import.meta.dirname, '..', '..', '..', 'action.yaml'), 'utf8')) as {
+      outputs?: Record<string, {description?: string}>
+    }
+    const description = actionYaml.outputs?.['cache-save-result']?.description
+
+    if (typeof description !== 'string') {
+      throw new TypeError('action.yaml: cache-save-result output has no description to check')
+    }
+
+    // Asserted as a filtered list, not a per-value expect(...).toBe(true): a failing
+    // assertion then names every undocumented value in one diff instead of stopping at
+    // the first.
+    const undocumentedValues = CACHE_SAVE_STATE_VALUES.filter(value => !description.includes(value))
+    expect(undocumentedValues).toEqual([])
+  })
+})

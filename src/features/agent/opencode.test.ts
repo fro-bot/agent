@@ -91,7 +91,18 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
   }
 }
 
-function createMockEventStream(events: Event[] = []): {
+// Models the real upstream endpoint when `signal` is supplied (the `client.event.subscribe
+// ({signal})` argument production code always passes): a continuing queue-and-heartbeat stream
+// that ends only on instance disposal, never on its own once the given events are exhausted --
+// closing releases exactly when that signal aborts, mirroring the real SDK transport tying its
+// read loop to the subscription's own AbortSignal. Without a signal, the stream exhausts
+// naturally once its events are yielded -- the shape most of this file's many direct
+// `processEventStream` characterization calls rely on, where the stream's own lifecycle is
+// incidental to what is under test and a caller-driven abort is asserted (or not) independently.
+function createMockEventStream(
+  events: Event[] = [],
+  signal?: AbortSignal,
+): {
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
 } {
@@ -100,6 +111,14 @@ function createMockEventStream(events: Event[] = []): {
       for (const event of events) {
         yield event
       }
+      if (signal == null) return
+      await new Promise<void>(resolve => {
+        if (signal.aborted) {
+          resolve()
+          return
+        }
+        signal.addEventListener('abort', () => resolve(), {once: true})
+      })
     })(),
     controller: {abort: vi.fn()},
   }
@@ -130,7 +149,10 @@ function createCompletedPrArtifactEvent(sessionID = 'ses_123'): Event {
   } as unknown as Event
 }
 
-function createCurrentTurnActivityStream(sessionID = 'ses_123'): {
+function createCurrentTurnActivityStream(
+  sessionID = 'ses_123',
+  signal?: AbortSignal,
+): {
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
 } {
@@ -148,6 +170,15 @@ function createCurrentTurnActivityStream(sessionID = 'ses_123'): {
       yield createCurrentTurnActivityEvent(sessionID)
       // session.idle is the terminal signal — required for currentTurnTerminalSignalReceived
       yield {type: 'session.idle', properties: {sessionID}} as unknown as Event
+      // Clean-run fixture: stays open past the terminal signal, released only when the
+      // subscription signal aborts (or forever, if none was supplied).
+      await new Promise<void>(resolve => {
+        if (signal?.aborted === true) {
+          resolve()
+          return
+        }
+        signal?.addEventListener('abort', () => resolve(), {once: true})
+      })
     })(),
     controller: {abort: vi.fn()},
   }
@@ -156,31 +187,41 @@ function createCurrentTurnActivityStream(sessionID = 'ses_123'): {
 function createPromptStartedActivityStream(
   promptAsync: ReturnType<typeof vi.fn>,
   sessionID = 'ses_123',
+  signal?: AbortSignal,
 ): {
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
 } {
   // Include session.idle after the activity event so currentTurnTerminalSignalReceived is set.
   // Without it, the poll's status().idle check is blocked and executeOpenCode tests hang.
-  return createPromptStartedEventStream(promptAsync, [
-    createCurrentTurnActivityEvent(sessionID),
-    {type: 'session.idle', properties: {sessionID}} as unknown as Event,
-  ])
+  return createPromptStartedEventStream(
+    promptAsync,
+    [createCurrentTurnActivityEvent(sessionID), {type: 'session.idle', properties: {sessionID}} as unknown as Event],
+    signal,
+  )
 }
 
+// Clean-run fixture: waits for `promptAsync` to be called (mirroring the real lazy-subscribe
+// timing), yields its scripted events, then stays open until `abort()` is called on the returned
+// controller OR the given subscription `signal` aborts (or forever, if neither ever fires) --
+// modelling the real upstream endpoint, which never closes itself once a clean run's events have
+// been delivered.
 function createPromptStartedEventStream(
   promptAsync: ReturnType<typeof vi.fn>,
   events: Event[],
+  signal?: AbortSignal,
 ): {
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
 } {
   let aborted = false
-  const controller = {
-    abort: vi.fn(() => {
-      aborted = true
-    }),
+  let releaseWait: (() => void) | null = null
+  const setAborted = (): void => {
+    aborted = true
+    releaseWait?.()
   }
+  const controller = {abort: vi.fn(setAborted)}
+  signal?.addEventListener('abort', setAborted, {once: true})
   return {
     stream: (async function* () {
       const callsBeforeSubscribe = promptAsync.mock.calls.length
@@ -196,6 +237,14 @@ function createPromptStartedEventStream(
         if (aborted) return
         yield event
       }
+      // Clean-run fixture: stays open past the scripted events, released only by an explicit
+      // controller.abort() call or the subscription signal aborting (or forever, if neither ever
+      // fires) -- modelling the real upstream endpoint, which never closes itself.
+      if (!aborted) {
+        await new Promise<void>(resolve => {
+          releaseWait = resolve
+        })
+      }
     })(),
     controller,
   }
@@ -205,16 +254,19 @@ function createPromptStartedErrorEventStream(
   promptAsync: ReturnType<typeof vi.fn>,
   events: Event[],
   releasePromptError: () => void,
+  signal?: AbortSignal,
 ): {
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
 } {
   let aborted = false
-  const controller = {
-    abort: vi.fn(() => {
-      aborted = true
-    }),
+  let releaseWait: (() => void) | null = null
+  const setAborted = (): void => {
+    aborted = true
+    releaseWait?.()
   }
+  const controller = {abort: vi.fn(setAborted)}
+  signal?.addEventListener('abort', setAborted, {once: true})
   return {
     stream: (async function* () {
       const callsBeforeSubscribe = promptAsync.mock.calls.length
@@ -229,6 +281,12 @@ function createPromptStartedErrorEventStream(
         yield event
       }
       releasePromptError()
+      // Clean-run fixture: stays open past the scripted events, same as createPromptStartedEventStream.
+      if (!aborted) {
+        await new Promise<void>(resolve => {
+          releaseWait = resolve
+        })
+      }
     })(),
     controller,
   }
@@ -297,10 +355,10 @@ function createMockClient(options: {
     event: {
       subscribe: vi
         .fn()
-        .mockImplementation(async () =>
+        .mockImplementation(async (subscribeOptions?: {signal?: AbortSignal}) =>
           options.events == null
-            ? createPromptStartedActivityStream(promptAsync)
-            : createPromptStartedEventStream(promptAsync, options.events),
+            ? createPromptStartedActivityStream(promptAsync, 'ses_123', subscribeOptions?.signal)
+            : createPromptStartedEventStream(promptAsync, options.events, subscribeOptions?.signal),
         ),
     },
   }
@@ -348,6 +406,7 @@ describe('executeOpenCode', () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
+    vi.unstubAllEnvs()
   })
 
   it('uses createOpencode SDK function', async () => {
@@ -606,7 +665,9 @@ describe('executeOpenCode', () => {
       await vi.advanceTimersByTimeAsync(2_500)
       const result = await resultPromise
 
-      // #then — cleanup may consume the remaining budget, but cannot rewrite terminal success
+      // #then — cleanup may consume the remaining budget, but cannot rewrite terminal success. The
+      // shared deadline did expire while SSE shutdown was bounded-waiting, but the success was
+      // already accepted before that -- teardown must not abort an already-completed session.
       expect(result).toMatchObject({success: true, exitCode: 0})
       expect(mockClient.session.messages).toHaveBeenCalledOnce()
       expect(mockClient.session.update).not.toHaveBeenCalled()
@@ -642,7 +703,9 @@ describe('executeOpenCode', () => {
       await vi.advanceTimersByTimeAsync(10_000)
       const result = await resultPromise
 
-      // #then — primary failure survives cleanup and cannot open a continuation attempt
+      // #then — primary failure survives cleanup and cannot open a continuation attempt. The shared
+      // deadline did expire during cleanup, but the failure was already accepted (not deferred past
+      // an ownership-ledger gate) before that happened -- teardown must not abort the session over it.
       expect(result).toMatchObject({success: false, exitCode: 1})
       expect(result.error).toContain('fetch failed')
       expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
@@ -699,7 +762,9 @@ describe('executeOpenCode', () => {
       await vi.advanceTimersByTimeAsync(1_000)
       const result = await resultPromise
 
-      // #then — the terminal result survives a timed-out best-effort artifact read
+      // #then — the terminal result survives a timed-out best-effort artifact read. The shared
+      // deadline expired while the artifact read was hanging, but success was already accepted
+      // before that -- teardown must not abort the already-completed session.
       expect(result).toMatchObject({success: true, exitCode: 0})
       expect(mockClient.session.messages).toHaveBeenCalledTimes(2)
       expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
@@ -1397,8 +1462,11 @@ describe('executeOpenCode', () => {
     )
   })
 
-  it('materializes reference files into the log directory and merges file parts', async () => {
-    // #given
+  it('materializes reference files into the log directory when RUNNER_TEMP is unset (fail-safe fallback)', async () => {
+    // #given RUNNER_TEMP is explicitly unset -- pins the fallback path deliberately rather than
+    // relying on whatever the ambient test environment happens to have (a real GitHub Actions
+    // runner always sets RUNNER_TEMP, so this must not depend on that being absent by accident)
+    vi.stubEnv('RUNNER_TEMP', undefined)
     const mockClient = createMockClient({
       promptResponse: {parts: [{type: 'text', text: 'Response'}]},
     })
@@ -1438,6 +1506,44 @@ describe('executeOpenCode', () => {
       imageFilePart,
       {type: 'file', mime: 'text/plain', url: 'file:///tmp/opencode/log/pr-context.txt', filename: 'pr-context.txt'},
     ])
+  })
+
+  it('materializes reference files into a dedicated run-scoped attachment directory under RUNNER_TEMP, not the log directory, when RUNNER_TEMP is set', async () => {
+    // #given RUNNER_TEMP is set (the real-CI case) -- reference files must NOT land in the log
+    // directory here, since that directory is not granted `external_directory` access (it holds
+    // more than just attachments; see `attachment-dir.ts`)
+    vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
+    vi.stubEnv('GITHUB_RUN_ID', '4242')
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '3')
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+    vi.spyOn(envUtils, 'getOpenCodeLogPath').mockReturnValue('/tmp/opencode/log')
+    const {buildAgentPrompt} = await import('./prompt.js')
+    vi.mocked(buildAgentPrompt).mockReturnValue({
+      text: 'Built prompt with sessionId',
+      referenceFiles: [{filename: 'pr-context.txt', content: 'context'}],
+    })
+    const {materializeReferenceFiles} = await import('./reference-files.js')
+    vi.mocked(materializeReferenceFiles).mockResolvedValue([])
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then the attachment directory is under RUNNER_TEMP, run-scoped, and distinct from the log
+    // directory -- and is created before use. Leaf creation is exclusive (no `recursive` option --
+    // see `createAttachmentDirExclusive`'s doc comment in `attachment-dir.ts`: a recursive mkdir's
+    // EEXIST fallback follows symlinks via `stat`, which is exactly what this leaf must not do),
+    // not the plain recursive `fs.mkdir` this pins used to assert.
+    const expectedAttachmentDir = '/home/runner/work/_temp/fro-bot-attachments/4242-3'
+    expect(fs.mkdir).toHaveBeenCalledWith(expectedAttachmentDir)
+    expect(materializeReferenceFiles).toHaveBeenCalledWith(
+      [{filename: 'pr-context.txt', content: 'context'}],
+      expectedAttachmentDir,
+      mockLogger,
+    )
   })
 
   it('does not write prompt artifact when OPENCODE_PROMPT_ARTIFACT is disabled', async () => {
@@ -1572,11 +1678,11 @@ describe('executeOpenCode retry behavior', () => {
           .mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => {
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) => {
           subscribeCallCount++
           return subscribeCallCount === 1
-            ? createPromptStartedEventStream(mockClient.session.promptAsync, [])
-            : createPromptStartedActivityStream(mockClient.session.promptAsync)
+            ? createPromptStartedEventStream(mockClient.session.promptAsync, [], options?.signal)
+            : createPromptStartedActivityStream(mockClient.session.promptAsync, 'ses_123', options?.signal)
         }),
       },
     }
@@ -1623,15 +1729,16 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => {
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) => {
           if (promptCallCount === 0) {
             return createPromptStartedErrorEventStream(
               mockClient.session.promptAsync,
               [createCurrentTurnActivityEvent()],
               () => releasePromptError?.(),
+              options?.signal,
             )
           }
-          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+          return createPromptStartedActivityStream(mockClient.session.promptAsync, 'ses_123', options?.signal)
         }),
       },
     }
@@ -1672,15 +1779,16 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => {
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) => {
           if (promptCallCount === 0) {
             return createPromptStartedErrorEventStream(
               mockClient.session.promptAsync,
               [createCurrentTurnActivityEvent(), createCompletedPrArtifactEvent()],
               () => releasePromptError?.(),
+              options?.signal,
             )
           }
-          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+          return createPromptStartedActivityStream(mockClient.session.promptAsync, 'ses_123', options?.signal)
         }),
       },
     }
@@ -1715,28 +1823,32 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () =>
-          createPromptStartedEventStream(mockClient.session.promptAsync, [
-            {
-              type: 'session.status',
-              properties: {
-                sessionID: 'ses_123',
-                status: {
-                  type: 'retry',
-                  attempt: 1,
-                  message: 'Usage limit reached',
-                  action: {
-                    reason: 'account_rate_limit',
-                    provider: 'anthropic',
-                    title: 'Usage limit reached',
-                    message: 'x',
-                    label: 'x',
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) =>
+          createPromptStartedEventStream(
+            mockClient.session.promptAsync,
+            [
+              {
+                type: 'session.status',
+                properties: {
+                  sessionID: 'ses_123',
+                  status: {
+                    type: 'retry',
+                    attempt: 1,
+                    message: 'Usage limit reached',
+                    action: {
+                      reason: 'account_rate_limit',
+                      provider: 'anthropic',
+                      title: 'Usage limit reached',
+                      message: 'x',
+                      label: 'x',
+                    },
+                    next: Date.now() + 5000,
                   },
-                  next: Date.now() + 5000,
                 },
-              },
-            } as unknown as Event,
-          ]),
+              } as unknown as Event,
+            ],
+            options?.signal,
+          ),
         ),
       },
     }
@@ -1783,16 +1895,23 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () =>
-          createPromptStartedEventStream(mockClient.session.promptAsync, [
-            {
-              type: 'session.error',
-              properties: {
-                sessionID: 'ses_123',
-                error: {name: 'ProviderAuthError', data: {providerID: 'sentinel-provider', message: 'sentinel-token'}},
-              },
-            } as unknown as Event,
-          ]),
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) =>
+          createPromptStartedEventStream(
+            mockClient.session.promptAsync,
+            [
+              {
+                type: 'session.error',
+                properties: {
+                  sessionID: 'ses_123',
+                  error: {
+                    name: 'ProviderAuthError',
+                    data: {providerID: 'sentinel-provider', message: 'sentinel-token'},
+                  },
+                },
+              } as unknown as Event,
+            ],
+            options?.signal,
+          ),
         ),
       },
     }
@@ -1864,7 +1983,9 @@ describe('executeOpenCode retry behavior', () => {
       event: {
         subscribe: vi
           .fn()
-          .mockImplementation(async () => createPromptStartedEventStream(mockClient.session.promptAsync, [])),
+          .mockImplementation(async (options?: {signal?: AbortSignal}) =>
+            createPromptStartedEventStream(mockClient.session.promptAsync, [], options?.signal),
+          ),
       },
     }
 
@@ -1927,7 +2048,9 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => createMockEventStream([])),
+        subscribe: vi
+          .fn()
+          .mockImplementation(async (options?: {signal?: AbortSignal}) => createMockEventStream([], options?.signal)),
       },
     }
 
@@ -1969,7 +2092,9 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => createMockEventStream([])),
+        subscribe: vi
+          .fn()
+          .mockImplementation(async (options?: {signal?: AbortSignal}) => createMockEventStream([], options?.signal)),
       },
     }
 
@@ -1979,7 +2104,9 @@ describe('executeOpenCode retry behavior', () => {
     } as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5_000)
+    const result = await resultPromise
 
     // #then
     expect(promptCallCount).toBe(1)
@@ -2005,7 +2132,7 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => {
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) => {
           const events: Event[] = [
             {
               type: 'message.updated',
@@ -2026,7 +2153,9 @@ describe('executeOpenCode retry behavior', () => {
             } as unknown as Event,
             {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
           ]
-          return Promise.resolve(createPromptStartedEventStream(mockClient.session.promptAsync, events))
+          return Promise.resolve(
+            createPromptStartedEventStream(mockClient.session.promptAsync, events, options?.signal),
+          )
         }),
       },
     }
@@ -2071,20 +2200,24 @@ describe('executeOpenCode retry behavior', () => {
           .mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => {
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) => {
           subscribeCallCount++
           if (subscribeCallCount === 1) {
-            return createPromptStartedEventStream(mockClient.session.promptAsync, [
-              {
-                type: 'session.error',
-                properties: {
-                  sessionID: 'ses_123',
-                  error: {status: 429, message: 'rate limited'},
-                },
-              } as unknown as Event,
-            ])
+            return createPromptStartedEventStream(
+              mockClient.session.promptAsync,
+              [
+                {
+                  type: 'session.error',
+                  properties: {
+                    sessionID: 'ses_123',
+                    error: {status: 429, message: 'rate limited'},
+                  },
+                } as unknown as Event,
+              ],
+              options?.signal,
+            )
           }
-          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+          return createPromptStartedActivityStream(mockClient.session.promptAsync, 'ses_123', options?.signal)
         }),
       },
     }
@@ -2132,20 +2265,24 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => {
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) => {
           subscribeCallCount++
           if (subscribeCallCount === 1) {
-            return createPromptStartedEventStream(mockClient.session.promptAsync, [
-              {
-                type: 'session.error',
-                properties: {
-                  sessionID: 'ses_123',
-                  error: {status: 429, message: 'rate limited'},
-                },
-              } as unknown as Event,
-            ])
+            return createPromptStartedEventStream(
+              mockClient.session.promptAsync,
+              [
+                {
+                  type: 'session.error',
+                  properties: {
+                    sessionID: 'ses_123',
+                    error: {status: 429, message: 'rate limited'},
+                  },
+                } as unknown as Event,
+              ],
+              options?.signal,
+            )
           }
-          return createPromptStartedActivityStream(mockClient.session.promptAsync)
+          return createPromptStartedActivityStream(mockClient.session.promptAsync, 'ses_123', options?.signal)
         }),
       },
     }
@@ -2188,16 +2325,20 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () =>
-          createPromptStartedEventStream(mockClient.session.promptAsync, [
-            {
-              type: 'session.error',
-              properties: {
-                sessionID: 'ses_123',
-                error: {status: 429, message: 'rate limited'},
-              },
-            } as unknown as Event,
-          ]),
+        subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) =>
+          createPromptStartedEventStream(
+            mockClient.session.promptAsync,
+            [
+              {
+                type: 'session.error',
+                properties: {
+                  sessionID: 'ses_123',
+                  error: {status: 429, message: 'rate limited'},
+                },
+              } as unknown as Event,
+            ],
+            options?.signal,
+          ),
         ),
       },
     }
@@ -2260,7 +2401,9 @@ describe('executeOpenCode retry behavior', () => {
       event: {
         subscribe: vi
           .fn()
-          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
+          .mockImplementation(async (options?: {signal?: AbortSignal}) =>
+            createPromptStartedActivityStream(mockClient.session.promptAsync, 'ses_123', options?.signal),
+          ),
       },
     }
 
@@ -2858,7 +3001,7 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {
+    const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: true,
       currentTurnTerminalSignalReceived: false,
       sessionIdle: false,
@@ -2876,10 +3019,15 @@ describe('pollForSessionCompletion', () => {
       activityTracker,
     )
 
-    // #then — fails on the very first poll tick, not after exhausting the full timeout
+    // #then — fails on the very first poll tick, not after exhausting the full timeout. Selecting
+    // this error never proves the turn ended: the fail-fast timing is pinned by `callCount === 1`,
+    // and the classification itself is pinned via `terminalProviderError`, not via the lifecycle
+    // flag — `mergeActivityError` no longer writes `currentTurnTerminalSignalReceived` (that flag
+    // is reserved for truly terminal signals: session.idle or a completed assistant message).
     expect(result.completed).toBe(false)
     expect(callCount).toBe(1)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('fails fast on a poll-only retry status with action.reason auth_unavailable (no SSE event at all)', async () => {
@@ -3346,8 +3494,9 @@ describe('processEventStream', () => {
     expect(responder).not.toHaveBeenCalledWith(expect.objectContaining({requestID: 'envelope-id'}))
   })
 
-  it('ignores permission asks for other sessions', async () => {
-    // #given a permission ask for a different session
+  it('answers a permission ask from another session — ownership is not required for permission.asked (foreground subagents are never adopted, so gating on ownership hung every dispatched review)', async () => {
+    // #given a permission ask for a session that is neither the root nor ledger-tracked (e.g. a
+    // foreground subagent's own session)
     const responder = vi.fn().mockResolvedValue(undefined)
     const eventStream = createMockEventStream([
       {
@@ -3363,7 +3512,7 @@ describe('processEventStream', () => {
       } as unknown as Event,
     ])
 
-    // #when the permission ask is processed
+    // #when the permission ask is processed with no ledger at all
     await processEventStream(
       eventStream.stream,
       'ses_123',
@@ -3374,8 +3523,13 @@ describe('processEventStream', () => {
       responder,
     )
 
-    // #then the other session's ask is ignored
-    expect(responder).not.toHaveBeenCalled()
+    // #then the ask is answered anyway, targeting its own session id
+    expect(responder).toHaveBeenCalledWith({
+      requestID: 'request-id',
+      sessionID: 'ses_other',
+      permission: 'read',
+      patterns: ['*.env'],
+    })
   })
 
   it('catches responder failures, logs a warning, and continues stream processing', async () => {
@@ -3861,7 +4015,9 @@ describe('processEventStream', () => {
     const {sendPromptToSession} = await import('./prompt-sender.js')
     const client = {
       event: {
-        subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
+        subscribe: vi
+          .fn()
+          .mockImplementation(async (options?: {signal?: AbortSignal}) => createMockEventStream([], options?.signal)),
       },
       session: {
         promptAsync: vi.fn().mockResolvedValue({error: 'fetch failed: connection reset'}),
@@ -4227,7 +4383,9 @@ describe('processEventStream', () => {
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
     expect(result.llmError?.resetTime).toEqual(new Date(nextEpochMs))
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this retry status is not proof the turn ended -- that lifecycle flag is
+    // reserved for session.idle / a completed assistant message.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     expect(activityTracker.sessionError).not.toBeNull()
     expect(activityTracker.sessionError).not.toContain('https://opencode.ai')
     expect(activityTracker.sessionError).not.toContain('acme')
@@ -4278,7 +4436,8 @@ describe('processEventStream', () => {
       // #then — classification is fixed and terminal; provider-controlled values do not cross the boundary
       expect(result.llmError?.type).toBe('provider_auth_error')
       expect(result.llmError?.retryable).toBe(false)
-      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+      // Classifying this error is not proof the turn ended.
+      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
       expect(JSON.stringify(result)).not.toContain('sentinel-provider')
       expect(JSON.stringify(result)).not.toContain('sentinel-token')
     },
@@ -4372,7 +4531,8 @@ describe('processEventStream', () => {
       expect(result.llmError?.retryable).toBe(false)
       expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
       expect(activityTracker.sessionError).toBe(result.llmError?.message)
-      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+      // Classifying this error is not proof the turn ended.
+      expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
       expect(JSON.stringify(result)).not.toContain('context-overflow-provider-message-sentinel')
       expect(JSON.stringify(result)).not.toContain('context-overflow-response-body-sentinel')
       expect(JSON.stringify(activityTracker)).not.toContain('context-overflow-provider-message-sentinel')
@@ -4414,7 +4574,8 @@ describe('processEventStream', () => {
     // #then
     expect(result.llmError?.type).toBe('provider_auth_error')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this retry status is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
     expect(JSON.stringify(result)).not.toContain('sentinel-provider')
     expect(JSON.stringify(result)).not.toContain('sentinel-token')
   })
@@ -4913,7 +5074,8 @@ describe('processEventStream', () => {
     expect(result.llmError).not.toBeNull()
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('does not classify an ordinary structured 429 session.error as quota exceeded', async () => {
@@ -4986,7 +5148,8 @@ describe('processEventStream', () => {
     expect(result.llmError).not.toBeNull()
     expect(result.llmError?.type).toBe('quota_exceeded')
     expect(result.llmError?.retryable).toBe(false)
-    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(true)
+    // Classifying this error is not proof the turn ended.
+    expect(activityTracker.currentTurnTerminalSignalReceived).toBe(false)
   })
 
   it('does not classify an ordinary plain-string session.error as quota_exceeded', async () => {
@@ -5625,7 +5788,12 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       yield currentTurnEvent
       // session.idle after arm provides the terminal signal (currentTurnTerminalSignalReceived)
       yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
+      // Clean-run fixture: stays open past the terminal signal -- no subscription signal is
+      // reachable here (eventStream bypasses client.event.subscribe), so this relies on
+      // runPromptAttempt's bounded cleanup window, matching the pattern used elsewhere in this file.
+      await new Promise<never>(() => undefined)
     })()
+
     const startPrompt = vi.fn(async () => {
       expect(streamStarted).toBe(true)
       releasePostArmEvent()
@@ -5892,7 +6060,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
   })
 
-  it('rejects a terminal result when wall-clock expiry precedes the timeout callback', async () => {
+  it('returns a typed timeout result when wall-clock expiry precedes the timeout callback', async () => {
     // #given — the poll result resolves after deadlineAt, while the timeout callback remains unlatched
     vi.useFakeTimers()
     try {
@@ -5930,15 +6098,18 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         undefined,
         deadline,
       )
-      const rejection = (async () => {
-        await expect(resultPromise).rejects.toMatchObject({name: 'DeadlineExceededError'})
-      })()
       await vi.advanceTimersByTimeAsync(0)
       vi.setSystemTime(deadlineAt + 1)
       await vi.advanceTimersByTimeAsync(500)
+      const result = await resultPromise
 
-      // #then — wall-clock expiry is authoritative even though isTimedOut() is still false
-      await rejection
+      // #then — wall-clock expiry is authoritative even though isTimedOut() is still false; the
+      // post-race ladder's `throw createDeadlineExceededError(...)` is gone (Steps 3b/5 of the
+      // restructure) — a bare `deadline` settlement with no preserved failure now reduces to a
+      // typed timeout result instead
+      expect(result.success).toBe(false)
+      expect(result.outcome).toBe('timeout')
+      expect(result.error).toBe('Attempt did not settle before the execution deadline')
     } finally {
       vi.useRealTimers()
     }
@@ -5966,20 +6137,25 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       } as unknown as Event,
     ])
 
-    // #when / #then
-    await expect(
-      runPromptAttempt(
-        {session: {status: vi.fn()}} as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-        'ses_123',
-        '/workspace',
-        30_000,
-        mockLogger,
-        eventStream.stream,
-        undefined,
-        undefined,
-        deadline,
-      ),
-    ).rejects.toMatchObject({name: 'DeadlineExceededError'})
+    // #when
+    const result = await runPromptAttempt(
+      {session: {status: vi.fn()}} as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+      undefined,
+      undefined,
+      deadline,
+    )
+
+    // #then — a bare `deadline` settlement (the auth event was never classified because
+    // `deadline.isExpired()` was already true when it arrived, so no failure survives to be
+    // preserved) now reduces to a typed timeout result instead of a thrown DeadlineExceededError
+    expect(result.success).toBe(false)
+    expect(result.outcome).toBe('timeout')
+    expect(result.error).toBe('Attempt did not settle before the execution deadline')
   })
 
   it('removes the poll interval abort listener when the timer wins', async () => {
@@ -6237,8 +6413,8 @@ describe('runPromptAttempt with v2.session.wait()', () => {
           .fn()
           .mockResolvedValueOnce({data: []}) // baseline: empty
           .mockResolvedValue({
-            // poll: new assistant message with time.completed
-            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}}}],
+            // poll: new assistant message with time.completed and a qualifying finish
+            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}, finish: 'stop'}}],
           }),
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
@@ -6393,7 +6569,11 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       } as unknown as Event,
       {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
     ]
-    const eventStream = createMockEventStream(events)
+    // Clean-run fixture: stays open past the terminal signal (no subscription signal is
+    // reachable here since eventStream bypasses client.event.subscribe) -- an already-created,
+    // never-aborted AbortSignal keeps createMockEventStream's stream open indefinitely, relying
+    // on runPromptAttempt's bounded cleanup window, matching the pattern used elsewhere.
+    const eventStream = createMockEventStream(events, new AbortController().signal)
 
     // Resolve wait shortly after the terminal event is processed
     setTimeout(() => resolveWait(), 30)
@@ -6435,13 +6615,16 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       // deliberately no v2 property — proves we don't duck-type client.v2
     }
     // Emit activity + session.idle (terminal signal), then resolve wait
-    const eventStream = createMockEventStream([
-      {
-        type: 'message.part.delta',
-        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hello'}},
-      } as unknown as Event,
-      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
-    ])
+    const eventStream = createMockEventStream(
+      [
+        {
+          type: 'message.part.delta',
+          properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hello'}},
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ],
+      new AbortController().signal,
+    )
     setTimeout(() => resolveWait(), 20)
 
     // #when — pass serverUrl so the v2 client can be created
@@ -6482,13 +6665,16 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     const mockClient = {
       session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})},
     }
-    const eventStream = createMockEventStream([
-      {
-        type: 'message.part.delta',
-        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
-      } as unknown as Event,
-      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
-    ])
+    const eventStream = createMockEventStream(
+      [
+        {
+          type: 'message.part.delta',
+          properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ],
+      new AbortController().signal,
+    )
     setTimeout(() => resolveWait(), 20)
 
     // #when
@@ -6529,7 +6715,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       } as unknown as Event,
       {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
     ]
-    const eventStream = createMockEventStream(events)
+    const eventStream = createMockEventStream(events, new AbortController().signal)
     setTimeout(() => resolveWait(), 30)
 
     // #when
@@ -6830,7 +7016,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       // session.idle provides the terminal signal — wait() alone after delta is not enough
       {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
     ]
-    const eventStream = createMockEventStream(deltaEvents)
+    const eventStream = createMockEventStream(deltaEvents, new AbortController().signal)
 
     // Resolve wait after a tick so the terminal signal (session.idle) is observed first
     setTimeout(() => {
@@ -6950,13 +7136,16 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
     // Emit activity + session.idle (terminal signal) so currentTurnTerminalSignalReceived is set
     // before wait resolves at 50ms. Without session.idle, wait falls back to poll (busy→timeout).
-    const eventStream = createMockEventStream([
-      {
-        type: 'message.part.delta',
-        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
-      } as unknown as Event,
-      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
-    ])
+    const eventStream = createMockEventStream(
+      [
+        {
+          type: 'message.part.delta',
+          properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
+        } as unknown as Event,
+        {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+      ],
+      new AbortController().signal,
+    )
 
     // #when
     const result = await runPromptAttempt(
@@ -7023,9 +7212,14 @@ describe('runPromptAttempt with v2.session.wait()', () => {
           },
         } as unknown as Event
         yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
+        // Clean-run fixture: stays open past the terminal signal (no subscription signal is
+        // reachable here since eventStream bypasses client.event.subscribe) -- relies on
+        // runPromptAttempt's bounded cleanup window, matching the pattern used elsewhere.
+        await new Promise<never>(() => undefined)
       })(),
       controller: {abort: vi.fn()},
     }
+
     const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
 
     try {

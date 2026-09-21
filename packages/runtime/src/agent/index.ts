@@ -1,3 +1,4 @@
+export {ATTACHMENT_DIR_SEGMENT, buildAttachmentDir, createAttachmentDirExclusive} from './attachment-dir.js'
 export {
   createAgentError,
   createErrorInfo,
@@ -16,7 +17,22 @@ export {ERROR_TYPES} from './error-format/types.js'
 export {filterAgentEnv} from './filter-env.js'
 export {createInactivityTimer} from './inactivity-timer.js'
 export type {InactivityTimer} from './inactivity-timer.js'
+export {
+  createLedgerReconciler,
+  createSdkLedgerReconcileAdapter,
+  DEFAULT_LEDGER_RECONCILE_INTERVAL_MS,
+  reconcileLedgerOnce,
+} from './ledger-reconcile.js'
+export type {
+  CreateLedgerReconcilerOptions,
+  LedgerReconcileAdapter,
+  LedgerReconcileChild,
+  LedgerReconciler,
+  ReconcileLedgerOptions,
+} from './ledger-reconcile.js'
 export {resolveOutputMode} from './output-mode.js'
+export {createOwnershipLedger} from './ownership-ledger.js'
+export type {OwnershipEntryState, OwnershipLedger, OwnershipLedgerEntry} from './ownership-ledger.js'
 export {
   buildCurrentThreadContextSection,
   buildHarnessRulesSection,

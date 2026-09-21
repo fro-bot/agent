@@ -220,6 +220,17 @@ export interface AgentResult {
   readonly commentsPosted: number
   readonly llmError: ErrorInfo | null
   readonly classificationPath?: ClassificationPath
+  /**
+   * `true` when any event stream observing this execution recorded an unexpected
+   * discontinuity (`EventStreamResult.discontinuity`) -- the observation channel closed
+   * without an intentional local shutdown and without a terminal signal. Sticky across LLM
+   * retry attempts within a single `executeOpenCode` call: once an attempt records a gap, a
+   * later attempt completing cleanly does not clear it -- selecting a clean result never
+   * proves the earlier gap didn't happen. Feeds `InvocationVerificationFacts.observationGap`
+   * in the harness's invocation-outcome assessment (`src/harness/outcome.ts`); this field
+   * itself carries no other behavior.
+   */
+  readonly observationGap: boolean
 }
 
 export type ClassificationPath = 'structured' | 'name' | 'fallback' | 'unclassified'

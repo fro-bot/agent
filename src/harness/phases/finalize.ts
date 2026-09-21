@@ -2,6 +2,7 @@ import type {ResponseDeliveryKind} from '@fro-bot/runtime'
 import type {BrokeredPushFailureClass, BrokeredPushOutcome} from '../../features/delegated/brokered-push.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CommentSummaryOptions} from '../../features/observability/types.js'
+import type {ReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
 import type {CommentTarget} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
@@ -179,6 +180,27 @@ export interface FinalizeResult {
   readonly deliveryKind: ResponseDeliveryKind
 }
 
+export interface FinalizePhaseOptions {
+  /**
+   * `true` when `run.ts` already knows, before this phase runs, that this invocation's own
+   * execution was not fully observed (an event-stream observation gap or unresolved
+   * background-dispatch ownership -- see `run.ts`'s `knownExecutionVeto` for the exact two
+   * facts). Withholds the brokered push (an irreversible commit) entirely, and is threaded
+   * into `runResponsePost` so an approving verdict downgrades to a plain `COMMENT` review
+   * rather than a formal `APPROVE`. Defaults to `false` so every existing caller keeps
+   * current behavior.
+   */
+  readonly knownExecutionVeto?: boolean
+  /**
+   * Injected publication-receipt operations (`services/github/review-delivery-receipt.js`),
+   * threaded into `runResponsePost` -> `submitReviewWithHeadGuard` for every review-capable
+   * verdict on the file-convention path. Paired with `runId`/`runAttempt` to identify the
+   * receipt. Optional only so tests that do not exercise the receipt keep compiling
+   * unmodified; `run.ts` always provides all three in production.
+   */
+  readonly reviewDeliveryReceiptOps?: ReviewDeliveryReceiptOperations
+}
+
 export async function runFinalizeWithResult(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
@@ -187,7 +209,9 @@ export async function runFinalizeWithResult(
   metrics: MetricsCollector,
   startTime: number,
   logger: Logger,
+  options: FinalizePhaseOptions = {},
 ): Promise<FinalizeResult> {
+  const {knownExecutionVeto = false, reviewDeliveryReceiptOps} = options
   const duration = Date.now() - startTime
 
   setActionOutputs({
@@ -217,7 +241,7 @@ export async function runFinalizeWithResult(
         `Recovered from context overflow (fresh review session; archived ${execution.overflowRecovery.archivedSessionId})\n`,
       )
     }
-    await writeJobSummary({...baseSummaryOptions, deliveryKind}, logger)
+    await writeJobSummary({...baseSummaryOptions, deliveryKind}, logger, execution.ownershipLedger)
     return {exitCode, deliveryKind}
   }
 
@@ -296,7 +320,10 @@ export async function runFinalizeWithResult(
       result = responsePrecheck
     } else {
       let deliveryFooter: string | undefined
-      if (execution.success === true) {
+      // A known execution veto withholds the brokered push entirely -- it is an
+      // irreversible commit, and this invocation already knows before delivery that its
+      // own execution was not fully observed. See `FinalizePhaseOptions.knownExecutionVeto`.
+      if (execution.success === true && knownExecutionVeto === false) {
         const triggerContext = routing.triggerResult.context
         const [owner = '', repo = ''] = routing.agentContext.repo.split('/')
         const eventFacts = {
@@ -392,6 +419,8 @@ export async function runFinalizeWithResult(
         responseFilePath: bootstrap.responseFilePath,
         responseFilePathCandidates: bootstrap.responseFilePathCandidates ?? undefined,
         ...(deliveryFooter == null ? {} : {deliveryFooter}),
+        ...(knownExecutionVeto ? {knownExecutionVeto} : {}),
+        ...(reviewDeliveryReceiptOps == null ? {} : {reviewDeliveryReceiptOps}),
       }
 
       result = await runResponsePost(responsePostParams, responsePostLogger)
@@ -502,7 +531,17 @@ export async function runFinalize(
   metrics: MetricsCollector,
   startTime: number,
   logger: Logger,
+  options: FinalizePhaseOptions = {},
 ): Promise<number> {
-  const result = await runFinalizeWithResult(bootstrap, routing, cacheRestore, execution, metrics, startTime, logger)
+  const result = await runFinalizeWithResult(
+    bootstrap,
+    routing,
+    cacheRestore,
+    execution,
+    metrics,
+    startTime,
+    logger,
+    options,
+  )
   return result.exitCode
 }

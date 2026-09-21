@@ -10,7 +10,7 @@ import process from 'node:process'
  * @param {object} baseObj - Parsed base config object.
  * @param {string} overlayRaw - Raw WORKSPACE_OPENCODE_CONFIG env string (may be empty).
  * @param {string} modelRaw - Raw WORKSPACE_OPENCODE_MODEL env string (may be empty).
- * @returns {{ ok: true, config: object } | { ok: false, error: string }} Merge result.
+ * @returns {{ ok: true, config: object, warnings: string[] } | { ok: false, error: string }} Merge result.
  */
 export function mergeConfig(baseObj, overlayRaw, modelRaw) {
   const model = (modelRaw ?? '').trim()
@@ -61,10 +61,27 @@ export function mergeConfig(baseObj, overlayRaw, modelRaw) {
   // Never allow autoupdate; version is pinned.
   merged.autoupdate = false
 
+  // Pin subagent_depth to 1, unconditionally, after the overlay spread — so no
+  // overlay value can survive. Workspace-layer mirror of the R12 pin in
+  // buildCIConfig (src/services/setup/ci-config.ts): upstream cancellation
+  // walks RUNNING jobs only, so a completed child that links the root session
+  // to a still-running grandchild is never walked at depth > 1, letting that
+  // grandchild outlive a cancellation meant to stop it. Depth one makes that
+  // path structurally unreachable.
+  const warnings = []
+  const hasSuppliedDepth = Object.prototype.hasOwnProperty.call(merged, 'subagent_depth')
+  const suppliedDepth = merged.subagent_depth
+  merged.subagent_depth = 1
+  if (hasSuppliedDepth && suppliedDepth !== 1) {
+    warnings.push(
+      `subagent_depth overridden to 1 (supplied ${JSON.stringify(suppliedDepth)}). Nested subagent depth is pinned to avoid an unreachable grandchild-cancellation gap.`,
+    )
+  }
+
   // Model wins if non-empty.
   if (normalizedModel !== '') merged.model = normalizedModel
 
-  return {ok: true, config: merged}
+  return {ok: true, config: merged, warnings}
 }
 
 // CLI main guard: node merge-config.mjs <config-file-path>
@@ -87,6 +104,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   if (result.ok === false) {
     process.stderr.write(`${result.error}\n`)
     process.exit(2)
+  }
+
+  for (const warning of result.warnings) {
+    process.stderr.write(`warning: ${warning}\n`)
   }
 
   const output = `${JSON.stringify(result.config, null, 2)}\n`
