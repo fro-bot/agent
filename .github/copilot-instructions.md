@@ -95,7 +95,7 @@ export function parseInputs(raw: Record<string, string>): Result<ActionInputs> {
 - **ESM-only**: `"type": "module"`, `.js` extensions in all relative imports
 - **No type suppression**: Never use `as any`, `@ts-ignore`, `@ts-expect-error`
 - **Result types**: Use `Result<T, E>` from `@bfra.me/es` for recoverable errors
-- **Readonly interfaces**: All interface properties use `readonly`
+- **Readonly interfaces**: All interface properties use `readonly` — except per-invocation mutable trackers threaded through the SSE event loop (`ActivityTracker` and its `RootFreshnessTracker` in `src/features/agent/streaming.ts`), where functional updates would allocate per token delta
 - **Discriminated unions** over optional properties
 - **`as const`** for fixed value arrays; infer union types from them
 - **Dependency injection**: Dependencies as function parameters, not global imports

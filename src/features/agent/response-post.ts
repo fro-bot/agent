@@ -13,6 +13,7 @@
 
 import type {AgentContext, ParsedResponse, ResponseFilePathCandidates, ResponseSurface} from '@fro-bot/runtime'
 import type {TriggerResultProcess} from '../../features/triggers/types.js'
+import type {ReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ReviewEvent} from '../reviews/types.js'
 
@@ -73,6 +74,25 @@ export interface RunResponsePostParams {
   readonly responseFilePathCandidates?: ResponseFilePathCandidates
   /** Action-generated delivery text appended only to plain comment responses. */
   readonly deliveryFooter?: string
+  /**
+   * `true` when `run.ts` already knows, before this call, that this invocation's own
+   * execution was not fully observed (an event-stream observation gap or unresolved
+   * background-dispatch ownership -- see `run.ts`'s `knownExecutionVeto`, threaded here via
+   * `FinalizePhaseOptions`). An approving verdict downgrades to a plain `COMMENT` review
+   * rather than a formal `APPROVE` -- an approval is an endorsement the harness cannot
+   * support when it already knows it could not fully observe its own execution -- and the
+   * downgraded review body gets a narrow harness-authored qualification. Defaults to
+   * `false` so every existing caller keeps current behavior.
+   */
+  readonly knownExecutionVeto?: boolean
+  /**
+   * Injected publication-receipt operations (`services/github/review-delivery-receipt.js`).
+   * Threaded into the single `submitReviewWithHeadGuard` call below for every review-capable
+   * verdict on this path (APPROVE, downgraded COMMENT, REQUEST_CHANGES). Optional only so
+   * tests that do not exercise the receipt keep compiling unmodified; the harness always
+   * provides it in production (see `finalize.ts`).
+   */
+  readonly reviewDeliveryReceiptOps?: ReviewDeliveryReceiptOperations
 }
 
 export interface ReadAndParseResponseFileParams {
@@ -337,6 +357,18 @@ function appendDeliveryFooter(body: string, deliveryFooter: string | undefined):
 }
 
 /**
+ * Harness-authored qualification appended only to a formal APPROVE that this call is
+ * downgrading to a plain COMMENT review because of a known execution-time defect (an
+ * event-stream observation gap or unresolved background-dispatch ownership) -- named so it
+ * reads as the HARNESS's own uncertainty about its invocation state, never as a report
+ * about the agent's work. The verdict and every finding in `body` are preserved unchanged;
+ * this only adds context alongside them.
+ */
+function qualifyForKnownExecutionVeto(body: string): string {
+  return `${body}\n\n> **Harness note:** delivered as a comment, not a formal approval, because this invocation could not fully confirm it observed its own execution (an event-stream gap or unresolved background work). The findings above are unaffected.`
+}
+
+/**
  * Run-scoped marker distinguishing THIS invocation's response comment from
  * any earlier response comment on the same thread. `BOT_COMMENT_MARKER`
  * alone only identifies "a bot response", which is ambiguous across repeat
@@ -437,8 +469,17 @@ async function postCommentWithRetry(
  * fail-closed when a guarded review cannot be submitted.
  */
 export async function runResponsePost(params: RunResponsePostParams, logger: Logger): Promise<ResponsePostResult> {
-  const {octokit, agentContext, triggerResult, botLogin, responseFilePath, responseFilePathCandidates, deliveryFooter} =
-    params
+  const {
+    octokit,
+    agentContext,
+    triggerResult,
+    botLogin,
+    responseFilePath,
+    responseFilePathCandidates,
+    deliveryFooter,
+    knownExecutionVeto,
+    reviewDeliveryReceiptOps,
+  } = params
 
   const prepared = await readAndParseResponseFile(
     {agentContext, triggerResult, responseFilePath, responseFilePathCandidates},
@@ -505,8 +546,15 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return failure('missing-target-context', 'Cannot submit a review: bot login is unavailable')
   }
 
+  // An approving verdict downgrades to a plain COMMENT review -- never a formal APPROVE --
+  // when recovered from a fallback artifact, OR when this invocation already carries a known
+  // execution veto: an approval is an endorsement the harness cannot support for content
+  // that was not the agent's actual final output, or when it already knows it could not
+  // fully observe its own execution. The verdict text itself, and every other finding, is
+  // preserved unchanged.
+  const withholdApproval = recoveredFromFallback || knownExecutionVeto === true
   const reviewEvent: ReviewEvent =
-    parsed.verdict === 'approve' ? (recoveredFromFallback ? 'COMMENT' : 'APPROVE') : 'REQUEST_CHANGES'
+    parsed.verdict === 'approve' ? (withholdApproval ? 'COMMENT' : 'APPROVE') : 'REQUEST_CHANGES'
 
   if (recoveredFromFallback && parsed.verdict === 'approve') {
     logger.warning('Response-post: withholding approving verdict from fallback response artifact', {
@@ -515,7 +563,18 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
       expectedResponseDirectory: path.dirname(responseFilePath),
       actualResponseDirectory: path.dirname(actualResponseFilePath),
     })
+  } else if (knownExecutionVeto === true && parsed.verdict === 'approve') {
+    logger.warning('Response-post: withholding approving verdict — known execution veto', {
+      prNumber: target.number,
+    })
   }
+
+  // Only the veto qualifies the review body -- the fallback-artifact downgrade above needs
+  // no additional text, and this qualification never touches ordinary comment delivery.
+  const reviewSubmitBody =
+    knownExecutionVeto === true && parsed.verdict === 'approve'
+      ? withMarker(appendDeliveryFooter(qualifyForKnownExecutionVeto(parsed.body), deliveryFooter))
+      : body
 
   const guard = await checkForkOrSelfGuard(
     {octokit, owner: target.owner, repo: target.repo, prNumber: target.number, botLogin, event: reviewEvent},
@@ -557,8 +616,21 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
         repo: target.repo,
         prNumber: target.number,
         event: reviewEvent,
-        body,
+        body: reviewSubmitBody,
         currentHeadSha: guard.currentHeadSha,
+        ...(reviewDeliveryReceiptOps == null
+          ? {}
+          : {
+              receipt: {
+                ops: reviewDeliveryReceiptOps,
+                identity: {
+                  repo: `${target.owner}/${target.repo}`,
+                  runId: process.env.GITHUB_RUN_ID ?? 'local',
+                  prNumber: target.number,
+                },
+                attempt: Number.parseInt(process.env.GITHUB_RUN_ATTEMPT ?? '1', 10),
+              },
+            }),
       },
       logger,
     )

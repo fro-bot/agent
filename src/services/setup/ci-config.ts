@@ -2,7 +2,13 @@ import type {OmoSlimPreset} from '../../shared/types.js'
 import type {Logger} from './types.js'
 import * as path from 'node:path'
 import process from 'node:process'
-import {buildResponseFileFallbackRoots, RESPONSE_FILE_DIR_SEGMENT} from '@fro-bot/runtime'
+import {
+  buildAttachmentDir,
+  buildResponseFileFallbackRoots,
+  getGitHubRunAttempt,
+  getGitHubRunId,
+  RESPONSE_FILE_DIR_SEGMENT,
+} from '@fro-bot/runtime'
 import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 
 export interface CIConfigResult {
@@ -172,9 +178,41 @@ function scopeExternalDirectoryPermission(
       editPermission[deniedEditPattern] = 'deny'
     }
 
+    // NOTE: unlike the response-file directory's edit-deny above (which guards a
+    // WORKSPACE-RELATIVE shadow of that segment name, not the real external directory --
+    // the model is explicitly meant to WRITE its response file there), this attachment
+    // directory gets no equivalent `edit` entry. Per upstream, an out-of-workspace edit is
+    // gated by `external_directory` itself (`packages/opencode/src/tool/edit.ts` -- see
+    // `attachment-dir.ts`'s doc comment), not a separate `edit` permission keyed on the
+    // absolute external path -- so an `edit` entry here would be a no-op for the actual
+    // external path and would only add a dead, unverifiable config key. The residual risk
+    // (the model could in principle edit its own already-consumed attachment copies) is
+    // accepted: the SDK reads file content once when building the message, so a later edit
+    // cannot retroactively change what was already injected.
+    // Run-attempt-scoped, not segment-wide: `path.join(runnerTemp, ATTACHMENT_DIR_SEGMENT, '*')`
+    // would match every OTHER run's subdirectory too (`*` compiles to regex `.*`, which matches
+    // `/`; see the pattern-semantics note above) -- on a persistent or self-hosted runner, that
+    // let a sibling run read this run's attachments (and, since `external_directory` gates edit
+    // too, plant a symlink for a later run's write to follow). `buildAttachmentDir` includes this
+    // run's own `<runId>-<runAttempt>` segment, so only that run's own subdirectory matches.
+    const attachmentPattern = path.join(
+      buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
+      '*',
+    )
+
     externalDirectory = {
       '*': 'deny',
       [path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, '*')]: 'allow',
+      // `*` compiles to regex `.*`, which matches the file(s) directly inside this run's own
+      // attachment subdirectory (`<attachmentDir>/*`) without needing anything deeper. This is
+      // ALSO layered onto the top-level, global `permission.external_directory` key by
+      // `scopeAttachmentDirectoryPermission` below -- that global grant is what reaches a
+      // dispatched subagent or an oMo/OMO-Slim orchestrator session, neither of which is the
+      // `build` agent this function scopes. This entry exists because the `build` agent's own
+      // permission block (built below) fully re-asserts `external_directory`, which would
+      // otherwise shadow the global grant for the `build` agent specifically (its `'*': 'deny'`
+      // sorts after the global grant in upstream's flattened, `findLast`-evaluated ruleset).
+      [attachmentPattern]: 'allow',
     }
 
     if (integrationWorkDir != null && integrationWorkDir.trim().length > 0) {
@@ -200,6 +238,122 @@ function scopeExternalDirectoryPermission(
         edit: editPermission,
         external_directory: externalDirectory,
       },
+    },
+  }
+}
+
+/**
+ * Grant the run-scoped reference-file ATTACHMENT directory (`buildAttachmentDir` /
+ * `ATTACHMENT_DIR_SEGMENT`, `@fro-bot/runtime`) at the TOP-LEVEL, GLOBAL `permission` key --
+ * deliberately NOT `agent.build.permission`, and called unconditionally in every oMo mode
+ * (disabled, oMo, OMO Slim), unlike `scopeExternalDirectoryPermission` above (which only
+ * runs in disabled mode and only ever reaches the `build` agent).
+ *
+ * Why the mode-agnostic, global placement is required: subagent dispatch (the `task` tool --
+ * the actual trigger for the hang this exists to prevent) only happens through an
+ * orchestrator agent, which only exists in oMo / OMO Slim mode. A grant that only reached
+ * the `build` agent (as `scopeExternalDirectoryPermission` does) would never reach a
+ * dispatched subagent at all in the modes where dispatch actually occurs.
+ *
+ * Why the global key reaches a dispatched subagent (verified against the pinned tag,
+ * `packages/harness/harness.config.json`'s `base_version`, since the vendored clone this
+ * project's other comments cite is not present on this host):
+ *
+ * 1. `packages/opencode/src/agent/agent.ts` builds each of upstream's BUILT-IN agents'
+ *    permission ruleset as `Permission.merge(defaults, <agent-specific defaults>, user)`,
+ *    where `user = Permission.fromConfig(cfg.permission ?? {})` -- i.e. this config's
+ *    top-level `permission` key, appended LAST.
+ * 2. `packages/opencode/src/permission/index.ts`'s `merge` is a bare `.flat()`, and its
+ *    `evaluate` resolves a request with `rulesets.flat().findLast(...)` -- the LAST array
+ *    entry matching BOTH the requested permission name and pattern (via wildcard) wins. A
+ *    later-appended `user` rule therefore overrides an earlier built-in default for any
+ *    pattern it also names, and does not disturb rules for OTHER patterns.
+ * 3. `packages/opencode/src/agent/subagent-permissions.ts`'s `deriveSubagentSessionPermission`
+ *    has a dispatched subagent's SESSION inherit the PARENT SESSION's own resolved
+ *    `external_directory` (and deny) rules directly -- not recomputed from the subagent's
+ *    own named agent. So once this global grant reaches whichever agent is running the root
+ *    session, every subagent it dispatches inherits it too, regardless of which named agent
+ *    (e.g. an OMO Slim reviewer/implementer persona) that subagent runs as.
+ *
+ * The gap this does NOT close, and cannot close from this project's own config: a
+ * plugin-defined agent (e.g. OMO Slim's orchestrator, or one of its own named subagents)
+ * that ships its OWN `external_directory` rule for pattern `'*'` in ITS OWN agent-specific
+ * config block would have that rule appended AFTER this global grant in THAT agent's own
+ * ruleset (mirroring exactly how `agent.build.permission` shadows this same global grant for
+ * the `build` agent above, which is why that block re-asserts the attachment pattern
+ * itself) -- and would win for that agent's OWN session, before it ever dispatches anything.
+ * This project's CI config has no visibility into a plugin's own agent definitions, and this
+ * has NOT been verified against the pinned OMO Slim version's actual agent config (out of
+ * scope: that package is not vendored in this repo, unlike the OpenCode core clone). What IS
+ * verified is the dispatch/inheritance step itself (points 1-3 above): once ANY session
+ * reaches the point of calling the `task` tool, its child inherits from it directly.
+ *
+ * Mirrors `scopeExternalDirectoryPermission`'s own fail-safe: when RUNNER_TEMP isn't set
+ * (e.g. local/non-Actions runs), this makes no change at all rather than guessing a broad
+ * allow pattern -- the harness's own materialization falls back to the (unscoped, as before
+ * this fix) OpenCode log directory in that same case (see `execution.ts`).
+ */
+function scopeAttachmentDirectoryPermission(
+  config: Record<string, unknown>,
+  runnerTemp: string | undefined,
+  logger: Logger,
+): void {
+  if (runnerTemp == null || runnerTemp.trim().length === 0) {
+    logger.debug('Skipping attachment directory permission grant: RUNNER_TEMP is not set')
+    return
+  }
+
+  const trimmedRunnerTemp = runnerTemp.trim()
+  // Run-attempt-scoped, not segment-wide -- see the matching note in
+  // `scopeExternalDirectoryPermission` above. This is the GLOBAL grant a dispatched subagent
+  // actually inherits, so leaving it segment-wide here is the more exploitable of the two copies:
+  // it is reachable from every mode that dispatches subagents at all.
+  const attachmentPattern = path.join(
+    buildAttachmentDir({runnerTemp: trimmedRunnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
+    '*',
+  )
+  const existingPermission = isRecord(config.permission) ? config.permission : {}
+  const existingExternalDirectoryRaw = existingPermission.external_directory
+  let existingExternalDirectory: Record<string, unknown>
+  if (isRecord(existingExternalDirectoryRaw)) {
+    existingExternalDirectory = {...existingExternalDirectoryRaw}
+  } else if (typeof existingExternalDirectoryRaw === 'string') {
+    existingExternalDirectory = {'*': existingExternalDirectoryRaw}
+  } else if (existingExternalDirectoryRaw == null) {
+    existingExternalDirectory = {}
+  } else {
+    // Genuinely incompatible shape (e.g. an array or number), not merely absent -- there is no
+    // way to merge this into the object form the grant below needs, so it is rejected explicitly
+    // instead of silently discarded. (Previously, anything that was neither a record nor a string
+    // fell through to `{}` with no record of what was lost.)
+    logger.warning(
+      'Ignoring operator-supplied permission.external_directory: expected a string or an object, got a shape that cannot be merged; operator rules for this key are not preserved',
+      {receivedType: Array.isArray(existingExternalDirectoryRaw) ? 'array' : typeof existingExternalDirectoryRaw},
+    )
+    existingExternalDirectory = {}
+  }
+
+  // Preserve the operator's own '*' rule instead of silently replacing it with a hardcoded
+  // 'deny' -- an operator who configured their own wildcard (e.g. 'allow', or a stricter 'ask')
+  // keeps that rule; only the ABSENCE of one falls back to the fail-closed 'deny' default.
+  // `Permission.evaluate`'s `findLast` (see the pattern-semantics note above) means the wildcard
+  // must still sort BEFORE the specific attachment allow below, or the attachment grant would be
+  // shadowed by it -- unchanged from before, just no longer clobbering the operator's own value.
+  const operatorWildcard = existingExternalDirectory['*']
+  const wildcard = operatorWildcard ?? 'deny'
+
+  delete existingExternalDirectory['*']
+  delete existingExternalDirectory[attachmentPattern]
+
+  // No corresponding `edit` entry -- see the matching note in `scopeExternalDirectoryPermission`
+  // above: an out-of-workspace edit is gated by `external_directory` itself upstream, not a
+  // separate `edit` permission keyed on the absolute external path.
+  config.permission = {
+    ...existingPermission,
+    external_directory: {
+      '*': wildcard,
+      ...existingExternalDirectory,
+      [attachmentPattern]: 'allow',
     },
   }
 }
@@ -260,6 +414,49 @@ export function buildCIConfig(
   if (!hasSystematic) {
     ciConfig.plugin = [...rawPlugins, systematicPlugin]
   }
+
+  // R12: pin subagent_depth to one, unconditionally, across every mode below.
+  // Upstream checks depth before execution against real session ancestry
+  // (`.slim/clonedeps/repos/anomalyco__opencode/packages/opencode/src/tool/task.ts:104-117`)
+  // — a depth value this project supplied would be a guess a client is in no
+  // position to make, so we pin the upstream setting instead of building a
+  // depth check of our own.
+  //
+  // Verified evidence (the `.slim/clonedeps/` checkout this cites is not present
+  // in the CI checkout, so this is recorded here for a reader without the clone):
+  // `subagent_depth` is a top-level key in the v1 config schema, defined as
+  // `subagent_depth: Schema.optional(NonNegativeInt)` at
+  // `packages/core/src/v1/config/config.ts:84`, and read at the exact site this
+  // pin is defending against, `packages/opencode/src/tool/task.ts:111`, as
+  // `depth >= (cfg.subagent_depth ?? 1)`. Both confirmed against the clone at
+  // `base_version` (`packages/harness/harness.config.json`) as of this comment;
+  // re-verify against the pinned tag if `base_version` moves.
+  //
+  // Depth matters because upstream cancellation walks RUNNING jobs only: a
+  // completed child that links the root session to a still-running
+  // grandchild is never walked, so the grandchild can outlive the
+  // cancellation meant to stop it. Depth one makes that path unreachable
+  // rather than handled.
+  //
+  // This project's general convention (established by the file-watcher
+  // config work) is that an explicit operator value wins. That convention
+  // is deliberately NOT followed here: depth one is closing a specific,
+  // unsolved correctness gap (grandchild traversal), not a stylistic
+  // default, so an operator override is recorded via a warning rather than
+  // honored. Raising it requires solving that traversal gap on its own
+  // terms — see the plan's Scope Boundaries — which is out of scope here.
+  const operatorSubagentDepth: unknown = ciConfig.subagent_depth
+  ciConfig.subagent_depth = 1
+  if (operatorSubagentDepth != null && operatorSubagentDepth !== 1) {
+    logger.warning(
+      `OpenCode config subagent_depth overridden to 1 (operator supplied ${String(operatorSubagentDepth)}). Nested subagent depth is pinned to avoid an unreachable grandchild-cancellation gap; see plan docs/plans/2026-09-14-001-feat-background-subagent-ownership-plan.md.`,
+    )
+  }
+
+  // Grant the reference-file attachment directory unconditionally, in every mode -- unlike
+  // `scopeExternalDirectoryPermission` below, which only runs (and only ever reaches the
+  // `build` agent) in disabled mode. See `scopeAttachmentDirectoryPermission`'s doc comment.
+  scopeAttachmentDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, logger)
 
   if (enableOmoSlim) {
     // Slim mode: strip OMO plugins, add slim plugin, pin orchestrator

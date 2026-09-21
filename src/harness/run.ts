@@ -1,21 +1,32 @@
-import type {ObjectStoreConfig, OutputModeMigrationState, OutputModeRequestState} from '@fro-bot/runtime'
+import type {
+  ObjectStoreConfig,
+  OutputModeMigrationState,
+  OutputModeRequestState,
+  OwnershipLedger,
+} from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
 import type {AttachmentResult} from '../features/attachments/index.js'
+import type {TriggerContext} from '../features/triggers/types.js'
+import type {DeduplicationEntity} from '../services/cache/dedup.js'
 import type {Octokit} from '../services/github/types.js'
+import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
 import * as core from '@actions/core'
-import {createMetricsCollector} from '../features/observability/index.js'
+import {applyTerminalReaction} from '../features/agent/index.js'
+import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
+import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
 import {getGitHubRunAttempt} from '../shared/env.js'
 import {createLogger} from '../shared/logger.js'
-import {setActionOutputs} from './config/outputs.js'
+import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
+import {assessInvocationOutcome} from './outcome.js'
 import {runAcknowledge} from './phases/acknowledge.js'
-import {runAcquireLock} from './phases/acquire-lock.js'
+import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
-import {resolveRequestedOutputModeState, runExecute} from './phases/execute.js'
+import {computeDrainDeadlineMs, resolveRequestedOutputModeState, runDrain, runExecute} from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
 import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
@@ -28,7 +39,6 @@ export async function run(): Promise<number> {
   metrics.start()
 
   let reactionCtx: ReactionContext | null = null
-  let agentSuccess = false
   let exitCode = 0
   let githubClient: Octokit | null = null
   let attachmentResult: AttachmentResult | null = null
@@ -38,6 +48,18 @@ export async function run(): Promise<number> {
   let runId = ''
   let sessionRetention: number | null = null
   let lockEtag: string | null = null
+  // Renews the coordination lock's lease across execution, drain, and persistence (plan
+  // Unit 12) -- null whenever this run holds no lock (S3 disabled, acquisition failed, or
+  // another surface already holds it). Held here, not inside acquire-lock.ts, because it
+  // must outlive the acquire-lock phase call and reach runCleanup in the finally block
+  // below, exactly like lockEtag already does.
+  let leaseRenewal: LeaseController | null = null
+  // Hoisted out of the try block (like lockEtag above) because runCleanup runs from the
+  // outer finally block, where a `const` declared inside try is out of scope. Populated
+  // right after runExecute returns; stays undefined only when execution never ran
+  // (SKIP_AGENT_EXECUTION=true) or the try block failed before reaching that point --
+  // both cases runCleanup treats as an empty, persistence-safe ledger.
+  let ownershipLedger: OwnershipLedger | undefined
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
   let storeConfig: ObjectStoreConfig = {
@@ -46,6 +68,30 @@ export async function run(): Promise<number> {
     region: '',
     prefix: '',
   }
+
+  // --- Invocation-outcome state (src/harness/outcome.ts), hoisted for the same reason as
+  // the fields above: the FINAL assessment happens in the outer `finally` block, after
+  // `runCleanup` returns its teardown safety evidence, so everything it needs must be
+  // reachable there. Defaults are the "nothing happened yet" case -- every early-return
+  // skip path (bootstrap/routing/dedup/lock declines) leaves these at their defaults, which
+  // assess as verification-complete (no execution ran, nothing to be unverified about) and
+  // let `deliverySucceeded` (from `exitCode`) alone decide succeeded vs. failed, matching
+  // those paths' pre-existing exit codes exactly.
+  let observationGap = false
+  let ownershipUnresolved = false
+  let triggerContext: TriggerContext | null = null
+  let dedupEntity: DeduplicationEntity | null = null
+  // Tracks failure/skip explicitly, set at each early-return site below, rather than
+  // inferring delivery from `exitCode === 0` in the `finally` block. `return 1`/`return 0`
+  // inside the `try` block already fixes this invocation's returned number before `finally`
+  // runs -- mutating `exitCode` there cannot change what was already returned (JS evaluates
+  // a `return` expression before running `finally`) -- so `finally` must read a fact set
+  // BEFORE each return, not `exitCode` itself, to know whether that return was a genuine
+  // failure, an intentional skip, or (the 'pending' default) a normal in-progress run.
+  // 'failed': bootstrap or cache-restore could not even start (`return 1`). 'skipped':
+  // routing found no matching trigger, dedup suppressed a repeat, or the coordination lock
+  // was contended (`return 0`, but nothing was attempted -- not the same as delivered).
+  let deliveryOutcome: 'pending' | 'failed' | 'skipped' = 'pending'
 
   const createUnavailableOutputModeMigration = (): OutputModeMigrationState => ({
     requested: requestedOutputModeState,
@@ -76,6 +122,7 @@ export async function run(): Promise<number> {
     requestedOutputModeState = resolveRequestedOutputModeState()
     const bootstrap = await runBootstrap(bootstrapLogger)
     if (bootstrap == null) {
+      deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 1
     }
@@ -85,18 +132,31 @@ export async function run(): Promise<number> {
 
     const routing = await runRouting(bootstrap, startTime)
     if (routing == null) {
+      deliveryOutcome = 'skipped'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 0
     }
     githubClient = routing.githubClient
+    triggerContext = routing.triggerResult.context
 
     repo = `${routing.triggerResult.context.repo.owner}/${routing.triggerResult.context.repo.repo}`
     runId = routing.agentContext.runId
+    // Built once per invocation and threaded to every review-submission seam (review
+    // reconciliation below, and finalize -> response-post -> submitReviewWithHeadGuard) so
+    // all of them reserve against the identical receipt identity. See
+    // services/github/review-delivery-receipt.ts for the fail-closed guarantee this backs.
+    const reviewDeliveryReceiptOps = createReviewDeliveryReceiptOperations(
+      storeConfig,
+      createLogger({phase: 'review-delivery-receipt'}),
+    )
+    const runAttempt = getGitHubRunAttempt()
     const dedup = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
     if (!dedup.shouldProceed) {
+      deliveryOutcome = 'skipped'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 0
     }
+    dedupEntity = dedup.entity
 
     const lockResult = await runAcquireLock({
       storeConfig,
@@ -107,12 +167,14 @@ export async function run(): Promise<number> {
     switch (lockResult.outcome) {
       case 'acquired':
         lockEtag = lockResult.lockEtag
+        leaseRenewal = lockResult.renewal
         break
       case 'held-by-other':
         bootstrapLogger.info('Skipping run — coordination lock held by another surface', {
           heldBy: lockResult.holder?.holder_id ?? null,
           surface: lockResult.holder?.surface ?? null,
         })
+        deliveryOutcome = 'skipped'
         setUnavailableActionOutputs(Date.now() - startTime)
         return 0
       case 's3-disabled':
@@ -133,6 +195,7 @@ export async function run(): Promise<number> {
 
     const cacheRestore = await runCacheRestore(bootstrap, metrics)
     if (cacheRestore == null) {
+      deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 1
     }
@@ -142,28 +205,75 @@ export async function run(): Promise<number> {
     attachmentResult = sessionPrep.attachmentResult
 
     const execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
-    agentSuccess = execution.success
+    ownershipLedger = execution.ownershipLedger
+    // Sticky, invocation-scoped facts -- feed the invocation-outcome assessment
+    // (src/harness/outcome.ts), never `execution.success` itself.
+    observationGap = execution.observationGap === true
+
+    // Drain: owned background work settles before anything below this point
+    // publishes, persists, or releases (Unit 10). `execution.ownershipLedger` is
+    // populated whenever execution actually ran (Unit 11); it is only absent when
+    // `SKIP_AGENT_EXECUTION=true` skipped execution entirely, in which case this
+    // call is a no-op exactly like before.
+    const drainLogger = createLogger({phase: 'drain'})
+    const drainResult = await runDrain({
+      ledger: execution.ownershipLedger,
+      client: cacheRestore.serverHandle.client,
+      parentSessionId: execution.sessionId,
+      deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
+      logger: drainLogger,
+    })
+    if (drainResult.expired) {
+      drainLogger.warning('Drain deadline reached before owned work settled; run reports incomplete', {
+        cancelledCount: drainResult.cancelledCount,
+        settledCount: drainResult.settledCount,
+        unknownCount: drainResult.unknownCount,
+      })
+    }
+    // Carries forward the overflow-recovery boundary's own unresolved ownership facts too
+    // (see ExecutePhaseResult.recoveryBoundaryUnresolved) -- the top-level drain above only
+    // ever observes the recovery session's own ledger, never the overflowed session's.
+    ownershipUnresolved = drainResult.unknownCount > 0 || execution.recoveryBoundaryUnresolved === true
+
+    // `true` when this invocation already knows, before publication, that its own execution
+    // was not fully observed -- computed from exactly the two facts above, both genuinely
+    // known at this point: `observationGap` (the event stream that watched execution closed
+    // without an intentional shutdown or terminal signal) and `ownershipUnresolved` (drain
+    // ended with unsettled or unconfirmed background-dispatch ownership, including an
+    // unresolved context-overflow recovery boundary). Deliberately excludes the two teardown
+    // facts `InvocationVerificationFacts` also tracks -- server quiescence and coordination-
+    // lease continuity: those are not knowable until `runCleanup` returns, which happens
+    // after publication, so folding them in here would gate an irreversible write against a
+    // snapshot that hardcodes them as clean (the mistake af0b155d0 made and baa96477d
+    // removed). A known defect can veto an endorsement without the absence of that defect
+    // certifying the invocation -- this flag is the veto, never a certificate, and it never
+    // feeds `assessInvocationOutcome` or the final `InvocationVerificationFacts` below.
+    const knownExecutionVeto = observationGap || ownershipUnresolved
 
     // Review reconciliation: after the agent session, check if a formal APPROVE
     // is needed to satisfy branch protection when the agent delivered a PASS
     // verdict as a comment instead of a review event. Fail-safe — never throws.
     const reconciliationLogger = createLogger({phase: 'review-reconciliation'})
-    const triggerContext = routing.triggerResult.context
-    const isPullRequestReviewTrigger = triggerContext.eventType === 'pull_request'
+    const reconciliationTriggerContext = routing.triggerResult.context
+    const isPullRequestReviewTrigger = reconciliationTriggerContext.eventType === 'pull_request'
     const prNumber =
-      triggerContext.target != null && triggerContext.target.kind === 'pr' ? triggerContext.target.number : null
+      reconciliationTriggerContext.target != null && reconciliationTriggerContext.target.kind === 'pr'
+        ? reconciliationTriggerContext.target.number
+        : null
     await runReviewReconciliation(
       {
         octokit: routing.githubClient,
         botLogin: routing.botLogin,
-        owner: triggerContext.repo.owner,
-        repo: triggerContext.repo.repo,
+        owner: reconciliationTriggerContext.repo.owner,
+        repo: reconciliationTriggerContext.repo.repo,
         prNumber,
         isPullRequestReviewTrigger,
         responseModeIsGithub: bootstrap.inputs.responseMode === 'github',
-        agentSucceeded: agentSuccess,
+        agentSucceeded: execution.success,
         runStartMs: startTime,
         isFileConventionDelivery: bootstrap.delivery === 'file-convention',
+        knownExecutionVeto,
+        receipt: {ops: reviewDeliveryReceiptOps, runId, runAttempt},
       },
       reconciliationLogger,
     )
@@ -178,16 +288,15 @@ export async function run(): Promise<number> {
       metrics,
       startTime,
       bootstrap.logger,
+      {knownExecutionVeto, reviewDeliveryReceiptOps},
     )
     exitCode = finalization.exitCode
 
-    // Dedup marker is saved only after a confirmed successful outcome (which,
-    // for file-convention runs, means finalize's delivery assertion passed —
-    // exitCode === 0). Saving it earlier (before finalize) risked a failed
-    // post followed by a retry being dedup-skipped and exiting 0 with no post.
-    if (exitCode === 0 && agentSuccess && dedup.entity != null) {
-      await saveDedupMarker(routing.triggerResult.context, dedup.entity, repo)
-    }
+    // Dedup marker and the terminal reaction both moved out of this try block -- they now
+    // happen in the `finally` block below, strictly after `runCleanup` returns and the
+    // FINAL invocation outcome is known. Saving the dedup marker here (before teardown had
+    // reported its own safety facts) risked marking an invocation deduplicated when its
+    // state was never actually verified.
   } catch (error) {
     exitCode = 1
     const duration = Date.now() - startTime
@@ -209,16 +318,10 @@ export async function run(): Promise<number> {
       core.setFailed('An unknown error occurred')
     }
   } finally {
-    // agentSuccess reflects execution.success only — it says nothing about
-    // whether finalize actually delivered the response. A non-zero exitCode
-    // means finalize failed to deliver (or the run otherwise failed), so the
-    // success reaction must not fire for that case.
-    const deliverySucceeded = agentSuccess && exitCode === 0
-    await runCleanup({
+    const cleanupResult = await runCleanup({
       bootstrapLogger,
       reactionCtx,
       githubClient,
-      agentSuccess: deliverySucceeded,
       attachmentResult,
       serverHandle,
       sessionRetention,
@@ -229,7 +332,87 @@ export async function run(): Promise<number> {
       repo,
       runId,
       lockEtag,
+      ownershipLedger,
+      leaseRenewal,
     })
+
+    // FINAL assessment: the single call to this pure function, made only now that
+    // `runCleanup` has returned the real teardown facts. `deliverySucceeded` is derived from
+    // `deliveryOutcome`/`exitCode`, never from `execution.success` directly, which is never
+    // cleared or second-guessed here. `knownExecutionVeto` above is a separate, earlier gate
+    // on irreversible publication and is never folded into this assessment or its inputs.
+    //
+    // A 'skipped' run (routing/dedup/lock-contention early return) bypasses this assessment
+    // entirely rather than feeding it a synthesized `deliverySucceeded` -- it attempted no
+    // delivery and has no execution/drain/teardown facts to assess, so forcing it through
+    // `assessInvocationOutcome` would either mislabel it 'succeeded' (this action.yaml value
+    // means delivery succeeded, which did not happen) or, if mapped to 'incomplete', flip
+    // its exit code from 0 to 1 below and turn every routine skip into a failed job.
+    let finalOutcome: InvocationOutcome
+    let finalIncompleteReasons: readonly string[] = []
+
+    if (deliveryOutcome === 'skipped') {
+      finalOutcome = 'skipped'
+    } else {
+      const finalVerification: InvocationVerificationFacts = {
+        observationGap,
+        ownershipUnresolved,
+        quiescenceConfirmed: cleanupResult.quiescenceConfirmed,
+        continuityUnverified: cleanupResult.continuityUnverified,
+      }
+      // 'failed' (bootstrap/cache-restore could not start) forces deliverySucceeded false
+      // regardless of `exitCode`'s value -- the early `return 1` that already produced this
+      // invocation's actual exit code left `exitCode` itself untouched (see `deliveryOutcome`'s
+      // doc above), so it cannot be trusted here for that path. Every other (non-early-return)
+      // path keeps reading `exitCode === 0`, unchanged from before.
+      const deliverySucceeded = deliveryOutcome === 'failed' ? false : exitCode === 0
+      const assessment = assessInvocationOutcome({deliverySucceeded, verification: finalVerification})
+      finalOutcome = assessment.outcome
+      finalIncompleteReasons = assessment.incompleteReasons
+
+      // Exit code contract: 1 for incomplete, same as failed -- no third numeric code. The
+      // structured `invocation-outcome` output and job-summary row are what distinguish "the
+      // harness contract was unmet" from "the agent was wrong". A `finish(1, ...)` (or
+      // exitCode already non-zero) path is left exactly as finalize decided it.
+      if (finalOutcome === 'incomplete' && exitCode === 0) {
+        exitCode = 1
+      }
+    }
+
+    // Dedup marker, written only after cleanup has had its say -- moved here (was: right
+    // after finalize, before cleanup ran) per the same reasoning that moved the terminal
+    // reaction below. A lock-contention skip reaches this point with both `dedupEntity` and
+    // `triggerContext` already populated (set before the lock is even acquired), so the
+    // outcome check is what stops a contended run, which delivered nothing, from marking
+    // itself deduplicated anyway.
+    //
+    // No exception for an incomplete invocation that already delivered a review: that used
+    // to be a deliberate carve-out here (writing the marker anyway, to discourage a rerun
+    // that could not recognize the earlier review and would submit a second one). It is
+    // removed now that `services/github/review-delivery-receipt.ts` independently protects
+    // every irreversible review submission with its own at-most-once reservation -- keeping
+    // this carve-out would only obscure that receipt as the actual authority, while this
+    // ordinary marker returns to its ordinary purpose: recording routine completion, not
+    // standing in for review idempotency.
+    const deduplicatable = finalOutcome === 'succeeded'
+    if (deduplicatable && dedupEntity != null && triggerContext != null) {
+      await saveDedupMarker(triggerContext, dedupEntity, repo)
+    }
+
+    // Terminal reaction: a distinct three-way projection (succeeded/incomplete/failed), not
+    // the boolean success/failure `completeAcknowledgment` used to receive -- moved here,
+    // strictly after cleanup, because passing a boolean derived from `exitCode` before
+    // teardown's own facts were known could select the success reaction for an invocation
+    // this assessment now calls incomplete. `reactionCtx` is structurally always null on a
+    // 'skipped' run (acknowledgment happens after every skip's early return), so the
+    // `finalOutcome !== 'skipped'` guard here is belt-and-suspenders, not load-bearing --
+    // added because `applyTerminalReaction` is not typed to accept a fourth outcome value.
+    if (reactionCtx != null && githubClient != null && finalOutcome !== 'skipped') {
+      await applyTerminalReaction(githubClient, reactionCtx, finalOutcome, bootstrapLogger)
+    }
+
+    setInvocationOutcomeOutput(finalOutcome)
+    await writeInvocationOutcomeSummary(finalOutcome, finalIncompleteReasons, bootstrapLogger)
   }
 
   return exitCode

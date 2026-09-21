@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-09-07"
-updated-by: "schedule-d7190410-34062354146"
+last-updated: "2026-09-20"
+updated-by: "schedule-d7190410-35540552880"
 sources:
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/response-file.ts
@@ -111,3 +111,5 @@ Mismatches degrade asymmetrically, in the direction that preserves work. A verdi
 ## Prompt Sender
 
 The assembled prompt text and reference files are sent to an OpenCode SDK session by `sendPromptToSession()` in `src/features/agent/prompt-sender.ts`. (This module lives in the action layer — the runtime no longer carries a parallel prompt-sender after the execution stack was consolidated; see [[Architecture Overview]].) The function handles model resolution (if a model override is configured), directory scoping to the GitHub workspace, and the construction of the SDK message payload with both text and file parts. For retry attempts after LLM failures, a short continuation prompt is sent instead of the full initial prompt, since the session already has the full context. That continuation text is built from the observed error type rather than a fixed string, and asks the model to continue the remaining objective rather than blindly resume — the [[Execution Lifecycle]] covers how the attempt outcome is classified and how the continuation is phrased.
+
+Submission is also where the run's completion evidence is armed. Immediately before the prompt is sent, the retry loop resets the root-freshness tracker so the attempt starts with no accumulated evidence that a turn has ended. This matters because the send is the boundary between "nothing is running" and "something is," and any idle observation carried across that boundary would describe the previous turn. See [[Background Subagents and Ownership]].

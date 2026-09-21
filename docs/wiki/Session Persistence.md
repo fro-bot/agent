@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-09-07"
-updated-by: "schedule-d7190410-34062354146"
+last-updated: "2026-09-20"
+updated-by: "schedule-d7190410-35540552880"
 sources:
   - src/services/cache/cache-key.ts
   - src/shared/cache-save-result.ts
@@ -75,7 +75,9 @@ The result is that a run can restore prior state successfully while its cache wr
 
 `saveCache` returns a structured `CacheSaveResult` (`src/shared/cache-save-result.ts`) rather than a boolean. The shape has two independent persistence axes — `cachePersisted` and `storePersisted` — plus a named `outcome` describing the terminal condition that produced them. Durability overall is the disjunction of the two axes, never either one alone.
 
-The reason for the shape is that a boolean collapsed three genuinely different situations into the same value: a deliberate opt-out (`SKIP_CACHE`), a denied write, and a successful write. Naming them separately makes the run's actual persistence story legible in the job summary and in the `cache-save-result` action output. The outcomes are `skipped-by-configuration`, `skipped-empty`, `checkpoint-declined`, `cache-rejected`, `cache-error`, and `persisted`.
+The reason for the shape is that a boolean collapsed three genuinely different situations into the same value: a deliberate opt-out (`SKIP_CACHE`), a denied write, and a successful write. Naming them separately makes the run's actual persistence story legible in the job summary and in the `cache-save-result` action output. The outcomes are `skipped-by-configuration`, `skipped-empty`, `checkpoint-declined`, `ownership-declined`, `cache-rejected`, `cache-error`, and `persisted`.
+
+`ownership-declined` means the save was never attempted at all. Cleanup's persistence safety gate refused it because it could not confirm no other writer was still touching this session's state: background subagent work this run owns was still unresolved, the OpenCode server's shutdown never confirmed the writer had quiesced, or the coordination lease could not be renewed. The three reasons are checked in a fixed order and only the first match is reported, on the reasoning that a reader needs one clear cause rather than a list of everything that happened to be true. Unlike the other outcomes here, it is not a retry candidate — it maps to its own `declined-for-safety` state value (see [[Execution Lifecycle]]) precisely so the post-action hook honors the refusal instead of second-guessing it with less information than cleanup had. [[Background Subagents and Ownership]] covers the gate and why a save on top of a live writer is worse than no save at all.
 
 `cache-rejected` deserves a note about what it does _not_ claim. `@actions/cache` distinguishes a policy denial, a reservation collision, a finalize error, a 5xx, and an upload failure internally, but none of those survive the `saveCache()` call boundary — every one returns the same `-1`. `cache-rejected` therefore covers all of them because the boundary cannot tell them apart, not because one was determined over the others. The source comments are explicit that this is an inference and that the cause must not be guessed from the trigger type or runner configuration: a self-hosted runner can hold a writable token on a comment trigger, and a transient service failure can happen regardless of token permissions.
 

@@ -1,9 +1,12 @@
 ---
 type: guide
-last-updated: "2026-09-07"
-updated-by: "schedule-d7190410-34062354146"
+last-updated: "2026-09-20"
+updated-by: "schedule-d7190410-35540552880"
 sources:
   - action.yaml
+  - src/harness/outcome.ts
+  - src/features/observability/job-summary.ts
+  - docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md
   - src/services/cache/save.ts
   - src/shared/cache-save-result.ts
   - src/services/cache/cache-key.ts
@@ -14,7 +17,7 @@ sources:
   - src/features/delegated/brokered-push-validation.ts
   - packages/gateway/src/web/operator-route.ts
   - docs/solutions/test-failures/gateway-operator-route-health-timeout-flake-2026-07-30.md
-summary: "Diagnosing common Fro Bot Agent failures — no response, cache persistence, setup and install errors, timeouts, brokered push, and a known gateway test flake"
+summary: "Diagnosing common Fro Bot Agent failures — no response, cache persistence, setup and install errors, timeouts, incomplete invocations, brokered push, and a known gateway test flake"
 ---
 
 # Troubleshooting
@@ -41,7 +44,9 @@ If sessions are not persisting between runs:
 4. Verify `skip-cache` is not set to `true`.
 5. Review run logs for cache-corruption warnings — a corrupted restore falls back to S3 when configured.
 
-Before guessing, read what the run actually reported. The `cache-save-result` output and the job summary name the persistence outcome directly: `durable` (the Actions cache write landed), `store-only` (the object store landed but the cache write did not), `skipped` (`skip-cache` was set), or `not-persisted` (nothing durable happened). A `store-only` result on a mention trigger is the expected, healthy shape once `s3-backup` is enabled — not a failure. A `not-persisted` result is the one worth investigating, and the job summary distinguishes its causes: a rejected write, a declined SQLite checkpoint, or no cacheable content found.
+Before guessing, read what the run actually reported. The `cache-save-result` output and the job summary name the persistence outcome directly: `durable` (the Actions cache write landed), `store-only` (the object store landed but the cache write did not), `skipped` (`skip-cache` was set), `declined-for-safety` (the save was refused before either backend was attempted), or `not-persisted` (nothing durable happened). A `store-only` result on a mention trigger is the expected, healthy shape once `s3-backup` is enabled — not a failure. A `not-persisted` result is the one worth investigating, and the job summary distinguishes its causes: a rejected write, a declined SQLite checkpoint, or no cacheable content found.
+
+A `declined-for-safety` result is a different investigation than `not-persisted`, and re-running the job will not clear it on its own. It means cleanup could not confirm no other writer was still touching session state — unresolved background-subagent work, an OpenCode server shutdown that never confirmed the writer had stopped, or a failed coordination lease renewal — and the post-action hook deliberately does not retry it: it runs with less information than the step that declined, so it honors the refusal rather than guessing. A recurring `declined-for-safety` result points at one of those three causes, not at cache configuration.
 
 Note what `not-persisted` cannot tell you. A rejected write surfaces as a single `-1` from `@actions/cache` with no detail, so the action cannot distinguish a policy denial from a reservation collision, a server error, or an upload failure. Do not infer the cause from the trigger type — the mapping is a strong prior, not a fact about the individual run.
 
@@ -64,6 +69,16 @@ If the agent times out before completing:
 - Increase the `timeout` input (default `1800000` ms / 30 minutes; `0` disables the limit).
 - Check the run logs for stuck operations or loops.
 - Break large tasks into smaller, focused steps.
+
+One timeout shape is worth recognizing on sight, because it produces no error at all: the run simply stops at its wall-clock limit having delivered nothing, with no exception and no classified failure in the logs. That pattern means something was waiting on a reply that never came. It was the signature of a permission ask being dropped by an event filter (see [[Background Subagents and Ownership]]), and it generalizes — when a run dies by clock with no error, look for the last event that expected a response rather than for the slowest step.
+
+## Incomplete Invocations
+
+A run reporting `invocation-outcome: incomplete` is a distinct diagnosis from a failure, and it will show a non-zero exit code despite possibly having produced a perfectly good result. `incomplete` means the harness could not *certify* that the invocation finished cleanly, for one of four reasons it names in the job summary: the event stream ended without a terminal signal (an observation gap), background subagent work this run owned never resolved, the OpenCode server never confirmed it had stopped writing, or the coordination lease could not be verified.
+
+Two consequences follow directly and are intentional. No dedup marker is written and no success reaction is posted, so a re-run is not dedup-skipped into a silent success — re-running is the correct first response. And the job summary's "Background Work" section names any unfinished subagent work by label rather than by count, so the specific outstanding work is identifiable rather than merely tallied.
+
+A single `incomplete` after a long or heavily parallel run is usually a dropped event rather than a defect. A repeated `incomplete` on the same workload points at background work that consistently outlives the drain budget — the remedy is a longer `timeout`, not a retry, since drain draws from the same wall-clock budget as execution.
 
 ## Brokered Push Not Landing
 

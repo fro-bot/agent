@@ -18,17 +18,19 @@
  * must not block recovery for the rest.
  */
 
-import type {CoordinationConfig} from '@fro-bot/runtime'
+import type {CoordinationConfig, LedgerReconcileAdapter, Logger, RunState} from '@fro-bot/runtime'
 
 import type {BindingsStore} from '../bindings/store.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
 import {
+  createOwnershipLedger,
   findStaleRuns,
   forceReleaseStaleLock,
   getLockKey,
   getRunKey,
   parseRunState,
+  reconcileLedgerOnce,
   releaseLock,
   transitionRun,
 } from '@fro-bot/runtime'
@@ -52,6 +54,22 @@ export interface RecoverStaleRunsDeps {
    * note without failing the recovery sweep.
    */
   readonly resolveThread: (threadId: string) => Promise<SinkThread | null>
+  /**
+   * Resolve a `LedgerReconcileAdapter` for a given repo's workspace server, or
+   * `null` when the server cannot be reached for that repo.
+   *
+   * The gateway daemon and the OpenCode server it drives live in different
+   * containers — a gateway restart is not a workspace restart, and the server
+   * can still be running background work the gateway no longer remembers.
+   * This is how a startup reconciliation pass asks the server what is still
+   * alive before trusting anything persisted about a stale EXECUTING run.
+   *
+   * Optional and omitted by callers that have not wired workspace-server
+   * access into recovery yet. When omitted (or when it throws, or resolves to
+   * `null`), any run with persisted ownership to reconcile is treated as
+   * unreachable — fail closed rather than trust staleness alone.
+   */
+  readonly resolveLedgerReconcileAdapter?: (repo: string) => Promise<LedgerReconcileAdapter | null>
   readonly logger: GatewayLogger
 }
 
@@ -63,6 +81,20 @@ export interface RecoverStaleRunsDeps {
 function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context?: Record<string, unknown>) => void} {
   return {
     debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
+  }
+}
+
+/**
+ * Adapt the gateway's `(context, message)` logger to the runtime's
+ * `(message, context)` `Logger` shape `reconcileLedgerOnce` expects, mapping
+ * `warn` to `warning` — the only name mismatch between the two shapes.
+ */
+function toLedgerReconcileLogger(logger: GatewayLogger): Logger {
+  return {
+    debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
+    info: (msg, ctx) => logger.info(ctx ?? {}, msg),
+    warning: (msg, ctx) => logger.warn(ctx ?? {}, msg),
+    error: (msg, ctx) => logger.error(ctx ?? {}, msg),
   }
 }
 
@@ -136,6 +168,179 @@ async function fetchLockRecord(
 }
 
 // ---------------------------------------------------------------------------
+// Persisted-ownership reconciliation (Unit 7: startup reconciliation)
+// ---------------------------------------------------------------------------
+//
+// Persisted run state is advisory, never authoritative. A gateway restart is
+// not a workspace restart: the server survives with background jobs still
+// running and still writing the workspace. Trusting a run's persisted
+// `details.ownedSessionIds` at face value would let a restart re-adopt
+// sessions it does not own, misroute approvals, or release a lock while
+// another party's work is live. Every persisted claim is intersected with
+// the live server's own view via `LedgerReconcileAdapter.children` (does the
+// server recognize this session as a descendant of the run's root at all?)
+// and `liveSessionIds` (is it running right now?) before it is ever treated
+// as this run's live work.
+
+/** A run's persisted claim about the work it dispatched, read defensively from `details`. */
+interface PersistedOwnership {
+  readonly rootSessionId: string
+  readonly ownedSessionIds: readonly string[]
+}
+
+/**
+ * Parse `run.details` for a persisted ownership claim, or `null` when none is
+ * present or the shape is not usable.
+ *
+ * `details` is a freeform `Record<string, unknown>` — nothing upstream
+ * guarantees these fields exist yet, so this never throws on a malformed or
+ * absent claim; it just treats the run as having nothing to reconcile.
+ */
+function readPersistedOwnership(run: RunState): PersistedOwnership | null {
+  const rootSessionId = run.details.rootSessionId
+  const rawOwnedSessionIds = run.details.ownedSessionIds
+
+  if (typeof rootSessionId !== 'string' || rootSessionId === '') return null
+  if (!Array.isArray(rawOwnedSessionIds)) return null
+
+  const ownedSessionIds = rawOwnedSessionIds.filter(
+    (candidate): candidate is string => typeof candidate === 'string' && candidate !== '',
+  )
+  if (ownedSessionIds.length === 0) return null
+
+  return {rootSessionId, ownedSessionIds}
+}
+
+/** Outcome of reconciling one run's persisted ownership claim against the live workspace server. */
+type OwnershipReconciliationOutcome =
+  | {readonly kind: 'no-persisted-ownership'}
+  | {readonly kind: 'reattach-failed'}
+  | {readonly kind: 'live-work-found'; readonly liveSessionIds: readonly string[]}
+  | {
+      readonly kind: 'no-live-work'
+      readonly confirmedFinished: readonly string[]
+      readonly downgradedToUnknown: readonly string[]
+    }
+
+interface ReconcileOwnedSessionsOpts {
+  readonly run: RunState
+  readonly repo: string
+  readonly resolveLedgerReconcileAdapter?: (repo: string) => Promise<LedgerReconcileAdapter | null>
+  readonly logger: GatewayLogger
+}
+
+/**
+ * Reconcile one run's persisted ownership claim against the live workspace
+ * server, delegating the three-way decision (restore, settle, downgrade to
+ * unknown) to `reconcileLedgerOnce` — the same primitive the agent-side
+ * ledger uses. Recovery's job here is only to seed a throwaway ledger with
+ * the persisted claim, run one reconciliation pass against it scoped to
+ * `rootSessionId`, and translate the resulting ledger states back into the
+ * outcome shape recovery already acts on.
+ *
+ * Never adopts a persisted session id as live/outstanding on the strength of
+ * the persisted claim alone — only `children(rootSessionId)` confirms the
+ * live server still recognizes it as a descendant of this run, and only
+ * `liveSessionIds()` confirms it is running right now. A session absent from
+ * `children()` is downgraded to unknown rather than restored, whether or not
+ * it happens to be live under some other tree — a claim the live server does
+ * not corroborate must never grant this run ownership or hold its lock.
+ */
+async function reconcileOwnedSessions(opts: ReconcileOwnedSessionsOpts): Promise<OwnershipReconciliationOutcome> {
+  const {run, repo, resolveLedgerReconcileAdapter, logger} = opts
+
+  const persisted = readPersistedOwnership(run)
+  if (persisted === null) {
+    return {kind: 'no-persisted-ownership'}
+  }
+
+  if (resolveLedgerReconcileAdapter === undefined) {
+    logger.warn(
+      {runId: run.run_id, repo},
+      'recovery: no ledger-reconciliation adapter configured — cannot verify persisted ownership against the live workspace server',
+    )
+    return {kind: 'reattach-failed'}
+  }
+
+  let adapter: LedgerReconcileAdapter | null
+  try {
+    adapter = await resolveLedgerReconcileAdapter(repo)
+  } catch (error: unknown) {
+    logger.warn(
+      {runId: run.run_id, repo, err: error instanceof Error ? error.message : String(error)},
+      'recovery: resolving the ledger-reconciliation adapter threw — treating persisted ownership as unreachable',
+    )
+    return {kind: 'reattach-failed'}
+  }
+
+  if (adapter === null) {
+    logger.warn(
+      {runId: run.run_id, repo},
+      'recovery: workspace server unreachable — cannot verify persisted ownership against it',
+    )
+    return {kind: 'reattach-failed'}
+  }
+
+  const ledger = createOwnershipLedger()
+  for (const sessionId of persisted.ownedSessionIds) {
+    ledger.adopt(sessionId, 'persisted')
+  }
+
+  const reconcileResult = await reconcileLedgerOnce({
+    ledger,
+    adapter,
+    parentSessionId: persisted.rootSessionId,
+    logger: toLedgerReconcileLogger(logger),
+  })
+
+  if (reconcileResult.success === false) {
+    logger.warn(
+      {runId: run.run_id, repo, err: reconcileResult.error.message},
+      'recovery: ledger-reconciliation call failed — cannot verify persisted ownership against the live workspace server',
+    )
+    return {kind: 'reattach-failed'}
+  }
+
+  // Read outcomes back only for the sessions this run actually claimed.
+  // `reconcileLedgerOnce` never adopts sessions beyond what this throwaway
+  // ledger was seeded with above (it settles/downgrades tracked entries
+  // only — see its module doc), so the snapshot below can only ever contain
+  // exactly `persisted.ownedSessionIds`.
+  const stateBySessionId = new Map(ledger.snapshot().map(entry => [entry.sessionId, entry.state] as const))
+  const liveOwned: string[] = []
+  const confirmedFinished: string[] = []
+  const downgradedToUnknown: string[] = []
+
+  for (const sessionId of persisted.ownedSessionIds) {
+    const state = stateBySessionId.get(sessionId)
+    if (state === 'outstanding') {
+      liveOwned.push(sessionId)
+    } else if (state === 'settled') {
+      confirmedFinished.push(sessionId)
+    } else if (state === 'unknown') {
+      downgradedToUnknown.push(sessionId)
+    }
+  }
+
+  if (downgradedToUnknown.length > 0) {
+    logger.warn(
+      {runId: run.run_id, repo, sessionIds: downgradedToUnknown},
+      'recovery: persisted ownership named session(s) the live workspace server does not recognize as owned — downgraded to unknown rather than restored',
+    )
+  }
+
+  if (liveOwned.length > 0) {
+    logger.info(
+      {runId: run.run_id, repo, sessionIds: liveOwned},
+      'recovery: persisted ownership confirmed live on the workspace server — deferring recovery until it settles',
+    )
+    return {kind: 'live-work-found', liveSessionIds: liveOwned}
+  }
+
+  return {kind: 'no-live-work', confirmedFinished, downgradedToUnknown}
+}
+
+// ---------------------------------------------------------------------------
 // recoverStaleRuns
 // ---------------------------------------------------------------------------
 
@@ -146,7 +351,7 @@ async function fetchLockRecord(
  * the gateway begins handling new mentions.
  */
 export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void> {
-  const {coordinationConfig, identity, bindingsStore, resolveThread, logger} = deps
+  const {coordinationConfig, identity, bindingsStore, resolveThread, resolveLedgerReconcileAdapter, logger} = deps
   const coordLogger = toCoordLogger(logger)
 
   // Enumerate all repos that have bindings
@@ -179,7 +384,16 @@ export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void
         logger.info({repo, count: staleRuns.length}, 'recovery: found stale runs')
 
         for (const run of staleRuns) {
-          await recoverOneRun({run, repo, coordinationConfig, identity, resolveThread, coordLogger, logger})
+          await recoverOneRun({
+            run,
+            repo,
+            coordinationConfig,
+            identity,
+            resolveThread,
+            resolveLedgerReconcileAdapter,
+            coordLogger,
+            logger,
+          })
         }
       }
 
@@ -310,24 +524,85 @@ async function reconcileCancelledLock(opts: ReconcileCancelledLockOpts): Promise
 // ---------------------------------------------------------------------------
 
 interface RecoverOneRunOpts {
-  readonly run: {
-    readonly run_id: string
-    readonly thread_id: string
-    readonly phase: string
-    readonly entity_ref: string
-  }
+  readonly run: RunState
   readonly repo: string
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
   readonly resolveThread: (threadId: string) => Promise<SinkThread | null>
+  readonly resolveLedgerReconcileAdapter?: (repo: string) => Promise<LedgerReconcileAdapter | null>
   readonly coordLogger: {debug: (message: string, context?: Record<string, unknown>) => void}
   readonly logger: GatewayLogger
 }
 
 async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
-  const {run, repo, coordinationConfig, identity, resolveThread, coordLogger, logger} = opts
+  const {run, repo, coordinationConfig, identity, resolveThread, resolveLedgerReconcileAdapter, coordLogger, logger} =
+    opts
 
   logger.info({runId: run.run_id, repo, threadId: run.thread_id}, 'recovery: recovering stale run')
+
+  // ── 0. Reconcile persisted ownership against the live workspace server ──
+  //
+  // Only EXECUTING runs can have dispatched work to reconcile — PENDING and
+  // ACKNOWLEDGED runs never reached execution. Persisted state is advisory
+  // only: a mismatch or an unreachable server must never let this restart
+  // trust staleness alone over what the server itself reports.
+  if (run.phase === 'EXECUTING') {
+    const reconciliation = await reconcileOwnedSessions({run, repo, resolveLedgerReconcileAdapter, logger})
+
+    if (reconciliation.kind === 'live-work-found') {
+      logger.warn(
+        {runId: run.run_id, repo, sessionIds: reconciliation.liveSessionIds},
+        'recovery: skipping FAILED transition and lock release — reconciled owned work is still live on the workspace server',
+      )
+      return
+    }
+
+    if (reconciliation.kind === 'reattach-failed') {
+      // Cannot verify persisted ownership one way or the other. Cancel the run
+      // and record why, but do NOT release its lock — an unverifiable claim
+      // might still name a live writer, and releasing on the strength of
+      // staleness alone is exactly the hazard this reconciliation exists to
+      // close. The lock is left held until a future sweep can verify it.
+      const runKeyResult = getRunKey(coordinationConfig, identity, repo, run.run_id)
+      if (runKeyResult.success === false) {
+        logger.warn(
+          {runId: run.run_id, repo, err: runKeyResult.error.message},
+          'recovery: could not build run key — skipping',
+        )
+        return
+      }
+
+      const runEtag = await resolveEtag(coordinationConfig, runKeyResult.data, 'run', logger)
+      if (runEtag !== null) {
+        const transitionResult = await transitionRun(
+          coordinationConfig,
+          identity,
+          repo,
+          run.run_id,
+          'CANCELLED',
+          runEtag,
+          coordLogger,
+        )
+
+        if (transitionResult.success === false) {
+          logger.warn(
+            {runId: run.run_id, repo, err: transitionResult.error.message},
+            'recovery: transitionRun CANCELLED (unreachable ownership) — continuing',
+          )
+        } else {
+          logger.warn(
+            {runId: run.run_id, repo},
+            'recovery: run cancelled — persisted ownership could not be reconciled against the live workspace server; lock left held rather than released on unverified staleness',
+          )
+        }
+      }
+      return
+    }
+
+    // reconciliation.kind is 'no-persisted-ownership' or 'no-live-work' — no
+    // confirmed live work remains, so the existing FAILED + lock-release path
+    // below is safe to run unchanged.
+  }
 
   // ── 1. Transition run state to FAILED ───────────────────────────────────
 

@@ -269,7 +269,23 @@ jobs:
       )
     name: Fro Bot
     runs-on: ubuntu-latest
+    # Backstop only: the action's own `timeout:` below is the deadline that matters,
+    # because it is the one that can still drain owned background work, cancel what
+    # will not settle, write a job summary, and publish a response. This cap must stay
+    # comfortably above it so the action always expires first -- when the job cap wins
+    # instead, the run is killed with none of that reported. Sized against real run
+    # history: the longest genuine run observed is 43 minutes, nearly all are under ten.
+    timeout-minutes: 75
     steps:
+      - name: Record job start time
+        id: job-start
+        # First step, before checkout, so "Compute action execution budget" below can measure
+        # everything this job did before the action ran -- the PR-head resolution, checkout,
+        # setup, App token mint, and (daily-schedule only) the #1598 runtime-verification
+        # collector, which makes real network calls across every roster owner and is the one
+        # most likely to run long.
+        run: echo "epoch-ms=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
+
       - name: Resolve same-repo PR-head ref
         id: prehead
         env:
@@ -354,6 +370,61 @@ jobs:
             cp "${RUNNER_TEMP}/runtime-verification.json" .context/dmr-runtime-verification/runtime-verification.json
           fi
 
+      - name: Compute action execution budget
+        id: budget
+        # Derives the action's execution deadline from the job-wide 75-minute cap minus an
+        # explicit 15-minute reserve for the action's own teardown (drain owned background
+        # work, cancel what will not settle, write a job summary, publish a response) --
+        # instead of a fixed 60-minute constant that assumes negligible pre-action time.
+        # Everything above this step (PR-head resolution, checkout, setup, App token mint,
+        # and on the daily schedule the #1598 collector's cross-owner network calls) runs
+        # BEFORE the action's `timeout:` clock starts, so an overrun there must shrink the
+        # execution budget, not eat into the reserve -- otherwise the job cap can still fire
+        # first and kill the run with none of the deadline's drain/cancel/report behavior.
+        #
+        # The available budget is never floored upward. Clamping a near-exhausted or negative
+        # budget up to a minimum used to hand the action a deadline with no teardown reserve
+        # left in the job cap at all -- the exact failure this step exists to prevent. Instead,
+        # if less than min_budget_ms remains after the reserve, this step fails outright before
+        # the action ever launches: a clear, early, explained failure beats starting work that
+        # cannot finish or report. min_budget_ms doubles as the minimum admission budget --
+        # below it there is nothing meaningful left to hand out.
+        #
+        # job-start (the job's first step) approximates real job start as closely as a step
+        # timestamp can: it cannot run before the job actually starts, only at or (by a
+        # negligible margin) after it, so elapsed_ms here very slightly undercounts true
+        # elapsed pre-action time rather than overstating it -- treat it as an approximation
+        # the reserve below is sized to comfortably absorb, not an exact clock.
+        #
+        # Release-notes narration keeps its own tighter ceiling (600000ms / 10 minutes,
+        # unrelated to this 60-minute one -- it exists so an unroutable model or provider
+        # stall fails fast) but is now bounded by the same remaining-job-lifetime check below
+        # instead of being handed that fixed value regardless of how much job time is left.
+        run: |
+          set -euo pipefail
+          now_ms=$(date +%s%3N)
+          start_ms="${{ steps.job-start.outputs.epoch-ms }}"
+          elapsed_ms=$(( now_ms - start_ms ))
+          job_cap_ms=$(( 75 * 60 * 1000 ))
+          reserve_ms=$(( 15 * 60 * 1000 ))
+          max_budget_ms=3600000
+          narration_max_budget_ms=600000
+          min_budget_ms=300000
+          available_ms=$(( job_cap_ms - reserve_ms - elapsed_ms ))
+          if [ "${available_ms}" -lt "${min_budget_ms}" ]; then
+            elapsed_min=$(( elapsed_ms / 60000 ))
+            cap_min=$(( job_cap_ms / 60000 ))
+            reserve_min=$(( reserve_ms / 60000 ))
+            echo "::error::Refusing to launch the action: ${elapsed_min}m already elapsed against a ${cap_min}m job cap with a ${reserve_min}m teardown reserve, leaving too little of the job budget to admit a run safely. Failing before launch beats handing the action a deadline it cannot honor." >&2
+            exit 1
+          fi
+          budget_ms=${available_ms}
+          if [ "${budget_ms}" -gt "${max_budget_ms}" ]; then budget_ms=${max_budget_ms}; fi
+          narration_budget_ms=${available_ms}
+          if [ "${narration_budget_ms}" -gt "${narration_max_budget_ms}" ]; then narration_budget_ms=${narration_max_budget_ms}; fi
+          echo "timeout-ms=${budget_ms}" >> "$GITHUB_OUTPUT"
+          echo "narration-timeout-ms=${narration_budget_ms}" >> "$GITHUB_OUTPUT"
+
       - name: Run Fro Bot
         uses: ./
         env:
@@ -413,10 +484,32 @@ jobs:
           # GitHub: the narrator edits the release body directly, so suppression is
           # enforced here, not left to prompt compliance.
           response-mode: ${{ (github.event.inputs.correlation-id != '' && 'none') || inputs.response-mode || 'github' }}
-          # Release-notes narration runs are bounded so an unroutable model or
-          # provider stall fails fast (the successCmd then soft-warns) instead of
-          # hanging the run; all other runs remain unbounded.
-          timeout: ${{ github.event.inputs.correlation-id != '' && '600000' || '0' }}
+          # Release-notes narration runs get a tight bound (still 10 minutes, unrelated to the
+          # job-wide deadline math below) so an unroutable model or provider stall fails fast
+          # (the successCmd then soft-warns) instead of hanging the run. It used to be the fixed
+          # literal '600000' regardless of remaining job lifetime; now it's
+          # steps.budget.outputs.narration-timeout-ms, the same 10-minute ceiling bounded by
+          # whatever job time is actually left, computed alongside the non-narration budget so
+          # both share one fail-before-launch guard. Everything else gets the dynamically
+          # computed budget from "Compute action execution budget" above: the job-wide
+          # 75-minute cap minus a 15-minute teardown reserve minus whatever this job already
+          # spent before this step, ceilinged there and never floored upward past what remains.
+          #
+          # This branch used to be a fixed `'3600000'` (60 minutes). Fixed was wrong: it
+          # assumed pre-action time (PR-head resolution, checkout, setup, App token mint, and
+          # on the daily schedule the #1598 collector's cross-owner network calls) was always
+          # negligible. If it ever exceeded 15 minutes, the 75-minute job cap fired before
+          # this deadline did, killing the run with none of the deadline's drain/cancel/report
+          # behavior -- the exact failure this deadline exists to prevent. Deriving the budget
+          # from elapsed job time closes that gap: pre-action overrun shrinks the budget
+          # instead of eating the reserve.
+          #
+          # Action-internal setup (bootstrap, cache restore, session prep) still runs before
+          # executeOpenCode starts its own relative deadline and is NOT accounted for here --
+          # closing that requires threading a true job-wide deadline through the action's
+          # phases, its post step, and its setup adapters. That's deferred to its own change;
+          # this step only closes the pre-action (job-level) gap.
+          timeout: ${{ github.event.inputs.correlation-id != '' && steps.budget.outputs.narration-timeout-ms || steps.budget.outputs.timeout-ms }}
 
       - name: Upload release-notes candidate
         # Only release-notes runs (both release-tag and correlation-id set) produce a

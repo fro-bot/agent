@@ -1,5 +1,7 @@
+import type {OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode, Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
+import type {AttemptSettlement} from './attempt-outcome.js'
 import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
@@ -38,6 +40,15 @@ export interface AttemptResult {
   /** Compatibility view derived from outcome; outcome is authoritative. */
   readonly shouldRetry: boolean
   readonly eventStreamResult: EventStreamResult
+  /**
+   * Why observation of this attempt stopped, as decided at the one point it was actually decided
+   * -- never re-derived later from a clock read. See attempt-outcome.ts's module doc for the
+   * governing invariant: selecting an error never proves quiescence, and observing quiescence
+   * never erases an error. Every `AttemptResult` construction site states the settlement it
+   * actually observed; callers (execution.ts) read this instead of inferring a cause from deadline
+   * or ledger state observed after the fact.
+   */
+  readonly settlement: AttemptSettlement
 }
 
 export async function sendPromptToSession(
@@ -51,6 +62,7 @@ export async function sendPromptToSession(
   serverUrl?: string | null,
   deadline?: ExecutionDeadline,
   onPermissionAsked?: PermissionAskedResponder,
+  ownershipLedger?: OwnershipLedger,
 ): Promise<AttemptResult> {
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart, ...(fileParts ?? [])]
@@ -81,6 +93,7 @@ export async function sendPromptToSession(
         llmError: promptLlmError,
         outcome,
         shouldRetry: shouldRetryFromOutcome(outcome),
+        settlement: {kind: 'failure-observed'},
         eventStreamResult: {
           tokens: null,
           model: null,
@@ -117,6 +130,7 @@ export async function sendPromptToSession(
         deadline,
         attemptAbortController,
         onPermissionAsked,
+        ownershipLedger,
       )
     return await runAttempt()
   } finally {

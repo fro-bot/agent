@@ -108,6 +108,31 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
           ? 'state persisted to the object store by main action'
           : 'main action skipped the save'
     logger.info(`Skipping post-action: ${skipReason}`, {cacheSaved})
+  } else if (cacheSaved === 'declined-for-safety') {
+    // runCleanup's persistence safety gate declined the save because it could not confirm
+    // no other writer could still be touching this session's state (unresolved background
+    // subagent ownership, unconfirmed OpenCode server quiescence, or a failed coordination
+    // lease renewal -- see runCleanup, src/harness/phases/cleanup.ts). This post hook must
+    // honor that decline rather than override it: it runs with strictly LESS information
+    // than cleanup had -- no OpenCodeServerHandle, no ownership ledger, no lease -- so it
+    // cannot be more confident that persisting now is safe than the step that just declined.
+    // A process-boundary argument does not rescue a blind retry here: a failed lease
+    // renewal means another surface (the Discord gateway, or a retried Action run) may hold
+    // the lock and be writing the same object-store prefix regardless of which process this
+    // is, and unconfirmed quiescence means the OpenCode child's exit was never confirmed --
+    // a runner does not guarantee orphaned children are reaped between steps, so "it must be
+    // gone by now" is an assumption, not a guarantee, in exactly the case that produced this
+    // decline. See CacheSaveStateValue's `declined-for-safety` doc (cache-save-result.ts)
+    // for why this is the one state value that must NOT fall through to the retry branch
+    // below, unlike every other not-persisted case.
+    logger.info('Skipping post-action: honoring persistence safety decline from main action, not retrying', {
+      cacheSaved,
+    })
+    await writeCacheSaveResultSummary(
+      {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'},
+      'post-skip-safety',
+      logger,
+    )
   } else {
     const runId = String(getGitHubRunId())
     try {
@@ -115,11 +140,24 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
       // OpenCodeServerHandle in this process at all -- runPost is the Action's separate
       // `post:` step, invoked by the runner as a fresh process well after the main step
       // (and everything it spawned, including the OpenCode child cleanup.ts shut down)
-      // has already exited. A process boundary is a strictly stronger guarantee than the
-      // port-liveness poll cleanup.ts relies on: there is no live writer left to race
-      // against a checkpoint here, only the possibility that the main step's own shutdown
-      // sequence never got far enough to attempt one (e.g. it crashed first). That is what
-      // this retry exists to cover, and it needs no quiescence step of its own to do it.
+      // has already exited.
+      //
+      // This branch only ever runs for `not-persisted`: nothing durable happened yet
+      // (checkpoint declined for a reason unrelated to persistence safety, no cacheable
+      // content existed, or a cache write was rejected/errored with no store persistence),
+      // or the state was absent/garbled. It deliberately does NOT run for
+      // `declined-for-safety` (see the branch above) -- that decline is not a "nothing
+      // happened yet" gap this retry can safely close. A process boundary proves there is
+      // no live writer *in this run's own process tree*, which is enough to justify
+      // retrying an ordinary not-persisted save. It proves nothing about a failed lease
+      // renewal (another surface entirely -- the Discord gateway, or a retried Action run --
+      // may hold the lock and be writing the same object-store prefix right now, regardless
+      // of which process this one is) or about unconfirmed quiescence (a runner does not
+      // guarantee orphaned children are reaped between steps, so "the OpenCode child must be
+      // gone by now" is an assumption, not a guarantee, in exactly the case that produced
+      // that decline). That is why those two reasons, plus unresolved ownership, get their
+      // own state value that skips this branch entirely rather than relying on this retry's
+      // reasoning to cover them too.
       const components = buildCacheKeyComponents()
       // GITHUB_WORKSPACE is a runner-level environment variable set for the whole job,
       // not something that requires STATE handoff from the main step — it is available

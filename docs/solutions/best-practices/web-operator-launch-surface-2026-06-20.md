@@ -1,7 +1,7 @@
 ---
 title: 'Web operator launch surface: fire-and-return, server-owned resolution, denylist-before-authz on a write route'
 date: 2026-06-20
-last_updated: 2026-06-26
+last_updated: 2026-09-19
 category: best-practices
 module: gateway
 problem_type: best_practice
@@ -104,6 +104,10 @@ export function createWebAutoDenyApproval(logger?: OperatorLogger) {
 ```
 
 Implication for callers: a web-launched run can only complete work that needs **no** tool approval until a real interactive web approval transport ships. This is the right v1 posture — fail fast, never deadlock — and the deferred replacement is tracked, not forgotten.
+
+**This pattern does not generalize across surfaces (added 2026-09-19).** Auto-denying every request is correct here for one reason: a web launch has no interactive approver, so nothing is lost by refusing. On a surface that *does* have a human approver — the Discord gateway, where a person can answer in the bound thread — answering on their behalf both discards a real approval path and crosses the ownership boundary that keeps one run's approval out of another run's thread.
+
+The distinction is who can answer, not whether answering is convenient. Before reusing this transport, confirm the target surface has no approver and owns its own server. The Action satisfies both (its own loopback server, no interactive path in CI) and answers everything; the gateway satisfies neither and must not. See `docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md`, where the opposite mistake — filtering asks on a surface that had to answer them — hung runs until their deadline.
 
 ### 4. Additive, optional engine seams keep the other transport byte-identical
 

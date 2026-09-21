@@ -1,4 +1,4 @@
-import type {CoordinationConfig, RunPhase, RunState} from '@fro-bot/runtime'
+import type {CoordinationConfig, LedgerReconcileAdapter, RunPhase, RunState} from '@fro-bot/runtime'
 import type {BindingsStore} from '../bindings/store.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
@@ -23,6 +23,11 @@ vi.mock('@fro-bot/runtime', async () => {
     forceReleaseStaleLock: vi.fn(),
     // parseRunState is pure JSON-shape validation — use the real implementation.
     parseRunState: actual.parseRunState,
+    // createOwnershipLedger is a pure in-memory primitive — use the real implementation.
+    createOwnershipLedger: actual.createOwnershipLedger,
+    // reconcileLedgerOnce is a pure function over the ledger and the injected adapter — use the
+    // real implementation so recovery's use of it is exercised, not mocked away.
+    reconcileLedgerOnce: actual.reconcileLedgerOnce,
   }
 })
 
@@ -64,7 +69,9 @@ function makeLogger(): GatewayLogger {
   }
 }
 
-function makeStaleRun(overrides: Partial<{run_id: string; thread_id: string; phase: RunPhase}> = {}): RunState {
+function makeStaleRun(
+  overrides: Partial<{run_id: string; thread_id: string; phase: RunPhase; details: Record<string, unknown>}> = {},
+): RunState {
   return {
     run_id: overrides.run_id ?? RUN_ID,
     thread_id: overrides.thread_id ?? THREAD_ID,
@@ -74,7 +81,28 @@ function makeStaleRun(overrides: Partial<{run_id: string; thread_id: string; pha
     started_at: new Date(Date.now() - 300_000).toISOString(),
     last_heartbeat: new Date(Date.now() - 300_000).toISOString(),
     holder_id: 'discord-gateway',
-    details: {},
+    details: overrides.details ?? {},
+  }
+}
+
+const ROOT_SESSION_ID = 'ses-root-001'
+const OWNED_SESSION_ID = 'ses-child-001'
+
+/** Build `run.details` carrying a persisted ownership claim for reconciliation tests. */
+function persistedOwnershipDetails(
+  overrides: {rootSessionId?: string; ownedSessionIds?: string[]} = {},
+): Record<string, unknown> {
+  return {
+    rootSessionId: overrides.rootSessionId ?? ROOT_SESSION_ID,
+    ownedSessionIds: overrides.ownedSessionIds ?? [OWNED_SESSION_ID],
+  }
+}
+
+/** Build a `LedgerReconcileAdapter` test double, mirroring the pattern in ledger-reconcile.test.ts. */
+function makeLedgerReconcileAdapter(overrides: Partial<LedgerReconcileAdapter> = {}): LedgerReconcileAdapter {
+  return {
+    children: overrides.children ?? vi.fn().mockResolvedValue({success: true, data: []}),
+    liveSessionIds: overrides.liveSessionIds ?? vi.fn().mockResolvedValue({success: true, data: new Set<string>()}),
   }
 }
 
@@ -160,6 +188,7 @@ function makeDeps(overrides: Partial<RecoverStaleRunsDeps> = {}): RecoverStaleRu
     identity: overrides.identity ?? 'discord-gateway',
     bindingsStore: overrides.bindingsStore ?? makeBindingsStore(),
     resolveThread: overrides.resolveThread ?? makeResolveThread(),
+    resolveLedgerReconcileAdapter: overrides.resolveLedgerReconcileAdapter,
     logger: overrides.logger ?? makeLogger(),
   }
 }
@@ -814,6 +843,294 @@ describe('recoverStaleRuns', () => {
       // #then — lock release is NOT called (ownership mismatch — runId: null !== stale RUN_ID)
       expect(mockReleaseLock).not.toHaveBeenCalled()
       // #and — transition still happened
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+    })
+  })
+
+  describe('startup reconciliation (Unit 7) — persisted ownership vs the live workspace server', () => {
+    it('happy path: a restart with no surviving work admits runs immediately (no persisted ownership to reconcile)', async () => {
+      // #given — a stale EXECUTING run whose details carry no persisted ownership claim
+      const staleRun = makeStaleRun()
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      const resolveLedgerReconcileAdapter = vi.fn()
+      const deps = makeDeps({resolveLedgerReconcileAdapter})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — no reconciliation attempted; existing FAILED + lock-release proceeds immediately
+      expect(resolveLedgerReconcileAdapter).not.toHaveBeenCalled()
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).toHaveBeenCalled()
+    })
+
+    it('happy path: persisted ownership whose sessions are confirmed finished still admits immediately', async () => {
+      // #given — persisted ownership names a session the server recognizes as a child, but it is not live
+      const staleRun = makeStaleRun({details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      const adapter = makeLedgerReconcileAdapter({
+        children: vi.fn().mockResolvedValue({success: true, data: [{id: OWNED_SESSION_ID}]}),
+        liveSessionIds: vi.fn().mockResolvedValue({success: true, data: new Set<string>()}),
+      })
+      const resolveLedgerReconcileAdapter = vi.fn().mockResolvedValue(adapter)
+      const deps = makeDeps({resolveLedgerReconcileAdapter})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — confirmed finished, not live: existing FAILED + lock-release proceeds
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).toHaveBeenCalled()
+    })
+
+    it('edge case: a run whose owned sessions still exist is reconciled before admission, and the run is held rather than failed', async () => {
+      // #given — persisted ownership names a session the server recognizes AND reports live
+      const staleRun = makeStaleRun({details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      const childrenFn = vi.fn().mockResolvedValue({success: true, data: [{id: OWNED_SESSION_ID}]})
+      const liveFn = vi.fn().mockResolvedValue({success: true, data: new Set([OWNED_SESSION_ID])})
+      const adapter = makeLedgerReconcileAdapter({children: childrenFn, liveSessionIds: liveFn})
+      const resolveLedgerReconcileAdapter = vi.fn().mockResolvedValue(adapter)
+      const logger = makeLogger()
+      const deps = makeDeps({resolveLedgerReconcileAdapter, logger})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — reconciliation ran (children + liveSessionIds both queried) BEFORE any decision
+      expect(childrenFn).toHaveBeenCalledWith(ROOT_SESSION_ID)
+      expect(liveFn).toHaveBeenCalledOnce()
+      // #and — the run is neither failed nor does its lock get released; live work holds it
+      expect(mockTransitionRun).not.toHaveBeenCalled()
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({runId: RUN_ID, repo: REPO_SLUG, sessionIds: [OWNED_SESSION_ID]}),
+        expect.stringContaining('still live on the workspace server'),
+      )
+    })
+
+    it('edge case: persisted state naming a session the live server does not recognize as owned is downgraded to unknown rather than restored', async () => {
+      // #given — persisted ownership names a session; the live server's children() does NOT include it
+      // at all (a corrupted/wrong persisted claim), regardless of whether that id happens to be live
+      // somewhere else. This must never be treated as this run's live work.
+      const staleRun = makeStaleRun({details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      const childrenFn = vi.fn().mockResolvedValue({success: true, data: []}) // not a recognized child at all
+      const liveFn = vi.fn().mockResolvedValue({success: true, data: new Set([OWNED_SESSION_ID])}) // happens to be "live" elsewhere
+      const adapter = makeLedgerReconcileAdapter({children: childrenFn, liveSessionIds: liveFn})
+      const resolveLedgerReconcileAdapter = vi.fn().mockResolvedValue(adapter)
+      const logger = makeLogger()
+      const deps = makeDeps({resolveLedgerReconcileAdapter, logger})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — downgraded to unknown, NOT restored as live-owned: normal recovery proceeds
+      // (FAILED + lock release), and the mismatch is logged distinctly.
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({runId: RUN_ID, repo: REPO_SLUG, sessionIds: [OWNED_SESSION_ID]}),
+        expect.stringContaining('does not recognize as owned'),
+      )
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).toHaveBeenCalled()
+    })
+
+    it('error path: an owned session that cannot be reattached is cancelled and recorded, without releasing its lock', async () => {
+      // #given — persisted ownership present, but the adapter's children() call fails
+      const staleRun = makeStaleRun({details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      const adapter = makeLedgerReconcileAdapter({
+        children: vi.fn().mockResolvedValue({success: false, error: new Error('workspace server unreachable')}),
+      })
+      const resolveLedgerReconcileAdapter = vi.fn().mockResolvedValue(adapter)
+      const logger = makeLogger()
+      mockTransitionRun.mockResolvedValue({
+        success: true,
+        data: {etag: 'etag-cancel', state: makeStaleRun({phase: 'CANCELLED'})},
+      })
+      const deps = makeDeps({resolveLedgerReconcileAdapter, logger})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — cancelled (not FAILED), recorded via warn logs, and the lock is left untouched
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'CANCELLED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({runId: RUN_ID, repo: REPO_SLUG}),
+        expect.stringContaining('run cancelled'),
+      )
+    })
+
+    it('error path: no resolveLedgerReconcileAdapter configured is treated the same as unreachable', async () => {
+      // #given — persisted ownership present, but recovery has no way to reach the workspace server at all
+      const staleRun = makeStaleRun({details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      const logger = makeLogger()
+      mockTransitionRun.mockResolvedValue({
+        success: true,
+        data: {etag: 'etag-cancel', state: makeStaleRun({phase: 'CANCELLED'})},
+      })
+      const deps = makeDeps({logger}) // no resolveLedgerReconcileAdapter
+
+      // #when — must not throw
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'CANCELLED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+    })
+
+    it('error path: an adapter resolving to null (workspace unreachable) is treated the same as unreachable', async () => {
+      // #given
+      const staleRun = makeStaleRun({details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      const resolveLedgerReconcileAdapter = vi.fn().mockResolvedValue(null)
+      mockTransitionRun.mockResolvedValue({
+        success: true,
+        data: {etag: 'etag-cancel', state: makeStaleRun({phase: 'CANCELLED'})},
+      })
+      const deps = makeDeps({resolveLedgerReconcileAdapter})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'CANCELLED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+    })
+
+    it('edge case: no conflicting run is admitted until reconciliation finishes (recoverStaleRuns awaits it)', async () => {
+      // #given — the adapter's children() call resolves only after we manually release a deferred promise
+      const staleRun = makeStaleRun({details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+
+      let releaseChildren: (() => void) | undefined
+      const childrenGate = new Promise<void>(resolve => {
+        releaseChildren = resolve
+      })
+      const childrenFn = vi.fn().mockImplementation(async () => {
+        await childrenGate
+        return {success: true, data: [{id: OWNED_SESSION_ID}]}
+      })
+      const liveFn = vi.fn().mockResolvedValue({success: true, data: new Set([OWNED_SESSION_ID])})
+      const adapter = makeLedgerReconcileAdapter({children: childrenFn, liveSessionIds: liveFn})
+      const resolveLedgerReconcileAdapter = vi.fn().mockResolvedValue(adapter)
+      const deps = makeDeps({resolveLedgerReconcileAdapter})
+
+      // #when — start the sweep but do not await it yet
+      const sweepPromise = recoverStaleRuns(deps)
+
+      // Race the sweep against a short timeout while the children() gate is held closed —
+      // if the sweep resolved before reconciliation finished, it would win this race.
+      const pendingSentinel = Symbol('pending')
+      const raceResult = await Promise.race([
+        sweepPromise.then(() => 'resolved' as const),
+        new Promise<typeof pendingSentinel>(resolve => setTimeout(() => resolve(pendingSentinel), 20)),
+      ])
+
+      // #then — the sweep has NOT resolved while reconciliation is still pending
+      expect(raceResult).toBe(pendingSentinel)
+
+      // #when — release the gate
+      releaseChildren?.()
+      await sweepPromise
+
+      // #then — no FAILED/lock-release happened (live work found) once reconciliation completed
+      expect(mockTransitionRun).not.toHaveBeenCalled()
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+    })
+
+    it('integration: a lock held by a reconciled run is not released while its work is live', async () => {
+      // #given — the same repo lock is owned by the stale EXECUTING run, and its persisted
+      // ownership is confirmed live by the workspace server
+      const staleRun = makeStaleRun({details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      const adapter = makeLedgerReconcileAdapter({
+        children: vi.fn().mockResolvedValue({success: true, data: [{id: OWNED_SESSION_ID}]}),
+        liveSessionIds: vi.fn().mockResolvedValue({success: true, data: new Set([OWNED_SESSION_ID])}),
+      })
+      const resolveLedgerReconcileAdapter = vi.fn().mockResolvedValue(adapter)
+      const deps = makeDeps({resolveLedgerReconcileAdapter})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — the lock this run holds (LOCK_KEY, run_id: RUN_ID per makeCoordinationConfig) is
+      // never released, and no other run could acquire it since it was never freed.
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+      expect(mockForceReleaseStaleLock).not.toHaveBeenCalled()
+    })
+
+    it('does not attempt reconciliation for stale PENDING or ACKNOWLEDGED runs (no dispatched work is possible)', async () => {
+      // #given — a stale PENDING run whose details happen to carry a persisted ownership claim
+      // (should never occur in practice, but recovery must not act on it for a phase that never executed)
+      const stalePending = makeStaleRun({phase: 'PENDING', details: persistedOwnershipDetails()})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [stalePending]})
+      const resolveLedgerReconcileAdapter = vi.fn()
+      const deps = makeDeps({resolveLedgerReconcileAdapter})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — reconciliation is never attempted for a non-EXECUTING run
+      expect(resolveLedgerReconcileAdapter).not.toHaveBeenCalled()
       expect(mockTransitionRun).toHaveBeenCalledWith(
         expect.anything(),
         'discord-gateway',

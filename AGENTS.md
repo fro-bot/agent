@@ -31,7 +31,7 @@ Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full d
 - **Functions only**: No ES6 classes; closures for stateful patterns
 - **Logger injection**: Every function takes `logger` parameter
 - **Result types**: `Result<T, E>` from `@bfra.me/es` for recoverable errors
-- **Readonly interfaces**: All properties use `readonly`
+- **Readonly interfaces**: All properties use `readonly` — except per-invocation mutable trackers threaded through the SSE event loop (`ActivityTracker` and its `RootFreshnessTracker` in `src/features/agent/streaming.ts`), where functional updates would allocate per token delta
 - **Strict booleans**: No implicit falsy checks (`!value`); use explicit comparisons
 - **Adapter pattern**: `CacheAdapter`, `ExecAdapter` for testable I/O
 - **Prettier**: 120-char line width via `@bfra.me/prettier-config/120-proof`

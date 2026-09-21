@@ -1,13 +1,16 @@
-import type {SessionSearchResult} from '@fro-bot/runtime'
+import type {SessionClient, SessionSearchResult} from '@fro-bot/runtime'
 import type {AgentResult} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
+import type {Logger} from '../../shared/logger.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
+import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {executeOpenCode} from '../../features/agent/index.js'
-import {runExecute} from './execute.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
+import {computeDrainDeadlineMs, DEFAULT_DRAIN_TEARDOWN_RESERVE_MS, runDrain, runExecute} from './execute.js'
 
 const mocks = vi.hoisted(() => ({
   archiveSession: vi.fn(),
@@ -44,14 +47,18 @@ vi.mock('node:fs/promises', () => ({
   rm: mocks.removeResponseFile,
 }))
 
-vi.mock('@fro-bot/runtime', () => ({
-  archiveSession: mocks.archiveSession,
-  findLatestSession: mocks.findLatestSession,
-  parseResponseFile: mocks.parseResponseFile,
-  resolveResponseDelivery: mocks.resolveResponseDelivery,
-  searchSessions: mocks.searchSessions,
-  writeSessionSummary: mocks.writeSessionSummary,
-}))
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original: typeof import('@fro-bot/runtime') = await importOriginal()
+  return {
+    ...original,
+    archiveSession: mocks.archiveSession,
+    findLatestSession: mocks.findLatestSession,
+    parseResponseFile: mocks.parseResponseFile,
+    resolveResponseDelivery: mocks.resolveResponseDelivery,
+    searchSessions: mocks.searchSessions,
+    writeSessionSummary: mocks.writeSessionSummary,
+  }
+})
 
 vi.mock('../../features/agent/index.js', () => ({
   executeOpenCode: mocks.executeOpenCode,
@@ -88,6 +95,7 @@ function createAgentResult(overrides: Partial<AgentResult> = {}): AgentResult {
       message: 'The model context window was exceeded.',
       retryable: false,
     },
+    observationGap: false,
     ...overrides,
   }
 }
@@ -722,5 +730,646 @@ describe('runExecute overflow recovery', () => {
     expect(mocks.searchSessions).not.toHaveBeenCalled()
     expect(result).toMatchObject({success: true, sessionId: 'successful-session', llmError: null})
     expect(result.overflowRecovery).toBeUndefined()
+  })
+})
+
+/** A client whose one adopted child always reports live -- forces drain past reconciliation into cancellation. */
+function createStuckSessionClient(callOrder: string[]): SessionClient {
+  return createFakeSessionClient({
+    children: async () => ({data: [{id: 'ses_child'}]}),
+    status: async () => ({data: {ses_child: {}}}),
+    abort: async (args: {path: {id: string}; signal: AbortSignal}) => {
+      callOrder.push(`abort:${args.path.id}`)
+      return {data: {}}
+    },
+  })
+}
+
+describe('runExecute overflow recovery — ownership ledger (Unit 11)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(executeOpenCode).mockReset()
+    mocks.readResponseFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
+    mocks.resolveOutputMode.mockReturnValue('branch-pr')
+    mocks.getInput.mockReturnValue('branch-pr')
+    mocks.searchSessions.mockResolvedValue([])
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('cancels outstanding work on the overflowed session before archiving it', async () => {
+    // #given the overflowed session's execution adopted a background dispatch that is still
+    // outstanding, and a client that never confirms it stopped
+    const callOrder: string[] = []
+    const cacheRestore = createCacheRestore()
+    const client = createStuckSessionClient(callOrder)
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockImplementation(async (_url: string, sessionId: string) => {
+      callOrder.push(`archive:${sessionId}`)
+      return true
+    })
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, sessionId: 'recovered-session', llmError: null}),
+    )
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs and overflow recovery kicks in
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then the outstanding entry was cancelled BEFORE the overflowed session was archived
+    expect(callOrder).toEqual(['abort:ses_child', 'archive:overflowed-session'])
+  })
+
+  it('starts the recovery session with a fresh ledger rather than inheriting the exhausted one', async () => {
+    // #given the overflowed session's ledger has outstanding work at the moment recovery begins
+    const callOrder: string[] = []
+    const cacheRestore = createCacheRestore()
+    const client = createStuckSessionClient(callOrder)
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockResolvedValue(true)
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, sessionId: 'recovered-session', llmError: null}),
+    )
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs and overflow recovery starts a fresh session
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then the recovery call received a DIFFERENT ledger object with nothing outstanding --
+    // caps reset rather than carrying over the overflowed session's exhausted budget
+    const firstLedger = vi.mocked(executeOpenCode).mock.calls[0]?.[4]
+    const recoveryLedger = vi.mocked(executeOpenCode).mock.calls[1]?.[4]
+    expect(recoveryLedger).toBeDefined()
+    expect(recoveryLedger).not.toBe(firstLedger)
+    expect(recoveryLedger?.outstanding()).toBe(0)
+  })
+
+  it('marks the entry unknown, blocking persistence, when cancellation cannot be confirmed during recovery', async () => {
+    // #given the overflowed session's outstanding entry is cancelled but the client never
+    // confirms it actually stopped (still reports live on every subsequent check)
+    const callOrder: string[] = []
+    const cacheRestore = createCacheRestore()
+    const client = createStuckSessionClient(callOrder)
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockResolvedValue(true)
+    let overflowedLedgerRef: import('@fro-bot/runtime').OwnershipLedger | undefined
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      overflowedLedgerRef = ledger
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, sessionId: 'recovered-session', llmError: null}),
+    )
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs and archives the overflowed session
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then a cancellation request was made, but it is never treated as confirmed on the
+    // strength of the abort call alone -- the entry lands in unknown, and persistence
+    // safety (isPersistenceSafe) reflects that honestly rather than reporting drained
+    expect(callOrder).toContain('abort:ses_child')
+    expect(overflowedLedgerRef?.snapshot()).toContainEqual({
+      sessionId: 'ses_child',
+      label: 'background task',
+      state: 'unknown',
+    })
+    expect(overflowedLedgerRef?.isPersistenceSafe()).toBe(false)
+  })
+
+  it('leaves the overflowed session with no outstanding work by the time the recovery session begins (integration)', async () => {
+    // #given the same stuck-work setup as the cancellation tests above
+    const callOrder: string[] = []
+    const cacheRestore = createCacheRestore()
+    const client = createStuckSessionClient(callOrder)
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockResolvedValue(true)
+    let overflowedLedgerRef: import('@fro-bot/runtime').OwnershipLedger | undefined
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      overflowedLedgerRef = ledger
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockImplementationOnce(async () => {
+      // #then by the time the SECOND (recovery) call starts, the overflowed session's
+      // ledger has nothing left outstanding -- no two sessions hold outstanding work
+      // on this workspace at the same time
+      expect(overflowedLedgerRef?.outstanding()).toBe(0)
+      return createAgentResult({
+        success: true,
+        exitCode: 0,
+        error: null,
+        sessionId: 'recovered-session',
+        llmError: null,
+      })
+    })
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    expect(vi.mocked(executeOpenCode)).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('computeDrainDeadlineMs', () => {
+  it('reserves 30 seconds for teardown by default', () => {
+    // #given the invocation's total timeout and how long execution already took
+    // #when the remaining drain budget is computed with the default reserve
+    const deadlineMs = computeDrainDeadlineMs(120_000, 10_000)
+
+    // #then the reserve is subtracted alongside the elapsed execution time
+    expect(DEFAULT_DRAIN_TEARDOWN_RESERVE_MS).toBe(30_000)
+    expect(deadlineMs).toBe(120_000 - 30_000 - 10_000)
+  })
+
+  it('never returns a negative budget', () => {
+    // #given execution and the reserve already exceed the total timeout
+    // #when the remaining drain budget is computed
+    const deadlineMs = computeDrainDeadlineMs(1_000, 900)
+
+    // #then the budget floors at zero rather than going negative
+    expect(deadlineMs).toBe(0)
+  })
+
+  it('accepts an overridden teardown reserve', () => {
+    // #given a caller-supplied reserve, distinct from the default
+    // #when the remaining drain budget is computed
+    const deadlineMs = computeDrainDeadlineMs(100_000, 5_000, 10_000)
+
+    // #then the override is used instead of the default 30 seconds
+    expect(deadlineMs).toBe(100_000 - 10_000 - 5_000)
+  })
+})
+
+function createFakeSessionClient(overrides: {
+  children?: () => Promise<{data?: unknown; error?: unknown}>
+  status?: () => Promise<{data?: unknown; error?: unknown}>
+  abort?: (args: {path: {id: string}; signal: AbortSignal}) => Promise<{data?: unknown; error?: unknown}>
+}): SessionClient {
+  return {
+    session: {
+      children: overrides.children ?? (async () => ({data: []})),
+      status: overrides.status ?? (async () => ({data: {}})),
+      abort: overrides.abort ?? (async () => ({data: {}})),
+    },
+  } as unknown as SessionClient
+}
+
+describe('runDrain', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  it('is a complete no-op when no ledger is supplied', async () => {
+    // #given a run with no ownership ledger at all -- today's production shape
+    const children = vi.fn(async () => ({data: []}))
+    const client = createFakeSessionClient({children})
+
+    // #when drain runs without a ledger
+    const outcome = await runDrain({
+      ledger: undefined,
+      client,
+      parentSessionId: 'ses_root',
+      deadlineMs: 60_000,
+      logger,
+    })
+
+    // #then nothing is reconciled or cancelled -- single-session runs are unchanged
+    expect(children).not.toHaveBeenCalled()
+    expect(outcome).toEqual({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0})
+  })
+
+  it('completes immediately when nothing is outstanding, without delaying finalize', async () => {
+    // #given a ledger with nothing tracked at all -- reconciliation has nothing to
+    // settle, so it must never call upstream just to check
+    const ledger = createOwnershipLedger()
+    const children = vi.fn(async () => ({data: []}))
+    const status = vi.fn(async () => ({data: {}}))
+    const client = createFakeSessionClient({children, status})
+
+    // #when drain runs
+    const outcome = await runDrain({
+      ledger,
+      client,
+      parentSessionId: 'ses_root',
+      deadlineMs: 60_000,
+      logger,
+    })
+
+    // #then the empty-ledger short circuit means reconciliation never calls upstream at
+    // all -- there is nothing tracked for `children`/`liveSessionIds` to confirm against,
+    // so drain completes without the round trip and without delaying finalize
+    expect(children).not.toHaveBeenCalled()
+    expect(status).not.toHaveBeenCalled()
+    expect(outcome.expired).toBe(false)
+    expect(outcome.unknownCount).toBe(0)
+  })
+
+  it('settles outstanding work discovered before finalize, via periodic reconciliation', async () => {
+    // #given a ledger with one adopted entry that is still live on the first pass
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const status = vi.fn<() => Promise<{data: Record<string, unknown>}>>()
+      status.mockResolvedValueOnce({data: {ses_child: {}}}).mockResolvedValue({data: {}})
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status,
+      })
+
+      // #when drain runs and the periodic reconciler fires
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 5_000,
+        logger,
+        reconcileIntervalMs: 20,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the entry settles once the child is no longer live, and finalize can proceed
+      expect(outcome.expired).toBe(false)
+      expect(outcome.unknownCount).toBe(0)
+      expect(ledger.snapshot()).toContainEqual({sessionId: 'ses_child', label: 'background task', state: 'settled'})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('settles a tracked entry whose completion event never arrived, via periodic reconciliation when no discontinuity was ever detected', async () => {
+    // #given a ledger entry the event stream never confirmed complete -- an earlier pass
+    // already downgraded it to unknown -- and no discontinuity ever fired to trigger a
+    // recheck. Only the interval-driven periodic pass can still confirm it settled.
+    // Reconciliation cannot adopt an untracked session; this entry is tracked from the start.
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      ledger.markUnknown('ses_child')
+      const status = vi.fn<() => Promise<{data: Record<string, unknown>}>>()
+      status.mockResolvedValueOnce({data: {ses_child: {}}}).mockResolvedValue({data: {}})
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status,
+      })
+
+      // #when drain runs and the periodic reconciler fires
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 5_000,
+        logger,
+        reconcileIntervalMs: 20,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the already-tracked entry, confirmed a child and no longer live, settles once
+      // a later pass observes it -- the dropped settlement is recovered, not a dropped dispatch
+      expect(outcome.expired).toBe(false)
+      expect(ledger.snapshot()).toContainEqual({sessionId: 'ses_child', label: 'background task', state: 'settled'})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not adopt an untracked live child -- drain completes without it (documented gap)', async () => {
+    // #given a live child session upstream reports under this parent, but the ledger
+    // never learned of it at all -- e.g. its dispatch event was dropped before ever
+    // reaching the ledger. There is no tracked entry for it, tracked or otherwise.
+    const ledger = createOwnershipLedger()
+    const children = vi.fn(async () => ({data: [{id: 'ses_untracked'}]}))
+    const status = vi.fn(async () => ({data: {ses_untracked: {}}}))
+    const client = createFakeSessionClient({children, status})
+
+    // #when drain runs
+    const outcome = await runDrain({
+      ledger,
+      client,
+      parentSessionId: 'ses_root',
+      deadlineMs: 60_000,
+      logger,
+    })
+
+    // #then the ledger has nothing tracked, so reconciliation's empty-ledger short circuit
+    // means `children`/`status` are never even called -- the untracked live child is never
+    // adopted, never appears in the ledger, and drain completes without waiting on it. This
+    // is the documented, bounded gap: a future change that reintroduces adoption would need
+    // to call upstream even for an empty ledger, and this assertion would catch it.
+    expect(children).not.toHaveBeenCalled()
+    expect(status).not.toHaveBeenCalled()
+    expect(outcome.expired).toBe(false)
+    expect(ledger.snapshot()).toHaveLength(0)
+  })
+
+  it('cancels outstanding work with a fresh signal when the deadline expires, and reports incomplete', async () => {
+    // #given an entry that never settles, and a client whose abort call succeeds and is
+    // then confirmed by a positive post-cancellation liveness check
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      let abortSignalAtCallTime: AbortSignal | null = null
+      let liveAfterAbort = false
+      const abort = vi.fn(async (args: {path: {id: string}; signal: AbortSignal}) => {
+        abortSignalAtCallTime = args.signal
+        liveAfterAbort = false
+        return {data: {}}
+      })
+      const status = vi.fn(async () => ({data: liveAfterAbort ? {ses_child: {}} : {}}))
+      liveAfterAbort = true
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status,
+        abort,
+      })
+
+      // #when drain runs past its deadline
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then cancellation was requested with a signal that is not already aborted --
+      // distinct from any expired execution-deadline signal -- and confirmed settled
+      expect(abort).toHaveBeenCalledWith({path: {id: 'ses_child'}, signal: expect.any(AbortSignal) as AbortSignal})
+      expect(abortSignalAtCallTime).not.toBeNull()
+      expect((abortSignalAtCallTime as unknown as AbortSignal).aborted).toBe(false)
+      expect(outcome).toMatchObject({expired: true, cancelledCount: 1, settledCount: 1, unknownCount: 0})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('leaves an entry unknown when the deadline expires and cancellation cannot be confirmed', async () => {
+    // #given an entry that never settles, and a post-cancellation liveness check that still
+    // (or again) reports it live -- cancellation was requested but nothing confirms the
+    // child actually stopped
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status: async () => ({data: {ses_child: {}}}),
+      })
+
+      // #when drain runs past its deadline
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the entry is downgraded to unknown, not falsely reported settled
+      expect(outcome).toMatchObject({expired: true, cancelledCount: 1, settledCount: 0, unknownCount: 1})
+      expect(ledger.snapshot()).toContainEqual({sessionId: 'ses_child', label: 'background task', state: 'unknown'})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels an already-unknown entry at deadline expiry, not only outstanding ones', async () => {
+    // #given an entry already downgraded to unknown (e.g. a prior failed reconciliation
+    // pass) BEFORE the deadline fires — exactly the entry most likely still live.
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      ledger.markUnknown('ses_child')
+      const abort = vi.fn(async () => ({data: {}}))
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status: async () => ({data: {ses_child: {}}}),
+        abort,
+      })
+
+      // #when drain runs past its deadline
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the unknown entry was cancelled, not skipped because it was never
+      // `outstanding`
+      expect(abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'ses_child'}}))
+      expect(outcome.cancelledCount).toBe(1)
+      expect(ledger.snapshot().find(entry => entry.sessionId === 'ses_child')?.state).toBe('unknown')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('includes a still-live tracked entry in the cancel set, reconfirmed by the final reconciliation pass', async () => {
+    // #given a known outstanding entry that stays a live child of this parent through
+    // every reconciliation pass, including the final pass `cancelOutstanding` runs
+    // immediately before building the cancel set -- not just the earlier passes made
+    // during the wait loop. Reconciliation cannot adopt a new, previously-untracked
+    // child; only this already-tracked entry is ever at stake.
+    vi.useFakeTimers()
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_known', 'background task')
+      const abort = vi.fn(async () => ({data: {}}))
+      const children = vi.fn(async () => ({data: [{id: 'ses_known'}]}))
+      const client = createFakeSessionClient({
+        children,
+        status: async () => ({data: {ses_known: {}}}),
+        abort,
+      })
+
+      // #when drain runs past its deadline; the periodic reconciler's interval is
+      // longer than the deadline so it never fires -- only the unconditional first
+      // pass and the cancel-path's final pass ever call `children()`.
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: 'ses_root',
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      const outcome = await outcomePromise
+
+      // #then the final reconciliation pass ran (a second `children()` call beyond the
+      // unconditional first pass), re-confirming the entry is still this parent's live
+      // child before the cancel set is built -- so it is cancelled, not silently skipped
+      // because an earlier snapshot was taken before that pass ran.
+      expect(children.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'ses_known'}}))
+      expect(outcome.cancelledCount).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('marks outstanding entries unknown, rather than claiming drain, when no client is available', async () => {
+    // #given a ledger with outstanding work but nothing to reconcile against
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+
+    // #when drain runs with a null client
+    const outcome = await runDrain({
+      ledger,
+      client: null,
+      parentSessionId: null,
+      deadlineMs: 60_000,
+      logger,
+    })
+
+    // #then the entry is honestly unknown, not silently reported as drained
+    expect(outcome).toEqual({expired: true, cancelledCount: 0, settledCount: 0, unknownCount: 1})
+  })
+
+  it('does not rewrite a terminal outcome already decided by execution, even when drain expires', async () => {
+    // #given a run that already finished successfully before drain starts
+    mocks.getInput.mockReturnValue('branch-pr')
+    mocks.resolveOutputMode.mockReturnValue('branch-pr')
+    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
+    mocks.readResponseFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, llmError: null, sessionId: 'decided-session'}),
+    )
+    const execution = await runExecute(
+      createBootstrap(1_000),
+      createRouting(),
+      createCacheRestore(),
+      createSessionPrep(),
+      createMetrics(),
+      0,
+    )
+    expect(execution.success).toBe(true)
+    expect(execution.exitCode).toBe(0)
+
+    // #when a long-running drain against unrelated outstanding work expires
+    vi.useFakeTimers()
+    let outcome: Awaited<ReturnType<typeof runDrain>>
+    try {
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'background task')
+      const client = createFakeSessionClient({
+        children: async () => ({data: [{id: 'ses_child'}]}),
+        status: async () => ({data: {ses_child: {}}}),
+      })
+      const outcomePromise = runDrain({
+        ledger,
+        client,
+        parentSessionId: execution.sessionId,
+        deadlineMs: 30,
+        logger,
+        reconcileIntervalMs: 10_000,
+        pollIntervalMs: 5,
+      })
+      await vi.advanceTimersByTimeAsync(200)
+      outcome = await outcomePromise
+    } finally {
+      vi.useRealTimers()
+    }
+
+    // #then drain's own incomplete outcome never touches the execution result -- the two
+    // are separate values, and the decided success/exitCode survive unchanged
+    expect(outcome.expired).toBe(true)
+    expect(execution.success).toBe(true)
+    expect(execution.exitCode).toBe(0)
+    expect(execution.sessionId).toBe('decided-session')
   })
 })
