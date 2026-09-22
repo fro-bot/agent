@@ -11,6 +11,8 @@ import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
 import type {OperatorAllowlist} from './web/auth/allowlist.js'
+import type {OperatorIngressPolicy} from './web/ingress/policy.js'
+import type {IngressRejection, ResolvedClientAddress} from './web/ingress/resolve-client.js'
 import type {PushDispatcher} from './web/operator-push/dispatcher.js'
 import type {OperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './web/operator-push/vapid.js'
@@ -24,7 +26,6 @@ import {
   err,
   redactSensitiveFields,
 } from '@fro-bot/runtime'
-import {getConnInfo} from '@hono/node-server/conninfo'
 import {Effect} from 'effect'
 import {createApprovalRegistry} from './approvals/registry.js'
 import {createBindingsStore} from './bindings/store.js'
@@ -50,6 +51,8 @@ import {DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutd
 import {emitAudit} from './web/audit.js'
 import {buildGitHubOAuthDeps} from './web/auth/github.js'
 import {createInMemorySessionStore} from './web/auth/session.js'
+import {extractRawIngressInput} from './web/ingress/hono-context.js'
+import {resolveClient} from './web/ingress/resolve-client.js'
 import {createDedupeCache} from './web/operator-push/dedupe-cache.js'
 import {createPushDispatcher} from './web/operator-push/dispatcher.js'
 import {createPushSender} from './web/operator-push/push-sender.js'
@@ -198,6 +201,14 @@ export interface BuildOperatorServerInputs {
     readonly oauthMaxOutstandingAttemptsPerKey: number
     readonly csrfSecret: string
     readonly allowlist: OperatorAllowlist
+    /**
+     * Trust-aware client-address resolution policy. Threaded through to the
+     * OAuth source-key extractor built below and mirrored onto
+     * OperatorServerConfig.ingressPolicy so the OAuth routes, the health
+     * route, and the logout route all resolve client identity through the
+     * same resolver and the same policy value.
+     */
+    readonly ingressPolicy: OperatorIngressPolicy
   }
 }
 
@@ -237,16 +248,15 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     operatorWebConfig,
   } = inputs
 
-  // Build the source key extractor for OAuth outstanding-attempt counting.
-  // Must use the TCP socket address (not caller-spoofable headers).
-  // getConnInfo may throw in environments without a real socket; fall back to 'unknown'.
-  const getSourceKey = (c: Context): string => {
-    try {
-      return getConnInfo(c).remote.address ?? 'unknown'
-    } catch {
-      return 'unknown'
-    }
-  }
+  // Build the source key extractor for OAuth outstanding-attempt counting and
+  // source-key binding. Resolves through the trusted-proxy-aware ingress
+  // policy: the TCP socket address is used directly for an untrusted peer,
+  // or the first untrusted address in a trusted proxy's X-Forwarded-For
+  // chain. A resolution failure (missing/invalid socket, missing/malformed
+  // forwarded chain) is propagated as an IngressRejection — never silently
+  // collapsed to a fallback key every failing request would share.
+  const getSourceKey = (c: Context): Effect.Effect<ResolvedClientAddress, IngressRejection> =>
+    resolveClient(extractRawIngressInput(c), operatorWebConfig.ingressPolicy)
 
   // Build the shared rate limiter for the operator surface.
   // Passed to both buildGitHubOAuthDeps and OperatorServerDeps so OAuth routes
@@ -316,6 +326,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     bindHost: operatorWebConfig.bindHost,
     bindPort: operatorWebConfig.bindPort,
     publicOrigin: operatorWebConfig.publicOrigin,
+    ingressPolicy: operatorWebConfig.ingressPolicy,
     githubOAuth: {
       clientId: operatorWebConfig.oauthClientId,
       clientSecret: operatorWebConfig.oauthClientSecret,

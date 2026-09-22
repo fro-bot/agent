@@ -16,21 +16,46 @@
  *   - Redirect targets are validated as same-origin/path-allowlisted before state mint.
  *   - Callback route must remain compatible with future Fetch Metadata middleware
  *     because GitHub redirects cross-site after authorization.
- *   - All auth failure branches return the same coarse 400 response shape (no-oracle).
+ *   - All auth failure branches return the same coarse 400 response shape (no-oracle),
+ *     with one narrow exception: a source-key mismatch on an otherwise-valid,
+ *     unconsumed, unexpired state redirects back to /start once (see below) instead
+ *     of dead-ending, because a legitimate client's resolved address can genuinely
+ *     change mid-flow. Every other rejection reason — unknown state, already-consumed
+ *     state, expired state, provider error — is unaffected and still 400s.
  *   - Numeric GitHub user id is the authority; login is display metadata only.
  *   - Source key for outstanding-attempt counting is injected by the caller and must
- *     be derived from the TCP socket address, not from caller-spoofable headers.
+ *     resolve through the trusted-proxy-aware ingress resolver (resolveClient), never
+ *     directly from caller-spoofable headers and never a fallback key on resolution
+ *     failure.
  *   - Callback validates that the current source key matches the source key bound at
- *     state mint time, preventing cross-IP state replay.
+ *     state mint time, preventing cross-IP state replay. Because both mint and consume
+ *     resolve through the same resolver and the same policy, a client whose start and
+ *     callback traverse different trusted proxies still resolves to the same key. On a
+ *     mismatch, the outstanding attempt is released (same consume() as the success
+ *     path) and the browser is bounced back to /start with a one-shot retry marker; a
+ *     second consecutive mismatch on the retried state terminates instead of bouncing
+ *     again, so an address that keeps shifting cannot loop forever. A bounced client
+ *     still needs its own allowlisted GitHub session to complete any flow — the bind
+ *     itself is unchanged, only the recovery path after a mismatch is new.
+ *   - Known tradeoff: releasing the attempt on mismatch (see above) means anyone who
+ *     learns a victim's `state` value — browser history, proxy logs, a shoulder-surf —
+ *     can replay the callback from a different address and consume that state before
+ *     the victim's own browser gets there, permanently burning the victim's flow (their
+ *     subsequent legitimate callback then hits the already-consumed branch and 400s).
+ *     This is accepted: recovery is "sign in again," and not releasing the attempt
+ *     reproduces the outstanding-attempt-cap outage this module exists to fix.
  */
 
 import type {Context, Hono} from 'hono'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
+import type {IngressRejection, ResolvedClientAddress} from '../ingress/resolve-client.js'
 import type {OperatorAllowlist} from './allowlist.js'
 import type {SessionDeps, SessionStore} from './session.js'
 import {createHash, randomBytes} from 'node:crypto'
+import {Effect} from 'effect'
 import {emitAudit} from '../audit.js'
+import {respondForIngressRejection} from '../ingress/hono-context.js'
 import {registerPublicCrossSiteRoute, registerPublicRoute} from '../operator-route.js'
 import {badRequestResponse, forbiddenResponse, rateLimitedResponse, unavailableResponse} from '../safe-response.js'
 import {buildSessionCookieValue, parseSessionCookie} from './session.js'
@@ -51,6 +76,13 @@ export interface OAuthStateEntry {
   readonly redirectTarget?: string
   /** Source key (socket IP) for outstanding-attempt counting. */
   readonly sourceKey?: string
+  /**
+   * True when this state entry was itself minted as the retry target of a
+   * source-key-mismatch bounce (see the callback's binding check). Bounds
+   * the bounce to a single retry: a mismatch on an entry that is already
+   * `bounced` terminates instead of redirecting again.
+   */
+  readonly bounced?: boolean
 }
 
 /** Server-side state store interface for OAuth state entries. */
@@ -103,18 +135,21 @@ export interface GitHubOAuthDeps {
   /** Server-side state store. */
   readonly stateStore: OAuthStateStore
   /**
-   * Injectable source key extractor for outstanding-attempt counting.
-   * Must return a key derived from the TCP socket address — NOT from
-   * caller-spoofable headers like X-Forwarded-For or X-Real-IP.
+   * Injectable trusted-proxy-aware client resolver for outstanding-attempt
+   * counting and source-key binding. Must resolve through the same
+   * `resolveClient` + `OperatorIngressPolicy` used everywhere else on the
+   * operator surface — never a caller-spoofable header read directly, and
+   * never a fallback fixed key on resolution failure.
    *
-   * In production, wire this to getConnInfo(c).remote.address with a
-   * 'unknown' fallback. In tests, return a fixed string.
+   * In production, wire this to `resolveClient(extractRawIngressInput(c), policy)`.
+   * In tests, a stub may return `Effect.succeed(...)` for a fixed resolved
+   * address, or `Effect.fail(...)` to exercise a rejection path.
    *
    * The global rate limiter in buildOperatorApp already applies socket-keyed
    * limits; this key is used only for the per-OAuth-flow outstanding-attempt cap
    * and for source key binding validation on callback.
    */
-  readonly getSourceKey: (c: Context) => string
+  readonly getSourceKey: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>
   /**
    * Rate limiter shared with the operator app.
    * Applied to both /start and /callback before any work is performed.
@@ -204,7 +239,7 @@ export interface GitHubOAuthConfig {
 export function buildGitHubOAuthDeps(
   logger: OAuthLogger,
   auditLogger: AuditLogger,
-  getSourceKey: (c: Context) => string,
+  getSourceKey: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>,
   rateLimiter: RateLimiter,
   sessionStore?: SessionStore,
   sessionDeps?: SessionDeps,
@@ -374,6 +409,17 @@ const GITHUB_FETCH_TIMEOUT_MS = 8_000
  */
 const MAX_GLOBAL_STATE_STORE_ENTRIES = 1_000
 
+/**
+ * Path for the OAuth start route. Shared between the route registration and
+ * the retry-bounce redirect built on a source-key mismatch (see the
+ * callback's binding check), so the two never drift apart.
+ */
+const OAUTH_START_PATH = '/operator/auth/github/start'
+
+// ---------------------------------------------------------------------------
+// Ingress rejection → response mapping
+// ---------------------------------------------------------------------------
+
 // ---------------------------------------------------------------------------
 // Route builder
 // ---------------------------------------------------------------------------
@@ -396,10 +442,16 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
 
   // ── GET /operator/auth/github/start ────────────────────────────────────────
 
-  registerPublicRoute(app, 'GET', '/operator/auth/github/start', async (c: Context): Promise<Response> => {
-    // Determine source key for rate limiting and outstanding-attempt counting.
-    // Must be derived from the TCP socket address (not caller-spoofable headers).
-    const sourceKey = deps.getSourceKey(c)
+  registerPublicRoute(app, 'GET', OAUTH_START_PATH, async (c: Context): Promise<Response> => {
+    // Resolve the trust-aware client address for rate limiting and
+    // outstanding-attempt counting. A resolution failure allocates neither a
+    // rate-limit bucket nor OAuth state — never falls back to a shared key.
+    const resolved = Effect.runSync(Effect.either(deps.getSourceKey(c)))
+    if (resolved._tag === 'Left') {
+      deps.logger.warn({reason: resolved.left.kind}, 'oauth start rejected: ingress resolution failed')
+      return respondForIngressRejection(c, resolved.left)
+    }
+    const sourceKey = resolved.right.canonical
 
     // Rate limit check — shared with the operator app, keyed on socket address.
     if (deps.rateLimiter.allow(sourceKey) === false) {
@@ -423,6 +475,14 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       deps.logger.warn({}, 'oauth start rejected: global state store ceiling reached')
       return rateLimitedResponse(c)
     }
+
+    // Retry-bounce marker: set only on the redirect this route's own callback
+    // builds after a source-key mismatch (see buildGitHubOAuthRoutes callback
+    // handler). Purely an availability bound on the retry loop — it carries no
+    // security weight, so a caller crafting this query param unprompted can
+    // only make their own next mismatch terminate instead of retry once; it
+    // cannot skip or weaken any check.
+    const isRetryBounce = c.req.query('retry') === '1'
 
     // Validate return_to before minting state.
     const returnTo = c.req.query('return_to')
@@ -448,6 +508,7 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       consumed: false,
       ...(redirectTarget === undefined ? {} : {redirectTarget}),
       sourceKey,
+      ...(isRetryBounce ? {bounced: true} : {}),
     })
 
     // Emit auth.start audit event.
@@ -473,8 +534,15 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
   // All other security checks (state validation, PKCE, source key binding) remain.
 
   registerPublicCrossSiteRoute(app, 'GET', config.callbackPath, async (c: Context): Promise<Response> => {
-    // Determine source key for rate limiting and source key binding validation.
-    const sourceKey = deps.getSourceKey(c)
+    // Resolve the trust-aware client address for rate limiting and source
+    // key binding validation. A resolution failure allocates neither a
+    // rate-limit bucket nor OAuth state — never falls back to a shared key.
+    const resolved = Effect.runSync(Effect.either(deps.getSourceKey(c)))
+    if (resolved._tag === 'Left') {
+      deps.logger.warn({reason: resolved.left.kind}, 'oauth callback rejected: ingress resolution failed')
+      return respondForIngressRejection(c, resolved.left)
+    }
+    const sourceKey = resolved.right.canonical
 
     // Rate limit check — shared with the operator app, keyed on socket address.
     if (deps.rateLimiter.allow(sourceKey) === false) {
@@ -547,12 +615,60 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     }
 
     // Source key binding check — reject if the callback comes from a different
-    // socket address than the one that initiated the flow. Uses the socket-derived
-    // key only; never caller-spoofable headers.
+    // trusted-proxy-resolved client than the one that initiated the flow. Uses
+    // the resolver-derived key only; never caller-spoofable headers. The bind
+    // itself stays exactly as strict as before — this only changes what
+    // happens after a mismatch is detected, not whether one is detected.
+    //
+    // A legitimate client's resolved address can genuinely change between
+    // /start and /callback (mobile handover, VPN toggle, dual-stack switch,
+    // CGNAT rotation) — GitHub's round trip can span minutes with 2FA. Dead-
+    // ending on 400 here would reproduce, at smaller scale, the outage this
+    // module exists to fix: the outstanding-attempt slot stays consumed
+    // against the cap until it naturally expires, so a client whose address
+    // keeps shifting locks itself out after a handful of genuine retries. So
+    // on a mismatch, release the attempt the same way the success path does
+    // (stateStore.consume) and bounce the browser back to /start so it can
+    // restart from wherever it is now.
+    //
+    // Bounded to one retry: the redirect carries `retry=1`, which /start
+    // stamps onto the *new* state entry as `bounced` (see the /start
+    // handler). A mismatch on an entry that is already `bounced` — i.e. a
+    // second consecutive mismatch — terminates with the same coarse 400
+    // instead of redirecting again, so a client with a genuinely unstable
+    // address cannot loop forever.
+    //
+    // This does not weaken the replay protection: a state is only eligible
+    // for the retry path if it is a valid, unconsumed, unexpired,
+    // correctly-looked-up entry whose bound address no longer matches — every
+    // other failure mode (unknown state, already-consumed state, expired
+    // state) is rejected above, unchanged, before this check ever runs. And a
+    // bounced attacker gains nothing: they land on a fresh /start with no
+    // code, no verifier, and no session — they still need their own
+    // allowlisted GitHub account to finish any flow from there.
     if (stateEntry.sourceKey !== undefined && stateEntry.sourceKey !== sourceKey) {
-      deps.logger.warn({}, 'oauth callback: source key mismatch')
+      // Release the outstanding attempt regardless of outcome (retry or
+      // terminate) — this is the part that must not be missed, or the bounce
+      // itself reproduces the original outage at a smaller scale.
+      deps.stateStore.consume(stateParam)
+
+      if (stateEntry.bounced === true) {
+        deps.logger.warn({}, 'oauth callback: source key mismatch after retry — terminating sign-in')
+        emitAudit(
+          {kind: 'auth.callback.failure', correlationId, reason: 'source_key_mismatch_terminal'},
+          deps.auditLogger,
+        )
+        return badRequestResponse(c)
+      }
+
+      deps.logger.warn({}, 'oauth callback: source key mismatch — restarting sign-in from current address')
       emitAudit({kind: 'auth.callback.failure', correlationId, reason: 'source_key_mismatch'}, deps.auditLogger)
-      return badRequestResponse(c)
+
+      const retryParams = new URLSearchParams({retry: '1'})
+      if (stateEntry.redirectTarget !== undefined && stateEntry.redirectTarget !== '') {
+        retryParams.set('return_to', stateEntry.redirectTarget)
+      }
+      return c.redirect(`${OAUTH_START_PATH}?${retryParams.toString()}`, 302)
     }
 
     // Consume state (one-time use) before any external calls.

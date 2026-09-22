@@ -7,6 +7,8 @@ import type {CoordinationLogger} from './runtime-effect.js'
 import {GatewayIntentBits} from 'discord.js'
 import {Effect} from 'effect'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
+import {parseTrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 
 // Spy on createDiscordClient so we can assert the intents wiring without
 // touching the network or requiring a real Discord token.
@@ -327,6 +329,7 @@ function makeOperatorWebConfig(
     oauthMaxOutstandingAttemptsPerKey: 5,
     csrfSecret: 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE',
     allowlist: denyAllAllowlist,
+    ingressPolicy: makeTrustedProxyIngressPolicy([Effect.runSync(parseTrustedProxyAddress('10.0.0.1'))]),
     ...overrides,
   }
 }
@@ -2027,6 +2030,7 @@ describe('launch route wiring — POST /operator/runs', () => {
       bindHost: '127.0.0.1',
       bindPort: 0,
       publicOrigin: 'https://operator.example.com',
+      ingressPolicy: makeOperatorWebConfig().ingressPolicy,
       githubOAuth: {
         clientId: 'test-oauth-client-id',
         clientSecret: 'test-oauth-client-secret',
@@ -2054,6 +2058,7 @@ describe('launch route wiring — POST /operator/runs', () => {
       bindHost: '127.0.0.1',
       bindPort: 0,
       publicOrigin: 'https://operator.example.com',
+      ingressPolicy: makeOperatorWebConfig().ingressPolicy,
     })
 
     // #then — launch route is absent when getBindingByRepo is missing
@@ -2072,6 +2077,7 @@ describe('launch route wiring — POST /operator/runs', () => {
       bindHost: '127.0.0.1',
       bindPort: 0,
       publicOrigin: 'https://operator.example.com',
+      ingressPolicy: makeOperatorWebConfig().ingressPolicy,
     })
 
     // #then — launch route is absent when launchWorkDeps is missing
