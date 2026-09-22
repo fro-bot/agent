@@ -3,18 +3,47 @@ import type {TrustedProxyAddress} from './trusted-proxy-address.js'
 declare const canonicalHttpsOriginBrand: unique symbol
 
 /**
- * Branded https:// origin string. This module does not itself validate origin
- * shape (protocol/host/port/path) — that validation lives in config loading
- * (`config.ts`, owned by a later lane). `asCanonicalHttpsOrigin` trusts the
- * caller to have already validated the string; it exists so
- * `OperatorIngressPolicy` cannot be constructed with an arbitrary unchecked
- * string in `publicOrigin`.
+ * Branded https:// origin string, guaranteed canonical: https:// scheme, host,
+ * optional port, no path beyond `/`, no query, no hash, no userinfo.
+ *
+ * The brand can only be produced by `asCanonicalHttpsOrigin` below — there is
+ * no separate raw constructor, so a caller cannot brand an arbitrary,
+ * unchecked string. `asCanonicalHttpsOrigin` performs the validation itself
+ * (mirroring the canonical-origin checks `config.ts` already applies when
+ * reading `GATEWAY_OPERATOR_PUBLIC_ORIGIN`) and brands only `URL#origin` of a
+ * value that has already passed every check — never the raw input.
  */
 export type CanonicalHttpsOrigin = string & {readonly [canonicalHttpsOriginBrand]: true}
 
-/** Brands an already-validated https:// origin string. Caller is responsible for validation. */
+/**
+ * Validates `origin` as a canonical https:// origin and brands the
+ * normalized result. Throws on anything that is not a valid URL, does not
+ * use `https:`, or carries a path beyond `/`, a query string, a hash
+ * fragment, or userinfo (username/password).
+ */
 export function asCanonicalHttpsOrigin(origin: string): CanonicalHttpsOrigin {
-  return origin as CanonicalHttpsOrigin
+  let parsed: URL
+  try {
+    parsed = new URL(origin)
+  } catch {
+    throw new Error(`asCanonicalHttpsOrigin: "${origin}" is not a valid URL`)
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`asCanonicalHttpsOrigin: "${origin}" must use https://`)
+  }
+  if (parsed.pathname !== '/') {
+    throw new Error(`asCanonicalHttpsOrigin: "${origin}" must be a canonical origin (no path beyond /)`)
+  }
+  if (parsed.search !== '') {
+    throw new Error(`asCanonicalHttpsOrigin: "${origin}" must be a canonical origin (no query string)`)
+  }
+  if (parsed.hash !== '') {
+    throw new Error(`asCanonicalHttpsOrigin: "${origin}" must be a canonical origin (no hash fragment)`)
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new Error(`asCanonicalHttpsOrigin: "${origin}" must be a canonical origin (no userinfo)`)
+  }
+  return parsed.origin as CanonicalHttpsOrigin
 }
 
 /**

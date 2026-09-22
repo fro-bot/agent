@@ -1,5 +1,7 @@
 import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
 import type {OperatorAllowlist} from './web/auth/allowlist.js'
+import type {OperatorIngressPolicy} from './web/ingress/policy.js'
+import type {TrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 import type {VapidKeyMaterial, VapidPublicKeyInfo} from './web/operator-push/vapid.js'
 
 import {Buffer} from 'node:buffer'
@@ -8,7 +10,10 @@ import {isIP} from 'node:net'
 import process from 'node:process'
 
 import {GatewayIntentBits} from 'discord.js'
+import {Effect, Either} from 'effect'
 import {parseAllowlistText} from './web/auth/allowlist.js'
+import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
+import {matchesTrustedProxyAddress, parseTrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 import {
   OPERATOR_PUSH_DEDUPE_WINDOW_MS,
   OPERATOR_PUSH_ENABLED,
@@ -45,6 +50,31 @@ const ALLOWED_PRIVILEGED_INTENTS = {
   MessageContent: GatewayIntentBits.MessageContent,
   GuildMembers: GatewayIntentBits.GuildMembers,
 } as const
+
+/**
+ * Startup-only sanity check on one configured trusted-proxy address: rejects
+ * addresses that cannot possibly identify a real reverse-proxy peer — the
+ * unspecified ("any") address for each family, and multicast ranges.
+ *
+ * This is a shallow literal check, not a network-reachability proof: it
+ * cannot establish that the address is actually a proxy, that it sits on the
+ * request path, or that it sanitizes headers before forwarding.
+ *
+ * Returns a human-readable rejection reason, or `undefined` when the address
+ * passes this check.
+ */
+function classifyTrustedProxyAddressRejection(canonical: TrustedProxyAddress['canonical']): string | undefined {
+  if (canonical.family === 'ipv4') {
+    const [a, b, c, d] = canonical.octets
+    if (a === 0 && b === 0 && c === 0 && d === 0) return 'the unspecified address (0.0.0.0)'
+    if (a >= 224 && a <= 239) return 'a multicast address (224.0.0.0/4)'
+    return undefined
+  }
+  const {groups} = canonical
+  if (groups.every(group => group === 0)) return 'the unspecified address (::)'
+  if (((groups[0] >> 8) & 0xff) === 0xff) return 'a multicast address (ff00::/8)'
+  return undefined
+}
 
 export interface GatewayConfig {
   readonly discordToken: string
@@ -125,6 +155,10 @@ export interface GatewayConfig {
    *   - bindHost must NOT be a sandbox-net address: `10.0.0.0/8` (Docker internal network;
    *     the operator listener must be on gateway-net only).
    *   - publicOrigin must be a valid https:// URL.
+   *   - `GATEWAY_OPERATOR_TRUSTED_PROXIES` (comma-separated exact IPv4/IPv6 addresses) is
+   *     required and must be non-empty — behind a reverse proxy the TCP socket address is
+   *     always the proxy's address, so without an explicit trusted-peer list every client
+   *     shares one rate-limit/OAuth-attempt key. See `ingressPolicy` below.
    *
    * The operator listener is bound to gateway-net only and is not reachable
    * from sandbox-net. TLS is terminated by the infra reverse proxy.
@@ -189,6 +223,19 @@ export interface GatewayConfig {
      * Fail-closed: missing/unreadable/empty/malformed allowlist denies everyone.
      */
     readonly allowlist: OperatorAllowlist
+    /**
+     * Trust-aware client-address resolution policy, built from
+     * `GATEWAY_OPERATOR_TRUSTED_PROXIES`. Always the `trusted-proxy` variant
+     * (with a non-empty peer tuple) when `operatorWeb` is present — startup
+     * fails before this object is constructed if the env var is missing,
+     * empty, or contains an invalid/unspecified/multicast/duplicate entry.
+     *
+     * Optional on the type (rather than required) only so pre-existing test
+     * fixtures that hand-construct a `GatewayConfig` without going through
+     * `loadGatewayConfig()` keep compiling; every config actually produced by
+     * `loadGatewayConfig()` sets it whenever `operatorWeb` is present.
+     */
+    readonly ingressPolicy?: OperatorIngressPolicy
   }
   /**
    * Operator Web Push configuration. Present only when
@@ -823,6 +870,66 @@ export function loadGatewayConfig(): GatewayConfig {
       )
     }
 
+    // Read the trusted-proxy peer list — required when operator web is enabled.
+    // GATEWAY_OPERATOR_TRUSTED_PROXIES: comma-separated exact IPv4/IPv6 addresses of the
+    // reverse-proxy hop(s) in front of the operator listener. Deliberately NOT CIDR, DNS
+    // names, private-network aliases, or a trusted-hop count — exact addresses keep the
+    // trust boundary bounded; a deployment with dynamic proxy addressing must stabilise
+    // them rather than have the gateway trust a whole subnet.
+    //
+    // Behind a reverse proxy the TCP socket address is always the proxy's address, so
+    // without an explicit trusted-peer list every client shares one rate-limit/OAuth-attempt
+    // key (the proxy's), which can lock the operator out of a live deployment. An empty or
+    // missing value silently reproduces that outage, so it fails loud here instead.
+    const rawTrustedProxies = readOptionalSecret('GATEWAY_OPERATOR_TRUSTED_PROXIES')
+    if (rawTrustedProxies === null || rawTrustedProxies.trim() === '') {
+      throw new Error(
+        'Missing required GATEWAY_OPERATOR_TRUSTED_PROXIES: set it to a comma-separated list of exact IPv4/IPv6 addresses ' +
+          'of the reverse-proxy hop(s) in front of the operator listener (e.g. "203.0.113.10,2001:db8::1"). Required ' +
+          'whenever the operator web surface is enabled — without it, every client behind the proxy shares one ' +
+          "rate-limit/OAuth-attempt key (the proxy's address), which can lock the operator out.",
+      )
+    }
+    const trustedProxyPeers: TrustedProxyAddress[] = []
+    const rawTrustedProxyEntries = rawTrustedProxies.split(',').map(entry => entry.trim())
+    for (const [entryIndex, rawEntry] of rawTrustedProxyEntries.entries()) {
+      const parseResult = Effect.runSync(Effect.either(parseTrustedProxyAddress(rawEntry)))
+      if (Either.isLeft(parseResult)) {
+        throw new Error(
+          `Invalid GATEWAY_OPERATOR_TRUSTED_PROXIES entry #${entryIndex + 1}: "${rawEntry}" is not a valid exact ` +
+            'IPv4/IPv6 address (CIDR ranges, hostnames, and other forms are not accepted).',
+        )
+      }
+      const peer = parseResult.right
+      const rejectionReason = classifyTrustedProxyAddressRejection(peer.canonical)
+      if (rejectionReason !== undefined) {
+        throw new Error(
+          `Invalid GATEWAY_OPERATOR_TRUSTED_PROXIES entry #${entryIndex + 1}: "${rawEntry}" is ${rejectionReason}, ` +
+            'which cannot identify a real reverse-proxy peer.',
+        )
+      }
+      const isDuplicate = trustedProxyPeers.some(existingPeer =>
+        matchesTrustedProxyAddress(peer.canonical, existingPeer),
+      )
+      if (isDuplicate === false) {
+        trustedProxyPeers.push(peer)
+      }
+    }
+    // Prove non-emptiness to the type checker via destructuring, rather than asserting it —
+    // rawTrustedProxies was already checked non-empty/non-whitespace above, so splitting on
+    // ',' always yields at least one entry, and every entry above either parses into a peer
+    // or throws — trustedProxyPeers cannot be empty here.
+    const [firstTrustedProxyPeer, ...restTrustedProxyPeers] = trustedProxyPeers
+    if (firstTrustedProxyPeer === undefined) {
+      throw new Error(
+        'Internal: GATEWAY_OPERATOR_TRUSTED_PROXIES resolved to zero peers after validation — this is a bug.',
+      )
+    }
+    const trustedProxyPeerTuple: readonly [TrustedProxyAddress, ...TrustedProxyAddress[]] = [
+      firstTrustedProxyPeer,
+      ...restTrustedProxyPeers,
+    ]
+
     // Read GitHub OAuth client credentials — required when operator web is enabled.
     // GATEWAY_OPERATOR_GITHUB_CLIENT_ID: GitHub OAuth App client ID.
     // Also accepts GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE pointing to a file.
@@ -918,6 +1025,17 @@ export function loadGatewayConfig(): GatewayConfig {
 
     // Normalize to parsedPublicOrigin.origin: strips trailing slash and default ports.
     // Stored value is always scheme+host+optional-non-default-port (no trailing slash).
+    //
+    // asCanonicalHttpsOrigin re-validates parsedPublicOrigin.origin (it is the only way to
+    // produce a CanonicalHttpsOrigin — it cannot brand an arbitrary string). The operator
+    // web surface is always enabled with a trusted-proxy policy here: an empty peer list is
+    // unrepresentable by OperatorIngressPolicy's type, and trustedProxyPeerTuple is already
+    // proven non-empty above, so this never silently falls back to a 'direct' policy.
+    const ingressPolicy: OperatorIngressPolicy = makeTrustedProxyIngressPolicy(
+      asCanonicalHttpsOrigin(parsedPublicOrigin.origin),
+      trustedProxyPeerTuple,
+    )
+
     operatorWeb = {
       bindHost: operatorBindHost,
       bindPort: operatorBindPort,
@@ -929,6 +1047,7 @@ export function loadGatewayConfig(): GatewayConfig {
       oauthMaxOutstandingAttemptsPerKey,
       csrfSecret,
       allowlist,
+      ingressPolicy,
     }
   }
 
