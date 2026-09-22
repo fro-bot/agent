@@ -11,13 +11,25 @@ export interface AuditLogger {
   readonly warn: (ctx: Record<string, unknown>, msg: string) => void
 }
 
-/** Safe reasons for auth callback failure. */
+/**
+ * Safe reasons for auth callback failure.
+ *
+ * `source_key_mismatch` and `source_key_mismatch_terminal` are deliberately
+ * distinct queryable values, not free-text variations of the same reason:
+ * the former is a bounce (attempt released, browser retried once from its
+ * current address) and the latter is a second consecutive mismatch on an
+ * already-bounced attempt, which terminates instead of retrying. Collapsing
+ * them would hide the signal that actually matters operationally — an
+ * address that keeps shifting on the same flow — behind a count of two
+ * differently-timed log lines that share a reason.
+ */
 export type AuthCallbackFailureReason =
   | 'state_mismatch'
   | 'provider_error'
   | 'token_exchange_failed'
   | 'user_fetch_failed'
   | 'source_key_mismatch'
+  | 'source_key_mismatch_terminal'
   | 'not_allowlisted'
   | 'unknown'
 
