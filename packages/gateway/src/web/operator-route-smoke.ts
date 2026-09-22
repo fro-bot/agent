@@ -26,8 +26,11 @@
 import {Buffer} from 'node:buffer'
 
 import {ok} from '@fro-bot/runtime'
+import {Effect} from 'effect'
 import {buildOperatorServerInputs} from '../program.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
+import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from './ingress/policy.js'
+import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {buildOperatorApp} from './server.js'
 
 // ---------------------------------------------------------------------------
@@ -243,6 +246,10 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
 
   // Build a stub operator web config — values only need to pass the URL/host
   // validation in buildOperatorApp (publicOrigin must be https://).
+  // No port is ever bound and no real request is ever resolved by this
+  // diagnostic, so a single stub trusted-proxy peer is sufficient to satisfy
+  // the (now required) ingressPolicy shape.
+  const stubTrustedProxyPeer = Effect.runSync(parseTrustedProxyAddress('10.0.0.1'))
   const operatorWebConfig = {
     bindHost: '127.0.0.1',
     bindPort: 18080,
@@ -254,6 +261,9 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     oauthMaxOutstandingAttemptsPerKey: 5,
     csrfSecret: Buffer.from('operator-smoke-csrf-secret-32b!!', 'utf8').toString('base64url'),
     allowlist,
+    ingressPolicy: makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin('https://operator.smoke.test'), [
+      stubTrustedProxyPeer,
+    ]),
   }
 
   // Resolve the bindingsStore — use the override if provided, else the default stub.

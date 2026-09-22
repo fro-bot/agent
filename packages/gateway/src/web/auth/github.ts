@@ -19,18 +19,25 @@
  *   - All auth failure branches return the same coarse 400 response shape (no-oracle).
  *   - Numeric GitHub user id is the authority; login is display metadata only.
  *   - Source key for outstanding-attempt counting is injected by the caller and must
- *     be derived from the TCP socket address, not from caller-spoofable headers.
+ *     resolve through the trusted-proxy-aware ingress resolver (resolveClient), never
+ *     directly from caller-spoofable headers and never a fallback key on resolution
+ *     failure.
  *   - Callback validates that the current source key matches the source key bound at
- *     state mint time, preventing cross-IP state replay.
+ *     state mint time, preventing cross-IP state replay. Because both mint and consume
+ *     resolve through the same resolver and the same policy, a client whose start and
+ *     callback traverse different trusted proxies still resolves to the same key.
  */
 
 import type {Context, Hono} from 'hono'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
+import type {IngressRejection, ResolvedClientAddress} from '../ingress/resolve-client.js'
 import type {OperatorAllowlist} from './allowlist.js'
 import type {SessionDeps, SessionStore} from './session.js'
 import {createHash, randomBytes} from 'node:crypto'
+import {Effect} from 'effect'
 import {emitAudit} from '../audit.js'
+import {respondForIngressRejection} from '../ingress/hono-context.js'
 import {registerPublicCrossSiteRoute, registerPublicRoute} from '../operator-route.js'
 import {badRequestResponse, forbiddenResponse, rateLimitedResponse, unavailableResponse} from '../safe-response.js'
 import {buildSessionCookieValue, parseSessionCookie} from './session.js'
@@ -103,18 +110,21 @@ export interface GitHubOAuthDeps {
   /** Server-side state store. */
   readonly stateStore: OAuthStateStore
   /**
-   * Injectable source key extractor for outstanding-attempt counting.
-   * Must return a key derived from the TCP socket address — NOT from
-   * caller-spoofable headers like X-Forwarded-For or X-Real-IP.
+   * Injectable trusted-proxy-aware client resolver for outstanding-attempt
+   * counting and source-key binding. Must resolve through the same
+   * `resolveClient` + `OperatorIngressPolicy` used everywhere else on the
+   * operator surface — never a caller-spoofable header read directly, and
+   * never a fallback fixed key on resolution failure.
    *
-   * In production, wire this to getConnInfo(c).remote.address with a
-   * 'unknown' fallback. In tests, return a fixed string.
+   * In production, wire this to `resolveClient(extractRawIngressInput(c), policy)`.
+   * In tests, a stub may return `Effect.succeed(...)` for a fixed resolved
+   * address, or `Effect.fail(...)` to exercise a rejection path.
    *
    * The global rate limiter in buildOperatorApp already applies socket-keyed
    * limits; this key is used only for the per-OAuth-flow outstanding-attempt cap
    * and for source key binding validation on callback.
    */
-  readonly getSourceKey: (c: Context) => string
+  readonly getSourceKey: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>
   /**
    * Rate limiter shared with the operator app.
    * Applied to both /start and /callback before any work is performed.
@@ -204,7 +214,7 @@ export interface GitHubOAuthConfig {
 export function buildGitHubOAuthDeps(
   logger: OAuthLogger,
   auditLogger: AuditLogger,
-  getSourceKey: (c: Context) => string,
+  getSourceKey: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>,
   rateLimiter: RateLimiter,
   sessionStore?: SessionStore,
   sessionDeps?: SessionDeps,
@@ -375,6 +385,10 @@ const GITHUB_FETCH_TIMEOUT_MS = 8_000
 const MAX_GLOBAL_STATE_STORE_ENTRIES = 1_000
 
 // ---------------------------------------------------------------------------
+// Ingress rejection → response mapping
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Route builder
 // ---------------------------------------------------------------------------
 
@@ -397,9 +411,15 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
   // ── GET /operator/auth/github/start ────────────────────────────────────────
 
   registerPublicRoute(app, 'GET', '/operator/auth/github/start', async (c: Context): Promise<Response> => {
-    // Determine source key for rate limiting and outstanding-attempt counting.
-    // Must be derived from the TCP socket address (not caller-spoofable headers).
-    const sourceKey = deps.getSourceKey(c)
+    // Resolve the trust-aware client address for rate limiting and
+    // outstanding-attempt counting. A resolution failure allocates neither a
+    // rate-limit bucket nor OAuth state — never falls back to a shared key.
+    const resolved = Effect.runSync(Effect.either(deps.getSourceKey(c)))
+    if (resolved._tag === 'Left') {
+      deps.logger.warn({reason: resolved.left.kind}, 'oauth start rejected: ingress resolution failed')
+      return respondForIngressRejection(c, resolved.left)
+    }
+    const sourceKey = resolved.right.canonical
 
     // Rate limit check — shared with the operator app, keyed on socket address.
     if (deps.rateLimiter.allow(sourceKey) === false) {
@@ -473,8 +493,15 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
   // All other security checks (state validation, PKCE, source key binding) remain.
 
   registerPublicCrossSiteRoute(app, 'GET', config.callbackPath, async (c: Context): Promise<Response> => {
-    // Determine source key for rate limiting and source key binding validation.
-    const sourceKey = deps.getSourceKey(c)
+    // Resolve the trust-aware client address for rate limiting and source
+    // key binding validation. A resolution failure allocates neither a
+    // rate-limit bucket nor OAuth state — never falls back to a shared key.
+    const resolved = Effect.runSync(Effect.either(deps.getSourceKey(c)))
+    if (resolved._tag === 'Left') {
+      deps.logger.warn({reason: resolved.left.kind}, 'oauth callback rejected: ingress resolution failed')
+      return respondForIngressRejection(c, resolved.left)
+    }
+    const sourceKey = resolved.right.canonical
 
     // Rate limit check — shared with the operator app, keyed on socket address.
     if (deps.rateLimiter.allow(sourceKey) === false) {

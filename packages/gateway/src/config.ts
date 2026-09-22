@@ -230,12 +230,12 @@ export interface GatewayConfig {
      * fails before this object is constructed if the env var is missing,
      * empty, or contains an invalid/unspecified/multicast/duplicate entry.
      *
-     * Optional on the type (rather than required) only so pre-existing test
-     * fixtures that hand-construct a `GatewayConfig` without going through
-     * `loadGatewayConfig()` keep compiling; every config actually produced by
-     * `loadGatewayConfig()` sets it whenever `operatorWeb` is present.
+     * Required: `loadGatewayConfig()` always sets it when `operatorWeb` is
+     * present, so every real config carries it. A hand-constructed test
+     * fixture that skips `loadGatewayConfig()` must supply one explicitly
+     * (e.g. via `makeDirectIngressPolicy`/`makeTrustedProxyIngressPolicy`).
      */
-    readonly ingressPolicy?: OperatorIngressPolicy
+    readonly ingressPolicy: OperatorIngressPolicy
   }
   /**
    * Operator Web Push configuration. Present only when

@@ -27,14 +27,29 @@
 
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
+import type {RawIngressInput, ResolvedClientAddress} from '../ingress/resolve-client.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps, OAuthStateStore} from './github.js'
 import type {SessionDeps, SessionStore} from './session.js'
 import {createHash} from 'node:crypto'
+import {Effect} from 'effect'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
+import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
+import {resolveClient, unsafeResolvedClientAddressForTest} from '../ingress/resolve-client.js'
+import {parseTrustedProxyAddress} from '../ingress/trusted-proxy-address.js'
 import {assertAllPrivilegedRoutesWrapped, isPublicRoute, registerPublicRoute} from '../operator-route.js'
 import {buildGitHubOAuthRoutes, createInMemoryStateStore} from './github.js'
 import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './session.js'
+
+/**
+ * Build a stub ResolvedClientAddress for test getSourceKey stubs. The branded
+ * type can only be produced by resolveClient() in production; tests use the
+ * sanctioned test-only constructor to stand in for a fixed resolved client
+ * identity.
+ */
+function stubResolved(canonical: string): ResolvedClientAddress {
+  return unsafeResolvedClientAddressForTest(canonical)
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -138,8 +153,8 @@ function makeStubDeps(overrides?: Partial<GitHubOAuthDeps>): GitHubOAuthDeps {
     generateVerifier: () => 'test-verifier-32-bytes-long-enough-for-pkce',
     generateState: () => 'test-state-value-32-bytes-long-ok',
     stateStore: createInMemoryStateStore(),
-    // In tests, return a fixed source key — no real socket available.
-    getSourceKey: () => 'test-source-key',
+    // In tests, resolve to a fixed source key — no real socket available.
+    getSourceKey: () => Effect.succeed(stubResolved('test-source-key')),
     rateLimiter: makePassRateLimiter(),
     ...overrides,
   }
@@ -159,6 +174,15 @@ function buildTestApp(deps: GitHubOAuthDeps, config: GitHubOAuthConfig): Hono {
   buildGitHubOAuthRoutes(app, deps, config)
   assertAllPrivilegedRoutesWrapped(app)
   return app
+}
+
+/** Mint an OAuth state by hitting the start route and parsing it off the redirect. */
+async function mintState(app: Hono): Promise<string> {
+  const startRes = await app.fetch(new Request('https://operator.example.com/operator/auth/github/start'))
+  const location = startRes.headers.get('location') ?? ''
+  const state = new URL(location).searchParams.get('state')
+  if (state === null) throw new Error('expected a state param on the start redirect')
+  return state
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +509,7 @@ describe('GET /operator/auth/github/start — rate limiter', () => {
   it('calls rateLimiter.allow with the source key on start', async () => {
     // #given
     const rateLimiter = makePassRateLimiter()
-    const deps = makeStubDeps({rateLimiter, getSourceKey: () => 'fixed-key'})
+    const deps = makeStubDeps({rateLimiter, getSourceKey: () => Effect.succeed(stubResolved('fixed-key'))})
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
 
@@ -670,7 +694,12 @@ describe('GET /operator/auth/github/callback — rate limiter', () => {
       issuedAt: now,
       consumed: false,
     })
-    const deps = makeStubDeps({rateLimiter, stateStore, clock: () => now + 1000, getSourceKey: () => 'fixed-key'})
+    const deps = makeStubDeps({
+      rateLimiter,
+      stateStore,
+      clock: () => now + 1000,
+      getSourceKey: () => Effect.succeed(stubResolved('fixed-key')),
+    })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
 
@@ -706,7 +735,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       stateStore,
       clock: () => now + 1000,
       auditLogger,
-      getSourceKey: () => 'ip-2', // different from mint-time key
+      getSourceKey: () => Effect.succeed(stubResolved('ip-2')), // different from mint-time key
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -740,7 +769,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     const deps = makeStubDeps({
       stateStore,
       clock: () => now + 1000,
-      getSourceKey: () => 'ip-1',
+      getSourceKey: () => Effect.succeed(stubResolved('ip-1')),
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -769,7 +798,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     const deps = makeStubDeps({
       stateStore,
       clock: () => now + 1000,
-      getSourceKey: () => 'any-key',
+      getSourceKey: () => Effect.succeed(stubResolved('any-key')),
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -859,7 +888,7 @@ describe('GET /operator/auth/github/callback — provider error state consumptio
     const deps = makeStubDeps({
       stateStore,
       clock: () => now + 1000,
-      getSourceKey: () => 'ip-2', // different source
+      getSourceKey: () => Effect.succeed(stubResolved('ip-2')), // different source
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -909,6 +938,150 @@ describe('GET /operator/auth/github/callback — provider error state consumptio
     // #and — state is NOT consumed (expired entries are not burned)
     const entry = stateStore.get('expired-state-value')
     expect(entry?.consumed).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// OAuth callback — source key binding through the REAL trusted-proxy resolver
+//
+// The tests above stub getSourceKey with a fixed/varying string — they prove
+// the *comparison* logic. These tests wire getSourceKey to the real
+// resolveClient() + OperatorIngressPolicy (the exact production composition
+// from program.ts), fed crafted RawIngressInput per call, to prove the
+// *resolution* itself: that start and callback traversing different trusted
+// proxies still bind, that IPv4 and IPv4-mapped-IPv6 spellings of one client
+// are the same key, and that a genuinely different client still fails. A real
+// socket cannot be made to originate from two different configured proxy
+// addresses in-process, so this is the faithful alternative: same resolver,
+// same policy, real (not stubbed) canonicalization — only the transport-level
+// getConnInfo() call is substituted.
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/auth/github/callback — source key binding via the real ingress resolver', () => {
+  const PROXY_A = '198.51.100.1'
+  const PROXY_B = '198.51.100.2'
+  const trustedProxyPolicy = makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com'), [
+    Effect.runSync(parseTrustedProxyAddress(PROXY_A)),
+    Effect.runSync(parseTrustedProxyAddress(PROXY_B)),
+  ])
+
+  /** Resolves each successive call against the real resolver, one RawIngressInput per call, in order. */
+  function makeSequencedRealGetSourceKey(
+    rawInputsInCallOrder: readonly RawIngressInput[],
+  ): GitHubOAuthDeps['getSourceKey'] {
+    let callIndex = 0
+    return () => {
+      const raw = rawInputsInCallOrder[callIndex]
+      callIndex += 1
+      if (raw === undefined) throw new Error('makeSequencedRealGetSourceKey: more calls than configured inputs')
+      return resolveClient(raw, trustedProxyPolicy)
+    }
+  }
+
+  it('start through trusted proxy A, callback through trusted proxy B, same client — binding passes', async () => {
+    // #given — start traverses proxy A, callback traverses proxy B; same client XFF both times
+    const deps = makeStubDeps({
+      getSourceKey: makeSequencedRealGetSourceKey([
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']},
+        {socketAddress: PROXY_B, forwardedForHeaders: ['203.0.113.5']},
+      ]),
+    })
+    const app = buildTestApp(deps, makeStubConfig())
+    const state = await mintState(app)
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code`),
+    )
+
+    // #then — binding passed; callback proceeded to identity verification
+    expect(res.status).toBe(200)
+  })
+
+  it('equivalent IPv4 and IPv4-mapped-IPv6 forms of one client — binding passes', async () => {
+    // #given — same trusted proxy both times; client written as plain IPv4 at
+    // mint, as its IPv4-mapped-IPv6 form at callback
+    const deps = makeStubDeps({
+      getSourceKey: makeSequencedRealGetSourceKey([
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']},
+        {socketAddress: PROXY_A, forwardedForHeaders: ['::ffff:203.0.113.5']},
+      ]),
+    })
+    const app = buildTestApp(deps, makeStubConfig())
+    const state = await mintState(app)
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code`),
+    )
+
+    // #then — both forms canonicalize to the same client; binding passed
+    expect(res.status).toBe(200)
+  })
+
+  it('a genuinely different client — binding is still rejected (existing protection not weakened)', async () => {
+    // #given — different XFF client at callback than at mint
+    const deps = makeStubDeps({
+      getSourceKey: makeSequencedRealGetSourceKey([
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']},
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.9']},
+      ]),
+    })
+    const app = buildTestApp(deps, makeStubConfig())
+    const state = await mintState(app)
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code`),
+    )
+
+    // #then — rejected
+    expect(res.status).toBe(400)
+  })
+
+  it('the provider-error callback path uses the same real-resolver comparison', async () => {
+    // #given — different XFF client at callback than at mint, provider returns an error
+    const stateStore = createInMemoryStateStore()
+    const deps = makeStubDeps({
+      stateStore,
+      getSourceKey: makeSequencedRealGetSourceKey([
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']},
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.9']},
+      ]),
+    })
+    const app = buildTestApp(deps, makeStubConfig())
+    const state = await mintState(app)
+
+    // #when — provider-error callback from the mismatched client
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?error=access_denied&state=${state}`),
+    )
+
+    // #then — rejected; the mismatched source key must NOT consume the state
+    // (same comparison, same fail-closed outcome as the non-error callback path)
+    expect(res.status).toBe(400)
+    const entry = stateStore.get(state)
+    expect(entry?.consumed).toBe(false)
+  })
+
+  it('socket-unavailable on start allocates neither a rate-limit bucket nor OAuth state, and returns 503', async () => {
+    // #given — the real resolver sees no socket at all (mirrors app.fetch() with no real connection)
+    const stateStore = createInMemoryStateStore()
+    const rateLimiter = {allow: vi.fn(() => true)}
+    const deps = makeStubDeps({
+      stateStore,
+      rateLimiter,
+      getSourceKey: makeSequencedRealGetSourceKey([{socketAddress: undefined, forwardedForHeaders: []}]),
+    })
+    const app = buildTestApp(deps, makeStubConfig())
+
+    // #when
+    const res = await app.fetch(new Request('https://operator.example.com/operator/auth/github/start'))
+
+    // #then — 503, never a fallback key
+    expect(res.status).toBe(503)
+    expect(rateLimiter.allow).not.toHaveBeenCalled()
+    expect(stateStore.size()).toBe(0)
   })
 })
 
@@ -1564,7 +1737,7 @@ describe('GET /operator/auth/github/start — global store ceiling', () => {
       stateStore,
       generateState: () => `state-${++stateCounter}`,
       // Each request gets a unique source key so per-source cap never triggers.
-      getSourceKey: () => `source-${++sourceCounter}`,
+      getSourceKey: () => Effect.succeed(stubResolved(`source-${++sourceCounter}`)),
     })
     // Per-source cap is high (100) so it never fires; global cap is what we hit.
     const config = makeStubConfig({maxOutstandingAttemptsPerKey: 100})
@@ -1602,7 +1775,7 @@ describe('GET /operator/auth/github/start — global store ceiling', () => {
     const deps = makeStubDeps({
       stateStore,
       generateState: () => `state-${++stateCounter}`,
-      getSourceKey: () => `source-${++sourceCounter}`,
+      getSourceKey: () => Effect.succeed(stubResolved(`source-${++sourceCounter}`)),
       clock: () => currentTime,
     })
     const config = makeStubConfig({maxOutstandingAttemptsPerKey: 100, stateTtlMs: ttlMs})

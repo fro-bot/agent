@@ -18,9 +18,12 @@
 import type {Context, Hono} from 'hono'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
+import type {IngressRejection, ResolvedClientAddress} from '../ingress/resolve-client.js'
 import type {BrowserGuardDeps} from './csrf.js'
 import {randomBytes} from 'node:crypto'
+import {Effect} from 'effect'
 import {emitAudit} from '../audit.js'
+import {respondForIngressRejection} from '../ingress/hono-context.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {okResponse, rateLimitedResponse} from '../safe-response.js'
 
@@ -193,11 +196,14 @@ export interface SessionDeps {
    */
   readonly rateLimiter?: RateLimiter
   /**
-   * Source key extractor for rate limiting.
-   * Must be derived from the TCP socket address — NOT from caller-spoofable headers.
-   * When absent, falls back to 'unknown' (backwards-compatible for tests).
+   * Trusted-proxy-aware client resolver for rate limiting.
+   * Must resolve through the same `resolveClient` + `OperatorIngressPolicy`
+   * used everywhere else on the operator surface — never a caller-spoofable
+   * header read directly. When absent, no rate limiting is applied
+   * (backwards-compatible for tests that don't care about rate limiting).
+   * A resolution failure is never treated as a fallback 'unknown' key.
    */
-  readonly getSourceKey?: (c: Context) => string
+  readonly getSourceKey?: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>
 }
 
 // ---------------------------------------------------------------------------
@@ -437,9 +443,17 @@ export function buildLogoutRoutes(
   // (setOperatorRouteGuard in server.ts). The handler reads the authenticated context
   // (sessionId, githubUserId) from Hono context variables set by the guard wrapper.
   registerOperatorRoute(app, 'POST', '/operator/auth/logout', async (c: Context): Promise<Response> => {
-    // Rate limit check — shared with the operator app, keyed on socket address.
-    if (deps.rateLimiter !== undefined) {
-      const sourceKey = deps.getSourceKey === undefined ? 'unknown' : deps.getSourceKey(c)
+    // Rate limit check — shared with the operator app, keyed on the
+    // trust-aware resolved client address. When no resolver is configured,
+    // rate limiting is skipped entirely (test back-compat) — never a fallback
+    // 'unknown' key that every unresolvable request would share.
+    if (deps.rateLimiter !== undefined && deps.getSourceKey !== undefined) {
+      const resolved = Effect.runSync(Effect.either(deps.getSourceKey(c)))
+      if (resolved._tag === 'Left') {
+        deps.logger.warn({reason: resolved.left.kind}, 'logout rejected: ingress resolution failed')
+        return respondForIngressRejection(c, resolved.left)
+      }
+      const sourceKey = resolved.right.canonical
       if (deps.rateLimiter.allow(sourceKey) === false) {
         deps.logger.warn({}, 'logout rejected: rate limited')
         return rateLimitedResponse(c)

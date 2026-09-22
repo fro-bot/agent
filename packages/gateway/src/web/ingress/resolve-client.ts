@@ -74,6 +74,20 @@ function toResolved(canonical: CanonicalAddress): ResolvedClientAddress {
 }
 
 /**
+ * TEST-ONLY escape hatch for the `ResolvedClientAddress` brand.
+ *
+ * Production code must never call this — the only production source of a
+ * `ResolvedClientAddress` is `resolveClient()` above. This exists solely so
+ * test fixtures that stub `getSourceKey` (or similar) can hand back a value
+ * of the right type without reaching for `as unknown as ResolvedClientAddress`
+ * at each call site, which would otherwise be the only way to satisfy the
+ * type from outside this module. Name is deliberately loud and greppable.
+ */
+export function unsafeResolvedClientAddressForTest(canonical: string): ResolvedClientAddress {
+  return {canonical} as ResolvedClientAddress
+}
+
+/**
  * Resolves the trust-aware client address for one request.
  *
  * Algorithm:

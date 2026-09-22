@@ -13,6 +13,7 @@
 import type {Context} from 'hono'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
+import {asCanonicalHttpsOrigin, makeDirectIngressPolicy} from './ingress/policy.js'
 import {
   assertAllPrivilegedRoutesWrapped,
   getOperatorAuthContext,
@@ -511,7 +512,12 @@ describe('buildOperatorApp — health route is explicitly public', () => {
         logger: {debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined},
         isShuttingDown: () => false,
       },
-      {bindHost: '127.0.0.1', bindPort: 0, publicOrigin: 'https://operator.example.com'},
+      {
+        bindHost: '127.0.0.1',
+        bindPort: 0,
+        publicOrigin: 'https://operator.example.com',
+        ingressPolicy: makeDirectIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com')),
+      },
     )
 
     // #when / #then — health route is public, not privileged
@@ -537,7 +543,12 @@ describe('buildOperatorApp — health route is explicitly public', () => {
         getBindingByRepo: async () => ({success: true as const, data: null}),
         dispatchWorkflow: async (owner: string, repo: string) => ({outcome: 'accepted' as const, owner, repo}),
       },
-      {bindHost: '127.0.0.1', bindPort: 0, publicOrigin: 'https://operator.example.com'},
+      {
+        bindHost: '127.0.0.1',
+        bindPort: 0,
+        publicOrigin: 'https://operator.example.com',
+        ingressPolicy: makeDirectIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com')),
+      },
     )
 
     // #when / #then — all operator routes are wrapped or explicitly public

@@ -12,10 +12,13 @@
  */
 
 import {Buffer} from 'node:buffer'
+import {Effect} from 'effect'
 import {describe, expect, it, vi} from 'vitest'
 
 import {buildOperatorServerInputs} from '../program.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
+import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from './ingress/policy.js'
+import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {EXPECTED_OPERATOR_ROUTES, runOperatorRouteSmoke} from './operator-route-smoke.js'
 import {buildOperatorApp} from './server.js'
 
@@ -102,6 +105,12 @@ function makeStubOperatorWebConfig() {
     oauthMaxOutstandingAttemptsPerKey: 5,
     csrfSecret: Buffer.from('test-csrf-secret-32-bytes-long!!', 'utf8').toString('base64url'),
     allowlist: loadAllowlistFromText('42\n', noopLogger),
+    // No port is ever bound and no real request is resolved in this
+    // diagnostic parity test, so a single stub trusted-proxy peer is
+    // sufficient to satisfy the (now required) ingressPolicy shape.
+    ingressPolicy: makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin('https://operator.smoke.test'), [
+      Effect.runSync(parseTrustedProxyAddress('10.0.0.1')),
+    ]),
   }
 }
 

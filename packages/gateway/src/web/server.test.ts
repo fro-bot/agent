@@ -20,10 +20,12 @@ import type {ServerType} from '@hono/node-server'
 
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {SessionDeps} from './auth/session.js'
+import type {ResolvedClientAddress} from './ingress/resolve-client.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './server.js'
 import {Buffer} from 'node:buffer'
 import {createServer} from 'node:http'
 
+import {Effect} from 'effect'
 import {describe, expect, it, vi} from 'vitest'
 import {createRateLimiter} from '../http/rate-limit.js'
 import {OPERATOR_CONTRACT_VERSION} from '../operator-contract/index.js'
@@ -31,9 +33,22 @@ import {loadAllowlistFromText} from './auth/allowlist.js'
 import {generateCsrfToken} from './auth/csrf.js'
 import {createInMemoryStateStore} from './auth/github.js'
 import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './auth/session.js'
+import {asCanonicalHttpsOrigin, makeDirectIngressPolicy, makeTrustedProxyIngressPolicy} from './ingress/policy.js'
+import {unsafeResolvedClientAddressForTest} from './ingress/resolve-client.js'
+import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {EXPECTED_OPERATOR_ROUTES} from './operator-route-smoke.js'
 import {isPrivilegedRoute, isPublicCrossSiteRoute, isPublicRoute} from './operator-route.js'
 import {buildOperatorApp, createOperatorServer} from './server.js'
+
+/**
+ * Build a stub ResolvedClientAddress for test getSourceKey stubs. The branded
+ * type can only be produced by resolveClient() in production; tests use the
+ * sanctioned test-only constructor to stand in for a fixed resolved client
+ * identity.
+ */
+function stubResolved(canonical: string): ResolvedClientAddress {
+  return unsafeResolvedClientAddressForTest(canonical)
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -63,8 +78,25 @@ function makeStubConfig(overrides?: Partial<OperatorServerConfig>): OperatorServ
     bindHost: '127.0.0.1',
     bindPort: 0,
     publicOrigin: 'https://operator.example.com',
+    // Default: no reverse proxy trusted. Real test requests over loopback
+    // (127.0.0.1) are therefore an untrusted peer — X-Forwarded-For is
+    // ignored, and any supplied X-Forwarded-Host/-Proto is rejected. Tests
+    // exercising the trusted-peer path override this with TRUSTED_PROXY_POLICY.
+    ingressPolicy: makeDirectIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com')),
     ...overrides,
   }
+}
+
+/**
+ * Ingress policy trusting 127.0.0.1 as a reverse-proxy peer — real test
+ * requests made via fetch() against a loopback-bound createOperatorServer()
+ * originate from exactly this address, so this is the only real (non-fabricated)
+ * way to exercise the trusted-peer path with a genuine socket.
+ */
+function makeTrustedLoopbackPolicy(publicOrigin = 'https://operator.example.com') {
+  return makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin(publicOrigin), [
+    Effect.runSync(parseTrustedProxyAddress('127.0.0.1')),
+  ])
 }
 
 interface RouteEntry {
@@ -145,7 +177,7 @@ function makeStubGitHubOAuthDeps(overrides?: Partial<GitHubOAuthDeps>): GitHubOA
     generateVerifier: () => 'stub-verifier-32-bytes-long-enough-for-pkce',
     generateState: () => 'stub-state-value-32-bytes-long-ok',
     stateStore: createInMemoryStateStore(),
-    getSourceKey: () => 'stub-source-key',
+    getSourceKey: () => Effect.succeed(stubResolved('stub-source-key')),
     // rateLimiter is overwritten by buildOperatorApp with the shared instance;
     // provide a pass-through stub so the type is satisfied.
     rateLimiter: {allow: () => true},
@@ -348,11 +380,13 @@ describe('operator server — body size limit', () => {
 // ---------------------------------------------------------------------------
 
 describe('operator server — unauthenticated rate limit', () => {
-  it('returns 429 when the socket-keyed rate limiter is exhausted', async () => {
-    // #given — rate limiter that always denies
+  it('returns 429 when the health-route rate limiter is exhausted', async () => {
+    // #given — health route uses its own independent limiter (healthRateLimiter),
+    // NOT the shared OAuth/logout rateLimiter — that separation is the fix for
+    // health polling being able to starve sign-in.
     const port = await findFreePort()
     const server = createOperatorServer(
-      makeStubDeps({rateLimiter: {allow: () => false}}),
+      makeStubDeps({healthRateLimiter: {allow: () => false}}),
       makeStubConfig({bindPort: port}),
     )
 
@@ -398,199 +432,332 @@ describe('operator server — unknown routes', () => {
 // Trusted-origin header validation — reject untrusted forwarded-host/proto
 // ---------------------------------------------------------------------------
 
-describe('operator server — trusted origin enforcement', () => {
-  it('rejects requests with X-Forwarded-Host that does not match publicOrigin', async () => {
-    // #given
-    const port = await findFreePort()
-    const server = createOperatorServer(
-      makeStubDeps(),
-      makeStubConfig({
-        bindPort: port,
-        publicOrigin: 'https://operator.example.com',
-      }),
-    )
+// All requests here go through a real TCP socket (createOperatorServer + fetch),
+// exactly like http/server.test.ts — the trust decision now depends on the real
+// peer address (getConnInfo), which app.fetch() cannot supply.
+
+/** Start a real operator server on a free loopback port; caller must close it. */
+async function startRealOperatorServer(
+  deps: OperatorServerDeps,
+  configOverrides: Partial<OperatorServerConfig> = {},
+): Promise<{readonly port: number; readonly close: () => Promise<void>}> {
+  const port = await findFreePort()
+  const server = createOperatorServer(deps, makeStubConfig({bindPort: port, ...configOverrides}))
+  return {
+    port,
+    close: async () => new Promise<void>(resolve => server.close(() => resolve())),
+  }
+}
+
+describe('operator server — trusted origin enforcement — untrusted peer (default policy)', () => {
+  it('rejects a request supplying X-Forwarded-Host/-Proto even when they match publicOrigin — a matching hostname is not proof of proxy provenance', async () => {
+    // #given — default policy trusts no peer; the real test socket (127.0.0.1) is untrusted
+    const {port, close} = await startRealOperatorServer(makeStubDeps())
 
     try {
-      // #when — send a request with a mismatched forwarded host
+      // #when — forwarded headers exactly match publicOrigin
       const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
-        headers: {
-          'x-forwarded-host': 'evil.attacker.com',
-          'x-forwarded-proto': 'https',
-        },
+        headers: {'x-forwarded-host': 'operator.example.com', 'x-forwarded-proto': 'https'},
       })
-      const body = await res.json()
 
-      // #then — rejected as untrusted
+      // #then — rejected: only the peer address decides trust, not header content
       expect(res.status).toBe(400)
-      expect(body).toEqual({error: 'bad request'})
+      expect(await res.json()).toEqual({error: 'bad request'})
     } finally {
-      await new Promise<void>(resolve => server.close(() => resolve()))
+      await close()
     }
   })
 
-  it('accepts requests with X-Forwarded-Host matching publicOrigin', async () => {
-    // #given
-    const port = await findFreePort()
-    const server = createOperatorServer(
-      makeStubDeps(),
-      makeStubConfig({
-        bindPort: port,
-        publicOrigin: 'https://operator.example.com',
-      }),
-    )
-
+  it('rejects a request supplying only X-Forwarded-Host from an untrusted peer', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps())
     try {
-      // #when — send a request with the correct forwarded host
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-host': 'evil.attacker.com'},
+      })
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
+  })
+
+  it('rejects a request supplying only X-Forwarded-Proto from an untrusted peer', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps())
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-proto': 'https'},
+      })
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
+  })
+
+  it('ignores X-Forwarded-For from an untrusted peer — the socket address is used, not the spoofed header', async () => {
+    // #given — an untrusted peer supplying a spoofed XFF should not be able to
+    // fragment or forge the rate-limit key via the header alone.
+    const {port, close} = await startRealOperatorServer(makeStubDeps())
+    try {
+      // #when — two requests claim two different "clients" via XFF from the same untrusted socket
+      const resA = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-for': '203.0.113.10'},
+      })
+      const resB = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-for': '203.0.113.20'},
+      })
+      // #then — XFF is not rejected outright (only X-Forwarded-Host/-Proto are);
+      // both requests succeed and are keyed on the real (untrusted) socket address
+      expect(resA.status).toBe(200)
+      expect(resB.status).toBe(200)
+    } finally {
+      await close()
+    }
+  })
+
+  it('no forwarded headers — headerless direct connection — accepted', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps())
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`)
+      expect(res.status).toBe(200)
+    } finally {
+      await close()
+    }
+  })
+})
+
+describe('operator server — trusted origin enforcement — trusted peer', () => {
+  it('accepts a single valid X-Forwarded-Host/-Proto pair matching publicOrigin', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
       const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
         headers: {
           'x-forwarded-host': 'operator.example.com',
           'x-forwarded-proto': 'https',
+          'x-forwarded-for': '198.51.100.1',
         },
       })
-      const body = await res.json()
-
-      // #then — accepted (health route is not privileged)
       expect(res.status).toBe(200)
-      expect(body).toEqual({ok: true, contractVersion: OPERATOR_CONTRACT_VERSION})
+      expect(await res.json()).toEqual({ok: true, contractVersion: OPERATOR_CONTRACT_VERSION})
     } finally {
-      await new Promise<void>(resolve => server.close(() => resolve()))
+      await close()
     }
   })
 
-  it('rejects requests with only X-Forwarded-Host (no proto) — partial headers', async () => {
-    // #given
-    const app = buildOperatorApp(makeStubDeps(), makeStubConfig())
-
-    // #when
-    const req = new Request('http://127.0.0.1/operator/health', {
-      headers: {'x-forwarded-host': 'operator.example.com'},
-    })
-    const res = await app.fetch(req)
-
-    // #then — partial forwarded headers are suspicious; reject
-    expect(res.status).toBe(400)
+  it('rejects a mismatched X-Forwarded-Host', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {
+          'x-forwarded-host': 'evil.attacker.com',
+          'x-forwarded-proto': 'https',
+          'x-forwarded-for': '198.51.100.1',
+        },
+      })
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
   })
 
-  it('rejects requests with only X-Forwarded-Proto (no host) — partial headers', async () => {
-    // #given
-    const app = buildOperatorApp(makeStubDeps(), makeStubConfig())
-
-    // #when
-    const req = new Request('http://127.0.0.1/operator/health', {
-      headers: {'x-forwarded-proto': 'https'},
-    })
-    const res = await app.fetch(req)
-
-    // #then — partial forwarded headers are suspicious; reject
-    expect(res.status).toBe(400)
+  it('rejects X-Forwarded-Proto=http (not https)', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {
+          'x-forwarded-host': 'operator.example.com',
+          'x-forwarded-proto': 'http',
+          'x-forwarded-for': '198.51.100.1',
+        },
+      })
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
   })
 
-  it('rejects requests with X-Forwarded-Proto=http (not https)', async () => {
-    // #given
-    const app = buildOperatorApp(makeStubDeps(), makeStubConfig({publicOrigin: 'https://operator.example.com'}))
-
-    // #when
-    const req = new Request('http://127.0.0.1/operator/health', {
-      headers: {
-        'x-forwarded-host': 'operator.example.com',
-        'x-forwarded-proto': 'http',
-      },
-    })
-    const res = await app.fetch(req)
-
-    // #then — http proto is not acceptable; TLS is required
-    expect(res.status).toBe(400)
+  it('rejects only X-Forwarded-Host (no proto) — partial headers', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-host': 'operator.example.com', 'x-forwarded-for': '198.51.100.1'},
+      })
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
   })
 
-  it('rejects X-Forwarded-Host with port suffix when publicOrigin has no port (full-host mismatch)', async () => {
-    // #given — publicOrigin has no explicit port (default 443 for https);
-    // publicOriginHost is 'operator.example.com' (no port suffix).
-    // Forwarded host includes ':443' — does not match exactly.
-    const app = buildOperatorApp(
-      makeStubDeps({rateLimiter: {allow: () => true}}),
-      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
-    )
-
-    // #when — host with port suffix does NOT match the stored publicOriginHost
-    const req = new Request('http://127.0.0.1/operator/health', {
-      headers: {
-        'x-forwarded-host': 'operator.example.com:443',
-        'x-forwarded-proto': 'https',
-      },
-    })
-    const res = await app.fetch(req)
-
-    // #then — full-host comparison: 'operator.example.com:443' !== 'operator.example.com'; rejected
-    expect(res.status).toBe(400)
+  it('rejects only X-Forwarded-Proto (no host) — partial headers', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-proto': 'https', 'x-forwarded-for': '198.51.100.1'},
+      })
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
   })
 
   it('rejects comma-separated X-Forwarded-Host (multi-value header)', async () => {
-    // #given — comma-separated host is not a valid single host match
-    const app = buildOperatorApp(makeStubDeps(), makeStubConfig({publicOrigin: 'https://operator.example.com'}))
-
-    // #when
-    const req = new Request('http://127.0.0.1/operator/health', {
-      headers: {
-        'x-forwarded-host': 'operator.example.com, evil.attacker.com',
-        'x-forwarded-proto': 'https',
-      },
-    })
-    const res = await app.fetch(req)
-
-    // #then — comma-separated host does not match the expected host; reject
-    expect(res.status).toBe(400)
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {
+          'x-forwarded-host': 'operator.example.com, evil.attacker.com',
+          'x-forwarded-proto': 'https',
+          'x-forwarded-for': '198.51.100.1',
+        },
+      })
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
   })
 
-  it('accepts X-Forwarded-Host matching publicOrigin with non-default port (exact host:port match)', async () => {
-    // #given — publicOrigin includes a non-default port; forwarded host must match exactly
-    const app = buildOperatorApp(
-      makeStubDeps({rateLimiter: {allow: () => true}}),
-      makeStubConfig({publicOrigin: 'https://operator.example.com:8443'}),
+  it('accepts X-Forwarded-Host matching publicOrigin with a non-default port (exact host:port match)', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {
+      publicOrigin: 'https://operator.example.com:8443',
+      ingressPolicy: makeTrustedLoopbackPolicy('https://operator.example.com:8443'),
+    })
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {
+          'x-forwarded-host': 'operator.example.com:8443',
+          'x-forwarded-proto': 'https',
+          'x-forwarded-for': '198.51.100.1',
+        },
+      })
+      expect(res.status).toBe(200)
+    } finally {
+      await close()
+    }
+  })
+
+  it('rejects X-Forwarded-Host with a port not present in publicOrigin', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {
+          'x-forwarded-host': 'operator.example.com:8443',
+          'x-forwarded-proto': 'https',
+          'x-forwarded-for': '198.51.100.1',
+        },
+      })
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
+  })
+
+  it('rejects a headerless request to a non-health route — the health-only exception does not generalize', async () => {
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/nonexistent`)
+      // #then — rejected by the forwarded-header middleware before the 404 handler runs
+      expect(res.status).toBe(400)
+    } finally {
+      await close()
+    }
+  })
+
+  it('a headerless direct health probe from a trusted-proxy peer still succeeds (narrow, health-only exception)', async () => {
+    // #given — trusted peer, zero forwarding metadata at all: the proxy's own
+    // liveness check, not a forwarded client request.
+    const {port, close} = await startRealOperatorServer(makeStubDeps(), {ingressPolicy: makeTrustedLoopbackPolicy()})
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`)
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ok: true, contractVersion: OPERATOR_CONTRACT_VERSION})
+    } finally {
+      await close()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The actual outage this fixes, pinned: two distinct clients behind one
+// trusted reverse proxy must resolve to two distinct rate-limit keys.
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/health — trusted-proxy client separation (regression pin for the outage)', () => {
+  it('two different clients behind one trusted proxy get separate rate-limit buckets', async () => {
+    // #given — health limiter with a per-key limit of 1; the real test socket
+    // (127.0.0.1) is the trusted proxy, two distinct XFF values are the two clients
+    const {port, close} = await startRealOperatorServer(
+      makeStubDeps({healthRateLimiter: createRateLimiter({limit: 1, windowMs: 60_000})}),
+      {ingressPolicy: makeTrustedLoopbackPolicy()},
     )
+    try {
+      // #when — client A's first request, then B's first request, then A's second request
+      const forwardedOrigin = {'x-forwarded-host': 'operator.example.com', 'x-forwarded-proto': 'https'}
+      const resA1 = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {...forwardedOrigin, 'x-forwarded-for': '203.0.113.5'},
+      })
+      const resB1 = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {...forwardedOrigin, 'x-forwarded-for': '203.0.113.9'},
+      })
+      const resA2 = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {...forwardedOrigin, 'x-forwarded-for': '203.0.113.5'},
+      })
 
-    // #when — forwarded host matches the stored publicOriginHost exactly
-    const req = new Request('http://127.0.0.1/operator/health', {
-      headers: {
-        'x-forwarded-host': 'operator.example.com:8443',
-        'x-forwarded-proto': 'https',
-      },
-    })
-    const res = await app.fetch(req)
-
-    // #then — exact match; accepted
-    expect(res.status).toBe(200)
+      // #then — A and B each get their own budget; A's second request exhausts A's
+      // own bucket, not a shared one collapsed onto the proxy's address
+      expect(resA1.status).toBe(200)
+      expect(resB1.status).toBe(200)
+      expect(resA2.status).toBe(429)
+    } finally {
+      await close()
+    }
   })
+})
 
-  it('rejects X-Forwarded-Host with mismatched port (port in forwarded but not in publicOrigin)', async () => {
-    // #given — publicOrigin has no explicit port; forwarded host includes a non-standard port
-    const app = buildOperatorApp(
-      makeStubDeps({rateLimiter: {allow: () => true}}),
-      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+// ---------------------------------------------------------------------------
+// Health limiter independence — health polling cannot starve sign-in, and vice versa.
+// ---------------------------------------------------------------------------
+
+describe('operator server — health and OAuth/logout use independent rate-limit budgets', () => {
+  it('exhausting the health budget does not block the OAuth start route', async () => {
+    // #given — health limiter denies everything; the shared OAuth/logout limiter allows
+    const {port, close} = await startRealOperatorServer(
+      makeStubDeps({
+        healthRateLimiter: {allow: () => false},
+        rateLimiter: {allow: () => true},
+        githubOAuth: makeStubGitHubOAuthDeps(),
+      }),
+      {githubOAuth: makeStubGitHubOAuthConfig()},
     )
+    try {
+      const healthRes = await fetch(`http://127.0.0.1:${port}/operator/health`)
+      const startRes = await fetch(`http://127.0.0.1:${port}/operator/auth/github/start`, {redirect: 'manual'})
 
-    // #when — forwarded host has port 8443 but publicOriginHost is 'operator.example.com'
-    const req = new Request('http://127.0.0.1/operator/health', {
-      headers: {
-        'x-forwarded-host': 'operator.example.com:8443',
-        'x-forwarded-proto': 'https',
-      },
-    })
-    const res = await app.fetch(req)
-
-    // #then — 'operator.example.com:8443' !== 'operator.example.com'; rejected
-    expect(res.status).toBe(400)
+      // #then — health is throttled; sign-in is unaffected
+      expect(healthRes.status).toBe(429)
+      expect(startRes.status).toBe(302)
+    } finally {
+      await close()
+    }
   })
 
-  it('no forwarded headers — direct connection — accepted', async () => {
-    // #given — inject stub rate limiter so getConnInfo (needs real socket) is not reached
-    const app = buildOperatorApp(makeStubDeps({rateLimiter: {allow: () => true}}), makeStubConfig())
+  it('exhausting the shared OAuth/logout budget does not block the health route', async () => {
+    // #given — shared limiter denies everything; health's own limiter allows
+    const {port, close} = await startRealOperatorServer(
+      makeStubDeps({
+        healthRateLimiter: {allow: () => true},
+        rateLimiter: {allow: () => false},
+        githubOAuth: makeStubGitHubOAuthDeps(),
+      }),
+      {githubOAuth: makeStubGitHubOAuthConfig()},
+    )
+    try {
+      const startRes = await fetch(`http://127.0.0.1:${port}/operator/auth/github/start`, {redirect: 'manual'})
+      const healthRes = await fetch(`http://127.0.0.1:${port}/operator/health`)
 
-    // #when — no forwarded headers at all
-    const req = new Request('http://127.0.0.1/operator/health')
-    const res = await app.fetch(req)
-
-    // #then — direct connection with no forwarded headers is allowed
-    expect(res.status).toBe(200)
+      // #then — sign-in is throttled; health is unaffected
+      expect(startRes.status).toBe(429)
+      expect(healthRes.status).toBe(200)
+    } finally {
+      await close()
+    }
   })
 })
 
@@ -728,23 +895,30 @@ describe('operator server — warning log on rejection paths', () => {
     expect(logger.warn).toHaveBeenCalledOnce()
   })
 
-  it('logs a warning when getConnInfo is unavailable (no-socket fallback path)', async () => {
-    // #given — use app.fetch() directly (no real socket) so getConnInfo throws;
-    // inject a rate limiter that always allows so the fallback path is reached.
+  it('returns 503 (never a fallback key) when the socket is unavailable, and logs a bounded diagnostic', async () => {
+    // #given — use app.fetch() directly (no real socket) so getConnInfo throws.
+    // A rate limiter that always allows is injected so a 200 here (if it occurred)
+    // could only be explained by a resurrected fallback key, not a rate-limit rejection.
     const logger = makeLogger()
-    const app = buildOperatorApp(makeStubDeps({logger, rateLimiter: {allow: () => true}}), makeStubConfig())
+    const healthRateLimiter = {allow: vi.fn(() => true)}
+    const app = buildOperatorApp(makeStubDeps({logger, healthRateLimiter}), makeStubConfig())
 
     // #when — direct app.fetch() has no underlying socket; getConnInfo will throw
     const req = new Request('http://127.0.0.1/operator/health')
     const res = await app.fetch(req)
 
-    // #then — request still succeeds (fallback key is used)
-    expect(res.status).toBe(200)
+    // #then — socket acquisition failure is a coarse 503, never a fallback 'unknown' key
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({error: 'unavailable'})
 
-    // #and — a warning was emitted for the collapsed rate-limit key
+    // #and — no rate-limit bucket was allocated for a request that never resolved a key
+    expect(healthRateLimiter.allow).not.toHaveBeenCalled()
+
+    // #and — a bounded diagnostic was logged (reason only, no raw headers/addresses)
     const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls as [Record<string, unknown>, string][]
-    const fallbackWarning = warnCalls.find(([, msg]) => msg.includes('getConnInfo unavailable'))
-    expect(fallbackWarning).toBeDefined()
+    const rejectionWarning = warnCalls.find(([, msg]) => msg.includes('ingress resolution failed'))
+    expect(rejectionWarning).toBeDefined()
+    expect(rejectionWarning?.[0]).toEqual({reason: 'socket-unavailable'})
   })
 })
 
@@ -844,7 +1018,7 @@ describe('buildOperatorApp — logout route registration', () => {
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
-    const app = buildOperatorApp(
+    const {port, close} = await startRealOperatorServer(
       makeStubDeps({
         sessionStore,
         sessionDeps,
@@ -854,30 +1028,33 @@ describe('buildOperatorApp — logout route registration', () => {
         logger,
         rateLimiter: {allow: () => true},
       }),
-      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+      {publicOrigin: 'https://operator.example.com'},
     )
 
-    // #when
-    const req = new Request('http://127.0.0.1/operator/auth/logout', {
-      method: 'POST',
-      headers: {
-        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
-        origin: 'https://operator.example.com',
-        'x-csrf-token': csrfToken,
-      },
-    })
-    const res = await app.fetch(req)
+    try {
+      // #when
+      const res = await fetch(`http://127.0.0.1:${port}/operator/auth/logout`, {
+        method: 'POST',
+        headers: {
+          cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+          origin: 'https://operator.example.com',
+          'x-csrf-token': csrfToken,
+        },
+      })
 
-    // #then — success
-    expect(res.status).toBe(200)
+      // #then — success
+      expect(res.status).toBe(200)
 
-    // #and — session is invalidated
-    expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+      // #and — session is invalidated
+      expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
 
-    // #and — clear-cookie header is set
-    const setCookie = res.headers.get('set-cookie') ?? ''
-    expect(setCookie).toContain(SESSION_COOKIE_NAME)
-    expect(setCookie.toLowerCase()).toContain('max-age=0')
+      // #and — clear-cookie header is set
+      const setCookie = res.headers.get('set-cookie') ?? ''
+      expect(setCookie).toContain(SESSION_COOKIE_NAME)
+      expect(setCookie.toLowerCase()).toContain('max-age=0')
+    } finally {
+      await close()
+    }
   })
 
   it('logout route returns 429 when rate limiter rejects (after guard passes)', async () => {
@@ -891,7 +1068,7 @@ describe('buildOperatorApp — logout route registration', () => {
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
-    const app = buildOperatorApp(
+    const {port, close} = await startRealOperatorServer(
       makeStubDeps({
         sessionStore,
         sessionDeps,
@@ -901,22 +1078,25 @@ describe('buildOperatorApp — logout route registration', () => {
         logger,
         rateLimiter: {allow: () => false},
       }),
-      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+      {publicOrigin: 'https://operator.example.com'},
     )
 
-    // #when — valid session + CSRF but rate limiter blocks
-    const req = new Request('http://127.0.0.1/operator/auth/logout', {
-      method: 'POST',
-      headers: {
-        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
-        origin: 'https://operator.example.com',
-        'x-csrf-token': csrfToken,
-      },
-    })
-    const res = await app.fetch(req)
+    try {
+      // #when — valid session + CSRF but rate limiter blocks
+      const res = await fetch(`http://127.0.0.1:${port}/operator/auth/logout`, {
+        method: 'POST',
+        headers: {
+          cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+          origin: 'https://operator.example.com',
+          'x-csrf-token': csrfToken,
+        },
+      })
 
-    // #then — rate limited
-    expect(res.status).toBe(429)
+      // #then — rate limited
+      expect(res.status).toBe(429)
+    } finally {
+      await close()
+    }
   })
 
   it('logout route clears cookie and invalidates session when rate limiter allows', async () => {
@@ -929,7 +1109,7 @@ describe('buildOperatorApp — logout route registration', () => {
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
-    const app = buildOperatorApp(
+    const {port, close} = await startRealOperatorServer(
       makeStubDeps({
         sessionStore,
         sessionDeps,
@@ -939,25 +1119,28 @@ describe('buildOperatorApp — logout route registration', () => {
         logger,
         rateLimiter: {allow: () => true},
       }),
-      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+      {publicOrigin: 'https://operator.example.com'},
     )
 
-    // #when
-    const req = new Request('http://127.0.0.1/operator/auth/logout', {
-      method: 'POST',
-      headers: {
-        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
-        origin: 'https://operator.example.com',
-        'x-csrf-token': csrfToken,
-      },
-    })
-    const res = await app.fetch(req)
+    try {
+      // #when
+      const res = await fetch(`http://127.0.0.1:${port}/operator/auth/logout`, {
+        method: 'POST',
+        headers: {
+          cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+          origin: 'https://operator.example.com',
+          'x-csrf-token': csrfToken,
+        },
+      })
 
-    // #then — allowed; session cleared
-    expect(res.status).toBe(200)
-    expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
-    const setCookie = res.headers.get('set-cookie') ?? ''
-    expect(setCookie.toLowerCase()).toContain('max-age=0')
+      // #then — allowed; session cleared
+      expect(res.status).toBe(200)
+      expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+      const setCookie = res.headers.get('set-cookie') ?? ''
+      expect(setCookie.toLowerCase()).toContain('max-age=0')
+    } finally {
+      await close()
+    }
   })
 })
 
@@ -1343,7 +1526,7 @@ describe('POST /operator/auth/logout — browser guard protection', () => {
     const {generateCsrfToken: genToken} = await import('./auth/csrf.js')
     const csrfToken = genToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
 
-    const app = buildOperatorApp(
+    const {port, close} = await startRealOperatorServer(
       makeStubDeps({
         sessionStore,
         sessionDeps: makeStubSessionDeps({clock: () => now + 1000}),
@@ -1353,24 +1536,27 @@ describe('POST /operator/auth/logout — browser guard protection', () => {
         logger,
         rateLimiter: {allow: () => true},
       }),
-      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+      {publicOrigin: 'https://operator.example.com'},
     )
 
-    // #when — POST logout with valid session and CSRF token
-    const req = new Request('http://127.0.0.1/operator/auth/logout', {
-      method: 'POST',
-      headers: {
-        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
-        origin: 'https://operator.example.com',
-        'x-csrf-token': csrfToken,
-      },
-    })
-    const res = await app.fetch(req)
+    try {
+      // #when — POST logout with valid session and CSRF token
+      const res = await fetch(`http://127.0.0.1:${port}/operator/auth/logout`, {
+        method: 'POST',
+        headers: {
+          cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+          origin: 'https://operator.example.com',
+          'x-csrf-token': csrfToken,
+        },
+      })
 
-    // #then — success
-    expect(res.status).toBe(200)
-    // #and — session is invalidated
-    expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+      // #then — success
+      expect(res.status).toBe(200)
+      // #and — session is invalidated
+      expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+    } finally {
+      await close()
+    }
   })
 })
 

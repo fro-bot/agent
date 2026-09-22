@@ -48,10 +48,13 @@ import type {AnnounceLogger} from './announce-handler.js'
 
 import {readdirSync, readFileSync, statSync} from 'node:fs'
 import {join} from 'node:path'
+import {Effect} from 'effect'
 import {describe, expect, it, vi} from 'vitest'
 import {loadAllowlistFromText} from '../web/auth/allowlist.js'
 import {createInMemoryStateStore} from '../web/auth/github.js'
 import {createInMemorySessionStore} from '../web/auth/session.js'
+import {asCanonicalHttpsOrigin, makeDirectIngressPolicy} from '../web/ingress/policy.js'
+import {unsafeResolvedClientAddressForTest} from '../web/ingress/resolve-client.js'
 import {buildOperatorApp} from '../web/server.js'
 import {buildAnnounceApp} from './server.js'
 
@@ -172,6 +175,9 @@ function makeOperatorStubConfig(): OperatorServerConfig {
     bindHost: '10.0.0.1',
     bindPort: 0, // not used — we never call serve()
     publicOrigin: 'https://operator.example.com',
+    // Structural stub for route-inventory pinning only — no request is ever
+    // resolved through this app, so a 'direct' policy is sufficient.
+    ingressPolicy: makeDirectIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com')),
   }
 }
 
@@ -184,7 +190,7 @@ function makeOAuthStubDeps(): GitHubOAuthDeps {
     generateVerifier: () => 'stub-verifier-32-bytes-long-enough-for-pkce',
     generateState: () => 'stub-state-value-32-bytes-long-ok',
     stateStore: createInMemoryStateStore(),
-    getSourceKey: () => 'stub-source-key',
+    getSourceKey: () => Effect.succeed(unsafeResolvedClientAddressForTest('stub-source-key')),
     // rateLimiter is overwritten by buildOperatorApp with the shared instance;
     // provide a pass-through stub so the type is satisfied.
     rateLimiter: {allow: () => true},

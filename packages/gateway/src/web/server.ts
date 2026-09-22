@@ -10,9 +10,13 @@
  *     Never 0.0.0.0, loopback, or sandbox-net for production config.
  *   - TLS is terminated by the infra reverse proxy at GATEWAY_OPERATOR_PUBLIC_ORIGIN.
  *     The operator listener receives plain HTTP over gateway-net.
- *   - Forwarded-host/proto headers are validated against publicOrigin (full host:port match).
- *     Requests with mismatched forwarded headers are rejected 400.
- *   - Unauthenticated socket-keyed rate limiting and body-size limits are applied.
+ *   - Client address and forwarded-host/proto trust are both decided by the configured
+ *     OperatorIngressPolicy (config.ingressPolicy): only a configured trusted-proxy peer
+ *     may supply X-Forwarded-For/-Host/-Proto at all, and a trusted peer's X-Forwarded-Host/-Proto
+ *     must match publicOrigin exactly. Requests failing either check are rejected 400.
+ *   - Unauthenticated rate limiting (socket- or trusted-proxy-resolved-key) and body-size
+ *     limits are applied. The health route uses an independent rate-limit budget from the
+ *     OAuth/logout routes so health polling cannot starve sign-in.
  *   - All responses pass through safe-response helpers (coarse, no-oracle).
  *   - GitHub OAuth start and callback routes are registered as public (unauthenticated).
  *     The callback route must remain compatible with future Fetch Metadata middleware
@@ -22,12 +26,14 @@
  */
 
 import type {ServerType} from '@hono/node-server'
+import type {Context} from 'hono'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {CancelRunDeps} from '../execute/cancel.js'
 import type {RunIndex} from '../execute/run-index.js'
 import type {RunMentionDeps} from '../execute/run.js'
 import type {DispatchWorkflow} from '../github/dispatch.js'
+import type {RateLimiter} from '../http/rate-limit.js'
 import type {DenylistCache} from '../redaction/denylist.js'
 import type {BindingsLookup} from '../redaction/surface-gate.js'
 import type {AuditLogger} from './audit.js'
@@ -35,13 +41,14 @@ import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps, SessionStore} from './auth/session.js'
+import type {OperatorIngressPolicy} from './ingress/policy.js'
 import type {SubscriptionRouteSessionStore} from './operator-push/subscription-route.js'
 import type {OperatorPushSubscriptionStore} from './operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './operator-push/vapid.js'
 import type {IdempotencyGuard} from './operator/idempotency.js'
 import type {RunObservationManager} from './sse/manager.js'
 import {serve} from '@hono/node-server'
-import {getConnInfo} from '@hono/node-server/conninfo'
+import {Effect} from 'effect'
 import {Hono} from 'hono'
 import {bodyLimit} from 'hono/body-limit'
 import {createRateLimiter} from '../http/rate-limit.js'
@@ -52,6 +59,10 @@ import {buildGitHubOAuthRoutes} from './auth/github.js'
 import {createRepoAuthzCache} from './auth/repo-authz.js'
 import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
+import {canonicalAddressToString, parseCanonicalAddress} from './ingress/canonical-address.js'
+import {extractRawIngressInput, respondForIngressRejection} from './ingress/hono-context.js'
+import {resolveClient} from './ingress/resolve-client.js'
+import {matchesTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {buildSubscriptionRoutes} from './operator-push/subscription-route.js'
 import {buildVapidPublicKeyRoute} from './operator-push/vapid-public-key-route.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
@@ -90,6 +101,15 @@ export const OPERATOR_MAX_BODY_BYTES = 64 * 1024
 const DEFAULT_UNAUTH_LIMIT = 20
 const DEFAULT_UNAUTH_WINDOW_MS = 60_000
 
+/**
+ * Default health-route burst limit: independent of the OAuth/logout budget
+ * (see healthRateLimiter). Generous relative to the unauthenticated default
+ * so ordinary infra health polling (e.g. several LB nodes at a few requests
+ * per minute each) never gets throttled, while still bounding abuse.
+ */
+const DEFAULT_HEALTH_LIMIT = 60
+const DEFAULT_HEALTH_WINDOW_MS = 60_000
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -111,10 +131,23 @@ export interface OperatorServerDeps {
   readonly isShuttingDown?: () => boolean
   /**
    * Optional injectable rate limiter for unauthenticated socket-keyed limits.
+   * Shared by the OAuth start/callback routes and the logout route — NOT by
+   * the health route, which uses its own independent instance (see
+   * healthRateLimiter below) so health polling cannot starve sign-in.
    * Uses the shared RateLimiter from http/rate-limit.ts with operator defaults
    * (20 req/min) when absent.
    */
-  readonly rateLimiter?: import('../http/rate-limit.js').RateLimiter
+  readonly rateLimiter?: RateLimiter
+  /**
+   * Optional injectable rate limiter for the unauthenticated health route.
+   * Deliberately a SEPARATE instance from `rateLimiter` — not merely a
+   * prefixed key into the shared limiter, because http/rate-limit.ts bounds
+   * the number of distinct keys per instance; sharing one map lets a burst of
+   * distinct health-probe keys crowd out OAuth/logout key capacity (and vice
+   * versa). Defaults to a fresh instance with its own request/map capacity
+   * when absent.
+   */
+  readonly healthRateLimiter?: RateLimiter
   /** Injectable clock for testability. */
   readonly clock?: () => number
   /**
@@ -275,6 +308,15 @@ export interface OperatorServerConfig {
    */
   readonly publicOrigin: string
   /**
+   * Trust-aware client-address resolution policy. The single source of truth
+   * for which peer addresses may be trusted to supply X-Forwarded-For /
+   * X-Forwarded-Host / X-Forwarded-Proto — used by the forwarded-header
+   * origin-trust middleware, the health route, and (via the caller wiring
+   * githubOAuth deps and sessionDeps.getSourceKey with the same policy) the
+   * OAuth and logout routes.
+   */
+  readonly ingressPolicy: OperatorIngressPolicy
+  /**
    * Optional GitHub OAuth configuration for the auth routes.
    * When present (alongside deps.githubOAuth), the GitHub OAuth start and
    * callback routes are registered. When absent, the auth routes are not
@@ -313,45 +355,21 @@ function parsePublicOriginHost(publicOrigin: string): string {
 }
 
 /**
- * Validate forwarded-host/proto headers against the configured public origin.
- *
- * Returns true when:
- *   - No forwarded headers are present (direct connection, no proxy).
- *   - Both X-Forwarded-Host and X-Forwarded-Proto are present and match
- *     the configured public origin (host and https protocol).
- *
- * Returns false when:
- *   - X-Forwarded-Host is present but does not match the public origin host.
- *   - X-Forwarded-Proto is present but is not 'https'.
- *   - Only one of the pair is present (partial forwarded headers are suspicious).
- *
- * This prevents a workspace-reachable attacker from spoofing the operator
- * origin by injecting forwarded headers.
+ * True when `socketAddress` matches a peer configured as trusted by `policy`.
+ * A 'direct' policy trusts no peer. Mirrors the (module-private) trust check
+ * inside web/ingress/resolve-client.ts — duplicated here, rather than
+ * exported from the ingress module, because this file needs the trust
+ * decision independently of (and before) a full resolveClient() call: the
+ * forwarded-header origin-trust middleware below must decide whether ANY
+ * X-Forwarded-Host/-Proto is even admissible before a route-level resolver
+ * runs.
  */
-function validateForwardedHeaders(
-  forwardedHost: string | undefined,
-  forwardedProto: string | undefined,
-  publicOriginHost: string,
-): boolean {
-  const hasHost = forwardedHost !== undefined && forwardedHost !== ''
-  const hasProto = forwardedProto !== undefined && forwardedProto !== ''
-
-  // No forwarded headers — direct connection on gateway-net. Network topology
-  // owns socket reachability; allow here, but authenticated routes must enforce
-  // identity independently of connection path.
-  if (hasHost === false && hasProto === false) return true
-
-  // Partial forwarded headers — suspicious. Reject.
-  if (hasHost !== hasProto) return false
-
-  // Both present — validate against public origin.
-  // X-Forwarded-Host must match publicOriginHost exactly, including port.
-  // A proxy forwarding from https://ops.example.com:8443 must send that full host.
-  // hasHost/hasProto guards above ensure these are non-empty strings here.
-  if ((forwardedHost ?? '') !== publicOriginHost) return false
-  if ((forwardedProto ?? '').toLowerCase() !== 'https') return false
-
-  return true
+function isTrustedPeer(socketAddress: string | undefined, policy: OperatorIngressPolicy): boolean {
+  if (policy.kind === 'direct') return false
+  if (socketAddress === undefined) return false
+  const canonical = parseCanonicalAddress(socketAddress)
+  if (canonical === undefined) return false
+  return policy.peers.some(peer => matchesTrustedProxyAddress(canonical, peer))
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +406,13 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   const rateLimiter =
     deps.rateLimiter ??
     createRateLimiter({limit: DEFAULT_UNAUTH_LIMIT, windowMs: DEFAULT_UNAUTH_WINDOW_MS, clock: deps.clock})
+  // Independent instance (own map, own capacity) so health polling can never
+  // compete with the OAuth/logout budget — the outage this fixes was exactly
+  // that competition. A higher default limit tolerates frequent infra health
+  // polling (e.g. multiple LB nodes) without touching the sign-in budget.
+  const healthLimiter =
+    deps.healthRateLimiter ??
+    createRateLimiter({limit: DEFAULT_HEALTH_LIMIT, windowMs: DEFAULT_HEALTH_WINDOW_MS, clock: deps.clock})
   const publicOriginHost = parsePublicOriginHost(config.publicOrigin)
 
   const app = new Hono()
@@ -420,18 +445,60 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //    Keyed on the actual TCP socket remote address — NOT X-Forwarded-For,
   //    which is caller-spoofable. This matches the announce server pattern.
 
-  // 4. Forwarded-header origin validation.
-  //    The operator listener is on gateway-net; the infra reverse proxy forwards
-  //    requests from the public operator origin. Validate that any forwarded
-  //    headers match the configured public origin to prevent workspace-reachable
-  //    attackers from spoofing the operator origin via injected headers.
+  // 4. Forwarded-header origin trust — decided by the ingress policy, not by
+  //    whether the forwarded values happen to match the public origin. A
+  //    caller matching the public hostname is not proof of proxy provenance —
+  //    only the peer (socket) address is:
+  //      - Untrusted peer: any supplied X-Forwarded-Host/-Proto is rejected
+  //        outright (X-Forwarded-For is ignored entirely — handled at the
+  //        route level by resolveClient). Headerless direct requests pass.
+  //      - Trusted peer: a single valid X-Forwarded-Host/-Proto pair matching
+  //        the configured public origin and https is required. Narrow
+  //        exception: a headerless /operator/health probe (no XFF, no XFH, no
+  //        XFP) from a trusted peer is treated as the proxy's own liveness
+  //        check, not a forwarded client request — the health route applies
+  //        its own narrow budget for it. Any forwarding metadata present
+  //        still routes through ordinary validation below.
   app.use('*', async (c, next) => {
     const forwardedHost = c.req.header('x-forwarded-host')
     const forwardedProto = c.req.header('x-forwarded-proto')
-    if (validateForwardedHeaders(forwardedHost, forwardedProto, publicOriginHost) === false) {
-      // Log a fixed/coarse warning — do not include caller-supplied header values
-      // to avoid leaking attacker-controlled data into logs.
-      deps.logger.warn({}, 'operator request rejected (untrusted forwarded headers)')
+    const hasHost = forwardedHost !== undefined && forwardedHost !== ''
+    const hasProto = forwardedProto !== undefined && forwardedProto !== ''
+    const hasForwardedFor = (c.req.header('x-forwarded-for') ?? '') !== ''
+
+    const {socketAddress} = extractRawIngressInput(c)
+    const trusted = isTrustedPeer(socketAddress, config.ingressPolicy)
+
+    if (trusted === false) {
+      if (hasHost === true || hasProto === true) {
+        // Log a fixed/coarse warning — do not include caller-supplied header values
+        // to avoid leaking attacker-controlled data into logs.
+        deps.logger.warn({}, 'operator request rejected (forwarded headers from untrusted peer)')
+        return badRequestResponse(c)
+      }
+      return next()
+    }
+
+    const isHeaderlessHealthProbe =
+      c.req.path === '/operator/health' && hasHost === false && hasProto === false && hasForwardedFor === false
+    if (isHeaderlessHealthProbe === true) {
+      return next()
+    }
+
+    if (hasHost === false && hasProto === false) {
+      deps.logger.warn({}, 'operator request rejected (trusted peer missing forwarded headers)')
+      return badRequestResponse(c)
+    }
+    if (hasHost !== hasProto) {
+      deps.logger.warn({}, 'operator request rejected (partial forwarded headers)')
+      return badRequestResponse(c)
+    }
+    if ((forwardedHost ?? '') !== publicOriginHost) {
+      deps.logger.warn({}, 'operator request rejected (forwarded host mismatch)')
+      return badRequestResponse(c)
+    }
+    if ((forwardedProto ?? '').toLowerCase() !== 'https') {
+      deps.logger.warn({}, 'operator request rejected (forwarded proto mismatch)')
       return badRequestResponse(c)
     }
     return next()
@@ -446,9 +513,10 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // expose getConnInfo, so the socket-keyed rate limit must be called from
   // within each route handler where the full context is available.
   //
-  // For unauthenticated routes: key on the TCP socket remote address (not
-  // X-Forwarded-For, which is caller-spoofable). Use getConnInfo(c).remote.address
-  // with a fallback to 'unknown' for test environments without a real socket.
+  // For unauthenticated routes: key via resolveClient(), which trusts the
+  // socket peer by default and only honours a forwarded chain when the
+  // socket is a configured trusted proxy. An unresolvable socket rejects the
+  // request rather than falling back to a shared key.
   //
   // For authenticated routes: key on the authenticated identity (user ID /
   // session ID) so that a single authenticated user cannot exhaust the
@@ -473,24 +541,38 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
    * Registered as a public route via registerPublicRoute — explicitly unauthenticated.
    * Rate limit is applied here (not in middleware) to avoid Hono's middleware
    * context type mismatch with getConnInfo. This matches the announce server pattern.
-   * Keyed on socket/proxy IP; per-client/post-auth identity keying is added with auth routes.
+   * Uses its own independent rate limiter (healthLimiter, not the shared OAuth/logout
+   * rateLimiter) so health polling cannot starve sign-in — see OperatorServerDeps.healthRateLimiter.
+   * Resolved through the same trusted-proxy-aware resolver as the OAuth and logout
+   * routes, with one narrow exception: a headerless direct probe from a trusted-proxy
+   * peer (no X-Forwarded-For at all) is treated as the proxy's own liveness check and
+   * keyed on its own address, rather than rejected for a missing forwarded chain. Any
+   * forwarding metadata that IS supplied is validated the ordinary way.
    */
   registerPublicRoute(app, 'GET', '/operator/health', c => {
-    // Rate limit keyed on actual TCP socket remote address (not X-Forwarded-For).
-    // Socket/proxy IP is the coarse key for unauthenticated requests; per-client
-    // identity keying is added when auth routes land.
-    // getConnInfo may throw in test environments without a real socket; fall back to 'unknown'.
-    let sourceKey = 'unknown'
-    try {
-      const connInfo = getConnInfo(c)
-      sourceKey = connInfo.remote.address ?? 'unknown'
-    } catch {
-      // No real socket (e.g. direct app.fetch() in tests) — use 'unknown' key.
-      // Warn in production: all rate-limit keys collapse to 'unknown', which
-      // defeats per-client isolation. Investigate if this appears in prod logs.
-      deps.logger.warn({}, 'getConnInfo unavailable — rate-limit key collapsed to unknown')
+    const raw = extractRawIngressInput(c)
+    const resolved = Effect.runSync(Effect.either(resolveClient(raw, config.ingressPolicy)))
+
+    let sourceKey: string
+    if (resolved._tag === 'Right') {
+      sourceKey = resolved.right.canonical
+    } else if (resolved.left.kind === 'missing-forwarded-for' && raw.forwardedForHeaders.length === 0) {
+      // Narrow, health-only exception: a headerless probe from a trusted-proxy
+      // peer is not a forwarded client request. Key on the peer's own address
+      // under the health-only budget — this must never become a generic
+      // missing-XFF fallback for any other route.
+      const socketCanonical = raw.socketAddress === undefined ? undefined : parseCanonicalAddress(raw.socketAddress)
+      if (socketCanonical === undefined) {
+        deps.logger.warn({reason: 'socket-invalid'}, 'operator health rejected: ingress resolution failed')
+        return unavailableResponse(c)
+      }
+      sourceKey = canonicalAddressToString(socketCanonical)
+    } else {
+      deps.logger.warn({reason: resolved.left.kind}, 'operator health rejected: ingress resolution failed')
+      return respondForIngressRejection(c, resolved.left)
     }
-    if (rateLimiter.allow(sourceKey) === false) {
+
+    if (healthLimiter.allow(sourceKey) === false) {
       deps.logger.warn({}, 'operator request rate limited (unauthenticated)')
       return rateLimitedResponse(c)
     }
@@ -595,14 +677,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     const sessionDepsWithRateLimiter = {
       ...deps.sessionDeps,
       rateLimiter,
-      getSourceKey: (c: Parameters<typeof getConnInfo>[0]) => {
-        try {
-          const connInfo = getConnInfo(c)
-          return connInfo.remote.address ?? 'unknown'
-        } catch {
-          return 'unknown'
-        }
-      },
+      getSourceKey: (c: Context) => resolveClient(extractRawIngressInput(c), config.ingressPolicy),
     }
     buildLogoutRoutes(app, deps.sessionStore, sessionDepsWithRateLimiter, browserGuardDeps)
   }
