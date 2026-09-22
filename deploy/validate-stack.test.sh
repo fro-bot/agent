@@ -4229,6 +4229,7 @@ services:
       GATEWAY_OPERATOR_BIND_HOST: "172.20.0.2"
       GATEWAY_OPERATOR_BIND_PORT: "4000"
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+      GATEWAY_OPERATOR_TRUSTED_PROXIES: "172.20.0.10"
   workspace:
     image: ubuntu:22.04
     networks:
@@ -4655,6 +4656,73 @@ fi
 echo ""
 echo "  OP-12 output (stderr+stdout combined):"
 echo "${OP12_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-13 — Negative: GATEWAY_OPERATOR_TRUSTED_PROXIES missing when BIND_HOST
+#              is set must be rejected.
+#
+# Without an explicit trusted-proxy list, the operator listener behind a
+# reverse proxy keys rate limits/OAuth-attempt caps on the proxy's own
+# address, sharing one key across every client — the outage this variable
+# exists to prevent. Presence-only check; see packages/gateway/src/config.ts
+# for the full exact-address/CIDR/unspecified/multicast validation.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-13: operator topology guard rejects missing GATEWAY_OPERATOR_TRUSTED_PROXIES when BIND_HOST is set ---"
+
+OP13_COMPOSE="${TMPDIR_TEST}/compose-op13.yaml"
+cat > "${OP13_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "172.20.0.2"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP13_OUTPUT=""
+OP13_EXIT=0
+OP13_OUTPUT="$(COMPOSE_FILE="${OP13_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP13_EXIT=$?
+
+if [[ "${OP13_EXIT}" -ne 0 ]]; then
+  pass "OP-13: validate-stack.sh exited non-zero (${OP13_EXIT}) for missing GATEWAY_OPERATOR_TRUSTED_PROXIES"
+else
+  fail "OP-13: validate-stack.sh exited ZERO for missing GATEWAY_OPERATOR_TRUSTED_PROXIES — guard did NOT fire"
+fi
+
+if echo "${OP13_OUTPUT}" | grep -qi "TRUSTED_PROXIES"; then
+  pass "OP-13: failure message mentions TRUSTED_PROXIES"
+else
+  fail "OP-13: failure message does not mention TRUSTED_PROXIES — output: ${OP13_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-13 output (stderr+stdout combined):"
+echo "${OP13_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
 # TEST 68 — Positive regression: real deploy/compose.yaml gateway service must

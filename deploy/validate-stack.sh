@@ -780,6 +780,12 @@ if not repos_mount_found:
 #   7e. GATEWAY_OPERATOR_PUBLIC_ORIGIN must use https:// (TLS required).
 #   7f. GATEWAY_OPERATOR_BIND_PORT must be present when bind host is set.
 #   7g. GATEWAY_OPERATOR_BIND_PORT must be an integer in 1..65535 when present.
+#   7i. GATEWAY_OPERATOR_TRUSTED_PROXIES must be present (non-empty) when bind host
+#       is set. Without it the gateway keys rate limits/OAuth-attempt caps on the
+#       proxy's own address behind a reverse proxy, sharing one key across every
+#       client. Presence-only here; the exact-address/CIDR/hostname and
+#       unspecified/multicast validation lives in the gateway's own startup check
+#       (packages/gateway/src/config.ts) and is not duplicated here.
 #
 # The operator listener must be bound to a gateway-net address only.
 # TLS is terminated by the infra reverse proxy at GATEWAY_OPERATOR_PUBLIC_ORIGIN.
@@ -802,6 +808,7 @@ if isinstance(gateway_env, list):
 operator_bind_host = gateway_env.get("GATEWAY_OPERATOR_BIND_HOST")
 operator_bind_port = gateway_env.get("GATEWAY_OPERATOR_BIND_PORT")
 operator_public_origin = gateway_env.get("GATEWAY_OPERATOR_PUBLIC_ORIGIN")
+operator_trusted_proxies = gateway_env.get("GATEWAY_OPERATOR_TRUSTED_PROXIES")
 
 # Only validate when the operator surface is enabled (bind host is set and non-empty).
 if operator_bind_host and str(operator_bind_host).strip():
@@ -918,6 +925,22 @@ if operator_bind_host and str(operator_bind_host).strip():
                 f"FAIL: GATEWAY_OPERATOR_BIND_PORT is '{_raw_port}' — must be an integer in the range 1–65535. "
                 "Set it to a valid port number (e.g. 4000)."
             )
+
+    # 7i: require trusted-proxy list when bind host is set.
+    #
+    # Presence-only check: the gateway's own startup validation (config.ts) enforces
+    # exact-address syntax, rejects CIDR/hostnames, and rejects unspecified/multicast
+    # addresses. Duplicating that here would drift from the authoritative check; this
+    # guard exists only to catch the missing-variable case before deploy, matching the
+    # scope of the 7d/7f presence checks above.
+    if not operator_trusted_proxies or not str(operator_trusted_proxies).strip():
+        failures.append(
+            "FAIL: GATEWAY_OPERATOR_BIND_HOST is set but GATEWAY_OPERATOR_TRUSTED_PROXIES is absent or "
+            "empty — required whenever the operator surface is enabled. Without it, every client behind "
+            "the reverse proxy shares one rate-limit/OAuth-attempt key (the proxy's address), which can "
+            "lock the operator out. Set it to a comma-separated list of exact IPv4/IPv6 addresses of the "
+            "reverse-proxy hop(s) in front of the operator listener (e.g. \"203.0.113.10,2001:db8::1\")."
+        )
 
 # ------------------------------------------------------------------
 # Report
