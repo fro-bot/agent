@@ -1,16 +1,9 @@
 import {Effect} from 'effect'
 import {describe, expect, it} from 'vitest'
 
-import {
-  asCanonicalHttpsOrigin,
-  makeDirectIngressPolicy,
-  makeTrustedProxyIngressPolicy,
-  type OperatorIngressPolicy,
-} from './policy.js'
+import {makeDirectIngressPolicy, makeTrustedProxyIngressPolicy, type OperatorIngressPolicy} from './policy.js'
 import {resolveClient, type RawIngressInput} from './resolve-client.js'
 import {parseTrustedProxyAddress, type TrustedProxyAddress} from './trusted-proxy-address.js'
-
-const ORIGIN = asCanonicalHttpsOrigin('https://operator.example.com')
 
 function peer(raw: string): TrustedProxyAddress {
   return Effect.runSync(parseTrustedProxyAddress(raw))
@@ -18,7 +11,7 @@ function peer(raw: string): TrustedProxyAddress {
 
 function trustedProxyPolicy(...peers: readonly [string, ...string[]]): OperatorIngressPolicy {
   const [first, ...rest] = peers
-  return makeTrustedProxyIngressPolicy(ORIGIN, [peer(first), ...rest.map(peer)])
+  return makeTrustedProxyIngressPolicy([peer(first), ...rest.map(peer)])
 }
 
 function input(socketAddress: string | undefined, forwardedForHeaders: readonly string[] = []): RawIngressInput {
@@ -106,6 +99,51 @@ describe('resolveClient — worked cases', () => {
     const result = await resolve(input(P1, [`unknown, ${CLIENT}`]), policy)
     expect(result).toMatchObject({_tag: 'Left', left: {kind: 'forwarded-for-malformed'}})
   })
+
+  // The four cases below pin real-world proxy output shapes that
+  // parseCanonicalAddress refuses. These are known tradeoffs, not oversights:
+  // Azure App Service and some CDN edges append ":port" to X-Forwarded-For
+  // entries, and "unknown" is a real token some proxies emit — but a
+  // port-suffixed address is ambiguous against bare IPv6, and accepting a
+  // non-address token would mean guessing. A future change to accept any of
+  // these must edit one of these tests deliberately, not widen the parser
+  // silently.
+
+  // #given socket P1 (trusted), XFF with a port-suffixed IPv4 entry (Azure App Service / some CDN edges shape)
+  // #when resolved
+  // #then the whole chain is rejected as malformed — the parser does not strip ports
+  it('rejects a port-suffixed IPv4 X-Forwarded-For entry (host:port)', async () => {
+    const policy = trustedProxyPolicy(P1)
+    const result = await resolve(input(P1, [`${CLIENT}:54321`]), policy)
+    expect(result).toMatchObject({_tag: 'Left', left: {kind: 'forwarded-for-malformed'}})
+  })
+
+  // #given socket P1 (trusted), XFF with a port-suffixed bracketed IPv6 entry
+  // #when resolved
+  // #then the whole chain is rejected as malformed — bracket-then-port is not an accepted shape
+  it('rejects a port-suffixed bracketed IPv6 X-Forwarded-For entry ([addr]:port)', async () => {
+    const policy = trustedProxyPolicy(P1)
+    const result = await resolve(input(P1, ['[2001:db8::1]:54321']), policy)
+    expect(result).toMatchObject({_tag: 'Left', left: {kind: 'forwarded-for-malformed'}})
+  })
+
+  // #given socket P1 (trusted), XFF with an RFC 7239 for= entry
+  // #when resolved
+  // #then the whole chain is rejected as malformed — RFC 7239 syntax is a different header format, not accepted here
+  it('rejects an RFC 7239 for= syntax X-Forwarded-For entry', async () => {
+    const policy = trustedProxyPolicy(P1)
+    const result = await resolve(input(P1, [`for=${CLIENT}`]), policy)
+    expect(result).toMatchObject({_tag: 'Left', left: {kind: 'forwarded-for-malformed'}})
+  })
+
+  // #given socket P1 (trusted), XFF "C, unknown" — unknown in a non-leading position
+  // #when resolved
+  // #then the whole chain is still rejected — position does not matter, every entry must parse
+  it('rejects the whole chain when unknown appears in a non-leading position', async () => {
+    const policy = trustedProxyPolicy(P1)
+    const result = await resolve(input(P1, [`${CLIENT}, unknown`]), policy)
+    expect(result).toMatchObject({_tag: 'Left', left: {kind: 'forwarded-for-malformed'}})
+  })
 })
 
 describe('resolveClient — socket handling', () => {
@@ -131,7 +169,7 @@ describe('resolveClient — socket handling', () => {
   // #when resolved
   // #then the socket is always selected and XFF is always ignored
   it('always selects the socket under a direct policy, ignoring XFF', async () => {
-    const policy = makeDirectIngressPolicy(ORIGIN)
+    const policy = makeDirectIngressPolicy()
     const result = await resolve(input(CLIENT, [P1]), policy)
     expect(result._tag).toBe('Right')
     expect(result._tag === 'Right' ? result.right.canonical : undefined).toBe(CLIENT)

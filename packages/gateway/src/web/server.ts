@@ -26,7 +26,7 @@
  */
 
 import type {ServerType} from '@hono/node-server'
-import type {Context} from 'hono'
+import type {Context, Env} from 'hono'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {CancelRunDeps} from '../execute/cancel.js'
@@ -417,6 +417,19 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
 
   const app = new Hono()
 
+  // A Context with an open Variables map — used to stash the middleware's
+  // headerless-health-probe verdict for the route to read, without widening
+  // the app's Variables generic. Mirrors the OpenContext idiom in
+  // operator-route.ts (c.set/c.get on an untyped Hono app).
+  type OpenContext = Context<Env & {Variables: Record<string, unknown>}>
+
+  // Context-variable key set by the forwarded-header middleware and read by
+  // the /operator/health route. This is the ONLY source of truth for whether
+  // a request is the narrow headerless-probe exception — the route must never
+  // re-derive this predicate, or the two definitions can drift apart (see the
+  // middleware comment below).
+  const HEADERLESS_HEALTH_PROBE_KEY = '__isHeaderlessHealthProbe'
+
   // ── Global middleware ──────────────────────────────────────────────────────
 
   // 1. Drain gate — refuse new requests during graceful shutdown.
@@ -459,7 +472,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //        check, not a forwarded client request — the health route applies
   //        its own narrow budget for it. Any forwarding metadata present
   //        still routes through ordinary validation below.
-  app.use('*', async (c, next) => {
+  app.use('*', async (c: OpenContext, next) => {
     const forwardedHost = c.req.header('x-forwarded-host')
     const forwardedProto = c.req.header('x-forwarded-proto')
     const hasHost = forwardedHost !== undefined && forwardedHost !== ''
@@ -482,6 +495,10 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     const isHeaderlessHealthProbe =
       c.req.path === '/operator/health' && hasHost === false && hasProto === false && hasForwardedFor === false
     if (isHeaderlessHealthProbe === true) {
+      // Stash the verdict for the health route to read verbatim — see
+      // HEADERLESS_HEALTH_PROBE_KEY above. The route must not re-derive this
+      // predicate from its own header reads, or the two checks can drift.
+      c.set(HEADERLESS_HEALTH_PROBE_KEY, true)
       return next()
     }
 
@@ -556,11 +573,18 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     let sourceKey: string
     if (resolved._tag === 'Right') {
       sourceKey = resolved.right.canonical
-    } else if (resolved.left.kind === 'missing-forwarded-for' && raw.forwardedForHeaders.length === 0) {
+    } else if (
+      resolved.left.kind === 'missing-forwarded-for' &&
+      (c as OpenContext).get(HEADERLESS_HEALTH_PROBE_KEY) === true
+    ) {
       // Narrow, health-only exception: a headerless probe from a trusted-proxy
       // peer is not a forwarded client request. Key on the peer's own address
       // under the health-only budget — this must never become a generic
-      // missing-XFF fallback for any other route.
+      // missing-XFF fallback for any other route. The verdict comes verbatim
+      // from the middleware (HEADERLESS_HEALTH_PROBE_KEY) — never re-derived
+      // here — so a request with valid forwarded host/proto but no
+      // X-Forwarded-For (a genuinely incomplete forwarded-client request, not
+      // the proxy's own liveness check) cannot slip into this branch.
       const socketCanonical = raw.socketAddress === undefined ? undefined : parseCanonicalAddress(raw.socketAddress)
       if (socketCanonical === undefined) {
         deps.logger.warn({reason: 'socket-invalid'}, 'operator health rejected: ingress resolution failed')

@@ -12,7 +12,7 @@ import process from 'node:process'
 import {GatewayIntentBits} from 'discord.js'
 import {Effect, Either} from 'effect'
 import {parseAllowlistText} from './web/auth/allowlist.js'
-import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
+import {makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
 import {matchesTrustedProxyAddress, parseTrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 import {
   OPERATOR_PUSH_DEDUPE_WINDOW_MS,
@@ -1026,15 +1026,11 @@ export function loadGatewayConfig(): GatewayConfig {
     // Normalize to parsedPublicOrigin.origin: strips trailing slash and default ports.
     // Stored value is always scheme+host+optional-non-default-port (no trailing slash).
     //
-    // asCanonicalHttpsOrigin re-validates parsedPublicOrigin.origin (it is the only way to
-    // produce a CanonicalHttpsOrigin — it cannot brand an arbitrary string). The operator
-    // web surface is always enabled with a trusted-proxy policy here: an empty peer list is
-    // unrepresentable by OperatorIngressPolicy's type, and trustedProxyPeerTuple is already
-    // proven non-empty above, so this never silently falls back to a 'direct' policy.
-    const ingressPolicy: OperatorIngressPolicy = makeTrustedProxyIngressPolicy(
-      asCanonicalHttpsOrigin(parsedPublicOrigin.origin),
-      trustedProxyPeerTuple,
-    )
+    // The operator web surface is always enabled with a trusted-proxy policy here: an empty
+    // peer list is unrepresentable by OperatorIngressPolicy's type, and trustedProxyPeerTuple
+    // is already proven non-empty above, so this never silently falls back to a 'direct'
+    // policy.
+    const ingressPolicy: OperatorIngressPolicy = makeTrustedProxyIngressPolicy(trustedProxyPeerTuple)
 
     operatorWeb = {
       bindHost: operatorBindHost,

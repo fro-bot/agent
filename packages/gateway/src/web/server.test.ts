@@ -33,7 +33,7 @@ import {loadAllowlistFromText} from './auth/allowlist.js'
 import {generateCsrfToken} from './auth/csrf.js'
 import {createInMemoryStateStore} from './auth/github.js'
 import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './auth/session.js'
-import {asCanonicalHttpsOrigin, makeDirectIngressPolicy, makeTrustedProxyIngressPolicy} from './ingress/policy.js'
+import {makeDirectIngressPolicy, makeTrustedProxyIngressPolicy} from './ingress/policy.js'
 import {unsafeResolvedClientAddressForTest} from './ingress/resolve-client.js'
 import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {EXPECTED_OPERATOR_ROUTES} from './operator-route-smoke.js'
@@ -82,7 +82,7 @@ function makeStubConfig(overrides?: Partial<OperatorServerConfig>): OperatorServ
     // (127.0.0.1) are therefore an untrusted peer — X-Forwarded-For is
     // ignored, and any supplied X-Forwarded-Host/-Proto is rejected. Tests
     // exercising the trusted-peer path override this with TRUSTED_PROXY_POLICY.
-    ingressPolicy: makeDirectIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com')),
+    ingressPolicy: makeDirectIngressPolicy(),
     ...overrides,
   }
 }
@@ -93,10 +93,8 @@ function makeStubConfig(overrides?: Partial<OperatorServerConfig>): OperatorServ
  * originate from exactly this address, so this is the only real (non-fabricated)
  * way to exercise the trusted-peer path with a genuine socket.
  */
-function makeTrustedLoopbackPolicy(publicOrigin = 'https://operator.example.com') {
-  return makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin(publicOrigin), [
-    Effect.runSync(parseTrustedProxyAddress('127.0.0.1')),
-  ])
+function makeTrustedLoopbackPolicy() {
+  return makeTrustedProxyIngressPolicy([Effect.runSync(parseTrustedProxyAddress('127.0.0.1'))])
 }
 
 interface RouteEntry {
@@ -617,7 +615,7 @@ describe('operator server — trusted origin enforcement — trusted peer', () =
   it('accepts X-Forwarded-Host matching publicOrigin with a non-default port (exact host:port match)', async () => {
     const {port, close} = await startRealOperatorServer(makeStubDeps(), {
       publicOrigin: 'https://operator.example.com:8443',
-      ingressPolicy: makeTrustedLoopbackPolicy('https://operator.example.com:8443'),
+      ingressPolicy: makeTrustedLoopbackPolicy(),
     })
     try {
       const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
@@ -797,6 +795,34 @@ describe('GET /operator/health — trusted-proxy client separation (regression p
       expect(resA1.status).toBe(200)
       expect(resB1.status).toBe(200)
       expect(resA2.status).toBe(429)
+    } finally {
+      await close()
+    }
+  })
+
+  it('a trusted peer with valid matching X-Forwarded-Host/-Proto but no X-Forwarded-For is never treated as the headerless probe — must not collapse onto the proxy key', async () => {
+    // #given — trusted peer, X-Forwarded-Host/-Proto ARE forwarded and match the
+    // public origin, but X-Forwarded-For is omitted. This is NOT the headerless
+    // probe the health-only exception exists for (that requires no XFH/XFP either) —
+    // it is an incomplete forwarded-client request, and must be rejected the ordinary
+    // way rather than silently keyed on the proxy's own address.
+    const healthRateLimiter = {allow: vi.fn(() => true)}
+    const {port, close} = await startRealOperatorServer(makeStubDeps({healthRateLimiter}), {
+      ingressPolicy: makeTrustedLoopbackPolicy(),
+    })
+    try {
+      const headers = {'x-forwarded-host': 'operator.example.com', 'x-forwarded-proto': 'https'}
+
+      // #when — two separate requests, both missing X-Forwarded-For entirely
+      const res1 = await fetch(`http://127.0.0.1:${port}/operator/health`, {headers})
+      const res2 = await fetch(`http://127.0.0.1:${port}/operator/health`, {headers})
+
+      // #then — both rejected by ordinary ingress validation; neither is admitted
+      // to the health-only budget under a shared proxy-address key, so two distinct
+      // callers matching this pattern never collapse onto one rate-limit key
+      expect(res1.status).toBe(400)
+      expect(res2.status).toBe(400)
+      expect(healthRateLimiter.allow).not.toHaveBeenCalled()
     } finally {
       await close()
     }

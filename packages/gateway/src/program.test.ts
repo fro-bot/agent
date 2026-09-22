@@ -7,7 +7,7 @@ import type {CoordinationLogger} from './runtime-effect.js'
 import {GatewayIntentBits} from 'discord.js'
 import {Effect} from 'effect'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
+import {makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
 import {parseTrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 
 // Spy on createDiscordClient so we can assert the intents wiring without
@@ -329,9 +329,7 @@ function makeOperatorWebConfig(
     oauthMaxOutstandingAttemptsPerKey: 5,
     csrfSecret: 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE',
     allowlist: denyAllAllowlist,
-    ingressPolicy: makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com'), [
-      Effect.runSync(parseTrustedProxyAddress('10.0.0.1')),
-    ]),
+    ingressPolicy: makeTrustedProxyIngressPolicy([Effect.runSync(parseTrustedProxyAddress('10.0.0.1'))]),
     ...overrides,
   }
 }

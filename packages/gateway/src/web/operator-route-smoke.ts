@@ -29,7 +29,7 @@ import {ok} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {buildOperatorServerInputs} from '../program.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
-import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from './ingress/policy.js'
+import {makeTrustedProxyIngressPolicy} from './ingress/policy.js'
 import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {buildOperatorApp} from './server.js'
 
@@ -261,9 +261,7 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     oauthMaxOutstandingAttemptsPerKey: 5,
     csrfSecret: Buffer.from('operator-smoke-csrf-secret-32b!!', 'utf8').toString('base64url'),
     allowlist,
-    ingressPolicy: makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin('https://operator.smoke.test'), [
-      stubTrustedProxyPeer,
-    ]),
+    ingressPolicy: makeTrustedProxyIngressPolicy([stubTrustedProxyPeer]),
   }
 
   // Resolve the bindingsStore — use the override if provided, else the default stub.

@@ -2214,18 +2214,6 @@ describe('loadGatewayConfig — GATEWAY_OPERATOR_TRUSTED_PROXIES', () => {
     // #when / #then
     expect(() => loadGatewayConfig()).toThrow(/multicast/)
   })
-
-  it('happy path: ingressPolicy.publicOrigin matches the validated GATEWAY_OPERATOR_PUBLIC_ORIGIN', () => {
-    // #given
-    setRequiredEnv()
-    setOperatorWebEnv({publicOrigin: 'https://ops.example.com', trustedProxies: '203.0.113.10'})
-
-    // #when
-    const config = loadGatewayConfig()
-
-    // #then
-    expect(config.operatorWeb?.ingressPolicy?.publicOrigin).toBe('https://ops.example.com')
-  })
 })
 
 // ---------------------------------------------------------------------------

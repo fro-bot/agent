@@ -13,7 +13,7 @@
 import type {Context} from 'hono'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
-import {asCanonicalHttpsOrigin, makeDirectIngressPolicy} from './ingress/policy.js'
+import {makeDirectIngressPolicy} from './ingress/policy.js'
 import {
   assertAllPrivilegedRoutesWrapped,
   getOperatorAuthContext,
@@ -516,7 +516,7 @@ describe('buildOperatorApp — health route is explicitly public', () => {
         bindHost: '127.0.0.1',
         bindPort: 0,
         publicOrigin: 'https://operator.example.com',
-        ingressPolicy: makeDirectIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com')),
+        ingressPolicy: makeDirectIngressPolicy(),
       },
     )
 
@@ -547,7 +547,7 @@ describe('buildOperatorApp — health route is explicitly public', () => {
         bindHost: '127.0.0.1',
         bindPort: 0,
         publicOrigin: 'https://operator.example.com',
-        ingressPolicy: makeDirectIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com')),
+        ingressPolicy: makeDirectIngressPolicy(),
       },
     )
 

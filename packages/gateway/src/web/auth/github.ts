@@ -37,6 +37,13 @@
  *     again, so an address that keeps shifting cannot loop forever. A bounced client
  *     still needs its own allowlisted GitHub session to complete any flow — the bind
  *     itself is unchanged, only the recovery path after a mismatch is new.
+ *   - Known tradeoff: releasing the attempt on mismatch (see above) means anyone who
+ *     learns a victim's `state` value — browser history, proxy logs, a shoulder-surf —
+ *     can replay the callback from a different address and consume that state before
+ *     the victim's own browser gets there, permanently burning the victim's flow (their
+ *     subsequent legitimate callback then hits the already-consumed branch and 400s).
+ *     This is accepted: recovery is "sign in again," and not releasing the attempt
+ *     reproduces the outstanding-attempt-cap outage this module exists to fix.
  */
 
 import type {Context, Hono} from 'hono'
@@ -647,7 +654,10 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
 
       if (stateEntry.bounced === true) {
         deps.logger.warn({}, 'oauth callback: source key mismatch after retry — terminating sign-in')
-        emitAudit({kind: 'auth.callback.failure', correlationId, reason: 'source_key_mismatch'}, deps.auditLogger)
+        emitAudit(
+          {kind: 'auth.callback.failure', correlationId, reason: 'source_key_mismatch_terminal'},
+          deps.auditLogger,
+        )
         return badRequestResponse(c)
       }
 

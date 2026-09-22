@@ -40,7 +40,7 @@ import {Effect} from 'effect'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
 import {extractRawIngressInput} from '../ingress/hono-context.js'
-import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
+import {makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
 import {resolveClient, unsafeResolvedClientAddressForTest} from '../ingress/resolve-client.js'
 import {parseTrustedProxyAddress} from '../ingress/trusted-proxy-address.js'
 import {assertAllPrivilegedRoutesWrapped, isPublicRoute, registerPublicRoute} from '../operator-route.js'
@@ -854,9 +854,60 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     const entry = stateStore.get('bounced-state-value')
     expect(entry?.consumed).toBe(true)
 
-    // #and — still a distinguishable source_key_mismatch failure
+    // #and — distinguishable from the bounce case in the audit stream: a
+    // terminal mismatch is a queryable reason of its own, not the same
+    // `source_key_mismatch` value as the first-attempt bounce
     const failureEvent = auditLogger.records.find(r => r.kind === 'auth.callback.failure')
-    expect(failureEvent?.reason).toBe('source_key_mismatch')
+    expect(failureEvent?.reason).toBe('source_key_mismatch_terminal')
+  })
+
+  it("a replayed callback from an attacker who learned the state value burns the victim's own subsequent callback", async () => {
+    // #given — state minted for the victim at 'victim-ip'; an attacker who
+    // learned the state value (browser history, proxy logs, shoulder-surf)
+    // replays the callback first, from a different address
+    const stateStore = createInMemoryStateStore()
+    const now = Date.now()
+    stateStore.set('shared-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      sourceKey: 'victim-ip',
+    })
+
+    const attackerDeps = makeStubDeps({
+      stateStore,
+      clock: () => now,
+      getSourceKey: () => Effect.succeed(stubResolved('attacker-ip')),
+    })
+    const config = makeStubConfig()
+    const attackerApp = buildTestApp(attackerDeps, config)
+
+    // #when — the attacker's replay hits the mismatch path and consumes the state
+    const replayRes = await attackerApp.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=attacker-code&state=shared-state-value',
+      ),
+    )
+    expect(replayRes.status).toBe(302) // bounced — the attacker gains nothing, but the state is now consumed
+
+    // #when — the victim's own browser then completes the real flow, from its
+    // genuine 'victim-ip' address, with the same original state value
+    const victimDeps = makeStubDeps({
+      stateStore,
+      clock: () => now,
+      getSourceKey: () => Effect.succeed(stubResolved('victim-ip')),
+    })
+    const victimApp = buildTestApp(victimDeps, config)
+    const victimRes = await victimApp.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=victim-code&state=shared-state-value',
+      ),
+    )
+
+    // #then — the victim's legitimate callback fails: the state was already
+    // consumed by the attacker's replay, so it hits the same-shape 400 as any
+    // other replayed-state case, even though the victim did nothing wrong
+    expect(victimRes.status).toBe(400)
   })
 
   it('unknown, consumed, or expired state is rejected unchanged — no retry path, even from a mismatched address', async () => {
@@ -1118,7 +1169,7 @@ describe('GET /operator/auth/github/callback — provider error state consumptio
 describe('GET /operator/auth/github/callback — source key binding via the real ingress resolver', () => {
   const PROXY_A = '198.51.100.1'
   const PROXY_B = '198.51.100.2'
-  const trustedProxyPolicy = makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com'), [
+  const trustedProxyPolicy = makeTrustedProxyIngressPolicy([
     Effect.runSync(parseTrustedProxyAddress(PROXY_A)),
     Effect.runSync(parseTrustedProxyAddress(PROXY_B)),
   ])
@@ -1289,9 +1340,7 @@ async function findFreePortForOAuthServer(): Promise<number> {
 }
 
 describe('GET /operator/auth/github/start — source key resolution via a real Hono Context', () => {
-  const trustedLoopbackPolicy = makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com'), [
-    Effect.runSync(parseTrustedProxyAddress('127.0.0.1')),
-  ])
+  const trustedLoopbackPolicy = makeTrustedProxyIngressPolicy([Effect.runSync(parseTrustedProxyAddress('127.0.0.1'))])
 
   /** Start a real OAuth-only server on a free loopback port; caller must close it. */
   async function startRealOAuthServer(
