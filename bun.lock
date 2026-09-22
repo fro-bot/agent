@@ -54,7 +54,7 @@
       "version": "0.0.0-development",
       "dependencies": {
         "@hono/node-server": "2.1.1",
-        "hono": "4.13.7",
+        "hono": "4.13.8",
       },
       "devDependencies": {
         "vitest": "4.1.11",
@@ -69,7 +69,7 @@
         "@octokit/core": "7.0.8",
         "discord.js": "14.27.0",
         "effect": "3.22.2",
-        "hono": "4.13.7",
+        "hono": "4.13.8",
         "web-push": "3.6.7",
         "yaml": "2.9.1",
       },
@@ -985,7 +985,7 @@
 
     "highlight.js": ["highlight.js@10.7.3", "", {}, "sha512-tzcUFauisWKNHaRkN4Wjl/ZA07gENAjFl3J/c480dprkGTg5EQstgaNFqBfUqCq54kZRIEcreTsAgF/m2quD7A=="],
 
-    "hono": ["hono@4.13.7", "", {}, "sha512-c8/gF9ac8Y78/agExVocyLevgR+JlpNB444Py0FSX8pJoPdYUfUzRcXtYEYGwt6l19qIlVZPN5Mfsw9jFShmQQ=="],
+    "hono": ["hono@4.13.8", "", {}, "sha512-/Gng7NfoykZl2pjukW5Z6+8Yxm3BPRf86GTbQnt0SbySkvax4fyL4H3HhY1cCpBGmiW9XDRFzRV+CXK2W8QudQ=="],
 
     "hook-std": ["hook-std@4.0.0", "", {}, "sha512-IHI4bEVOt3vRUDJ+bFA9VUJlo7SzvFARPNLw75pqSmAOP2HmTWfFJtPvLBrDrlgjEYXY9zs7SFdHPQaJShkSCQ=="],
 
