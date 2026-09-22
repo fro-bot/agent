@@ -675,6 +675,98 @@ describe('operator server — trusted origin enforcement — trusted peer', () =
 })
 
 // ---------------------------------------------------------------------------
+// Trusted-peer rejections must not allocate a rate-limit bucket — an
+// unauthenticated caller who can still consume budget on a rejected request
+// is the exact failure class this whole change exists to fix.
+// ---------------------------------------------------------------------------
+
+describe('operator server — trusted peer rejections allocate no rate-limit bucket', () => {
+  it('missing both forwarded headers on a non-health route allocates no bucket', async () => {
+    // #given — trusted peer, a registered non-health route, and a spied rateLimiter
+    // (the limiter that route would call if the middleware let the request through)
+    const rateLimiter = {allow: vi.fn(() => true)}
+    const {port, close} = await startRealOperatorServer(
+      makeStubDeps({rateLimiter, githubOAuth: makeStubGitHubOAuthDeps()}),
+      {ingressPolicy: makeTrustedLoopbackPolicy(), githubOAuth: makeStubGitHubOAuthConfig()},
+    )
+    try {
+      // #when — no forwarded headers at all
+      const res = await fetch(`http://127.0.0.1:${port}/operator/auth/github/start`, {redirect: 'manual'})
+
+      // #then — rejected before the route runs; no bucket consumed
+      expect(res.status).toBe(400)
+      expect(rateLimiter.allow).not.toHaveBeenCalled()
+    } finally {
+      await close()
+    }
+  })
+
+  it('only X-Forwarded-Host (partial headers) allocates no health bucket', async () => {
+    const healthRateLimiter = {allow: vi.fn(() => true)}
+    const {port, close} = await startRealOperatorServer(makeStubDeps({healthRateLimiter}), {
+      ingressPolicy: makeTrustedLoopbackPolicy(),
+    })
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-host': 'operator.example.com'},
+      })
+      expect(res.status).toBe(400)
+      expect(healthRateLimiter.allow).not.toHaveBeenCalled()
+    } finally {
+      await close()
+    }
+  })
+
+  it('only X-Forwarded-Proto (partial headers) allocates no health bucket', async () => {
+    const healthRateLimiter = {allow: vi.fn(() => true)}
+    const {port, close} = await startRealOperatorServer(makeStubDeps({healthRateLimiter}), {
+      ingressPolicy: makeTrustedLoopbackPolicy(),
+    })
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-proto': 'https'},
+      })
+      expect(res.status).toBe(400)
+      expect(healthRateLimiter.allow).not.toHaveBeenCalled()
+    } finally {
+      await close()
+    }
+  })
+
+  it('a mismatched X-Forwarded-Host allocates no health bucket', async () => {
+    const healthRateLimiter = {allow: vi.fn(() => true)}
+    const {port, close} = await startRealOperatorServer(makeStubDeps({healthRateLimiter}), {
+      ingressPolicy: makeTrustedLoopbackPolicy(),
+    })
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-host': 'evil.attacker.com', 'x-forwarded-proto': 'https'},
+      })
+      expect(res.status).toBe(400)
+      expect(healthRateLimiter.allow).not.toHaveBeenCalled()
+    } finally {
+      await close()
+    }
+  })
+
+  it('a non-https X-Forwarded-Proto allocates no health bucket', async () => {
+    const healthRateLimiter = {allow: vi.fn(() => true)}
+    const {port, close} = await startRealOperatorServer(makeStubDeps({healthRateLimiter}), {
+      ingressPolicy: makeTrustedLoopbackPolicy(),
+    })
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {'x-forwarded-host': 'operator.example.com', 'x-forwarded-proto': 'http'},
+      })
+      expect(res.status).toBe(400)
+      expect(healthRateLimiter.allow).not.toHaveBeenCalled()
+    } finally {
+      await close()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // The actual outage this fixes, pinned: two distinct clients behind one
 // trusted reverse proxy must resolve to two distinct rate-limit keys.
 // ---------------------------------------------------------------------------

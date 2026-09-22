@@ -25,15 +25,21 @@
  * Uses BDD comments (#given, #when, #then).
  */
 
+import type {AddressInfo} from 'node:net'
+
+import type {Context} from 'hono'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
 import type {RawIngressInput, ResolvedClientAddress} from '../ingress/resolve-client.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps, OAuthStateStore} from './github.js'
 import type {SessionDeps, SessionStore} from './session.js'
 import {createHash} from 'node:crypto'
+import {createServer} from 'node:http'
+import {serve} from '@hono/node-server'
 import {Effect} from 'effect'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
+import {extractRawIngressInput} from '../ingress/hono-context.js'
 import {asCanonicalHttpsOrigin, makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
 import {resolveClient, unsafeResolvedClientAddressForTest} from '../ingress/resolve-client.js'
 import {parseTrustedProxyAddress} from '../ingress/trusted-proxy-address.js'
@@ -719,8 +725,9 @@ describe('GET /operator/auth/github/callback — rate limiter', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /operator/auth/github/callback — source key binding', () => {
-  it('rejects callback when source key differs from mint-time source key', async () => {
+  it('on first mismatch, redirects back to /start and releases the outstanding attempt instead of 400ing', async () => {
     // #given — state minted with source key 'ip-1', callback comes from 'ip-2'
+    // (address changed mid-flow — mobile handover, VPN toggle, CGNAT rotation)
     const stateStore = createInMemoryStateStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
@@ -746,13 +753,164 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     )
     const res = await app.fetch(req)
 
-    // #then — rejected with 400
-    expect(res.status).toBe(400)
+    // #then — bounced back to /start, not a 400
+    expect(res.status).toBe(302)
+    const location = res.headers.get('location') ?? ''
+    expect(location).toContain('/operator/auth/github/start')
+    expect(location).toContain('retry=1')
+
+    // #and — the outstanding attempt is released (consumed), so it no longer
+    // counts against the cap — this is the part that must not be missed
+    const entry = stateStore.get('valid-state-value')
+    expect(entry?.consumed).toBe(true)
+    expect(stateStore.countOutstanding('ip-1')).toBe(0)
 
     // #and — failure audit event emitted with source_key_mismatch reason
     const failureEvent = auditLogger.records.find(r => r.kind === 'auth.callback.failure')
     expect(failureEvent).toBeDefined()
     expect(failureEvent?.reason).toBe('source_key_mismatch')
+  })
+
+  it('retrying the bounced flow from the new stable address succeeds', async () => {
+    // #given — state minted from 'ip-1'; the client's address is now stably 'ip-2'
+    const stateStore = createInMemoryStateStore()
+    const now = Date.now()
+    stateStore.set('orig-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      sourceKey: 'ip-1',
+    })
+
+    let stateCounter = 0
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now,
+      generateState: () => `retry-state-${++stateCounter}`,
+      getSourceKey: () => Effect.succeed(stubResolved('ip-2')), // stable from here on
+    })
+    const config = makeStubConfig()
+    const app = buildTestApp(deps, config)
+
+    // #when — first callback attempt mismatches and bounces
+    const bounceRes = await app.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=orig-state-value',
+      ),
+    )
+    expect(bounceRes.status).toBe(302)
+    const bounceLocation = bounceRes.headers.get('location') ?? ''
+
+    // #when — client follows the redirect back to /start, now stably at ip-2
+    const startRes = await app.fetch(new Request(`https://operator.example.com${bounceLocation}`))
+    expect(startRes.status).toBe(302)
+    const newState = new URL(startRes.headers.get('location') ?? '').searchParams.get('state')
+    if (newState === null) throw new Error('expected a state param on the retried start redirect')
+
+    // #when — retried callback, still from ip-2
+    const finalRes = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=${newState}`),
+    )
+
+    // #then — succeeds
+    expect(finalRes.status).toBe(200)
+  })
+
+  it('a second consecutive mismatch terminates with an error instead of redirecting again', async () => {
+    // #given — a state entry that is itself already the retry target of a
+    // prior bounce (bounced: true), and the address mismatches again
+    const stateStore = createInMemoryStateStore()
+    const now = Date.now()
+    stateStore.set('bounced-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      sourceKey: 'ip-2',
+      bounced: true,
+    })
+
+    const auditLogger = makeAuditLogger()
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now,
+      auditLogger,
+      getSourceKey: () => Effect.succeed(stubResolved('ip-3')), // mismatches again
+    })
+    const config = makeStubConfig()
+    const app = buildTestApp(deps, config)
+
+    // #when
+    const res = await app.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=bounced-state-value',
+      ),
+    )
+
+    // #then — terminates with an error; no further redirect
+    expect(res.status).toBe(400)
+    expect(res.headers.get('location')).toBeNull()
+
+    // #and — the attempt is still released
+    const entry = stateStore.get('bounced-state-value')
+    expect(entry?.consumed).toBe(true)
+
+    // #and — still a distinguishable source_key_mismatch failure
+    const failureEvent = auditLogger.records.find(r => r.kind === 'auth.callback.failure')
+    expect(failureEvent?.reason).toBe('source_key_mismatch')
+  })
+
+  it('unknown, consumed, or expired state is rejected unchanged — no retry path, even from a mismatched address', async () => {
+    // #given — three invalid-state scenarios, all approached from a source key
+    // that would be eligible for the retry path IF the state were valid
+    const now = Date.now()
+    const ttlMs = 10 * 60 * 1000
+
+    const consumedStore = createInMemoryStateStore()
+    consumedStore.set('consumed-state', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: true,
+      sourceKey: 'ip-1',
+    })
+
+    const expiredStore = createInMemoryStateStore()
+    expiredStore.set('expired-state', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      sourceKey: 'ip-1',
+    })
+
+    const scenarios: readonly {
+      readonly stateStore: OAuthStateStore
+      readonly stateParam: string
+      readonly clock: () => number
+    }[] = [
+      {stateStore: createInMemoryStateStore(), stateParam: 'unknown-state', clock: () => now}, // #given — never minted
+      {stateStore: consumedStore, stateParam: 'consumed-state', clock: () => now}, // #given — already consumed
+      {stateStore: expiredStore, stateParam: 'expired-state', clock: () => now + ttlMs + 1}, // #given — past TTL
+    ]
+
+    for (const scenario of scenarios) {
+      const deps = makeStubDeps({
+        stateStore: scenario.stateStore,
+        clock: scenario.clock,
+        getSourceKey: () => Effect.succeed(stubResolved('ip-2')), // mismatched from the bound key, if any
+      })
+      const config = makeStubConfig({stateTtlMs: ttlMs})
+      const app = buildTestApp(deps, config)
+
+      // #when
+      const res = await app.fetch(
+        new Request(
+          `https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=${scenario.stateParam}`,
+        ),
+      )
+
+      // #then — unchanged coarse rejection, never a redirect
+      expect(res.status).toBe(400)
+      expect(res.headers.get('location')).toBeNull()
+    }
   })
 
   it('accepts callback when source key matches mint-time source key', async () => {
@@ -1019,24 +1177,38 @@ describe('GET /operator/auth/github/callback — source key binding via the real
     expect(res.status).toBe(200)
   })
 
-  it('a genuinely different client — binding is still rejected (existing protection not weakened)', async () => {
+  it('a genuinely different client — the existing protection is still enforced (never completes the original flow)', async () => {
     // #given — different XFF client at callback than at mint
     const deps = makeStubDeps({
       getSourceKey: makeSequencedRealGetSourceKey([
-        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']},
-        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.9']},
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']}, // mint (original client)
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.9']}, // attacker's first attempt
+        {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.9']}, // attacker replays the same original state
       ]),
     })
     const app = buildTestApp(deps, makeStubConfig())
     const state = await mintState(app)
 
-    // #when
-    const res = await app.fetch(
+    // #when — the attacker's first attempt at the original state+code
+    const firstRes = await app.fetch(
       new Request(`https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code`),
     )
 
-    // #then — rejected
-    expect(res.status).toBe(400)
+    // #then — bounced to a fresh /start, not handed the original identity
+    expect(firstRes.status).toBe(302)
+    expect(firstRes.headers.get('location') ?? '').toContain('/operator/auth/github/start')
+
+    // #when — the attacker replays the exact same original state+code again
+    const secondRes = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code`),
+    )
+
+    // #then — the bounce already released and consumed the original state, so
+    // the replay lands on the ordinary “already consumed” rejection — the
+    // attacker never completes the original client's flow, and gets no
+    // further redirect out of it
+    expect(secondRes.status).toBe(400)
+    expect(secondRes.headers.get('location')).toBeNull()
   })
 
   it('the provider-error callback path uses the same real-resolver comparison', async () => {
@@ -1082,6 +1254,103 @@ describe('GET /operator/auth/github/callback — source key binding via the real
     expect(res.status).toBe(503)
     expect(rateLimiter.allow).not.toHaveBeenCalled()
     expect(stateStore.size()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// OAuth start — source key resolution wired through a REAL Hono Context
+//
+// The "real ingress resolver" tests above feed predetermined RawIngressInput
+// values into resolveClient() directly, in call order — they prove the
+// *comparison* logic, not that the route hands resolveClient the request's
+// actual Context. This section serves the OAuth routes over a genuine TCP
+// socket (mirroring the announce-server precedent in http/server.test.ts, and
+// startRealOperatorServer in web/server.test.ts) so getConnInfo(c) inside
+// extractRawIngressInput returns a real remote address, and getSourceKey is
+// the exact production composition — resolveClient(extractRawIngressInput(c),
+// policy), as wired in program.ts — rather than a stub or a sequenced fixture.
+// ---------------------------------------------------------------------------
+
+/** Find a free port by briefly opening a server (mirrors web/server.test.ts). */
+async function findFreePortForOAuthServer(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const s = createServer()
+    s.listen(0, '127.0.0.1', () => {
+      const port = (s.address() as AddressInfo).port
+      s.close(err => {
+        if (err !== undefined && err !== null) {
+          reject(err)
+        } else {
+          resolve(port)
+        }
+      })
+    })
+  })
+}
+
+describe('GET /operator/auth/github/start — source key resolution via a real Hono Context', () => {
+  const trustedLoopbackPolicy = makeTrustedProxyIngressPolicy(asCanonicalHttpsOrigin('https://operator.example.com'), [
+    Effect.runSync(parseTrustedProxyAddress('127.0.0.1')),
+  ])
+
+  /** Start a real OAuth-only server on a free loopback port; caller must close it. */
+  async function startRealOAuthServer(
+    config: GitHubOAuthConfig,
+  ): Promise<{readonly port: number; readonly close: () => Promise<void>}> {
+    let stateCounter = 0
+    const deps = makeStubDeps({
+      rateLimiter: makePassRateLimiter(),
+      // Distinct state values per call — makeStubDeps' default generateState is
+      // a fixed string, which would collide across the sequential requests
+      // below and overwrite each other's state-store entry.
+      generateState: () => `real-context-state-${++stateCounter}`,
+      // The real production composition (see program.ts getSourceKey) — not a
+      // stub returning a fixed/sequenced key. getConnInfo(c) requires a genuine
+      // socket, which only a real serve() listener (not app.fetch()) provides.
+      getSourceKey: (c: Context) => resolveClient(extractRawIngressInput(c), trustedLoopbackPolicy),
+    })
+    const app = buildTestApp(deps, config)
+    const port = await findFreePortForOAuthServer()
+    const server = serve({fetch: app.fetch, port, hostname: '127.0.0.1'})
+    return {
+      port,
+      close: async () => new Promise<void>(resolve => server.close(() => resolve())),
+    }
+  }
+
+  it('two distinct clients behind the trusted loopback proxy each get their own outstanding-attempt budget', async () => {
+    // #given — cap of 1 outstanding attempt per source key; a real listening server
+    const config = makeStubConfig({maxOutstandingAttemptsPerKey: 1})
+    const {port, close} = await startRealOAuthServer(config)
+    try {
+      // #when — two different real clients (distinguished by X-Forwarded-For
+      // through the trusted loopback proxy) each start once, then the first
+      // client starts again
+      const resA1 = await fetch(`http://127.0.0.1:${port}/operator/auth/github/start`, {
+        headers: {'x-forwarded-for': '203.0.113.5'},
+        redirect: 'manual',
+      })
+      const resB1 = await fetch(`http://127.0.0.1:${port}/operator/auth/github/start`, {
+        headers: {'x-forwarded-for': '203.0.113.9'},
+        redirect: 'manual',
+      })
+      const resA2 = await fetch(`http://127.0.0.1:${port}/operator/auth/github/start`, {
+        headers: {'x-forwarded-for': '203.0.113.5'},
+        redirect: 'manual',
+      })
+
+      // #then — A and B each get their own budget, proving the route resolved
+      // two distinct real Contexts to two distinct keys; A's second start
+      // exceeds A's own cap, proving the SAME real Context resolves to the
+      // SAME key on a repeat request. Either wiring defect (stale/shared
+      // Context, or a Context ignored in favor of a fixed key) would collapse
+      // this into either "B blocked too" or "A2 never blocked".
+      expect(resA1.status).toBe(302)
+      expect(resB1.status).toBe(302)
+      expect(resA2.status).toBe(429)
+    } finally {
+      await close()
+    }
   })
 })
 

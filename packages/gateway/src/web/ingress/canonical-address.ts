@@ -52,14 +52,24 @@ function parseStrictIpv4(token: string): readonly [number, number, number, numbe
   return octets as [number, number, number, number]
 }
 
+/** Result of splitting one IPv6 half into 16-bit groups. */
+interface GroupSequence {
+  readonly groups: readonly number[]
+  // Whether the final piece was written as a dotted-decimal IPv4 tail
+  // (RFC 4291 mixed notation) rather than plain hex groups — needed by the
+  // caller to distinguish the deprecated IPv4-compatible dotted form from an
+  // address that merely happens to share its numeric value.
+  readonly hadDottedTail: boolean
+}
+
 /**
  * Splits an IPv6 half (the text to one side of `::`, or the whole address when
  * there is no compression) into 16-bit group values. The final piece may be a
  * dotted-decimal IPv4 tail (RFC 4291 mixed notation), which is converted to
  * two hex groups. Returns `undefined` on any malformed piece.
  */
-function parseGroupSequence(part: string): number[] | undefined {
-  if (part === '') return []
+function parseGroupSequence(part: string): GroupSequence | undefined {
+  if (part === '') return {groups: [], hadDottedTail: false}
   const pieces = part.split(':')
   if (pieces.includes('')) return undefined
   const last = pieces.at(-1) ?? ''
@@ -70,10 +80,27 @@ function parseGroupSequence(part: string): number[] | undefined {
     if (hexPieces.some(piece => HEX_GROUP_PATTERN.test(piece) === false)) return undefined
     const hexGroups = hexPieces.map(piece => Number.parseInt(piece, 16))
     const ipv4Groups = [(ipv4[0] << 8) | ipv4[1], (ipv4[2] << 8) | ipv4[3]]
-    return [...hexGroups, ...ipv4Groups]
+    return {groups: [...hexGroups, ...ipv4Groups], hadDottedTail: true}
   }
   if (pieces.some(piece => HEX_GROUP_PATTERN.test(piece) === false)) return undefined
-  return pieces.map(piece => Number.parseInt(piece, 16))
+  return {groups: pieces.map(piece => Number.parseInt(piece, 16)), hadDottedTail: false}
+}
+
+/**
+ * True when `groups` is the deprecated IPv4-compatible shape (leading six
+ * groups zero, NOT the `::ffff:` mapped prefix) AND it was reached via a
+ * dotted-decimal tail. Rejected outright: this parser also parses configured
+ * trusted-proxy addresses, and an operator who legitimately means "the IPv4
+ * host a.b.c.d" writes that or its unambiguous `::ffff:` mapped form — a
+ * distinct accepted identity here would let a proxy entry spelled in this
+ * dead notation silently fail to match the mapped form real dual-stack
+ * sockets actually emit, or (if ever collapsed) widen the trusted set. No
+ * legitimate path emits this form, so refusing it loudly beats keying trust
+ * decisions on it.
+ */
+function isDeprecatedIpv4CompatibleForm(groups: readonly number[], hadDottedTail: boolean): boolean {
+  if (hadDottedTail === false) return false
+  return groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0
 }
 
 function splitOnDoubleColon(token: string): readonly [string, string] {
@@ -90,21 +117,23 @@ function parseIpv6Groups(
   const compressed = doubleColonCount === 1
 
   if (compressed === false) {
-    const groups = parseGroupSequence(token)
-    if (groups === undefined || groups.length !== 8) return undefined
-    return groups as [number, number, number, number, number, number, number, number]
+    const parsed = parseGroupSequence(token)
+    if (parsed === undefined || parsed.groups.length !== 8) return undefined
+    if (isDeprecatedIpv4CompatibleForm(parsed.groups, parsed.hadDottedTail)) return undefined
+    return parsed.groups as [number, number, number, number, number, number, number, number]
   }
 
   const [headRaw, tailRaw] = splitOnDoubleColon(token)
   const head = parseGroupSequence(headRaw)
   const tail = parseGroupSequence(tailRaw)
   if (head === undefined || tail === undefined) return undefined
-  const knownLength = head.length + tail.length
+  const knownLength = head.groups.length + tail.groups.length
   // '::' must stand in for at least one 16-bit zero group — reject if the
   // explicit groups already account for all 8 (ambiguous / non-canonical).
   if (knownLength >= 8) return undefined
-  const zeroFill = Array.from({length: 8 - knownLength}).fill(0)
-  const full = [...head, ...zeroFill, ...tail]
+  const zeroFill: number[] = Array.from({length: 8 - knownLength}, () => 0)
+  const full = [...head.groups, ...zeroFill, ...tail.groups]
+  if (isDeprecatedIpv4CompatibleForm(full, head.hadDottedTail || tail.hadDottedTail)) return undefined
   return full as [number, number, number, number, number, number, number, number]
 }
 
@@ -147,8 +176,10 @@ function stripBrackets(token: string): {readonly inner: string; readonly hadBrac
  *
  * Rejects: shortened/hex/leading-zero IPv4, ports on either family,
  * bracketed IPv4, zone identifiers (including encoded forms), embedded
- * whitespace/control characters, hostnames, and any other non-address token
- * (e.g. `unknown`, `for=...`, CIDR).
+ * whitespace/control characters, hostnames, the deprecated IPv4-compatible
+ * dotted IPv6 form (`::a.b.c.d`, `0:0:0:0:0:0:a.b.c.d` — see
+ * `isDeprecatedIpv4CompatibleForm`), and any other non-address token (e.g.
+ * `unknown`, `for=...`, CIDR).
  */
 export function parseCanonicalAddress(raw: string): CanonicalAddress | undefined {
   const normalized = normalizeToken(raw)

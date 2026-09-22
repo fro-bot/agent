@@ -933,7 +933,7 @@ if operator_bind_host and str(operator_bind_host).strip():
     # addresses. Duplicating that here would drift from the authoritative check; this
     # guard exists only to catch the missing-variable case before deploy, matching the
     # scope of the 7d/7f presence checks above.
-    if not operator_trusted_proxies or not str(operator_trusted_proxies).strip():
+    if operator_trusted_proxies is None or str(operator_trusted_proxies).strip() == '':
         failures.append(
             "FAIL: GATEWAY_OPERATOR_BIND_HOST is set but GATEWAY_OPERATOR_TRUSTED_PROXIES is absent or "
             "empty — required whenever the operator surface is enabled. Without it, every client behind "

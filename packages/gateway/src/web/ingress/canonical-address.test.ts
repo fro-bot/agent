@@ -181,6 +181,55 @@ describe('parseCanonicalAddress — IPv4-mapped IPv6', () => {
     expect(expanded).toBeDefined()
     expect(canonicalAddressEquals(expanded!, ipv4!)).toBe(true)
   })
+
+  // #given a loopback address in dotted-decimal and compressed mapped-IPv6 spellings
+  // #when parsed
+  // #then they compare equal — this is the trusted-proxy-list collapse the
+  // deprecated compatible form below must NOT also get
+  it('127.0.0.1 and its compressed IPv4-mapped-IPv6 form compare equal', () => {
+    const ipv4 = parseCanonicalAddress('127.0.0.1')
+    const mapped = parseCanonicalAddress('::ffff:127.0.0.1')
+    expect(ipv4).toBeDefined()
+    expect(mapped).toBeDefined()
+    expect(canonicalAddressEquals(ipv4!, mapped!)).toBe(true)
+  })
+
+  // #given a loopback address in dotted-decimal and fully expanded mapped-IPv6 spellings
+  // #when parsed
+  // #then they compare equal
+  it('127.0.0.1 and its fully expanded IPv4-mapped-IPv6 form compare equal', () => {
+    const ipv4 = parseCanonicalAddress('127.0.0.1')
+    const mapped = parseCanonicalAddress('0000:0000:0000:0000:0000:ffff:127.0.0.1')
+    expect(ipv4).toBeDefined()
+    expect(mapped).toBeDefined()
+    expect(canonicalAddressEquals(ipv4!, mapped!)).toBe(true)
+  })
+})
+
+describe('parseCanonicalAddress — deprecated IPv4-compatible IPv6 (rejected)', () => {
+  // #given the deprecated IPv4-compatible compressed form of a loopback address
+  // #when parsed
+  // #then it is rejected outright, and is therefore never equal to the plain IPv4 form
+  it('rejects the compressed IPv4-compatible dotted form, distinct from plain IPv4', () => {
+    const compatible = parseCanonicalAddress('::127.0.0.1')
+    const ipv4 = parseCanonicalAddress('127.0.0.1')
+    expect(compatible).toBeUndefined()
+    expect(ipv4).toBeDefined()
+  })
+
+  // #given the deprecated IPv4-compatible form written with explicit zero groups
+  // #when parsed
+  // #then it is rejected outright
+  it('rejects the fully expanded IPv4-compatible dotted form', () => {
+    expect(parseCanonicalAddress('0:0:0:0:0:0:127.0.0.1')).toBeUndefined()
+  })
+
+  // #given the IPv4-compatible dotted form for a non-loopback address
+  // #when parsed
+  // #then it is rejected outright (not specific to loopback)
+  it('rejects the IPv4-compatible dotted form for an arbitrary address', () => {
+    expect(parseCanonicalAddress('::203.0.113.7')).toBeUndefined()
+  })
 })
 
 describe('parseCanonicalAddress — general normalization', () => {

@@ -288,6 +288,8 @@ When creating the GitHub OAuth App, set the callback URL to:
 
 For example, if `GATEWAY_OPERATOR_PUBLIC_ORIGIN=https://operator.example.com`, the callback URL is `https://operator.example.com/operator/auth/github/callback`.
 
+If the resolved client address changes between `/start` and `/callback` (mobile handover, VPN toggle, CGNAT rotation — the GitHub round trip can span minutes with 2FA), the callback bounces the browser back to `/start` once to retry from the current address instead of dead-ending; a second consecutive mismatch fails closed.
+
 ### Required secrets
 
 ```bash
