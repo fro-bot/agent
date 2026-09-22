@@ -18,6 +18,7 @@ import http, {createServer} from 'node:http'
 
 import {describe, expect, it, vi} from 'vitest'
 
+import {createRateLimiter} from './rate-limit.js'
 import {createReplayCache} from './replay-cache.js'
 import {createAnnounceServer} from './server.js'
 
@@ -589,8 +590,10 @@ describe('POST /v1/announce — Discord failure → 5xx', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /v1/announce — rate limit keyed on connection (not XFF)', () => {
-  it('two requests with different x-forwarded-for but same connection share the same rate-limit bucket', async () => {
-    // #given — rate limiter capped at 1 request; both requests come from same TCP connection (127.0.0.1)
+  it('records the same key for two requests with different x-forwarded-for, and the key is not either XFF value', async () => {
+    // #given — a key-RECORDING limiter: it captures every key it is handed and always allows.
+    // This pins the actual property in question — what key does the handler derive? — independent
+    // of any accept/reject behaviour, which a bucketing limiter can't isolate on its own.
     const rawBody1 = makeRawBody(validSurveyPayload)
     const rawBody2 = makeRawBody({
       ...validSurveyPayload,
@@ -598,13 +601,61 @@ describe('POST /v1/announce — rate limit keyed on connection (not XFF)', () =>
     })
     const sig1 = makeSignature(rawBody1, TIMESTAMP)
     const sig2 = makeSignature(rawBody2, TIMESTAMP)
+    const recordedKeys: string[] = []
     const rateLimiter = {
-      calls: 0,
-      allow(this: {calls: number}): boolean {
-        this.calls += 1
-        return this.calls <= 1
+      allow: (key: string): boolean => {
+        recordedKeys.push(key)
+        return true
       },
     }
+
+    const port = await findFreePort()
+    const {client} = makeDiscordClient(true)
+    const logger = makeLogger()
+
+    const server = createAnnounceServer(
+      {client, logger, rateLimiter, clock: () => NOW_MS},
+      {webhookSecret: SECRET, presenceChannelId: CHANNEL_ID, httpPort: port},
+    )
+
+    try {
+      // #when — two requests over the same TCP connection pool but with different XFF headers
+      await postAnnounce(port, rawBody1, {
+        'x-gateway-signature': sig1,
+        'x-gateway-timestamp': TIMESTAMP,
+        'x-forwarded-for': '10.0.0.1',
+      })
+      await postAnnounce(port, rawBody2, {
+        'x-gateway-signature': sig2,
+        'x-gateway-timestamp': TIMESTAMP,
+        'x-forwarded-for': '10.0.0.2',
+      })
+
+      // #then — same key both times, and it is neither of the spoofable XFF values (it's the real
+      // loopback socket address the test client actually connected from).
+      expect(recordedKeys).toHaveLength(2)
+      expect(recordedKeys[0]).toBe(recordedKeys[1])
+      expect(recordedKeys[0]).not.toBe('10.0.0.1')
+      expect(recordedKeys[0]).not.toBe('10.0.0.2')
+      expect(recordedKeys[0]).toMatch(/^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/)
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
+
+  it('two requests with different x-forwarded-for but the same connection share the same rate-limit bucket', async () => {
+    // #given — a genuinely key-SENSITIVE limiter (the real fixed-window implementation, capped
+    // at 1 request/window) proves the observable consequence: if both requests bucket together,
+    // the second is rejected. A stub that rejects its second call regardless of key would pass
+    // this test even if the handler keyed on XFF — the real bucketing algorithm won't.
+    const rawBody1 = makeRawBody(validSurveyPayload)
+    const rawBody2 = makeRawBody({
+      ...validSurveyPayload,
+      context: {...validSurveyPayload.context, wiki_pages_changed: 5},
+    })
+    const sig1 = makeSignature(rawBody1, TIMESTAMP)
+    const sig2 = makeSignature(rawBody2, TIMESTAMP)
+    const rateLimiter = createRateLimiter({limit: 1, clock: () => NOW_MS})
 
     const port = await findFreePort()
     const {client} = makeDiscordClient(true)

@@ -76,6 +76,7 @@ beforeEach(() => {
     'GATEWAY_OPERATOR_BIND_HOST',
     'GATEWAY_OPERATOR_BIND_PORT',
     'GATEWAY_OPERATOR_PUBLIC_ORIGIN',
+    'GATEWAY_OPERATOR_TRUSTED_PROXIES',
     'GATEWAY_OPERATOR_GITHUB_CLIENT_ID',
     'GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET',
     'GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS',
@@ -450,10 +451,13 @@ function setRequiredEnv(): void {
  * Call after setRequiredEnv() when testing operator web happy paths.
  * Includes CSRF secret and allowlist (required when operator web is enabled).
  */
-function setOperatorWebEnv(overrides: {bindHost?: string; bindPort?: string; publicOrigin?: string} = {}): void {
+function setOperatorWebEnv(
+  overrides: {bindHost?: string; bindPort?: string; publicOrigin?: string; trustedProxies?: string} = {},
+): void {
   process.env.GATEWAY_OPERATOR_BIND_HOST = overrides.bindHost ?? '172.20.0.2'
   process.env.GATEWAY_OPERATOR_BIND_PORT = overrides.bindPort ?? '4000'
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = overrides.publicOrigin ?? 'https://operator.example.com'
+  process.env.GATEWAY_OPERATOR_TRUSTED_PROXIES = overrides.trustedProxies ?? '203.0.113.10'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
   // CSRF secret and allowlist are required when operator web is enabled.
@@ -2023,6 +2027,7 @@ function setOperatorEnv(origin: string): void {
   process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
   process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = origin
+  process.env.GATEWAY_OPERATOR_TRUSTED_PROXIES = '203.0.113.10'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
   // CSRF secret and allowlist are required when operator web is enabled.
@@ -2106,6 +2111,112 @@ describe('loadGatewayConfig — GATEWAY_OPERATOR_PUBLIC_ORIGIN canonical origin 
 })
 
 // ---------------------------------------------------------------------------
+// GATEWAY_OPERATOR_TRUSTED_PROXIES — trusted-proxy ingress policy
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — GATEWAY_OPERATOR_TRUSTED_PROXIES', () => {
+  it('error path: operator web enabled + GATEWAY_OPERATOR_TRUSTED_PROXIES missing → throws, names the variable', () => {
+    // #given — operator web fully configured except the trusted-proxy list
+    setRequiredEnv()
+    setOperatorWebEnv()
+    delete process.env.GATEWAY_OPERATOR_TRUSTED_PROXIES
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_TRUSTED_PROXIES/)
+  })
+
+  it('error path: operator web enabled + GATEWAY_OPERATOR_TRUSTED_PROXIES is empty/whitespace → throws', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_TRUSTED_PROXIES = '   '
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_TRUSTED_PROXIES/)
+  })
+
+  it('complement: operator web disabled + GATEWAY_OPERATOR_TRUSTED_PROXIES missing → starts fine', () => {
+    // #given — operator web is not enabled at all (no bind host/port/origin)
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — no requirement is imposed when the operator surface is off
+    expect(config.operatorWeb).toBeUndefined()
+  })
+
+  it('happy path: a valid list parses, normalizes, and dedupes two spellings of one address into one peer', () => {
+    // #given — '10.0.0.5' and its IPv4-mapped-IPv6 spelling are the same numeric address
+    setRequiredEnv()
+    setOperatorWebEnv({trustedProxies: '10.0.0.5, ::ffff:10.0.0.5, 2001:db8::1'})
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — three entries, two of which collapse to one, leaving two peers
+    const {ingressPolicy} = config.operatorWeb ?? {}
+    expect(ingressPolicy?.kind).toBe('trusted-proxy')
+    expect(ingressPolicy?.kind === 'trusted-proxy' ? ingressPolicy.peers.length : undefined).toBe(2)
+  })
+
+  it('error path: an invalid entry anywhere in the list fails startup, naming the offending entry', () => {
+    // #given — second entry is not a valid exact address
+    setRequiredEnv()
+    setOperatorWebEnv({trustedProxies: '10.0.0.5, not-an-address'})
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_TRUSTED_PROXIES/)
+    expect(() => loadGatewayConfig()).toThrow(/not-an-address/)
+  })
+
+  it('error path: CIDR notation is rejected (exact addresses only, no ranges)', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv({trustedProxies: '10.0.0.0/8'})
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_TRUSTED_PROXIES/)
+  })
+
+  it('error path: the unspecified IPv4 address (0.0.0.0) is rejected', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv({trustedProxies: '0.0.0.0'})
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/unspecified/)
+  })
+
+  it('error path: the unspecified IPv6 address (::) is rejected', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv({trustedProxies: '::'})
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/unspecified/)
+  })
+
+  it('error path: an IPv4 multicast address (224.0.0.1) is rejected', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv({trustedProxies: '224.0.0.1'})
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/multicast/)
+  })
+
+  it('error path: an IPv6 multicast address (ff02::1) is rejected', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv({trustedProxies: 'ff02::1'})
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/multicast/)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // GATEWAY_OPERATOR_GITHUB_CLIENT_ID / CLIENT_SECRET — OAuth credential validation
 // ---------------------------------------------------------------------------
 
@@ -2116,6 +2227,7 @@ describe('loadGatewayConfig — operator web OAuth credentials', () => {
     process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
     process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
     process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+    process.env.GATEWAY_OPERATOR_TRUSTED_PROXIES = '203.0.113.10'
     process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-secret'
     // GATEWAY_OPERATOR_GITHUB_CLIENT_ID intentionally absent
 
@@ -2129,6 +2241,7 @@ describe('loadGatewayConfig — operator web OAuth credentials', () => {
     process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
     process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
     process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+    process.env.GATEWAY_OPERATOR_TRUSTED_PROXIES = '203.0.113.10'
     process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-client-id'
     // GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET intentionally absent
 
@@ -2280,6 +2393,7 @@ describe('loadGatewayConfig — operator web OAuth credentials', () => {
     process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
     process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
     process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+    process.env.GATEWAY_OPERATOR_TRUSTED_PROXIES = '203.0.113.10'
     process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
     process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
     process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'

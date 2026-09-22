@@ -288,6 +288,8 @@ When creating the GitHub OAuth App, set the callback URL to:
 
 For example, if `GATEWAY_OPERATOR_PUBLIC_ORIGIN=https://operator.example.com`, the callback URL is `https://operator.example.com/operator/auth/github/callback`.
 
+If the resolved client address changes between `/start` and `/callback` (mobile handover, VPN toggle, CGNAT rotation — the GitHub round trip can span minutes with 2FA), the callback bounces the browser back to `/start` once to retry from the current address instead of dead-ending; a second consecutive mismatch fails closed.
+
 ### Required secrets
 
 ```bash
@@ -349,14 +351,36 @@ The operator web surface is a browser-facing authenticated API that lets human o
 | `GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET` / `_FILE` | GitHub OAuth App client secret |
 | `GATEWAY_OPERATOR_CSRF_SECRET` / `_FILE` | CSRF signing key — 256-bit CSPRNG entropy, base64url-encoded, no padding |
 | `GATEWAY_OPERATOR_ALLOWLIST` / `GATEWAY_OPERATOR_ALLOWLIST_FILE` | Newline-separated numeric GitHub user IDs permitted to log in |
+| `GATEWAY_OPERATOR_TRUSTED_PROXIES` | **Required.** Comma-separated exact IPv4/IPv6 addresses of the reverse-proxy hop(s) in front of the operator listener. Gateway refuses to start without it. See [Trusted proxies](#trusted-proxies) below. |
 | `GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS` | Optional comma-separated list of allowed post-auth redirect paths (default: `/operator`) |
 
 For secret provisioning details see [Required secrets](#required-secrets) above.
 
+### Trusted proxies
+
+Behind a reverse proxy, the TCP socket address the gateway sees on every inbound connection is always the proxy's address, not the caller's. The operator listener uses this address to key rate limits and the sign-in attempt cap, so without an explicit trusted-peer list every client behind the proxy shares one key — a handful of page loads can exhaust the attempt cap and lock every operator out, with no window that drains. `GATEWAY_OPERATOR_TRUSTED_PROXIES` names the peer(s) allowed to have their forwarded-header chain trusted.
+
+**Required whenever the operator surface is enabled.** An empty or missing value stops the gateway at startup — see `packages/gateway/src/config.ts` for the exact error text.
+
+**What it accepts:** a comma-separated list of exact IPv4/IPv6 addresses only. Not CIDR ranges, not hostnames, not a trusted-hop count. Addresses are normalized and deduplicated; the unspecified address (`0.0.0.0`, `::`) and multicast ranges are rejected at startup — they cannot identify a real proxy peer.
+
+**Determining the correct value:** set it to the address the gateway _sees_ on inbound connections — the proxy's address on `gateway-net` — not the proxy's public-facing address, and not the client's address. Find it from the proxy's perspective (its `gateway-net` container/host IP) or by inspecting the gateway's connection logs for the peer address before any forwarded-header trust is applied.
+
+**Failure modes of a wrong value differ and matter:**
+
+- **Naming a proxy that is not actually in front of the listener** — legitimate forwarded requests get rejected (the real proxy's address is untrusted, so its forwarded-header chain is ignored).
+- **Omitting an intermediate proxy in a multi-hop chain** — clients behind the omitted hop silently share one key again. This is the original bug returning, with no startup error and no runtime error to flag it.
+- **Naming an address that is not actually a proxy** — that caller gains the ability to assert arbitrary client identities via forwarded headers, since the gateway will trust whatever it forwards.
+- **A correct value, paired with a proxy whose forwarded-header format the parser rejects** — Azure App Service and some CDN edges append `:port` to each `X-Forwarded-For` entry; other proxies emit the literal `unknown` when they cannot determine an address. The parser accepts only bare IPv4/IPv6 addresses, so either shape rejects the whole chain (deliberate — an address-with-port is ambiguous against bare IPv6, and skipping a bad entry would let a caller shape which address gets selected). Symptom: every operator request returns a uniform `400`, with `reason: 'forwarded-for-malformed'` in the warn log. Fix the proxy configuration to emit bare addresses — the parser is not going to start accepting ports.
+
+**What startup validation cannot check:** the syntax/format checks above cannot prove that a configured address is genuinely a reverse proxy, that it sits on the actual request path, or that it strips caller-supplied forwarding headers before appending its own. Those properties require a deployment-level test against the live infra topology, not a config-time assertion — do not treat a clean startup as proof the trust boundary is correctly deployed.
+
+**Deployment dependency:** this variable only produces trustworthy client attribution if the public edge strips or replaces caller-supplied forwarding metadata (`X-Forwarded-For` and similar) before it reaches a trusted hop, and every trusted proxy appends its own observed peer rather than passing values through unchanged. Allowlisting a proxy that forwards attacker-controlled header values verbatim defeats the purpose — the gateway ends up trusting attacker-supplied data instead of the proxy's own observation.
+
 Follow these steps in order to deploy and operate the web surface:
 
 1. **Deploy the gateway image** — see [One-Time Setup](#one-time-setup) and [Starting the Stack](#starting-the-stack) for the Docker Compose setup and image build.
-2. **Set the enabling env** — configure the `GATEWAY_OPERATOR_*` vars above (bind host/port/origin, OAuth credentials, CSRF secret, allowlist). See [Required secrets](#required-secrets) for the secret file commands.
+2. **Set the enabling env** — configure the `GATEWAY_OPERATOR_*` vars above (bind host/port/origin, trusted proxies, OAuth credentials, CSRF secret, allowlist). See [Required secrets](#required-secrets) for the secret file commands and [Trusted proxies](#trusted-proxies) for the trusted-proxy list.
 3. **Register the GitHub OAuth app callback URL** — the callback path is `/operator/auth/github/callback` on your public origin; see [OAuth callback URL](#oauth-callback-url) above.
 4. **Configure the operator allowlist** — add one numeric GitHub user ID per line to `deploy/secrets/gateway-operator-allowlist`; see the allowlist note in [Required secrets](#required-secrets).
 5. **Backfill deny keys for pre-gate bindings** — repos bound before deny-key capture was added will not appear in `GET /operator/repos` until their deny keys are populated. Run the backfill admin command (documented in [`packages/gateway/AGENTS.md`](../packages/gateway/AGENTS.md#redaction-gate)):
