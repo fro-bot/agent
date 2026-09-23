@@ -7,12 +7,14 @@
 
 import type {Buffer} from 'node:buffer'
 
+import type {GitRunnerFn} from './inspect.js'
 import type {InspectRequest} from './types.js'
 import {execFileSync} from 'node:child_process'
 import {
   chmodSync,
   closeSync,
   fstatSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readdirSync,
@@ -83,6 +85,16 @@ async function makeCheckoutDir(): Promise<{owner: string; repo: string; dir: str
 
 function req(owner: string, repo: string): InspectRequest {
   return {owner, repo}
+}
+
+/**
+ * Bumps a tracked file's mtime into the future so its stat info no longer matches what's cached
+ * in the index — the precondition `git status` needs before it re-checks the file's content,
+ * which is what makes it invoke a configured `filter.<driver>.clean`/`.process` at all.
+ */
+function makeStatDirty(filePath: string): void {
+  const future = new Date(Date.now() + 60_000)
+  utimesSync(filePath, future, future)
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +591,246 @@ describe('inspectCheckout — hostile core.fsmonitor', () => {
     expect(() => statSync(markerPath)).not.toThrow()
     // Documented for the report: this is the induced-failure evidence.
     expect(typeof failureOutput).toBe('string')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Config-injection neutralization: hostile filter.<driver> drivers must never execute.
+//
+// `git status` runs a tracked file's assigned `filter.<driver>.clean` (and, for a process
+// filter, `.process`) whenever the file's stat info no longer matches the index — none of this
+// is reached by the fixed `-c core.fsmonitor=false` etc. neutralizers above, because the driver
+// is looked up by name from `.gitattributes`/`.git/info/attributes`, and the set of configured
+// names isn't fixed. Every test below plants a hostile driver, makes the file stat-dirty, and
+// asserts the marker it would write is never created.
+// ---------------------------------------------------------------------------
+
+describe('inspectCheckout — hostile filter drivers', () => {
+  it('does not execute a hostile filter.<x>.clean driver on a stat-dirty tracked file', async () => {
+    // #given
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    const markerPath = join(dir, 'clean-fired')
+    gitSync(dir, ['config', 'filter.evil.clean', `touch ${markerPath}; cat`])
+    // .git/info/attributes (untracked) rather than a committed .gitattributes: the attribute
+    // applies only to a.txt, and setup itself never runs the filter it's testing.
+    writeFileSync(join(dir, '.git', 'info', 'attributes'), 'a.txt filter=evil\n')
+    makeStatDirty(join(dir, 'a.txt'))
+
+    // #when — the protected code path enumerates and neutralizes filter.evil.clean.
+    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+    // #then
+    expect(result.response.ok).toBe(true)
+    expect(() => statSync(markerPath)).toThrow()
+  })
+
+  it('induced failure: the same hostile clean driver DOES fire without neutralization (raw git control)', async () => {
+    // #given — identical hostile config, but invoked via a raw git status call with no filter
+    // neutralization at all.
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    const markerPath = join(dir, 'clean-fired-unprotected')
+    gitSync(dir, ['config', 'filter.evil.clean', `touch ${markerPath}; cat`])
+    writeFileSync(join(dir, '.git', 'info', 'attributes'), 'a.txt filter=evil\n')
+    makeStatDirty(join(dir, 'a.txt'))
+
+    // #when — raw git status, no filter neutralization.
+    try {
+      execFileSync('git', ['-C', dir, 'status', '--porcelain=v2', '--branch'], {env: GIT_ENV, encoding: 'utf8'})
+    } catch {
+      // Irrelevant here whether `status` itself exits non-zero; only the marker matters.
+    }
+
+    // #then — the marker exists, proving the hostile driver executed when unprotected.
+    expect(() => statSync(markerPath)).not.toThrow()
+  })
+
+  it('does not execute a hostile filter.<x>.process driver, and status still succeeds despite required=true', async () => {
+    // #given — a process filter that writes a marker then fails the protocol handshake, with
+    // `required=true` explicitly set so a leftover-true `required` can't be relied on to make
+    // `status` fail safely instead of neutralizing the driver.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-process-filter-'))
+    const markerPath = join(fakeBinDir, 'process-fired')
+    const scriptPath = join(fakeBinDir, 'procf.sh')
+    writeFileSync(scriptPath, `#!/bin/sh\ntouch '${markerPath}'\nexit 1\n`)
+    chmodSync(scriptPath, 0o755)
+
+    try {
+      gitSync(dir, ['config', 'filter.evilproc.process', scriptPath])
+      gitSync(dir, ['config', 'filter.evilproc.required', 'true'])
+      writeFileSync(join(dir, '.git', 'info', 'attributes'), 'a.txt filter=evilproc\n')
+      makeStatDirty(join(dir, 'a.txt'))
+
+      // #when
+      const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+      // #then — no execution, AND the forced required=false override kept status itself
+      // succeeding (a hostile `required=true` left in place would otherwise fail `status`).
+      expect(result.response.ok).toBe(true)
+      expect(() => statSync(markerPath)).toThrow()
+    } finally {
+      rmSync(fakeBinDir, {recursive: true, force: true})
+    }
+  })
+
+  it('induced failure: the same hostile process driver DOES start without neutralization (raw git control)', async () => {
+    // #given
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-process-filter-unprotected-'))
+    const markerPath = join(fakeBinDir, 'process-fired-unprotected')
+    const scriptPath = join(fakeBinDir, 'procf.sh')
+    writeFileSync(scriptPath, `#!/bin/sh\ntouch '${markerPath}'\nexit 1\n`)
+    chmodSync(scriptPath, 0o755)
+
+    try {
+      gitSync(dir, ['config', 'filter.evilproc.process', scriptPath])
+      writeFileSync(join(dir, '.git', 'info', 'attributes'), 'a.txt filter=evilproc\n')
+      makeStatDirty(join(dir, 'a.txt'))
+
+      // #when — raw git status, no filter neutralization.
+      try {
+        execFileSync('git', ['-C', dir, 'status', '--porcelain=v2', '--branch'], {env: GIT_ENV, encoding: 'utf8'})
+      } catch {
+        // Expected: the fake process filter fails the protocol handshake and status errors.
+      }
+
+      // #then — the marker exists, proving the process filter was started when unprotected. A
+      // process filter speaks a protocol rather than running to completion, but writing the
+      // marker before failing the handshake is enough to prove it was launched.
+      expect(() => statSync(markerPath)).not.toThrow()
+    } finally {
+      rmSync(fakeBinDir, {recursive: true, force: true})
+    }
+  })
+
+  it('neutralizes a driver name containing a dot', async () => {
+    // #given — `filter.evil.dot.clean`: the driver name itself is `evil.dot`, not `evil`.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    const markerPath = join(dir, 'dotted-fired')
+    gitSync(dir, ['config', 'filter.evil.dot.clean', `touch ${markerPath}; cat`])
+    writeFileSync(join(dir, '.git', 'info', 'attributes'), 'a.txt filter=evil.dot\n')
+    makeStatDirty(join(dir, 'a.txt'))
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+    // #then
+    expect(result.response.ok).toBe(true)
+    expect(() => statSync(markerPath)).toThrow()
+  })
+
+  it('neutralizes a driver name containing an equals sign (cannot be overridden via -c)', async () => {
+    // #given — `-c 'filter.evil=x.clean=...'` would split on the FIRST `=`, corrupting the key.
+    // Only the GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> env mechanism keeps this driver name
+    // intact.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    const markerPath = join(dir, 'eq-fired')
+    gitSync(dir, ['config', 'filter.evil=x.clean', `touch ${markerPath}; cat`])
+    writeFileSync(join(dir, '.git', 'info', 'attributes'), 'a.txt filter=evil=x\n')
+    makeStatDirty(join(dir, 'a.txt'))
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+    // #then
+    expect(result.response.ok).toBe(true)
+    expect(() => statSync(markerPath)).toThrow()
+  })
+
+  it('neutralizes a driver defined in a file pulled in through include.path', async () => {
+    // #given — the driver itself lives in a separate file, only reachable through `include.path`.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    const markerPath = join(dir, 'included-fired')
+    const includedConfigPath = join(dir, 'included.gitconfig')
+    writeFileSync(includedConfigPath, `[filter "included"]\n\tclean = touch ${markerPath}; cat\n`)
+    gitSync(dir, ['config', 'include.path', includedConfigPath])
+    writeFileSync(join(dir, '.git', 'info', 'attributes'), 'a.txt filter=included\n')
+    makeStatDirty(join(dir, 'a.txt'))
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+    // #then
+    expect(result.response.ok).toBe(true)
+    expect(() => statSync(markerPath)).toThrow()
+  })
+
+  it('never invokes `git status` when filter-driver enumeration fails (fails closed)', async () => {
+    // #given — an injected runner that fails only the `git config` enumeration call and
+    // otherwise delegates to the real runner, plus a recorder of every invocation's argv.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    const invocations: (readonly string[])[] = []
+    const failingConfigRunner: GitRunnerFn = async (args, options) => {
+      invocations.push(args)
+      if (args.includes('config')) {
+        return {kind: 'failed', code: 2, stdout: '', stderr: 'simulated enumeration failure'}
+      }
+      return runGit(args, options)
+    }
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), {reposRoot, gitRunner: failingConfigRunner})
+
+    // #then — reported as inspection-failed, and `status` was never called at all.
+    expect(result.statusCode).toBe(500)
+    expect(result.response).toEqual({ok: false, error: 'inspection-failed'})
+    expect(invocations.some(args => args.includes('status'))).toBe(false)
+  })
+
+  it('does not descend into a submodule with its own hostile filter driver', async () => {
+    // #given — the submodule has its own config and its own hostile clean driver, entirely
+    // separate from the superproject's config that enumeration reads.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    const subDir = await mkdtemp(join(os.tmpdir(), 'inspect-submodule-'))
+    initRepo(subDir)
+    commitFile(subDir, 's.txt', 'sub\n', 'submodule base')
+
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+    try {
+      execFileSync('git', ['-C', dir, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subDir, 'subdir'], {
+        env: GIT_ENV,
+      })
+      gitSync(dir, ['commit', '-q', '-m', 'add submodule'])
+
+      const submoduleDir = join(dir, 'subdir')
+      const markerPath = join(dir, 'submodule-fired')
+      gitSync(submoduleDir, ['config', 'filter.evilsub.clean', `touch ${markerPath}; cat`])
+      // Written directly into the submodule's real git-dir info/attributes, never through `git
+      // add`/`git commit` in the submodule: staging a newly-attributed .gitattributes change
+      // itself makes real git re-run the clean filter on s.txt as a side effect of that add —
+      // that's setup noise from an unprotected raw git call, not the vector under test, and
+      // would otherwise plant the marker before inspectCheckout ever runs.
+      const submoduleGitDir = gitSync(submoduleDir, ['rev-parse', '--absolute-git-dir']).trim()
+      mkdirSync(join(submoduleGitDir, 'info'), {recursive: true})
+      writeFileSync(join(submoduleGitDir, 'info', 'attributes'), 's.txt filter=evilsub\n')
+      makeStatDirty(join(submoduleDir, 's.txt'))
+
+      // #when
+      const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+      // #then — `--ignore-submodules=all` means status never looks inside the submodule at all.
+      expect(result.response.ok).toBe(true)
+      expect(() => statSync(markerPath)).toThrow()
+    } finally {
+      await rm(subDir, {recursive: true, force: true})
+    }
   })
 })
 

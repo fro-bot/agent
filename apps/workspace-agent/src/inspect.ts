@@ -5,13 +5,23 @@
  * 1. Never runs `git clone`, `git fetch`, `git checkout`, or any write/network git command.
  * 2. `git status` is invoked with `--no-optional-locks` so it never writes the refreshed
  *    stat-cache back to the on-disk index (see buildGitInvocation() for the full rationale).
- * 3. Every git invocation carries `-c core.fsmonitor=false` (and other `-c` neutralizers) so an
- *    agent-writable `.git/config` cannot turn inspection into code execution.
+ * 3. Every git invocation neutralizes the code-execution vectors `status` can reach through an
+ *    agent-writable `.git/config` / `.gitattributes` / `.git/info/attributes`: `core.fsmonitor`,
+ *    `core.hooksPath`, `core.pager`, `credential.helper`, and — enumerated fresh before every
+ *    `status` call, since the set of configured names isn't fixed — every `filter.<name>.clean`,
+ *    `.smudge`, and `.process` driver, plus `.required` forced to `false`. Submodule recursion is
+ *    disabled (`--ignore-submodules=all`) because a submodule's own config/attributes aren't
+ *    covered by any of the above. This is a closed list of what's neutralized, not a blanket claim
+ *    that inspection can't execute code — anything not on this list is still a candidate to check
+ *    before relying on it.
  * 4. No credentials are read, minted, or passed to the git subprocess environment.
  * 5. Every git subprocess has a bounded timeout and is CONFIRMED terminated (we wait for the
  *    child's `close` event, not just for `kill()` to return) before the timeout outcome resolves.
  * 6. A checkout whose git top-level or git-directory resolves outside the canonical path is
  *    rejected as `checkout-substituted` \u2014 state is never reported for a substituted repository.
+ * 7. Filter-driver enumeration (invariant 3) fails closed: if it fails, times out, or produces
+ *    output this module can't parse, `git status` is never invoked and the call reports
+ *    `inspection-failed`. A missed neutralization is worse than a missing observation.
  */
 
 import type {
@@ -138,6 +148,10 @@ export const runGit: GitRunnerFn = async (args, options) =>
  *   paging for a subcommand that ignores the global flag).
  * - `-c credential.helper=`: disables any operator-side credential helper; inspection never needs
  *   credentials and must never be handed any.
+ *
+ * `filter.<name>.clean`/`.smudge`/`.process` drivers are NOT in this fixed list because the set of
+ * configured names isn't fixed \u2014 they're enumerated and neutralized per call via env overrides;
+ * see enumerateFilterDrivers()/buildFilterNeutralizationEnv() below.
  */
 const GIT_SAFETY_ARGS: readonly string[] = [
   '--no-optional-locks',
@@ -170,6 +184,121 @@ function buildInspectEnv(): Record<string, string> {
     HOME: process.env.HOME ?? '/root',
     PATH: process.env.PATH ?? '/usr/bin:/bin',
   }
+}
+
+// ---------------------------------------------------------------------------
+// Filter-driver enumeration and neutralization — closes the vector where `git status` runs
+// `filter.<driver>.clean` (and `.process`) on any tracked file whose stat info no longer matches
+// the index. The driver command lives in config (any level `git config` reads: system, global,
+// local, worktree, and anything pulled in via `include.path`/`includeIf`) and is assigned to
+// files via `.gitattributes` or `.git/info/attributes` — both agent-writable between harness
+// runs, and neither covered by the fixed `-c` neutralizers above.
+// ---------------------------------------------------------------------------
+
+const FILTER_CONFIG_KEY_RE = /^filter\.(.+)\.(?:clean|smudge|process|required)$/
+
+/**
+ * Parses `git config -z --get-regexp '^filter\.'` output into the set of configured filter-driver
+ * names. `-z` NUL-terminates each record as `key\nvalue\0` so a value containing embedded
+ * newlines can never be misread as a record boundary \u2014 not needed for the key itself here, but
+ * the key can contain `.` and `=` (valid characters in a git config subsection name), which is
+ * exactly why GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> (not `-c`) are used to neutralize them
+ * below. The regex is greedy on the driver-name capture, so `filter.evil.dot.clean` yields
+ * `evil.dot` (not `evil`) and `filter.evil=x.clean` yields `evil=x` \u2014 confirmed against real git
+ * 2.55.0.
+ */
+function parseFilterDriverNames(stdout: string): ReadonlySet<string> {
+  const names = new Set<string>()
+  for (const record of stdout.split('\0')) {
+    if (record.length === 0) continue
+    const newlineIndex = record.indexOf('\n')
+    const key = newlineIndex === -1 ? record : record.slice(0, newlineIndex)
+    const match = FILTER_CONFIG_KEY_RE.exec(key)
+    const driverName = match?.[1]
+    if (driverName !== undefined) names.add(driverName)
+  }
+  return names
+}
+
+export type FilterEnumerationOutcome =
+  {readonly kind: 'ok'; readonly drivers: ReadonlySet<string>} | {readonly kind: 'failed'}
+
+/**
+ * Enumerates every configured `filter.<name>.*` driver so each can be neutralized before `git
+ * status` runs. Plain `git config` \u2014 no `--global`/`--system`/`--local`/`--file` \u2014 reads every
+ * level `status` itself reads (system, global, local, worktree) and follows `include.path`/
+ * `includeIf`, confirmed against real git 2.55.0, so this sees exactly what could assign a driver
+ * to a tracked file. `--get-regexp` exits 1 with empty stdout when nothing matches (the common
+ * case: no filter drivers configured) \u2014 that is success with an empty set, not a failure.
+ *
+ * Fails closed: any other non-ok outcome (timeout, non-1 exit, or output this function can't
+ * parse as a config record) reports `'failed'`, and the caller must never run `git status` after
+ * a `'failed'` result.
+ */
+async function enumerateFilterDrivers(
+  cwd: string,
+  env: Record<string, string>,
+  gitRunner: GitRunnerFn,
+  timeoutMs: number,
+): Promise<FilterEnumerationOutcome> {
+  const outcome = await gitRunner(gitInvocation(cwd, ['config', '-z', '--get-regexp', String.raw`^filter\.`]), {
+    cwd,
+    env,
+    timeoutMs,
+  })
+  if (outcome.kind === 'ok') return {kind: 'ok', drivers: parseFilterDriverNames(outcome.stdout)}
+  if (outcome.kind === 'failed' && outcome.code === 1 && outcome.stdout.length === 0) {
+    return {kind: 'ok', drivers: new Set()}
+  }
+  return {kind: 'failed'}
+}
+
+/**
+ * Builds the `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` env overrides that
+ * neutralize every enumerated filter driver for one git invocation. Env-based overrides are used
+ * instead of `-c key=value` because `-c` splits its argument on the FIRST `=`, so a driver named
+ * with an `=` in it (a valid git config subsection name) can't be neutralized that way \u2014 the env
+ * mechanism keeps the key and value as separate strings, never joined and re-split. Documented
+ * since git 2.31; confirmed present and behaving as documented on git 2.55.0 (the version
+ * `deploy/workspace.Dockerfile` installs).
+ *
+ * For each driver: `clean` and `smudge` are set to the empty string, `process` to the empty
+ * string, and `required` to `false`.
+ * - Empty `clean`/`process`: confirmed against real git 2.55 that this makes git treat the file as
+ *   if no filter were configured for that operation \u2014 no subprocess is spawned. (`smudge` is
+ *   never invoked by `git status` \u2014 it only runs on checkout \u2014 but is neutralized too for
+ *   defense-in-depth in case a future code path in this module runs a checkout-adjacent command.)
+ * - `required=false` is necessary, not optional: with an empty `clean`/`process` but `required`
+ *   left at a hostile `true`, `git status` treats the now-unusable filter as a hard error and
+ *   exits non-zero (confirmed against real git 2.55) \u2014 the command never executes, but every
+ *   inspection of that repo would then fail. Forcing `required=false` gets both no execution and a
+ *   successful `status`.
+ *
+ * KNOWN SIDE EFFECT (see report): with `clean` disabled, a tracked file whose stat info no longer
+ * matches the index but whose *content* a real clean filter would normalize back to the committed
+ * blob (git-lfs pointers, CRLF normalization, etc.) now compares raw worktree bytes against the
+ * index blob instead \u2014 confirmed against real git 2.55 to report such a file as modified even
+ * though the tree is semantically clean. A wrong "dirty" label is recoverable; executing a planted
+ * command is not, so this is accepted and must be reported, not fixed here.
+ */
+function buildFilterNeutralizationEnv(drivers: ReadonlySet<string>): Record<string, string> {
+  const overrides: Record<string, string> = {}
+  let index = 0
+  for (const driver of drivers) {
+    const entries: readonly (readonly [string, string])[] = [
+      ['clean', ''],
+      ['smudge', ''],
+      ['process', ''],
+      ['required', 'false'],
+    ]
+    for (const [subkey, value] of entries) {
+      overrides[`GIT_CONFIG_KEY_${index}`] = `filter.${driver}.${subkey}`
+      overrides[`GIT_CONFIG_VALUE_${index}`] = value
+      index += 1
+    }
+  }
+  if (index > 0) overrides.GIT_CONFIG_COUNT = String(index)
+  return overrides
 }
 
 // ---------------------------------------------------------------------------
@@ -394,11 +523,26 @@ export async function inspectCheckout(
     gitDirResolved === canonicalResolved || gitDirResolved.startsWith(`${canonicalResolved}/`)
   if (gitDirWithinCanonical === false) return failure('checkout-substituted', 409)
 
-  const statusOutcome = await gitRunner(gitInvocation(canonicalResolved, ['status', '--porcelain=v2', '--branch']), {
-    cwd: canonicalResolved,
-    env,
-    timeoutMs,
-  })
+  // Fail closed: enumerate every configured filter driver before `status` ever runs. If this
+  // fails, times out, or returns something unparseable, `status` must never be invoked \u2014 an
+  // inspection that might execute a planted command is worse than one reporting nothing.
+  const filterEnumeration = await enumerateFilterDrivers(canonicalResolved, env, gitRunner, timeoutMs)
+  if (filterEnumeration.kind === 'failed') return failure('inspection-failed', 500)
+
+  const statusEnv: Record<string, string> = {...env, ...buildFilterNeutralizationEnv(filterEnumeration.drivers)}
+
+  // `--ignore-submodules=all`: a submodule has its own config/attributes, which the enumeration
+  // above does not (and cannot, without recursing) cover, and `status.submoduleSummary` can spawn
+  // additional work on top. This means the dirty counts below no longer reflect submodule
+  // changes \u2014 see the module header and the report for the trade-off.
+  const statusOutcome = await gitRunner(
+    gitInvocation(canonicalResolved, ['status', '--porcelain=v2', '--branch', '--ignore-submodules=all']),
+    {
+      cwd: canonicalResolved,
+      env: statusEnv,
+      timeoutMs,
+    },
+  )
 
   if (statusOutcome.kind === 'timeout') return failure('inspection-timeout', 504)
   if (statusOutcome.kind === 'failed') return failure('inspection-failed', 500)
