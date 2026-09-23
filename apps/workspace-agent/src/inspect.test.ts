@@ -5,10 +5,23 @@
  * behavior (porcelain v2 parsing, config-injection neutralization, index read-only-ness).
  */
 
-import type {InspectRequest} from './types.js'
+import type {Buffer} from 'node:buffer'
 
+import type {InspectRequest} from './types.js'
 import {execFileSync} from 'node:child_process'
-import {chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync} from 'node:fs'
+import {
+  chmodSync,
+  closeSync,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import {mkdir, mkdtemp, rm, symlink, writeFile} from 'node:fs/promises'
 import os from 'node:os'
 import {join} from 'node:path'
@@ -573,6 +586,20 @@ describe('inspectCheckout — hostile core.fsmonitor', () => {
 // Read-only invariant: the index is never modified.
 // ---------------------------------------------------------------------------
 
+/**
+ * Read the index's bytes and mtime from ONE open file descriptor, so both describe the same
+ * file at the same moment. Reading bytes by path and then stat-ing by path again could pair
+ * one version's contents with another's timestamp if the file were replaced in between.
+ */
+function snapshotIndex(indexPath: string): {readonly bytes: Buffer; readonly mtimeMs: number} {
+  const fd = openSync(indexPath, 'r')
+  try {
+    return {bytes: readFileSync(fd), mtimeMs: fstatSync(fd).mtimeMs}
+  } finally {
+    closeSync(fd)
+  }
+}
+
 describe('inspectCheckout — index is never modified', () => {
   it('leaves the index byte-identical after a protected inspection', async () => {
     // #given — force a stat mismatch (bumped mtime) so a plain `git status` would have a reason
@@ -584,18 +611,16 @@ describe('inspectCheckout — index is never modified', () => {
     utimesSync(join(dir, 'a.txt'), future, future)
 
     const indexPath = join(dir, '.git', 'index')
-    const beforeBytes = readFileSync(indexPath)
-    const beforeMtime = statSync(indexPath).mtimeMs
+    const before = snapshotIndex(indexPath)
 
     // #when
     const result = await inspectCheckout(req(owner, repo), {reposRoot})
 
     // #then
     expect(result.response.ok).toBe(true)
-    const afterBytes = readFileSync(indexPath)
-    const afterMtime = statSync(indexPath).mtimeMs
-    expect(afterBytes.equals(beforeBytes)).toBe(true)
-    expect(afterMtime).toBe(beforeMtime)
+    const after = snapshotIndex(indexPath)
+    expect(after.bytes.equals(before.bytes)).toBe(true)
+    expect(after.mtimeMs).toBe(before.mtimeMs)
   })
 
   it('induced failure: a raw `git status` (no --no-optional-locks) DOES rewrite the index', async () => {
@@ -607,17 +632,15 @@ describe('inspectCheckout — index is never modified', () => {
     utimesSync(join(dir, 'a.txt'), future, future)
 
     const indexPath = join(dir, '.git', 'index')
-    const beforeBytes = readFileSync(indexPath)
-    const beforeMtime = statSync(indexPath).mtimeMs
+    const before = snapshotIndex(indexPath)
 
     // #when — raw git status, no --no-optional-locks.
     execFileSync('git', ['-C', dir, 'status', '--porcelain=v2', '--branch'], {env: GIT_ENV, encoding: 'utf8'})
 
     // #then — the index changed (mtime or bytes), proving --no-optional-locks is the meaningful
     // protection dropped in the "protected" test above.
-    const afterBytes = readFileSync(indexPath)
-    const afterMtime = statSync(indexPath).mtimeMs
-    const changed = afterMtime !== beforeMtime || !afterBytes.equals(beforeBytes)
+    const after = snapshotIndex(indexPath)
+    const changed = after.mtimeMs !== before.mtimeMs || after.bytes.equals(before.bytes) === false
     expect(changed).toBe(true)
   })
 })
