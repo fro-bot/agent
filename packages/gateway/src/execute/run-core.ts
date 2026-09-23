@@ -55,6 +55,8 @@ export type RunCoreErrorKind =
   | 'stream-ended' // event stream closed before session.idle was received
   | 'missing-coordinator' // approval-required mode but no coordinator provided (fail-closed)
   | 'drain-timeout' // root session went idle with owned work outstanding and the deadline expired before it settled
+  | 'checkout-substituted' // inspect() found a tree that is not the expected repository — a correctness failure, not a missing label
+  | 'workspace-unavailable' // clone failed for a reason that will not resolve on its own (e.g. the repo does not exist or is inaccessible) — do not invite a retry
 
 /**
  * Error thrown by `runOpenCodeCore` on any failure path.

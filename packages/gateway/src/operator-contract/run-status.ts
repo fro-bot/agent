@@ -115,6 +115,12 @@ export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND = {
   // bounded by the same wall-clock budget, so this is operator-facing exactly
   // the same deadline-expiry outcome as 'timeout', not a distinct concept.
   'drain-timeout': 'max-duration-timeout',
+  // Neither has a dedicated operator-facing bucket yet — both surface as 'unknown'
+  // rather than being folded into 'workspace-unreachable', which would misrepresent
+  // a correctness failure (checkout-substituted) or a non-retriable one
+  // (workspace-unavailable) as a transient reachability problem.
+  'checkout-substituted': undefined,
+  'workspace-unavailable': undefined,
 } satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>
 
 /**

@@ -7,10 +7,12 @@ import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
 import type {OperatorFailureKind} from '../operator-contract/run-status.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
-import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
+import type {CheckoutObservation, CloneErrorCode, ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
+import type {CheckoutProvenance} from './provenance.js'
 import type {ChannelQueue} from './queue.js'
+import type {RunCoreErrorKind} from './run-core.js'
 import type {RunIndex} from './run-index.js'
 
 import {
@@ -35,6 +37,7 @@ import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {abortRegistry} from './abort-registry.js'
 import {attachOpencode} from './opencode-attach.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
+import {classifyInspectResult, formatProvenanceForPrompt, formatProvenanceLine} from './provenance.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 
 // ---------------------------------------------------------------------------
@@ -125,6 +128,20 @@ export interface RunMentionDeps {
    */
   readonly ensureClone: (owner: string, repo: string) => Promise<Result<string, EnsureCloneFailure>>
   /**
+   * Report the state of the checkout `ensureClone` just ensured exists.
+   * Called immediately after a successful `ensureClone`, still under the repo
+   * lock. Read-only — never clones, fetches, or mutates the checkout.
+   * Injected so tests can stub it without a live workspace.
+   *
+   * The engine classifies the result via `classifyInspectResult`: a
+   * `checkout-substituted` failure fails the run (a tree that isn't the
+   * expected repository is a correctness failure); every other outcome
+   * (success or any other failure) becomes a `CheckoutProvenance` the run
+   * carries forward — to the agent prompt, to the human-facing reply, and
+   * onto the run's persisted state.
+   */
+  readonly inspect: (owner: string, repo: string) => Promise<Result<CheckoutObservation, WorkspaceError>>
+  /**
    * Workspace readiness check. Called after ensure-clone, before execution.
    * Injected so tests can stub it without a live workspace.
    *
@@ -197,6 +214,81 @@ export function formatTimeoutDuration(ms: number): string {
     return `${minutePart} ${remainingSeconds} ${remainingSeconds === 1 ? 'second' : 'seconds'}`
   }
   return `${totalSeconds} ${totalSeconds === 1 ? 'second' : 'seconds'}`
+}
+
+/**
+ * `CloneErrorCode`s that are operator-side and will not resolve on their own:
+ * the workspace-agent environment is broken (`git-not-available`), a local
+ * filesystem/path problem (`permission-denied` — an `EACCES` creating the
+ * workspace directory, NOT a GitHub access problem; `too-many-files`;
+ * `path-escaped-workspace`), a resolution bug (`head-resolution-failed`), or
+ * the gateway sent a malformed request (`invalid-owner`, `invalid-repo`,
+ * `invalid-token-shape`, `malformed-body`, `body-too-large` — a gateway bug,
+ * also operator-side).
+ *
+ * Deliberately EXCLUDES `clone-failed`: it is the workspace-agent's catch-all
+ * for any `git clone` failure that isn't a timeout/ENOSPC/missing-git
+ * (`apps/workspace-agent/src/clone.ts:429`). A missing or uninstalled
+ * repository fails earlier, at GitHub App auth (see `classifyEnsureCloneFailure`
+ * below) — `clone-failed` never sees that case. What's left is dominated by
+ * transient causes (a connection reset, a proxy 502, a GitHub 5xx mid-clone),
+ * with a rarer operator-side case (an existing destination that isn't a valid
+ * git worktree, `clone.ts:452-496`) that code cannot distinguish from the
+ * transient one. Staying in `unreachable` costs a wasted retry for the rare
+ * case; moving to `workspace-unavailable` would send everyone hitting the
+ * common transient case on a false "go check the repo" chase. Do not move
+ * `clone-failed` back into this set without a way to tell the two apart.
+ */
+const PERMANENT_CLONE_ERROR_CODES: ReadonlySet<CloneErrorCode> = new Set<CloneErrorCode>([
+  'invalid-owner',
+  'invalid-repo',
+  'invalid-token-shape',
+  'malformed-body',
+  'body-too-large',
+  'git-not-available',
+  'permission-denied',
+  'too-many-files',
+  'path-escaped-workspace',
+  'head-resolution-failed',
+])
+
+/**
+ * Map an `EnsureCloneFailure` to a `RunCoreErrorKind` honestly, instead of
+ * collapsing every non-auth failure into `unreachable`.
+ *
+ * `auth-failure` splits on `reason` — positive evidence only, mirroring
+ * `ensure-clone.ts`'s `classifyAuthFailure`: `'not-installed'` and
+ * `'insufficient-permissions'` are set ONLY when `authForRepo` proved (via
+ * `instanceof`) that the App isn't installed or lacks required permissions —
+ * a PERMANENT condition until an operator fixes the installation, so it
+ * belongs in `workspace-unavailable`. Everything else — `'timeout'`, the
+ * unclassified `'auth-error'` remainder (a discovery network/5xx/rate-limit
+ * failure, or a token-mint failure), or `reason` absent — has no positive
+ * evidence of permanence and stays `auth` (bucketed with `unreachable`
+ * below): a GitHub outage or a rate limit must not be told "an operator
+ * needs to look at it".
+ *
+ * `workspace-failure`/`clone-error` codes in `PERMANENT_CLONE_ERROR_CODES`
+ * become `workspace-unavailable` — operator-side failures that will not
+ * resolve on their own, so the user-facing message must not invite a
+ * pointless retry. Everything else (network/timeout/http/parse/
+ * response-mismatch, and the transient clone-error codes including
+ * `clone-failed`) stays `unreachable`, matching prior behavior.
+ */
+function classifyEnsureCloneFailure(failure: EnsureCloneFailure): RunCoreErrorKind {
+  if (failure.kind === 'auth-failure') {
+    return failure.reason === 'not-installed' || failure.reason === 'insufficient-permissions'
+      ? 'workspace-unavailable'
+      : 'auth'
+  }
+  if (
+    failure.kind === 'workspace-failure' &&
+    failure.workspaceKind === 'clone-error' &&
+    PERMANENT_CLONE_ERROR_CODES.has(failure.code)
+  ) {
+    return 'workspace-unavailable'
+  }
+  return 'unreachable'
 }
 
 /** Narrow logger adapter for runtime coordination functions. */
@@ -520,7 +612,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     persona,
     logger,
   } = deps
-  const {approvalRegistry, approvalMode, ensureClone, readyz} = deps
+  const {approvalRegistry, approvalMode, ensureClone, readyz, inspect} = deps
 
   // ── All mutable state that the outer finally needs is declared here so the
   // finally block can always reference channelId regardless of where execution
@@ -562,6 +654,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   // is exactly the bug this barrier exists to close. The run stays reserved until a
   // later reconciliation pass confirms settlement or an operator intervenes.
   let quarantined = false
+
+  // ── Checkout provenance — what this run started from ────────────────────────────────────────
+  // Set once, right after a successful `ensureClone` + `inspect` (still under the repo lock).
+  // Declared here (outer-try-spanning) so both the success/quarantine/cancel/failure branches
+  // below and the prompt-construction step can read it. `provenanceLine` is the deterministic,
+  // code-generated human-facing line derived from it — computed once alongside `provenance` so
+  // every codepath that appends it is guaranteed to append the SAME text.
+  let provenance: CheckoutProvenance | undefined
+  let provenanceLine: string | undefined
 
   try {
     // ── Workspace readiness gate ──────────────────────────────────────────────────────────────
@@ -755,6 +856,28 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     const {statusSink, replySink} = request
 
+    // ── Provenance delivery helpers ─────────────────────────────────────────────────
+    // `provenanceLine` is deterministic and code-generated (never written by the model).
+    // It must reach EVERY final reply on EVERY transport. The reply sink's buffer
+    // (append/flush) is the one delivery channel guaranteed on both surfaces: Discord's
+    // flush() posts the buffer, and the web ReplySink's flush() is its ONLY final-answer
+    // channel (its send() is a no-op — see web-sinks.ts). Appending into the buffer
+    // BEFORE flush() (or before reading `buffered()` as `finalText`) guarantees delivery
+    // without any transport-specific code. Separately, `withProvenanceLine` appends the
+    // same text to the literal failure-note strings (`userMessage`/`quarantineMessage`)
+    // that Discord delivers via `resolveToFailure`/`send` — a channel the web transport
+    // does not use (its resolveToFailure/send are no-ops), so it needs no such handling.
+    let provenanceLineAppended = false
+    function appendProvenanceLineToBuffer(): void {
+      if (provenanceLine === undefined || provenanceLineAppended) return
+      provenanceLineAppended = true
+      const current = replySink.buffered()
+      replySink.append(current.trim().length > 0 ? `\n\n${provenanceLine}` : provenanceLine)
+    }
+    function withProvenanceLine(text: string): string {
+      return provenanceLine === undefined ? text : `${text}\n\n${provenanceLine}`
+    }
+
     try {
       // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
       // Rehydrates a missing checkout (e.g. after container recreation) before OpenCode can start.
@@ -779,7 +902,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           },
           'run: workspace clone unavailable — aborting',
         )
-        const runCoreKind = ensureCloneResult.error.kind === 'auth-failure' ? 'auth' : 'unreachable'
+        const runCoreKind = classifyEnsureCloneFailure(ensureCloneResult.error)
         throw new RunCoreError(runCoreKind, `ensureClone failed: ${ensureCloneResult.error.kind}`)
       }
 
@@ -787,6 +910,29 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // workspacePath stored in the binding (e.g. after container recreation).
       const bindingWithEnsuredPath = {...binding, workspacePath: ensureCloneResult.data}
 
+      // ── Checkout provenance — report what the checkout holds, still under the repo lock ──────
+      // Runs immediately after ensureClone, before the EXECUTING transition, so a
+      // `checkout-substituted` failure (a tree that isn't the expected repository — a
+      // correctness failure) fails the run through the SAME post-lock path as any other
+      // execution failure, before any agent session starts. Every other outcome (success or
+      // any other inspect failure) proceeds with a `CheckoutProvenance` the run carries
+      // forward: PR 1 never fails a run merely because inspection was unavailable.
+      const inspectResult = await inspect(binding.owner, binding.repo)
+      const inspectOutcome = classifyInspectResult(inspectResult)
+      if (inspectOutcome.decision === 'fail-run') {
+        logger.error(
+          {channelId, owner: binding.owner, repo: binding.repo},
+          'run: checkout-substituted — tree is not the expected repository, aborting',
+        )
+        throw new RunCoreError('checkout-substituted', 'inspect failed: checkout-substituted')
+      }
+      provenance = inspectOutcome.provenance
+      provenanceLine = formatProvenanceLine(repo, provenance)
+
+      // Persist the STARTING provenance atomically with the EXECUTING phase write —
+      // reusing the existing detailsPatch mechanism rather than a separate write. This
+      // is what the run began from, not a claim about the whole run: later checkout
+      // mutations by the agent are never reflected back onto this field.
       const execResult = await transitionRun(
         coordinationConfig,
         identity,
@@ -795,6 +941,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         'EXECUTING',
         runEtag,
         coordLogger,
+        {detailsPatch: {checkoutProvenance: provenance}},
       )
       if (execResult.success === false) {
         // ── Graceful loser: cancel-wins-adoption race (ACKNOWLEDGED → EXECUTING) ──────
@@ -850,6 +997,14 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
               owner: bindingWithEnsuredPath.owner,
               repo: bindingWithEnsuredPath.repo,
             })
+
+      // ── Checkout provenance for the agent — engine-level insertion ─────────────────
+      // Appended here, AFTER whichever prompt builder just ran (Discord's or a custom
+      // one), so no builder can leave it out. The agent needs to know what it's reading
+      // — especially when the tree is dirty, detached, or mid-operation — and that
+      // remote freshness was not checked.
+      const promptTextWithProvenance =
+        provenance === undefined ? promptText : `${promptText}\n\n${formatProvenanceForPrompt(provenance)}`
 
       // ── Remaining budget — single origin for hard abort AND approval deadline ──
       //
@@ -969,7 +1124,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         await runOpenCodeCore({
           handle,
           directory: bindingWithEnsuredPath.workspacePath,
-          promptText,
+          promptText: promptTextWithProvenance,
           sink: replySink,
           signal: effectiveSignal,
           logger,
@@ -1030,10 +1185,13 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       }
 
       // ── Status controller final-answer transition ─────────────────────────────────────────────
+      // Append the deterministic provenance line BEFORE reading the buffer, so both branches
+      // below (the in-place status edit AND the raw flush) carry the same text.
       // Get the buffered text BEFORE flush so the controller can decide whether to edit in place.
       // resolveToAnswer returns:
       //   'handled'   → controller edited the status message into the answer; skip sink flush.
       //   'delegated' → controller deleted the status (or typing-only); flush via sink as normal.
+      appendProvenanceLineToBuffer()
       const finalText = replySink.buffered()
       const answerResult = await statusSink.resolveToAnswer(finalText)
       if (answerResult.transition === 'delegated') {
@@ -1058,6 +1216,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       const isDrainTimeout = isCoreError && execError.kind === 'drain-timeout'
       const isStreamEnded = isCoreError && execError.kind === 'stream-ended'
       const isReachability = isCoreError && (execError.kind === 'unreachable' || execError.kind === 'auth')
+      const isCheckoutSubstituted = isCoreError && execError.kind === 'checkout-substituted'
+      const isWorkspaceUnavailable = isCoreError && execError.kind === 'workspace-unavailable'
       const isEmptyPrompt = execError instanceof EmptyPromptError
 
       // ── Cancel classification — registry probe, NOT composite abort-reason inspection ──
@@ -1169,6 +1329,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         }
 
         // Best-effort flush of partial output — mirrors the existing failure-path ordering.
+        // Provenance line appended first so the buffer-only web transport still carries it.
+        appendProvenanceLineToBuffer()
         await replySink.flush().catch((flushError: unknown) => {
           logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in quarantine path')
         })
@@ -1179,8 +1341,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(quarantineFailureKind))
         }
 
-        const quarantineMessage =
-          'The task failed and its background work could not be confirmed stopped. This repository stays reserved for a bounded window while that resolves — please contact an operator if it persists.'
+        const quarantineMessage = withProvenanceLine(
+          'The task failed and its background work could not be confirmed stopped. This repository stays reserved for a bounded window while that resolves — please contact an operator if it persists.',
+        )
         const quarantineReplyResult = await statusSink.resolveToFailure(quarantineMessage).catch((error: unknown) => {
           logger.warn(
             {repo, runId, err: String(error)},
@@ -1240,7 +1403,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
         // Best-effort flush of partial output BEFORE the transition/observer notify —
         // mirrors the existing failure-path ordering so the user's streamed output is
-        // never lost on cancel.
+        // never lost on cancel. Deliberately NOT appending the provenance line here:
+        // cancel suppresses the user-facing failure reply entirely (see below) — there
+        // is no "final reply" on this path to attach a starting-state line to, and this
+        // flush is exactly the agent's pre-cancel partial output, unmodified.
         await replySink.flush().catch((flushError: unknown) => {
           logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in cancel path')
         })
@@ -1379,6 +1545,13 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
         // Flush partial output (best-effort) so the user sees whatever streamed before the failure.
         // Wrapped in its own try/catch so a flush failure does not mask the original error.
+        // Deliberately NOT appending the provenance line into this buffer: the real
+        // DiscordStreamSink (and this flow's own test doubles) set `hasVisibleOutput()`
+        // as a SIDE EFFECT of THIS flush succeeding — appending a code-generated line
+        // here would make every failure look like it "posted updates above" even when
+        // the agent produced nothing. The provenance line is still delivered on this
+        // path via `withProvenanceLine(userMessage)` below (Discord's resolveToFailure/
+        // send channel).
         await replySink.flush().catch((flushError: unknown) => {
           logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
         })
@@ -1396,7 +1569,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
         const inactivityDuration = formatTimeoutDuration(runInactivityTimeoutMs)
         const hasVisibleOutput = replySink.hasVisibleOutput() === true
-        const userMessage =
+        const userMessage = withProvenanceLine(
           isTimeout === true
             ? hasVisibleOutput === true
               ? `The task reached the ${timeoutDuration} time limit after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
@@ -1409,13 +1582,18 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
                 ? hasVisibleOutput === true
                   ? `The task's background work did not finish within the ${timeoutDuration} time limit and was cancelled. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
                   : `The task's background work did not finish within the ${timeoutDuration} time limit and was cancelled. Please try again.`
-                : isReachability === true
-                  ? 'The workspace is not reachable right now. Please try again later.'
-                  : isEmptyPrompt === true
-                    ? 'Nothing to do — please include a task in your message.'
-                    : isStreamEnded === true
-                      ? 'The task stream closed unexpectedly. Please try again.'
-                      : 'The task failed. Please try again.'
+                : isCheckoutSubstituted === true
+                  ? "The workspace checkout doesn't match this repository. An operator needs to look at it before this can continue."
+                  : isWorkspaceUnavailable === true
+                    ? 'The workspace could not prepare this repository. An operator needs to look at it before this can continue.'
+                    : isReachability === true
+                      ? 'The workspace is not reachable right now. Please try again later.'
+                      : isEmptyPrompt === true
+                        ? 'Nothing to do — please include a task in your message.'
+                        : isStreamEnded === true
+                          ? 'The task stream closed unexpectedly. Please try again.'
+                          : 'The task failed. Please try again.',
+        )
 
         // ── Status controller failure transition ──────────────────────────────────────────────────
         // resolveToFailure returns:

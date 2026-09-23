@@ -162,6 +162,15 @@ function makeRunMentionDeps(): MentionDeps['run'] {
     persona: null,
     ensureClone: vi.fn().mockResolvedValue({success: true as const, data: '/workspace/repos/acme/widget'}),
     readyz: vi.fn().mockResolvedValue({success: true as const, data: {ready: true, opencode: 'ready'}}),
+    inspect: vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {
+        head: {kind: 'attached' as const, branch: 'main', sha: 'a'.repeat(40)},
+        worktree: {kind: 'clean' as const},
+        operationInProgress: 'none' as const,
+        observedAt: '2026-01-01T00:00:00.000Z',
+      },
+    }),
   }
 }
 
