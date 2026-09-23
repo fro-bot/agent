@@ -72,16 +72,6 @@ export interface OperatorRunStatus {
   readonly failureKind?: OperatorFailureKind
   /**
    * What this run started from (the checked-out commit/branch, worktree
-   * cleanliness, any in-progress operation). Present on EVERY phase —
-   * success or failure — not only FAILED, unlike `failureKind`: this is the
-   * run's starting state, not an outcome. Absent (`undefined`) for a run
-   * recorded before this field existed, or if the stored value is malformed;
-   * both collapse to the same "no provenance recorded" state. Never a claim
-   * about the CURRENT tree — an agent that edits files or switches branches
-   * mid-run changes it; this describes the starting point only.
-   */
-  /**
-   * What this run started from (the checked-out commit/branch, worktree
    * cleanliness, any in-progress operation). Present ONLY on runs that reached
    * EXECUTING — i.e. inspection ran and the run actually started. A run that
    * fails before EXECUTING (e.g. `checkout-substituted`, `workspace-unavailable`)
