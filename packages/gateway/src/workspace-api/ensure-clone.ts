@@ -16,7 +16,7 @@
 import type {Result} from '@fro-bot/runtime'
 import type {AppClient} from '../github/app-client.js'
 import type {WorkspaceClient} from './client.js'
-import type {CloneErrorCode, WorkspaceError} from './types.js'
+import type {CloneErrorCode, InspectErrorCode, WorkspaceError} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {workspaceRepoPath} from './client.js'
@@ -50,6 +50,7 @@ export type EnsureCloneFailure =
  */
 export type WorkspaceFailure =
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'clone-error'; readonly code: CloneErrorCode}
+  | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'inspect-error'; readonly code: InspectErrorCode}
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'http-error'; readonly status: number}
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'network-error'}
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'timeout'}
@@ -90,6 +91,10 @@ function toWorkspaceFailure(error: WorkspaceError): WorkspaceFailure {
   switch (error.kind) {
     case 'clone-error':
       return {kind: 'workspace-failure', workspaceKind: 'clone-error', code: error.code}
+    case 'inspect-error':
+      // ensureWorkspaceClone only ever calls workspaceClient.clone(), which never produces this
+      // kind — handled here purely to keep the shared WorkspaceError switch exhaustive.
+      return {kind: 'workspace-failure', workspaceKind: 'inspect-error', code: error.code}
     case 'http-error':
       return {kind: 'workspace-failure', workspaceKind: 'http-error', status: error.status}
     case 'network-error':

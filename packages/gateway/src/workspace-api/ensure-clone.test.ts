@@ -63,6 +63,7 @@ function makeWorkspaceClient(
   return {
     clone: vi.fn().mockResolvedValue(cloneResult),
     readyz: vi.fn(),
+    inspect: vi.fn(),
   }
 }
 

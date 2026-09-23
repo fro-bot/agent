@@ -9,7 +9,20 @@
 
 import type {Result} from '@fro-bot/runtime'
 
-import type {CloneErrorCode, CloneFailure, CloneRequest, CloneSuccess, ReadyzResponse, WorkspaceError} from './types.js'
+import type {
+  CheckoutObservation,
+  CheckoutOperation,
+  CloneErrorCode,
+  CloneFailure,
+  CloneRequest,
+  CloneSuccess,
+  InspectErrorCode,
+  InspectFailure,
+  InspectRequest,
+  InspectSuccess,
+  ReadyzResponse,
+  WorkspaceError,
+} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
 
@@ -34,6 +47,21 @@ export interface WorkspaceClient {
    * - `err({kind: 'parse-error'})` on malformed response body
    */
   readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>
+  /**
+   * Report the state of an EXISTING checkout via POST /inspect. Never clones, fetches, or
+   * mutates the checkout — read-only.
+   *
+   * Returns:
+   * - `ok(observation)` on HTTP 200 with a validated `CheckoutObservation`.
+   * - `err({kind: 'inspect-error', code})` on a structured inspect failure (HTTP 404/409/500/504).
+   * - `err({kind: 'http-error', status})` on unexpected HTTP status.
+   * - `err({kind: 'timeout'})` on AbortSignal.timeout expiry.
+   * - `err({kind: 'network-error'})` on connection failure.
+   * - `err({kind: 'parse-error'})` on a malformed response body — including a status/body
+   *   contradiction, an unknown `kind`/`operationInProgress` value, an invalid SHA, or a
+   *   malformed timestamp. The wire response is never trusted at face value.
+   */
+  readonly inspect: (request: InspectRequest) => Promise<Result<CheckoutObservation, WorkspaceError>>
 }
 
 const DEFAULT_TIMEOUT_MS = 300_000 // 5 minutes
@@ -177,7 +205,64 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     return ok(parsed)
   }
 
-  return {clone, readyz}
+  async function inspect(request: InspectRequest): Promise<Result<CheckoutObservation, WorkspaceError>> {
+    // SECURITY: body is never logged (no secrets here, but keep the same discipline as clone()).
+    const body = JSON.stringify(request)
+
+    let response: Response
+    try {
+      response = await fetch(`${baseUrl}/inspect`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+    } catch (fetchError) {
+      if (fetchError instanceof Error && fetchError.name === 'TimeoutError') {
+        return err({kind: 'timeout'})
+      }
+      if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+        return err({kind: 'timeout'})
+      }
+      return err({kind: 'network-error'})
+    }
+
+    const httpStatus = response.status
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      if (!response.ok) {
+        return err({kind: 'http-error', status: httpStatus})
+      }
+      return err({kind: 'parse-error'})
+    }
+
+    if (!isInspectResponse(parsed)) {
+      if (!response.ok) {
+        return err({kind: 'http-error', status: httpStatus})
+      }
+      return err({kind: 'parse-error'})
+    }
+
+    // Status↔body coherence check: `ok: true` must arrive on HTTP 200; `ok: false` must arrive on
+    // a non-2xx status. A mismatch is untrustworthy wire data — fail closed as parse-error rather
+    // than act on either half of a contradictory response.
+    if (parsed.ok === true && httpStatus !== 200) {
+      return err({kind: 'parse-error'})
+    }
+    if (parsed.ok === false && response.ok) {
+      return err({kind: 'parse-error'})
+    }
+
+    if (parsed.ok === false) {
+      return err({kind: 'inspect-error', code: parsed.error})
+    }
+
+    return ok(parsed.observation)
+  }
+
+  return {clone, readyz, inspect}
 }
 
 // ---------------------------------------------------------------------------
@@ -228,4 +313,102 @@ const CLONE_ERROR_CODES = new Set<string>([
 
 function isCloneErrorCode(value: string): value is CloneErrorCode {
   return CLONE_ERROR_CODES.has(value)
+}
+
+// ---------------------------------------------------------------------------
+// /inspect response parsing — rejects status/body contradictions, unknown `kind`
+// values, invalid SHAs, and malformed timestamps rather than trusting the wire.
+// ---------------------------------------------------------------------------
+
+const SHA_RE = /^[0-9a-f]{40}$/
+
+function isValidSha(value: unknown): value is string {
+  return typeof value === 'string' && SHA_RE.test(value)
+}
+
+const CHECKOUT_OPERATIONS = new Set<string>(['none', 'merge', 'rebase', 'cherry-pick', 'revert', 'bisect'])
+
+function isCheckoutOperation(value: unknown): value is CheckoutOperation {
+  return typeof value === 'string' && CHECKOUT_OPERATIONS.has(value)
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0
+}
+
+function isCheckoutHead(value: unknown): value is CheckoutObservation['head'] {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (v.kind === 'attached') {
+    return typeof v.branch === 'string' && v.branch.length > 0 && isValidSha(v.sha)
+  }
+  if (v.kind === 'detached') {
+    return isValidSha(v.sha)
+  }
+  // Unknown kind — a missing branch field must never be interpreted as "detached".
+  return false
+}
+
+function isWorktreeState(value: unknown): value is CheckoutObservation['worktree'] {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (v.kind === 'clean') return true
+  if (v.kind === 'dirty') {
+    return (
+      isNonNegativeInteger(v.staged) &&
+      isNonNegativeInteger(v.unstaged) &&
+      isNonNegativeInteger(v.untracked) &&
+      isNonNegativeInteger(v.conflicted)
+    )
+  }
+  return false
+}
+
+/**
+ * Validates an ISO-8601 timestamp by round-tripping through `Date`: the string must parse AND
+ * `toISOString()` must reproduce it exactly. This rejects non-canonical-but-parseable forms
+ * (e.g. `2024-01-01`, a bare date with no time component) as malformed, matching what an injected
+ * clock's `toISOString()` output actually looks like on the wire.
+ */
+function isValidIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return false
+  return parsed.toISOString() === value
+}
+
+function isCheckoutObservation(value: unknown): value is CheckoutObservation {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  return (
+    isCheckoutHead(v.head) &&
+    isWorktreeState(v.worktree) &&
+    isCheckoutOperation(v.operationInProgress) &&
+    isValidIsoTimestamp(v.observedAt)
+  )
+}
+
+function isInspectResponse(value: unknown): value is InspectSuccess | InspectFailure {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (typeof v.ok !== 'boolean') return false
+  if (v.ok === true) {
+    return isCheckoutObservation(v.observation)
+  }
+  return typeof v.error === 'string' && isInspectErrorCode(v.error)
+}
+
+const INSPECT_ERROR_CODES = new Set<string>([
+  'invalid-owner',
+  'invalid-repo',
+  'malformed-body',
+  'body-too-large',
+  'no-checkout',
+  'checkout-substituted',
+  'inspection-failed',
+  'inspection-timeout',
+])
+
+function isInspectErrorCode(value: string): value is InspectErrorCode {
+  return INSPECT_ERROR_CODES.has(value)
 }

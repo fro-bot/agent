@@ -1,4 +1,4 @@
-import type {CloneErrorCode, CloneRequest} from './types.js'
+import type {CloneErrorCode, CloneRequest, InspectErrorCode} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
@@ -790,6 +790,377 @@ describe('createWorkspaceClient', () => {
 
       // #then — body parse failed on non-2xx → http-error (not parse-error)
       expect(result).toEqual(err({kind: 'http-error', status: 500}))
+      vi.unstubAllGlobals()
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// inspect tests
+// ---------------------------------------------------------------------------
+
+function makeInspectRequest(): {owner: string; repo: string} {
+  return {owner: 'testowner', repo: 'testrepo'}
+}
+
+describe('WorkspaceClient.inspect', () => {
+  const VALID_OBSERVATION = {
+    head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
+    worktree: {kind: 'clean'},
+    operationInProgress: 'none',
+    observedAt: '2026-01-01T00:00:00.000Z',
+  }
+
+  describe('happy path', () => {
+    it('returns ok(observation) on HTTP 200 with a valid attached-clean observation', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation: VALID_OBSERVATION})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(ok(VALID_OBSERVATION))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns ok(observation) for a detached-dirty observation', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {
+        head: {kind: 'detached', sha: 'b'.repeat(40)},
+        worktree: {kind: 'dirty', staged: 1, unstaged: 2, untracked: 3, conflicted: 4},
+        operationInProgress: 'rebase',
+        observedAt: '2026-02-02T12:30:00.000Z',
+      }
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(ok(observation))
+      vi.unstubAllGlobals()
+    })
+
+    it('pOSTs /inspect with owner/repo on the same base URL as /clone', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation: VALID_OBSERVATION})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://workspace:9100/inspect',
+        expect.objectContaining({method: 'POST', body: JSON.stringify(makeInspectRequest())}),
+      )
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('inspect-error codes', () => {
+    const errorCodes: InspectErrorCode[] = [
+      'invalid-owner',
+      'invalid-repo',
+      'malformed-body',
+      'body-too-large',
+      'no-checkout',
+      'checkout-substituted',
+      'inspection-failed',
+      'inspection-timeout',
+    ]
+
+    for (const code of errorCodes) {
+      it(`preserves inspect-error code: ${code}`, async () => {
+        // #given
+        const client = makeClient()
+        const fetchMock = mockFetch({ok: false, status: 404, json: async () => ({ok: false, error: code})})
+        vi.stubGlobal('fetch', fetchMock)
+
+        // #when
+        const result = await client.inspect(makeInspectRequest())
+
+        // #then
+        expect(result).toEqual(err({kind: 'inspect-error', code}))
+        vi.unstubAllGlobals()
+      })
+    }
+  })
+
+  describe('network / transport errors', () => {
+    it('returns network-error on fetch throw', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, throws: new Error('ECONNREFUSED')})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'network-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns timeout on AbortSignal.timeout expiry', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, throws: Object.assign(new Error('timeout'), {name: 'TimeoutError'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'timeout'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error with status on an unexpected non-2xx status with no parseable body', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 502})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 502}))
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('rejects wire data rather than trusting it', () => {
+    it('rejects a status/body contradiction: HTTP 200 with {ok:false}', async () => {
+      // #given — a not-ok body arriving on a 2xx status is untrustworthy, not a real success or a
+      // clean structured failure.
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: false, error: 'no-checkout'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects a status/body contradiction: HTTP 404 with {ok:true}', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({
+        ok: false,
+        status: 404,
+        json: async () => ({ok: true, observation: VALID_OBSERVATION}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects an unknown head.kind value', async () => {
+      // #given — a missing branch field must never be interpreted as "detached"; an unrecognized
+      // kind must be rejected outright, not coerced.
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, head: {kind: 'mystery', sha: 'a'.repeat(40)}}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects an attached head with a missing branch field', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, head: {kind: 'attached', sha: 'a'.repeat(40)}}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects an unknown worktree.kind value', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, worktree: {kind: 'filthy'}}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects a dirty worktree missing one of the four counts', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, worktree: {kind: 'dirty', staged: 1, unstaged: 0, untracked: 0}}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects an unknown operationInProgress value', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, operationInProgress: 'time-travel'}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects a SHA shorter than 40 hex characters', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, head: {kind: 'attached', branch: 'main', sha: 'abc123'}}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects a SHA with non-hex characters', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, head: {kind: 'attached', branch: 'main', sha: `g${'a'.repeat(39)}`}}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects an uppercase SHA', async () => {
+      // #given — git rev-parse always emits lowercase hex; uppercase is untrustworthy wire data.
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, head: {kind: 'attached', branch: 'main', sha: 'A'.repeat(40)}}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects a malformed timestamp (non-canonical, e.g. bare date)', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, observedAt: '2026-01-01'}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects an unparseable timestamp', async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, observedAt: 'not-a-date'}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects a response missing the observation field entirely', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects an unknown top-level inspect-error code', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 500, json: async () => ({ok: false, error: 'made-up-code'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 500}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns parse-error when response body has an unrelated shape', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: true, json: async () => ({unexpected: 'shape'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
       vi.unstubAllGlobals()
     })
   })
