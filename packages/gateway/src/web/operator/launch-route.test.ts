@@ -156,6 +156,15 @@ function makeLaunchWorkDeps(): RunMentionDeps {
     statusMode: 'live-status',
     ensureClone: vi.fn(async () => ({success: true as const, data: '/workspace/acme/widget'})),
     readyz: vi.fn(async () => ({success: true as const, data: {ready: true as const, opencode: 'ready' as const}})),
+    inspect: vi.fn(async () => ({
+      success: true as const,
+      data: {
+        head: {kind: 'attached' as const, branch: 'main', sha: 'a'.repeat(40)},
+        worktree: {kind: 'clean' as const},
+        operationInProgress: 'none' as const,
+        observedAt: '2026-01-01T00:00:00.000Z',
+      },
+    })),
     runIndex: {
       register: vi.fn(),
       lookup: vi.fn(async () => undefined),

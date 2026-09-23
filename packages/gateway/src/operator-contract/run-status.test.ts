@@ -399,6 +399,110 @@ describe('toOperatorRunStatus — unknown phase fallback (fail-closed)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// toOperatorRunStatus — checkoutProvenance projection
+// ---------------------------------------------------------------------------
+
+describe('toOperatorRunStatus — checkoutProvenance', () => {
+  const OBSERVED_RAW = {
+    kind: 'observed',
+    observation: {
+      head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
+      worktree: {kind: 'clean'},
+      operationInProgress: 'none',
+      observedAt: '2026-01-01T00:00:00.000Z',
+    },
+    remote: {kind: 'not-checked'},
+  }
+
+  const UNAVAILABLE_RAW = {kind: 'unavailable', remote: {kind: 'not-checked'}}
+
+  it("a successful run's status includes its observed provenance", () => {
+    // #given a COMPLETED run whose details carry an observed provenance
+    const runState = makeRunState({phase: 'COMPLETED', details: {checkoutProvenance: OBSERVED_RAW}})
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutProvenance).toEqual(OBSERVED_RAW)
+  })
+
+  it("a FAILED run's status includes its provenance too — not gated on phase like failureKind is", () => {
+    // #given — this is the case the whole task exists for: a failed run must still
+    // carry what it started from.
+    const runState = makeRunState({
+      phase: 'FAILED',
+      details: {checkoutProvenance: OBSERVED_RAW, failureKind: 'stream-ended'},
+    })
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then both are present — provenance is not suppressed by the failure
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutProvenance).toEqual(OBSERVED_RAW)
+    expect(result.failureKind).toBe('stream-ended')
+  })
+
+  it("'unavailable' provenance projects correctly", () => {
+    // #given
+    const runState = makeRunState({phase: 'FAILED', details: {checkoutProvenance: UNAVAILABLE_RAW}})
+
+    // #when
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutProvenance).toEqual({kind: 'unavailable', remote: {kind: 'not-checked'}})
+  })
+
+  it('a run with no stored provenance (pre-existing record) projects to the defined absent state and does not throw', () => {
+    // #given a RunState recorded before this field existed — details has no checkoutProvenance key
+    const runState = makeRunState({phase: 'COMPLETED', details: {}})
+
+    // #when / #then — does not throw
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #and — the field is simply absent (never present-but-undefined, never null)
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutProvenance).toBeUndefined()
+    expect(Object.prototype.hasOwnProperty.call(result, 'checkoutProvenance')).toBe(false)
+  })
+
+  it('malformed stored provenance is rejected, not passed through', () => {
+    // #given a corrupted/version-skewed stored value — missing the required `remote` field
+    const runState = makeRunState({
+      phase: 'COMPLETED',
+      details: {checkoutProvenance: {kind: 'observed', observation: OBSERVED_RAW.observation}},
+    })
+
+    // #when
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then — rejected to the same absent state as "no provenance recorded", not passed through raw
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutProvenance).toBeUndefined()
+  })
+
+  it("a redacted repo's run does not leak provenance (or anything else) — the whole record is omitted", () => {
+    // #given a run with real provenance whose repo is on the denylist
+    const runState = makeRunState({
+      entity_ref: 'secret-org/secret-repo#1',
+      details: {checkoutProvenance: OBSERVED_RAW},
+    })
+    const deniedKey = {databaseId: 999, nodeId: 'MDEwOlJlcG9zaXRvcnk5OTk='}
+
+    // #when projected with a predicate that always denies
+    const result = toOperatorRunStatus(runState, {...BASE_OPTS, repoKey: deniedKey, isRepoDenylisted: () => true})
+
+    // #then — the entire record (including provenance, which carries a SHA and branch
+    // name) is omitted, not returned with provenance stripped from an otherwise-populated object
+    expect(result).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // toOperatorFailureKind — internal→operator failure-kind mapping
 //
 // Structural note: toOperatorFailureKind(failureKind: unknown) takes only the single
@@ -415,6 +519,8 @@ describe('toOperatorFailureKind — allowlist mapping', () => {
     ['auth', 'workspace-unreachable'],
     ['session-error', 'session-error'],
     ['prompt-error', 'session-error'],
+    ['checkout-substituted', 'checkout-substituted'],
+    ['workspace-unavailable', 'workspace-unavailable'],
   ]
 
   for (const [internalKind, expected] of cases) {
@@ -485,6 +591,8 @@ describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCo
       'stream-ended',
       'missing-coordinator',
       'drain-timeout',
+      'checkout-substituted',
+      'workspace-unavailable',
     ] as const
 
     const validOperatorFailureKinds = new Set<OperatorFailureKind>([
@@ -493,6 +601,8 @@ describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCo
       'stream-ended',
       'workspace-unreachable',
       'session-error',
+      'checkout-substituted',
+      'workspace-unavailable',
       'unknown',
     ])
 
@@ -500,7 +610,7 @@ describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCo
       // #when mapped through the operator-safe gate
       const result = toOperatorFailureKind(kind)
 
-      // #then it resolves to one of the six closed OperatorFailureKind values
+      // #then it resolves to one of the eight closed OperatorFailureKind values
       // (including 'unknown' for kinds with no operator-meaningful mapping, e.g.
       // 'missing-coordinator')
       assert(result !== undefined, `expected ${kind} to map to a defined OperatorFailureKind`)

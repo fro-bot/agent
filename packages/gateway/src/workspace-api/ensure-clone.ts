@@ -14,11 +14,15 @@
  */
 
 import type {Result} from '@fro-bot/runtime'
-import type {AppClient} from '../github/app-client.js'
+import type {AppClient, AppNotInstalledError, AuthError, InsufficientPermissionsError} from '../github/app-client.js'
 import type {WorkspaceClient} from './client.js'
-import type {CloneErrorCode, WorkspaceError} from './types.js'
+import type {CloneErrorCode, CloneWorkspaceError} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
+import {
+  AppNotInstalledError as AppNotInstalledErrorClass,
+  InsufficientPermissionsError as InsufficientPermissionsErrorClass,
+} from '../github/app-client.js'
 import {workspaceRepoPath} from './client.js'
 
 // ---------------------------------------------------------------------------
@@ -26,10 +30,27 @@ import {workspaceRepoPath} from './client.js'
 // ---------------------------------------------------------------------------
 
 /**
+ * Closed classification for an `auth-failure`. Positive-evidence only: the two
+ * PERMANENT reasons (`not-installed`, `insufficient-permissions`) are set ONLY
+ * when the underlying error is provably that specific `AppClient` error class
+ * (`instanceof`, never a string match on `.message`/`.constructor.name`).
+ * Everything else — a network/5xx/rate-limit `AuthError` from installation
+ * discovery, a token-mint `AuthError` (the cached installation was evicted;
+ * the next call re-discovers), or a timeout — is transient and stays
+ * `'auth-error'`/`'timeout'`: the unclassified remainder defaults to transient,
+ * never to permanent, on the same asymmetry as `isStructuralCorruptionError`
+ * in `src/services/cache/sqlite-errors.ts` (a retry on a permanent failure
+ * costs a wasted retry; an escalation on a transient one sends someone to
+ * chase a blip).
+ */
+export type EnsureCloneAuthFailureReason = 'timeout' | 'not-installed' | 'insufficient-permissions' | 'auth-error'
+
+/**
  * Structured failure kinds returned by ensureWorkspaceClone.
  *
  * - `auth-failure`: GitHub App auth failed or timed out. `reason` distinguishes
- *   the two sub-cases for ops/automation; callers may ignore it for coarse replies.
+ *   sub-cases for ops/automation — see `EnsureCloneAuthFailureReason`; callers
+ *   may ignore it for coarse replies.
  * - `workspace-failure`: Clone failed. `workspaceKind` mirrors the underlying
  *   WorkspaceError kind for structured ops/automation use. Additional fields
  *   (`code`, `status`) are present when the underlying error carries them.
@@ -40,9 +61,29 @@ import {workspaceRepoPath} from './client.js'
  * Ops/automation MAY inspect `reason`, `workspaceKind`, `code`, and `status`.
  */
 export type EnsureCloneFailure =
-  | {readonly kind: 'auth-failure'; readonly reason?: 'auth-error' | 'timeout'}
+  | {readonly kind: 'auth-failure'; readonly reason?: EnsureCloneAuthFailureReason}
   | WorkspaceFailure
   | {readonly kind: 'unexpected-error'}
+
+/**
+ * Classify an `authForRepo` failure into an `EnsureCloneAuthFailureReason` on
+ * positive evidence only. `instanceof` against the exported `AppClient` error
+ * classes — never `.message` or `.constructor.name` string matching, which a
+ * refactor or a minifier could silently break.
+ */
+function classifyAuthFailure(
+  error: AppNotInstalledError | InsufficientPermissionsError | AuthError,
+): 'not-installed' | 'insufficient-permissions' | 'auth-error' {
+  if (error instanceof AppNotInstalledErrorClass) {
+    return 'not-installed'
+  }
+  if (error instanceof InsufficientPermissionsErrorClass) {
+    return 'insufficient-permissions'
+  }
+  // Unclassified AuthError: discovery network/5xx/rate-limit, or a token-mint
+  // failure. No positive evidence of permanence — defaults to transient.
+  return 'auth-error'
+}
 
 /**
  * workspace-failure sub-union — mirrors WorkspaceError kinds with structured detail.
@@ -82,11 +123,15 @@ export interface EnsureCloneDeps {
 // ---------------------------------------------------------------------------
 
 /**
- * Map a WorkspaceError to a WorkspaceFailure, preserving structured detail
+ * Map a CloneWorkspaceError to a WorkspaceFailure, preserving structured detail
  * (workspaceKind, code, status) for ops/automation while keeping the outer
  * `kind: 'workspace-failure'` coarse for Discord reply handlers.
+ *
+ * `clone()` returns `CloneWorkspaceError` — a narrower type than the shared
+ * `WorkspaceError` union that excludes `inspect-error` — so this switch has no
+ * unreachable branch to keep exhaustive.
  */
-function toWorkspaceFailure(error: WorkspaceError): WorkspaceFailure {
+function toWorkspaceFailure(error: CloneWorkspaceError): WorkspaceFailure {
   switch (error.kind) {
     case 'clone-error':
       return {kind: 'workspace-failure', workspaceKind: 'clone-error', code: error.code}
@@ -162,12 +207,14 @@ export async function ensureWorkspaceClone(deps: EnsureCloneDeps): Promise<Resul
       clearTimeout(timeoutHandle)
     }
     if (authResult.success === false) {
+      const reason = classifyAuthFailure(authResult.error)
       logger.warn('ensure-clone: app auth failed', {
         owner,
         repo,
         errorKind: authResult.error.constructor.name,
+        reason,
       })
-      return err({kind: 'auth-failure', reason: 'auth-error'})
+      return err({kind: 'auth-failure', reason})
     }
 
     // SECURITY: token is never logged.

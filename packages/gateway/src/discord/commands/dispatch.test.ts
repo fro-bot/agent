@@ -67,7 +67,7 @@ function makeDeps(
       getRepoIdentity: vi.fn(),
       invalidateCache: vi.fn(),
     },
-    workspaceClient: {clone: vi.fn(), readyz: vi.fn()},
+    workspaceClient: {clone: vi.fn(), readyz: vi.fn(), inspect: vi.fn()},
     installUrl: INSTALL_URL,
     logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     queue: makeQueue(),

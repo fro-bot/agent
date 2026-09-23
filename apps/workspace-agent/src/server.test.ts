@@ -1,5 +1,6 @@
 import type {CloneHandlerResult} from './clone.js'
-import type {CloneExecutorFn} from './server.js'
+import type {InspectHandlerResult} from './inspect.js'
+import type {CloneExecutorFn, InspectExecutorFn} from './server.js'
 
 import {describe, expect, it, vi} from 'vitest'
 import {createApp} from './server.js'
@@ -8,6 +9,27 @@ const VALID_TOKEN = `ghs_${'a'.repeat(36)}`
 
 function makeCloneExecutor(result: CloneHandlerResult): CloneExecutorFn & ReturnType<typeof vi.fn> {
   return vi.fn().mockResolvedValue(result) as CloneExecutorFn & ReturnType<typeof vi.fn>
+}
+
+function makeInspectExecutor(result: InspectHandlerResult): InspectExecutorFn & ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(result) as InspectExecutorFn & ReturnType<typeof vi.fn>
+}
+
+async function postInspect(
+  app: ReturnType<typeof createApp>,
+  body: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<Response> {
+  const bodyStr = JSON.stringify(body)
+  return app.request('/inspect', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': String(new TextEncoder().encode(bodyStr).length),
+      ...extraHeaders,
+    },
+    body: bodyStr,
+  })
 }
 
 async function postClone(
@@ -654,5 +676,175 @@ describe('GET /readyz — proxy-listening gate', () => {
     expect(resAfter.status).toBe(503)
     const body = await resAfter.json()
     expect(body).toEqual({ready: false, opencode: 'ready'})
+  })
+})
+
+describe('POST /inspect — validation', () => {
+  it('returns 413 body-too-large when Content-Length header is missing', async () => {
+    // #given
+    const app = createApp()
+
+    // #when
+    const res = await app.request('/inspect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({owner: 'fro-bot', repo: 'agent'}),
+    })
+
+    // #then
+    expect(res.status).toBe(413)
+  })
+
+  it('returns 400 malformed-body for non-JSON body', async () => {
+    // #given
+    const app = createApp()
+    const badBody = 'not json{{{'
+
+    // #when
+    const res = await app.request('/inspect', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(new TextEncoder().encode(badBody).length),
+      },
+      body: badBody,
+    })
+
+    // #then
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'malformed-body'})
+  })
+
+  it('returns 400 invalid-owner for traversal attempt', async () => {
+    // #given
+    const app = createApp()
+
+    // #when
+    const res = await postInspect(app, {owner: '../etc', repo: 'passwd'})
+
+    // #then
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'invalid-owner'})
+  })
+
+  it('returns 400 invalid-repo for repo with slash', async () => {
+    // #given
+    const app = createApp()
+
+    // #when
+    const res = await postInspect(app, {owner: 'fro-bot', repo: 'foo/bar'})
+
+    // #then
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'invalid-repo'})
+  })
+
+  it('does not invoke the inspect executor when validation fails', async () => {
+    // #given
+    const inspectExecutor = vi.fn()
+    const app = createApp({inspectExecutor})
+
+    // #when
+    await postInspect(app, {owner: '../etc', repo: 'passwd'})
+
+    // #then
+    expect(inspectExecutor).not.toHaveBeenCalled()
+  })
+
+  it('does not require or accept a token field', async () => {
+    // #given
+    const inspectExecutor = makeInspectExecutor({
+      response: {
+        ok: true,
+        observation: {
+          head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
+          worktree: {kind: 'clean'},
+          operationInProgress: 'none',
+          observedAt: '2026-01-01T00:00:00.000Z',
+        },
+      },
+      statusCode: 200,
+    })
+    const app = createApp({inspectExecutor})
+
+    // #when
+    const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
+
+    // #then
+    expect(res.status).toBe(200)
+    expect(inspectExecutor).toHaveBeenCalledWith({owner: 'fro-bot', repo: 'agent'})
+  })
+})
+
+describe('POST /inspect — response passthrough', () => {
+  it('returns 200 with the observation on success', async () => {
+    // #given
+    const observation = {
+      head: {kind: 'detached' as const, sha: 'b'.repeat(40)},
+      worktree: {kind: 'dirty' as const, staged: 1, unstaged: 2, untracked: 3, conflicted: 0},
+      operationInProgress: 'rebase' as const,
+      observedAt: '2026-01-01T00:00:00.000Z',
+    }
+    const inspectExecutor = makeInspectExecutor({response: {ok: true, observation}, statusCode: 200})
+    const app = createApp({inspectExecutor})
+
+    // #when
+    const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
+
+    // #then
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ok: true, observation})
+  })
+
+  it('returns 404 no-checkout when the executor reports no checkout', async () => {
+    // #given
+    const inspectExecutor = makeInspectExecutor({response: {ok: false, error: 'no-checkout'}, statusCode: 404})
+    const app = createApp({inspectExecutor})
+
+    // #when
+    const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
+
+    // #then
+    expect(res.status).toBe(404)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'no-checkout'})
+  })
+
+  it('returns 409 checkout-substituted when the executor detects substitution', async () => {
+    // #given
+    const inspectExecutor = makeInspectExecutor({
+      response: {ok: false, error: 'checkout-substituted'},
+      statusCode: 409,
+    })
+    const app = createApp({inspectExecutor})
+
+    // #when
+    const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
+
+    // #then
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'checkout-substituted'})
+  })
+
+  it('returns 504 inspection-timeout when the executor times out', async () => {
+    // #given
+    const inspectExecutor = makeInspectExecutor({
+      response: {ok: false, error: 'inspection-timeout'},
+      statusCode: 504,
+    })
+    const app = createApp({inspectExecutor})
+
+    // #when
+    const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
+
+    // #then
+    expect(res.status).toBe(504)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'inspection-timeout'})
   })
 })

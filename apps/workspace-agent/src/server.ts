@@ -6,10 +6,19 @@
  */
 
 import type {CloneHandlerDeps, CloneHandlerResult} from './clone.js'
-import type {CloneFailure, CloneRequest, HealthzResponse, ReadyzResponse} from './types.js'
+import type {InspectHandlerDeps, InspectHandlerResult} from './inspect.js'
+import type {
+  CloneFailure,
+  CloneRequest,
+  HealthzResponse,
+  InspectFailure,
+  InspectRequest,
+  ReadyzResponse,
+} from './types.js'
 
 import {Hono} from 'hono'
 import {executeClone, scrubCredentials} from './clone.js'
+import {inspectCheckout} from './inspect.js'
 import {sanitizeOwner, sanitizeRepo, validateTokenShape} from './sanitize.js'
 
 /** Maximum allowed request body size in bytes. */
@@ -17,6 +26,9 @@ const MAX_BODY_BYTES = 4096
 
 /** Simplified clone executor signature for dependency injection. */
 export type CloneExecutorFn = (request: CloneRequest, deps?: CloneHandlerDeps) => Promise<CloneHandlerResult>
+
+/** Simplified inspect executor signature for dependency injection. */
+export type InspectExecutorFn = (request: InspectRequest, deps?: InspectHandlerDeps) => Promise<InspectHandlerResult>
 
 /**
  * OpenCode readiness state shared between the lifecycle and the server.
@@ -45,6 +57,8 @@ export interface ProxyListeningRef {
 export interface ServerDeps {
   /** Injected clone executor for testability. */
   readonly cloneExecutor?: CloneExecutorFn
+  /** Injected inspect executor for testability. */
+  readonly inspectExecutor?: InspectExecutorFn
   /** OpenCode server readiness reference. When absent, opencode field is omitted from /healthz. */
   readonly opencodeStatus?: OpencodeStatusRef
   /**
@@ -61,7 +75,7 @@ export interface ServerDeps {
  * @param deps - Optional dependency overrides for testing.
  */
 export function createApp(deps: ServerDeps = {}): Hono {
-  const {cloneExecutor = executeClone, opencodeStatus, proxyListening} = deps
+  const {cloneExecutor = executeClone, inspectExecutor = inspectCheckout, opencodeStatus, proxyListening} = deps
   const app = new Hono()
 
   // GET /healthz — liveness probe (always 200; clone-only signal)
@@ -157,6 +171,54 @@ export function createApp(deps: ServerDeps = {}): Hono {
     // Defense-in-depth: scrub any credential patterns from the response before sending.
     const scrubbed = JSON.parse(scrubCredentials(JSON.stringify(response))) as typeof response
     return c.json(scrubbed, statusCode)
+  })
+
+  // POST /inspect — read-only observation of an EXISTING checkout (branch, SHA, dirty state,
+  // in-progress operation). Never clones, fetches, or mutates the checkout. Named distinctly from
+  // `/clone` so its read-only contract is unambiguous at the route level.
+  app.post('/inspect', async c => {
+    const contentLengthHeader = c.req.header('content-length')
+    if (contentLengthHeader === undefined || contentLengthHeader === null) {
+      const err: InspectFailure = {ok: false, error: 'body-too-large'}
+      return c.json(err, 413)
+    }
+    const contentLength = Number.parseInt(contentLengthHeader, 10)
+    if (Number.isNaN(contentLength) || contentLength > MAX_BODY_BYTES) {
+      const err: InspectFailure = {ok: false, error: 'body-too-large'}
+      return c.json(err, 413)
+    }
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      const err: InspectFailure = {ok: false, error: 'malformed-body'}
+      return c.json(err, 400)
+    }
+
+    if (typeof body !== 'object' || body === null) {
+      const err: InspectFailure = {ok: false, error: 'malformed-body'}
+      return c.json(err, 400)
+    }
+
+    const raw = body as Record<string, unknown>
+
+    const owner = sanitizeOwner(raw.owner)
+    if (owner === null) {
+      const err: InspectFailure = {ok: false, error: 'invalid-owner'}
+      return c.json(err, 400)
+    }
+
+    const repo = sanitizeRepo(raw.repo)
+    if (repo === null) {
+      const err: InspectFailure = {ok: false, error: 'invalid-repo'}
+      return c.json(err, 400)
+    }
+
+    const request: InspectRequest = {owner, repo}
+
+    const {response, statusCode} = await inspectExecutor(request)
+    return c.json(response, statusCode)
   })
 
   // 404 for unknown routes

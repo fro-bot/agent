@@ -26,9 +26,11 @@ export interface PushPayload {
 /**
  * Closed allowlist of failure labels safe to surface in a push payload.
  *
- * `satisfies readonly OperatorFailureKind[]` makes this exhaustive over the
- * OperatorFailureKind union at compile time — adding a new OperatorFailureKind
- * member in run-status.ts without adding an entry here is a compile error.
+ * `satisfies readonly OperatorFailureKind[]` only checks that each entry is a
+ * valid OperatorFailureKind. It does NOT require every kind to be listed:
+ * adding a kind in run-status.ts compiles without an entry here, and that kind
+ * then falls back to generic push copy (see `checkout-substituted`,
+ * `workspace-unavailable`).
  */
 const KNOWN_SAFE_FAILURE_LABELS_LIST = [
   'inactivity-timeout',
