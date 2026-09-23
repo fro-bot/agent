@@ -522,13 +522,23 @@ describe('recoverStaleRuns', () => {
   })
 
   describe('stale PENDING and ACKNOWLEDGED recovery', () => {
-    it('transitions a stale PENDING run to FAILED without attempting lock release', async () => {
-      // #given — a stale PENDING run (no lock held by PENDING runs)
+    it('transitions a stale PENDING run to FAILED and skips lock release when no lock record exists', async () => {
+      // #given — a stale PENDING run; no lock object exists for this repo
       const stalePending = makeStaleRun({phase: 'PENDING'})
       mockFindStaleRuns.mockResolvedValue({success: true, data: [stalePending]})
 
+      const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
+        if (key === RUN_KEY) return {success: true, data: {data: '{}', etag: RUN_ETAG}}
+        // No lock object present — PENDING crashed before lock acquisition.
+        return {success: false, error: new Error('not found')}
+      })
+      const coordConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {...makeCoordinationConfig().storeAdapter, getObject: getObjectFn},
+      }
+
       const logger = makeLogger()
-      const deps = makeDeps({logger})
+      const deps = makeDeps({logger, coordinationConfig: coordConfig})
 
       // #when
       await recoverStaleRuns(deps)
@@ -543,22 +553,25 @@ describe('recoverStaleRuns', () => {
         RUN_ETAG,
         expect.anything(),
       )
-      // PENDING runs do not hold a lock — lock release must NOT be attempted
+      // No lock record to release — lock release must NOT be attempted
       expect(mockReleaseLock).not.toHaveBeenCalled()
     })
 
-    it('transitions a stale ACKNOWLEDGED run to FAILED without attempting lock release', async () => {
-      // #given — a stale ACKNOWLEDGED run (no lock held by ACKNOWLEDGED runs)
+    it('releases the lock for a stale ACKNOWLEDGED run whose run_id still owns it', async () => {
+      // #given — a stale ACKNOWLEDGED run whose crash left the lock held under its own run_id.
+      // This is the finding-1 regression case: the lock is now acquired BEFORE the
+      // ACKNOWLEDGED transition and held across ensureClone, so an ACKNOWLEDGED run can
+      // legitimately hold it. Fails against the old phase-gated release (EXECUTING only).
       const staleAcknowledged = makeStaleRun({phase: 'ACKNOWLEDGED'})
       mockFindStaleRuns.mockResolvedValue({success: true, data: [staleAcknowledged]})
 
       const logger = makeLogger()
-      const deps = makeDeps({logger})
+      const deps = makeDeps({logger}) // default coordination config: lock owned by RUN_ID
 
       // #when
       await recoverStaleRuns(deps)
 
-      // #then — run transitioned to FAILED
+      // #then — run transitioned to FAILED and its lock released
       expect(mockTransitionRun).toHaveBeenCalledWith(
         expect.anything(),
         'discord-gateway',
@@ -568,7 +581,41 @@ describe('recoverStaleRuns', () => {
         RUN_ETAG,
         expect.anything(),
       )
-      // ACKNOWLEDGED runs do not hold a lock — lock release must NOT be attempted
+      expect(mockReleaseLock).toHaveBeenCalledWith(expect.anything(), REPO_SLUG, LOCK_ETAG, expect.anything())
+    })
+
+    it('does NOT release the lock for a stale ACKNOWLEDGED run whose lock was since taken by a different run', async () => {
+      // #given — the lock record now names a different run_id (a newer run re-acquired it
+      // after this stale run's lease expired). Release must be skipped.
+      const staleAcknowledged = makeStaleRun({phase: 'ACKNOWLEDGED'})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleAcknowledged]})
+
+      const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
+        if (key === RUN_KEY) return {success: true, data: {data: '{}', etag: RUN_ETAG}}
+        if (key === LOCK_KEY)
+          return {success: true, data: {data: JSON.stringify({run_id: 'run-newer'}), etag: LOCK_ETAG}}
+        return {success: false, error: new Error('not found')}
+      })
+      const coordConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {...makeCoordinationConfig().storeAdapter, getObject: getObjectFn},
+      }
+
+      const deps = makeDeps({coordinationConfig: coordConfig})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — run transitioned to FAILED, but the lock (now owned by a different run) is untouched
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
       expect(mockReleaseLock).not.toHaveBeenCalled()
     })
 
@@ -616,7 +663,8 @@ describe('recoverStaleRuns', () => {
 
       // #then — all three runs transitioned to FAILED
       expect(mockTransitionRun).toHaveBeenCalledTimes(3)
-      // Only the EXECUTING run's lock is released (it owns the lock)
+      // Only the EXECUTING run's lock is released — it owns the lock; PENDING and
+      // ACKNOWLEDGED runs here do NOT own it (the lock record names 'run-exec').
       expect(mockReleaseLock).toHaveBeenCalledTimes(1)
     })
 

@@ -519,6 +519,8 @@ describe('toOperatorFailureKind — allowlist mapping', () => {
     ['auth', 'workspace-unreachable'],
     ['session-error', 'session-error'],
     ['prompt-error', 'session-error'],
+    ['checkout-substituted', 'checkout-substituted'],
+    ['workspace-unavailable', 'workspace-unavailable'],
   ]
 
   for (const [internalKind, expected] of cases) {
@@ -589,6 +591,8 @@ describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCo
       'stream-ended',
       'missing-coordinator',
       'drain-timeout',
+      'checkout-substituted',
+      'workspace-unavailable',
     ] as const
 
     const validOperatorFailureKinds = new Set<OperatorFailureKind>([
@@ -597,6 +601,8 @@ describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCo
       'stream-ended',
       'workspace-unreachable',
       'session-error',
+      'checkout-substituted',
+      'workspace-unavailable',
       'unknown',
     ])
 
@@ -604,7 +610,7 @@ describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCo
       // #when mapped through the operator-safe gate
       const result = toOperatorFailureKind(kind)
 
-      // #then it resolves to one of the six closed OperatorFailureKind values
+      // #then it resolves to one of the eight closed OperatorFailureKind values
       // (including 'unknown' for kinds with no operator-meaningful mapping, e.g.
       // 'missing-coordinator')
       assert(result !== undefined, `expected ${kind} to map to a defined OperatorFailureKind`)

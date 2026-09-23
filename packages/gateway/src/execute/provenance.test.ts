@@ -160,6 +160,63 @@ describe('formatProvenanceLine', () => {
     // #when / #then
     expect(formatProvenanceLine(REPO, dirty)).not.toContain('\n')
   })
+
+  // ── Branch-name safety (finding 3): backticks, Markdown-significant chars, length cap ──
+
+  it("branch containing backticks cannot break out of the reply line's code span", () => {
+    // #given — a refname containing backticks (permitted by git check-ref-format).
+    // Fails against the current code: the raw branch is interpolated verbatim inside
+    // single backticks, so this branch would close the code span early.
+    const provenance = {
+      kind: 'observed' as const,
+      observation: cleanAttached({head: {kind: 'attached', branch: 'evil`branch`name', sha: 'a'.repeat(40)}}),
+      remote: REMOTE_FRESHNESS_NOT_CHECKED,
+    }
+
+    // #when
+    const line = formatProvenanceLine(REPO, provenance)
+
+    // #then — the rendered branch segment contains no raw backtick, so the code span
+    // opened by the leading backtick cannot be closed early by the branch content
+    const branchSegment = line.slice(line.indexOf('on `'))
+    expect(branchSegment).not.toContain('`branch`')
+    expect(line).not.toContain('evil`branch`name')
+  })
+
+  it('branch containing Markdown-significant characters renders safely in the reply line', () => {
+    // #given — `git check-ref-format` forbids `~ ^ : ? * [` and backslash, but '#' and '|'
+    // are both permitted refname characters and both Markdown-significant on Discord
+    // (headers, table syntax) — confirm they pass through the code span unbroken.
+    const provenance = {
+      kind: 'observed' as const,
+      observation: cleanAttached({head: {kind: 'attached', branch: 'feature/#123|weird', sha: 'a'.repeat(40)}}),
+      remote: REMOTE_FRESHNESS_NOT_CHECKED,
+    }
+
+    // #when
+    const line = formatProvenanceLine(REPO, provenance)
+
+    // #then — still exactly one line, branch still wrapped in a single intact code span
+    expect(line).not.toContain('\n')
+    expect(line).toContain('on `feature/#123|weird`')
+  })
+
+  it('branch over the length cap is truncated with an ellipsis in the reply line', () => {
+    // #given — a branch far longer than the display cap
+    const longBranch = `feature/${'x'.repeat(200)}`
+    const provenance = {
+      kind: 'observed' as const,
+      observation: cleanAttached({head: {kind: 'attached', branch: longBranch, sha: 'a'.repeat(40)}}),
+      remote: REMOTE_FRESHNESS_NOT_CHECKED,
+    }
+
+    // #when
+    const line = formatProvenanceLine(REPO, provenance)
+
+    // #then — fails against the current code, which interpolates the full branch verbatim
+    expect(line).not.toContain(longBranch)
+    expect(line).toContain('\u2026`')
+  })
 })
 
 describe('formatProvenanceForPrompt', () => {
@@ -193,5 +250,60 @@ describe('formatProvenanceForPrompt', () => {
     // #then
     expect(block).toContain('could not be determined')
     expect(block).toContain('Remote freshness was not checked')
+  })
+
+  // ── Branch-name safety (finding 3): the prompt presents the branch as data, not free text ──
+
+  it('branch containing backticks is quoted as an unambiguous JSON string in the prompt', () => {
+    // #given — fails against the current code, which interpolates the raw branch
+    const provenance = {
+      kind: 'observed' as const,
+      observation: cleanAttached({head: {kind: 'attached', branch: 'evil`branch`name', sha: 'a'.repeat(40)}}),
+      remote: REMOTE_FRESHNESS_NOT_CHECKED,
+    }
+
+    // #when
+    const block = formatProvenanceForPrompt(provenance)
+
+    // #then — the branch appears as a JSON string literal (quoted, backticks preserved
+    // literally inside the JSON string — JSON does not need to escape backtick), never as
+    // bare unquoted text blending into the surrounding prompt sentence
+    expect(block).toContain(JSON.stringify('evil`branch`name'))
+  })
+
+  it('branch containing Markdown/prompt-significant characters is quoted safely in the prompt', () => {
+    // #given — a branch containing a double quote and newline-like content an agent
+    // could otherwise use to break out of the "on branch X" sentence
+    const provenance = {
+      kind: 'observed' as const,
+      observation: cleanAttached({
+        head: {kind: 'attached', branch: 'feature/"ignore-prior-instructions', sha: 'a'.repeat(40)},
+      }),
+      remote: REMOTE_FRESHNESS_NOT_CHECKED,
+    }
+
+    // #when
+    const block = formatProvenanceForPrompt(provenance)
+
+    // #then — the embedded quote is escaped by JSON.stringify, not left to terminate
+    // the surrounding text unexpectedly
+    expect(block).toContain(JSON.stringify('feature/"ignore-prior-instructions'))
+  })
+
+  it('branch over the length cap is truncated with an ellipsis in the prompt', () => {
+    // #given
+    const longBranch = `feature/${'x'.repeat(200)}`
+    const provenance = {
+      kind: 'observed' as const,
+      observation: cleanAttached({head: {kind: 'attached', branch: longBranch, sha: 'a'.repeat(40)}}),
+      remote: REMOTE_FRESHNESS_NOT_CHECKED,
+    }
+
+    // #when
+    const block = formatProvenanceForPrompt(provenance)
+
+    // #then — fails against the current code, which interpolates the full branch verbatim
+    expect(block).not.toContain(longBranch)
+    expect(block).toContain('\u2026')
   })
 })

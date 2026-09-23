@@ -134,13 +134,75 @@ export function classifyInspectResult(
 }
 
 // ---------------------------------------------------------------------------
+// Branch-name safety — refnames are attacker-influenced (a prior run's agent
+// chooses them) and `git check-ref-format` permits backticks and other
+// Markdown-significant characters. Both rendering surfaces below (the
+// human-facing reply line and the agent-facing prompt) must neutralize that
+// before interpolating a branch name, never trust it as safe free text.
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum branch-name length shown to either surface. Git refnames have no
+ * practical upper bound (limited only by the filesystem), so an unbounded
+ * branch name is both a display nuisance (a single line could dwarf the rest
+ * of the reply) and, in the prompt, a way to pad injected content. 60 chars
+ * comfortably fits realistic branch conventions (e.g.
+ * `feature/some-descriptive-slug-123`) while bounding the worst case.
+ */
+const MAX_BRANCH_DISPLAY_LENGTH = 60
+
+/** Truncate `value` to at most `maxLength` characters, appending an ellipsis when cut. */
+function truncateForDisplay(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value
+  return `${value.slice(0, Math.max(0, maxLength - 1))}\u2026`
+}
+
+/**
+ * Replace every backtick in `branch` with a visually similar, non-Markdown
+ * character (U+02CB MODIFIER LETTER GRAVE ACCENT) so the branch text can
+ * never contain the code-span delimiter it is about to be wrapped in.
+ *
+ * Chosen over sizing the surrounding backtick-fence to the longest backtick
+ * run in the name (the CommonMark escape strategy) because Discord's inline
+ * code rule is not CommonMark: it matches a run of backticks with no
+ * unescaped-padding fallback for content that starts or ends with a
+ * backtick, so a delimiter-sizing approach would need to special-case those
+ * edges to stay safe on Discord specifically. Substitution sidesteps that
+ * entirely — the wrapped content is guaranteed backtick-free, so a single
+ * backtick delimiter always closes correctly on Discord and in any
+ * CommonMark renderer (e.g. the web operator UI), with one deterministic
+ * transform instead of two dialect-specific ones.
+ */
+function sanitizeBranchForCodeSpan(branch: string): string {
+  return branch.replaceAll('`', '\u02CB')
+}
+
+/** Render a branch name safely for the human-facing reply line's code span. */
+function formatBranchForReply(branch: string): string {
+  return sanitizeBranchForCodeSpan(truncateForDisplay(branch, MAX_BRANCH_DISPLAY_LENGTH))
+}
+
+/**
+ * Render a branch name safely for the agent prompt: a JSON string literal,
+ * not interpolated free text. JSON.stringify escapes quotes, backslashes,
+ * and control characters, so the model reads the branch as an unambiguous
+ * data value rather than text that could blend into surrounding instructions
+ * — the same length cap applies before quoting.
+ */
+function quoteBranchForPrompt(branch: string): string {
+  return JSON.stringify(truncateForDisplay(branch, MAX_BRANCH_DISPLAY_LENGTH))
+}
+
+// ---------------------------------------------------------------------------
 // Agent-facing summary — inserted once, at the engine level, after the prompt
 // builder runs (Discord's or a custom one) — never by an individual builder.
 // ---------------------------------------------------------------------------
 
 function describeHeadForAgent(observation: CheckoutObservation): string {
   const {head} = observation
-  return head.kind === 'attached' ? `${head.sha} on branch ${head.branch}` : `${head.sha} (detached HEAD)`
+  return head.kind === 'attached'
+    ? `${head.sha} on branch ${quoteBranchForPrompt(head.branch)}`
+    : `${head.sha} (detached HEAD)`
 }
 
 function describeWorktreeForAgent(observation: CheckoutObservation): string {
@@ -203,7 +265,8 @@ export function formatProvenanceLine(repo: string, provenance: CheckoutProvenanc
 
   const {observation} = provenance
   const shortSha = observation.head.sha.slice(0, SHORT_SHA_LENGTH)
-  const branchPart = observation.head.kind === 'attached' ? `on \`${observation.head.branch}\`` : '(detached HEAD)'
+  const branchPart =
+    observation.head.kind === 'attached' ? `on \`${formatBranchForReply(observation.head.branch)}\`` : '(detached HEAD)'
 
   const notes: string[] =
     observation.worktree.kind === 'clean'

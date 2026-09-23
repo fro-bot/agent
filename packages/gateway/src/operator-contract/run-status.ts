@@ -80,6 +80,21 @@ export interface OperatorRunStatus {
    * about the CURRENT tree — an agent that edits files or switches branches
    * mid-run changes it; this describes the starting point only.
    */
+  /**
+   * What this run started from (the checked-out commit/branch, worktree
+   * cleanliness, any in-progress operation). Present ONLY on runs that reached
+   * EXECUTING — i.e. inspection ran and the run actually started. A run that
+   * fails before EXECUTING (e.g. `checkout-substituted`, `workspace-unavailable`)
+   * has no checkout provenance to report; its reason is carried in `failureKind`
+   * instead, never persisted here. A substituted checkout has no trustworthy
+   * provenance to record, and a failed clone has no checkout at all.
+   *
+   * Absent (`undefined`) both for a run that never reached EXECUTING and for a
+   * run recorded before this field existed, or if the stored value is malformed
+   * — all collapse to the same "no provenance recorded" state. Never a claim
+   * about the CURRENT tree — an agent that edits files or switches branches
+   * mid-run changes it; this describes the starting point only.
+   */
   readonly checkoutProvenance?: OperatorCheckoutProvenance
 }
 
@@ -108,9 +123,20 @@ export const PHASE_TO_WEB_STATUS: Record<RunPhase, OperatorWebStatus> = {
  * A closed allowlist derived from RunCoreErrorKind (execute/run-core.ts) — the internal
  * error-kind vocabulary. 'unknown' is the fallback for any internal kind with no mapping
  * entry (defense-in-depth: unmapped/future/unrecognized kinds never leak past this gate).
+ *
+ * This union may gain values over time as new RunCoreErrorKind cases get their own
+ * operator-facing bucket. Consumers that switch over it must handle unrecognized/future
+ * values gracefully (e.g. a default/fallback branch) rather than assuming the set is fixed.
  */
 export type OperatorFailureKind =
-  'inactivity-timeout' | 'max-duration-timeout' | 'stream-ended' | 'workspace-unreachable' | 'session-error' | 'unknown'
+  | 'inactivity-timeout'
+  | 'max-duration-timeout'
+  | 'stream-ended'
+  | 'workspace-unreachable'
+  | 'session-error'
+  | 'checkout-substituted'
+  | 'workspace-unavailable'
+  | 'unknown'
 
 /**
  * Closed allowlist mapping RunCoreErrorKind (internal) → OperatorFailureKind (operator-safe).
@@ -137,12 +163,12 @@ export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND = {
   // bounded by the same wall-clock budget, so this is operator-facing exactly
   // the same deadline-expiry outcome as 'timeout', not a distinct concept.
   'drain-timeout': 'max-duration-timeout',
-  // Neither has a dedicated operator-facing bucket yet — both surface as 'unknown'
-  // rather than being folded into 'workspace-unreachable', which would misrepresent
-  // a correctness failure (checkout-substituted) or a non-retriable one
-  // (workspace-unavailable) as a transient reachability problem.
-  'checkout-substituted': undefined,
-  'workspace-unavailable': undefined,
+  // Each gets its own dedicated operator-facing bucket rather than being folded
+  // into 'workspace-unreachable', which would misrepresent a correctness failure
+  // (checkout-substituted) or a non-retriable one (workspace-unavailable) as a
+  // transient reachability problem.
+  'checkout-substituted': 'checkout-substituted',
+  'workspace-unavailable': 'workspace-unavailable',
 } satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>
 
 /**
