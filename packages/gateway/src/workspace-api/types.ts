@@ -54,6 +54,62 @@ export type CloneErrorCode =
   | 'head-resolution-failed'
   | 'overloaded'
 
+/** POST /inspect request body. */
+export interface InspectRequest {
+  readonly owner: string
+  readonly repo: string
+}
+
+/** Observed HEAD state of a checkout — attached to a branch, or detached. */
+export type CheckoutHead =
+  | {readonly kind: 'attached'; readonly branch: string; readonly sha: string}
+  | {readonly kind: 'detached'; readonly sha: string}
+
+/** Observed worktree cleanliness. `dirty` always carries all four counts together. */
+export type WorktreeState =
+  | {readonly kind: 'clean'}
+  | {
+      readonly kind: 'dirty'
+      readonly staged: number
+      readonly unstaged: number
+      readonly untracked: number
+      readonly conflicted: number
+    }
+
+/** In-progress git operation detected from state files in the git directory. */
+export type CheckoutOperation = 'none' | 'merge' | 'rebase' | 'am' | 'cherry-pick' | 'revert' | 'bisect'
+
+/** A single point-in-time observation of an existing checkout. Never mutates the checkout. */
+export interface CheckoutObservation {
+  readonly head: CheckoutHead
+  readonly worktree: WorktreeState
+  readonly operationInProgress: CheckoutOperation
+  /** ISO-8601 timestamp, from an injected clock. */
+  readonly observedAt: string
+}
+
+/** POST /inspect error response. */
+export interface InspectFailure {
+  readonly ok: false
+  readonly error: InspectErrorCode
+}
+
+/** POST /inspect success response. */
+export interface InspectSuccess {
+  readonly ok: true
+  readonly observation: CheckoutObservation
+}
+
+export type InspectErrorCode =
+  | 'invalid-owner'
+  | 'invalid-repo'
+  | 'malformed-body'
+  | 'body-too-large'
+  | 'no-checkout'
+  | 'checkout-substituted'
+  | 'inspection-failed'
+  | 'inspection-timeout'
+
 /**
  * GET /readyz success response (HTTP 200).
  * Narrows the flat `ReadyzResponse` emitted by `apps/workspace-agent/src/server.ts`.
@@ -78,9 +134,34 @@ export type ReadyzResponse = ReadyzReady | ReadyzNotReady
 /**
  * Client-side error discriminated union for workspace-api calls.
  * These are the errors the gateway's workspace client can return.
+ *
+ * This is the union of everything ANY workspace-api call can produce — kept for
+ * callers (e.g. `readyz()`, and existing consumers outside this module) that
+ * genuinely need the wider shape. `clone()` and `inspect()` return the narrower
+ * `CloneWorkspaceError`/`InspectWorkspaceError` below instead, since each can only
+ * ever produce its own structured-error kind, never the other's.
  */
 export type WorkspaceError =
   | {readonly kind: 'clone-error'; readonly code: CloneErrorCode}
+  | {readonly kind: 'inspect-error'; readonly code: InspectErrorCode}
+  | {readonly kind: 'http-error'; readonly status: number}
+  | {readonly kind: 'network-error'}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'parse-error'}
+  | {readonly kind: 'response-mismatch'}
+
+/** Errors `WorkspaceClient.clone()` can return — never `inspect-error`, which `clone()` cannot produce. */
+export type CloneWorkspaceError =
+  | {readonly kind: 'clone-error'; readonly code: CloneErrorCode}
+  | {readonly kind: 'http-error'; readonly status: number}
+  | {readonly kind: 'network-error'}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'parse-error'}
+  | {readonly kind: 'response-mismatch'}
+
+/** Errors `WorkspaceClient.inspect()` can return — never `clone-error`, which `inspect()` cannot produce. */
+export type InspectWorkspaceError =
+  | {readonly kind: 'inspect-error'; readonly code: InspectErrorCode}
   | {readonly kind: 'http-error'; readonly status: number}
   | {readonly kind: 'network-error'}
   | {readonly kind: 'timeout'}

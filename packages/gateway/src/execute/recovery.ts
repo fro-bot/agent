@@ -3,14 +3,18 @@
  *
  * On gateway boot, scans every bound repo for runs that were left in a
  * non-terminal active phase (EXECUTING, PENDING, or ACKNOWLEDGED) by a prior
- * crash or shutdown. EXECUTING runs hold a lock+lease; PENDING and ACKNOWLEDGED
- * runs can be stranded when a crash or shutdown occurs after admission but
- * before the run reaches EXECUTING.
+ * crash or shutdown. The repo lock is now acquired before the PENDING →
+ * ACKNOWLEDGED transition and held across `ensureClone` (see run.ts), so
+ * EXECUTING is no longer the only phase that can be left holding it — a crash
+ * during that window can strand the lock under a PENDING or ACKNOWLEDGED run
+ * too. PENDING and ACKNOWLEDGED runs can also be stranded without ever having
+ * held the lock, when a crash or shutdown occurs before lock acquisition.
  *
  * For each stranded run the sweep:
  *  1. Transitions the run state to FAILED.
- *  2. Releases the repo lock — only for EXECUTING runs (PENDING and ACKNOWLEDGED
- *     runs have not yet acquired the lock, so no release is needed).
+ *  2. Releases the repo lock — whenever the lock record still names this
+ *     run's own run_id, regardless of phase. A lock already re-acquired by a
+ *     different run is never touched.
  *  3. Posts a brief "previous task interrupted" note to the original thread
  *     (best-effort — skipped if the thread cannot be resolved).
  *
@@ -639,13 +643,18 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
     }
   }
 
-  // ── 2. Release the repo lock (EXECUTING only) ───────────────────────────
+  // ── 2. Release the repo lock, if this stale run's own runId still owns it ──
   //
-  // Only EXECUTING runs hold the repo lock. PENDING and ACKNOWLEDGED runs have
-  // not yet reached the lock-acquisition step, so attempting a lock release for
-  // them would be incorrect (and could release a lock held by a different run).
+  // The repo lock is now acquired BEFORE the PENDING → ACKNOWLEDGED transition
+  // (see run.ts) and held across `ensureClone`, which can run for minutes. A
+  // crash in that window can strand the lock under a PENDING or ACKNOWLEDGED
+  // run just as easily as under EXECUTING, so release is not gated on phase —
+  // it is gated on lock ownership. The ownership check below (lock.run_id ===
+  // this run's run_id) is what makes this safe: a lock already re-acquired by
+  // a different run is never touched, regardless of which phase this stale run
+  // was left in.
 
-  if (run.phase === 'EXECUTING') {
+  {
     const lockKeyResult = getLockKey(coordinationConfig, repo)
 
     if (lockKeyResult.success === false) {
@@ -666,7 +675,7 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
               'recovery: releaseLock failed — continuing',
             )
           } else {
-            logger.info({runId: run.run_id, repo}, 'recovery: lock released')
+            logger.info({runId: run.run_id, repo, phase: run.phase}, 'recovery: lock released')
           }
         } else {
           logger.warn(

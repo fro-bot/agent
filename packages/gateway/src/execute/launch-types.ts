@@ -437,8 +437,8 @@ export interface LaunchWorkRequest {
   }) => string
 
   /**
-   * Optional thread factory called by the engine after `ensureClone` and `readyz`
-   * pass, before lock acquisition.
+   * Optional thread factory called by the engine after `readyz` passes, before
+   * lock acquisition.
    *
    * The Discord adapter provides this to create the response thread at the right
    * point in the pipeline (after gates pass, before lock). The factory creates the

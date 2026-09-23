@@ -651,6 +651,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
             error: (msg, meta) => logger.error(meta ?? {}, msg),
           },
         }),
+      // Report checkout provenance. Called right after ensureClone, still under the
+      // repo lock — see run.ts. Read-only: never clones, fetches, or mutates the checkout.
+      inspect: async (owner: string, repo: string) => workspaceClient.inspect({owner, repo}),
       // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
       // The in-memory queue is lossy by design; dropping pending tasks on graceful
       // shutdown matches that contract and is consistent with the messageCreate

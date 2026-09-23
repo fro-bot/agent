@@ -235,12 +235,11 @@ Releasing is always done in a `finally` block so crashes leave the system in a r
 
 ### Startup stale-run recovery
 
-`execute/recovery.ts` (`recoverStaleRuns`) runs once after Discord login on every gateway startup. It scans all bound repos for runs that were left in the `EXECUTING` phase by a prior crash — the only phase that can be stranded with a held lock and lease (PENDING→ACKNOWLEDGED→EXECUTING all complete synchronously before any interruptible await). For each stranded run it:
+`execute/recovery.ts` (`recoverStaleRuns`) runs once after Discord login on every gateway startup. It scans all bound repos for runs left in `EXECUTING`, `PENDING`, or `ACKNOWLEDGED` by a prior crash. The repo lock is acquired before the `PENDING`→`ACKNOWLEDGED` transition and held across `ensureClone` (which can run for minutes), so a crash can strand the lock under any of the three phases, not just `EXECUTING`. For each stranded run it:
 
 1. Transitions the run state to `FAILED` via a conditional-write against the current S3 object etag.
-2. Releases the repo lock so the next mention can proceed.
+2. Releases the repo lock whenever the lock record still names this run's own `run_id` (regardless of phase) so the next mention can proceed; a lock already re-acquired by a different run is left untouched.
 3. Posts a brief "previous task interrupted on restart" note to the original thread (best-effort; skipped if the thread is unreachable).
-
 Per-run errors are logged and the sweep continues — one corrupted record does not block recovery for the rest.
 
 ### Tool approval

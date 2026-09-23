@@ -132,7 +132,7 @@ describe('runMention', () => {
     })
   })
 
-  // ── Ensure-clone gate (after concurrency, before thread/lock) ──────────
+  // ── Ensure-clone gate (after concurrency AND lock/heartbeat, before EXECUTING) ──
 
   describe('ensure-clone gate', () => {
     it('happy path: ensure-clone succeeds → proceeds to thread creation and execution', async () => {
@@ -151,9 +151,10 @@ describe('runMention', () => {
       expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
     })
 
-    it('ensure-clone failure → coarse reply, no thread created, concurrency slot released', async () => {
-      // #given
+    it('ensure-clone failure (post-lock) → coarse reply in the thread, lock and slot released', async () => {
+      // #given — ensureClone now runs AFTER thread creation and lock acquisition
       const {runMention} = await import('./run.js')
+      setupHappyPath()
       const ensureClone = makeEnsureCloneFn('failure')
       const releaseFn = vi.fn()
       const deps = makeDeps({
@@ -170,23 +171,28 @@ describe('runMention', () => {
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — coarse reply sent via message.reply (no thread yet)
-      expect(message.reply).toHaveBeenCalledOnce()
-      const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+      // #then — a thread WAS created (ensureClone runs after thread/lock now)
+      expect(message.startThread).toHaveBeenCalledOnce()
+      // #and — coarse reply sent in the thread, not the source message
+      const thread = message._thread
+      expect(thread.send).toHaveBeenCalledOnce()
+      const call = (thread.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
         content: string
         allowedMentions: unknown
       }
-      expect(call.content).toContain('workspace')
+      expect(call.content).toContain('not reachable')
       expect(call.allowedMentions).toEqual({parse: []})
-      // No thread created
-      expect(message.startThread).not.toHaveBeenCalled()
-      // Concurrency slot released in finally
+      // #and — lock was acquired then released (clone failure happens post-lock)
+      expect(mockRuntime.acquireLock).toHaveBeenCalledOnce()
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      // #and — concurrency slot released in finally
       expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
     })
 
     it('ensure-clone failure does not expose internal details in reply', async () => {
       // #given
       const {runMention} = await import('./run.js')
+      setupHappyPath()
       const ensureClone = vi.fn().mockResolvedValue({
         success: false as const,
         error: {kind: 'auth-failure' as const, reason: 'auth-error' as const},
@@ -197,8 +203,9 @@ describe('runMention', () => {
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — no internal detail in reply
-      const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+      // #then — no internal detail in the thread reply
+      const thread = message._thread
+      const call = (thread.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
       expect(call.content).not.toContain('auth')
       expect(call.content).not.toContain('token')
       expect(call.content).not.toContain('clone')
@@ -275,8 +282,155 @@ describe('runMention', () => {
     })
   })
 
-  // ── Readiness gate (after ensure-clone, before thread/lock) ─────────────
+  // ── Ensure-clone ordering (PR 1634 reorder: checkout prep runs under the repo lock) ──
+  //
+  // These pin the target order from the reorder brief:
+  //   channel slot → readyz → thread creation → acquireLock → heartbeat → ensureClone → OpenCode
+  // Each case is verified to fail against the OLD order (ensureClone before readyz/thread/lock).
 
+  describe('ensure-clone ordering', () => {
+    it('ensureClone runs AFTER acquireLock succeeds and AFTER heartbeat renewal starts — call order, not just call presence', async () => {
+      // #given — track the actual invocation order of the three collaborators
+      const {runMention} = await import('./run.js')
+      const callOrder: string[] = []
+      setupHappyPath({
+        start: vi.fn(() => {
+          callOrder.push('heartbeat.start')
+        }),
+      })
+      mockRuntime.acquireLock.mockImplementation(async () => {
+        callOrder.push('acquireLock')
+        return {success: true as const, data: {acquired: true as const, etag: 'lock-etag-v1', holder: null}}
+      })
+      const ensureClone = vi.fn().mockImplementation(async () => {
+        callOrder.push('ensureClone')
+        return {success: true as const, data: '/workspace/acme/widget'}
+      })
+      const deps = makeDeps({ensureClone})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — exact order: lock acquired, renewal started, THEN checkout prep
+      expect(callOrder).toEqual(['acquireLock', 'heartbeat.start', 'ensureClone'])
+    })
+
+    it('a run that fails to acquire the lock never calls ensureClone', async () => {
+      // #given — lock is held by another gateway
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      mockRuntime.acquireLock.mockResolvedValue({
+        success: true as const,
+        data: {acquired: false as const, etag: null, holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown},
+      } as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
+      const ensureClone = makeEnsureCloneFn('success')
+      const deps = makeDeps({ensureClone})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — ensureClone never called
+      expect(ensureClone).not.toHaveBeenCalled()
+    })
+
+    it('a run whose lock acquisition errors (not just "held") never calls ensureClone', async () => {
+      // #given — acquireLock returns a hard error (not a "held by another" result)
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      mockRuntime.acquireLock.mockResolvedValue({success: false as const, error: new Error('lock store unreachable')})
+      const ensureClone = makeEnsureCloneFn('success')
+      const deps = makeDeps({ensureClone})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — ensureClone never called
+      expect(ensureClone).not.toHaveBeenCalled()
+    })
+
+    it('clone failure after lock acquisition stops the heartbeat and releases the lock with the CURRENT (post-heartbeat-stop) etag, not the original lock etag', async () => {
+      // #given — heartbeat.stop() returns a fresh lockEtag that has advanced past the
+      // original acquireLock etag (renewal ticked at least once). The release call must
+      // use this fresh etag — reusing the stale original etag is the exact stale-etag
+      // release bug this subsystem has shipped before (silent 412, orphaned lock).
+      const {runMention} = await import('./run.js')
+      const stopFn = vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          runEtag: 'run-etag-after-heartbeat',
+          lockEtag: 'lock-etag-after-heartbeat',
+          runState: buildMockRunState(),
+        },
+      })
+      setupHappyPath({stop: stopFn})
+      mockRuntime.transitionRun
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
+        })
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
+        })
+      const ensureClone = makeEnsureCloneFn('failure')
+      const message = makeMessage()
+      const deps = makeDeps({ensureClone})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — heartbeat stopped exactly once
+      expect(stopFn).toHaveBeenCalledOnce()
+
+      // #and — lock released with the fresh post-heartbeat-stop etag, not 'lock-etag-v1'
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      const releaseCall = mockRuntime.releaseLock.mock.calls[0] as unknown[]
+      expect(releaseCall[2]).toBe('lock-etag-after-heartbeat')
+
+      // #and — run-state transitioned to FAILED (post-lock failure path)
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('FAILED')
+
+      // #and — the user is replied to in the thread that now exists
+      const thread = message._thread
+      expect(thread.send).toHaveBeenCalledOnce()
+      const call = (thread.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+      expect(call.content).toContain('not reachable')
+    })
+
+    it('launchWork: ensureClone runs AFTER acquireLock succeeds and AFTER heartbeat start — same order as runMention', async () => {
+      // #given — the operator-web launch path (launchWork) shares executeWorkOnHeldSlot with
+      // runMention, so it must exhibit the identical post-lock ordering.
+      const {launchWork} = await import('./run.js')
+      const callOrder: string[] = []
+      setupHappyPath({
+        start: vi.fn(() => {
+          callOrder.push('heartbeat.start')
+        }),
+      })
+      mockRuntime.acquireLock.mockImplementation(async () => {
+        callOrder.push('acquireLock')
+        return {success: true as const, data: {acquired: true as const, etag: 'lock-etag-v1', holder: null}}
+      })
+      const ensureClone = vi.fn().mockImplementation(async () => {
+        callOrder.push('ensureClone')
+        return {success: true as const, data: '/workspace/acme/widget'}
+      })
+      const request = makeInMemoryRequest()
+      const deps = makeDeps({ensureClone})
+
+      // #when
+      await awaitLaunchWorkRun(launchWork, request, deps)
+
+      // #then — exact order matches the Discord adapter path
+      expect(callOrder).toEqual(['acquireLock', 'heartbeat.start', 'ensureClone'])
+    })
+  })
+
+  // ── Readiness gate (after concurrency, before thread/lock) ───────────
   describe('readiness gate', () => {
     it('happy path: readyz=ready → proceeds to thread creation and execution', async () => {
       // #given
@@ -342,19 +496,19 @@ describe('runMention', () => {
       expect(message.startThread).not.toHaveBeenCalled()
     })
 
-    it('readyz is NOT called when ensure-clone fails', async () => {
-      // #given
+    it('ensure-clone is NOT called when readyz fails', async () => {
+      // #given — readyz is now the earlier gate; ensureClone must not run if it fails
       const {runMention} = await import('./run.js')
-      const ensureClone = makeEnsureCloneFn('failure')
-      const readyz = makeReadyzFn('ready')
+      const ensureClone = makeEnsureCloneFn('success')
+      const readyz = makeReadyzFn('not-ready')
       const deps = makeDeps({ensureClone, readyz})
       const message = makeMessage()
 
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — ensure-clone failed: readyz never called
-      expect(readyz).not.toHaveBeenCalled()
+      // #then — readyz failed: ensureClone never called
+      expect(ensureClone).not.toHaveBeenCalled()
     })
 
     it('readyz is NOT called when concurrency cap fires', async () => {
@@ -948,17 +1102,28 @@ describe('early-abort gates terminalize to FAILED', () => {
     vi.clearAllMocks()
   })
 
-  // ── Gate 1: ensureClone fail ───────────────────────────────────────────────
+  // ── ensureClone fail (post-lock) ────────────────────────────────────────────
 
-  it('gate 1 (ensureClone fail): run terminalized to FAILED, same reply text, no orphan PENDING', async () => {
-    // #given — ensureClone fails; run was admitted (PENDING) by launchWork
+  it('ensureClone fail (post-lock): run terminalized to FAILED via the ACKNOWLEDGED\u2192FAILED path, lock released, no orphan PENDING', async () => {
+    // #given — ensureClone now runs AFTER the lock is acquired and ACK commits, so a
+    // failure here reaches ACKNOWLEDGED (unlike the readyz/thread/lock gates below, which
+    // still fire pre-ACK). It must route through the same post-lock failure machinery as
+    // any other execution failure (heartbeat stop, FAILED transition, lock release, reply).
     const {launchWork} = await import('./run.js')
+    setupHappyPath()
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-1'}})
-    // transitionRun mock for the FAILED terminalization (best-effort)
-    mockRuntime.transitionRun.mockResolvedValue({
-      success: true as const,
-      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
-    })
+    // One-shot stubs: ACK returns ACKNOWLEDGED state, the terminal call returns FAILED state —
+    // setupHappyPath's blanket mockResolvedValue would otherwise report every transition
+    // (including the ACK) as phase FAILED to the observer.
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
+      })
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
+      })
 
     const ensureClone = makeEnsureCloneFn('failure')
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -971,20 +1136,25 @@ describe('early-abort gates terminalize to FAILED', () => {
     // #then — run terminalized to FAILED (no orphan PENDING)
     const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
     expect(transitionPhases).toContain('FAILED')
-    // ACKNOWLEDGED was NOT reached (ensureClone failed before ACK)
-    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
+    // ACKNOWLEDGED WAS reached (ensureClone now fails after ACK, unlike the pre-ACK gates)
+    expect(transitionPhases).toContain('ACKNOWLEDGED')
+    // EXECUTING was NOT reached (ensureClone fires before the EXECUTING transition)
+    expect(transitionPhases).not.toContain('EXECUTING')
 
     // #and — observer notified of FAILED state
     const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
     expect(observedPhases).toContain('FAILED')
 
-    // #and — same reply text as before (unchanged)
-    const sends = request._replySink._sends
-    const errorSend = sends.find(s => s.content.includes('workspace'))
-    expect(errorSend).toBeDefined()
-    expect(errorSend?.content).toContain('not available')
+    // #and — lock acquired then released via the generic post-lock failure path
+    expect(mockRuntime.acquireLock).toHaveBeenCalledOnce()
+    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
 
-    // #and — runOpenCodeCore NOT called (gate fired before execution)
+    // #and — coarse reply reuses the existing "unreachable" post-lock failure message
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.includes('not reachable'))
+    expect(errorSend).toBeDefined()
+
+    // #and — runOpenCodeCore NOT called (clone fails before OpenCode starts)
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
@@ -1356,13 +1526,20 @@ describe('early-abort gates terminalize to FAILED', () => {
   // ── R8 Discord: Discord run whose early gate fails writes FAILED run-state ─
 
   it('r8 Discord: Discord run whose ensureClone fails now writes FAILED run-state (previously just replied)', async () => {
-    // #given — Discord mention; ensureClone fails; run was admitted (PENDING) by launchWork
+    // #given — Discord mention; ensureClone fails (post-lock); run was admitted (PENDING) by launchWork
     const {runMention} = await import('./run.js')
+    setupHappyPath()
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-r8'}})
-    mockRuntime.transitionRun.mockResolvedValue({
-      success: true as const,
-      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
-    })
+    // One-shot stubs: ACK returns ACKNOWLEDGED state, the terminal call returns FAILED state.
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
+      })
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
+      })
 
     const ensureClone = makeEnsureCloneFn('failure')
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -1380,11 +1557,12 @@ describe('early-abort gates terminalize to FAILED', () => {
     const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
     expect(observedPhases).toContain('FAILED')
 
-    // #and — same reply text as before (unchanged)
-    expect(message.reply).toHaveBeenCalledOnce()
-    const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
-    expect(call.content).toContain('workspace')
-    expect(call.content).toContain('not available')
+    // #and — reply now goes to the thread (a thread exists by the time ensureClone runs)
+    // reusing the existing "unreachable" post-lock failure message
+    const thread = message._thread
+    expect(thread.send).toHaveBeenCalledOnce()
+    const call = (thread.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(call.content).toContain('not reachable')
   })
 
   // ── Regression: successful run unchanged ───────────────────────────────────
@@ -1431,14 +1609,15 @@ describe('early-abort gates terminalize to FAILED', () => {
   })
 })
 
-describe('failAdmittedRun failureKind threading (pre-ACK gates)', () => {
+describe('failureKind threading (early-abort gates)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
 
   it('workspace clone failure: FAILED transitionRun carries detailsPatch.failureKind = "unreachable"', async () => {
-    // #given — ensureClone fails before ACK
+    // #given — ensureClone fails post-lock (after ACK, before EXECUTING)
     const {runMention} = await import('./run.js')
+    setupHappyPath()
     const ensureClone = makeEnsureCloneFn('failure')
     const message = makeMessage()
     const deps = makeDeps({ensureClone})

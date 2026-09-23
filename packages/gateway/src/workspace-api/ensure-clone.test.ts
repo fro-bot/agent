@@ -10,12 +10,12 @@ import type {Result} from '@fro-bot/runtime'
 import type {AppClient, AppClientAuthResult} from '../github/app-client.js'
 import type {WorkspaceClient} from './client.js'
 import type {EnsureCloneFailure} from './ensure-clone.js'
-import type {CloneSuccess, WorkspaceError} from './types.js'
+import type {CloneSuccess, CloneWorkspaceError} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 
-import {AppNotInstalledError, AuthError} from '../github/app-client.js'
+import {AppNotInstalledError, AuthError, InsufficientPermissionsError} from '../github/app-client.js'
 import {workspaceRepoPath} from './client.js'
 import {ensureWorkspaceClone} from './ensure-clone.js'
 
@@ -43,7 +43,9 @@ function makeAuthResult(token = 'ghs_testtoken'): AppClientAuthResult {
 }
 
 function makeAppClient(
-  authResult: Result<AppClientAuthResult, AppNotInstalledError | AuthError> = ok(makeAuthResult()),
+  authResult: Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError> = ok(
+    makeAuthResult(),
+  ),
 ): AppClient {
   return {
     authForRepo: vi.fn().mockResolvedValue(authResult),
@@ -54,7 +56,7 @@ function makeAppClient(
 }
 
 function makeWorkspaceClient(
-  cloneResult: Result<CloneSuccess, WorkspaceError> = ok({
+  cloneResult: Result<CloneSuccess, CloneWorkspaceError> = ok({
     ok: true,
     path: workspaceRepoPath('testowner', 'testrepo'),
     commit: 'abc123',
@@ -63,6 +65,7 @@ function makeWorkspaceClient(
   return {
     clone: vi.fn().mockResolvedValue(cloneResult),
     readyz: vi.fn(),
+    inspect: vi.fn(),
   }
 }
 
@@ -226,7 +229,7 @@ describe('ensureWorkspaceClone', () => {
       expect(workspaceClient.clone).not.toHaveBeenCalled()
     })
 
-    it('returns auth-failure with reason auth-error when authForRepo fails with AppNotInstalledError', async () => {
+    it('positive evidence — AppNotInstalledError classifies as reason "not-installed" (permanent, operator-side)', async () => {
       // #given
       const owner = 'testowner'
       const repo = 'testrepo'
@@ -240,6 +243,46 @@ describe('ensureWorkspaceClone', () => {
       const result = await ensureWorkspaceClone({owner, repo, appClient, workspaceClient, logger})
 
       // #then
+      const failure = assertFailure(result)
+      expect(failure).toMatchObject({kind: 'auth-failure', reason: 'not-installed'})
+    })
+
+    it('positive evidence — InsufficientPermissionsError classifies as reason "insufficient-permissions" (permanent, operator-side)', async () => {
+      // #given
+      const owner = 'testowner'
+      const repo = 'testrepo'
+      const appClient = makeAppClient(
+        err(
+          new InsufficientPermissionsError(
+            ['contents:read'],
+            'https://github.com/apps/fro-bot-agent/installations/new',
+          ),
+        ),
+      )
+      const workspaceClient = makeWorkspaceClient()
+      const logger = makeLogger()
+
+      // #when
+      const result = await ensureWorkspaceClone({owner, repo, appClient, workspaceClient, logger})
+
+      // #then
+      const failure = assertFailure(result)
+      expect(failure).toMatchObject({kind: 'auth-failure', reason: 'insufficient-permissions'})
+    })
+
+    it('no positive evidence — a plain AuthError (e.g. discovery 5xx/network/rate-limit) stays reason "auth-error" (transient default)', async () => {
+      // #given — simulates a discovery-stage AuthError that is NOT AppNotInstalledError/
+      // InsufficientPermissionsError (e.g. a GitHub 5xx or network failure during discovery)
+      const owner = 'testowner'
+      const repo = 'testrepo'
+      const appClient = makeAppClient(err(new AuthError('GitHub API returned 503')))
+      const workspaceClient = makeWorkspaceClient()
+      const logger = makeLogger()
+
+      // #when
+      const result = await ensureWorkspaceClone({owner, repo, appClient, workspaceClient, logger})
+
+      // #then — no positive evidence of permanence → defaults to transient, never to permanent
       const failure = assertFailure(result)
       expect(failure).toMatchObject({kind: 'auth-failure', reason: 'auth-error'})
     })
