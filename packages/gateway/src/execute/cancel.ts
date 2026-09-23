@@ -101,7 +101,7 @@ export interface CancelRunDeps {
  * Bounded strategy for the pre-ACK rendezvous retry: a single retry after the
  * first 412 resolves to EXECUTING. One retry is sufficient because the
  * registration window (dequeue → abort-registry registration) is short and
- * bounded by the pipeline's own gates (ensureClone/readyz/threadFactory/lock);
+ * bounded by the pipeline's own gates (readyz/threadFactory/lock/ensureClone);
  * a run cannot cycle between "not yet registered" and "EXECUTING" more than
  * once within that window. Exceeding the bound returns `{outcome:'retry'}`
  * rather than looping unboundedly — the caller (a future web route) can

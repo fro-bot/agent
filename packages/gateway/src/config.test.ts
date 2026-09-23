@@ -3067,12 +3067,14 @@ describe('operatorPush config', () => {
     expect(thrown?.message).not.toContain(FAKE_VAPID_PRIVATE_KEY)
   })
 
-  it('regression: OPERATOR_CONTRACT_VERSION is unchanged by adding push config/DTOs', async () => {
-    // #given — push DTOs are added to the operator-contract barrel without bumping the
-    // version constant (the dashboard SSE drift gate matches this value exactly).
+  it('regression: OPERATOR_CONTRACT_VERSION was unchanged by adding push config/DTOs (stayed 1.6.0); a later additive field (checkoutProvenance) bumped it to 1.7.0 (MINOR, per version.ts policy)', async () => {
+    // #given — push DTOs were added to the operator-contract barrel without bumping the
+    // version constant (the dashboard SSE drift gate matches this value exactly). A later
+    // change (OperatorRunStatus.checkoutProvenance) DID bump it — a new optional field on a
+    // frozen type is a MINOR change per version.ts's increment policy.
     const {OPERATOR_CONTRACT_VERSION} = await import('./operator-contract/index.js')
 
     // #when / #then
-    expect(OPERATOR_CONTRACT_VERSION).toBe('1.6.0')
+    expect(OPERATOR_CONTRACT_VERSION).toBe('1.7.0')
   })
 })

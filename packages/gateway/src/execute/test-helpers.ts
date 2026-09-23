@@ -432,6 +432,29 @@ export function makeReadyzFn(result: 'ready' | 'not-ready' | 'throws' = 'ready')
     : vi.fn().mockResolvedValue({success: true as const, data: {ready: false, opencode: 'starting'}})
 }
 
+/** A clean, attached-HEAD observation — the default `inspect()` result in tests. */
+export function makeCleanObservation(overrides: Partial<{readonly sha: string; readonly branch: string}> = {}) {
+  return {
+    head: {kind: 'attached' as const, branch: overrides.branch ?? 'main', sha: overrides.sha ?? 'a'.repeat(40)},
+    worktree: {kind: 'clean' as const},
+    operationInProgress: 'none' as const,
+    observedAt: '2026-01-01T00:00:00.000Z',
+  }
+}
+
+export function makeInspectFn(result: 'observed' | 'unavailable' | 'checkout-substituted' = 'observed') {
+  if (result === 'observed') {
+    return vi.fn().mockResolvedValue({success: true as const, data: makeCleanObservation()})
+  }
+  if (result === 'checkout-substituted') {
+    return vi.fn().mockResolvedValue({
+      success: false as const,
+      error: {kind: 'inspect-error' as const, code: 'checkout-substituted' as const},
+    })
+  }
+  return vi.fn().mockResolvedValue({success: false as const, error: {kind: 'network-error' as const}})
+}
+
 export function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
   return {
     coordinationConfig: {} as CoordinationConfig,
@@ -450,6 +473,7 @@ export function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDep
     statusMode: overrides.statusMode ?? 'live-status',
     ensureClone: overrides.ensureClone ?? makeEnsureCloneFn('success'),
     readyz: overrides.readyz ?? makeReadyzFn('ready'),
+    inspect: overrides.inspect ?? makeInspectFn('observed'),
     ...overrides,
   }
 }

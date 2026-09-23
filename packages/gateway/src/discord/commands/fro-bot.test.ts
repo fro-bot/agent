@@ -82,6 +82,7 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
     workspaceClient: {
       clone: vi.fn(),
       readyz: vi.fn().mockResolvedValue({success: true, data: {ready: true, opencode: 'ready'}}),
+      inspect: vi.fn(),
     },
     installUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     logger: {

@@ -124,9 +124,19 @@ describe('operator cancel — abort-registry integration', () => {
     // #and — concurrency slot released
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
 
-    // #and — no user-facing failure reply was sent to the thread
+    // #and — no user-facing failure reply was sent to the thread AT ALL (not just
+    // one missing the provenance line): the cancel path calls neither
+    // `statusSink.resolveToFailure` nor `replySink.send` (see the "Suppress the
+    // user-facing failure reply" comment in run.ts — the cancellation notice is
+    // the only communication on this path). Guards against a regression that sends
+    // a cancel reply containing the provenance line ("Started from…" / "Remote
+    // freshness…") that `sends.some(...includes('failed'))` alone would miss.
+    expect(request._statusSink.resolveToFailure).not.toHaveBeenCalled()
     const sends = request._replySink._sends
+    expect(sends).toHaveLength(0)
     expect(sends.some(s => s.content.toLowerCase().includes('failed'))).toBe(false)
+    expect(sends.some(s => s.content.includes('Started from'))).toBe(false)
+    expect(sends.some(s => s.content.includes('Remote freshness'))).toBe(false)
 
     // #and — registry entry deleted (a later abort() is now a no-op)
     expect(abortRegistry.has(CANCEL_RUN_ID)).toBe(false)
