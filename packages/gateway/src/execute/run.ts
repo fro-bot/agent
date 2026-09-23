@@ -492,7 +492,9 @@ function scheduleQuarantineRelease(opts: ScheduleQuarantineReleaseOpts): void {
  * cap. Exporting this function would allow callers to bypass the queue.
  *
  * ASSUMES the channel concurrency slot is already held by the caller.
- * Owns: clone → readyz → thread → lock → run-state → heartbeat → execute → cleanup.
+ * Owns: readyz → thread → lock → run-state → heartbeat → clone → execute → cleanup.
+ * `clone` (`ensureClone`) runs AFTER lock acquisition and heartbeat start — it reads and can
+ * mutate the shared per-repo checkout, so it must never run while the repo lock is not held.
  *
  * On completion (success or failure), performs an **atomic handoff**:
  * - Calls `queue.takeNext(channelId)` while the slot is still held.
@@ -538,12 +540,16 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   const runStartMs = Date.now()
 
   // ── Pre-ACK gate section — dual-finally wrapper ──────────────────────────────────────────────
-  // Gates 1-4 (ensureClone, readyz, threadFactory, lock) and gate 5 (ACK transition) all fire
-  // while the run is still PENDING (task.adoptionEtag is the current etag). Each explicit-return
-  // failure path calls failAdmittedRun before returning. The try/catch below handles the case
-  // where a gate THROWS (not just returns) — it terminalizes to FAILED then rethrows.
+  // Gates 1-3 (readyz, threadFactory, lock) and gate 4 (ACK transition) all fire while the run
+  // is still PENDING (task.adoptionEtag is the current etag). Each explicit-return failure path
+  // calls failAdmittedRun before returning. The try/catch below handles the case where a gate
+  // THROWS (not just returns) — it terminalizes to FAILED then rethrows.
   // Once the ACK transition succeeds, the existing EXECUTING catch owns FAILED; this wrapper
   // must NOT run after a successful ACK (it only wraps the pre-ACK section).
+  //
+  // ensureClone (checkout preparation) is NOT a pre-ACK gate — it now runs after the repo lock
+  // is acquired and heartbeat renewal has started (see the inner try below), because it reads
+  // and can mutate the shared per-repo checkout and must never run while unlocked.
   let preAckCompleted = false
   let lockEtag: string | null = null
   // ── Quarantine — set only when `runOpenCodeCore` throws a `RunCoreError` with
@@ -558,34 +564,6 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   let quarantined = false
 
   try {
-    // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
-    // Rehydrates a missing checkout (e.g. after container recreation) before OpenCode can start.
-    // Placed after the concurrency gate so duplicate mentions are rejected before any
-    // GitHub App token is minted or workspace clone is attempted.
-    const ensureCloneResult = await ensureClone(binding.owner, binding.repo)
-    if (ensureCloneResult.success === false) {
-      logger.warn(
-        {
-          channelId,
-          owner: binding.owner,
-          repo: binding.repo,
-          failureKind: ensureCloneResult.error.kind,
-        },
-        'run: workspace clone unavailable — aborting',
-      )
-      // Gate 1 failure: terminalize the admitted run to FAILED before replying.
-      // 'unreachable' maps to 'workspace-unreachable' via the operator projection.
-      await failAdmittedRun(deps, repo, runId, task.adoptionEtag, 'unreachable')
-      await request.replySink.send('source', {
-        content: 'The workspace is not available right now. Please try again later.',
-      })
-      return
-    }
-
-    // Use the ensured (canonical) path from ensureClone, not the potentially stale
-    // workspacePath stored in the binding (e.g. after container recreation).
-    const bindingWithEnsuredPath = {...binding, workspacePath: ensureCloneResult.data}
-
     // ── Workspace readiness gate ──────────────────────────────────────────────────────────────
     // Fail-closed: any error result or thrown exception → treat as not-ready.
     // This prevents creating a thread, acquiring a lock, or creating run-state
@@ -601,7 +579,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     if (workspaceReady === false) {
       logger.warn({channelId, repo}, 'run: workspace not ready — aborting')
-      // Gate 2 failure: terminalize the admitted run to FAILED before replying.
+      // Gate 1 failure: terminalize the admitted run to FAILED before replying.
       // 'unreachable' maps to 'workspace-unreachable' via the operator projection.
       await failAdmittedRun(deps, repo, runId, task.adoptionEtag, 'unreachable')
       await request.replySink.send('source', {
@@ -639,14 +617,14 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           {channelId, repo, err: threadError instanceof Error ? threadError.message : String(threadError)},
           'run: threadFactory threw or timed out — aborting',
         )
-        // Gate 3 (throw/timeout) failure: terminalize the admitted run to FAILED before replying.
+        // Gate 2 (throw/timeout) failure: terminalize the admitted run to FAILED before replying.
         await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
         await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
         return
       }
       if (threadResult.ok === false) {
         logger.error({channelId, repo, err: threadResult.error}, 'run: threadFactory failed — aborting')
-        // Gate 3 (ok:false) failure: terminalize the admitted run to FAILED before replying.
+        // Gate 2 (ok:false) failure: terminalize the admitted run to FAILED before replying.
         await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
         await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
         return
@@ -660,7 +638,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     if (lockResult.success === false) {
       logger.error({repo, runId, err: lockResult.error.message}, 'run: lock acquisition error')
-      // Gate 4 (lock error) failure: terminalize the admitted run to FAILED before replying.
+      // Gate 3 (lock error) failure: terminalize the admitted run to FAILED before replying.
       await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       return
@@ -669,7 +647,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     if (lockResult.data.acquired === false) {
       // Lock held — terminal "waiting" reply; do NOT expose holder ID to Discord
       logger.info({repo, runId, holder: lockResult.data.holder?.holder_id ?? 'unknown'}, 'run: lock held by another')
-      // Gate 4 (lock not acquired) failure: terminalize the admitted run to FAILED before replying.
+      // Gate 3 (lock not acquired) failure: terminalize the admitted run to FAILED before replying.
       await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('thread', {
         content: 'Another task is already in progress for this repo. Try again when it completes.',
@@ -711,7 +689,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       }
 
       logger.error({repo, runId, err: ackResult.error.message}, 'run: transitionRun ACKNOWLEDGED failed')
-      // Gate 5 (ACK fail): run is still PENDING; terminalize to FAILED using adoptionEtag.
+      // Gate 4 (ACK fail): run is still PENDING; terminalize to FAILED using adoptionEtag.
       await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
@@ -778,6 +756,37 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     const {statusSink, replySink} = request
 
     try {
+      // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
+      // Rehydrates a missing checkout (e.g. after container recreation) before OpenCode can start.
+      // Runs here — after the repo lock is held and heartbeat renewal is running, before the
+      // EXECUTING transition — because it reads and can mutate the shared per-repo checkout at
+      // `/workspace/repos/{owner}/{repo}`. Running it before the lock (as gates 1-3 do) would let
+      // a second run on the same repo (a different channel, the operator web surface, or a GitHub
+      // Action run) observe or mutate the tree concurrently with the lock holder.
+      //
+      // A failure here is routed through the SAME post-lock failure path as any other execution
+      // failure below (see the `catch (execError)` block): throwing a `RunCoreError` lets the
+      // existing heartbeat-stop / FAILED-transition / flush / thread-reply machinery run unchanged,
+      // rather than duplicating that sequence with a bespoke clone-failure handler.
+      const ensureCloneResult = await ensureClone(binding.owner, binding.repo)
+      if (ensureCloneResult.success === false) {
+        logger.warn(
+          {
+            channelId,
+            owner: binding.owner,
+            repo: binding.repo,
+            failureKind: ensureCloneResult.error.kind,
+          },
+          'run: workspace clone unavailable — aborting',
+        )
+        const runCoreKind = ensureCloneResult.error.kind === 'auth-failure' ? 'auth' : 'unreachable'
+        throw new RunCoreError(runCoreKind, `ensureClone failed: ${ensureCloneResult.error.kind}`)
+      }
+
+      // Use the ensured (canonical) path from ensureClone, not the potentially stale
+      // workspacePath stored in the binding (e.g. after container recreation).
+      const bindingWithEnsuredPath = {...binding, workspacePath: ensureCloneResult.data}
+
       const execResult = await transitionRun(
         coordinationConfig,
         identity,
@@ -1879,7 +1888,7 @@ async function ackEnqueueResult(request: LaunchWorkRequest, result: 'queued' | '
  *    `sendMessage(message, ...)` before a thread exists.
  *
  * 3. **Thread factory:** provides a `threadFactory` on the `LaunchWorkRequest`
- *    that the engine calls after `ensureClone`/`readyz` pass (before lock).
+ *    that the engine calls after `readyz` passes (before lock).
  *    The factory creates the Discord thread, initializes the real
  *    `StatusSink`/`ReplySink` implementations (wrapping `createStatusController`
  *    and `createDiscordStreamSink`), and returns the thread ID.
@@ -1971,7 +1980,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   }
 
   // ── Thread factory ────────────────────────────────────────────────────────
-  // Called by the engine after ensureClone/readyz pass, before lock acquisition.
+  // Called by the engine after readyz passes, before lock acquisition.
   // Creates the Discord thread, initializes real sinks, returns the thread ID.
   // The engine never imports Discord types — it only calls this opaque factory.
   const threadFactory: LaunchWorkRequest['threadFactory'] = async () => {
