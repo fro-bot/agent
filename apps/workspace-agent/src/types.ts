@@ -77,7 +77,7 @@ export type WorktreeState =
     }
 
 /** In-progress git operation detected from state files in the git directory. */
-export type CheckoutOperation = 'none' | 'merge' | 'rebase' | 'cherry-pick' | 'revert' | 'bisect'
+export type CheckoutOperation = 'none' | 'merge' | 'rebase' | 'am' | 'cherry-pick' | 'revert' | 'bisect'
 
 /** A single point-in-time observation of an existing checkout. Never mutates the checkout. */
 export interface CheckoutObservation {

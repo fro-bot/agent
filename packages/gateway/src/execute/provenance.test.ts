@@ -1,4 +1,4 @@
-import type {CheckoutObservation, WorkspaceError} from '../workspace-api/types.js'
+import type {CheckoutObservation, InspectWorkspaceError} from '../workspace-api/types.js'
 import {describe, expect, it} from 'vitest'
 import {
   classifyInspectResult,
@@ -36,7 +36,7 @@ describe('classifyInspectResult', () => {
 
   it('checkout-substituted → fail-run (never becomes a provenance value)', () => {
     // #given
-    const error: WorkspaceError = {kind: 'inspect-error', code: 'checkout-substituted'}
+    const error: InspectWorkspaceError = {kind: 'inspect-error', code: 'checkout-substituted'}
 
     // #when
     const outcome = classifyInspectResult({success: false, error})
@@ -45,7 +45,7 @@ describe('classifyInspectResult', () => {
     expect(outcome).toEqual({decision: 'fail-run', reason: 'checkout-substituted'})
   })
 
-  it.each<WorkspaceError>([
+  it.each<InspectWorkspaceError>([
     {kind: 'inspect-error', code: 'no-checkout'},
     {kind: 'inspect-error', code: 'inspection-failed'},
     {kind: 'inspect-error', code: 'inspection-timeout'},

@@ -35,7 +35,7 @@ export type OperatorWorktreeState =
       readonly conflicted: number
     }
 
-export type OperatorCheckoutOperation = 'none' | 'merge' | 'rebase' | 'cherry-pick' | 'revert' | 'bisect'
+export type OperatorCheckoutOperation = 'none' | 'merge' | 'rebase' | 'am' | 'cherry-pick' | 'revert' | 'bisect'
 
 export interface OperatorCheckoutObservation {
   readonly head: OperatorCheckoutHead
@@ -44,7 +44,13 @@ export interface OperatorCheckoutObservation {
   readonly observedAt: string
 }
 
-/** Whether remote freshness was checked. Present on every variant — never omitted. */
+/**
+ * Whether remote freshness was checked. Present on every variant — never omitted.
+ *
+ * `kind` may gain additional variants in later contract minors (e.g. a future `'checked'`
+ * variant reporting how far behind the remote the checkout is). Consumers must handle an
+ * unknown `kind` gracefully rather than assume the current list (`'not-checked'`) is complete.
+ */
 export interface OperatorRemoteFreshness {
   readonly kind: 'not-checked'
 }
@@ -71,7 +77,7 @@ export type OperatorCheckoutProvenance =
 // — never `as any`, `as unknown as`, or a blind property-existence check.
 // ---------------------------------------------------------------------------
 
-const CHECKOUT_OPERATIONS = new Set<string>(['none', 'merge', 'rebase', 'cherry-pick', 'revert', 'bisect'])
+const CHECKOUT_OPERATIONS = new Set<string>(['none', 'merge', 'rebase', 'am', 'cherry-pick', 'revert', 'bisect'])
 const SHA_RE = /^[0-9a-f]{40}$/
 
 function isCheckoutOperation(value: unknown): value is OperatorCheckoutOperation {

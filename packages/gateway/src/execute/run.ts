@@ -7,7 +7,13 @@ import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
 import type {OperatorFailureKind} from '../operator-contract/run-status.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
-import type {CheckoutObservation, CloneErrorCode, ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
+import type {
+  CheckoutObservation,
+  CloneErrorCode,
+  InspectWorkspaceError,
+  ReadyzResponse,
+  WorkspaceError,
+} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
 import type {CheckoutProvenance} from './provenance.js'
@@ -37,7 +43,12 @@ import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {abortRegistry} from './abort-registry.js'
 import {attachOpencode} from './opencode-attach.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
-import {classifyInspectResult, formatProvenanceForPrompt, formatProvenanceLine} from './provenance.js'
+import {
+  classifyInspectResult,
+  formatProvenanceForPrompt,
+  formatProvenanceLine,
+  formatSubstitutedCheckoutLine,
+} from './provenance.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 
 // ---------------------------------------------------------------------------
@@ -140,7 +151,7 @@ export interface RunMentionDeps {
    * carries forward — to the agent prompt, to the human-facing reply, and
    * onto the run's persisted state.
    */
-  readonly inspect: (owner: string, repo: string) => Promise<Result<CheckoutObservation, WorkspaceError>>
+  readonly inspect: (owner: string, repo: string) => Promise<Result<CheckoutObservation, InspectWorkspaceError>>
   /**
    * Workspace readiness check. Called after ensure-clone, before execution.
    * Injected so tests can stub it without a live workspace.
@@ -271,15 +282,24 @@ const PERMANENT_CLONE_ERROR_CODES: ReadonlySet<CloneErrorCode> = new Set<CloneEr
  * `workspace-failure`/`clone-error` codes in `PERMANENT_CLONE_ERROR_CODES`
  * become `workspace-unavailable` — operator-side failures that will not
  * resolve on their own, so the user-facing message must not invite a
- * pointless retry. Everything else (network/timeout/http/parse/
- * response-mismatch, and the transient clone-error codes including
- * `clone-failed`) stays `unreachable`, matching prior behavior.
+ * pointless retry. `workspace-failure`/`response-mismatch` is also
+ * `workspace-unavailable`: `client.ts` raises it when the path the workspace
+ * agent reports doesn't exactly match the path the gateway expects, a
+ * comparison that returns the same answer on every retry and that
+ * `ensure-clone.ts` already logs at error level as a security signal —
+ * telling the user to retry would be both futile and understate what may be
+ * a tamper signal. Everything else (network/timeout/http/parse, and the
+ * transient clone-error codes including `clone-failed`) stays `unreachable`,
+ * matching prior behavior.
  */
 function classifyEnsureCloneFailure(failure: EnsureCloneFailure): RunCoreErrorKind {
   if (failure.kind === 'auth-failure') {
     return failure.reason === 'not-installed' || failure.reason === 'insufficient-permissions'
       ? 'workspace-unavailable'
       : 'auth'
+  }
+  if (failure.kind === 'workspace-failure' && failure.workspaceKind === 'response-mismatch') {
+    return 'workspace-unavailable'
   }
   if (
     failure.kind === 'workspace-failure' &&
@@ -924,6 +944,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           {channelId, owner: binding.owner, repo: binding.repo},
           'run: checkout-substituted — tree is not the expected repository, aborting',
         )
+        // Set the provenance line before throwing — this is the one failure reply
+        // where an operator most needs it (the run found a tree that shouldn't be
+        // there), and `withProvenanceLine` only appends when `provenanceLine` is set.
+        provenanceLine = formatSubstitutedCheckoutLine(repo)
         throw new RunCoreError('checkout-substituted', 'inspect failed: checkout-substituted')
       }
       provenance = inspectOutcome.provenance
@@ -951,6 +975,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         const currentPhase = await readCurrentRunPhase(deps, repo, runId)
         if (currentPhase === 'CANCELLED') {
           logger.info({repo, runId}, 'run: EXECUTING lost the adoption race to an operator cancel — exiting cleanly')
+          // No provenance is persisted on this exit, deliberately. Provenance is saved
+          // atomically with THIS transition (detailsPatch above), and it never landed —
+          // the operator's cancel committed first, so the agent never started. Provenance
+          // records what a run STARTED FROM; a run that never started has no starting
+          // state, and writing one anyway would record a start that didn't happen.
           // Registration happens only after EXECUTING succeeds (below), so there is no
           // abort-registry entry to delete here — the outer finally's unconditional
           // delete() is still a safe no-op for this runId.

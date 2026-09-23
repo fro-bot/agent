@@ -16,7 +16,7 @@
 import type {Result} from '@fro-bot/runtime'
 import type {AppClient, AppNotInstalledError, AuthError, InsufficientPermissionsError} from '../github/app-client.js'
 import type {WorkspaceClient} from './client.js'
-import type {CloneErrorCode, InspectErrorCode, WorkspaceError} from './types.js'
+import type {CloneErrorCode, CloneWorkspaceError} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {
@@ -91,7 +91,6 @@ function classifyAuthFailure(
  */
 export type WorkspaceFailure =
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'clone-error'; readonly code: CloneErrorCode}
-  | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'inspect-error'; readonly code: InspectErrorCode}
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'http-error'; readonly status: number}
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'network-error'}
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'timeout'}
@@ -124,18 +123,18 @@ export interface EnsureCloneDeps {
 // ---------------------------------------------------------------------------
 
 /**
- * Map a WorkspaceError to a WorkspaceFailure, preserving structured detail
+ * Map a CloneWorkspaceError to a WorkspaceFailure, preserving structured detail
  * (workspaceKind, code, status) for ops/automation while keeping the outer
  * `kind: 'workspace-failure'` coarse for Discord reply handlers.
+ *
+ * `clone()` returns `CloneWorkspaceError` — a narrower type than the shared
+ * `WorkspaceError` union that excludes `inspect-error` — so this switch has no
+ * unreachable branch to keep exhaustive.
  */
-function toWorkspaceFailure(error: WorkspaceError): WorkspaceFailure {
+function toWorkspaceFailure(error: CloneWorkspaceError): WorkspaceFailure {
   switch (error.kind) {
     case 'clone-error':
       return {kind: 'workspace-failure', workspaceKind: 'clone-error', code: error.code}
-    case 'inspect-error':
-      // ensureWorkspaceClone only ever calls workspaceClient.clone(), which never produces this
-      // kind — handled here purely to keep the shared WorkspaceError switch exhaustive.
-      return {kind: 'workspace-failure', workspaceKind: 'inspect-error', code: error.code}
     case 'http-error':
       return {kind: 'workspace-failure', workspaceKind: 'http-error', status: error.status}
     case 'network-error':

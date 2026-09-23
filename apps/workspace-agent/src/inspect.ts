@@ -14,8 +14,6 @@
  *    rejected as `checkout-substituted` \u2014 state is never reported for a substituted repository.
  */
 
-import type {Buffer} from 'node:buffer'
-
 import type {
   CheckoutObservation,
   CheckoutOperation,
@@ -24,7 +22,7 @@ import type {
   InspectRequest,
   InspectSuccess,
 } from './types.js'
-import {spawn} from 'node:child_process'
+import {execFile} from 'node:child_process'
 import {realpath, stat} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
@@ -40,6 +38,16 @@ export const DEFAULT_INSPECT_TIMEOUT_MS = 10_000
  * elsewhere in this repo (src/services/setup/adapters.ts) for confirmed-termination semantics.
  */
 const GIT_KILL_REAP_GRACE_MS = 2_000
+
+/**
+ * Bound on buffered stdout/stderr per git invocation. `execFile` buffers both streams in
+ * memory and enforces this ceiling itself (Node's default is 1 MiB, too small for `git status
+ * --porcelain=v2` on a large dirty tree — a single renamed/untracked file is a full porcelain
+ * line, so tens of thousands of changed files can run into several MB of output). 64 MiB
+ * comfortably covers even a six-figure changed-file count while still bounding memory use per
+ * inspection call.
+ */
+const GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024
 
 // ---------------------------------------------------------------------------
 // Git subprocess runner \u2014 confirmed-termination timeout, no credential env.
@@ -59,61 +67,59 @@ export type GitOutcome =
 export type GitRunnerFn = (args: readonly string[], options: GitRunnerOptions) => Promise<GitOutcome>
 
 /**
- * Default git runner. Spawns `git` directly (not promisified execFile) so we retain a handle to
- * the child process and can CONFIRM termination on timeout: we wait for the `close` event (which
- * fires only after the process has actually exited) before resolving the timeout outcome, rather
- * than resolving as soon as `kill()` is called.
+ * Default git runner. Uses the callback form of `execFile` (never the promisified wrapper) so we
+ * retain a handle to the underlying `ChildProcess` and can CONFIRM termination on timeout: on
+ * timeout we SIGKILL the child and wait for `execFile`'s callback — which Node fires only after
+ * the child's stdio streams have actually closed — before resolving the timeout outcome, rather
+ * than resolving as soon as `kill()` is called. `maxBuffer` is set explicitly so a pathologically
+ * large `git status` output fails cleanly (mapped to a `failed` outcome) instead of throwing past
+ * the caller.
  */
 export const runGit: GitRunnerFn = async (args, options) =>
   new Promise(resolve => {
-    const child = spawn('git', args, {cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe']})
-    let stdout = ''
-    let stderr = ''
     let settled = false
     let timedOut = false
     let graceHandle: ReturnType<typeof setTimeout> | undefined
+    let timeoutHandle: ReturnType<typeof setTimeout>
 
-    const timeoutHandle = setTimeout(() => {
+    const child = execFile(
+      'git',
+      args,
+      {cwd: options.cwd, env: options.env, maxBuffer: GIT_MAX_BUFFER_BYTES, encoding: 'utf8'},
+      (error, stdout, stderr) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeoutHandle)
+        clearTimeout(graceHandle)
+        if (timedOut) {
+          resolve({kind: 'timeout'})
+          return
+        }
+        if (error === null) {
+          resolve({kind: 'ok', stdout, stderr})
+          return
+        }
+        // error.code is the numeric exit code for a normal non-zero exit, or a string (e.g.
+        // 'ENOENT', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') for spawn/stream failures — including
+        // maxBuffer overflow, which we want reported as a clean `failed` outcome, not a throw
+        // that escapes the caller.
+        const code = typeof error.code === 'number' ? error.code : null
+        resolve({kind: 'failed', code, stdout, stderr})
+      },
+    )
+
+    timeoutHandle = setTimeout(() => {
       timedOut = true
       child.kill('SIGKILL')
       // Grace window in case SIGKILL doesn't reap promptly (unusual, but SIGKILL delivery is not
-      // instantaneous). If the child still hasn't closed after this, resolve anyway \u2014 the caller
-      // must never hang forever \u2014 but we have genuinely waited, not just fired-and-forgotten.
+      // instantaneous). If the child still hasn't closed after this, resolve anyway — the caller
+      // must never hang forever — but we have genuinely waited, not just fired-and-forgotten.
       graceHandle = setTimeout(() => {
         if (settled) return
         settled = true
         resolve({kind: 'timeout'})
       }, GIT_KILL_REAP_GRACE_MS)
     }, options.timeoutMs)
-
-    child.stdout?.on('data', (data: Buffer) => {
-      stdout += data.toString('utf8')
-    })
-    child.stderr?.on('data', (data: Buffer) => {
-      stderr += data.toString('utf8')
-    })
-    child.on('error', () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeoutHandle)
-      clearTimeout(graceHandle)
-      resolve({kind: 'failed', code: null, stdout, stderr})
-    })
-    child.on('close', code => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeoutHandle)
-      clearTimeout(graceHandle)
-      if (timedOut) {
-        resolve({kind: 'timeout'})
-        return
-      }
-      if (code === 0) {
-        resolve({kind: 'ok', stdout, stderr})
-        return
-      }
-      resolve({kind: 'failed', code, stdout, stderr})
-    })
   })
 
 /**
@@ -253,10 +259,25 @@ async function pathExists(target: string): Promise<boolean> {
   }
 }
 
+/**
+ * `rebase-apply/` is shared by two distinct git operations: `git am` and the apply-based
+ * (`--apply`) form of `git rebase`. Git itself tells them apart with a marker file inside the
+ * directory: `applying` for `git am`, `rebasing` for `git rebase --apply` (verified against real
+ * git 2.55: `am` leaves only `applying`, `rebase --apply` leaves only `rebasing`, never both).
+ * If `rebase-apply/` exists with neither marker — a state git's own sources treat as impossible
+ * for a live operation — report `rebase`: it was the pre-existing (and more common) mapping for
+ * this directory, so a markerless directory left by some future git version degrades to the
+ * prior behavior rather than to a guess with no evidence behind it.
+ */
+async function detectRebaseApplyOperation(gitDir: string): Promise<CheckoutOperation> {
+  if (await pathExists(join(gitDir, 'rebase-apply', 'applying'))) return 'am'
+  return 'rebase'
+}
+
 async function detectOperationInProgress(gitDir: string): Promise<CheckoutOperation> {
   if (await pathExists(join(gitDir, 'MERGE_HEAD'))) return 'merge'
   if (await pathExists(join(gitDir, 'rebase-merge'))) return 'rebase'
-  if (await pathExists(join(gitDir, 'rebase-apply'))) return 'rebase'
+  if (await pathExists(join(gitDir, 'rebase-apply'))) return detectRebaseApplyOperation(gitDir)
   if (await pathExists(join(gitDir, 'CHERRY_PICK_HEAD'))) return 'cherry-pick'
   if (await pathExists(join(gitDir, 'REVERT_HEAD'))) return 'revert'
   if (await pathExists(join(gitDir, 'BISECT_LOG'))) return 'bisect'
@@ -298,7 +319,7 @@ function failure(error: InspectErrorCode, statusCode: InspectHandlerResult['stat
  *    reported for a substituted or escaped repository.
  * 3. Runs `git status --no-optional-locks --porcelain=v2 --branch` to read HEAD and worktree
  *    state in a single read-only call.
- * 4. Detects an in-progress merge/rebase/cherry-pick/revert/bisect from the presence of git's own
+ * 4. Detects an in-progress merge/rebase/am/cherry-pick/revert/bisect from the presence of git's
  *    state files in the resolved git directory \u2014 never from parsing human-readable output.
  */
 export async function inspectCheckout(
@@ -309,6 +330,15 @@ export async function inspectCheckout(
   const {timeoutMs = DEFAULT_INSPECT_TIMEOUT_MS} = options
   const {owner, repo} = request
 
+  // Resolve the repos root itself first, so the substitution check below compares against the
+  // real (symlink-free) root rather than a possibly-symlinked ancestor of it.
+  let reposRootResolved: string
+  try {
+    reposRootResolved = await realpath(reposRoot)
+  } catch {
+    return failure('inspection-failed', 500)
+  }
+
   const destPath = join(reposRoot, owner, repo)
 
   let canonicalResolved: string
@@ -316,6 +346,16 @@ export async function inspectCheckout(
     canonicalResolved = await realpath(destPath)
   } catch {
     return failure('no-checkout', 404)
+  }
+
+  // Strict equality, not a prefix/"underneath" check: the resolved checkout must be EXACTLY
+  // `<resolved reposRoot>/<owner>/<repo>`. A prefix check alone would still accept a symlinked
+  // `owner` component, or a repo directory symlinked to a *different* repo that happens to live
+  // under the same root — both resolve to a path underneath reposRoot without being the
+  // requested checkout.
+  const expectedCanonical = join(reposRootResolved, owner, repo)
+  if (canonicalResolved !== expectedCanonical) {
+    return failure('checkout-substituted', 409)
   }
 
   const env = buildInspectEnv()

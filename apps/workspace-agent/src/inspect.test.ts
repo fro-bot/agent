@@ -8,7 +8,7 @@
 import type {InspectRequest} from './types.js'
 
 import {execFileSync} from 'node:child_process'
-import {chmodSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync} from 'node:fs'
+import {chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync} from 'node:fs'
 import {mkdir, mkdtemp, rm, symlink, writeFile} from 'node:fs/promises'
 import os from 'node:os'
 import {join} from 'node:path'
@@ -235,6 +235,70 @@ describe('inspectCheckout — happy path', () => {
     const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
     expect(success.observation.operationInProgress).toBe('rebase')
   })
+
+  it("detects a real `git am` in progress and reports it as 'am', not 'rebase'", async () => {
+    // #given — build a patch from a divergent commit and `git am` it against a base that no
+    // longer matches, so `git am` stops with a conflict and leaves rebase-apply/applying.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'line1\n', 'base')
+    gitSync(dir, ['branch', 'topic'])
+    writeFileSync(join(dir, 'a.txt'), 'line1\nmain-change\n')
+    gitSync(dir, ['commit', '-q', '-am', 'main change'])
+    gitSync(dir, ['checkout', 'topic', '-q'])
+    writeFileSync(join(dir, 'a.txt'), 'line1\ntopic-change\n')
+    gitSync(dir, ['commit', '-q', '-am', 'topic change'])
+
+    const patchDir = mkdtempSync(join(os.tmpdir(), 'inspect-am-patch-'))
+    try {
+      execFileSync('git', ['format-patch', '-1', 'topic', '-o', patchDir], {cwd: dir, env: GIT_ENV})
+      const [patchName] = readdirSync(patchDir)
+      if (patchName === undefined) throw new Error('format-patch produced no patch file')
+      const patchPath = join(patchDir, patchName)
+
+      gitSync(dir, ['checkout', 'main', '-q'])
+      try {
+        execFileSync('git', ['am', patchPath], {cwd: dir, env: GIT_ENV})
+      } catch {
+        // Expected: the patch does not cleanly apply to `main`, so `git am` stops mid-apply.
+      }
+
+      // #when
+      const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+      // #then
+      const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
+      expect(success.observation.operationInProgress).toBe('am')
+    } finally {
+      rmSync(patchDir, {recursive: true, force: true})
+    }
+  })
+
+  it("detects an apply-based `git rebase --apply` conflict and reports it as 'rebase', not 'am'", async () => {
+    // #given — force the legacy apply-based rebase backend so it leaves rebase-apply/rebasing
+    // rather than rebase-merge/.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'line1\n', 'base')
+    gitSync(dir, ['branch', 'topic'])
+    writeFileSync(join(dir, 'a.txt'), 'line1\nmain-change\n')
+    gitSync(dir, ['commit', '-q', '-am', 'main change'])
+    gitSync(dir, ['checkout', 'topic', '-q'])
+    writeFileSync(join(dir, 'a.txt'), 'line1\ntopic-change\n')
+    gitSync(dir, ['commit', '-q', '-am', 'topic change'])
+    try {
+      gitSync(dir, ['rebase', '--apply', 'main'])
+    } catch {
+      // Expected: apply-based rebase stops on conflict.
+    }
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+    // #then
+    const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
+    expect(success.observation.operationInProgress).toBe('rebase')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -322,6 +386,97 @@ describe('inspectCheckout — errors', () => {
     // #then
     expect(result.statusCode).toBe(409)
     expect(result.response).toEqual({ok: false, error: 'checkout-substituted'})
+  })
+
+  // -------------------------------------------------------------------------
+  // Symlinked-checkout escape: the owner/repo path itself (not just .git) is a
+  // symlink. Real symlinks in a temp dir, never mocked realpath — the fix must hold
+  // against actual filesystem resolution.
+  // -------------------------------------------------------------------------
+
+  it('rejects a repo directory symlinked to a repo OUTSIDE the repos root (induced-failure baseline: fails without the fix)', async () => {
+    // #given — a real git repo living entirely outside reposRoot, and
+    // reposRoot/owner/repo is a symlink pointing straight at it.
+    const owner = 'testowner'
+    const repo = 'testrepo'
+    const outsideRoot = await mkdtemp(join(os.tmpdir(), 'inspect-outside-'))
+    const outsideRepoDir = join(outsideRoot, 'evil-target')
+    await mkdir(outsideRepoDir, {recursive: true})
+    initRepo(outsideRepoDir)
+    commitFile(outsideRepoDir, 'secret.txt', 'outside\n', 'outside commit')
+
+    await mkdir(join(reposRoot, owner), {recursive: true})
+    await symlink(outsideRepoDir, join(reposRoot, owner, repo))
+
+    try {
+      // #when
+      const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+      // #then — must be rejected, never report the outside repo's state as this repo's.
+      expect(result.statusCode).toBe(409)
+      expect(result.response).toEqual({ok: false, error: 'checkout-substituted'})
+    } finally {
+      await rm(outsideRoot, {recursive: true, force: true})
+    }
+  })
+
+  it('rejects a repo directory symlinked to a DIFFERENT repo inside the repos root', async () => {
+    // #given — a real repo at reposRoot/otherowner/otherrepo, and reposRoot/testowner/testrepo
+    // is a symlink pointing at it instead of being its own checkout.
+    const owner = 'testowner'
+    const repo = 'testrepo'
+    const otherOwner = 'otherowner'
+    const otherRepo = 'otherrepo'
+    const otherDir = join(reposRoot, otherOwner, otherRepo)
+    await mkdir(otherDir, {recursive: true})
+    initRepo(otherDir)
+    commitFile(otherDir, 'other.txt', 'other\n', 'other commit')
+
+    await mkdir(join(reposRoot, owner), {recursive: true})
+    await symlink(otherDir, join(reposRoot, owner, repo))
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+    // #then — rejected even though the target is inside reposRoot: a prefix/"underneath" check
+    // alone would have let this through.
+    expect(result.statusCode).toBe(409)
+    expect(result.response).toEqual({ok: false, error: 'checkout-substituted'})
+  })
+
+  it('rejects a checkout whose owner component is a symlink', async () => {
+    // #given — the real repo lives at reposRoot/real-owner-dir/testrepo, and
+    // reposRoot/testowner is a symlink to real-owner-dir.
+    const owner = 'testowner'
+    const repo = 'testrepo'
+    const realOwnerDir = join(reposRoot, 'real-owner-dir')
+    const realRepoDir = join(realOwnerDir, repo)
+    await mkdir(realRepoDir, {recursive: true})
+    initRepo(realRepoDir)
+    commitFile(realRepoDir, 'a.txt', 'base\n', 'initial commit')
+
+    await symlink(realOwnerDir, join(reposRoot, owner))
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+    // #then
+    expect(result.statusCode).toBe(409)
+    expect(result.response).toEqual({ok: false, error: 'checkout-substituted'})
+  })
+
+  it('still accepts an ordinary (non-symlinked) checkout', async () => {
+    // #given — sanity control: no symlinks anywhere in the path.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+
+    // #then
+    expect(result.statusCode).toBe(200)
+    expect(result.response.ok).toBe(true)
   })
 
   it('times out and confirms the git subprocess is terminated', async () => {

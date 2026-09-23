@@ -16,10 +16,12 @@ import type {
   CloneFailure,
   CloneRequest,
   CloneSuccess,
+  CloneWorkspaceError,
   InspectErrorCode,
   InspectFailure,
   InspectRequest,
   InspectSuccess,
+  InspectWorkspaceError,
   ReadyzResponse,
   WorkspaceError,
 } from './types.js'
@@ -31,10 +33,15 @@ export interface WorkspaceClientOptions {
   readonly timeoutMs?: number
   /** Timeout for /readyz checks. Defaults to 5 seconds — much shorter than clone. */
   readonly readyzTimeoutMs?: number
+  /**
+   * Timeout for /inspect checks. Defaults to DEFAULT_INSPECT_TIMEOUT_MS (25 seconds) —
+   * much shorter than clone. See DEFAULT_INSPECT_TIMEOUT_MS for sizing rationale.
+   */
+  readonly inspectTimeoutMs?: number
 }
 
 export interface WorkspaceClient {
-  readonly clone: (request: CloneRequest) => Promise<Result<CloneSuccess, WorkspaceError>>
+  readonly clone: (request: CloneRequest) => Promise<Result<CloneSuccess, CloneWorkspaceError>>
   /**
    * Check workspace readiness via GET /readyz.
    *
@@ -61,11 +68,25 @@ export interface WorkspaceClient {
    *   contradiction, an unknown `kind`/`operationInProgress` value, an invalid SHA, or a
    *   malformed timestamp. The wire response is never trusted at face value.
    */
-  readonly inspect: (request: InspectRequest) => Promise<Result<CheckoutObservation, WorkspaceError>>
+  readonly inspect: (request: InspectRequest) => Promise<Result<CheckoutObservation, InspectWorkspaceError>>
 }
 
 const DEFAULT_TIMEOUT_MS = 300_000 // 5 minutes
 const DEFAULT_READYZ_TIMEOUT_MS = 5_000 // 5 seconds — fast gate check
+/**
+ * Timeout for /inspect calls. The gateway calls inspect() while holding the per-repo
+ * coordination lock (see ensureClone/inspect ordering in execute/run.ts), so this must
+ * be sized well below the clone budget: a stalled workspace agent must not pin that lock
+ * for anywhere near DEFAULT_TIMEOUT_MS.
+ *
+ * Server-side (apps/workspace-agent/src/inspect.ts DEFAULT_INSPECT_TIMEOUT_MS), inspect()
+ * runs at most two bounded git subprocesses at 10s each (20s worst case) plus unbounded
+ * filesystem work (realpath x3, several stat() calls for in-progress-operation detection).
+ * 25s gives ~5s of headroom above the two-subprocess worst case for that fs work and
+ * scheduling jitter, while still keeping the repo lock pinned for a small fraction of the
+ * 5-minute clone budget instead of the whole thing.
+ */
+const DEFAULT_INSPECT_TIMEOUT_MS = 25_000 // 25 seconds — 2x10s bounded subprocesses + fs-work headroom
 
 // Mirrors WORKSPACE_REPOS_ROOT in apps/workspace-agent/src/clone.ts (separate
 // package/container boundary, so not imported). Module-private: callers use
@@ -89,7 +110,12 @@ export function workspaceRepoPath(owner: string, repo: string): string {
  * Never logs request or response bodies.
  */
 export function createWorkspaceClient(options: WorkspaceClientOptions): WorkspaceClient {
-  const {baseUrl, timeoutMs = DEFAULT_TIMEOUT_MS, readyzTimeoutMs = DEFAULT_READYZ_TIMEOUT_MS} = options
+  const {
+    baseUrl,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    readyzTimeoutMs = DEFAULT_READYZ_TIMEOUT_MS,
+    inspectTimeoutMs = DEFAULT_INSPECT_TIMEOUT_MS,
+  } = options
 
   async function readyz(): Promise<Result<ReadyzResponse, WorkspaceError>> {
     let response: Response
@@ -140,7 +166,7 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     return ok(parsed)
   }
 
-  async function clone(request: CloneRequest): Promise<Result<CloneSuccess, WorkspaceError>> {
+  async function clone(request: CloneRequest): Promise<Result<CloneSuccess, CloneWorkspaceError>> {
     const {owner, repo} = request
     // SECURITY: body is never logged — it contains the IAT.
     const body = JSON.stringify(request)
@@ -205,7 +231,7 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     return ok(parsed)
   }
 
-  async function inspect(request: InspectRequest): Promise<Result<CheckoutObservation, WorkspaceError>> {
+  async function inspect(request: InspectRequest): Promise<Result<CheckoutObservation, InspectWorkspaceError>> {
     // SECURITY: body is never logged (no secrets here, but keep the same discipline as clone()).
     const body = JSON.stringify(request)
 
@@ -215,7 +241,7 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(inspectTimeoutMs),
       })
     } catch (fetchError) {
       if (fetchError instanceof Error && fetchError.name === 'TimeoutError') {
@@ -326,7 +352,7 @@ function isValidSha(value: unknown): value is string {
   return typeof value === 'string' && SHA_RE.test(value)
 }
 
-const CHECKOUT_OPERATIONS = new Set<string>(['none', 'merge', 'rebase', 'cherry-pick', 'revert', 'bisect'])
+const CHECKOUT_OPERATIONS = new Set<string>(['none', 'merge', 'rebase', 'am', 'cherry-pick', 'revert', 'bisect'])
 
 function isCheckoutOperation(value: unknown): value is CheckoutOperation {
   return typeof value === 'string' && CHECKOUT_OPERATIONS.has(value)

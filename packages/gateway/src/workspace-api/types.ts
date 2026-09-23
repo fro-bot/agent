@@ -77,7 +77,7 @@ export type WorktreeState =
     }
 
 /** In-progress git operation detected from state files in the git directory. */
-export type CheckoutOperation = 'none' | 'merge' | 'rebase' | 'cherry-pick' | 'revert' | 'bisect'
+export type CheckoutOperation = 'none' | 'merge' | 'rebase' | 'am' | 'cherry-pick' | 'revert' | 'bisect'
 
 /** A single point-in-time observation of an existing checkout. Never mutates the checkout. */
 export interface CheckoutObservation {
@@ -134,9 +134,33 @@ export type ReadyzResponse = ReadyzReady | ReadyzNotReady
 /**
  * Client-side error discriminated union for workspace-api calls.
  * These are the errors the gateway's workspace client can return.
+ *
+ * This is the union of everything ANY workspace-api call can produce — kept for
+ * callers (e.g. `readyz()`, and existing consumers outside this module) that
+ * genuinely need the wider shape. `clone()` and `inspect()` return the narrower
+ * `CloneWorkspaceError`/`InspectWorkspaceError` below instead, since each can only
+ * ever produce its own structured-error kind, never the other's.
  */
 export type WorkspaceError =
   | {readonly kind: 'clone-error'; readonly code: CloneErrorCode}
+  | {readonly kind: 'inspect-error'; readonly code: InspectErrorCode}
+  | {readonly kind: 'http-error'; readonly status: number}
+  | {readonly kind: 'network-error'}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'parse-error'}
+  | {readonly kind: 'response-mismatch'}
+
+/** Errors `WorkspaceClient.clone()` can return — never `inspect-error`, which `clone()` cannot produce. */
+export type CloneWorkspaceError =
+  | {readonly kind: 'clone-error'; readonly code: CloneErrorCode}
+  | {readonly kind: 'http-error'; readonly status: number}
+  | {readonly kind: 'network-error'}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'parse-error'}
+  | {readonly kind: 'response-mismatch'}
+
+/** Errors `WorkspaceClient.inspect()` can return — never `clone-error`, which `inspect()` cannot produce. */
+export type InspectWorkspaceError =
   | {readonly kind: 'inspect-error'; readonly code: InspectErrorCode}
   | {readonly kind: 'http-error'; readonly status: number}
   | {readonly kind: 'network-error'}

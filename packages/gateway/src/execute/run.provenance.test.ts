@@ -1,13 +1,18 @@
+import type {CoordinationConfig} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {
   awaitLaunchWorkRun,
   buildMockRunState,
+  makeBinding,
   makeCleanObservation,
   makeDeps,
   makeEnsureCloneFn,
   makeInMemoryRequest,
   makeInspectFn,
+  makeMessage,
+  makeStatusControllerMock,
+  mockCreateDiscordStreamSink,
   mockRunOpenCodeCore,
   mockRuntime,
   setupHappyPath,
@@ -191,6 +196,131 @@ describe('checkout provenance', () => {
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
+  it('checkout-substituted → the failure reply carries the withheld-provenance line (no SHA, no branch)', async () => {
+    // #given — the same substituted-checkout setup as above; this test only asserts
+    // on the reply content
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
+      })
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
+      })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          runEtag: 'run-etag-after-heartbeat',
+          lockEtag: 'lock-etag-after-heartbeat',
+          runState: buildMockRunState(),
+        },
+      }),
+      isRunning: false,
+    })
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({inspect: makeInspectFn('checkout-substituted')})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — this is the ONE failure reply that most needs the line (the run found a
+    // tree that shouldn't be there), and before the fix it was silently dropped because
+    // `provenanceLine` was never set before the throw. Exact text, no SHA, no branch —
+    // those would describe the substituted (untrusted) tree, not the expected one.
+    const sends = request._replySink._sends
+    const failureSend = sends.find(s => s.content.includes("doesn't match this repository"))
+    expect(failureSend).toBeDefined()
+    expect(failureSend?.content).toContain(
+      'Started from `acme/widget` — starting state withheld: checkout is not the expected repository.',
+    )
+    expect(failureSend?.content).not.toMatch(/@[0-9a-f]{7}/)
+    expect(failureSend?.content).not.toContain('Remote freshness')
+  })
+
+  it('eXECUTING lost the adoption race to an operator cancel: no provenance write ever lands', async () => {
+    // #given — inspect() succeeds (an observation is available and would normally be
+    // persisted via the EXECUTING detailsPatch), but the ACKNOWLEDGED -> EXECUTING
+    // transition 412s and a re-read shows the run was already cancelled by an operator.
+    // Pins existing behavior (run.ts's cancel-wins-adoption-race exit at the EXECUTING
+    // transition never writes provenance) — this test passes both before and after the
+    // comment-only change at that exit; there is no code-behavior fix here to induce a
+    // failure from.
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
+      })
+      .mockResolvedValueOnce({success: false as const, error: new Error('412 precondition failed')})
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          runEtag: 'run-etag-after-heartbeat',
+          lockEtag: 'lock-etag-after-heartbeat',
+          runState: buildMockRunState(),
+        },
+      }),
+      isRunning: false,
+    })
+
+    const cancelledRunState = buildMockRunState({phase: 'CANCELLED'})
+    const getObjectMock = vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {data: JSON.stringify(cancelledRunState), etag: 'cancelled-etag'},
+    })
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({coordinationConfig, inspect: makeInspectFn('observed')})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — ACKNOWLEDGED succeeded, EXECUTING was attempted (carrying checkoutProvenance
+    // in its detailsPatch) but that attempt is exactly the one mocked to fail above — no
+    // transitionRun call ever succeeds with checkoutProvenance, so nothing lands in the store
+    const transitionCalls = mockRuntime.transitionRun.mock.calls
+    expect(transitionCalls.map(c => c[4] as string)).toEqual(['ACKNOWLEDGED', 'EXECUTING'])
+    const executingCall = transitionCalls.find(c => c[4] === 'EXECUTING')
+    const executingOptions = executingCall?.[7]
+    expect(executingOptions?.detailsPatch?.checkoutProvenance).toBeDefined()
+
+    // #and — no FAILED fallback (this is the graceful-loser exit, not a genuine failure)
+    // and no further transitionRun attempts — the provenance-carrying write is never retried
+    expect(mockRuntime.transitionRun).toHaveBeenCalledTimes(2)
+
+    // #and — clean exit: lock released, no agent session started, no reply sent
+    expect(mockRuntime.releaseLock).toHaveBeenCalled()
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(request._replySink._sends).toHaveLength(0)
+  })
+
   it('inspection is called after ensureClone and under the lock (call order)', async () => {
     // #given
     const {launchWork} = await import('./run.js')
@@ -256,6 +386,36 @@ describe('checkout provenance', () => {
     expect(errorSend).toBeDefined()
     expect(errorSend?.content).not.toContain('not reachable')
     expect(errorSend?.content).not.toMatch(/may not exist|doesn't have access/)
+    expect(errorSend?.content).toContain('An operator needs to look at it')
+
+    // #and — inspect was never called (ensureClone failed before it)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  it('clone response-mismatch is workspace-unavailable, not the retry-inviting message — the path comparison gives the same answer on every retry, and ensure-clone.ts already logs it as a security signal', async () => {
+    // #given — ensureClone surfaces a workspace-failure/response-mismatch, the coarse
+    // mapping of client.ts's strict full-path equality check failing (a possible tamper
+    // signal, not a transient condition)
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const ensureClone = makeEnsureCloneFn('success')
+    ;(ensureClone as unknown as {mockResolvedValue: (v: unknown) => void}).mockResolvedValue({
+      success: false,
+      error: {kind: 'workspace-failure', workspaceKind: 'response-mismatch'},
+    })
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({ensureClone})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — no "try again later" retry invitation for a check that returns the same
+    // answer on every retry
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.length > 0)
+    expect(errorSend).toBeDefined()
+    expect(errorSend?.content).not.toContain('not reachable')
+    expect(errorSend?.content).not.toContain('try again later')
     expect(errorSend?.content).toContain('An operator needs to look at it')
 
     // #and — inspect was never called (ensureClone failed before it)
@@ -397,5 +557,120 @@ describe('checkout provenance', () => {
     const sends = request._replySink._sends
     const errorSend = sends.find(s => s.content.includes('not reachable'))
     expect(errorSend).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The deterministic provenance line is appended into the reply buffer through
+// a mutable guard (`provenanceLineAppended` in run.ts) that fires at most once
+// per run — deliberately NOT on the generic failure and cancel paths (see the
+// comment at the FAILED branch's flush call). These tests pin that "exactly
+// once" contract on every delivery mode that DOES carry the buffer-channel
+// line: both success transitions (live-status and typing-only, which differ
+// only in whether the status controller "handles" the answer in place or
+// "delegates" to a sink flush), a plain buffer-only success (the web
+// transport's shape), and quarantine (whose flush explicitly re-uses the same
+// buffer-append mechanism "so the buffer-only web transport still carries
+// it"). A regression that appended the line twice (guard removed) or zero
+// times (append call deleted) would fail these.
+// ---------------------------------------------------------------------------
+
+/** Count non-overlapping occurrences of the provenance line's stable opening marker. */
+function countProvenanceMarker(text: string): number {
+  return (text.match(/Started from `acme\/widget/g) ?? []).length
+}
+
+/** Stream-sink mock with a real accumulating buffer (unlike the static default). */
+function makeTrackingStreamSinkMock() {
+  let buffer = ''
+  return {
+    append: vi.fn((text: string) => {
+      buffer += text
+    }),
+    flush: vi.fn().mockImplementation(async () => ({kind: 'sent' as const, charCount: buffer.length})),
+    buffered: vi.fn(() => buffer),
+    markVisibleOutputSent: vi.fn(),
+    markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+    hasVisibleOutput: vi.fn().mockReturnValue(false),
+  }
+}
+
+describe('the deterministic provenance line appears exactly once per delivery mode', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('success on live-status: resolveToAnswer(handled) carries the line exactly once — no separate flush to duplicate it', async () => {
+    // #given — live-status mode; the status controller "handles" the answer by editing
+    // the status message in place with the text it received
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const ctrl = makeStatusControllerMock({resolveToAnswerResult: {transition: 'handled'}})
+    mockCreateDiscordStreamSink.mockReturnValue(makeTrackingStreamSinkMock())
+    const message = makeMessage()
+    const deps = makeDeps({statusMode: 'live-status', inspect: makeInspectFn('observed')})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — the line is in the exact text the status message was edited to
+    expect(ctrl.resolveToAnswer).toHaveBeenCalledOnce()
+    const finalText = ctrl.resolveToAnswer.mock.calls[0]?.[0] as string
+    expect(countProvenanceMarker(finalText)).toBe(1)
+  })
+
+  it('success on typing-only: resolveToAnswer(delegated) → sink.flush carries the line exactly once', async () => {
+    // #given — typing-only mode; the controller delegates (no status message), so the
+    // flushed sink buffer is the only place the answer (and the line) is delivered
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+    const streamSink = makeTrackingStreamSinkMock()
+    mockCreateDiscordStreamSink.mockReturnValue(streamSink)
+    const message = makeMessage()
+    const deps = makeDeps({statusMode: 'typing-only', inspect: makeInspectFn('observed')})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then
+    expect(streamSink.flush).toHaveBeenCalledOnce()
+    expect(countProvenanceMarker(streamSink.buffered())).toBe(1)
+  })
+
+  it('web success: the buffer-only transport (no status controller) carries the line exactly once', async () => {
+    // #given — the launchWork/in-memory-request shape the web transport uses: no status
+    // message, `replySink.buffered()`/`flush()` is the only delivery channel
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    mockRunOpenCodeCore.mockImplementation(async params => {
+      ;(params as {sink: {append: (t: string) => void}}).sink.append('the agent answer')
+    })
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({inspect: makeInspectFn('observed')})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then
+    expect(countProvenanceMarker(request._replySink.buffered())).toBe(1)
+  })
+
+  it('quarantine: the flushed buffer carries the line exactly once', async () => {
+    // #given — a quarantined RunCoreError; the quarantine branch appends the line into
+    // the SAME buffer/guard mechanism as the success path ("so the buffer-only web
+    // transport still carries it"), before flushing
+    const {launchWork} = await import('./run.js')
+    const {RunCoreError} = await import('./run-core.js')
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed', true))
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({inspect: makeInspectFn('observed')})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then
+    expect(countProvenanceMarker(request._replySink.buffered())).toBe(1)
   })
 })

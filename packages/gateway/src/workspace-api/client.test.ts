@@ -283,7 +283,7 @@ describe('WorkspaceClient.readyz', () => {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeClient(overrides?: {baseUrl?: string; timeoutMs?: number}) {
+function makeClient(overrides?: {baseUrl?: string; timeoutMs?: number; inspectTimeoutMs?: number}) {
   return createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 1000, ...overrides})
 }
 
@@ -846,6 +846,21 @@ describe('WorkspaceClient.inspect', () => {
       vi.unstubAllGlobals()
     })
 
+    it("accepts operationInProgress: 'am' (git am, distinct from rebase)", async () => {
+      // #given
+      const client = makeClient()
+      const observation = {...VALID_OBSERVATION, operationInProgress: 'am'}
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(ok(observation))
+      vi.unstubAllGlobals()
+    })
+
     it('pOSTs /inspect with owner/repo on the same base URL as /clone', async () => {
       // #given
       const client = makeClient()
@@ -934,6 +949,43 @@ describe('WorkspaceClient.inspect', () => {
       // #then
       expect(result).toEqual(err({kind: 'http-error', status: 502}))
       vi.unstubAllGlobals()
+    })
+  })
+
+  describe('inspect timeout budget', () => {
+    it('uses inspectTimeoutMs, not the clone timeoutMs, for the /inspect AbortSignal', async () => {
+      // #given — a distinct inspectTimeoutMs and a much larger clone timeoutMs, so a shared
+      // budget would be observably wrong.
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
+      const client = makeClient({timeoutMs: 300_000, inspectTimeoutMs: 25_000})
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation: VALID_OBSERVATION})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      await client.inspect(makeInspectRequest())
+
+      // #then — inspect() must abort on its own budget, never the 5-minute clone budget.
+      expect(timeoutSpy).toHaveBeenCalledWith(25_000)
+      expect(timeoutSpy).not.toHaveBeenCalledWith(300_000)
+      vi.unstubAllGlobals()
+      timeoutSpy.mockRestore()
+    })
+
+    it('defaults inspectTimeoutMs independently of an injected clone timeoutMs', async () => {
+      // #given — only timeoutMs (clone budget) is overridden; inspectTimeoutMs is left at its
+      // own default (25s) rather than inheriting the clone value.
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
+      const client = createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 300_000})
+      const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation: VALID_OBSERVATION})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(timeoutSpy).toHaveBeenCalledWith(25_000)
+      vi.unstubAllGlobals()
+      timeoutSpy.mockRestore()
     })
   })
 

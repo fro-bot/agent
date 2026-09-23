@@ -10,7 +10,7 @@ import type {Result} from '@fro-bot/runtime'
 import type {AppClient, AppClientAuthResult} from '../github/app-client.js'
 import type {WorkspaceClient} from './client.js'
 import type {EnsureCloneFailure} from './ensure-clone.js'
-import type {CloneSuccess, WorkspaceError} from './types.js'
+import type {CloneSuccess, CloneWorkspaceError} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
@@ -56,7 +56,7 @@ function makeAppClient(
 }
 
 function makeWorkspaceClient(
-  cloneResult: Result<CloneSuccess, WorkspaceError> = ok({
+  cloneResult: Result<CloneSuccess, CloneWorkspaceError> = ok({
     ok: true,
     path: workspaceRepoPath('testowner', 'testrepo'),
     commit: 'abc123',

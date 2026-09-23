@@ -14,7 +14,7 @@
  * rewrite of every consumer.
  */
 
-import type {CheckoutObservation, InspectErrorCode, WorkspaceError} from '../workspace-api/types.js'
+import type {CheckoutObservation, InspectErrorCode, InspectWorkspaceError} from '../workspace-api/types.js'
 
 // ---------------------------------------------------------------------------
 // RemoteFreshness — explicit "not checked" today, extensible tomorrow
@@ -60,7 +60,7 @@ export type CheckoutProvenance =
  * Never called for `checkout-substituted` — `classifyInspectResult` routes that
  * code to `{decision: 'fail-run'}` before this function would be reached.
  */
-function toProvenanceUnavailableReason(error: WorkspaceError): ProvenanceUnavailableReason {
+function toProvenanceUnavailableReason(error: InspectWorkspaceError): ProvenanceUnavailableReason {
   switch (error.kind) {
     case 'inspect-error':
       // Narrowed by the caller (classifyInspectResult) to exclude 'checkout-substituted'.
@@ -74,11 +74,12 @@ function toProvenanceUnavailableReason(error: WorkspaceError): ProvenanceUnavail
     case 'parse-error':
       return {kind: 'parse-error'}
     case 'response-mismatch':
+      // inspect() does not produce this today: its status/body contradiction
+      // returns 'parse-error', and only clone()'s path-equality check raises
+      // 'response-mismatch'. It stays in InspectWorkspaceError's type, so it is
+      // handled rather than asserted away, and kept 'unavailable' rather than
+      // failing the run.
       return {kind: 'response-mismatch'}
-    case 'clone-error':
-      // inspect() never produces this WorkspaceError kind — handled only to keep
-      // the shared WorkspaceError switch exhaustive.
-      return {kind: 'network-error'}
   }
 }
 
@@ -109,7 +110,7 @@ export type InspectOutcome =
 export function classifyInspectResult(
   result:
     | {readonly success: true; readonly data: CheckoutObservation}
-    | {readonly success: false; readonly error: WorkspaceError},
+    | {readonly success: false; readonly error: InspectWorkspaceError},
 ): InspectOutcome {
   if (result.success === true) {
     return {
@@ -216,4 +217,18 @@ export function formatProvenanceLine(repo: string, provenance: CheckoutProvenanc
   }
 
   return `Started from \`${repo}@${shortSha}\` ${branchPart}, ${notes.join(', ')}. Remote freshness not checked.`
+}
+
+/**
+ * Build the human-facing provenance line for the one case `formatProvenanceLine`
+ * never sees: a checkout `inspect()` found to be a different repository than
+ * expected (`checkout-substituted`). Deliberately omits SHA and branch — those
+ * would describe the substituted tree, not the expected one, and this line
+ * exists precisely because that tree should not be trusted. Distinct from
+ * `formatProvenanceLine`'s `unavailable` case, which means "inspection
+ * failed" (an availability gap) rather than "the checkout is untrustworthy"
+ * (a correctness signal) — the two must not share wording.
+ */
+export function formatSubstitutedCheckoutLine(repo: string): string {
+  return `Started from \`${repo}\` — starting state withheld: checkout is not the expected repository.`
 }
