@@ -30,7 +30,18 @@
 
 import type {RunPhase, RunState, Surface} from '@fro-bot/runtime'
 import type {RunCoreErrorKind} from '../execute/run-core.js'
+import type {OperatorCheckoutProvenance} from './provenance.js'
 
+import {parseOperatorCheckoutProvenance} from './provenance.js'
+
+export type {
+  OperatorCheckoutHead,
+  OperatorCheckoutObservation,
+  OperatorCheckoutOperation,
+  OperatorCheckoutProvenance,
+  OperatorRemoteFreshness,
+  OperatorWorktreeState,
+} from './provenance.js'
 export type {RunPhase, Surface} from '@fro-bot/runtime'
 
 /**
@@ -59,6 +70,17 @@ export interface OperatorRunStatus {
   readonly startedAt: string
   readonly stale: boolean
   readonly failureKind?: OperatorFailureKind
+  /**
+   * What this run started from (the checked-out commit/branch, worktree
+   * cleanliness, any in-progress operation). Present on EVERY phase —
+   * success or failure — not only FAILED, unlike `failureKind`: this is the
+   * run's starting state, not an outcome. Absent (`undefined`) for a run
+   * recorded before this field existed, or if the stored value is malformed;
+   * both collapse to the same "no provenance recorded" state. Never a claim
+   * about the CURRENT tree — an agent that edits files or switches branches
+   * mid-run changes it; this describes the starting point only.
+   */
+  readonly checkoutProvenance?: OperatorCheckoutProvenance
 }
 
 /**
@@ -218,6 +240,13 @@ export const toOperatorRunStatus = (
   // solely within this branch — never elsewhere.
   const failureKind = runState.phase === 'FAILED' ? toOperatorFailureKind(runState.details.failureKind) : undefined
 
+  // checkoutProvenance is populated for EVERY phase — it describes the run's
+  // STARTING state, not an outcome, so unlike failureKind it is not gated on
+  // FAILED. Parsed (never cast) from untrusted `details`; a pre-existing run
+  // (recorded before this field existed) or a malformed stored value both
+  // collapse to `undefined` — the same "no provenance recorded" state.
+  const checkoutProvenance = parseOperatorCheckoutProvenance(runState.details.checkoutProvenance)
+
   // #when projecting — map only operator-safe fields; internal fields are never read
   return {
     runId: runState.run_id,
@@ -230,5 +259,6 @@ export const toOperatorRunStatus = (
     startedAt: runState.started_at,
     stale,
     ...(failureKind === undefined ? {} : {failureKind}),
+    ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
   }
 }
