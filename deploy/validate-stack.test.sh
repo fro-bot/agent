@@ -52,6 +52,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
       - egress-net
@@ -127,6 +131,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -178,6 +186,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -231,6 +243,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -289,6 +305,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -333,6 +353,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -377,6 +401,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -443,6 +471,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -499,6 +531,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -555,6 +591,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
       - egress-net
@@ -615,6 +655,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     network_mode: host
     volumes:
       - workspace-repos:/workspace/repos
@@ -674,6 +718,10 @@ services:
     network_mode: host
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -736,6 +784,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -792,6 +844,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     network_mode: "service:mitmproxy"
     volumes:
       - workspace-repos:/workspace/repos
@@ -843,6 +899,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     network_mode: "container:foo"
     volumes:
       - workspace-repos:/workspace/repos
@@ -889,6 +949,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1035,6 +1099,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1103,6 +1171,10 @@ services:
       - sandbox-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1177,6 +1249,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1245,6 +1321,10 @@ services:
       - sandbox-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1307,6 +1387,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1395,6 +1479,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1458,6 +1546,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1521,6 +1613,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1582,6 +1678,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1644,6 +1744,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1705,6 +1809,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1759,6 +1867,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1821,6 +1933,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1884,6 +2000,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -1947,6 +2067,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2009,6 +2133,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2077,6 +2205,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2144,6 +2276,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2210,6 +2346,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2271,6 +2411,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2335,6 +2479,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2398,6 +2546,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2458,6 +2610,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2508,6 +2664,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2575,6 +2735,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2641,6 +2805,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2692,6 +2860,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2754,6 +2926,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2816,6 +2992,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2871,6 +3051,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2932,6 +3116,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -2994,6 +3182,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3056,6 +3248,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3118,6 +3314,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3182,6 +3382,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3245,11 +3449,15 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
     networks:
       - sandbox-net
     volumes:
       - workspace-repos:/workspace/repos
     security_opt:
+      - no-new-privileges:true
       - "seccomp:default"
 
 networks:
@@ -3295,11 +3503,15 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
     networks:
       - sandbox-net
     volumes:
       - workspace-repos:/workspace/repos
     security_opt:
+      - no-new-privileges:true
       - "label:disable"
 
 networks:
@@ -3332,6 +3544,12 @@ echo "${SECOPT_LABEL_OUTPUT}" | sed 's/^/    /'
 # SYS_TIME allows setting the system clock.  It is not in the banned set and
 # must not be over-rejected.  This confirms the guard is not a blanket cap_add
 # ban but targets only the specific dangerous capabilities.
+#
+# Deliberately applied to a THIRD service (not workspace) — Invariant 8c
+# requires workspace's cap_add to be EXACTLY the six-capability provisioning
+# allowlist (no extras, including benign ones), so SYS_TIME on workspace
+# itself would correctly fail Invariant 8c rather than exercise the banned-set
+# check this test targets. A generic sidecar isolates the two invariants.
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- TEST 57: guard accepts cap_add: [SYS_TIME] (benign capability, not banned) ---"
@@ -3346,10 +3564,18 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
       - workspace-repos:/workspace/repos
+  sidecar:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
     cap_add:
       - SYS_TIME
 
@@ -3398,6 +3624,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3459,6 +3689,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3521,6 +3755,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3583,6 +3821,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3640,6 +3882,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3702,6 +3948,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3752,6 +4002,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3801,6 +4055,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3862,6 +4120,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3922,6 +4184,10 @@ services:
       - egress-net
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -3992,6 +4258,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4052,6 +4322,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4112,6 +4386,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "http://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4171,6 +4449,10 @@ services:
       GATEWAY_OPERATOR_BIND_PORT: "4000"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4232,6 +4514,10 @@ services:
       GATEWAY_OPERATOR_TRUSTED_PROXIES: "172.20.0.10"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4311,6 +4597,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4376,6 +4666,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4436,6 +4730,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4496,6 +4794,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4559,6 +4861,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4622,6 +4928,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4689,6 +4999,10 @@ services:
       GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
   workspace:
     image: ubuntu:22.04
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
     networks:
       - sandbox-net
     volumes:
@@ -4849,6 +5163,237 @@ echo ""
 echo "  LOCKSTEP-1 context:"
 echo "    compose.yaml image : ${COMPOSE_MITM_IMAGE:-<not found>}"
 echo "    egress-smoke.sh    : $(grep 'image:.*mitmproxy' "${EGRESS_SMOKE_FILE}" | head -1 | sed 's/^[[:space:]]*//' || echo '<no mitmproxy image line>')"
+
+# ---------------------------------------------------------------------------
+# Shared fixture: a minimal but fully-hardened workspace service, used as the
+# baseline for TEST 69-75 (workspace uid-isolation Invariant 8). Each negative
+# test starts from this baseline and mutates exactly one hardening key.
+# ---------------------------------------------------------------------------
+hardened_workspace_compose() {
+  local user_line="$1"
+  local cap_drop_line="$2"
+  local cap_add_line="$3"
+  local secopt_line="$4"
+  local token_target="$5"
+  local ca_target="$6"
+  cat <<YAML
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+${user_line}
+${cap_drop_line}
+${cap_add_line}
+${secopt_line}
+    networks:
+      - sandbox-net
+    volumes:
+      - type: bind
+        source: ./secrets/workspace-opencode-token
+        target: ${token_target}
+        read_only: true
+      - type: bind
+        source: ./secrets/workspace-opencode-auth
+        target: /run/workspace-agent/secrets/workspace_opencode_auth
+        read_only: true
+      - mitmproxy-certs:${ca_target}
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+  mitmproxy-certs:
+YAML
+}
+
+USER_OK='    user: "0:0"'
+CAP_DROP_OK='    cap_drop: [ALL]'
+CAP_ADD_OK='    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]'
+SECOPT_OK='    security_opt: [no-new-privileges:true]'
+TOKEN_TARGET_OK='/run/workspace-agent/secrets/workspace_opencode_token'
+CA_TARGET_OK='/run/workspace-agent/mitmproxy'
+
+# ---------------------------------------------------------------------------
+# TEST 69 — Positive: a fully-hardened workspace service (Invariant 8) passes.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 69: workspace uid-isolation hardening (Invariant 8) accepts a fully-hardened service ---"
+
+HARDENED_COMPOSE="${TMPDIR_TEST}/compose-hardened.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" > "${HARDENED_COMPOSE}"
+
+HARDENED_OUTPUT=""
+HARDENED_EXIT=0
+HARDENED_OUTPUT="$(COMPOSE_FILE="${HARDENED_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || HARDENED_EXIT=$?
+
+if [[ "${HARDENED_EXIT}" -eq 0 ]]; then
+  pass "TEST 69: fully-hardened workspace service passes Invariant 8"
+else
+  fail "TEST 69: fully-hardened workspace service was rejected — output: ${HARDENED_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 70 — Negative: workspace missing 'user: "0:0"' must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 70: Invariant 8 rejects workspace missing user: \"0:0\" ---"
+
+NO_USER_COMPOSE="${TMPDIR_TEST}/compose-no-user.yaml"
+hardened_workspace_compose "" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" > "${NO_USER_COMPOSE}"
+
+NO_USER_OUTPUT=""
+NO_USER_EXIT=0
+NO_USER_OUTPUT="$(COMPOSE_FILE="${NO_USER_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || NO_USER_EXIT=$?
+
+if [[ "${NO_USER_EXIT}" -ne 0 ]]; then
+  pass "TEST 70: validate-stack.sh exited non-zero for workspace missing user: \"0:0\""
+else
+  fail "TEST 70: validate-stack.sh exited ZERO for workspace missing user: \"0:0\" — guard did NOT fire"
+fi
+if echo "${NO_USER_OUTPUT}" | grep -qi 'user:'; then
+  pass "TEST 70: failure message mentions the missing user setting"
+else
+  fail "TEST 70: failure message does not mention 'user:' — output: ${NO_USER_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 71 — Negative: workspace cap_add missing a required capability (KILL)
+#           must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 71: Invariant 8 rejects workspace cap_add missing a required capability ---"
+
+MISSING_CAP_COMPOSE="${TMPDIR_TEST}/compose-missing-cap.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" \
+  '    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]' "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" > "${MISSING_CAP_COMPOSE}"
+
+MISSING_CAP_OUTPUT=""
+MISSING_CAP_EXIT=0
+MISSING_CAP_OUTPUT="$(COMPOSE_FILE="${MISSING_CAP_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || MISSING_CAP_EXIT=$?
+
+if [[ "${MISSING_CAP_EXIT}" -ne 0 ]]; then
+  pass "TEST 71: validate-stack.sh exited non-zero for workspace cap_add missing KILL"
+else
+  fail "TEST 71: validate-stack.sh exited ZERO for workspace cap_add missing KILL — guard did NOT fire"
+fi
+if echo "${MISSING_CAP_OUTPUT}" | grep -q "cap_add"; then
+  pass "TEST 71: failure message mentions cap_add"
+else
+  fail "TEST 71: failure message does not mention cap_add — output: ${MISSING_CAP_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 72 — Negative: workspace cap_add with an extra, non-allowlisted
+#           capability must be rejected (even though it is not on the
+#           cross-service banned-capability list checked by Invariant 1d).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 72: Invariant 8 rejects workspace cap_add with an extra non-allowlisted capability ---"
+
+EXTRA_CAP_COMPOSE="${TMPDIR_TEST}/compose-extra-cap.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" \
+  '    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL, NET_BIND_SERVICE]' "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" > "${EXTRA_CAP_COMPOSE}"
+
+EXTRA_CAP_OUTPUT=""
+EXTRA_CAP_EXIT=0
+EXTRA_CAP_OUTPUT="$(COMPOSE_FILE="${EXTRA_CAP_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || EXTRA_CAP_EXIT=$?
+
+if [[ "${EXTRA_CAP_EXIT}" -ne 0 ]]; then
+  pass "TEST 72: validate-stack.sh exited non-zero for workspace cap_add with an extra capability"
+else
+  fail "TEST 72: validate-stack.sh exited ZERO for workspace cap_add with an extra capability — guard did NOT fire"
+fi
+if echo "${EXTRA_CAP_OUTPUT}" | grep -q "NET_BIND_SERVICE"; then
+  pass "TEST 72: failure message names the unexpected extra capability"
+else
+  fail "TEST 72: failure message does not name NET_BIND_SERVICE — output: ${EXTRA_CAP_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 73 — Negative: workspace missing security_opt: no-new-privileges:true
+#           must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 73: Invariant 8 rejects workspace missing no-new-privileges:true ---"
+
+NO_NNP_COMPOSE="${TMPDIR_TEST}/compose-no-nnp.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" > "${NO_NNP_COMPOSE}"
+
+NO_NNP_OUTPUT=""
+NO_NNP_EXIT=0
+NO_NNP_OUTPUT="$(COMPOSE_FILE="${NO_NNP_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || NO_NNP_EXIT=$?
+
+if [[ "${NO_NNP_EXIT}" -ne 0 ]]; then
+  pass "TEST 73: validate-stack.sh exited non-zero for workspace missing no-new-privileges:true"
+else
+  fail "TEST 73: validate-stack.sh exited ZERO for workspace missing no-new-privileges:true — guard did NOT fire"
+fi
+if echo "${NO_NNP_OUTPUT}" | grep -qi "no-new-privileges"; then
+  pass "TEST 73: failure message mentions no-new-privileges"
+else
+  fail "TEST 73: failure message does not mention no-new-privileges — output: ${NO_NNP_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 74 — Negative: workspace's OpenCode token secret mounted at the OLD,
+#           unprotected /run/secrets path (readable by any uid) must be
+#           rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 74: Invariant 8 rejects the OpenCode token secret mounted outside /run/workspace-agent ---"
+
+OLD_SECRET_PATH_COMPOSE="${TMPDIR_TEST}/compose-old-secret-path.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" \
+  '/run/secrets/workspace_opencode_token' "${CA_TARGET_OK}" > "${OLD_SECRET_PATH_COMPOSE}"
+
+OLD_SECRET_PATH_OUTPUT=""
+OLD_SECRET_PATH_EXIT=0
+OLD_SECRET_PATH_OUTPUT="$(COMPOSE_FILE="${OLD_SECRET_PATH_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OLD_SECRET_PATH_EXIT=$?
+
+if [[ "${OLD_SECRET_PATH_EXIT}" -ne 0 ]]; then
+  pass "TEST 74: validate-stack.sh exited non-zero for the token secret mounted at the old /run/secrets path"
+else
+  fail "TEST 74: validate-stack.sh exited ZERO for the token secret at the old /run/secrets path — guard did NOT fire"
+fi
+if echo "${OLD_SECRET_PATH_OUTPUT}" | grep -q "workspace_opencode_token"; then
+  pass "TEST 74: failure message names the missing protected mount"
+else
+  fail "TEST 74: failure message does not name workspace_opencode_token — output: ${OLD_SECRET_PATH_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 75 — Negative: the mitmproxy CA volume mounted at the OLD, unprotected
+#           /run/mitmproxy-certs path must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 75: Invariant 8 rejects the mitmproxy CA volume mounted outside /run/workspace-agent ---"
+
+OLD_CA_PATH_COMPOSE="${TMPDIR_TEST}/compose-old-ca-path.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" \
+  "${TOKEN_TARGET_OK}" '/run/mitmproxy-certs' > "${OLD_CA_PATH_COMPOSE}"
+
+OLD_CA_PATH_OUTPUT=""
+OLD_CA_PATH_EXIT=0
+OLD_CA_PATH_OUTPUT="$(COMPOSE_FILE="${OLD_CA_PATH_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OLD_CA_PATH_EXIT=$?
+
+if [[ "${OLD_CA_PATH_EXIT}" -ne 0 ]]; then
+  pass "TEST 75: validate-stack.sh exited non-zero for the mitmproxy CA volume at the old /run/mitmproxy-certs path"
+else
+  fail "TEST 75: validate-stack.sh exited ZERO for the mitmproxy CA volume at the old path — guard did NOT fire"
+fi
+if echo "${OLD_CA_PATH_OUTPUT}" | grep -q "/run/workspace-agent/mitmproxy"; then
+  pass "TEST 75: failure message names the missing protected CA mount"
+else
+  fail "TEST 75: failure message does not name /run/workspace-agent/mitmproxy — output: ${OLD_CA_PATH_OUTPUT}"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

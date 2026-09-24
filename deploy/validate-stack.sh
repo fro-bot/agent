@@ -943,6 +943,112 @@ if operator_bind_host and str(operator_bind_host).strip():
         )
 
 # ------------------------------------------------------------------
+# Invariant 8: workspace uid-isolation hardening.
+#
+# The workspace-agent service PROCESS stays uid 0 (it needs CAP_CHOWN/
+# CAP_DAC_OVERRIDE/CAP_FOWNER/CAP_SETUID/CAP_SETGID to create protected
+# directories, install the mitmproxy CA, migrate legacy checkout ownership,
+# and drop OpenCode itself to the unprivileged agent uid 10001 — see
+# deploy/workspace-entrypoint.sh) but with every other Linux capability
+# dropped and no-new-privileges set. This invariant statically enforces that
+# hardening so a future edit cannot silently widen the workspace container's
+# privilege without a corresponding, deliberate change here.
+#
+#   8a. workspace declares user: "0:0" (exact string — not omitted, not a
+#       different uid/gid, which would either break the root-only setup
+#       steps or accidentally run the whole service unprivileged).
+#   8b. workspace declares cap_drop including ALL.
+#   8c. workspace's cap_add is EXACTLY the six-capability allowlist —
+#       {CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL} — no more (a wider
+#       set re-opens the very privilege surface Invariant 1d's cross-service
+#       banned-capability check patrols) and no fewer (a narrower set breaks
+#       the entrypoint's own directory/migration/privilege-drop steps).
+#   8d. workspace declares security_opt including no-new-privileges:true.
+#   8e. workspace's secret mounts (workspace_opencode_token,
+#       workspace_opencode_auth) and the mitmproxy CA volume all target paths
+#       under the protected /run/workspace-agent tree — not the old top-level
+#       /run/secrets or /run/mitmproxy-certs, which were readable by any uid.
+#   6  (recap): the workspace-repos volume mount itself is unchanged by this
+#       hardening — already enforced above; not re-checked here.
+# ------------------------------------------------------------------
+workspace_user = workspace_svc.get("user")
+if str(workspace_user).strip() != "0:0":
+    failures.append(
+        f"FAIL: workspace declares user: {workspace_user!r} — expected user: \"0:0\". "
+        "The workspace-agent service process must stay uid 0 (reduced capabilities — see "
+        "cap_drop/cap_add below) so it can create protected directories, install the mitmproxy "
+        "CA, and migrate legacy checkout ownership before dropping OpenCode itself to the "
+        "unprivileged agent uid. Set workspace.user to \"0:0\"."
+    )
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+def _norm_cap(cap):
+    c = str(cap).strip().upper()
+    return c[4:] if c.startswith("CAP_") else c
+
+workspace_cap_drop = {_norm_cap(c) for c in _as_list(workspace_svc.get("cap_drop"))}
+if "ALL" not in workspace_cap_drop:
+    failures.append(
+        f"FAIL: workspace cap_drop is {sorted(workspace_cap_drop)!r} — must include ALL. "
+        "Set workspace.cap_drop to [ALL] and grant back only the required capabilities via cap_add."
+    )
+
+REQUIRED_CAP_ADD = {"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "KILL"}
+workspace_cap_add = {_norm_cap(c) for c in _as_list(workspace_svc.get("cap_add"))}
+if workspace_cap_add != REQUIRED_CAP_ADD:
+    missing = REQUIRED_CAP_ADD - workspace_cap_add
+    extra = workspace_cap_add - REQUIRED_CAP_ADD
+    detail = []
+    if missing:
+        detail.append(f"missing {sorted(missing)!r}")
+    if extra:
+        detail.append(f"unexpected extra {sorted(extra)!r}")
+    failures.append(
+        f"FAIL: workspace cap_add is {sorted(workspace_cap_add)!r} — expected exactly "
+        f"{sorted(REQUIRED_CAP_ADD)!r} ({'; '.join(detail)}). The workspace-agent service needs exactly "
+        "these six capabilities for its root-only setup steps (directory creation, CA install, "
+        "checkout-ownership migration, and dropping privilege to the agent uid) — no more, no less."
+    )
+
+workspace_sec_opts = {str(o).strip().lower() for o in _as_list(workspace_svc.get("security_opt"))}
+if "no-new-privileges:true" not in workspace_sec_opts:
+    failures.append(
+        f"FAIL: workspace security_opt is {sorted(workspace_sec_opts)!r} — must include "
+        "no-new-privileges:true. Without it, a setuid/setcap binary inside the container could "
+        "re-acquire privileges the cap_drop above just removed."
+    )
+
+def _volume_target(v):
+    return parse_volume_entry(v)[1]
+
+# Negative (forbidden-path) check rather than a required-presence check:
+# most synthetic fixtures in this test harness exercise unrelated invariants
+# and never mount secrets at all, which is fine — nothing here requires a
+# secret mount to exist. What is forbidden is mounting one of these specific
+# secrets/CA at the OLD, unprotected top-level paths (readable by any uid)
+# instead of under /run/workspace-agent — that is the regression this guards.
+FORBIDDEN_MOUNT_TARGETS = {
+    "/run/secrets/workspace_opencode_token": "the OpenCode bearer-token secret",
+    "/run/secrets/workspace_opencode_auth": "the OpenCode auth.json secret",
+    "/run/mitmproxy-certs": "the mitmproxy CA volume",
+}
+workspace_targets = {_volume_target(v) for v in workspace_vols}
+for forbidden_target, description in FORBIDDEN_MOUNT_TARGETS.items():
+    if forbidden_target in workspace_targets:
+        failures.append(
+            f"FAIL: workspace mounts {description} at the old, unprotected path {forbidden_target!r}. "
+            "Secrets and the mitmproxy CA must be mounted under the protected /run/workspace-agent "
+            "tree (root-owned, 0700 tmpfs) so the unprivileged agent uid (10001) cannot read them "
+            "directly. Move this mount under /run/workspace-agent/secrets/ or /run/workspace-agent/mitmproxy."
+        )
+
+# ------------------------------------------------------------------
 # Report
 # ------------------------------------------------------------------
 if failures:
@@ -957,6 +1063,8 @@ print(f"    mitmproxy egress leg(s): {sorted(mitmproxy_egress_nets)!r}  ✓")
 print("    workspace has no direct egress  ✓")
 print(f"    non-internal network attachments: only allowlisted pairs {sorted(allowed_non_internal_attachments)!r}  ✓")
 print(f"    workspace mounts {REQUIRED_SOURCE!r} at {REQUIRED_TARGET!r}  ✓")
+print("    workspace uid isolation: user=0:0, cap_drop=ALL, cap_add=exact six-capability allowlist, "
+      "no-new-privileges, protected secret/CA mounts  ✓")
 PYEOF
 
   echo "    Topology invariants: OK"

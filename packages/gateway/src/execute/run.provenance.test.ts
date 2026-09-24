@@ -392,6 +392,36 @@ describe('checkout provenance', () => {
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
+  it('checkout-handoff-failed is workspace-unavailable, not the retry-inviting message — a handoff failure (hardlink, filesystem boundary, deadline, entry cap) is deterministic and will not resolve on retry', async () => {
+    // #given — clone-error code the workspace-agent returns when the post-clone ownership
+    // handoff fails (apps/workspace-agent/src/clone.ts); the same staged tree fails the same
+    // way every time, so this must land in the no-retry bucket, not `clone-timeout`'s or
+    // `too-many-files`'s retryable one.
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const ensureClone = makeEnsureCloneFn('success')
+    ;(ensureClone as unknown as {mockResolvedValue: (v: unknown) => void}).mockResolvedValue({
+      success: false,
+      error: {kind: 'workspace-failure', workspaceKind: 'clone-error', code: 'checkout-handoff-failed'},
+    })
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({ensureClone})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — no retry-inviting wording; the no-retry "an operator needs to look at it" wording
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.length > 0)
+    expect(errorSend).toBeDefined()
+    expect(errorSend?.content).not.toContain('not reachable')
+    expect(errorSend?.content).not.toContain('try again later')
+    expect(errorSend?.content).toContain('An operator needs to look at it')
+
+    // #and — inspect was never called (ensureClone failed before it)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
   it('clone response-mismatch is workspace-unavailable, not the retry-inviting message — the path comparison gives the same answer on every retry, and ensure-clone.ts already logs it as a security signal', async () => {
     // #given — ensureClone surfaces a workspace-failure/response-mismatch, the coarse
     // mapping of client.ts's strict full-path equality check failing (a possible tamper

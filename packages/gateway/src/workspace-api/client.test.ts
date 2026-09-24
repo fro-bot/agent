@@ -498,6 +498,7 @@ describe('createWorkspaceClient', () => {
       'permission-denied',
       'too-many-files',
       'path-escaped-workspace',
+      'checkout-handoff-failed',
     ]
 
     for (const code of errorCodes) {

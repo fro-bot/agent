@@ -48,10 +48,12 @@ The stock `anthropic` / `openai` provider IDs honor `options.baseURL`, so a prox
 OpenCode reads provider credentials from `OPENCODE_AUTH_CONTENT` (env) **or** an `auth.json` file at its XDG data path. Prefer the **file**: write it from a mounted secret in the entrypoint, `0600`, and never export it. A file has a strictly smaller introspection surface than an env var — it is not in `/proc/<pid>/environ` and not in `docker inspect` `Config.Env`, so a same-user process (including cloned repo code) cannot read it from process metadata. This mirrors the Action tier's `populateAuthJson`.
 
 ```sh
-AUTH_SRC="${WORKSPACE_OPENCODE_AUTH_FILE:-/run/secrets/workspace_opencode_auth}"
-AUTH_DEST="${XDG_DATA_HOME:-/root/.local/share}/opencode/auth.json"
+AUTH_SRC="${WORKSPACE_OPENCODE_AUTH_FILE:-/run/workspace-agent/secrets/workspace_opencode_auth}"
+AUTH_DEST="/home/opencode/.local/share/opencode/auth.json"
 # validate shape, then: (umask 077; cp "$AUTH_SRC" "$AUTH_DEST"); chmod 600 "$AUTH_DEST"
 ```
+
+Provisioning now runs as the unprivileged agent uid (`10001`, account `opencode`) via `setpriv`, not as root — see `deploy/scripts/provision-agent-config.mjs` and the entrypoint's Step 5 for the current split (root reads the protected secret, the agent-uid subprocess writes both destination files).
 
 ### 3. Bake nothing deployment-specific; overlay at the entrypoint
 
@@ -124,8 +126,8 @@ echo -n '{"anthropic":{"type":"api","key":"<cliproxy-token>"},"openai":{"type":"
 Feeding `WORKSPACE_OPENCODE_CONFIG={"autoupdate":true,"plugin":[],"provider":{...}}` must still yield an effective config with `"autoupdate": false` and the baked plugin present. The CI `workspace-smoke` job asserts exactly this:
 
 ```sh
-docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'
-docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /root/.config/opencode/opencode.json'
+docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
+docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /home/opencode/.config/opencode/opencode.json'
 ```
 
 ### Test-harness gotcha (not a product bug)
