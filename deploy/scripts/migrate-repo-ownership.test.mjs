@@ -127,8 +127,11 @@ test('a hardlink shared with a file outside the tree is broken before chown (pri
     const outsidePath = join(root, 'shared-outside.dat')
     await link(insidePath, outsidePath)
 
-    const beforeInside = await lstat(insidePath)
-    assert.equal(beforeInside.nlink, 2, 'sanity: hardlink set up correctly')
+    // Checked through the outside path: both names share one inode, so its nlink
+    // proves the hardlink, and insidePath is never stat'd by path before the
+    // single open() below (CodeQL js/file-system-race).
+    const beforeOutside = await lstat(outsidePath)
+    assert.equal(beforeOutside.nlink, 2, 'sanity: hardlink set up correctly')
 
     const {ops, calls} = recordingOps()
     const result = await migrateRepoOwnership({reposRoot,

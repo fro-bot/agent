@@ -344,8 +344,10 @@ must_succeed "root can read the dummy secret-holder's environ (setup sanity chec
 # nothing to do with the uid boundary under test, which is exactly the bug a
 # prior revision of this harness hit (see the module comment history). The
 # fix: prove dd-can-open-/proc/<pid>/mem-AT-ALL under this kernel's Yama
-# policy using a target root DOES legitimately own as an ancestor — its own
-# child, spawned in the same shell. A descendant is always a valid ATTACH
+# policy using a target the opener IS an ancestor of. Yama checks the process
+# doing the open, so `sleep & dd /proc/$!/mem` is NOT enough — dd would be
+# sleep's sibling, both children of sh. `exec dd` replaces sh in place (same
+# pid), making dd itself sleep's parent. A descendant is always a valid ATTACH
 # target regardless of ptrace_scope (0 or 1). The uid-10001 control below
 # does the same against ITS OWN child, ruling out a mount or hidepid=...
 # artifact that would block 10001 from opening ANY /proc/*/mem file
@@ -356,11 +358,11 @@ must_succeed "root can read the dummy secret-holder's environ (setup sanity chec
 # shellcheck disable=SC2016 # the $! / $p / $r are for the INNER sh -c script, not this outer bash line
 must_succeed "root can open a child process's /proc/<pid>/mem (Yama-compliant descendant target, setup sanity check)" \
   "$MAIN_CID" "0:0" \
-  sh -c 'sleep 30 & p=$!; dd if=/proc/$p/mem of=/dev/null bs=1 count=0 2>&1; r=$?; kill "$p" 2>/dev/null; exit $r'
+  sh -c 'sleep 5 & exec dd if=/proc/$!/mem of=/dev/null bs=1 count=0 2>&1'
 # shellcheck disable=SC2016 # same as above — inner sh -c script, uid 10001's own child
 must_succeed "uid 10001 can open its own child process's /proc/<pid>/mem (rules out a mount/hidepid artifact, setup sanity check)" \
   "$MAIN_CID" "$AGENT_USER" \
-  sh -c 'sleep 30 & p=$!; dd if=/proc/$p/mem of=/dev/null bs=1 count=0 2>&1; r=$?; kill "$p" 2>/dev/null; exit $r'
+  sh -c 'sleep 5 & exec dd if=/proc/$!/mem of=/dev/null bs=1 count=0 2>&1'
 
 # /proc/<pid>/mem probes use `dd ... count=0`, deliberately: dd still open()s
 # the file (where the kernel's ptrace_may_access() permission gate actually
