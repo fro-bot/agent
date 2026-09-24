@@ -257,6 +257,19 @@ export async function executeClone(request: CloneRequest, deps: CloneHandlerDeps
  * guarantee the execute bit survives (e.g. umask 0177 would silently strip it back to
  * 0600 and reintroduce the "cannot exec" failure). `chmod` is called explicitly after
  * the write to set the mode unconditionally, independent of umask.
+ *
+ * The script answers ONLY the exact `https://github.com` credential prompts git issues
+ * for the fixed clone URL (see invariant #6) — nothing else. Git follows HTTP redirects
+ * on the first request by default (`http.followRedirects=initial`), and a redirect to a
+ * different HTTPS host makes git prompt for THAT host's credentials; sealing global/system
+ * config (buildCloneGitEnv) does not stop a same-request redirect, so the helper itself
+ * has to refuse to answer for any host but github.com. The `case` patterns are exact
+ * literals (no globs) against git's real prompt text — `Username for 'https://github.com': `
+ * and `Password for 'https://x-access-token@github.com': ` — confirmed against real git
+ * (see clone.askpass.test.ts). Exact-literal matching means a lookalike host
+ * (`github.com.evil.example`), a path trick (`evil.example/github.com`), a non-https
+ * scheme, or a non-default port cannot match; every other prompt falls through to the
+ * `exit 1` fallback, same as before.
  */
 export async function writeAskpassHelper(dir: string): Promise<string> {
   // Open askpass.sh with O_EXCL (exclusive creation — refuses if exists).
@@ -268,8 +281,8 @@ export async function writeAskpassHelper(dir: string): Promise<string> {
     const askpassScript = [
       '#!/bin/sh',
       'case "$1" in',
-      `  Username*) printf '%s' 'x-access-token' ;;`,
-      `  Password*) printf '%s' "${githubTokenRef}" ;;`,
+      `  "Username for 'https://github.com': ") printf '%s' 'x-access-token' ;;`,
+      `  "Password for 'https://x-access-token@github.com': ") printf '%s' "${githubTokenRef}" ;;`,
       `  *) exit 1 ;;`,
       'esac',
       '',

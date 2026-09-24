@@ -15,6 +15,9 @@ Exposes a single `POST /clone` endpoint that clones a GitHub repo into `/workspa
 5. **Path confinement.** Owner and repo are validated against `[A-Za-z0-9._-]+`. After clone, `fs.realpath` confirms the path is within `/workspace/repos/`.
 6. **Credential helper disabled.** `-c credential.helper=` prevents any operator-side git credential helper from caching the IAT.
 7. **Token never logged.** No log line, error response, or test snapshot may contain the IAT.
+8. **Askpass helper is executable, on purpose.** Mode `0700` is set with an explicit `chmod` after write (not just the `open()` mode, which the process umask can mask back down) — git executes this file to answer credential prompts.
+9. **Askpass helper answers only `https://github.com`.** The script exact-matches git's literal prompt text (`Username for 'https://github.com': ` / `Password for 'https://x-access-token@github.com': `, no glob) and `exit 1`s for anything else, so a same-request HTTP redirect to another host cannot get the IAT.
+10. **Global/system git config is sealed, HTTPS-only.** `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_ALLOW_PROTOCOL=https` on the clone (and post-clone local) subprocess env block a config-planted `url.<x>.insteadOf` redirect — a fresh clone has no repo-local config yet, so global/system are the only places one could come from.
 
 ## Port
 

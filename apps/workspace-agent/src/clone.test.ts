@@ -241,7 +241,7 @@ describe('executeClone — happy path', () => {
     expect(scriptContent).not.toContain('ghs_')
   })
 
-  it('askpass script uses case/printf for username and password', async () => {
+  it('askpass script uses case/printf and answers ONLY the exact github.com https prompts', async () => {
     // #given
     const fakeHandle = makeFakeFileHandle()
     mockOpen.mockResolvedValue(fakeHandle as unknown as import('node:fs/promises').FileHandle)
@@ -255,12 +255,15 @@ describe('executeClone — happy path', () => {
       options: {timeoutMs: 500},
     })
 
-    // #then
+    // #then — exact-literal case arms (no glob), matching git's real prompt text
+    // (confirmed against real git in clone.askpass.test.ts) for https://github.com only.
+    // A glob like `Username*`/`Password*` would answer ANY host's prompt — including one
+    // reached via an HTTP redirect to an attacker-controlled or lookalike host.
     const scriptContent = fakeHandle.writeFile.mock.calls[0]![0] as string
     expect(scriptContent).toContain('case "$1"')
-    expect(scriptContent).toContain('Username*')
+    expect(scriptContent).toContain(`"Username for 'https://github.com': ")`)
     expect(scriptContent).toContain('x-access-token')
-    expect(scriptContent).toContain('Password*')
+    expect(scriptContent).toContain(`"Password for 'https://x-access-token@github.com': ")`)
   })
 
   it('opens askpass.sh with O_EXCL (wx flag) in the mkdtemp dir', async () => {
