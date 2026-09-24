@@ -3,7 +3,9 @@
  *
  * SECURITY INVARIANTS (non-negotiable):
  * 1. Token is NEVER passed via argv, URL, or shell string.
- * 2. Token is injected via GIT_ASKPASS helper script (mkdtemp dir, O_EXCL file, chmod 0600, deleted in finally).
+ * 2. Token is injected via GIT_ASKPASS helper script (mkdtemp dir, O_EXCL file, chmod 0700 — git executes
+ *    this file, so owner-execute is required; it lives in a private 0700 mkdtemp dir and never contains
+ *    the token itself — deleted in finally).
  * 3. Token is passed to the askpass script via GITHUB_TOKEN env var — NOT embedded in the script body.
  * 4. GIT_TRACE=0, GIT_CURL_VERBOSE=0, GIT_TRACE_PACKET=0, GIT_TRACE_PERFORMANCE=0 in subprocess env.
  * 5. execFile only — no exec(), no shell interpolation.
@@ -12,12 +14,15 @@
  * 8. Stderr is scrubbed of x-access-token patterns before logging or returning.
  * 9. Token is never logged, never in error responses, never persisted.
  * 10. Clone is atomic: written to a temp dir, renamed to dest on success; partial clones never reach destPath.
+ * 11. GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_NOSYSTEM=1 seal off global/system git config for the clone
+ *     (and the post-clone local rev-parse) subprocess — a fresh clone has no repo config yet, so those are
+ *     the only places a `url.<x>.insteadOf` redirect could come from and hijack the credentialed request.
  */
 
 import type {CloneFailure, CloneRequest, CloneSuccess} from './types.js'
 import {execFile as execFileCb} from 'node:child_process'
 import {rmSync} from 'node:fs'
-import {mkdir, mkdtemp, open, realpath, rename, rm} from 'node:fs/promises'
+import {chmod, mkdir, mkdtemp, open, realpath, rename, rm} from 'node:fs/promises'
 import os from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
@@ -234,6 +239,114 @@ export async function executeClone(request: CloneRequest, deps: CloneHandlerDeps
   return semaphoreResult
 }
 
+/**
+ * Writes the GIT_ASKPASS helper script into `dir` (which must already exist, e.g. from
+ * `mkdtemp`) and returns the script's path.
+ *
+ * The script never embeds the token in its body — it reads $GITHUB_TOKEN from its own
+ * process env at exec time, so the file on disk contains no secret.
+ *
+ * Mode is 0o700 (owner read/write/execute), not 0o600. Git *executes* this file when it
+ * needs to prompt for a credential (i.e. for any private repository); without the owner
+ * execute bit, git fails with "cannot exec '<path>': Permission denied" regardless of
+ * whether the process runs as root — execute permission is checked against the mode bits.
+ * The directory this file lives in is a private mkdtemp dir (mode 0700, not world- or
+ * group-readable), so adding owner-execute here adds no exposure.
+ *
+ * The mode passed to `open()` is masked by the process umask, so it alone cannot
+ * guarantee the execute bit survives (e.g. umask 0177 would silently strip it back to
+ * 0600 and reintroduce the "cannot exec" failure). `chmod` is called explicitly after
+ * the write to set the mode unconditionally, independent of umask.
+ *
+ * The script answers ONLY the exact `https://github.com` credential prompts git issues
+ * for the fixed clone URL (see invariant #6) — nothing else. Git follows HTTP redirects
+ * on the first request by default (`http.followRedirects=initial`), and a redirect to a
+ * different HTTPS host makes git prompt for THAT host's credentials; sealing global/system
+ * config (buildCloneGitEnv) does not stop a same-request redirect, so the helper itself
+ * has to refuse to answer for any host but github.com. The `case` patterns are exact
+ * literals (no globs) against git's real prompt text — `Username for 'https://github.com': `
+ * and `Password for 'https://x-access-token@github.com': ` — confirmed against real git
+ * (see clone.askpass.test.ts). Exact-literal matching means a lookalike host
+ * (`github.com.evil.example`), a path trick (`evil.example/github.com`), a non-https
+ * scheme, or a non-default port cannot match; every other prompt falls through to the
+ * `exit 1` fallback, same as before.
+ */
+export async function writeAskpassHelper(dir: string): Promise<string> {
+  // Open askpass.sh with O_EXCL (exclusive creation — refuses if exists).
+  const askpassPath = join(dir, 'askpass.sh')
+  const fh = await open(askpassPath, 'wx', 0o700)
+  try {
+    // We construct the string to avoid triggering no-template-curly-in-string lint rule.
+    const githubTokenRef = ['$', '{GITHUB_TOKEN}'].join('')
+    const askpassScript = [
+      '#!/bin/sh',
+      'case "$1" in',
+      `  "Username for 'https://github.com': ") printf '%s' 'x-access-token' ;;`,
+      `  "Password for 'https://x-access-token@github.com': ") printf '%s' "${githubTokenRef}" ;;`,
+      `  *) exit 1 ;;`,
+      'esac',
+      '',
+    ].join('\n')
+    await fh.writeFile(askpassScript)
+  } finally {
+    await fh.close()
+  }
+  // Umask-independent: guarantees the execute bit regardless of the process umask.
+  await chmod(askpassPath, 0o700)
+  return askpassPath
+}
+
+/**
+ * Builds the environment used to invoke `git clone` for a workspace clone request.
+ *
+ * Seals git's config resolution before the token is ever placed in this env: a freshly
+ * requested clone has no repo-local `.git/config` yet, so the global and system config
+ * files are the only places a `url.<x>.insteadOf` rule (or similar config-driven
+ * credential-forwarding trick) could live. A rule planted in either could silently
+ * redirect the clone URL to an attacker-controlled or otherwise unintended host while
+ * GIT_ASKPASS still answers the credential prompt for it — handing the token to whatever
+ * host the redirect points to.
+ *   - GIT_CONFIG_GLOBAL=/dev/null   — git reads no user/global gitconfig at all.
+ *   - GIT_CONFIG_NOSYSTEM=1         — git reads no system-wide gitconfig at all.
+ *   - GIT_ALLOW_PROTOCOL=https      — git will not follow a config- or redirect-induced
+ *                                      switch to a non-https transport.
+ *
+ * Exported so tests exercise the exact production env-building logic rather than a
+ * hand-copied approximation of it.
+ */
+export function buildCloneGitEnv(
+  token: string,
+  askpassPath: string,
+  parentEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const env: Record<string, string> = {
+    GIT_ASKPASS: askpassPath,
+    GITHUB_TOKEN: token,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_TRACE: '0',
+    GIT_TRACE_PACKET: '0',
+    GIT_TRACE_PERFORMANCE: '0',
+    GIT_CURL_VERBOSE: '0',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ALLOW_PROTOCOL: 'https',
+    HOME: parentEnv.HOME ?? '/root',
+    PATH: parentEnv.PATH ?? '/usr/bin:/bin',
+  }
+
+  // Propagate egress-proxy settings so git reaches GitHub through mitmproxy.
+  // The workspace runs on an internal-only network; without these, clone has
+  // no route out. These are not secrets, so they do not break token isolation.
+  for (const proxyVar of ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy']) {
+    const value = parentEnv[proxyVar]
+    if (value !== undefined && value !== '') {
+      env[proxyVar] = value
+    }
+  }
+
+  return env
+}
+
 async function executeCloneInner(
   owner: string,
   repo: string,
@@ -338,51 +451,11 @@ async function executeCloneInner(
     askpassDir = await mkdtempFn(join(os.tmpdir(), 'workspace-agent-askpass-'))
     activeAskpassDirs.add(askpassDir)
 
-    // Open askpass.sh with O_EXCL (exclusive creation — refuses if exists).
-    const askpassPath = join(askpassDir, 'askpass.sh')
-    const fh = await open(askpassPath, 'wx', 0o600)
-    try {
-      // Token is NOT embedded in the script body — it reads $GITHUB_TOKEN from env.
-      // This means the script file on disk contains no secret.
-      // Build the askpass script. The shell reads GITHUB_TOKEN from its environment.
-      // We construct the string to avoid triggering no-template-curly-in-string lint rule.
-      const githubTokenRef = ['$', '{GITHUB_TOKEN}'].join('')
-      const askpassScript = [
-        '#!/bin/sh',
-        'case "$1" in',
-        `  Username*) printf '%s' 'x-access-token' ;;`,
-        `  Password*) printf '%s' "${githubTokenRef}" ;;`,
-        `  *) exit 1 ;;`,
-        'esac',
-        '',
-      ].join('\n')
-      await fh.writeFile(askpassScript)
-    } finally {
-      await fh.close()
-    }
+    const askpassPath = await writeAskpassHelper(askpassDir)
 
-    // Minimal env — only what git needs. Token via GITHUB_TOKEN, not in script body.
-    const spawnEnv: Record<string, string> = {
-      GIT_ASKPASS: askpassPath,
-      GITHUB_TOKEN: token,
-      GIT_TERMINAL_PROMPT: '0',
-      GIT_TRACE: '0',
-      GIT_TRACE_PACKET: '0',
-      GIT_TRACE_PERFORMANCE: '0',
-      GIT_CURL_VERBOSE: '0',
-      HOME: process.env.HOME ?? '/root',
-      PATH: process.env.PATH ?? '/usr/bin:/bin',
-    }
-
-    // Propagate egress-proxy settings so git reaches GitHub through mitmproxy.
-    // The workspace runs on an internal-only network; without these, clone has
-    // no route out. These are not secrets, so they do not break token isolation.
-    for (const proxyVar of ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy']) {
-      const value = process.env[proxyVar]
-      if (value !== undefined && value !== '') {
-        spawnEnv[proxyVar] = value
-      }
-    }
+    // Minimal, sealed env — only what git needs. Token via GITHUB_TOKEN, not in script
+    // body. See buildCloneGitEnv for why global/system config is disabled here.
+    const spawnEnv = buildCloneGitEnv(token, askpassPath, process.env)
 
     // Atomic clone: clone into a temp dir in the same parent (so rename is atomic).
     const randomSuffix = Math.random().toString(36).slice(2, 10)
