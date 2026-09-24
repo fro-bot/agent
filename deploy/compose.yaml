@@ -236,11 +236,16 @@ services:
       NO_PROXY: localhost,127.0.0.1,workspace
       # Bearer token for the OpenCode reverse proxy.
       # The gateway presents this token when attaching to the workspace OpenCode server.
-      WORKSPACE_OPENCODE_TOKEN_FILE: /run/secrets/workspace_opencode_token
+      # Mounted under the protected /run/workspace-agent/secrets tmpfs (see
+      # volumes below) — root-only (0700), so the unprivileged OpenCode agent
+      # uid (10001) cannot read it directly.
+      WORKSPACE_OPENCODE_TOKEN_FILE: /run/workspace-agent/secrets/workspace_opencode_token
       # OpenCode provider credentials (auth.json blob). Required for the @mention
-      # loop; optional for clone-only deployments. The entrypoint validates it and
-      # writes auth.json (0600) to OpenCode's data path — never exported as env.
-      WORKSPACE_OPENCODE_AUTH_FILE: /run/secrets/workspace_opencode_auth
+      # loop; optional for clone-only deployments. The entrypoint validates it as
+      # root, then hands it to an agent-uid (10001) subprocess over stdin — never
+      # argv — which writes auth.json (0600) under the agent's own home. See
+      # deploy/workspace-entrypoint.sh and deploy/scripts/provision-agent-config.mjs.
+      WORKSPACE_OPENCODE_AUTH_FILE: /run/workspace-agent/secrets/workspace_opencode_auth
       # OpenCode model + provider config for the mention loop (operator config,
       # not secrets — the provider key lives in the auth.json secret above).
       # Mirrors the action's `model` + `opencode-config` inputs. Set both in
@@ -250,36 +255,71 @@ services:
       # The entrypoint overlays them onto the baked base config (plugin preserved).
       WORKSPACE_OPENCODE_MODEL: ${WORKSPACE_OPENCODE_MODEL:-}
       WORKSPACE_OPENCODE_CONFIG: ${WORKSPACE_OPENCODE_CONFIG:-}
+      # Optional — override the checkout-ownership migration deadline (ms).
+      # Default: 300000 (5 minutes). See deploy/README.md upgrade notes.
+      WORKSPACE_MIGRATION_DEADLINE_MS: ${WORKSPACE_MIGRATION_DEADLINE_MS:-}
+    # Container hardening (workspace uid isolation): the service PROCESS stays
+    # uid 0 (it needs CAP_CHOWN/CAP_DAC_OVERRIDE/CAP_FOWNER to create protected
+    # directories, install the mitmproxy CA, and migrate legacy checkout
+    # ownership — see deploy/workspace-entrypoint.sh), but with every other
+    # capability dropped. OpenCode itself — and every tool it spawns — runs as
+    # the unprivileged agent uid 10001, never as root. See deploy/README.md for
+    # the full rationale and the one-time ownership-migration upgrade note.
+    user: '0:0'
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    tmpfs:
+      # Protected runtime scratch space — root-owned, 0700, reset on every
+      # container start. Holds the secret bind-mounts and the mitmproxy CA
+      # volume beneath it (see volumes below) so the agent uid (10001) can
+      # never read the raw secrets or CA material directly — only the merged,
+      # world-readable system CA bundle the entrypoint produces from it.
+      # NOT noexec: askpass helper scripts execute from under this tree.
+      - /run/workspace-agent:rw,nosuid,nodev,mode=0700,uid=0,gid=0
     volumes:
       # workspace-opencode-token: shared secret for the bearer-token proxy.
       # The gateway reads the same value from WORKSPACE_OPENCODE_TOKEN_FILE.
+      # Nested under the /run/workspace-agent tmpfs above — root-only (0700),
+      # so the agent uid cannot read it. Individual-file binds nested under an
+      # already-mounted tmpfs directory (the same pattern Docker/Swarm secrets
+      # use for /run/secrets) mount cleanly in the expected nested order; this
+      # still needs confirming against a real container (see deploy/README.md).
       - type: bind
         source: ./secrets/workspace-opencode-token
-        target: /run/secrets/workspace_opencode_token
+        target: /run/workspace-agent/secrets/workspace_opencode_token
         read_only: true
         bind:
           create_host_path: false
       # workspace-opencode-auth: OpenCode provider credentials (API-key auth.json
       # blob, e.g. {"anthropic":{"type":"api","key":"sk-..."}}). Required for the
-      # mention loop; leave empty for clone-only deployments.
+      # mention loop; leave empty for clone-only deployments. Same protected-tmpfs
+      # nesting as the token above.
       - type: bind
         source: ./secrets/workspace-opencode-auth
-        target: /run/secrets/workspace_opencode_auth
+        target: /run/workspace-agent/secrets/workspace_opencode_auth
         read_only: true
         bind:
           create_host_path: false
-      # mitmproxy CA cert (written by mitmproxy on first start). Mounted at a
-      # dedicated path — NOT over /etc/ssl/certs — so the entrypoint's
-      # update-ca-certificates can write the MERGED system bundle (base CAs +
-      # mitmproxy) without the mount making the destination read-only. The
-      # entrypoint trusts this for git/libcurl and the opencode binary, which
-      # read the system store (NODE_EXTRA_CA_CERTS does not cover them).
-      - mitmproxy-certs:/run/mitmproxy-certs:ro
+      # mitmproxy CA cert (written by mitmproxy on first start), nested under
+      # the protected tmpfs above — root-only; the agent uid never reads the
+      # raw CA material, only the merged system bundle the entrypoint produces
+      # from it (world-readable, required for OpenCode's own outbound TLS as
+      # the agent uid). Previously mounted at the top-level /run/mitmproxy-certs
+      # (readable by any uid); moving it under the root-only tmpfs is itself
+      # part of the uid-isolation hardening, not just a path rename.
+      - mitmproxy-certs:/run/workspace-agent/mitmproxy:ro
       # workspace-repos: named volume for cloned repository checkouts.
       # Survives `docker compose up --force-recreate` and daemon upgrades.
       # WARNING: `docker compose down -v` removes this volume and destroys all
       # cloned repos. Mentioning Fro Bot in a bound channel after a volume loss
-      # will rehydrate the checkout automatically.
+      # will rehydrate the checkout automatically. UNCHANGED by uid isolation:
+      # deploy/validate-stack.sh:check_compose_topology (Invariant 6) enforces
+      # this exact source/target pair.
       - workspace-repos:/workspace/repos
     # Port model:
     #   9100 — Hono API (/healthz, /clone) — sandbox-net only, no host mapping
@@ -302,7 +342,18 @@ services:
       interval: 10s
       timeout: 3s
       retries: 4
-      start_period: 45s
+      # 45s (the pre-migration default) only covered image-pull-cold-start
+      # boot. The entrypoint's one-time checkout-ownership migration (step 4,
+      # deploy/scripts/migrate-repo-ownership.mjs) now runs before the clone
+      # API starts listening and is bounded at up to 5 minutes
+      # (WORKSPACE_MIGRATION_DEADLINE_MS, default 300000). start_period is set
+      # to comfortably exceed the migration deadline plus CA-wait (up to 30s)
+      # and process startup, so a large first-upgrade migration is not
+      # mistaken for an unhealthy container mid-flight. Subsequent restarts
+      # are fast (the migration is idempotent — already-migrated checkouts are
+      # skipped via their completion marker), so this only costs time on the
+      # one upgrade boot, never on steady-state restarts.
+      start_period: 360s
 
   mitmproxy:
     image: mitmproxy/mitmproxy:12.2.3@sha256:00b77b5d8804c8ad18cb6caefbf9d5849e895e8986c5ce011f4ae30f4385962f

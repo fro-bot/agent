@@ -197,6 +197,19 @@ The `workspace-repos` named volume is created automatically by Docker Compose on
 
 Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. Empty files mean "secret not set", which is the same as the file being absent — the gateway treats both as opt-out.
 
+### Workspace uid isolation (one-time checkout ownership migration)
+
+The workspace container's OpenCode process — and every tool it spawns — now runs as a fixed unprivileged uid (`10001`, account `opencode`), not root. The workspace-agent **service** itself still starts as root (uid 0) with a reduced Linux capability set (see `compose.yaml`: `cap_drop: [ALL]`, `cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]`) so it can set up protected directories and drop OpenCode's own privilege before it ever touches a cloned repo.
+
+**What this means for an existing deployment:** repo checkouts cloned before this change are root-owned on the `workspace-repos` volume. On the first boot after upgrading, the entrypoint walks each `owner/repo` checkout and hands ownership to uid `10001` — filesystem-only (no `git` invocations), symlink-safe, and hardlink-safe (see `deploy/scripts/migrate-repo-ownership.mjs`). The parent directories (`/workspace/repos`, `/workspace/repos/<owner>`) and the migration's own state directory stay root-owned; only the checkout directories themselves move.
+
+- **Runs automatically at container start** — no manual step required. It is resumable and idempotent: each checkout is marked complete only after it fully migrates, so a restart mid-migration safely resumes rather than re-doing (or skipping) finished work.
+- **Precondition: only one workspace container may use the `workspace-repos` volume during the upgrade.** Two containers migrating the same volume concurrently is unsupported — stop any other workspace container attached to the volume before upgrading.
+- **How long it takes:** proportional to the number and size of existing checkouts. It is bounded by a deadline, default **5 minutes**, configurable via `WORKSPACE_MIGRATION_DEADLINE_MS` (milliseconds) in `deploy/.env`. If the deadline is hit, the container refuses to start rather than launching OpenCode against a partially-migrated, mixed-ownership tree — restart the container to resume from where it left off. The `workspace` healthcheck's `start_period` (360s) is sized to cover the default deadline plus boot overhead; raise both together if you widen the deadline for a very large `workspace-repos` volume.
+- **New deployments** have nothing to migrate — checkouts are created directly under the agent uid, and this step is a fast no-op.
+
+**Where the secret mounts moved:** `workspace-opencode-token`, `workspace-opencode-auth`, and the mitmproxy CA volume are now mounted under a protected, root-only path inside the container (`/run/workspace-agent/secrets/…` and `/run/workspace-agent/mitmproxy`, a `tmpfs` reset on every container start) instead of the old top-level `/run/secrets/…` and `/run/mitmproxy-certs`, which any uid in the container could read. **The host-side secret files themselves are unchanged** — `deploy/secrets/workspace-opencode-token` and `deploy/secrets/workspace-opencode-auth` keep the same names and locations; only the in-container mount destination moved. No operator action is needed for this beyond pulling the updated image.
+
 ### Current optional secrets
 
 | Secret file | Purpose | When added |
