@@ -1,6 +1,6 @@
 import type {ExecFileFn} from './clone.js'
 
-import {mkdir, mkdtemp, open, realpath, rename, rm} from 'node:fs/promises'
+import {chmod, mkdir, mkdtemp, open, realpath, rename, rm} from 'node:fs/promises'
 
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {executeClone, resetCloneSemaphoreForTesting, scrubCredentials} from './clone.js'
@@ -10,6 +10,7 @@ vi.mock('node:fs/promises', async () => {
   const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
   return {
     ...actual,
+    chmod: vi.fn().mockResolvedValue(undefined),
     mkdir: vi.fn().mockResolvedValue(undefined),
     mkdtemp: vi.fn(),
     open: vi.fn(),
@@ -19,6 +20,7 @@ vi.mock('node:fs/promises', async () => {
   }
 })
 
+const mockChmod = vi.mocked(chmod)
 const mockMkdir = vi.mocked(mkdir)
 const mockMkdtemp = vi.mocked(mkdtemp)
 const mockOpen = vi.mocked(open)
@@ -66,6 +68,7 @@ beforeEach(() => {
   mockMkdir.mockResolvedValue(undefined)
   mockMkdtemp.mockResolvedValue(FAKE_ASKPASS_DIR)
   mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
+  mockChmod.mockResolvedValue(undefined)
   mockRename.mockResolvedValue(undefined)
   mockRm.mockResolvedValue(undefined)
   fakeMkdtempFn.mockResolvedValue(FAKE_ASKPASS_DIR)
@@ -138,6 +141,28 @@ describe('executeClone — happy path', () => {
     expect(cloneCallEnv.GIT_CURL_VERBOSE).toBe('0')
     expect(cloneCallEnv.GIT_TERMINAL_PROMPT).toBe('0')
     expect(cloneCallEnv.GIT_ASKPASS).toBe(FAKE_ASKPASS_PATH)
+  })
+
+  it('seals git config resolution on the clone subprocess env', async () => {
+    // #given
+    const execFileFn = makeExecFile([{stdout: ''}, {stdout: 'sha123\n'}])
+
+    // #when
+    await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — global/system config is disabled so a planted url.<x>.insteadOf
+    // redirect cannot hijack the credentialed clone request (a fresh clone has
+    // no repo-local config yet, so global/system are the only places it could
+    // come from), and only https is allowed.
+    const cloneCallEnv = (execFileFn.mock.calls[0]![2] as {env: Record<string, string>}).env
+    expect(cloneCallEnv.GIT_CONFIG_GLOBAL).toBe('/dev/null')
+    expect(cloneCallEnv.GIT_CONFIG_NOSYSTEM).toBe('1')
+    expect(cloneCallEnv.GIT_ALLOW_PROTOCOL).toBe('https')
   })
 
   it('propagates egress proxy env vars to the git clone subprocess', async () => {
@@ -238,7 +263,7 @@ describe('executeClone — happy path', () => {
     expect(scriptContent).toContain('Password*')
   })
 
-  it('opens askpass.sh with O_EXCL (wx flag) and mode 0700 in the mkdtemp dir', async () => {
+  it('opens askpass.sh with O_EXCL (wx flag) in the mkdtemp dir', async () => {
     // #given
     const execFileFn = makeExecFile([{stdout: ''}, {stdout: 'sha123\n'}])
 
@@ -251,10 +276,32 @@ describe('executeClone — happy path', () => {
     })
 
     // #then
-    // 0700 (not 0600) is required: git executes this file to answer credential
-    // prompts, so the owner-execute bit must be set or git fails with
-    // "cannot exec '<path>': Permission denied" for any private repository.
-    expect(mockOpen).toHaveBeenCalledWith(FAKE_ASKPASS_PATH, 'wx', 0o700)
+    // O_EXCL is a real security property (refuses to follow/overwrite an existing
+    // path), so it stays asserted here. The mode passed to open() is NOT asserted
+    // here anymore: it's masked by the process umask and is not what actually sets
+    // the final mode (see the next test, and clone.askpass.test.ts for the real,
+    // umask-independent, git-can-execute-it proof).
+    expect(mockOpen).toHaveBeenCalledWith(FAKE_ASKPASS_PATH, 'wx', expect.any(Number))
+  })
+
+  it('chmods askpass.sh to 0700 after writing it (umask-independent)', async () => {
+    // #given
+    const execFileFn = makeExecFile([{stdout: ''}, {stdout: 'sha123\n'}])
+
+    // #when
+    await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then
+    // chmod, not the open() mode argument, is what guarantees the execute bit:
+    // open()'s requested mode is masked by the process umask, so an unusual umask
+    // could silently strip owner-execute back to 0600 and reintroduce the
+    // "cannot exec" failure. chmod sets the mode unconditionally.
+    expect(mockChmod).toHaveBeenCalledWith(FAKE_ASKPASS_PATH, 0o700)
   })
 
   it('creates the repos root directory with mkdir -p', async () => {
