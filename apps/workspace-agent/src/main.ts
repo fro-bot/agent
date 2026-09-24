@@ -90,16 +90,20 @@ export interface WorkspaceAgentDeps {
 }
 
 /**
- * Start the workspace-agent: Hono server, supervised OpenCode, and bearer proxy.
+ * Start the workspace-agent: Hono server, bearer proxy, then supervised OpenCode.
  *
  * All startup work that was previously at module top-level lives here so the
  * env → supervisor readiness-timeout wiring is assertable via injected deps.
  *
- * **Startup order is preserved byte-for-byte from the pre-refactor entrypoint:**
+ * **Startup order (reordered so OpenCode is never spawned before the control ports are bound):**
  * 1. Read env (readReadyTimeoutMs, readSecret) — BEFORE any server bind
- * 2. serve() — Hono HTTP server on :9100
- * 3. runSupervisedOpencode() — supervised OpenCode lifecycle (fire-and-forget)
- * 4. createOpencodeProxy() + proxy.listen() — bearer proxy on :9200
+ * 2. serve() — Hono HTTP server on :9100, AWAITED until actually listening
+ * 3. createOpencodeProxy() + proxy.listen() on :9200 — AWAITED until the bind attempt settles
+ *    (success or failure; a failed bind still leaves the process in degraded mode, unchanged)
+ * 4. runSupervisedOpencode() — supervised OpenCode lifecycle (fire-and-forget), spawned as the
+ *    unprivileged agent uid ONLY once both control ports above are already bound — once OpenCode
+ *    runs unprivileged it is just another process on the box, and must never have a window where
+ *    it could win a race to bind 9100 or 9200 before the real listeners do
  * 5. Wire SIGTERM/SIGINT shutdown handlers
  */
 export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promise<void> {
@@ -115,8 +119,6 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   const opencodeStatus = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
 
   // /readyz requires BOTH opencodeStatus === 'ready' AND proxyListening.listening === true.
-  // The proxy binds (milliseconds) before OpenCode finishes booting (seconds), so this
-  // is true before opencodeStatus → 'ready', avoiding a startup false-negative.
   const proxyListeningRef: ProxyListeningRef = {listening: false}
 
   // detached:true puts the child in its own process group — it does NOT inherit SIGTERM
@@ -128,9 +130,17 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   // Read env before any server bind: fail-fast if WORKSPACE_OPENCODE_READY_TIMEOUT_MS is malformed.
   const opencodeReadyTimeoutMs = readReadyTimeoutMs(env)
 
+  // Bind :9100 and WAIT for the OS to confirm it is actually listening (not just "serve() was
+  // called") before doing anything else that could race an unprivileged process for a port.
+  let resolveServerListening: () => void
+  const serverListening = new Promise<void>(resolve => {
+    resolveServerListening = resolve
+  })
   const server = serveFn({fetch: app.fetch, port: PORT, hostname: HOST}, info => {
     console.warn(`workspace-agent listening on ${info.address}:${info.port}`)
+    resolveServerListening()
   })
+  await serverListening
 
   const opencodeLogger = {
     info: (msg: string, meta?: Record<string, unknown>) => console.warn(msg, meta ?? ''),
@@ -138,8 +148,54 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     error: (msg: string, meta?: Record<string, unknown>) => console.error(msg, meta ?? ''),
   }
 
+  let proxy: OpencodeProxyHandle | undefined
+
+  try {
+    const token = readSecretFn('WORKSPACE_OPENCODE_TOKEN')
+    proxy = createOpencodeProxyFn({
+      token,
+      upstreamUrl: `http://${OPENCODE_HOSTNAME}:${OPENCODE_PORT}`,
+      logger: opencodeLogger,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('workspace-agent: cannot start proxy — missing WORKSPACE_OPENCODE_TOKEN', {message})
+    // Process should not start without the proxy; exit with error code.
+    process.exit(1)
+  }
+
+  proxy.server.on('close', () => {
+    proxyListeningRef.listening = false
+  })
+  proxy.server.on('error', () => {
+    proxyListeningRef.listening = false
+  })
+
+  // AWAIT the :9200 bind attempt to SETTLE (success or failure) before spawning OpenCode.
+  // INTENTIONAL ASYMMETRY (unchanged from before the reorder): sync secret-read failure above
+  // calls process.exit(1) because the proxy cannot be constructed at all — there is no degraded
+  // mode without a token. An async listen() rejection is different: the proxy object exists,
+  // /readyz correctly returns 503 (proxyListeningRef stays false), and the operator can diagnose
+  // via logs. Keeping the process alive in degraded mode lets the clone API (:9100) continue
+  // serving and avoids a crash-loop restart race in container orchestrators — awaiting here only
+  // ensures the bind ATTEMPT has already happened (and thus can no longer be raced) before
+  // OpenCode is spawned; it does not turn a failed bind into a fatal error.
+  await proxy
+    .listen(PROXY_PORT, HOST)
+    .then(() => {
+      proxyListeningRef.listening = true
+    })
+    .catch((error: unknown) => {
+      proxyListeningRef.listening = false
+      const message = error instanceof Error ? error.message : String(error)
+      console.error('workspace-agent: proxy failed to start', {message})
+    })
+
   // Fire-and-forget: supervisor writes status transitions to opencodeStatus.
   // On respawn exhaustion it lands in 'degraded' (clone API still alive; /readyz → 503).
+  // Spawned only now — AFTER :9100 is confirmed listening and the :9200 bind attempt has
+  // settled — so an unprivileged OpenCode process (uid 10001) can never win a race to bind
+  // either control port first.
   const opencodeServerPromise = runSupervisedOpencodeFn({
     rootDir: WORKSPACE_REPOS_ROOT,
     logger: opencodeLogger,
@@ -154,49 +210,6 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     const message = error instanceof Error ? error.message : String(error)
     console.error('workspace-agent: opencode supervisor crashed unexpectedly', {message})
   })
-
-  let proxy: OpencodeProxyHandle | undefined
-
-  try {
-    const token = readSecretFn('WORKSPACE_OPENCODE_TOKEN')
-    proxy = createOpencodeProxyFn({
-      token,
-      upstreamUrl: `http://${OPENCODE_HOSTNAME}:${OPENCODE_PORT}`,
-      logger: opencodeLogger,
-    })
-    // listen() resolves when the OS assigns the port (milliseconds), well before
-    // OpenCode finishes booting (seconds) — so proxyListeningRef.listening is true
-    // before opencodeStatus can transition to 'ready', avoiding a /readyz false-negative.
-    // INTENTIONAL ASYMMETRY: sync secret-read failure (above catch block) calls
-    // process.exit(1) because the proxy cannot be constructed at all — there is
-    // no degraded mode without a token. An async listen() rejection is different:
-    // the proxy object exists, /readyz correctly returns 503 (proxyListeningRef
-    // stays false), and the operator can diagnose via logs. Keeping the process
-    // alive in degraded mode lets the clone API (:9100) continue serving and
-    // avoids a crash-loop restart race in container orchestrators.
-    proxy
-      .listen(PROXY_PORT, HOST)
-      .then(() => {
-        proxyListeningRef.listening = true
-      })
-      .catch((error: unknown) => {
-        // listen() failed — stay alive in degraded mode; /readyz returns 503.
-        proxyListeningRef.listening = false
-        const message = error instanceof Error ? error.message : String(error)
-        console.error('workspace-agent: proxy failed to start', {message})
-      })
-    proxy.server.on('close', () => {
-      proxyListeningRef.listening = false
-    })
-    proxy.server.on('error', () => {
-      proxyListeningRef.listening = false
-    })
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    console.error('workspace-agent: cannot start proxy — missing WORKSPACE_OPENCODE_TOKEN', {message})
-    // Process should not start without the proxy; exit with error code.
-    process.exit(1)
-  }
 
   let shuttingDown = false
 

@@ -39,13 +39,15 @@ function makeFakeProxy(callLog: string[], proxyListeningRef?: ProxyListeningRef)
 
 /**
  * Build a fake serve function (replaces @hono/node-server serve).
- * Returns a minimal ServerType-compatible object.
+ * Returns a minimal ServerType-compatible object, and invokes the listening callback
+ * synchronously (on the next microtask) so startWorkspaceAgent's `await serverListening` for
+ * :9100 resolves — real @hono/node-server invokes it once the OS confirms the bind.
  */
 function makeFakeServeFn(callLog: string[]) {
-  return vi.fn((_options: unknown, _cb?: unknown) => {
+  return vi.fn((_options: unknown, cb?: (info: {address: string; family: string; port: number}) => void) => {
     callLog.push('serve')
-    // Return a minimal http.Server-like object (close is required for shutdown)
     const s = new http.Server()
+    cb?.({address: '0.0.0.0', family: 'IPv4', port: 9100})
     return s
   })
 }
@@ -125,13 +127,14 @@ describe('startWorkspaceAgent', () => {
   })
 
   describe('startup ordering', () => {
-    it('starts components in the same order as the pre-refactor entrypoint: serve → runSupervisedOpencode → createOpencodeProxy → proxy.listen', async () => {
+    it('starts components in the reordered sequence: serve → createOpencodeProxy → proxy.listen → runSupervisedOpencode', async () => {
       // #given
-      // The pre-refactor order in main.ts:
-      //   1. serve() — Hono server
-      //   2. runSupervisedOpencode() — supervisor (fire-and-forget)
-      //   3. createOpencodeProxy() — proxy factory
-      //   4. proxy.listen() — proxy bind
+      // Reordered so OpenCode (spawned unprivileged) is never running before both control ports
+      // are bound:
+      //   1. serve() — Hono server on :9100, awaited until listening
+      //   2. createOpencodeProxy() — proxy factory
+      //   3. proxy.listen() — proxy bind on :9200, awaited until settled
+      //   4. runSupervisedOpencode() — supervisor (fire-and-forget), spawned last
       const callLog: string[] = []
       const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
       const fakeEnv: NodeJS.ProcessEnv = {}
@@ -148,21 +151,64 @@ describe('startWorkspaceAgent', () => {
         readSecretFn: (_name: string) => 'fake-token',
       })
 
-      // #then — assert the exact startup sequence
-      // serve must come before runSupervisedOpencode
+      // #then — assert the exact reordered startup sequence
       const serveIdx = callLog.indexOf('serve')
-      const supervisorIdx = callLog.indexOf('runSupervisedOpencode')
       const proxyFactoryIdx = callLog.indexOf('createOpencodeProxy')
       const proxyListenIdx = callLog.indexOf('proxy.listen')
+      const supervisorIdx = callLog.indexOf('runSupervisedOpencode')
 
       expect(serveIdx).toBeGreaterThanOrEqual(0)
-      expect(supervisorIdx).toBeGreaterThanOrEqual(0)
       expect(proxyFactoryIdx).toBeGreaterThanOrEqual(0)
       expect(proxyListenIdx).toBeGreaterThanOrEqual(0)
+      expect(supervisorIdx).toBeGreaterThanOrEqual(0)
 
-      expect(serveIdx).toBeLessThan(supervisorIdx)
-      expect(supervisorIdx).toBeLessThan(proxyFactoryIdx)
+      expect(serveIdx).toBeLessThan(proxyFactoryIdx)
       expect(proxyFactoryIdx).toBeLessThan(proxyListenIdx)
+      expect(proxyListenIdx).toBeLessThan(supervisorIdx)
+    })
+
+    it('does not spawn OpenCode (runSupervisedOpencode) until both :9100 is listening and the :9200 bind attempt has settled', async () => {
+      // #given — proxy.listen() resolves only after a delay, so a call-order assertion alone
+      // would not catch a regression that calls runSupervisedOpencode before the bind RESOLVES.
+      const callLog: string[] = []
+      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {}
+      const fakeServeFn = makeFakeServeFn(callLog)
+      const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+
+      let proxyListenResolved = false
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+        callLog.push('createOpencodeProxy')
+        const server = new http.Server()
+        return {
+          server,
+          listen: async (_port: number, _hostname: string): Promise<void> => {
+            callLog.push('proxy.listen:start')
+            await new Promise<void>(resolve => setTimeout(resolve, 10))
+            proxyListenResolved = true
+            callLog.push('proxy.listen:resolved')
+          },
+          close: async (): Promise<void> => {},
+        }
+      })
+
+      // #when
+      await startWorkspaceAgent({
+        env: fakeEnv,
+        serveFn: fakeServeFn,
+        runSupervisedOpencodeFn: fakeSupervisorFn,
+        createOpencodeProxyFn: fakeProxyFactory,
+        readSecretFn: (_name: string) => 'fake-token',
+      })
+
+      // #then — by the time runSupervisedOpencode is invoked, the delayed proxy.listen() had
+      // already RESOLVED, not merely been called.
+      expect(proxyListenResolved).toBe(true)
+      const listenResolvedIdx = callLog.indexOf('proxy.listen:resolved')
+      const supervisorIdx = callLog.indexOf('runSupervisedOpencode')
+      expect(listenResolvedIdx).toBeGreaterThanOrEqual(0)
+      expect(supervisorIdx).toBeGreaterThanOrEqual(0)
+      expect(listenResolvedIdx).toBeLessThan(supervisorIdx)
     })
 
     it('reads env (readReadyTimeoutMs) before any server bind (serve is called after env is resolved)', async () => {
@@ -184,11 +230,14 @@ describe('startWorkspaceAgent', () => {
         },
       })
 
-      const fakeServeFn = vi.fn((_options: unknown, _cb?: unknown) => {
-        callLog.push('serve')
-        const s = new http.Server()
-        return s
-      })
+      const fakeServeFn = vi.fn(
+        (_options: unknown, cb?: (info: {address: string; family: string; port: number}) => void) => {
+          callLog.push('serve')
+          const s = new http.Server()
+          cb?.({address: '0.0.0.0', family: 'IPv4', port: 9100})
+          return s
+        },
+      )
 
       const fakeSupervisorFn = vi.fn(async (options: RunSupervisedOpencodeOptions): Promise<void> => {
         callLog.push('runSupervisedOpencode')
@@ -240,8 +289,10 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
       })
-      // proxy.listen().then(...) is fire-and-forget in main.ts; flush the microtask queue
-      // so the .then() callback (which sets proxyListeningRef.listening = true) has run.
+      // main.ts now AWAITS proxy.listen() directly (so OpenCode is never spawned before the
+      // bind attempt settles), so proxyListeningRef.listening is already true by the time
+      // startWorkspaceAgent resolves — no microtask flush needed. Kept anyway as a harmless
+      // no-op guard against a future regression back to fire-and-forget.
       await Promise.resolve()
 
       // #then — main.ts wires proxy.listen().then(() => proxyListeningRef.listening = true)
@@ -280,9 +331,8 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
       })
-      // Flush microtasks so the .catch() on proxy.listen() has run
-      await Promise.resolve()
-      await Promise.resolve()
+      // main.ts now AWAITS proxy.listen() (including its .catch()) directly, so this has
+      // already settled by the time startWorkspaceAgent resolves.
 
       // #then — listen() rejected, so proxyListeningRef.listening must remain false
       // (the .catch() handler in main.ts sets it to false explicitly)

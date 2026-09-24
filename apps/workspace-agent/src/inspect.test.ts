@@ -7,7 +7,7 @@
 
 import type {Buffer} from 'node:buffer'
 
-import type {GitRunnerFn} from './inspect.js'
+import type {GitRunnerFn, InspectHandlerDeps} from './inspect.js'
 import type {InspectRequest} from './types.js'
 import {execFileSync} from 'node:child_process'
 import {
@@ -24,12 +24,13 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs'
-import {mkdir, mkdtemp, rm, symlink, writeFile} from 'node:fs/promises'
+import {mkdir, mkdtemp, realpath, rm, symlink, writeFile} from 'node:fs/promises'
 import os from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
 
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {AGENT_GID, AGENT_UID} from './identity.js'
 import {inspectCheckout, runGit} from './inspect.js'
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,28 @@ function req(owner: string, repo: string): InspectRequest {
 }
 
 /**
+ * Default deps for every real-git test below: reposRoot plus a uid/gid override.
+ *
+ * WHY: this machine is not root, so inspectCheckout's PRODUCTION default (AGENT_UID/AGENT_GID =
+ * 10001/10001 from identity.ts) fails here — an unprivileged process cannot setuid(2) to an
+ * arbitrary uid it doesn't own. Passing the CURRENT process's own uid/gid instead keeps every git
+ * invocation running through the EXACT SAME code path production uses (GitRunnerOptions.uid/gid
+ * is still populated, still threaded into execFile's options) — the only thing that differs is
+ * WHICH identity value is used, not whether the uid/gid-passing machinery runs at all. setuid(2)
+ * permits an unprivileged process to "switch" to its own real uid (a no-op in practice), so this
+ * neither skips nor weakens the code under test. The real cross-uid behavior — an actual 10001
+ * checkout owner, actual privilege drop — is exercised in CI's container harness (a later lane),
+ * which is the only place that can meaningfully test it without running the whole suite as root.
+ */
+function localDeps(overrides: InspectHandlerDeps = {}): InspectHandlerDeps {
+  return {
+    reposRoot,
+    options: {uid: process.getuid?.(), gid: process.getgid?.()},
+    ...overrides,
+  }
+}
+
+/**
  * Bumps a tracked file's mtime into the future so its stat info no longer matches what's cached
  * in the index — the precondition `git status` needs before it re-checks the file's content,
  * which is what makes it invoke a configured `filter.<driver>.clean`/`.process` at all.
@@ -96,6 +119,52 @@ function makeStatDirty(filePath: string): void {
   const future = new Date(Date.now() + 60_000)
   utimesSync(filePath, future, future)
 }
+
+// ---------------------------------------------------------------------------
+// uid/gid defaults — NOT exercised against real git (this machine can't setuid to an
+// arbitrary uid); asserts the OPTIONS every git invocation receives, via an injected recording
+// gitRunner. Production behavior for an actual 10001 identity is exercised in CI's container
+// harness (a later lane).
+// ---------------------------------------------------------------------------
+
+describe('inspectCheckout — uid/gid defaults', () => {
+  it('passes AGENT_UID/AGENT_GID (identity.ts) to every git invocation when the caller does not override them', async () => {
+    // #given — real directories so realpath() resolves (rev-parse's reported toplevel/git-dir
+    // must exist on disk), but a FAKE gitRunner stands in for git itself so no real setuid
+    // happens on this non-root machine.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    const gitDir = join(dir, '.git')
+    await mkdir(gitDir, {recursive: true})
+
+    const capturedOptions: {uid?: number; gid?: number}[] = []
+    const fakeGitRunner: GitRunnerFn = async (args, options) => {
+      capturedOptions.push({uid: options.uid, gid: options.gid})
+      if (args.includes('rev-parse')) {
+        return {kind: 'ok', stdout: `${dir}\n${gitDir}\n`, stderr: ''}
+      }
+      if (args.includes('config')) {
+        return {kind: 'ok', stdout: '', stderr: ''}
+      }
+      // status
+      return {
+        kind: 'ok',
+        stdout: `# branch.oid ${'a'.repeat(40)}\n# branch.head main\n`,
+        stderr: '',
+      }
+    }
+
+    // #when — NO uid/gid override in deps.options: production default path.
+    const result = await inspectCheckout(req(owner, repo), {reposRoot, gitRunner: fakeGitRunner})
+
+    // #then
+    expect(result.response.ok).toBe(true)
+    expect(capturedOptions.length).toBeGreaterThanOrEqual(3) // rev-parse, config enumeration, status
+    for (const options of capturedOptions) {
+      expect(options.uid).toBe(AGENT_UID)
+      expect(options.gid).toBe(AGENT_GID)
+    }
+  })
+})
 
 // ---------------------------------------------------------------------------
 // Happy path
@@ -109,7 +178,7 @@ describe('inspectCheckout — happy path', () => {
     const sha = commitFile(dir, 'a.txt', 'base\n', 'initial commit')
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.statusCode).toBe(200)
@@ -130,7 +199,7 @@ describe('inspectCheckout — happy path', () => {
     gitSync(dir, ['checkout', '--detach', sha, '-q'])
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response.ok).toBe(true)
@@ -147,7 +216,7 @@ describe('inspectCheckout — happy path', () => {
     gitSync(dir, ['add', 'b.txt'])
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
@@ -162,7 +231,7 @@ describe('inspectCheckout — happy path', () => {
     writeFileSync(join(dir, 'a.txt'), 'modified\n')
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
@@ -177,7 +246,7 @@ describe('inspectCheckout — happy path', () => {
     writeFileSync(join(dir, 'c.txt'), 'untracked\n')
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
@@ -203,7 +272,7 @@ describe('inspectCheckout — happy path', () => {
     }
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
@@ -229,7 +298,7 @@ describe('inspectCheckout — happy path', () => {
     }
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
@@ -254,7 +323,7 @@ describe('inspectCheckout — happy path', () => {
     }
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
@@ -289,7 +358,7 @@ describe('inspectCheckout — happy path', () => {
       }
 
       // #when
-      const result = await inspectCheckout(req(owner, repo), {reposRoot})
+      const result = await inspectCheckout(req(owner, repo), localDeps())
 
       // #then
       const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
@@ -318,7 +387,7 @@ describe('inspectCheckout — happy path', () => {
     }
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     const success = result.response as {ok: true; observation: import('./types.js').CheckoutObservation}
@@ -334,7 +403,7 @@ describe('inspectCheckout — errors', () => {
   it('returns no-checkout when the path does not exist', async () => {
     // #given — reposRoot exists but owner/repo does not
     // #when
-    const result = await inspectCheckout(req('nope', 'nope'), {reposRoot})
+    const result = await inspectCheckout(req('nope', 'nope'), localDeps())
 
     // #then
     expect(result.statusCode).toBe(404)
@@ -347,7 +416,7 @@ describe('inspectCheckout — errors', () => {
     const {owner, repo} = await makeCheckoutDir()
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response).toEqual({ok: false, error: 'no-checkout'})
@@ -367,7 +436,7 @@ describe('inspectCheckout — errors', () => {
     await writeFile(join(dir, '.git'), `gitdir: ${externalGitDir}\n`)
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.statusCode).toBe(409)
@@ -388,7 +457,7 @@ describe('inspectCheckout — errors', () => {
     commitFile(ownerDir, 'ancestor.txt', 'a\n', 'ancestor commit')
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.statusCode).toBe(409)
@@ -406,7 +475,7 @@ describe('inspectCheckout — errors', () => {
     await symlink(join(externalDir, '.git'), join(dir, '.git'))
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.statusCode).toBe(409)
@@ -435,7 +504,7 @@ describe('inspectCheckout — errors', () => {
 
     try {
       // #when
-      const result = await inspectCheckout(req(owner, repo), {reposRoot})
+      const result = await inspectCheckout(req(owner, repo), localDeps())
 
       // #then — must be rejected, never report the outside repo's state as this repo's.
       expect(result.statusCode).toBe(409)
@@ -461,7 +530,7 @@ describe('inspectCheckout — errors', () => {
     await symlink(otherDir, join(reposRoot, owner, repo))
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then — rejected even though the target is inside reposRoot: a prefix/"underneath" check
     // alone would have let this through.
@@ -483,7 +552,7 @@ describe('inspectCheckout — errors', () => {
     await symlink(realOwnerDir, join(reposRoot, owner))
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.statusCode).toBe(409)
@@ -497,7 +566,7 @@ describe('inspectCheckout — errors', () => {
     commitFile(dir, 'a.txt', 'base\n', 'initial commit')
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.statusCode).toBe(200)
@@ -505,37 +574,76 @@ describe('inspectCheckout — errors', () => {
   })
 
   it('times out and confirms the git subprocess is terminated', async () => {
-    // #given — a fake `git` binary on PATH that sleeps, then would (if not killed) write a
-    // marker file. A short timeout should kill it before the marker is ever written.
+    // #given — a fake `git` binary whose ENTIRE script body is a single `exec sleep 5`. `exec`
+    // replaces the shell's own process image with `sleep` — no fork, no grandchild — so the pid
+    // `runGit` sends SIGKILL to IS `sleep` itself. This is deliberately different from a script
+    // that forks a child and waits on it (see the `termination-unconfirmed` test below, which
+    // proves the negative case: a forked-and-waited child is NOT reliably killed by signaling
+    // just the parent).
     const {dir} = await makeCheckoutDir()
     initRepo(dir)
     commitFile(dir, 'a.txt', 'base\n', 'initial commit')
 
     const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-git-bin-'))
-    const markerPath = join(fakeBinDir, 'marker')
     const fakeGitPath = join(fakeBinDir, 'git')
-    writeFileSync(fakeGitPath, `#!/bin/sh\nsleep 5\ntouch '${markerPath}'\n`)
+    writeFileSync(fakeGitPath, '#!/bin/sh\nexec sleep 5\n')
     chmodSync(fakeGitPath, 0o755)
 
     try {
       // #when — call the exported runner directly with a PATH that resolves to the fake binary.
+      const start = Date.now()
       const outcome = await runGit(['status'], {
         cwd: dir,
         // fakeBinDir first so `git` resolves to our sleeping stub, but the rest of PATH stays so
-        // the stub's own `sleep`/`touch` calls resolve normally inside its shell.
+        // the stub's own `sleep` call resolves normally inside its shell.
         env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
         timeoutMs: 150,
       })
+      const elapsedMs = Date.now() - start
 
-      // #then
+      // #then — confirmed quickly (well inside the 2s reap grace), proving `sleep` itself — not
+      // just its parent shell — was actually killed rather than left running for its full 5s.
       expect(outcome).toEqual({kind: 'timeout'})
-      // The fake binary's `sleep 5` must have been interrupted before it could `touch` the
-      // marker — proves the subprocess was actually killed, not merely abandoned.
-      expect(() => statSync(markerPath)).toThrow()
+      expect(elapsedMs).toBeLessThan(2_000)
     } finally {
       rmSync(fakeBinDir, {recursive: true, force: true})
     }
   })
+
+  it('reports termination-unconfirmed (never timeout) when SIGKILL is sent but the child never confirms closed', async () => {
+    // #given — a fake `git` that FORKS `sleep 10` as its own child and waits on it (no `exec`
+    // tail-call — the shell stays alive as `sleep`'s parent). `runGit` sends SIGKILL only to the
+    // pid it was given: the SHELL. That kills the shell immediately, but `sleep 10` is the
+    // shell's own child, not the process `kill()` targeted — SIGKILL does not cascade to it, and
+    // it keeps running (and keeps holding the inherited stdout/stderr pipe open) for the rest of
+    // its 10s, well past the runner's 2s reap-grace window. This is a real, reproducible
+    // "attempted but unconfirmed" termination — the mirror image of the `exec`-based test above,
+    // which proves the confirmed case.
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-git-bin-unconfirmed-'))
+    const fakeGitPath = join(fakeBinDir, 'git')
+    writeFileSync(fakeGitPath, '#!/bin/sh\nsleep 10\n')
+    chmodSync(fakeGitPath, 0o755)
+
+    try {
+      // #when — short timeout so SIGKILL fires almost immediately; the grace window (2s, not
+      // caller-configurable) is what this test actually waits out.
+      const outcome = await runGit(['status'], {
+        cwd: dir,
+        env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
+        timeoutMs: 150,
+      })
+
+      // #then — distinct from the confirmed-timeout outcome above: this must NEVER claim the
+      // process definitely stopped.
+      expect(outcome).toEqual({kind: 'termination-unconfirmed'})
+    } finally {
+      rmSync(fakeBinDir, {recursive: true, force: true})
+    }
+  }, 8_000)
 })
 
 // ---------------------------------------------------------------------------
@@ -556,7 +664,7 @@ describe('inspectCheckout — hostile core.fsmonitor', () => {
     gitSync(dir, ['config', 'core.fsmonitor', hookPath])
 
     // #when — the protected code path (inspectCheckout) applies -c core.fsmonitor=false.
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response.ok).toBe(true)
@@ -619,7 +727,7 @@ describe('inspectCheckout — hostile filter drivers', () => {
     makeStatDirty(join(dir, 'a.txt'))
 
     // #when — the protected code path enumerates and neutralizes filter.evil.clean.
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response.ok).toBe(true)
@@ -668,7 +776,7 @@ describe('inspectCheckout — hostile filter drivers', () => {
       makeStatDirty(join(dir, 'a.txt'))
 
       // #when
-      const result = await inspectCheckout(req(owner, repo), {reposRoot})
+      const result = await inspectCheckout(req(owner, repo), localDeps())
 
       // #then — no execution, AND the forced required=false override kept status itself
       // succeeding (a hostile `required=true` left in place would otherwise fail `status`).
@@ -722,7 +830,7 @@ describe('inspectCheckout — hostile filter drivers', () => {
     makeStatDirty(join(dir, 'a.txt'))
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response.ok).toBe(true)
@@ -742,7 +850,7 @@ describe('inspectCheckout — hostile filter drivers', () => {
     makeStatDirty(join(dir, 'a.txt'))
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response.ok).toBe(true)
@@ -762,7 +870,7 @@ describe('inspectCheckout — hostile filter drivers', () => {
     makeStatDirty(join(dir, 'a.txt'))
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response.ok).toBe(true)
@@ -785,7 +893,7 @@ describe('inspectCheckout — hostile filter drivers', () => {
     }
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot, gitRunner: failingConfigRunner})
+    const result = await inspectCheckout(req(owner, repo), localDeps({gitRunner: failingConfigRunner}))
 
     // #then — reported as inspection-failed, and `status` was never called at all.
     expect(result.statusCode).toBe(500)
@@ -823,7 +931,7 @@ describe('inspectCheckout — hostile filter drivers', () => {
       makeStatDirty(join(submoduleDir, 's.txt'))
 
       // #when
-      const result = await inspectCheckout(req(owner, repo), {reposRoot})
+      const result = await inspectCheckout(req(owner, repo), localDeps())
 
       // #then — `--ignore-submodules=all` means status never looks inside the submodule at all.
       expect(result.response.ok).toBe(true)
@@ -866,7 +974,7 @@ describe('inspectCheckout — index is never modified', () => {
     const before = snapshotIndex(indexPath)
 
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response.ok).toBe(true)
@@ -908,9 +1016,75 @@ describe('inspectCheckout — path resolution', () => {
     initRepo(dir)
     commitFile(dir, 'a.txt', 'base\n', 'initial commit')
     // #when
-    const result = await inspectCheckout(req(owner, repo), {reposRoot})
+    const result = await inspectCheckout(req(owner, repo), localDeps())
 
     // #then
     expect(result.response.ok).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// safe.directory: every git invocation resets and re-grants exactly the canonical checkout path.
+// ---------------------------------------------------------------------------
+
+describe('inspectCheckout — safe.directory', () => {
+  it('passes -c safe.directory= then -c safe.directory=<canonicalPath> on every invocation, and status still succeeds', async () => {
+    // #given — a recording gitRunner that delegates to the REAL runGit (so this exercises actual
+    // git behavior, not a mock), capturing the argv of every call.
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const invocations: (readonly string[])[] = []
+    const recordingRunner: GitRunnerFn = async (args, options) => {
+      invocations.push(args)
+      return runGit(args, options)
+    }
+
+    // #when
+    const result = await inspectCheckout(req(owner, repo), localDeps({gitRunner: recordingRunner}))
+
+    // #then — status succeeded (safe.directory grants access; it isn't left blocking real git)
+    expect(result.response.ok).toBe(true)
+    expect(invocations.length).toBeGreaterThanOrEqual(3) // rev-parse, config enumeration, status
+
+    // Compared against the REALPATH-resolved checkout dir, not the raw joined path: inspectCheckout
+    // grants safe.directory for the canonical (symlink-resolved) path, which on some platforms
+    // (e.g. macOS's /tmp -> /private/tmp) differs from the literal path this test constructed.
+    const canonicalDir = await realpath(dir)
+
+    // Every recorded invocation resets any prior safe.directory exception first (the empty
+    // entry), then grants exactly the resolved checkout path — never `*`, never a parent path.
+    for (const args of invocations) {
+      const resetIdx = args.indexOf('safe.directory=')
+      const grantIdx = args.indexOf(`safe.directory=${canonicalDir}`)
+      expect(resetIdx).toBeGreaterThanOrEqual(0)
+      expect(grantIdx).toBeGreaterThan(resetIdx)
+      expect(args).not.toContain('safe.directory=*')
+    }
+  })
+
+  it('never grants a parent directory or wildcard as safe.directory', async () => {
+    // #given
+    const {owner, repo, dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const invocations: (readonly string[])[] = []
+    const recordingRunner: GitRunnerFn = async (args, options) => {
+      invocations.push(args)
+      return runGit(args, options)
+    }
+
+    // #when
+    await inspectCheckout(req(owner, repo), localDeps({gitRunner: recordingRunner}))
+
+    // #then — no invocation grants the reposRoot, the owner directory, or `*`.
+    const parentDir = join(dir, '..')
+    for (const args of invocations) {
+      expect(args).not.toContain('safe.directory=*')
+      expect(args).not.toContain(`safe.directory=${reposRoot}`)
+      expect(args).not.toContain(`safe.directory=${parentDir}`)
+    }
   })
 })

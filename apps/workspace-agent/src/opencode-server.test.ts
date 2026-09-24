@@ -9,7 +9,14 @@ import type {SpawnFn} from './opencode-server.js'
 
 import {EventEmitter} from 'node:events'
 import {afterEach, describe, expect, it, vi} from 'vitest'
-import {defaultPollReady, runSupervisedOpencode, startOpencodeServer} from './opencode-server.js'
+import {AGENT_GID, AGENT_HOME, AGENT_UID, OPENCODE_EXECUTABLE_PATH} from './identity.js'
+import {
+  buildOpencodeEnv,
+  buildOpencodeLaunchSpec,
+  defaultPollReady,
+  runSupervisedOpencode,
+  startOpencodeServer,
+} from './opencode-server.js'
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -105,7 +112,7 @@ describe('startOpencodeServer — happy path', () => {
     expect(handle.url).toBe('http://127.0.0.1:54321')
     expect(spawnArgs).toHaveLength(1)
     expect(spawnArgs[0]).toMatchObject({
-      command: 'opencode',
+      command: OPENCODE_EXECUTABLE_PATH,
       args: ['serve', '--hostname', '127.0.0.1', '--port', '54321'],
     })
 
@@ -926,9 +933,12 @@ describe('process-group reaping — group kill when pid is present', () => {
       }),
     ).rejects.toThrow()
 
-    // #then — detached: true was passed to spawnFn
+    // #then — detached: true, plus the unprivileged uid/gid, was passed to spawnFn. Both spawn
+    // sites (startOpencodeServer here, and the supervised respawn loop) are routed through the
+    // same buildOpencodeLaunchSpec builder — see the 'buildOpencodeLaunchSpec' describe block
+    // below for the direct assertion that both produce an identical shape.
     expect(spawnOpts).toHaveLength(1)
-    expect(spawnOpts[0]?.options).toMatchObject({detached: true})
+    expect(spawnOpts[0]?.options).toMatchObject({detached: true, uid: AGENT_UID, gid: AGENT_GID})
   })
 
   it('bind remains 127.0.0.1 and no secret/token is logged on the kill path', async () => {
@@ -1933,5 +1943,186 @@ describe('runSupervisedOpencode — abort-listener retention (memory-leak regres
 
     // Net count must be 0 after the supervisor returns (finally cleanup ran).
     expect(netListeners).toBe(0)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildOpencodeEnv — allowlist construction, tested against a HOSTILE parent env
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('buildOpencodeEnv', () => {
+  /** Every name explicitly called out as forbidden in the process-boundary brief. */
+  const HOSTILE_PARENT_ENV: NodeJS.ProcessEnv = {
+    WORKSPACE_OPENCODE_TOKEN: 'super-secret-bearer-token',
+    WORKSPACE_OPENCODE_TOKEN_FILE: '/run/secrets/workspace-opencode-token',
+    WORKSPACE_ANYTHING_CONTROL_SETTING: 'evil',
+    GITHUB_TOKEN: 'ghs_hostile',
+    GH_TOKEN: 'ghs_hostile_2',
+    AWS_ACCESS_KEY_ID: 'AKIAHOSTILE',
+    AWS_SECRET_ACCESS_KEY: 'hostile-secret',
+    GIT_ASKPASS: '/tmp/hostile-askpass.sh',
+    GIT_CONFIG_GLOBAL: '/tmp/hostile-gitconfig',
+    SSH_AUTH_SOCK: '/tmp/hostile.sock',
+    NODE_OPTIONS: '--require /tmp/hostile-preload.js',
+    LD_PRELOAD: '/tmp/hostile.so',
+    LD_LIBRARY_PATH: '/tmp/hostile-lib',
+    BASH_ENV: '/tmp/hostile-bashrc',
+    ENV: '/tmp/hostile-profile',
+    // A plausible-looking but NOT-allowlisted variable — proves the allowlist really is additive,
+    // not "copy everything except the forbidden names".
+    RANDOM_HARMLESS_LOOKING_VAR: 'still-must-not-appear',
+    PATH: '/tmp/hostile-bin:/usr/bin',
+    HOME: '/tmp/hostile-home',
+  }
+
+  it('never includes any forbidden key from a hostile parent env', () => {
+    // #given / #when
+    const env = buildOpencodeEnv(HOSTILE_PARENT_ENV)
+
+    // #then — every forbidden key from the brief, absent by construction.
+    for (const key of Object.keys(HOSTILE_PARENT_ENV)) {
+      if (key === 'PATH' || key === 'HOME') continue // fixed, not copied — asserted separately below
+      expect(env).not.toHaveProperty(key)
+    }
+  })
+
+  it('overrides HOME and PATH with fixed values — never the parent-supplied ones', () => {
+    // #given / #when
+    const env = buildOpencodeEnv(HOSTILE_PARENT_ENV)
+
+    // #then
+    expect(env.HOME).toBe(AGENT_HOME)
+    expect(env.HOME).not.toBe('/tmp/hostile-home')
+    expect(env.PATH).not.toContain('/tmp/hostile-bin')
+  })
+
+  it('pins the exact allowlisted output for an empty parent env', () => {
+    // #given / #when
+    const env = buildOpencodeEnv({})
+
+    // #then — exact key set, not just "contains". A future key silently added to the allowlist
+    // (or accidentally leaking through) changes this snapshot.
+    expect(Object.keys(env).sort()).toEqual(
+      [
+        'HOME',
+        'LOGNAME',
+        'PATH',
+        'TMPDIR',
+        'USER',
+        'XDG_CACHE_HOME',
+        'XDG_CONFIG_HOME',
+        'XDG_DATA_HOME',
+        'XDG_STATE_HOME',
+      ].sort(),
+    )
+  })
+
+  it('a key added to the parent env does not appear in the output unless the allowlist changes', () => {
+    // #given — baseline with nothing extra
+    const baseline = buildOpencodeEnv({})
+
+    // #when — add a brand-new, never-seen-before key to the parent
+    const withExtra = buildOpencodeEnv({...HOSTILE_PARENT_ENV, TOTALLY_NOVEL_KEY_12345: 'value'})
+
+    // #then — the new key never appears; the allowlisted key SET is unchanged from baseline
+    expect(withExtra).not.toHaveProperty('TOTALLY_NOVEL_KEY_12345')
+    expect(Object.keys(withExtra).sort()).toEqual(Object.keys(baseline).sort())
+  })
+
+  it('copies proxy variables (both cases) only when set', () => {
+    // #given
+    const env = buildOpencodeEnv({
+      HTTPS_PROXY: 'https://proxy.example:8080',
+      http_proxy: 'http://proxy.example:8080',
+      NO_PROXY: 'localhost',
+    })
+
+    // #then
+    expect(env.HTTPS_PROXY).toBe('https://proxy.example:8080')
+    expect(env.http_proxy).toBe('http://proxy.example:8080')
+    expect(env.NO_PROXY).toBe('localhost')
+    expect(env).not.toHaveProperty('HTTP_PROXY')
+    expect(env).not.toHaveProperty('https_proxy')
+    expect(env).not.toHaveProperty('no_proxy')
+  })
+
+  it('copies the CA bundle var the entrypoint actually sets (NODE_EXTRA_CA_CERTS) when present', () => {
+    // #given — mirrors deploy/workspace-entrypoint.sh: export NODE_EXTRA_CA_CERTS="$SYSTEM_BUNDLE"
+    const env = buildOpencodeEnv({NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/ca-certificates.crt'})
+
+    // #then
+    expect(env.NODE_EXTRA_CA_CERTS).toBe('/etc/ssl/certs/ca-certificates.crt')
+  })
+
+  it('copies every OPENCODE_* flag the image bakes in, and nothing else prefix-adjacent', () => {
+    // #given — the two flags deploy/workspace.Dockerfile bakes as ENV, plus a decoy.
+    const env = buildOpencodeEnv({
+      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: 'true',
+      OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS: 'true',
+      NOT_OPENCODE_PREFIXED: 'nope',
+    })
+
+    // #then
+    expect(env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER).toBe('true')
+    expect(env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS).toBe('true')
+    expect(env).not.toHaveProperty('NOT_OPENCODE_PREFIXED')
+  })
+
+  it('copies locale variables only when set', () => {
+    // #given
+    const env = buildOpencodeEnv({LANG: 'en_US.UTF-8'})
+
+    // #then
+    expect(env.LANG).toBe('en_US.UTF-8')
+    expect(env).not.toHaveProperty('LC_ALL')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildOpencodeLaunchSpec — the single shared spec both spawn sites use
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('buildOpencodeLaunchSpec', () => {
+  it('uses the absolute OpenCode executable path, never a bare PATH-resolved command', () => {
+    // #given / #when
+    const spec = buildOpencodeLaunchSpec({rootDir: '/workspace/repos', hostname: '127.0.0.1', port: 54321})
+
+    // #then
+    expect(spec.command).toBe(OPENCODE_EXECUTABLE_PATH)
+    expect(spec.command.startsWith('/')).toBe(true)
+  })
+
+  it('defaults uid/gid to the unprivileged agent identity from identity.ts', () => {
+    // #given / #when
+    const spec = buildOpencodeLaunchSpec({rootDir: '/workspace/repos', hostname: '127.0.0.1', port: 54321})
+
+    // #then
+    expect(spec.options.uid).toBe(AGENT_UID)
+    expect(spec.options.gid).toBe(AGENT_GID)
+    expect(spec.options.detached).toBe(true)
+  })
+
+  it('builds the env through the allowlist builder, not process.env passthrough', () => {
+    // #given — a parent env carrying a secret that must never reach the child
+    const spec = buildOpencodeLaunchSpec({
+      rootDir: '/workspace/repos',
+      hostname: '127.0.0.1',
+      port: 54321,
+      parentEnv: {WORKSPACE_OPENCODE_TOKEN: 'must-not-leak', HOME: '/tmp/hostile-home'},
+    })
+
+    // #then
+    expect(spec.options.env).not.toHaveProperty('WORKSPACE_OPENCODE_TOKEN')
+    expect(spec.options.env.HOME).toBe(AGENT_HOME)
+  })
+
+  it('produces the exact same shape regardless of caller — the one spec both spawn sites share', () => {
+    // #given — two calls with the same logical inputs, as startOpencodeServer and
+    // runSupervisedOpencode's respawn loop each make independently.
+    const specA = buildOpencodeLaunchSpec({rootDir: '/workspace/repos', hostname: '127.0.0.1', port: 54321})
+    const specB = buildOpencodeLaunchSpec({rootDir: '/workspace/repos', hostname: '127.0.0.1', port: 54321})
+
+    // #then
+    expect(specA).toEqual(specB)
   })
 })

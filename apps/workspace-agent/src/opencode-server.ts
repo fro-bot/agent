@@ -12,9 +12,24 @@
  * 4. Bounded respawn: max attempts + total boot budget prevent infinite retry.
  */
 
+import type {StdioOptions} from 'node:child_process'
+
 import {spawn as nodeSpawnRaw} from 'node:child_process'
 import process from 'node:process'
 import {setTimeout as sleep} from 'node:timers/promises'
+
+import {
+  AGENT_GID,
+  AGENT_HOME,
+  AGENT_TMPDIR,
+  AGENT_UID,
+  AGENT_USERNAME,
+  AGENT_XDG_CACHE_HOME,
+  AGENT_XDG_CONFIG_HOME,
+  AGENT_XDG_DATA_HOME,
+  AGENT_XDG_STATE_HOME,
+  OPENCODE_EXECUTABLE_PATH,
+} from './identity.js'
 
 export interface Logger {
   readonly info: (msg: string, meta?: Record<string, unknown>) => void
@@ -34,7 +49,16 @@ export interface ChildHandle {
 export type SpawnFn = (
   command: string,
   args: readonly string[],
-  options: {readonly cwd?: string; readonly env?: NodeJS.ProcessEnv; readonly detached?: boolean},
+  options: {
+    readonly cwd?: string
+    readonly env?: NodeJS.ProcessEnv
+    readonly detached?: boolean
+    /** Unprivileged uid to run the child as. Always set for the OpenCode child — see identity.ts. */
+    readonly uid?: number
+    /** Unprivileged gid to run the child as. Always set for the OpenCode child — see identity.ts. */
+    readonly gid?: number
+    readonly stdio?: StdioOptions
+  },
 ) => ChildHandle
 
 /**
@@ -45,6 +69,138 @@ export type SpawnFn = (
  */
 const nodeSpawn: SpawnFn = (command, args, options) =>
   nodeSpawnRaw(command, [...args], options) as unknown as ChildHandle
+
+// ── OpenCode child environment allowlist ────────────────────────────────────
+//
+// Proxy variables copied through verbatim if the SERVICE process has them set — both
+// upper-case (RFC convention) and lower-case (curl/libcurl convention) forms.
+const PROXY_ENV_NAMES = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy'] as const
+
+// CA bundle settings. Only NODE_EXTRA_CA_CERTS is set today (deploy/workspace-entrypoint.sh,
+// after installing the mitmproxy CA into the system trust store) — SSL_CERT_FILE and
+// GIT_SSL_CAINFO are included so a future CA-trust mechanism keeps working without a code change
+// here, not because the image sets them now.
+const CA_BUNDLE_ENV_NAMES = ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'GIT_SSL_CAINFO'] as const
+
+// Locale variables, copied through only if the SERVICE process has them set.
+const LOCALE_ENV_NAMES = ['LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE'] as const
+
+/**
+ * Trusted PATH for the OpenCode child. OpenCode itself is always launched via the absolute
+ * OPENCODE_EXECUTABLE_PATH (never resolved through PATH), but OpenCode's own tool calls (git,
+ * ripgrep, etc.) resolve through this PATH — fixed to the exact locations
+ * deploy/workspace.Dockerfile installs them at (apk packages under /usr/bin, Bun/opencode under
+ * /usr/local/bin), never inherited from the service's environment.
+ */
+const TRUSTED_OPENCODE_PATH = '/usr/local/bin:/usr/bin:/bin'
+
+function copyEnvIfSet(source: NodeJS.ProcessEnv, target: Record<string, string>, name: string): void {
+  const value = source[name]
+  if (value !== undefined) target[name] = value
+}
+
+/**
+ * Builds the OpenCode child environment by CONSTRUCTING it from a fixed allowlist — never by
+ * copying and subtracting from `process.env`. Every key that ends up in the result is named
+ * explicitly below; nothing from `parentEnv` reaches the child except the exact names listed in
+ * PROXY_ENV_NAMES, CA_BUNDLE_ENV_NAMES, LOCALE_ENV_NAMES, and the `OPENCODE_*` prefix (the image's
+ * own baked feature flags — see deploy/workspace.Dockerfile — which never collide with the
+ * `WORKSPACE_*`-prefixed secrets the service holds; see config.ts). This means
+ * WORKSPACE_OPENCODE_TOKEN, any `*_FILE` secret path, any other `WORKSPACE_*` control setting,
+ * GITHUB_TOKEN, GH_TOKEN, AWS_*, inherited GIT_*, SSH_AUTH_SOCK, NODE_OPTIONS, LD_*, BASH_ENV,
+ * and ENV can never appear in the output, by construction — there is no code path that would put
+ * them there, not a filter that might miss one.
+ */
+export function buildOpencodeEnv(parentEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: Record<string, string> = {
+    HOME: AGENT_HOME,
+    USER: AGENT_USERNAME,
+    LOGNAME: AGENT_USERNAME,
+    PATH: TRUSTED_OPENCODE_PATH,
+    XDG_DATA_HOME: AGENT_XDG_DATA_HOME,
+    XDG_CONFIG_HOME: AGENT_XDG_CONFIG_HOME,
+    XDG_CACHE_HOME: AGENT_XDG_CACHE_HOME,
+    XDG_STATE_HOME: AGENT_XDG_STATE_HOME,
+    TMPDIR: AGENT_TMPDIR,
+  }
+
+  for (const name of PROXY_ENV_NAMES) copyEnvIfSet(parentEnv, env, name)
+  for (const name of CA_BUNDLE_ENV_NAMES) copyEnvIfSet(parentEnv, env, name)
+  for (const name of LOCALE_ENV_NAMES) copyEnvIfSet(parentEnv, env, name)
+
+  for (const [key, value] of Object.entries(parentEnv)) {
+    if (key.startsWith('OPENCODE_') && value !== undefined) {
+      env[key] = value
+    }
+  }
+
+  return env
+}
+
+// ── Shared OpenCode launch spec ─────────────────────────────────────────────
+
+/** Fixed stdio wiring for the OpenCode child: stdin ignored (never written to), stdout/stderr piped. */
+const OPENCODE_STDIO: StdioOptions = ['ignore', 'pipe', 'pipe']
+
+export interface BuildOpencodeLaunchSpecOptions {
+  readonly rootDir: string
+  readonly hostname: string
+  readonly port: number
+  /** Parent (service) environment to source the allowlisted values from. Defaults to process.env. */
+  readonly parentEnv?: NodeJS.ProcessEnv
+  /** Unprivileged uid to spawn as. Defaults to AGENT_UID (identity.ts). */
+  readonly uid?: number
+  /** Unprivileged gid to spawn as. Defaults to AGENT_GID (identity.ts). */
+  readonly gid?: number
+  /** Absolute OpenCode executable path. Defaults to OPENCODE_EXECUTABLE_PATH (identity.ts). */
+  readonly executablePath?: string
+}
+
+export interface OpencodeLaunchSpec {
+  readonly command: string
+  readonly args: readonly string[]
+  readonly options: {
+    readonly cwd: string
+    readonly env: NodeJS.ProcessEnv
+    readonly detached: true
+    readonly uid: number
+    readonly gid: number
+    readonly stdio: StdioOptions
+  }
+}
+
+/**
+ * Builds the single launch spec used at EVERY OpenCode spawn site (startOpencodeServer and the
+ * runSupervisedOpencode respawn loop), so uid/gid/env/executable-path are computed in exactly one
+ * place and a future spawn site can't forget the unprivileged identity.
+ *
+ * `detached: true` is preserved — process-group supervision (killChildGroup) depends on the child
+ * being its own process-group leader.
+ */
+export function buildOpencodeLaunchSpec(options: BuildOpencodeLaunchSpecOptions): OpencodeLaunchSpec {
+  const {
+    rootDir,
+    hostname,
+    port,
+    parentEnv = process.env,
+    uid = AGENT_UID,
+    gid = AGENT_GID,
+    executablePath = OPENCODE_EXECUTABLE_PATH,
+  } = options
+
+  return {
+    command: executablePath,
+    args: ['serve', '--hostname', hostname, '--port', String(port)],
+    options: {
+      cwd: rootDir,
+      env: buildOpencodeEnv(parentEnv),
+      detached: true,
+      uid,
+      gid,
+      stdio: OPENCODE_STDIO,
+    },
+  }
+}
 
 /**
  * Readiness probe — return true if the server is accepting connections.
@@ -217,11 +373,11 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
 
   // detached: true makes the child a process-group leader (pgid = pid) so
   // killChildGroup can reap the whole group on timeout/abort/close.
-  const child = spawnFn('opencode', ['serve', '--hostname', hostname, '--port', String(port)], {
-    cwd: rootDir,
-    env: process.env,
-    detached: true,
-  })
+  // Routed through the shared launch-spec builder: absolute executable path, unprivileged
+  // uid/gid, and the constructed env allowlist — never process.env, never a fallback to the
+  // service identity on spawn failure.
+  const launchSpec = buildOpencodeLaunchSpec({rootDir, hostname, port})
+  const child = spawnFn(launchSpec.command, launchSpec.args, launchSpec.options)
 
   // Use an object to hold mutable state — TypeScript does not narrow mutable
   // object properties across await points, preventing false narrowing errors.
@@ -411,11 +567,11 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
 
       // detached: true makes the child a process-group leader (pgid = pid) so
       // killChildGroup can reap the whole group on timeout/abort/shutdown.
-      const child = spawnFn('opencode', ['serve', '--hostname', hostname, '--port', String(port)], {
-        cwd: rootDir,
-        env: process.env,
-        detached: true,
-      })
+      // Same shared launch-spec builder as startOpencodeServer — unprivileged uid/gid, absolute
+      // executable path, constructed env allowlist. No fallback to the service identity on
+      // spawn failure: the loop below reads state.exited/state from spawnFn's own error event.
+      const launchSpec = buildOpencodeLaunchSpec({rootDir, hostname, port})
+      const child = spawnFn(launchSpec.command, launchSpec.args, launchSpec.options)
 
       // Per-attempt mutable state.
       const state: {exited: boolean; exitCode: number | null; becameReady: boolean} = {

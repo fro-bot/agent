@@ -37,6 +37,8 @@ import {realpath, stat} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
+import {AGENT_GID, AGENT_HOME, AGENT_UID} from './identity.js'
+
 /** Root directory where repos are cloned inside the workspace container. Mirrors clone.ts. */
 export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 
@@ -67,12 +69,23 @@ export interface GitRunnerOptions {
   readonly cwd: string
   readonly env: Record<string, string>
   readonly timeoutMs: number
+  /** Unprivileged uid to run git as. Defaults applied by callers from identity.ts (AGENT_UID). */
+  readonly uid?: number
+  /** Unprivileged gid to run git as. Defaults applied by callers from identity.ts (AGENT_GID). */
+  readonly gid?: number
 }
 
 export type GitOutcome =
   | {readonly kind: 'ok'; readonly stdout: string; readonly stderr: string}
   | {readonly kind: 'failed'; readonly code: number | null; readonly stdout: string; readonly stderr: string}
   | {readonly kind: 'timeout'}
+  /**
+   * SIGKILL was sent, but the child's stdio streams never confirmed closed within the reap grace
+   * window — termination was attempted, not confirmed. Distinct from `timeout` (which only ever
+   * represents a CONFIRMED kill) so a caller can never mistake "we gave up waiting" for "the
+   * process is definitely gone", per this module's header invariant #5.
+   */
+  | {readonly kind: 'termination-unconfirmed'}
 
 export type GitRunnerFn = (args: readonly string[], options: GitRunnerOptions) => Promise<GitOutcome>
 
@@ -95,7 +108,14 @@ export const runGit: GitRunnerFn = async (args, options) =>
     const child = execFile(
       'git',
       args,
-      {cwd: options.cwd, env: options.env, maxBuffer: GIT_MAX_BUFFER_BYTES, encoding: 'utf8'},
+      {
+        cwd: options.cwd,
+        env: options.env,
+        maxBuffer: GIT_MAX_BUFFER_BYTES,
+        encoding: 'utf8',
+        uid: options.uid,
+        gid: options.gid,
+      },
       (error, stdout, stderr) => {
         if (settled) return
         settled = true
@@ -122,12 +142,15 @@ export const runGit: GitRunnerFn = async (args, options) =>
       timedOut = true
       child.kill('SIGKILL')
       // Grace window in case SIGKILL doesn't reap promptly (unusual, but SIGKILL delivery is not
-      // instantaneous). If the child still hasn't closed after this, resolve anyway — the caller
-      // must never hang forever — but we have genuinely waited, not just fired-and-forgotten.
+      // instantaneous). If the child still hasn't closed after this, the caller must never hang
+      // forever — but termination is NOT confirmed at this point (the exec callback, which Node
+      // fires only once the child's stdio streams actually close, never ran): resolve as
+      // `termination-unconfirmed`, never as `timeout`, so nothing downstream can mistake "we gave
+      // up waiting" for "the process is definitely gone" (module header invariant #5).
       graceHandle = setTimeout(() => {
         if (settled) return
         settled = true
-        resolve({kind: 'timeout'})
+        resolve({kind: 'termination-unconfirmed'})
       }, GIT_KILL_REAP_GRACE_MS)
     }, options.timeoutMs)
   })
@@ -166,13 +189,39 @@ const GIT_SAFETY_ARGS: readonly string[] = [
   'credential.helper=',
 ]
 
-function gitInvocation(cwd: string, subArgs: readonly string[]): readonly string[] {
-  return ['-C', cwd, ...GIT_SAFETY_ARGS, ...subArgs]
+/**
+ * `-c safe.directory=` followed by `-c safe.directory=<canonicalPath>`: the FIRST entry resets
+ * any `safe.directory` exceptions a repo's own (agent-writable) config might otherwise
+ * contribute (confirmed against real git 2.55.0 that an empty `safe.directory` value clears
+ * prior entries rather than adding one), and the SECOND grants exactly the canonical checkout
+ * path, never `*` (which would trust every path) and never a parent path (which would also trust
+ * sibling checkouts). Command-line `-c` config is honored for `safe.directory`; a repo's own
+ * `.git/config` is NOT (confirmed against real git 2.55.0), which is exactly why this must be
+ * passed as `-c` here rather than relying on anything committed inside the checkout. Required
+ * once the checkout is owned by AGENT_UID and git also runs as AGENT_UID; kept unconditionally
+ * (including for a same-uid caller) because the migration period can leave a checkout still
+ * owned by the service uid while git already runs as AGENT_UID, or vice versa.
+ */
+function safeDirectoryArgs(canonicalPath: string): readonly string[] {
+  return ['-c', 'safe.directory=', '-c', `safe.directory=${canonicalPath}`]
+}
+
+function gitInvocation(cwd: string, canonicalPath: string, subArgs: readonly string[]): readonly string[] {
+  return ['-C', cwd, ...GIT_SAFETY_ARGS, ...safeDirectoryArgs(canonicalPath), ...subArgs]
 }
 
 /**
  * Minimal git subprocess environment. Deliberately does NOT include GITHUB_TOKEN, proxy
- * variables, or any credential material \u2014 inspection is local-only and needs no network access.
+ * variables, or any credential material - inspection is local-only and needs no network access.
+ *
+ * GIT_CONFIG_NOSYSTEM and GIT_CONFIG_GLOBAL=/dev/null disable the system and global config
+ * levels entirely (HOME is fixed to AGENT_HOME rather than inherited from the calling process,
+ * since the global config lookup git would otherwise perform there is disabled anyway, and this
+ * process may still be the root-owned service during the migration period). This changes where
+ * the filter-driver enumeration below reads from - down to local + worktree +
+ * `include.path`/`includeIf` config reachable from those - which is intended: a global/system
+ * config the agent doesn't own can no longer contribute a hostile filter driver or a
+ * safe.directory exception at all.
  */
 function buildInspectEnv(): Record<string, string> {
   return {
@@ -181,7 +230,9 @@ function buildInspectEnv(): Record<string, string> {
     GIT_TRACE_PACKET: '0',
     GIT_TRACE_PERFORMANCE: '0',
     GIT_CURL_VERBOSE: '0',
-    HOME: process.env.HOME ?? '/root',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    HOME: AGENT_HOME,
     PATH: process.env.PATH ?? '/usr/bin:/bin',
   }
 }
@@ -240,11 +291,15 @@ async function enumerateFilterDrivers(
   env: Record<string, string>,
   gitRunner: GitRunnerFn,
   timeoutMs: number,
+  uid: number | undefined,
+  gid: number | undefined,
 ): Promise<FilterEnumerationOutcome> {
-  const outcome = await gitRunner(gitInvocation(cwd, ['config', '-z', '--get-regexp', String.raw`^filter\.`]), {
+  const outcome = await gitRunner(gitInvocation(cwd, cwd, ['config', '-z', '--get-regexp', String.raw`^filter\.`]), {
     cwd,
     env,
     timeoutMs,
+    uid,
+    gid,
   })
   if (outcome.kind === 'ok') return {kind: 'ok', drivers: parseFilterDriverNames(outcome.stdout)}
   if (outcome.kind === 'failed' && outcome.code === 1 && outcome.stdout.length === 0) {
@@ -423,7 +478,19 @@ export interface InspectHandlerDeps {
   /** Workspace repos root. Defaults to WORKSPACE_REPOS_ROOT. */
   readonly reposRoot?: string
   /** Inspection options. */
-  readonly options?: {readonly timeoutMs?: number}
+  readonly options?: {
+    readonly timeoutMs?: number
+    /**
+     * Unprivileged uid every git invocation runs as. Defaults to AGENT_UID (identity.ts) —
+     * production wiring never needs to override this. Injectable ONLY so local tests (this
+     * machine is not root; switching to an arbitrary uid fails) can pass the CURRENT process's
+     * own uid instead — see inspect.test.ts for exactly how and why that doesn't weaken the
+     * code path under test.
+     */
+    readonly uid?: number
+    /** Unprivileged gid every git invocation runs as. Defaults to AGENT_GID (identity.ts). */
+    readonly gid?: number
+  }
   /** Injected clock for testability. Defaults to `() => new Date()`. */
   readonly clock?: () => Date
 }
@@ -456,7 +523,7 @@ export async function inspectCheckout(
   deps: InspectHandlerDeps = {},
 ): Promise<InspectHandlerResult> {
   const {gitRunner = runGit, reposRoot = WORKSPACE_REPOS_ROOT, options = {}, clock = () => new Date()} = deps
-  const {timeoutMs = DEFAULT_INSPECT_TIMEOUT_MS} = options
+  const {timeoutMs = DEFAULT_INSPECT_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const {owner, repo} = request
 
   // Resolve the repos root itself first, so the substitution check below compares against the
@@ -490,15 +557,20 @@ export async function inspectCheckout(
   const env = buildInspectEnv()
 
   const topOutcome = await gitRunner(
-    gitInvocation(canonicalResolved, ['rev-parse', '--show-toplevel', '--absolute-git-dir']),
+    gitInvocation(canonicalResolved, canonicalResolved, ['rev-parse', '--show-toplevel', '--absolute-git-dir']),
     {
       cwd: canonicalResolved,
       env,
       timeoutMs,
+      uid,
+      gid,
     },
   )
 
   if (topOutcome.kind === 'timeout') return failure('inspection-timeout', 504)
+  // Unconfirmed termination must never be reported as the clean, confirmed timeout above — it
+  // does not claim the process actually stopped (module header invariant #5).
+  if (topOutcome.kind === 'termination-unconfirmed') return failure('inspection-failed', 500)
   if (topOutcome.kind === 'failed') return failure('no-checkout', 404)
 
   const topLines = topOutcome.stdout.trim().split('\n')
@@ -526,7 +598,7 @@ export async function inspectCheckout(
   // Fail closed: enumerate every configured filter driver before `status` ever runs. If this
   // fails, times out, or returns something unparseable, `status` must never be invoked \u2014 an
   // inspection that might execute a planted command is worse than one reporting nothing.
-  const filterEnumeration = await enumerateFilterDrivers(canonicalResolved, env, gitRunner, timeoutMs)
+  const filterEnumeration = await enumerateFilterDrivers(canonicalResolved, env, gitRunner, timeoutMs, uid, gid)
   if (filterEnumeration.kind === 'failed') return failure('inspection-failed', 500)
 
   const statusEnv: Record<string, string> = {...env, ...buildFilterNeutralizationEnv(filterEnumeration.drivers)}
@@ -534,17 +606,25 @@ export async function inspectCheckout(
   // `--ignore-submodules=all`: a submodule has its own config/attributes, which the enumeration
   // above does not (and cannot, without recursing) cover, and `status.submoduleSummary` can spawn
   // additional work on top. This means the dirty counts below no longer reflect submodule
-  // changes \u2014 see the module header and the report for the trade-off.
+  // changes -- see the module header and the report for the trade-off.
   const statusOutcome = await gitRunner(
-    gitInvocation(canonicalResolved, ['status', '--porcelain=v2', '--branch', '--ignore-submodules=all']),
+    gitInvocation(canonicalResolved, canonicalResolved, [
+      'status',
+      '--porcelain=v2',
+      '--branch',
+      '--ignore-submodules=all',
+    ]),
     {
       cwd: canonicalResolved,
+      uid,
+      gid,
       env: statusEnv,
       timeoutMs,
     },
   )
 
   if (statusOutcome.kind === 'timeout') return failure('inspection-timeout', 504)
+  if (statusOutcome.kind === 'termination-unconfirmed') return failure('inspection-failed', 500)
   if (statusOutcome.kind === 'failed') return failure('inspection-failed', 500)
 
   const parsed = parsePorcelainV2(statusOutcome.stdout)
