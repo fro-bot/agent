@@ -38,6 +38,7 @@ IMAGE="${WORKSPACE_IMAGE:-fro-bot-workspace:smoke}"
 HEALTHY_TIMEOUT_S="${ISOLATION_HARNESS_HEALTHY_TIMEOUT_S:-60}"
 EXEC_TIMEOUT_S="${ISOLATION_HARNESS_EXEC_TIMEOUT_S:-15}"
 SHUTDOWN_TIMEOUT_S="${ISOLATION_HARNESS_SHUTDOWN_TIMEOUT_S:-30}"
+SIGNAL_WAIT_TIMEOUT_S="${ISOLATION_HARNESS_SIGNAL_WAIT_TIMEOUT_S:-15}"
 MIGRATION_HEALTHY_TIMEOUT_S="${ISOLATION_HARNESS_MIGRATION_TIMEOUT_S:-90}"
 
 AGENT_UID=10001
@@ -783,21 +784,237 @@ if [ "$control_b_password_prompt" = "$bundle_password_literal" ]; then
 fi
 pass "askpass prompt control B: a Password prompt built from the wrong embedded username does NOT match the bundle literal (regression check for this block's own recorder fix)"
 
-# Signals across uids: the root supervisor can stop the uid-10001 OpenCode
-# process on shutdown (killChildGroup sends SIGTERM to -pgid as root, which
-# CAP_KILL + matching process-group membership permits regardless of uid).
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4d: signals across uids, verified INSIDE a running container
+#
+# An exited container reports no processes by definition — "docker stop"
+# followed by "docker top fails" proves the CONTAINER stopped, not that
+# killChildGroup's actual mechanism (root sending SIGTERM to a NEGATIVE pgid
+# owned by uid 10001) works. That check would pass identically even if
+# killChildGroup were a no-op, since Docker's own teardown (SIGTERM to pid 1,
+# then SIGKILL to the whole cgroup at the timeout) would eventually clear
+# every process regardless. This phase proves the actual mechanism instead,
+# while the container is still up: build a real 3-level uid-10001 process
+# tree with a known pgid, prove (positive control) it is really running as
+# 10001, kill -TERM the negative pgid AS ROOT the same way killChildGroup
+# does, and prove every level — including the grandchild — is gone from
+# /proc while the container keeps running. A separate negative control
+# proves the direction is one-way: 10001 cannot signal the root service.
+#
+# Tool availability (checked at runtime, not assumed): deploy/workspace.Dockerfile's
+# final stage apk-installs only git/ca-certificates/libgcc/libstdc++/ripgrep/
+# curl/setpriv on top of the node:24-alpine base — no explicit util-linux or
+# procps package. `setsid` and `kill` are therefore expected to be busybox's
+# own applets (or ash's builtin `kill`), not util-linux's setsid or
+# procps-ng's kill. Busybox ships `setsid` as a standard applet (creates a
+# new session, so the exec'd process becomes both session leader and the
+# leader of a fresh process group) and its `kill` applet accepts a negative
+# pid to target a process group, same as procps — this is ordinary POSIX
+# kill(1)/setsid(1) behavior, not a GNU/util-linux extension, so no
+# real behavioral gap is expected between implementations. Still checked
+# with `command -v` rather than assumed: if setsid is missing, this block
+# falls back to a plain docker-exec-spawned tree (docker exec typically
+# still assigns a fresh process group to the exec'd process, since it has no
+# controlling terminal to join) and flags that path as lower confidence in
+# logs — it does NOT silently skip the property. If `kill` itself is
+# missing (would be unusual — even ash's builtin kill is always present),
+# the block fails loudly naming exactly that, rather than producing a
+# false pass from an unrelated "command not found" exit code.
+# ─────────────────────────────────────────────────────────────────────────────
+log "phase 4d: signals across uids (real process-group kill, verified via /proc)"
+
+SIGNAL_CHECK_DIR="$(mktemp -d)"
+TMPDIRS+=("$SIGNAL_CHECK_DIR")
+
+cat > "${SIGNAL_CHECK_DIR}/group-tree.sh" <<'GROUPTREE_EOF'
+#!/bin/sh
+# Spawns a 3-level process tree (parent -> child -> grandchild). Nothing
+# here calls setpgid, so all three share whatever process group this
+# top-level process started in — setsid (when the caller uses it) makes
+# that a brand-new group with pgid == this process's own pid.
+echo $$ > /tmp/group-parent.pid
+sh -c '
+  echo $$ > /tmp/group-child.pid
+  sleep 600 &
+  echo $! > /tmp/group-grandchild.pid
+  wait
+' &
+wait
+GROUPTREE_EOF
+chmod 755 "${SIGNAL_CHECK_DIR}/group-tree.sh"
+
+cat > "${SIGNAL_CHECK_DIR}/pgid-of.sh" <<'PGIDOF_EOF'
+#!/bin/sh
+# Usage: pgid-of.sh <pid> — prints the pgrp field from /proc/<pid>/stat.
+# comm (field 2) is parenthesized and may itself contain spaces, so split on
+# the LAST ") " rather than naive whitespace splitting: state=$1 ppid=$2
+# pgrp=$3 of what remains.
+awk -F') ' '{print $NF}' "/proc/$1/stat" | awk '{print $3}'
+PGIDOF_EOF
+chmod 755 "${SIGNAL_CHECK_DIR}/pgid-of.sh"
+
+cat > "${SIGNAL_CHECK_DIR}/group-scan.sh" <<'GROUPSCAN_EOF'
+#!/bin/sh
+# Usage: group-scan.sh <pid> — resolves <pid>'s pgid, then lists every
+# process in /proc sharing that pgid as "MEMBER pid=<p> uid=<u>". Used both
+# to confirm OpenCode's own process group is entirely uid-10001 (read-only —
+# never kills through this path) and, incidentally, exercises the same
+# pgid-lookup logic the kill-target discovery below relies on.
+TARGET_PID="$1"
+TARGET_PGID="$(awk -F') ' '{print $NF}' "/proc/${TARGET_PID}/stat" | awk '{print $3}')"
+echo "PGID=${TARGET_PGID}"
+for p in /proc/[0-9]*; do
+  pid="${p#/proc/}"
+  [ -r "$p/stat" ] || continue
+  pgid="$(awk -F') ' '{print $NF}' "$p/stat" 2>/dev/null | awk '{print $3}')"
+  [ "$pgid" = "$TARGET_PGID" ] || continue
+  uid_line="$(awk '/^Uid:/{print $2}' "$p/status" 2>/dev/null)"
+  echo "MEMBER pid=${pid} uid=${uid_line}"
+done
+GROUPSCAN_EOF
+chmod 755 "${SIGNAL_CHECK_DIR}/group-scan.sh"
+
+docker cp "${SIGNAL_CHECK_DIR}/group-tree.sh" "${MAIN_CID}:/tmp/group-tree.sh"
+docker cp "${SIGNAL_CHECK_DIR}/pgid-of.sh" "${MAIN_CID}:/tmp/pgid-of.sh"
+docker cp "${SIGNAL_CHECK_DIR}/group-scan.sh" "${MAIN_CID}:/tmp/group-scan.sh"
+run_exec "$MAIN_CID" "0:0" chmod 755 /tmp/group-tree.sh /tmp/pgid-of.sh /tmp/group-scan.sh
+
+if run_exec "$MAIN_CID" "0:0" sh -c 'command -v setsid >/dev/null 2>&1'; then
+  GROUP_LAUNCH_CMD=(setsid /tmp/group-tree.sh)
+  log "  setsid found in the image — using it for a deterministic fresh session+process-group"
+else
+  GROUP_LAUNCH_CMD=(/tmp/group-tree.sh)
+  log "  setsid NOT found in this image — falling back to a plain docker-exec-spawned tree. The pgid below is still DISCOVERED empirically via /proc (never assumed), but this path has NOT independently confirmed isolation from any other uid-10001 process group the way an explicit new session does — treat this property's result as lower confidence if this branch is the one that ran (see report)."
+fi
+if ! run_exec "$MAIN_CID" "0:0" sh -c 'command -v kill >/dev/null 2>&1 || kill -l >/dev/null 2>&1'; then
+  fail "signal handling: no usable 'kill' found in the image (checked both a standalone binary and the shell builtin) — cannot send the negative-pgid signal this property depends on"
+fi
+
+docker exec --user 10001:10001 -d "$MAIN_CID" "${GROUP_LAUNCH_CMD[@]}"
+
+# Bounded wait for all three pid files (the tree self-reports its own pids —
+# no guessing).
+group_pids_ready=false
+for _ in $(seq 1 20); do
+  if run_exec "$MAIN_CID" "0:0" sh -c 'test -f /tmp/group-parent.pid && test -f /tmp/group-child.pid && test -f /tmp/group-grandchild.pid'; then
+    group_pids_ready=true
+    break
+  fi
+  sleep 0.5
+done
+[ "$group_pids_ready" = "true" ] || fail "signal handling: the uid-10001 test process tree never wrote all three pid files — setup itself failed, before any kill was attempted"
+
+group_parent_pid="$(run_exec "$MAIN_CID" "0:0" cat /tmp/group-parent.pid | tr -d '[:space:]')"
+group_child_pid="$(run_exec "$MAIN_CID" "0:0" cat /tmp/group-child.pid | tr -d '[:space:]')"
+group_grandchild_pid="$(run_exec "$MAIN_CID" "0:0" cat /tmp/group-grandchild.pid | tr -d '[:space:]')"
+[ -n "$group_parent_pid" ] && [ -n "$group_child_pid" ] && [ -n "$group_grandchild_pid" ] \
+  || fail "signal handling: one or more test-tree pid files were empty (parent='${group_parent_pid}' child='${group_child_pid}' grandchild='${group_grandchild_pid}')"
+log "  test tree pids: parent=${group_parent_pid} child=${group_child_pid} grandchild=${group_grandchild_pid}"
+
+test_group_pgid="$(run_exec "$MAIN_CID" "0:0" /tmp/pgid-of.sh "$group_parent_pid" | tr -d '[:space:]')"
+[ -n "$test_group_pgid" ] || fail "signal handling: could not determine the test tree's pgid from /proc/${group_parent_pid}/stat"
+log "  test tree pgid: ${test_group_pgid}"
+
+# Refuse to signal a group that is not exclusively the test tree's. Without
+# setsid, the tree could inherit a pgid shared with the root service (pid 1)
+# or its supervisor, and a root `kill -<pgid>` would take down the service
+# instead of proving anything. The group leader must be the tree's own parent.
+service_pgid="$(run_exec "$MAIN_CID" "0:0" /tmp/pgid-of.sh 1 | tr -d '[:space:]')"
+[ "$test_group_pgid" != "$service_pgid" ] \
+  || fail "signal handling: the test tree shares pgid ${test_group_pgid} with the root service (pid 1) — refusing to signal it"
+[ "$test_group_pgid" = "$group_parent_pid" ] \
+  || fail "signal handling: the test tree's pgid (${test_group_pgid}) is not its own parent (${group_parent_pid}), so the group may contain other processes — refusing to signal it"
+
+# Positive control: every recorded pid is alive AND really running as uid
+# 10001 before the kill — otherwise the kill "succeeding" would prove nothing
+# (it could just be signalling processes that were never there or never
+# 10001-owned in the first place).
+GROUP_TREE_PID_NAMES=(group_parent_pid group_child_pid group_grandchild_pid)
+GROUP_TREE_PIDS=("$group_parent_pid" "$group_child_pid" "$group_grandchild_pid")
+for pid_idx in 0 1 2; do
+  pid_name="${GROUP_TREE_PID_NAMES[$pid_idx]}"
+  pid_val="${GROUP_TREE_PIDS[$pid_idx]}"
+  must_succeed "signal handling positive control: ${pid_name} (${pid_val}) exists before the kill" "$MAIN_CID" "0:0" test -d "/proc/${pid_val}"
+  # shellcheck disable=SC2016 # awk's own $2 field reference, deliberately not a bash expansion
+  pid_uid_line="$(run_exec "$MAIN_CID" "0:0" awk '/^Uid:/{print $2}' "/proc/${pid_val}/status")"
+  [ "$pid_uid_line" = "10001" ] || fail "signal handling positive control: ${pid_name} (${pid_val}) has real uid ${pid_uid_line}, expected 10001 — the test tree did not actually run as the agent uid, so killing it would prove nothing"
+done
+pass "signal handling positive control: all three test-tree pids (parent/child/grandchild) exist and run as real uid 10001 before the kill"
+
+# The actual property: root, with ONLY the production capabilities (CAP_KILL
+# among them, no CAP_SYS_PTRACE), signals the uid-10001 process GROUP with a
+# negative pgid — exactly what killChildGroup does
+# (apps/workspace-agent/src/opencode-server.ts: process.kill(-(child.pid), 'SIGTERM')).
+run_exec "$MAIN_CID" "0:0" kill -TERM -- "-${test_group_pgid}"
+
+signal_reaped=false
+for _ in $(seq 1 "$SIGNAL_WAIT_TIMEOUT_S"); do
+  if ! run_exec "$MAIN_CID" "0:0" sh -c "test -d /proc/${group_parent_pid} || test -d /proc/${group_child_pid} || test -d /proc/${group_grandchild_pid}"; then
+    signal_reaped=true
+    break
+  fi
+  sleep 1
+done
+if [ "$signal_reaped" != "true" ]; then
+  still_alive=""
+  for pid_idx in 0 1 2; do
+    pid_name="${GROUP_TREE_PID_NAMES[$pid_idx]}"
+    pid_val="${GROUP_TREE_PIDS[$pid_idx]}"
+    run_exec "$MAIN_CID" "0:0" test -d "/proc/${pid_val}" && still_alive="${still_alive} ${pid_name}(${pid_val})"
+  done
+  fail "signal handling: 'kill -TERM -${test_group_pgid}' as root did not reap the uid-10001 test tree within ${SIGNAL_WAIT_TIMEOUT_S}s — still alive:${still_alive:- none? (race — re-check the poll logic)} — this directly exercises what killChildGroup depends on"
+fi
+# docker top the CONTAINER (not /proc) as an independent cross-check that we
+# didn't just lose the pids to a container-wide teardown — the container is
+# still supposed to be fully up at this point.
+docker top "$MAIN_CID" >/dev/null 2>&1 || fail "signal handling: the container itself is no longer running — this check is only meaningful while it's up, not via container teardown"
+pass "signal handling: root, with only the production capabilities (CAP_KILL, no CAP_SYS_PTRACE), sent SIGTERM to the uid-10001 process group's negative pgid and reaped parent + child + GRANDCHILD, entirely inside a still-running container"
+
+# Negative control: the direction is one-way. As uid 10001, signalling the
+# root service (pid 1) must fail with a permission error, and pid 1 must
+# still be alive and the container still healthy afterward.
+must_fail "signal handling negative control: uid 10001 cannot kill -TERM the root service (pid 1)" "$MAIN_CID" "$AGENT_USER" kill -TERM 1
+must_succeed "signal handling negative control: pid 1 is still alive after the denied kill attempt" "$MAIN_CID" "0:0" test -d /proc/1
+wait_for_healthz "$MAIN_CID" 10 || fail "signal handling negative control: the container is no longer healthy after the denied 10001->root kill attempt (pid 1 should be completely unaffected)"
+pass "signal handling negative control: uid 10001 cannot signal the root service; pid 1 and the container's healthz remain unaffected"
+
+# OpenCode's own process group, read-only — never killed through this path.
+# Whether OpenCode is actually serving at this point in the harness: yes for
+# this specific check (it only needs `opencode serve` to be listening, which
+# happens on boot independent of provider credentials — the credential-only
+# gap this harness cannot exercise is a live AGENTIC TURN through the
+# mention loop, e.g. the :9200 proxy-reaches-OpenCode check in phase 4 and
+# this group-membership check, not "is the process up at all").
+set +e
+oc_pid_now="$(run_exec "$MAIN_CID" "0:0" pidof opencode 2>/dev/null | awk '{print $1}')"
+set -e
+if [ -z "$oc_pid_now" ]; then
+  log "  OpenCode is not running at this point in the harness (pidof opencode found nothing) — skipping the OpenCode-group-membership check; not a failure of this phase's own properties"
+else
+  oc_group_scan="$(run_exec "$MAIN_CID" "0:0" /tmp/group-scan.sh "$oc_pid_now")"
+  log "  OpenCode (pid ${oc_pid_now}) process-group scan:"
+  printf '%s\n' "$oc_group_scan" | while IFS= read -r scan_line; do log "    ${scan_line}"; done
+  oc_group_non_agent="$(printf '%s\n' "$oc_group_scan" | grep '^MEMBER' | grep -v 'uid=10001' || true)"
+  [ -z "$oc_group_non_agent" ] || fail "signal handling: OpenCode's process group contains non-10001 member(s): ${oc_group_non_agent}"
+  oc_member_count="$(printf '%s\n' "$oc_group_scan" | grep -c '^MEMBER')"
+  [ "$oc_member_count" -ge 1 ] || fail "signal handling: OpenCode's process-group scan found zero members, including OpenCode itself — scan logic is broken"
+  pass "OpenCode's own process group (pid ${oc_pid_now}) has ${oc_member_count} member(s), all uid 10001 — confirms detached:true made it a group leader of an all-agent-uid group (read-only check, never killed)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# docker stop: kept for its own real purpose — a clean shutdown within the
+# timeout — NOT as proof of reaping (Phase 4d above already proved the
+# actual signalling mechanism against real /proc state; an exited container
+# reporting no processes is true by definition and proves nothing about
+# killChildGroup specifically).
+# ─────────────────────────────────────────────────────────────────────────────
 docker stop --time "$SHUTDOWN_TIMEOUT_S" "$MAIN_CID" >/dev/null
-# docker stop already waited for the container to exit (or killed it at the
-# timeout); if OpenCode were still running/wedged, the container would not
-# have stopped inside SHUTDOWN_TIMEOUT_S at all, but confirm explicitly via
-# `docker top` — an exited container reports no processes.
 if docker top "$MAIN_CID" >/dev/null 2>&1; then
-  fail "signal handling: container is still running after 'docker stop --time ${SHUTDOWN_TIMEOUT_S}' — OpenCode (or the supervisor) did not shut down"
+  fail "shutdown: container is still running after 'docker stop --time ${SHUTDOWN_TIMEOUT_S}' — the supervisor did not exit cleanly within the timeout"
 fi
 container_state="$(docker inspect -f '{{.State.Status}}' "$MAIN_CID")"
-[ "$container_state" = "exited" ] || fail "signal handling: container state after stop is '${container_state}', expected 'exited'"
-pass "the root supervisor's shutdown (docker stop, SIGTERM) reaps the uid-10001 OpenCode process; no 10001 process survives"
-log "NOTE (confidence: see report): this proves OpenCode itself is reaped. It does NOT independently prove a GRANDCHILD of OpenCode is also reaped — POSIX setpgid() cannot join an externally-spawned docker-exec process to OpenCode's process group from outside its own ancestry, and constructing a REAL grandchild needs OpenCode to actually dispatch a tool subprocess, which needs live provider credentials this smoke context does not have. killChildGroup's use of \`process.kill(-pgid, 'SIGTERM')\` is, by POSIX semantics, unconditionally group-wide (see apps/workspace-agent/src/opencode-server.ts) — this harness proves the mechanism reaches OpenCode itself; the grandchild case rests on that same POSIX guarantee rather than an independent empirical check here."
+[ "$container_state" = "exited" ] || fail "shutdown: container state after stop is '${container_state}', expected 'exited'"
+pass "shutdown: the container stops cleanly within ${SHUTDOWN_TIMEOUT_S}s (reaping itself was already proven directly in phase 4d, not inferred from this)"
 
 # restart container so we don't leak a stopped-but-not-removed container past
 # this phase's own trap accounting (cleanup() force-removes regardless, but
