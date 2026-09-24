@@ -466,11 +466,12 @@ must_succeed "cannot remove the checkout directory" "$MAIN_CID" "0:0" \
 pass "uid 10001 cannot rename or remove a checkout directory (root-owned 0755 parent blocks it; root can)"
 
 # ── cannot bind 9100 or 9200 while the service holds them ──────────────────
-# `timeout N nc -l -p PORT` inside the container disambiguates bind failure
-# (nc exits nonzero immediately, status != 124) from bind SUCCESS-but-no-
-# connection-arrived (nc/timeout would otherwise hang until run_exec's own
-# EXEC_TIMEOUT_S killed the docker-exec client for an unrelated reason, which
-# would make a positive control "fail" for the wrong reason).
+# `timeout N nc -l -p PORT` inside the container bounds a successful listen
+# that no connection ever reaches. The exit status alone cannot tell the two
+# outcomes apart reliably: busybox `timeout` reports a timed-out child as
+# 143 (128+SIGTERM), not GNU's 124. So each side keys on what nc says:
+# a refused bind prints "Address in use" (EADDRINUSE, the specific reason
+# under test); a successful listen prints no bind error and ends by timeout.
 assert_cannot_bind() {
   local property="$1" cid="$2" user="$3" port="$4"
   local out status
@@ -478,8 +479,8 @@ assert_cannot_bind() {
   out="$(run_exec "$cid" "$user" sh -c "timeout 2 nc -l -p ${port} 2>&1")"
   status=$?
   set -e
-  if [ "$status" -eq 124 ] || [ "$status" -eq 0 ]; then
-    fail "${property}: uid ${user} appears to have BOUND port ${port} (status=${status}: 124=harness timeout killed a still-listening nc, 0=nc exited cleanly after accepting/timing out on an open listen) — output: ${out}"
+  if ! printf '%s' "$out" | grep -q 'Address in use'; then
+    fail "${property}: uid ${user} was not refused with EADDRINUSE on port ${port} (status=${status}) — it may have bound it, or failed for an unrelated reason — output: ${out}"
   fi
   log "  bind attempt on :${port} failed as expected (status=${status}): ${out}"
 }
@@ -491,9 +492,14 @@ assert_can_bind() {
   out="$(run_exec "$cid" "$user" sh -c "timeout 2 nc -l -p ${port} 2>&1")"
   status=$?
   set -e
-  if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+  # 0: nc exited on its own; 124 (GNU) / 143 (busybox): timeout ended a listen.
+  if printf '%s' "$out" | grep -qi 'bind'; then
     fail "${property} (positive control): uid ${user} could NOT bind port ${port} (status=${status}): ${out}"
   fi
+  case "$status" in
+    0 | 124 | 143) ;;
+    *) fail "${property} (positive control): nc on port ${port} ended with unexpected status ${status}: ${out}" ;;
+  esac
 }
 
 assert_cannot_bind "cannot bind :9100 (already held by the service)" "$MAIN_CID" "$AGENT_USER" 9100
