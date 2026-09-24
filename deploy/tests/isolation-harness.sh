@@ -1255,15 +1255,20 @@ docker run --rm \
     printf "ignored.log\n" > .gitignore
     printf "#!/bin/sh\necho hi\n" > run.sh
     chmod 755 run.sh
+    # Files OUTSIDE the checkout but on the same volume live under the
+    # service state dir, which the migration never walks. A stray file at the
+    # volume root would be read as an owner directory and fail the boot.
+    mkdir -m 700 /workspace/repos/.workspace-agent
+    mkdir -m 700 /workspace/repos/.workspace-agent/harness-fixture
     # Sentinel target OUTSIDE the checkout, same volume/filesystem, root-owned.
-    printf "outside sentinel content\n" > /workspace/repos/.sentinel-target
-    ln -s /workspace/repos/.sentinel-target symlink-to-outside
+    printf "outside sentinel content\n" > /workspace/repos/.workspace-agent/harness-fixture/sentinel-target
+    ln -s /workspace/repos/.workspace-agent/harness-fixture/sentinel-target symlink-to-outside
     # Hardlink to a root-owned file elsewhere on the same volume.
-    printf "shared inode content\n" > /workspace/repos/.hardlink-source
-    ln /workspace/repos/.hardlink-source hardlinked.txt
+    printf "shared inode content\n" > /workspace/repos/.workspace-agent/harness-fixture/hardlink-source
+    ln /workspace/repos/.workspace-agent/harness-fixture/hardlink-source hardlinked.txt
     # Record hashes for post-migration comparison.
-    sha256sum tracked.txt ignored.log run.sh hardlinked.txt /workspace/repos/.sentinel-target /workspace/repos/.hardlink-source \
-      > /workspace/repos/.pre-migration-hashes.txt
+    sha256sum tracked.txt ignored.log run.sh hardlinked.txt /workspace/repos/.workspace-agent/harness-fixture/sentinel-target /workspace/repos/.workspace-agent/harness-fixture/hardlink-source \
+      > /workspace/repos/.workspace-agent/harness-fixture/pre-migration-hashes.txt
   '
 
 log "legacy fixture populated (dirty tracked file, ignored file, executable, outside symlink, outside hardlink)"
@@ -1296,7 +1301,7 @@ assert_migration_state() {
   non_agent="$(run_exec "$MIG_CID" "0:0" find /workspace/repos/acme/widgets -not -user 10001 2>&1 || true)"
   [ -z "$non_agent" ] || fail "migration (${label}): file(s) inside the checkout not owned by uid 10001: ${non_agent}"
 
-  run_exec "$MIG_CID" "0:0" sh -c 'cd /workspace/repos/acme/widgets && sha256sum -c /workspace/repos/.pre-migration-hashes.txt' \
+  run_exec "$MIG_CID" "0:0" sh -c 'cd /workspace/repos/acme/widgets && sha256sum -c /workspace/repos/.workspace-agent/harness-fixture/pre-migration-hashes.txt' \
     || fail "migration (${label}): content hashes changed after migration"
 
   # The fixture created run.sh with `chmod 755`. migrate-repo-ownership.mjs
@@ -1307,16 +1312,16 @@ assert_migration_state() {
   run_sh_mode="$(run_exec "$MIG_CID" "0:0" stat -c '%a' /workspace/repos/acme/widgets/run.sh)"
   [ "$run_sh_mode" = "755" ] || fail "migration (${label}): run.sh mode is ${run_sh_mode}, expected 755 unchanged (owner-exec bit is the FIRST octal digit)"
 
-  outside_owner="$(run_exec "$MIG_CID" "0:0" stat -c '%u' /workspace/repos/.sentinel-target)"
-  [ "$outside_owner" = "0" ] || fail "migration (${label}): symlink target /workspace/repos/.sentinel-target owner changed to ${outside_owner}, expected 0 (migration must never follow symlinks)"
+  outside_owner="$(run_exec "$MIG_CID" "0:0" stat -c '%u' /workspace/repos/.workspace-agent/harness-fixture/sentinel-target)"
+  [ "$outside_owner" = "0" ] || fail "migration (${label}): symlink target /workspace/repos/.workspace-agent/harness-fixture/sentinel-target owner changed to ${outside_owner}, expected 0 (migration must never follow symlinks)"
   local symlink_owner
   symlink_owner="$(run_exec "$MIG_CID" "0:0" stat -c '%u' /workspace/repos/acme/widgets/symlink-to-outside)"
   [ "$symlink_owner" = "10001" ] || fail "migration (${label}): the symlink ITSELF is owned by ${symlink_owner}, expected 10001 (lchown of the symlink, not its target)"
 
   local hardlink_source_owner hardlink_source_nlink
-  hardlink_source_owner="$(run_exec "$MIG_CID" "0:0" stat -c '%u' /workspace/repos/.hardlink-source)"
-  [ "$hardlink_source_owner" = "0" ] || fail "migration (${label}): outside hardlink source /workspace/repos/.hardlink-source owner changed to ${hardlink_source_owner}, expected 0"
-  hardlink_source_nlink="$(run_exec "$MIG_CID" "0:0" stat -c '%h' /workspace/repos/.hardlink-source)"
+  hardlink_source_owner="$(run_exec "$MIG_CID" "0:0" stat -c '%u' /workspace/repos/.workspace-agent/harness-fixture/hardlink-source)"
+  [ "$hardlink_source_owner" = "0" ] || fail "migration (${label}): outside hardlink source /workspace/repos/.workspace-agent/harness-fixture/hardlink-source owner changed to ${hardlink_source_owner}, expected 0"
+  hardlink_source_nlink="$(run_exec "$MIG_CID" "0:0" stat -c '%h' /workspace/repos/.workspace-agent/harness-fixture/hardlink-source)"
   [ "$hardlink_source_nlink" = "1" ] || fail "migration (${label}): outside hardlink source still has nlink ${hardlink_source_nlink} (expected 1 — the inside copy should have been broken onto its own inode)"
 
   run_exec "$MIG_CID" "0:0" test -f /workspace/repos/.workspace-agent/completed/acme__widgets.json \
