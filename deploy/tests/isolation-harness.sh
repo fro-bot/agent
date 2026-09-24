@@ -745,13 +745,17 @@ clone_restart_summary_line="$(printf '%s\n' "$clone_restart_logs" | grep 'migrat
 [ -n "$clone_restart_summary_line" ] || fail "phase 4b-restart: no 'migrate-repo-ownership: completed=...' summary line found in this boot's logs — got: ${clone_restart_logs}"
 log "  migration summary for this boot: ${clone_restart_summary_line}"
 
-echo "$clone_restart_summary_line" | grep -q 'completed=0 ' \
-  || fail "phase 4b-restart: migration summary reports something COMPLETED (walked) this boot — expected completed=0: ${clone_restart_summary_line}"
-echo "$clone_restart_summary_line" | grep -qE 'agent-owned=[1-9][0-9]*' \
-  || fail "phase 4b-restart: migration summary does not report the /clone checkout as agent-owned-skipped — expected agent-owned>=1: ${clone_restart_summary_line}"
-echo "$clone_restart_summary_line" | grep -q 'dirs=0 files=0 ' \
-  || fail "phase 4b-restart: migration summary reports dirs/files touched this boot — expected dirs=0 files=0 (nothing walked): ${clone_restart_summary_line}"
-pass "phase 4b-restart: migration summary for this boot reports the /clone checkout skipped (agent-owned), with nothing walked or changed"
+# Assert on the /clone checkout BY NAME, not on the run's totals: earlier
+# phases deliberately leave a root-owned git checkout on this volume (the
+# /inspect dubious-ownership fixture), and migrating it on this boot is
+# correct. Only the /clone checkout must be skipped.
+clone_restart_key="${CLONE_OWNER}/${CLONE_REPO}"
+printf '%s\n' "$clone_restart_logs" | grep -qxF "migrate: ${clone_restart_key}: skipped (already agent-owned)" \
+  || fail "phase 4b-restart: this boot's migration did not report ${clone_restart_key} as skipped (already agent-owned) — got: ${clone_restart_logs}"
+if printf '%s\n' "$clone_restart_logs" | grep -qxF "migrate: ${clone_restart_key}: complete"; then
+  fail "phase 4b-restart: this boot's migration WALKED ${clone_restart_key} (reported it complete) instead of skipping it"
+fi
+pass "phase 4b-restart: this boot's migration skipped the /clone checkout (${clone_restart_key}) as already agent-owned, without walking it"
 
 clone_restart_hashes_after="$(run_exec "$MAIN_CID" "0:0" sh -c "find '${CLONE_CHECKOUT_PATH}' -type f -exec sha256sum {} \\; | sort")"
 clone_restart_owners_after="$(run_exec "$MAIN_CID" "0:0" sh -c "find '${CLONE_CHECKOUT_PATH}' -exec stat -c '%n %u:%g' {} \\; | sort")"

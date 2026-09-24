@@ -390,6 +390,7 @@ export async function migrateRepoOwnership(options) {
           checkoutRootSt.gid === targetGid
         ) {
           skippedAgentOwned.push(checkoutKey)
+          log(`migrate: ${checkoutKey}: skipped (already agent-owned)`)
           continue
         }
         await migrateEntry(checkoutPath, ctx)
