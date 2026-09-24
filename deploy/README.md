@@ -207,6 +207,20 @@ The workspace container's OpenCode process — and every tool it spawns — now 
 - **Precondition: only one workspace container may use the `workspace-repos` volume during the upgrade.** Two containers migrating the same volume concurrently is unsupported — stop any other workspace container attached to the volume before upgrading.
 - **How long it takes:** proportional to the number and size of existing checkouts. It is bounded by a deadline, default **5 minutes**, configurable via `WORKSPACE_MIGRATION_DEADLINE_MS` (milliseconds) in `deploy/.env`. If the deadline is hit, the container refuses to start rather than launching OpenCode against a partially-migrated, mixed-ownership tree — restart the container to resume from where it left off. The `workspace` healthcheck's `start_period` (360s) is sized to cover the default deadline plus boot overhead; raise both together if you widen the deadline for a very large `workspace-repos` volume.
 - **New deployments** have nothing to migrate — checkouts are created directly under the agent uid, and this step is a fast no-op.
+- **Migration failure:** the container refuses to start if any checkout can't be fully migrated (an owner directory that's a symlink, not a real directory, not root-owned, unreadable, or foreign-filesystem; or a nested mount inside a checkout). The log names every offending path and what to do about it. Fix each path, then restart — checkouts that already migrated cleanly keep their completion marker and are not redone.
+- **Rollback:** after migration every checkout is owned by uid `10001`; a previous image's workspace container runs `git` as root, and root refuses to operate on a repo it doesn't own (git calls this "dubious ownership" — verified against real git with `GIT_TEST_ASSUME_DIFFERENT_OWNER=1 git status`, which exits 128 with `fatal: detected dubious ownership in repository at ...`). Before rolling back, chown the `<owner>/<repo>` checkout trees back to root — **never** the `/workspace/repos` root, `/workspace/repos/<owner>` directories, or the `.workspace-agent` state dir:
+
+  ```sh
+  # Run against the workspace-repos volume, e.g. via a throwaway container with it mounted at /workspace/repos.
+  for owner in /workspace/repos/*/; do
+    [ "$(basename "$owner")" = ".workspace-agent" ] && continue
+    for repo in "$owner"*/; do
+      chown -hR 0:0 "$repo"  # -h: change symlinks themselves, never their targets
+    done
+  done
+  ```
+
+- **Leftover `.tmp-*` dirs:** partial clones from the pre-migration clone path are never migrated or deleted automatically — the migration only warns and names them in the log. They are safe to remove manually once you've confirmed they're not in use.
 
 **Where the secret mounts moved:** `workspace-opencode-token`, `workspace-opencode-auth`, and the mitmproxy CA volume are now mounted under a protected, root-only path inside the container (`/run/workspace-agent/secrets/…` and `/run/workspace-agent/mitmproxy`, a `tmpfs` reset on every container start) instead of the old top-level `/run/secrets/…` and `/run/mitmproxy-certs`, which any uid in the container could read. **The host-side secret files themselves are unchanged** — `deploy/secrets/workspace-opencode-token` and `deploy/secrets/workspace-opencode-auth` keep the same names and locations; only the in-container mount destination moved. No operator action is needed for this beyond pulling the updated image.
 
@@ -538,7 +552,7 @@ The stack uses two named Docker volumes that survive container recreation and da
 | Volume | Mounted at | Contents |
 | --- | --- | --- |
 | `workspace-repos` | `/workspace/repos` (workspace service) | Cloned repository checkouts |
-| `mitmproxy-certs` | `/home/mitmproxy/.mitmproxy` (mitmproxy) and `/run/mitmproxy-certs` (workspace, gateway) | mitmproxy CA certificate |
+| `mitmproxy-certs` | `/home/mitmproxy/.mitmproxy` (mitmproxy), `/run/workspace-agent/mitmproxy` (workspace), `/etc/ssl/certs` (gateway) | mitmproxy CA certificate |
 
 **Safe operations** — these preserve both volumes:
 

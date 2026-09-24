@@ -46,11 +46,19 @@ export const DEFAULT_DEADLINE_MS = 5 * 60 * 1000
 export const STAGING_PREFIX = '.tmp-'
 export const STATE_DIR_NAME = '.workspace-agent'
 
-class MigrationTimeoutError extends Error {
-  constructor(message) {
-    super(message)
-    this.name = 'MigrationTimeoutError'
-  }
+// Functions-only: no Error subclasses (repo convention — only the gateway
+// uses class-based errors). A discriminating `code` property plus a
+// predicate stands in for `instanceof MigrationTimeoutError`.
+const MIGRATION_TIMEOUT_CODE = 'MIGRATION_TIMEOUT'
+
+function createMigrationTimeoutError(message) {
+  const error = new Error(message)
+  error.code = MIGRATION_TIMEOUT_CODE
+  return error
+}
+
+function isMigrationTimeoutError(error) {
+  return error instanceof Error && error.code === MIGRATION_TIMEOUT_CODE
 }
 
 /**
@@ -70,6 +78,7 @@ export function defaultOps() {
     chmod: fsPromises.chmod,
     chown: fsPromises.chown,
     lchown: fsPromises.lchown,
+    utimes: fsPromises.utimes,
   }
 }
 
@@ -117,6 +126,12 @@ async function breakHardlink(ops, path, st, log) {
   const data = await ops.readFile(path)
   await ops.writeFile(tmp, data, {mode: st.mode & 0o777})
   await ops.rename(tmp, path)
+  // The rename gives the new inode a fresh mtime — restore the original
+  // atime/mtime from the `st` captured before the break, sub-second
+  // precision included (Date objects carry it through to utimes on
+  // platforms that support it). xattrs and ACLs are NOT preserved by this
+  // copy — only content, POSIX mode bits, and now atime/mtime.
+  await ops.utimes(path, st.atime, st.mtime)
   log(`  broke hardlink (nlink=${st.nlink}): ${path}`)
 }
 
@@ -134,8 +149,11 @@ async function migrateEntry(entryPath, ctx) {
   const st = await ctx.ops.lstat(entryPath)
 
   if (st.dev !== ctx.rootDev) {
-    ctx.log(`  skip (different filesystem, not crossing mount boundary): ${entryPath}`)
+    const problem = `${entryPath} contains a mount from another filesystem; unmount it or move it out of the checkout`
+    ctx.log(`  PROBLEM: ${problem}`)
     ctx.stats.skippedForeignFs++
+    ctx.checkoutProblems.push(problem)
+    ctx.problems.push(problem)
     return
   }
 
@@ -152,7 +170,7 @@ async function migrateEntry(entryPath, ctx) {
     const names = await ctx.ops.readdir(entryPath)
     for (const name of names) {
       if (name.startsWith(STAGING_PREFIX)) {
-        ctx.log(`  skip staging dir: ${join(entryPath, name)}`)
+        ctx.log(`  WARNING: leftover staging dir from the old clone path, not touched or removed: ${join(entryPath, name)}`)
         ctx.stats.skippedStaging++
         continue
       }
@@ -238,6 +256,11 @@ export async function migrateRepoOwnership(options) {
   const stats = {dirs: 0, files: 0, symlinks: 0, other: 0, hardlinksBroken: 0, skippedStaging: 0, skippedForeignFs: 0}
   const completed = []
   const skippedAlreadyDone = []
+  // Every offending path found this run, across owner-level and
+  // checkout-entry-level problems. Non-empty at the end fails the whole run
+  // (non-zero exit) — but every checkout that migrated cleanly still keeps
+  // its marker, so a fixed-and-restarted run only redoes the broken ones.
+  const problems = []
 
   const ctx = {
     ops,
@@ -246,9 +269,11 @@ export async function migrateRepoOwnership(options) {
     rootDev,
     stats,
     log,
+    problems,
+    checkoutProblems: [],
     checkDeadline(where) {
       if (Date.now() > deadlineAt) {
-        throw new MigrationTimeoutError(`migration deadline (${deadlineMs}ms) exceeded at: ${where}`)
+        throw createMigrationTimeoutError(`migration deadline (${deadlineMs}ms) exceeded at: ${where}`)
       }
     },
   }
@@ -269,18 +294,37 @@ export async function migrateRepoOwnership(options) {
     try {
       ownerSt = await ops.lstat(ownerPath)
     } catch (error) {
-      log(`  skip owner (cannot stat ${ownerPath}): ${error.message}`)
+      const problem = `${ownerPath} cannot be stat'd (${error.message}); fix filesystem access to this path and restart`
+      log(`  PROBLEM: ${problem}`)
+      problems.push(problem)
       continue
     }
     // Owner directories stay root-owned, 0755 — never chowned, never descended
-    // into if they are not real, same-owner, same-filesystem directories.
-    if (
-      ownerSt.isSymbolicLink() ||
-      !ownerSt.isDirectory() ||
-      ownerSt.dev !== rootDev ||
-      ownerSt.uid !== expectedRootOwnerUid
-    ) {
-      log(`  skip owner (not a real same-filesystem directory): ${ownerPath}`)
+    // into if they are not real, same-owner, same-filesystem directories. Any
+    // violation here means the checkouts under it are never migrated, so it
+    // must fail the run loudly rather than silently skip.
+    if (ownerSt.isSymbolicLink()) {
+      const problem = `${ownerPath} is a symlink; replace it with a real directory`
+      log(`  PROBLEM: ${problem}`)
+      problems.push(problem)
+      continue
+    }
+    if (!ownerSt.isDirectory()) {
+      const problem = `${ownerPath} is not a directory; remove it or replace it with a real directory`
+      log(`  PROBLEM: ${problem}`)
+      problems.push(problem)
+      continue
+    }
+    if (ownerSt.dev !== rootDev) {
+      const problem = `${ownerPath} is mounted from a different filesystem than ${reposRoot}; unmount it or move it out of ${reposRoot}`
+      log(`  PROBLEM: ${problem}`)
+      problems.push(problem)
+      continue
+    }
+    if (ownerSt.uid !== expectedRootOwnerUid) {
+      const problem = `${ownerPath} is owned by uid ${ownerSt.uid}, expected ${expectedRootOwnerUid}; chown it to the expected owner`
+      log(`  PROBLEM: ${problem}`)
+      problems.push(problem)
       continue
     }
 
@@ -288,12 +332,15 @@ export async function migrateRepoOwnership(options) {
     try {
       repoNames = await ops.readdir(ownerPath)
     } catch (error) {
-      log(`  skip owner (cannot list ${ownerPath}): ${error.message}`)
+      const problem = `${ownerPath} cannot be listed (${error.message}); fix filesystem access to this directory and restart`
+      log(`  PROBLEM: ${problem}`)
+      problems.push(problem)
       continue
     }
 
     for (const repo of repoNames) {
       if (repo.startsWith(STAGING_PREFIX)) {
+        log(`  WARNING: leftover staging dir from the old clone path, not touched or removed: ${join(ownerPath, repo)}`)
         stats.skippedStaging++
         continue
       }
@@ -305,10 +352,11 @@ export async function migrateRepoOwnership(options) {
       }
 
       const checkoutPath = join(ownerPath, repo)
+      ctx.checkoutProblems = []
       try {
         await migrateEntry(checkoutPath, ctx)
       } catch (error) {
-        if (error instanceof MigrationTimeoutError) {
+        if (isMigrationTimeoutError(error)) {
           timedOut = true
           log(`TIMEOUT: ${error.message} (checkout in progress: ${checkoutKey}, no marker written)`)
           break outer
@@ -316,7 +364,18 @@ export async function migrateRepoOwnership(options) {
         throw error
       }
 
-      // Only reached on full, uninterrupted success for this checkout.
+      if (ctx.checkoutProblems.length > 0) {
+        // A skip happened somewhere inside this checkout (e.g. a nested
+        // foreign-filesystem mount) — the tree was NOT fully migrated, so
+        // writing a completion marker would make that partial state
+        // permanent. Leave it unmarked; a future run retries it once the
+        // reported problem is fixed.
+        log(`  no marker written for ${checkoutKey}: ${ctx.checkoutProblems.length} problem(s) found inside this checkout`)
+        continue
+      }
+
+      // Only reached on full, uninterrupted, problem-free success for this
+      // checkout.
       const tmpMarker = `${marker}.tmp-${process.pid}`
       await ops.writeFile(
         tmpMarker,
@@ -327,6 +386,14 @@ export async function migrateRepoOwnership(options) {
       completed.push(checkoutKey)
       log(`migrate: ${checkoutKey}: complete`)
     }
+  }
+
+  if (problems.length > 0 && !timedOut) {
+    const message = [
+      `migration found ${problems.length} problem(s) that must be fixed before boot can continue:`,
+      ...problems.map(p => `  - ${p}`),
+    ].join('\n')
+    throw new Error(message)
   }
 
   return {

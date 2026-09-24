@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {mkdtemp, mkdir, writeFile, readFile, symlink, link, lstat, rm, readdir} from 'node:fs/promises'
+import {mkdtemp, mkdir, writeFile, readFile, symlink, link, lstat, rm, readdir, utimes} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
@@ -291,6 +291,237 @@ test('fails loudly (rejects) when the repos volume root is a symlink', async () 
       migrateRepoOwnership({reposRoot: linkedRoot, targetUid: TARGET_UID, targetGid: TARGET_GID, ops}),
       /symlink/,
     )
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test("breaking a hardlink preserves the original file's atime/mtime", async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot, repoDir} = await buildRepoTree(root)
+    const insidePath = join(repoDir, 'shared-mtime.dat')
+    await writeFile(insidePath, 'shared bytes\n', {mode: 0o644})
+    const outsidePath = join(root, 'shared-mtime-outside.dat')
+    await link(insidePath, outsidePath)
+
+    const fixedPast = new Date('2020-01-01T00:00:00.000Z')
+    await utimes(insidePath, fixedPast, fixedPast)
+
+    const {ops} = recordingOps()
+    const result = await migrateRepoOwnership({reposRoot,
+      expectedRootOwnerUid: process.getuid(), targetUid: TARGET_UID, targetGid: TARGET_GID, ops})
+
+    assert.equal(result.ok, true)
+    const afterSt = await lstat(insidePath)
+    assert.equal(
+      afterSt.mtime.getTime(),
+      fixedPast.getTime(),
+      'mtime must be restored to the pre-break value after breaking the hardlink',
+    )
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+// --- Fail-the-boot-on-any-skip policy -------------------------------------
+//
+// A non-root test process cannot chown, and cannot create a directory owned
+// by an arbitrary different uid either — so "not root-owned" and "cannot be
+// listed" are simulated by wrapping the real `lstat`/`readdir` ops for one
+// specific path, delegating to the real filesystem for everything else
+// (same technique `recordingOps` already uses for chown/lchown).
+
+function withLstatUidOverride(overridePath, fakeUid) {
+  const {ops: real} = recordingOps()
+  return {
+    ...real,
+    lstat: async path => {
+      const st = await real.lstat(path)
+      if (path === overridePath) st.uid = fakeUid
+      return st
+    },
+  }
+}
+
+function withReaddirFailure(overridePath) {
+  const {ops: real} = recordingOps()
+  return {
+    ...real,
+    readdir: async path => {
+      if (path === overridePath) throw new Error('EACCES: permission denied (simulated)')
+      return real.readdir(path)
+    },
+  }
+}
+
+test('an owner directory that is a symlink fails the run and names the path', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot} = await buildRepoTree(root)
+    const realDir = join(root, 'real-owner')
+    await mkdir(realDir, {mode: 0o755})
+    const symlinkOwner = join(reposRoot, 'evil-owner')
+    await symlink(realDir, symlinkOwner)
+
+    const {ops} = recordingOps()
+    await assert.rejects(
+      migrateRepoOwnership({reposRoot, expectedRootOwnerUid: process.getuid(), targetUid: TARGET_UID, targetGid: TARGET_GID, ops}),
+      error => {
+        assert.match(error.message, /evil-owner/)
+        assert.match(error.message, /symlink/)
+        return true
+      },
+    )
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('an owner directory that is a regular file fails the run and names the path', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot} = await buildRepoTree(root)
+    const fileOwner = join(reposRoot, 'not-a-dir-owner')
+    await writeFile(fileOwner, 'oops\n')
+
+    const {ops} = recordingOps()
+    await assert.rejects(
+      migrateRepoOwnership({reposRoot, expectedRootOwnerUid: process.getuid(), targetUid: TARGET_UID, targetGid: TARGET_GID, ops}),
+      error => {
+        assert.match(error.message, /not-a-dir-owner/)
+        assert.match(error.message, /not a directory/)
+        return true
+      },
+    )
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('an owner directory not owned by the expected root uid fails the run and names the path', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot} = await buildRepoTree(root)
+    const mismatchOwner = join(reposRoot, 'wrong-uid-owner')
+    await mkdir(mismatchOwner, {mode: 0o755})
+
+    const ops = withLstatUidOverride(mismatchOwner, process.getuid() + 999)
+    await assert.rejects(
+      migrateRepoOwnership({reposRoot, expectedRootOwnerUid: process.getuid(), targetUid: TARGET_UID, targetGid: TARGET_GID, ops}),
+      error => {
+        assert.match(error.message, /wrong-uid-owner/)
+        assert.match(error.message, /owned by uid/)
+        return true
+      },
+    )
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('an owner directory that cannot be listed fails the run and names the path', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot} = await buildRepoTree(root)
+    const unreadableOwner = join(reposRoot, 'unreadable-owner')
+    await mkdir(unreadableOwner, {mode: 0o755})
+
+    const ops = withReaddirFailure(unreadableOwner)
+    await assert.rejects(
+      migrateRepoOwnership({reposRoot, expectedRootOwnerUid: process.getuid(), targetUid: TARGET_UID, targetGid: TARGET_GID, ops}),
+      error => {
+        assert.match(error.message, /unreadable-owner/)
+        assert.match(error.message, /cannot be listed/)
+        return true
+      },
+    )
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('two problems in one run are both named in the failure output', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot} = await buildRepoTree(root)
+    const fileOwner = join(reposRoot, 'not-a-dir-owner')
+    await writeFile(fileOwner, 'oops\n')
+    const unreadableOwner = join(reposRoot, 'unreadable-owner')
+    await mkdir(unreadableOwner, {mode: 0o755})
+
+    const ops = withReaddirFailure(unreadableOwner)
+    await assert.rejects(
+      migrateRepoOwnership({reposRoot, expectedRootOwnerUid: process.getuid(), targetUid: TARGET_UID, targetGid: TARGET_GID, ops}),
+      error => {
+        assert.match(error.message, /not-a-dir-owner/)
+        assert.match(error.message, /unreadable-owner/)
+        return true
+      },
+    )
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('a checkout containing a nested foreign-filesystem mount fails the run and writes no marker for that checkout', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot, repoDir} = await buildRepoTree(root)
+    const nestedMountPath = join(repoDir, 'src', 'index.js')
+
+    const {ops: real} = recordingOps()
+    const ops = {
+      ...real,
+      lstat: async path => {
+        const st = await real.lstat(path)
+        if (path === nestedMountPath) st.dev = st.dev + 1
+        return st
+      },
+    }
+
+    await assert.rejects(
+      migrateRepoOwnership({reposRoot, expectedRootOwnerUid: process.getuid(), targetUid: TARGET_UID, targetGid: TARGET_GID, ops}),
+      error => {
+        assert.match(error.message, /index\.js/)
+        assert.match(error.message, /mount from another filesystem/)
+        return true
+      },
+    )
+
+    const markerPath = join(reposRoot, '.workspace-agent', 'completed', 'acme__widgets.json')
+    assert.equal(
+      await lstat(markerPath).then(
+        () => true,
+        () => false,
+      ),
+      false,
+      'no marker may exist for a checkout with a skipped nested-mount entry',
+    )
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('a leftover .tmp-* staging directory logs a warning naming it and is left untouched', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot, ownerDir} = await buildRepoTree(root)
+    const stagingDir = join(ownerDir, '.tmp-clone-abc123')
+    await mkdir(stagingDir, {mode: 0o755})
+    await writeFile(join(stagingDir, 'partial-file'), 'x')
+
+    const {ops} = recordingOps()
+    const logs = []
+    const result = await migrateRepoOwnership({reposRoot,
+      expectedRootOwnerUid: process.getuid(), targetUid: TARGET_UID, targetGid: TARGET_GID, ops, log: msg => logs.push(msg)})
+
+    assert.equal(result.ok, true)
+    const warning = logs.find(m => m.includes('WARNING') && m.includes(stagingDir))
+    assert.ok(warning, 'a warning naming the leftover staging dir path must be logged')
+
+    const content = await readFile(join(stagingDir, 'partial-file'), 'utf8')
+    assert.equal(content, 'x', 'leftover staging dir contents must be untouched')
   } finally {
     await rm(root, {recursive: true, force: true})
   }
