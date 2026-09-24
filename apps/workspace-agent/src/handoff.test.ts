@@ -166,7 +166,7 @@ describe('handOffToAgent — bounded walk', () => {
     expect(ops.lchownCalls.length).toBe(0)
   })
 
-  it('fails with too-many-entries once the entry cap is exceeded', async () => {
+  it('fails with max-entries once the entry cap is exceeded', async () => {
     // #given — a flat directory with more children than the cap allows
     const children = Array.from({length: 5}, (_, i) => `/staging/root/f${i}`)
     const ops = makeFakeOps([
@@ -184,7 +184,7 @@ describe('handOffToAgent — bounded walk', () => {
     })
 
     // #then
-    expect(result).toEqual({ok: false, reason: 'too-many-entries', path: '/staging/root/f1'})
+    expect(result).toEqual({ok: false, reason: 'max-entries', path: '/staging/root/f1'})
   })
 })
 
@@ -226,6 +226,6 @@ describe('handOffToAgent — filesystem-boundary and unsupported-node defense', 
     })
 
     // #then
-    expect(result).toEqual({ok: false, reason: 'unsupported-entry-type', path: '/staging/root/pipe'})
+    expect(result).toEqual({ok: false, reason: 'unsupported-entry', path: '/staging/root/pipe'})
   })
 })

@@ -72,7 +72,7 @@ export interface HandoffOptions {
 }
 
 export type HandoffFailureReason =
-  'hardlink' | 'foreign-filesystem' | 'unsupported-entry-type' | 'deadline-exceeded' | 'too-many-entries'
+  'hardlink' | 'foreign-filesystem' | 'unsupported-entry' | 'deadline-exceeded' | 'max-entries'
 
 export type HandoffResult =
   | {readonly ok: true; readonly entries: number}
@@ -107,7 +107,7 @@ async function chmodIfNeeded(
 async function walk(entryPath: string, ctx: WalkContext): Promise<HandoffResult | null> {
   if (ctx.now() > ctx.deadlineAt) return {ok: false, reason: 'deadline-exceeded', path: entryPath}
   ctx.entries += 1
-  if (ctx.entries > ctx.maxEntries) return {ok: false, reason: 'too-many-entries', path: entryPath}
+  if (ctx.entries > ctx.maxEntries) return {ok: false, reason: 'max-entries', path: entryPath}
 
   const st = await ctx.ops.lstat(entryPath)
 
@@ -146,7 +146,7 @@ async function walk(entryPath: string, ctx: WalkContext): Promise<HandoffResult 
   }
 
   // fifo, socket, device, etc. — no legitimate reason to appear in a git checkout.
-  return {ok: false, reason: 'unsupported-entry-type', path: entryPath}
+  return {ok: false, reason: 'unsupported-entry', path: entryPath}
 }
 
 /**

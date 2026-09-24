@@ -29,11 +29,15 @@
  * 14. Once staging is handed to AGENT_UID/AGENT_GID and renamed into place, any git invocation against
  *     an EXISTING checkout at that path (the `repo-exists` idempotency check, and the post-rename race
  *     check) runs as AGENT_UID/AGENT_GID with the same neutralized, credential-free invocation shape
- *     inspect.ts uses (git-safety.ts) — never as the root-owned service.
+ *     `/inspect` uses (git-safety.ts) — never as the root-owned service.
+ * 15. A handoff failure is always reported as `checkout-handoff-failed` (deterministic — the same
+ *     staged tree fails the same way on every retry), never `clone-timeout` or `too-many-files`
+ *     (both reserved for `git clone` itself). The specific reason lives in `CloneFailure.code`,
+ *     never in a new response field.
  */
 
+import type {GitRunnerFn} from './git-safety.js'
 import type {HandoffOps} from './handoff.js'
-import type {GitRunnerFn} from './inspect.js'
 import type {CloneFailure, CloneRequest, CloneSuccess} from './types.js'
 import {execFile as execFileCb} from 'node:child_process'
 import {rmSync} from 'node:fs'
@@ -43,10 +47,9 @@ import {join} from 'node:path'
 import process from 'node:process'
 import {promisify} from 'node:util'
 
-import {buildNeutralGitEnv, gitInvocation} from './git-safety.js'
+import {buildNeutralGitEnv, gitInvocation, runGit} from './git-safety.js'
 import {handOffToAgent} from './handoff.js'
 import {AGENT_GID, AGENT_UID, CLONE_STAGING_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
-import {runGit} from './inspect.js'
 
 const execFile = promisify(execFileCb)
 
@@ -66,16 +69,18 @@ export const MAX_CLONE_QUEUE_DEPTH = 50
  * Deadline for the post-clone ownership-handoff walk (handoff.ts), in milliseconds. Generous
  * enough for a very large repo's worth of filesystem entries, but bounded so a pathological tree
  * can never hold the per-repo lock — and the global clone semaphore slot — open indefinitely.
- * Exceeding it maps to the existing `clone-timeout` error code (504), the same code an aborted
- * `git clone` itself already reports.
+ * Exceeding it maps to `checkout-handoff-failed` (`code: 'deadline-exceeded'`) — deliberately NOT
+ * `clone-timeout`, which is reserved for `git clone` itself timing out and is treated as
+ * retryable downstream; a handoff deadline is deterministic and will not resolve on retry.
  */
 export const HANDOFF_DEADLINE_MS = 30_000
 
 /**
  * Entry cap for the post-clone ownership-handoff walk. A fresh HTTPS clone of even a very large
- * monorepo lands well under this. Exceeding it is treated as the same resource-exhaustion failure
- * mode `too-many-files` already reports for an EMFILE from git itself, rather than inventing a
- * new error code for what is, from the caller's perspective, the same kind of failure.
+ * monorepo lands well under this. Exceeding it maps to `checkout-handoff-failed`
+ * (`code: 'max-entries'`) — deliberately NOT `too-many-files`, which is reserved for an EMFILE
+ * resource exhaustion from git itself and is treated as retryable downstream; a fixed entry cap
+ * being exceeded by a fixed tree is deterministic and will not resolve on retry.
  */
 export const MAX_HANDOFF_ENTRIES = 500_000
 
@@ -122,7 +127,7 @@ export interface CloneHandlerDeps {
   /**
    * Injected git runner for the `repo-exists` and post-rename race-check validation against an
    * EXISTING checkout, run as AGENT_UID/AGENT_GID. Defaults to the confirmed-termination `runGit`
-   * (inspect.ts) — the same runner `/inspect` uses.
+   * (git-safety.ts) — the same runner `/inspect` uses.
    */
   readonly gitRunner?: GitRunnerFn
   /** Injected filesystem operations for the ownership-handoff walk (handoff.ts). Defaults to real node:fs/promises. */
@@ -413,7 +418,7 @@ export function buildCloneGitEnv(
  * Validates that `canonicalPath` is a usable, non-bare git checkout with a resolvable HEAD
  * commit — the same two-step check the `repo-exists` idempotency check and the post-rename
  * race-check both need. Runs as AGENT_UID/AGENT_GID with the same neutralized, credential-free
- * invocation shape inspect.ts uses (git-safety.ts) — never as the root-owned service, and never
+ * invocation shape `/inspect` uses (git-safety.ts) — never as the root-owned service, and never
  * with `safe.directory` set to anything but this exact canonical path.
  *
  * Fails closed: a timeout, a confirmed-or-unconfirmed kill, a non-zero exit, or unexpected output
@@ -591,22 +596,16 @@ async function executeCloneInner(
       ops: handoffLimits.ops,
     })
     if (handoffResult.ok === false) {
-      if (handoffResult.reason === 'deadline-exceeded') {
-        return {
-          response: {ok: false, error: 'clone-timeout'},
-          statusCode: 504,
-        }
-      }
-      if (handoffResult.reason === 'too-many-entries') {
-        return {
-          response: {ok: false, error: 'too-many-files'},
-          statusCode: 500,
-        }
-      }
-      // hardlink | foreign-filesystem | unsupported-entry-type — none has a legitimate reason to
-      // appear in a fresh HTTPS clone; treat all three as a clone failure.
+      // A handoff failure is DETERMINISTIC — the same staged tree fails the same way on every
+      // retry, whether it's a deadline, the entry cap, a hardlink, a filesystem-boundary crossing,
+      // or an unsupported node type. It is never a `git clone` timeout (`clone-timeout`) or an
+      // EMFILE resource exhaustion (`too-many-files`) — reusing either of those codes here would
+      // tell the caller (gateway `PERMANENT_CLONE_ERROR_CODES`) this is retryable when it can never
+      // succeed. One code covers every handoff-failure reason; the reason itself is carried in
+      // `code` (the existing machine-readable sub-code field — see `types.ts`), never logged
+      // separately, since this module has no logger of its own.
       return {
-        response: {ok: false, error: 'clone-failed'},
+        response: {ok: false, error: 'checkout-handoff-failed', code: handoffResult.reason},
         statusCode: 500,
       }
     }

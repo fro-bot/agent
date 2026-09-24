@@ -53,6 +53,15 @@ export type CloneErrorCode =
   | 'path-escaped-workspace'
   | 'head-resolution-failed'
   | 'overloaded'
+  /**
+   * The workspace-agent's post-clone ownership handoff failed — a DETERMINISTIC failure: the
+   * same staged tree fails the same way on every retry (a hardlink, a filesystem-boundary
+   * crossing, an unsupported node type, or the handoff's own deadline/entry cap). Classified as
+   * PERMANENT in `PERMANENT_CLONE_ERROR_CODES` (execute/run.ts) — never `clone-timeout` or
+   * `too-many-files`, both of which stay retryable. The specific reason lives in
+   * `CloneFailure.code`, not a new field.
+   */
+  | 'checkout-handoff-failed'
 
 /** POST /inspect request body. */
 export interface InspectRequest {

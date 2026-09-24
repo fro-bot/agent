@@ -335,6 +335,7 @@ const CLONE_ERROR_CODES = new Set<string>([
   'path-escaped-workspace',
   'head-resolution-failed',
   'overloaded',
+  'checkout-handoff-failed',
 ])
 
 function isCloneErrorCode(value: string): value is CloneErrorCode {

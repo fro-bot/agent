@@ -24,6 +24,12 @@
  *    `inspection-failed`. A missed neutralization is worse than a missing observation.
  */
 
+// GIT_SAFETY_ARGS, safeDirectoryArgs, gitInvocation, buildInspectEnv, GitRunnerOptions, GitOutcome,
+// GitRunnerFn, and the confirmed-termination `runGit` runner all now live in git-safety.ts, shared
+// with clone.ts's `repo-exists` and post-rename race-check validation (and, for `runGit` itself,
+// with clone.ts's default `gitRunner`) — see that module for the full rationale. Imported below
+// under their original local names so nothing else in this file has to change.
+import type {GitOutcome, GitRunnerFn, GitRunnerOptions} from './git-safety.js'
 import type {
   CheckoutObservation,
   CheckoutOperation,
@@ -32,11 +38,10 @@ import type {
   InspectRequest,
   InspectSuccess,
 } from './types.js'
-import {execFile} from 'node:child_process'
 import {realpath, stat} from 'node:fs/promises'
 import {join} from 'node:path'
 
-import {buildNeutralGitEnv as buildInspectEnv, gitInvocation} from './git-safety.js'
+import {buildNeutralGitEnv as buildInspectEnv, gitInvocation, runGit} from './git-safety.js'
 import {AGENT_GID, AGENT_UID} from './identity.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors clone.ts. */
@@ -45,121 +50,8 @@ export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 /** Default inspection timeout in milliseconds. Local-only git calls; short by design. */
 export const DEFAULT_INSPECT_TIMEOUT_MS = 10_000
 
-/**
- * Bound on waiting for a confirmed reap after SIGKILL. Mirrors the reap-grace pattern used
- * elsewhere in this repo (src/services/setup/adapters.ts) for confirmed-termination semantics.
- */
-const GIT_KILL_REAP_GRACE_MS = 2_000
-
-/**
- * Bound on buffered stdout/stderr per git invocation. `execFile` buffers both streams in
- * memory and enforces this ceiling itself (Node's default is 1 MiB, too small for `git status
- * --porcelain=v2` on a large dirty tree — a single renamed/untracked file is a full porcelain
- * line, so tens of thousands of changed files can run into several MB of output). 64 MiB
- * comfortably covers even a six-figure changed-file count while still bounding memory use per
- * inspection call.
- */
-const GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024
-
-// ---------------------------------------------------------------------------
-// Git subprocess runner \u2014 confirmed-termination timeout, no credential env.
-// ---------------------------------------------------------------------------
-
-export interface GitRunnerOptions {
-  readonly cwd: string
-  readonly env: Record<string, string>
-  readonly timeoutMs: number
-  /** Unprivileged uid to run git as. Defaults applied by callers from identity.ts (AGENT_UID). */
-  readonly uid?: number
-  /** Unprivileged gid to run git as. Defaults applied by callers from identity.ts (AGENT_GID). */
-  readonly gid?: number
-}
-
-export type GitOutcome =
-  | {readonly kind: 'ok'; readonly stdout: string; readonly stderr: string}
-  | {readonly kind: 'failed'; readonly code: number | null; readonly stdout: string; readonly stderr: string}
-  | {readonly kind: 'timeout'}
-  /**
-   * SIGKILL was sent, but the child's stdio streams never confirmed closed within the reap grace
-   * window — termination was attempted, not confirmed. Distinct from `timeout` (which only ever
-   * represents a CONFIRMED kill) so a caller can never mistake "we gave up waiting" for "the
-   * process is definitely gone", per this module's header invariant #5.
-   */
-  | {readonly kind: 'termination-unconfirmed'}
-
-export type GitRunnerFn = (args: readonly string[], options: GitRunnerOptions) => Promise<GitOutcome>
-
-/**
- * Default git runner. Uses the callback form of `execFile` (never the promisified wrapper) so we
- * retain a handle to the underlying `ChildProcess` and can CONFIRM termination on timeout: on
- * timeout we SIGKILL the child and wait for `execFile`'s callback — which Node fires only after
- * the child's stdio streams have actually closed — before resolving the timeout outcome, rather
- * than resolving as soon as `kill()` is called. `maxBuffer` is set explicitly so a pathologically
- * large `git status` output fails cleanly (mapped to a `failed` outcome) instead of throwing past
- * the caller.
- */
-export const runGit: GitRunnerFn = async (args, options) =>
-  new Promise(resolve => {
-    let settled = false
-    let timedOut = false
-    let graceHandle: ReturnType<typeof setTimeout> | undefined
-    let timeoutHandle: ReturnType<typeof setTimeout>
-
-    const child = execFile(
-      'git',
-      args,
-      {
-        cwd: options.cwd,
-        env: options.env,
-        maxBuffer: GIT_MAX_BUFFER_BYTES,
-        encoding: 'utf8',
-        uid: options.uid,
-        gid: options.gid,
-      },
-      (error, stdout, stderr) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timeoutHandle)
-        clearTimeout(graceHandle)
-        if (timedOut) {
-          resolve({kind: 'timeout'})
-          return
-        }
-        if (error === null) {
-          resolve({kind: 'ok', stdout, stderr})
-          return
-        }
-        // error.code is the numeric exit code for a normal non-zero exit, or a string (e.g.
-        // 'ENOENT', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') for spawn/stream failures — including
-        // maxBuffer overflow, which we want reported as a clean `failed` outcome, not a throw
-        // that escapes the caller.
-        const code = typeof error.code === 'number' ? error.code : null
-        resolve({kind: 'failed', code, stdout, stderr})
-      },
-    )
-
-    timeoutHandle = setTimeout(() => {
-      timedOut = true
-      child.kill('SIGKILL')
-      // Grace window in case SIGKILL doesn't reap promptly (unusual, but SIGKILL delivery is not
-      // instantaneous). If the child still hasn't closed after this, the caller must never hang
-      // forever — but termination is NOT confirmed at this point (the exec callback, which Node
-      // fires only once the child's stdio streams actually close, never ran): resolve as
-      // `termination-unconfirmed`, never as `timeout`, so nothing downstream can mistake "we gave
-      // up waiting" for "the process is definitely gone" (module header invariant #5).
-      graceHandle = setTimeout(() => {
-        if (settled) return
-        settled = true
-        resolve({kind: 'termination-unconfirmed'})
-      }, GIT_KILL_REAP_GRACE_MS)
-    }, options.timeoutMs)
-  })
-
-// GIT_SAFETY_ARGS, safeDirectoryArgs, gitInvocation, and buildInspectEnv (the neutralized
-// invocation shape for running git against an EXISTING checkout as AGENT_UID/AGENT_GID) now live
-// in git-safety.ts, shared with clone.ts's `repo-exists` and post-rename race-check validation —
-// see that module for the full rationale. Imported above under their original local names so
-// nothing else in this file, or inspect.test.ts, has to change.
+export type {GitOutcome, GitRunnerFn, GitRunnerOptions}
+export {runGit}
 
 // ---------------------------------------------------------------------------
 // Filter-driver enumeration and neutralization — closes the vector where `git status` runs

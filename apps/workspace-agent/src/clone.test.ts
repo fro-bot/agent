@@ -1,8 +1,8 @@
 import type {Stats} from 'node:fs'
 
 import type {ExecFileFn} from './clone.js'
+import type {GitOutcome, GitRunnerFn, GitRunnerOptions} from './git-safety.js'
 import type {HandoffOps} from './handoff.js'
-import type {GitOutcome, GitRunnerFn, GitRunnerOptions} from './inspect.js'
 
 import {chmod, mkdir, mkdtemp, open, realpath, rename, rm} from 'node:fs/promises'
 
@@ -1253,7 +1253,7 @@ describe('executeClone — staging and ownership handoff', () => {
     expect(callOrder.indexOf('head-resolved')).toBeLessThan(callOrder.indexOf('handoff-started'))
   })
 
-  it('a hardlinked entry (nlink > 1) in the staged tree fails the clone and leaves staging clean', async () => {
+  it('a hardlinked entry (nlink > 1) in the staged tree fails with checkout-handoff-failed / hardlink, and leaves staging clean', async () => {
     // #given — the staged root itself looks like a hardlinked regular file to the handoff walker
     const execFileFn = makeExecFile([
       {stdout: '', stderr: ''},
@@ -1275,15 +1275,16 @@ describe('executeClone — staging and ownership handoff', () => {
       handoffOps,
     })
 
-    // #then — clone fails, nothing was renamed, and staging is cleaned up
-    expect(result.response).toEqual({ok: false, error: 'clone-failed'})
+    // #then — the deterministic handoff error code, with the specific reason in `code`; nothing
+    // was renamed, and staging is cleaned up
+    expect(result.response).toEqual({ok: false, error: 'checkout-handoff-failed', code: 'hardlink'})
     expect(result.statusCode).toBe(500)
     expect(handoffOps.lchown).not.toHaveBeenCalled()
     expect(mockRename).not.toHaveBeenCalled()
     expect(mockRm).toHaveBeenCalledWith(FAKE_STAGING_CLONE_DIR, {recursive: true, force: true})
   })
 
-  it('exceeding the handoff entry cap fails the clone (too-many-files) and leaves staging clean', async () => {
+  it('exceeding the handoff entry cap fails with checkout-handoff-failed / max-entries, and leaves staging clean', async () => {
     // #given — a staged root directory with one child; cap of 1 means the child exceeds it
     const execFileFn = makeExecFile([
       {stdout: '', stderr: ''},
@@ -1305,11 +1306,115 @@ describe('executeClone — staging and ownership handoff', () => {
       handoffOps,
     })
 
-    // #then — the existing too-many-files error code is reused, not a new one; staging is cleaned up
-    expect(result.response).toEqual({ok: false, error: 'too-many-files'})
+    // #then — never `too-many-files` (reserved for a real EMFILE) — staging is cleaned up
+    expect(result.response).toEqual({ok: false, error: 'checkout-handoff-failed', code: 'max-entries'})
     expect(result.statusCode).toBe(500)
     expect(mockRename).not.toHaveBeenCalled()
     expect(mockRm).toHaveBeenCalledWith(FAKE_STAGING_CLONE_DIR, {recursive: true, force: true})
+  })
+
+  it('a deadline exceeded during handoff fails with checkout-handoff-failed / deadline-exceeded, and leaves staging clean', async () => {
+    // #given — an already-expired deadline (negative) guarantees the very first check trips it
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''},
+      {stdout: 'sha123\n', stderr: ''},
+    ])
+    const handoffOps = makeHandoffOps()
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500, handoffDeadlineMs: -1},
+      handoffOps,
+    })
+
+    // #then — never `clone-timeout` (reserved for `git clone` itself timing out)
+    expect(result.response).toEqual({ok: false, error: 'checkout-handoff-failed', code: 'deadline-exceeded'})
+    expect(result.statusCode).toBe(500)
+    expect(mockRm).toHaveBeenCalledWith(FAKE_STAGING_CLONE_DIR, {recursive: true, force: true})
+  })
+
+  it('a foreign-filesystem boundary during handoff fails with checkout-handoff-failed / foreign-filesystem', async () => {
+    // #given — root and its one child report different st_dev values
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''},
+      {stdout: 'sha123\n', stderr: ''},
+    ])
+    let lstatCalls = 0
+    const handoffOps: HandoffOps = {
+      lstat: vi.fn().mockImplementation(async () => {
+        lstatCalls += 1
+        // First two calls (handOffToAgent's own rootDev read, then walk's root re-read) are the
+        // root itself; the third is the child, on a different device.
+        return makeStats({isDirectory: lstatCalls <= 2, dev: lstatCalls <= 2 ? 1 : 2})
+      }),
+      readdir: vi.fn().mockResolvedValue(['mounted']),
+      lchown: vi.fn().mockResolvedValue(undefined),
+      chmod: vi.fn().mockResolvedValue(undefined),
+    }
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+      handoffOps,
+    })
+
+    // #then
+    expect(result.response).toEqual({ok: false, error: 'checkout-handoff-failed', code: 'foreign-filesystem'})
+    expect(result.statusCode).toBe(500)
+    expect(mockRm).toHaveBeenCalledWith(FAKE_STAGING_CLONE_DIR, {recursive: true, force: true})
+  })
+
+  it('an unsupported node type during handoff fails with checkout-handoff-failed / unsupported-entry', async () => {
+    // #given — the staged root itself is neither a dir, file, nor symlink to the handoff walker
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''},
+      {stdout: 'sha123\n', stderr: ''},
+    ])
+    const handoffOps: HandoffOps = {
+      lstat: vi.fn().mockResolvedValue(makeStats({isDirectory: false, isFile: false, isSymbolicLink: false})),
+      readdir: vi.fn().mockResolvedValue([]),
+      lchown: vi.fn().mockResolvedValue(undefined),
+      chmod: vi.fn().mockResolvedValue(undefined),
+    }
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+      handoffOps,
+    })
+
+    // #then
+    expect(result.response).toEqual({ok: false, error: 'checkout-handoff-failed', code: 'unsupported-entry'})
+    expect(result.statusCode).toBe(500)
+    expect(mockRm).toHaveBeenCalledWith(FAKE_STAGING_CLONE_DIR, {recursive: true, force: true})
+  })
+
+  it('a real git clone timeout (AbortError) still produces clone-timeout, not checkout-handoff-failed', async () => {
+    // #given — the clone itself aborts; the handoff never runs
+    const abortError = Object.assign(new Error('The operation was aborted'), {name: 'AbortError'})
+    const execFileFn = makeExecFile([{error: abortError}])
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+      handoffOps: makeHandoffOps(),
+    })
+
+    // #then
+    expect(result.response).toEqual({ok: false, error: 'clone-timeout'})
+    expect(result.statusCode).toBe(504)
   })
 })
 
