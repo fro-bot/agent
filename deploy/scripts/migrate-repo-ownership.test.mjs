@@ -196,6 +196,98 @@ test('.workspace-agent state dir and .tmp-* staging dirs are skipped', async () 
   }
 })
 
+test('a checkout root already owned by the target uid:gid is skipped entirely, no marker required', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot, repoDir} = await buildRepoTree(root)
+
+    // A hardlink inside the checkout: if the walk ran despite the skip, its
+    // breakHardlink step would read the file's full content and rewrite it.
+    const insidePath = join(repoDir, 'shared.dat')
+    await writeFile(insidePath, 'shared bytes\n', {mode: 0o644})
+    const outsidePath = join(root, 'shared-outside.dat')
+    await link(insidePath, outsidePath)
+
+    // A non-root test process cannot really chown to an arbitrary uid, so
+    // the "target uid:gid" for this test IS the test process's own uid:gid
+    // — the checkout tree buildRepoTree() just created is already owned by
+    // it, with no chown needed to make the skip condition true for real.
+    const uid = process.getuid()
+    const gid = process.getgid()
+
+    const {ops, calls} = recordingOps()
+    const readFileCalls = []
+    const readdirCalls = []
+    ops.readFile = async (...args) => {
+      readFileCalls.push(args[0])
+      return readFile(...args)
+    }
+    ops.readdir = async (...args) => {
+      readdirCalls.push(args[0])
+      return readdir(...args)
+    }
+
+    const result = await migrateRepoOwnership({
+      reposRoot,
+      expectedRootOwnerUid: uid,
+      targetUid: uid,
+      targetGid: gid,
+      ops,
+    })
+
+    assert.equal(result.ok, true)
+    assert.deepEqual(result.completed, [], 'an agent-owned checkout is not "completed" this run — it was already done')
+    assert.deepEqual(result.skippedAgentOwned, ['acme/widgets'])
+    assert.deepEqual(result.skippedAlreadyDone, [])
+    assert.equal(calls.lchown.length, 0, 'no lchown calls anywhere under the checkout')
+    assert.equal(
+      calls.chown.filter(c => c.path.startsWith(repoDir)).length,
+      0,
+      'no chown calls under the checkout (chown is otherwise only used for state-dir setup)',
+    )
+
+    const readsUnderCheckout = readFileCalls.filter(p => p.startsWith(repoDir))
+    assert.deepEqual(readsUnderCheckout, [], 'no file content, including the hardlink, may be read')
+    const listsUnderCheckout = readdirCalls.filter(p => p.startsWith(repoDir))
+    assert.deepEqual(listsUnderCheckout, [], 'the checkout tree must never be listed')
+
+    // The hardlink must remain exactly as built: shared, untouched.
+    const insideSt = await lstat(insidePath)
+    const outsideSt = await lstat(outsidePath)
+    assert.equal(insideSt.ino, outsideSt.ino, 'the hardlink must still be shared — never broken')
+    assert.equal(insideSt.nlink, 2, 'nlink must be unchanged')
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('a checkout root NOT owned by the target uid:gid is still walked', async () => {
+  const root = await makeTempRoot()
+  try {
+    const {reposRoot, repoDir} = await buildRepoTree(root)
+    const {ops, calls} = recordingOps()
+
+    // targetUid/targetGid (10001/10001) intentionally differ from the real
+    // owner (the test process) — real chowns to 10001 are faked/recorded,
+    // so the checkout root's real owner never becomes the target.
+    const result = await migrateRepoOwnership({
+      reposRoot,
+      expectedRootOwnerUid: process.getuid(),
+      targetUid: TARGET_UID,
+      targetGid: TARGET_GID,
+      ops,
+    })
+
+    assert.equal(result.ok, true)
+    assert.deepEqual(result.skippedAgentOwned, [], 'root-owned checkout must not be skipped')
+    assert.deepEqual(result.completed, ['acme/widgets'])
+    const scriptCall = calls.lchown.find(c => c.path === join(repoDir, 'run.sh'))
+    assert.ok(scriptCall, 'a root-owned checkout must actually be walked and chowned')
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
 test('idempotency: running twice performs zero additional chowns on the second run', async () => {
   const root = await makeTempRoot()
   try {

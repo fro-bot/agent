@@ -32,6 +32,14 @@
 // walked again from scratch. Re-chowning an already-migrated tree is a no-op
 // cost, so redoing a partial checkout is safe and idempotent.
 //
+// Agent-owned roots: a checkout whose root directory is already owned by
+// targetUid:targetGid is skipped without a walk, marker or not. The walk is
+// post-order (a directory is chowned only after everything beneath it), so
+// an agent-owned root proves the tree has nothing root-owned left inside —
+// see the skip check next to skippedAgentOwned for the one accepted gap.
+// This is what makes checkouts /clone hands straight to the agent uid cheap
+// to boot through even though /clone never writes a completion marker.
+//
 // Bounded: a deadline (default 5 minutes, configurable) is checked before
 // each filesystem entry is processed. On expiry, the walk stops immediately,
 // no marker is written for the in-progress checkout, and the run reports
@@ -219,7 +227,7 @@ async function migrateEntry(entryPath, ctx) {
  *   a non-root test process can only create dirs it itself owns)
  * @param {object} [options.ops] - injectable fs operations (see defaultOps())
  * @param {(msg: string) => void} [options.log]
- * @returns {Promise<{ok: true, timedOut: boolean, completed: string[], skippedAlreadyDone: string[], stats: object}>}
+ * @returns {Promise<{ok: true, timedOut: boolean, completed: string[], skippedAlreadyDone: string[], skippedAgentOwned: string[], stats: object}>}
  */
 export async function migrateRepoOwnership(options) {
   const {
@@ -256,6 +264,7 @@ export async function migrateRepoOwnership(options) {
   const stats = {dirs: 0, files: 0, symlinks: 0, other: 0, hardlinksBroken: 0, skippedStaging: 0, skippedForeignFs: 0}
   const completed = []
   const skippedAlreadyDone = []
+  const skippedAgentOwned = []
   // Every offending path found this run, across owner-level and
   // checkout-entry-level problems. Non-empty at the end fails the whole run
   // (non-zero exit) — but every checkout that migrated cleanly still keeps
@@ -354,6 +363,35 @@ export async function migrateRepoOwnership(options) {
       const checkoutPath = join(ownerPath, repo)
       ctx.checkoutProblems = []
       try {
+        // Skip rule: a checkout root already owned by the target agent
+        // uid:gid needs no walk. migrateEntry is post-order — a directory is
+        // chowned only after every entry beneath it has been recursed into
+        // and chowned (:169-184) — so an agent-owned root proves either (a)
+        // a prior run fully chowned this tree and only the marker write
+        // didn't land (e.g. a crash between the final lchown and the
+        // rename), or (b) /clone produced this checkout already owned by
+        // the agent and it was never root-owned to begin with. Either way,
+        // nothing under the root can still be root-owned. lstat (never
+        // stat) so a symlinked checkout root can't redirect this check.
+        //
+        // Accepted gap: before this uid-isolation upgrade, the agent ran as
+        // root and could have chowned a checkout root to targetUid by hand
+        // while leaving some files inside still root-owned. That checkout
+        // is skipped here, and the agent then gets EACCES on those
+        // leftover files — but that only affects the agent's own access to
+        // its own checkout, never another checkout's, and it cannot happen
+        // after this upgrade because targetUid has no CAP_CHOWN and can't
+        // change ownership of anything.
+        const checkoutRootSt = await ops.lstat(checkoutPath)
+        if (
+          !checkoutRootSt.isSymbolicLink() &&
+          checkoutRootSt.isDirectory() &&
+          checkoutRootSt.uid === targetUid &&
+          checkoutRootSt.gid === targetGid
+        ) {
+          skippedAgentOwned.push(checkoutKey)
+          continue
+        }
         await migrateEntry(checkoutPath, ctx)
       } catch (error) {
         if (isMigrationTimeoutError(error)) {
@@ -401,6 +439,7 @@ export async function migrateRepoOwnership(options) {
     timedOut,
     completed,
     skippedAlreadyDone,
+    skippedAgentOwned,
     stats,
     durationMs: Date.now() - startedAt,
   }
@@ -444,6 +483,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     process.stderr.write(
       `migrate-repo-ownership: completed=${result.completed.length} ` +
         `already-done=${result.skippedAlreadyDone.length} ` +
+        `agent-owned=${result.skippedAgentOwned.length} ` +
         `dirs=${result.stats.dirs} files=${result.stats.files} ` +
         `hardlinks-broken=${result.stats.hardlinksBroken} durationMs=${result.durationMs}\n`,
     )
