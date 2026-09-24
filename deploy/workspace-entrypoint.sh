@@ -69,6 +69,16 @@ fi
 # traverse into anything beneath it regardless of the children's mode.
 # --nested re-verifies that barrier is in place before relaxing the child
 # check, and logs the child's observed owner/mode for operator visibility.
+#
+# Coupling note: each dir_spec's single `mode` field is used by
+# ensure-protected-dir.mjs --nested for TWO purposes at once — it's the mode
+# the PARENT must already have, and it's the mode the CHILD gets if this
+# call is the one creating it fresh. Both nested rows below (secrets,
+# mitmproxy) intentionally use the same 0700 the parent barrier
+# (RUNTIME_DIR) uses, so one field is fine here — but that's a real coupling
+# in the script, not a coincidence; see the "Coupling note" in
+# ensure-protected-dir.mjs before adding a nested row that wants a different
+# parent vs. first-creation mode.
 # ---------------------------------------------------------------------------
 RUNTIME_DIR="/run/workspace-agent"
 REPOS_ROOT="/workspace/repos"
@@ -221,6 +231,20 @@ fi
 # `runuser`/`gosu` configurations do since numeric --reuid/--regid work
 # directly; the account is created anyway (see Dockerfile) for clarity and so
 # process listings show "opencode" instead of a bare uid.
+#
+# Environment: setpriv only drops uid/gid — it does NOT touch the
+# environment, so without more the provisioning subprocess would inherit
+# root's ENTIRE environment (every secret-adjacent var this script itself
+# set or received, e.g. AUTH_SRC's path, anything the container runtime
+# injected). It only needs what it actually reads (grep provision-agent-
+# config.mjs / merge-config.mjs): WORKSPACE_OPENCODE_MODEL and
+# WORKSPACE_OPENCODE_CONFIG, plus PATH (to resolve `node`) and HOME/XDG_*
+# (the agent's own home, matching the Dockerfile-created ~/.local/share,
+# ~/.config, ~/.cache, ~/.local/state — conventional for anything under this
+# uid, even though these two scripts don't read them today). `env -i` wipes
+# the environment and rebuilds it from only this explicit allowlist; the
+# auth secret itself keeps arriving on stdin exactly as before, never as an
+# env var.
 # ---------------------------------------------------------------------------
 AUTH_SRC="${WORKSPACE_OPENCODE_AUTH_FILE:-${RUNTIME_DIR}/secrets/workspace_opencode_auth}"
 BASE_CONFIG_PATH="/usr/local/share/fro-bot/opencode.base.json"
@@ -256,6 +280,15 @@ if [ -n "$AUTH_RAW" ]; then
   auth_was_present=true
 fi
 if provision_output=$(printf '%s' "$AUTH_RAW" | setpriv --reuid="$AGENT_UID" --regid="$AGENT_GID" --clear-groups \
+    env -i \
+      PATH="$PATH" \
+      HOME="$AGENT_HOME" \
+      XDG_CONFIG_HOME="${AGENT_HOME}/.config" \
+      XDG_DATA_HOME="${AGENT_HOME}/.local/share" \
+      XDG_CACHE_HOME="${AGENT_HOME}/.cache" \
+      XDG_STATE_HOME="${AGENT_HOME}/.local/state" \
+      WORKSPACE_OPENCODE_MODEL="${WORKSPACE_OPENCODE_MODEL:-}" \
+      WORKSPACE_OPENCODE_CONFIG="${WORKSPACE_OPENCODE_CONFIG:-}" \
     node "$SCRIPTS_DIR/provision-agent-config.mjs" "$BASE_CONFIG_PATH" "$AUTH_DEST" "$CONFIG_DEST" 2>&1); then
   provision_rc=0
 else

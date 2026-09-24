@@ -279,7 +279,10 @@ services:
       # volume beneath it (see volumes below) so the agent uid (10001) can
       # never read the raw secrets or CA material directly — only the merged,
       # world-readable system CA bundle the entrypoint produces from it.
-      # NOT noexec: askpass helper scripts execute from under this tree.
+      # Note: the askpass helper does NOT live under this tree — clone.ts
+      # writes it under os.tmpdir() (typically /tmp), not /run/workspace-agent.
+      # This tmpfs only ever holds the secret bind-mounts and the mitmproxy CA
+      # volume below, both read (never executed) by the entrypoint.
       - /run/workspace-agent:rw,nosuid,nodev,mode=0700,uid=0,gid=0
     volumes:
       # workspace-opencode-token: shared secret for the bearer-token proxy.

@@ -92,6 +92,17 @@ function checkStrictParent(parentPath, uid, gid, mode) {
  * like the strict case (owned uid:gid, mode `mode`) since we're the one
  * creating it.
  *
+ * Coupling note: ONE `mode` value serves two different purposes in nested
+ * mode — it is what the PARENT must already have (checkStrictParent), and
+ * it is what the CHILD gets IF this call is the one creating it. Every
+ * current caller (see workspace-entrypoint.sh's dir_spec table) intends the
+ * same 0700 for both, since the parent is the actual barrier and the child
+ * inherits it only for the (rare, first-boot) case of creating it fresh —
+ * so one argument is deliberate, not an oversight. If a future nested entry
+ * ever needs a parent mode different from its own first-creation mode, split
+ * this into two parameters (`parentMode`, `childMode`) rather than
+ * overloading `mode` silently.
+ *
  * @param {string} dirPath
  * @param {number} uid
  * @param {number} gid

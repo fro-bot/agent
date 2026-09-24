@@ -40,6 +40,10 @@ EXEC_TIMEOUT_S="${ISOLATION_HARNESS_EXEC_TIMEOUT_S:-15}"
 SHUTDOWN_TIMEOUT_S="${ISOLATION_HARNESS_SHUTDOWN_TIMEOUT_S:-30}"
 SIGNAL_WAIT_TIMEOUT_S="${ISOLATION_HARNESS_SIGNAL_WAIT_TIMEOUT_S:-15}"
 MIGRATION_HEALTHY_TIMEOUT_S="${ISOLATION_HARNESS_MIGRATION_TIMEOUT_S:-90}"
+# Tight bound for a restart AFTER /clone: the checkout is already agent-owned,
+# so the migration must skip it outright (no walk) — nowhere near the full
+# MIGRATION_HEALTHY_TIMEOUT_S a from-scratch legacy-volume migration gets.
+CLONE_RESTART_HEALTHY_TIMEOUT_S="${ISOLATION_HARNESS_CLONE_RESTART_TIMEOUT_S:-60}"
 
 AGENT_UID=10001
 AGENT_GID=10001
@@ -646,50 +650,116 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 log "phase 4b: /clone hands new checkouts to the agent uid"
 
+# CLONE_OWNER/CLONE_REPO are the single source of truth for the repo this
+# phase clones — every request body, path, and diagnostic below is derived
+# from these two variables so the assertions and the failure diagnostics can
+# never drift apart.
+CLONE_OWNER="octocat"
+CLONE_REPO="Hello-World"
 CLONE_TOKEN="ghs_isolationHarnessDummyCloneToken1234567890"  # ghs_ + 40 chars, well past validateTokenShape's >=20 minimum
-clone_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"octocat\",\"repo\":\"Hello-World\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
+clone_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
 if ! echo "$clone_out" | grep -q '"ok":true'; then
   # /clone reports only a coarse error code. Reproduce the network half with
   # the same sealed git config, as root, so the log shows git's own reason.
   echo "--- diagnostic: git ls-remote as root with sealed config ---" >&2
-  run_exec "$MAIN_CID" "0:0" sh -c 'GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/octocat/Hello-World.git HEAD 2>&1' >&2 || true
+  run_exec "$MAIN_CID" "0:0" sh -c "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/${CLONE_OWNER}/${CLONE_REPO}.git HEAD 2>&1" >&2 || true
   echo "--- diagnostic: staging and owner directories ---" >&2
-  run_exec "$MAIN_CID" "0:0" sh -c 'ls -la /workspace/repos /workspace/repos/.workspace-agent /workspace/repos/.workspace-agent/staging /workspace/repos/octocat 2>&1' >&2 || true
+  run_exec "$MAIN_CID" "0:0" sh -c "ls -la /workspace/repos /workspace/repos/.workspace-agent /workspace/repos/.workspace-agent/staging /workspace/repos/${CLONE_OWNER} 2>&1" >&2 || true
   echo "--- diagnostic: workspace logs (tail) ---" >&2
   docker logs --tail 40 "$MAIN_CID" >&2 2>&1 || true
 fi
-echo "$clone_out" | grep -q '"ok":true' || fail "clone: POST /clone octocat/Hello-World did not return ok:true — got: ${clone_out} (network-level failure? this container has no --network override, so it depends on the runner having outbound internet — see the block comment above before assuming a uid/ownership regression)"
-pass "POST /clone octocat/Hello-World succeeds over the harness's direct (unproxied) network path"
+echo "$clone_out" | grep -q '"ok":true' || fail "clone: POST /clone ${CLONE_OWNER}/${CLONE_REPO} did not return ok:true — got: ${clone_out} (network-level failure? this container has no --network override, so it depends on the runner having outbound internet — see the block comment above before assuming a uid/ownership regression)"
+pass "POST /clone ${CLONE_OWNER}/${CLONE_REPO} succeeds over the harness's direct (unproxied) network path"
 
 clone_root_owner="$(run_exec "$MAIN_CID" "0:0" stat -c '%u:%g:%a' /workspace/repos)"
 [ "$clone_root_owner" = "0:0:755" ] || fail "clone: /workspace/repos is ${clone_root_owner}, expected 0:0:755"
-clone_owner_dir_owner="$(run_exec "$MAIN_CID" "0:0" stat -c '%u:%g:%a' /workspace/repos/octocat)"
-[ "$clone_owner_dir_owner" = "0:0:755" ] || fail "clone: /workspace/repos/octocat is ${clone_owner_dir_owner}, expected 0:0:755"
-clone_non_agent_owned="$(run_exec "$MAIN_CID" "0:0" find /workspace/repos/octocat/Hello-World -not -user 10001 2>&1 || true)"
+clone_owner_dir_owner="$(run_exec "$MAIN_CID" "0:0" stat -c '%u:%g:%a' "/workspace/repos/${CLONE_OWNER}")"
+[ "$clone_owner_dir_owner" = "0:0:755" ] || fail "clone: /workspace/repos/${CLONE_OWNER} is ${clone_owner_dir_owner}, expected 0:0:755"
+clone_non_agent_owned="$(run_exec "$MAIN_CID" "0:0" find "/workspace/repos/${CLONE_OWNER}/${CLONE_REPO}" -not -user 10001 2>&1 || true)"
 [ -z "$clone_non_agent_owned" ] || fail "clone: file(s) inside the new checkout not owned by uid 10001: ${clone_non_agent_owned}"
-pass "clone: /workspace/repos and /workspace/repos/octocat stay 0:0 0755; the new checkout is entirely 10001-owned"
+pass "clone: /workspace/repos and /workspace/repos/${CLONE_OWNER} stay 0:0 0755; the new checkout is entirely 10001-owned"
 
 clone_staging_listing="$(run_exec "$MAIN_CID" "0:0" sh -c 'find /workspace/repos/.workspace-agent/staging -mindepth 1 2>&1 || true')"
 [ -z "$clone_staging_listing" ] || fail "clone: /workspace/repos/.workspace-agent/staging/ is not empty after a completed clone: ${clone_staging_listing}"
-clone_stray_tmp="$(run_exec "$MAIN_CID" "0:0" sh -c "find /workspace/repos/octocat -maxdepth 1 -name '.tmp-*' 2>&1 || true")"
-[ -z "$clone_stray_tmp" ] || fail "clone: stray .tmp-* entries left under /workspace/repos/octocat: ${clone_stray_tmp}"
+clone_stray_tmp="$(run_exec "$MAIN_CID" "0:0" sh -c "find /workspace/repos/${CLONE_OWNER} -maxdepth 1 -name '.tmp-*' 2>&1 || true")"
+[ -z "$clone_stray_tmp" ] || fail "clone: stray .tmp-* entries left under /workspace/repos/${CLONE_OWNER}: ${clone_stray_tmp}"
 pass "clone: staging directory is empty and no .tmp-* staging leftovers remain under the owner directory"
 
 must_succeed "clone: uid 10001 can create/edit a file in the new checkout" "$MAIN_CID" "$AGENT_USER" \
-  sh -c 'echo "isolation-harness-edit" > /workspace/repos/octocat/Hello-World/isolation-harness-edit.txt && grep -q isolation-harness-edit /workspace/repos/octocat/Hello-World/isolation-harness-edit.txt'
+  sh -c "echo 'isolation-harness-edit' > /workspace/repos/${CLONE_OWNER}/${CLONE_REPO}/isolation-harness-edit.txt && grep -q isolation-harness-edit /workspace/repos/${CLONE_OWNER}/${CLONE_REPO}/isolation-harness-edit.txt"
 pass "clone: uid 10001 can create and edit a file inside the checkout /clone produced"
 
-clone_inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"octocat\",\"repo\":\"Hello-World\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
+clone_inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
 echo "$clone_inspect_out" | grep -q '"ok":true' || fail "clone: POST /inspect on the new checkout did not return ok:true — got: ${clone_inspect_out}"
 pass "clone: POST /inspect on the /clone-produced checkout succeeds"
 
-clone_repeat_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /tmp/clone-repeat-body.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"octocat\",\"repo\":\"Hello-World\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
+clone_repeat_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /tmp/clone-repeat-body.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
 [ "$clone_repeat_out" = "409" ] || fail "clone: second POST /clone of the same repo returned HTTP ${clone_repeat_out}, expected 409 (repo-exists) — body: $(run_exec "$MAIN_CID" "0:0" cat /tmp/clone-repeat-body.json 2>&1 || true)"
 clone_repeat_body="$(run_exec "$MAIN_CID" "0:0" cat /tmp/clone-repeat-body.json 2>&1 || true)"
 echo "$clone_repeat_body" | grep -q 'repo-exists' || fail "clone: second /clone returned 409 but body does not say repo-exists: ${clone_repeat_body}"
 clone_repeat_logs="$(docker logs "$MAIN_CID" 2>&1 || true)"
 echo "$clone_repeat_logs" | grep -qi 'dubious ownership' && fail "clone: 'dubious ownership' appeared in workspace logs after the repeat /clone's repo-exists validation ran git as 10001 against the checkout"
 pass "clone: a second /clone of the same repo returns 409 repo-exists, with no dubious-ownership error in the workspace logs"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4b-restart: a restart AFTER /clone must not re-walk the checkout
+# /clone just produced. /clone hands new checkouts straight to uid 10001 but
+# writes no completion marker for them — it's migrate-repo-ownership.mjs's
+# skip-if-checkout-root-is-already-agent-owned rule (not the marker) that
+# keeps every subsequent boot cheap and correct. This is exactly the
+# regression the rule fixes: without it, every boot after a /clone would
+# re-walk that checkout as root, growing unboundedly toward the migration
+# deadline as more repos get cloned.
+# ─────────────────────────────────────────────────────────────────────────────
+log "phase 4b-restart: a restart after /clone skips the freshly cloned checkout entirely"
+
+CLONE_CHECKOUT_PATH="/workspace/repos/${CLONE_OWNER}/${CLONE_REPO}"
+
+# Record the checkout's full content hash and per-path uid:gid BEFORE the
+# restart, sorted so the comparison isn't sensitive to readdir order.
+clone_restart_hashes_before="$(run_exec "$MAIN_CID" "0:0" sh -c "find '${CLONE_CHECKOUT_PATH}' -type f -exec sha256sum {} \\; | sort")"
+clone_restart_owners_before="$(run_exec "$MAIN_CID" "0:0" sh -c "find '${CLONE_CHECKOUT_PATH}' -exec stat -c '%n %u:%g' {} \\; | sort")"
+[ -n "$clone_restart_hashes_before" ] || fail "phase 4b-restart: pre-restart content hash of ${CLONE_CHECKOUT_PATH} is empty — the checkout appears empty, cannot prove anything is unchanged"
+
+clone_restart_started_at="$(date +%s)"
+docker restart --time "$SHUTDOWN_TIMEOUT_S" "$MAIN_CID" >/dev/null
+if ! wait_for_healthz "$MAIN_CID" "$CLONE_RESTART_HEALTHY_TIMEOUT_S"; then
+  echo "--- container logs ---" >&2
+  docker logs "$MAIN_CID" 2>&1 >&2 || true
+  fail "phase 4b-restart: container did not become healthy within ${CLONE_RESTART_HEALTHY_TIMEOUT_S}s after restarting post-/clone (a full re-walk of the /clone checkout would blow this bound)"
+fi
+clone_restart_elapsed=$(( $(date +%s) - clone_restart_started_at ))
+pass "phase 4b-restart: container restarted and became healthy again in ${clone_restart_elapsed}s (within the ${CLONE_RESTART_HEALTHY_TIMEOUT_S}s bound)"
+
+# Read ONLY this new boot's migration summary line. docker's log driver
+# appends across restarts (the log is NOT reset), and this container has now
+# booted twice, so a plain `docker logs` would also match the first boot's
+# line (which legitimately reports zero of everything, since /clone hadn't
+# run yet) — `--since` the new boot's own recorded start time isolates it,
+# mirroring how the migration phase's docker-logs reads are always scoped to
+# a single boot by construction (a freshly created container there, a
+# freshly restarted one here).
+clone_restart_started_iso="$(docker inspect -f '{{.State.StartedAt}}' "$MAIN_CID")"
+clone_restart_logs="$(docker logs --since "$clone_restart_started_iso" "$MAIN_CID" 2>&1 || true)"
+clone_restart_summary_line="$(printf '%s\n' "$clone_restart_logs" | grep 'migrate-repo-ownership: completed=' | tail -1)"
+[ -n "$clone_restart_summary_line" ] || fail "phase 4b-restart: no 'migrate-repo-ownership: completed=...' summary line found in this boot's logs — got: ${clone_restart_logs}"
+log "  migration summary for this boot: ${clone_restart_summary_line}"
+
+echo "$clone_restart_summary_line" | grep -q 'completed=0 ' \
+  || fail "phase 4b-restart: migration summary reports something COMPLETED (walked) this boot — expected completed=0: ${clone_restart_summary_line}"
+echo "$clone_restart_summary_line" | grep -qE 'agent-owned=[1-9][0-9]*' \
+  || fail "phase 4b-restart: migration summary does not report the /clone checkout as agent-owned-skipped — expected agent-owned>=1: ${clone_restart_summary_line}"
+echo "$clone_restart_summary_line" | grep -q 'dirs=0 files=0 ' \
+  || fail "phase 4b-restart: migration summary reports dirs/files touched this boot — expected dirs=0 files=0 (nothing walked): ${clone_restart_summary_line}"
+pass "phase 4b-restart: migration summary for this boot reports the /clone checkout skipped (agent-owned), with nothing walked or changed"
+
+clone_restart_hashes_after="$(run_exec "$MAIN_CID" "0:0" sh -c "find '${CLONE_CHECKOUT_PATH}' -type f -exec sha256sum {} \\; | sort")"
+clone_restart_owners_after="$(run_exec "$MAIN_CID" "0:0" sh -c "find '${CLONE_CHECKOUT_PATH}' -exec stat -c '%n %u:%g' {} \\; | sort")"
+[ "$clone_restart_hashes_before" = "$clone_restart_hashes_after" ] \
+  || fail "phase 4b-restart: checkout content hashes changed across the restart"
+[ "$clone_restart_owners_before" = "$clone_restart_owners_after" ] \
+  || fail "phase 4b-restart: checkout ownership (uid:gid per path) changed across the restart"
+pass "phase 4b-restart: checkout content hashes and per-path uid:gid are byte-for-byte unchanged across the restart"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 4c: the image's git produces the prompts the askpass helper expects
@@ -1042,7 +1112,13 @@ pass "signal handling positive control: all three test-tree pids (parent/child/g
 # among them, no CAP_SYS_PTRACE), signals the uid-10001 process GROUP with a
 # negative pgid — exactly what killChildGroup does
 # (apps/workspace-agent/src/opencode-server.ts: process.kill(-(child.pid), 'SIGTERM')).
-run_exec "$MAIN_CID" "0:0" kill -TERM -- "-${test_group_pgid}"
+#
+# NOT `kill -TERM -- "-${pgid}"`: the image's kill is busybox's, which does
+# not understand the GNU `--` end-of-options marker and rejects it ("kill:
+# invalid number '--'"). Signal the group the exact way killChildGroup itself
+# does — via node's process.kill(-pgid, 'SIGTERM') — rather than chasing
+# busybox kill's own negative-number syntax. node is already in this image.
+run_exec "$MAIN_CID" "0:0" node -e 'process.kill(-Number(process.argv[1]), "SIGTERM")' "$test_group_pgid"
 
 signal_reaped=false
 for _ in $(seq 1 "$SIGNAL_WAIT_TIMEOUT_S"); do
@@ -1070,6 +1146,12 @@ pass "signal handling: root, with only the production capabilities (CAP_KILL, no
 # Negative control: the direction is one-way. As uid 10001, signalling the
 # root service (pid 1) must fail with a permission error, and pid 1 must
 # still be alive and the container still healthy afterward.
+#
+# `kill -TERM 1` (a single positive pid, no negative-pgid `--` marker) means
+# exactly what it says under busybox's kill — this call is NOT affected by
+# the `--` incompatibility fixed above, confirmed by inspection of busybox's
+# kill applet (it only special-cases the leading `-` on NEGATIVE numbers /
+# signal names, never on a bare positive pid).
 must_fail "signal handling negative control: uid 10001 cannot kill -TERM the root service (pid 1)" "$MAIN_CID" "$AGENT_USER" kill -TERM 1
 must_succeed "signal handling negative control: pid 1 is still alive after the denied kill attempt" "$MAIN_CID" "0:0" test -d /proc/1
 wait_for_healthz "$MAIN_CID" 10 || fail "signal handling negative control: the container is no longer healthy after the denied 10001->root kill attempt (pid 1 should be completely unaffected)"

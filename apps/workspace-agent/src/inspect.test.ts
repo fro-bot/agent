@@ -629,12 +629,15 @@ describe('inspectCheckout — errors', () => {
     chmodSync(fakeGitPath, 0o755)
 
     try {
-      // #when — short timeout so SIGKILL fires almost immediately; the grace window (2s, not
-      // caller-configurable) is what this test actually waits out.
+      // #when — the timeout must fire only AFTER the shell has forked `sleep`. If SIGKILL lands
+      // first, the shell dies holding the only pipe writer, the pipe closes, and the outcome is a
+      // confirmed `timeout` — which is correct behavior, but not the case under test. At 150ms a
+      // loaded runner could still be starting the shell, so this used to flake; 1s leaves the
+      // fork ample room. The grace window (2s, not caller-configurable) is what's waited out.
       const outcome = await runGit(['status'], {
         cwd: dir,
         env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
-        timeoutMs: 150,
+        timeoutMs: 1_000,
       })
 
       // #then — distinct from the confirmed-timeout outcome above: this must NEVER claim the
@@ -643,7 +646,7 @@ describe('inspectCheckout — errors', () => {
     } finally {
       rmSync(fakeBinDir, {recursive: true, force: true})
     }
-  }, 8_000)
+  }, 10_000)
 })
 
 // ---------------------------------------------------------------------------
