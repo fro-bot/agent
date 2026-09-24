@@ -672,7 +672,9 @@ async function executeCloneInner(
     }
 
     if (resolvedPath.startsWith(`${reposRoot}/`) === false && resolvedPath !== reposRoot) {
-      // Path escaped the workspace — remove the clone and reject.
+      // Path escaped the workspace — remove the clone and reject. Root deletes an agent-owned tree
+      // here, but this is unreachable in practice: the owner directory is root-owned 0755, so the
+      // agent cannot swap destPath for a symlink between the rename above and this check.
       await rm(destPath, {recursive: true, force: true})
       return {
         response: {ok: false, error: 'path-escaped-workspace'},

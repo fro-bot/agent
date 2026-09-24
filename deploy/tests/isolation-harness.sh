@@ -1124,20 +1124,40 @@ pass "signal handling positive control: all three test-tree pids (parent/child/g
 # busybox kill's own negative-number syntax. node is already in this image.
 run_exec "$MAIN_CID" "0:0" node -e 'process.kill(-Number(process.argv[1]), "SIGTERM")' "$test_group_pgid"
 
+# A process counts as terminated when its /proc entry is gone OR it is a
+# zombie (state Z): it has exited and only its exit status is left. The tree
+# is started detached, so once its parent dies the rest reparent to pid 1 —
+# node, which never waits on children it did not spawn — and linger as
+# zombies. That is about reaping, not about whether the signal was delivered,
+# which is the property under test. Each zombie is recorded, not hidden.
+pid_is_running() {
+  # true only if /proc/<pid> exists and its state is not Z
+  local st
+  # shellcheck disable=SC2016 # awk's own $2, not a bash expansion
+  st="$(run_exec "$MAIN_CID" "0:0" awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null || true)"
+  st="$(printf '%s' "$st" | tr -d '[:space:]')"
+  [ -n "$st" ] && [ "$st" != "Z" ]
+}
 signal_reaped=false
 for _ in $(seq 1 "$SIGNAL_WAIT_TIMEOUT_S"); do
-  if ! run_exec "$MAIN_CID" "0:0" sh -c "test -d /proc/${group_parent_pid} || test -d /proc/${group_child_pid} || test -d /proc/${group_grandchild_pid}"; then
+  if ! pid_is_running "$group_parent_pid" && ! pid_is_running "$group_child_pid" && ! pid_is_running "$group_grandchild_pid"; then
     signal_reaped=true
     break
   fi
   sleep 1
+done
+for pid_idx in 0 1 2; do
+  pid_val="${GROUP_TREE_PIDS[$pid_idx]}"
+  if run_exec "$MAIN_CID" "0:0" grep -q '^State:[[:space:]]*Z' "/proc/${pid_val}/status" 2>/dev/null; then
+    log "RECORD (not asserted) ${GROUP_TREE_PID_NAMES[$pid_idx]}(${pid_val}) exited but is an unreaped zombie — pid 1 is node, which does not reap orphans"
+  fi
 done
 if [ "$signal_reaped" != "true" ]; then
   still_alive=""
   for pid_idx in 0 1 2; do
     pid_name="${GROUP_TREE_PID_NAMES[$pid_idx]}"
     pid_val="${GROUP_TREE_PIDS[$pid_idx]}"
-    run_exec "$MAIN_CID" "0:0" test -d "/proc/${pid_val}" && still_alive="${still_alive} ${pid_name}(${pid_val})"
+    pid_is_running "$pid_val" && still_alive="${still_alive} ${pid_name}(${pid_val})"
   done
   fail "signal handling: 'kill -TERM -${test_group_pgid}' as root did not reap the uid-10001 test tree within ${SIGNAL_WAIT_TIMEOUT_S}s — still alive:${still_alive:- none? (race — re-check the poll logic)} — this directly exercises what killChildGroup depends on"
 fi
