@@ -52,23 +52,49 @@ fi
 # start, so /run/workspace-agent's subdirectories are always (re)created
 # here; /workspace/repos/.workspace-agent lives on the persistent
 # workspace-repos volume, so across restarts it is validated, not recreated.
+#
+# /run/workspace-agent and .workspace-agent are the barriers: strict checks
+# (owned 0:0, mode exactly 0700, never a symlink). Nothing but this script
+# ever creates them, so an exact match is always achievable.
+#
+# secrets/ and mitmproxy/ are --nested: their owner/mode are NOT ours to
+# control. When a secret file is bind-mounted at secrets/<name>, Docker
+# creates the secrets/ directory itself at 0755, before this script ever
+# runs. mitmproxy/ is worse in production — a read-only volume mountpoint
+# (mitmproxy-certs) whose owner/mode come from the mitmproxy container, and
+# which can't be chmod'ed even if we wanted to (the mount is :ro). A strict
+# check on either would refuse every real deployment that mounts a secret.
+# What actually keeps the agent uid out is the parent (RUNTIME_DIR, checked
+# strict above in this same loop): root-owned 0700, so uid 10001 can't
+# traverse into anything beneath it regardless of the children's mode.
+# --nested re-verifies that barrier is in place before relaxing the child
+# check, and logs the child's observed owner/mode for operator visibility.
 # ---------------------------------------------------------------------------
 RUNTIME_DIR="/run/workspace-agent"
 REPOS_ROOT="/workspace/repos"
 STATE_DIR="${REPOS_ROOT}/.workspace-agent"
 
 for dir_spec in \
-  "${RUNTIME_DIR}:0:0:700" \
-  "${RUNTIME_DIR}/secrets:0:0:700" \
-  "${RUNTIME_DIR}/mitmproxy:0:0:700" \
-  "${STATE_DIR}:0:0:700"; do
+  "${RUNTIME_DIR}:0:0:700:strict" \
+  "${RUNTIME_DIR}/secrets:0:0:700:nested" \
+  "${RUNTIME_DIR}/mitmproxy:0:0:700:nested" \
+  "${STATE_DIR}:0:0:700:strict"; do
   dir_path="${dir_spec%%:*}"
   rest="${dir_spec#*:}"
   dir_uid="${rest%%:*}"
   rest2="${rest#*:}"
   dir_gid="${rest2%%:*}"
-  dir_mode="${rest2#*:}"
-  if ! node "$SCRIPTS_DIR/ensure-protected-dir.mjs" "$dir_path" "$dir_uid" "$dir_gid" "$dir_mode"; then
+  rest3="${rest2#*:}"
+  dir_mode="${rest3%%:*}"
+  dir_level="${rest3#*:}"
+  if [ "$dir_level" = "nested" ]; then
+    dir_check_ok=0
+    node "$SCRIPTS_DIR/ensure-protected-dir.mjs" --nested "$dir_path" "$dir_uid" "$dir_gid" "$dir_mode" || dir_check_ok=1
+  else
+    dir_check_ok=0
+    node "$SCRIPTS_DIR/ensure-protected-dir.mjs" "$dir_path" "$dir_uid" "$dir_gid" "$dir_mode" || dir_check_ok=1
+  fi
+  if [ "$dir_check_ok" -ne 0 ]; then
     echo "workspace-entrypoint: refusing to start — ${dir_path} failed its protected-directory check (see message above)" >&2
     exit 1
   fi
