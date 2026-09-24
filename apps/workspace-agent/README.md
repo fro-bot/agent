@@ -61,6 +61,9 @@ If the repo is already cloned, returns **409**:
 
 - Token is injected via `GIT_ASKPASS` — never appears in process argv
 - Token is passed to the askpass script via `GITHUB_TOKEN` env var — **not embedded in the script body** (script file on disk contains no secret)
+- Askpass script is `chmod 0700` explicitly after write (not just the `open()` mode, which the process umask can mask back down) so git can execute it
+- Askpass script answers **only** the exact `https://github.com` credential prompt (literal match on git's prompt text, no glob) and `exit 1`s for everything else — a same-request HTTP redirect to another host cannot get the token
+- Global/system git config is sealed on the clone subprocess (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_ALLOW_PROTOCOL=https`), blocking a config-planted `url.<x>.insteadOf` redirect
 - Git trace env vars are suppressed (`GIT_TRACE=0`, etc.)
 - Stderr is scrubbed of credential patterns before any error is returned
 - Owner/repo are validated against `[A-Za-z0-9._-]+` before path construction; bare `.` and `..` are explicitly rejected
