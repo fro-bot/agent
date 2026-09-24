@@ -176,7 +176,11 @@ TOKEN_FILE="$(mktemp)"
 AUTH_FILE="$(mktemp)"
 CA_FILE="$(mktemp)"
 TMPFILES+=("$TOKEN_FILE" "$AUTH_FILE" "$CA_FILE")
-printf 'isolation-harness-dummy-bearer-token' >"$TOKEN_FILE"
+# Single source of truth for the control-API bearer this harness mounts as the
+# workspace_opencode_token secret — reused below for every authenticated
+# POST /clone and POST /inspect call instead of a second hardcoded literal.
+WORKSPACE_BEARER='isolation-harness-dummy-bearer-token'
+printf '%s' "$WORKSPACE_BEARER" >"$TOKEN_FILE"
 printf '{"anthropic":{"type":"api","key":"sk-isolation-harness-dummy"}}' >"$AUTH_FILE"
 # A real, throwaway self-signed CA. The entrypoint installs whatever is
 # mounted here into the system trust store, and a malformed PEM there can
@@ -562,10 +566,19 @@ run_exec "$MAIN_CID" "0:0" sh -c '
 # the SHA256SUMS fetch at build time, so it is always present here — no
 # wget-availability fallback needed. curl -d auto-sets Content-Length, which
 # POST /inspect requires (server.ts rejects a missing content-length header).
-inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"acme\",\"repo\":\"widgets\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
+inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"acme\",\"repo\":\"widgets\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
 echo "$inspect_out" | grep -q '"ok":true' || fail "service behavior: POST /inspect against a root-owned checkout did not return ok:true — got: ${inspect_out}"
 echo "$inspect_out" | grep -qi 'dubious' && fail "service behavior: POST /inspect response mentions 'dubious' ownership — got: ${inspect_out}"
 pass "POST /inspect succeeds against a checkout git does not own, with no dubious-ownership error"
+
+# Control-API bearer: uid 10001 (the unprivileged agent, reachable over loopback on :9100) must
+# be refused; root with the correct bearer must still succeed. This is the core Unit 1 property
+# — without it, uid 10001 could already call /clone or /inspect itself over loopback.
+inspect_noauth_status="$(run_exec "$MAIN_CID" "$AGENT_USER" sh -c "curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"acme\",\"repo\":\"widgets\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
+[ "$inspect_noauth_status" = "401" ] || fail "auth: uid 10001 POST /inspect without the control-API bearer returned HTTP ${inspect_noauth_status}, expected 401"
+inspect_auth_status="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"acme\",\"repo\":\"widgets\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
+[ "$inspect_auth_status" = "200" ] || fail "auth: root POST /inspect WITH the control-API bearer returned HTTP ${inspect_auth_status}, expected 200"
+pass "control-API bearer enforced: uid 10001 without the bearer gets 401 on POST /inspect; root with the bearer succeeds"
 
 # OpenCode's database/logs/cache/state land under /home/opencode, owned by
 # 10001, nothing under /root.
@@ -580,7 +593,7 @@ pass "OpenCode's files under /home/opencode are all owned by uid 10001; nothing 
 # The 9200 bearer proxy reaches OpenCode, and the bearer token is not exposed
 # via OpenCode's own /proc/<pid>/environ (read as root) or any file OpenCode
 # can read.
-proxy_probe="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer isolation-harness-dummy-bearer-token' http://127.0.0.1:9200/ 2>&1 || true")"
+proxy_probe="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' http://127.0.0.1:9200/ 2>&1 || true")"
 case "$proxy_probe" in
   2* | 3* | 4[0-9][0-9]) : ;; # any HTTP response (even 404/405 from the upstream) proves the proxy reached OpenCode and forwarded
   *) fail "service behavior: :9200 bearer proxy did not produce an HTTP response (got '${proxy_probe}') — proxy or upstream may be down" ;;
@@ -657,7 +670,7 @@ log "phase 4b: /clone hands new checkouts to the agent uid"
 CLONE_OWNER="octocat"
 CLONE_REPO="Hello-World"
 CLONE_TOKEN="ghs_isolationHarnessDummyCloneToken1234567890"  # ghs_ + 40 chars, well past validateTokenShape's >=20 minimum
-clone_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
+clone_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
 if ! echo "$clone_out" | grep -q '"ok":true'; then
   # /clone reports only a coarse error code. Reproduce the network half with
   # the same sealed git config, as root, so the log shows git's own reason.
@@ -689,11 +702,11 @@ must_succeed "clone: uid 10001 can create/edit a file in the new checkout" "$MAI
   sh -c "echo 'isolation-harness-edit' > /workspace/repos/${CLONE_OWNER}/${CLONE_REPO}/isolation-harness-edit.txt && grep -q isolation-harness-edit /workspace/repos/${CLONE_OWNER}/${CLONE_REPO}/isolation-harness-edit.txt"
 pass "clone: uid 10001 can create and edit a file inside the checkout /clone produced"
 
-clone_inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
+clone_inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
 echo "$clone_inspect_out" | grep -q '"ok":true' || fail "clone: POST /inspect on the new checkout did not return ok:true — got: ${clone_inspect_out}"
 pass "clone: POST /inspect on the /clone-produced checkout succeeds"
 
-clone_repeat_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /tmp/clone-repeat-body.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
+clone_repeat_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /tmp/clone-repeat-body.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
 [ "$clone_repeat_out" = "409" ] || fail "clone: second POST /clone of the same repo returned HTTP ${clone_repeat_out}, expected 409 (repo-exists) — body: $(run_exec "$MAIN_CID" "0:0" cat /tmp/clone-repeat-body.json 2>&1 || true)"
 clone_repeat_body="$(run_exec "$MAIN_CID" "0:0" cat /tmp/clone-repeat-body.json 2>&1 || true)"
 echo "$clone_repeat_body" | grep -q 'repo-exists' || fail "clone: second /clone returned 409 but body does not say repo-exists: ${clone_repeat_body}"

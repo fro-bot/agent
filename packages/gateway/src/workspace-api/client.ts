@@ -30,6 +30,13 @@ import {err, ok} from '@fro-bot/runtime'
 
 export interface WorkspaceClientOptions {
   readonly baseUrl: string
+  /**
+   * Control-API bearer — the same `WORKSPACE_OPENCODE_TOKEN` this gateway already holds for
+   * the 9200 attach proxy (`config.workspaceOpencodeToken`). Sent as `Authorization: Bearer
+   * <token>` on every control call (`clone`, `inspect`) except `readyz`, which the workspace
+   * exempts from auth for the compose readiness probe.
+   */
+  readonly token: string
   readonly timeoutMs?: number
   /** Timeout for /readyz checks. Defaults to 5 seconds — much shorter than clone. */
   readonly readyzTimeoutMs?: number
@@ -112,6 +119,7 @@ export function workspaceRepoPath(owner: string, repo: string): string {
 export function createWorkspaceClient(options: WorkspaceClientOptions): WorkspaceClient {
   const {
     baseUrl,
+    token,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     readyzTimeoutMs = DEFAULT_READYZ_TIMEOUT_MS,
     inspectTimeoutMs = DEFAULT_INSPECT_TIMEOUT_MS,
@@ -175,7 +183,7 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     try {
       response = await fetch(`${baseUrl}/clone`, {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
         body,
         signal: AbortSignal.timeout(timeoutMs),
       })
@@ -239,7 +247,7 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     try {
       response = await fetch(`${baseUrl}/inspect`, {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
         body,
         signal: AbortSignal.timeout(inspectTimeoutMs),
       })

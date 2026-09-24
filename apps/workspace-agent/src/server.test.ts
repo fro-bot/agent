@@ -2,6 +2,8 @@ import type {CloneHandlerResult} from './clone.js'
 import type {InspectHandlerResult} from './inspect.js'
 import type {CloneExecutorFn, InspectExecutorFn} from './server.js'
 
+import {Buffer} from 'node:buffer'
+
 import {describe, expect, it, vi} from 'vitest'
 import {createApp} from './server.js'
 
@@ -846,5 +848,211 @@ describe('POST /inspect — response passthrough', () => {
     expect(res.status).toBe(504)
     const body = await res.json()
     expect(body).toEqual({ok: false, error: 'inspection-timeout'})
+  })
+})
+
+describe('Control-API bearer authentication', () => {
+  const AUTH_TOKEN = `auth-token-${'z'.repeat(32)}`
+  const AUTH_HEADER = {Authorization: `Bearer ${AUTH_TOKEN}`}
+
+  describe('happy path — correct bearer', () => {
+    it('pOST /clone with the correct bearer behaves exactly as today', async () => {
+      // #given
+      const cloneExecutor = makeCloneExecutor({
+        response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'},
+        statusCode: 200,
+      })
+      const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+
+      // #when
+      const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN}, AUTH_HEADER)
+
+      // #then
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body).toEqual({ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'})
+      expect(cloneExecutor).toHaveBeenCalledTimes(1)
+    })
+
+    it('pOST /inspect with the correct bearer behaves exactly as today', async () => {
+      // #given
+      const observation = {
+        head: {kind: 'attached' as const, branch: 'main', sha: 'a'.repeat(40)},
+        worktree: {kind: 'clean' as const},
+        operationInProgress: 'none' as const,
+        observedAt: '2026-01-01T00:00:00.000Z',
+      }
+      const inspectExecutor = makeInspectExecutor({response: {ok: true, observation}, statusCode: 200})
+      const app = createApp({inspectExecutor, token: AUTH_TOKEN})
+
+      // #when
+      const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'}, AUTH_HEADER)
+
+      // #then
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body).toEqual({ok: true, observation})
+      expect(inspectExecutor).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('error path — rejected before body parsing or git', () => {
+    const cases: {name: string; headers: Record<string, string>}[] = [
+      {name: 'no Authorization header', headers: {}},
+      {
+        name: 'Basic scheme instead of Bearer',
+        headers: {Authorization: `Basic ${Buffer.from('user:pass').toString('base64')}`},
+      },
+      {name: 'Bearer with an empty token', headers: {Authorization: 'Bearer '}},
+      {name: 'wrong token', headers: {Authorization: 'Bearer completely-different-token-value'}},
+      {
+        name: 'token differing only in the last byte',
+        headers: {Authorization: `Bearer ${AUTH_TOKEN.slice(0, -1)}y`},
+      },
+      {name: 'token that is a prefix of the real one', headers: {Authorization: `Bearer ${AUTH_TOKEN.slice(0, -1)}`}},
+    ]
+
+    for (const {name, headers} of cases) {
+      it(`POST /clone returns 401 for ${name}, without invoking the clone executor`, async () => {
+        // #given
+        const cloneExecutor = makeCloneExecutor({
+          response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'},
+          statusCode: 200,
+        })
+        const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+
+        // #when
+        const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN}, headers)
+
+        // #then
+        expect(res.status).toBe(401)
+        const body = await res.json()
+        expect(body).toEqual({ok: false, error: 'unauthorized'})
+        expect(cloneExecutor).not.toHaveBeenCalled()
+      })
+
+      it(`POST /inspect returns 401 for ${name}, without invoking the inspect executor`, async () => {
+        // #given
+        const inspectExecutor = makeInspectExecutor({
+          response: {
+            ok: true,
+            observation: {
+              head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
+              worktree: {kind: 'clean'},
+              operationInProgress: 'none',
+              observedAt: '2026-01-01T00:00:00.000Z',
+            },
+          },
+          statusCode: 200,
+        })
+        const app = createApp({inspectExecutor, token: AUTH_TOKEN})
+
+        // #when
+        const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'}, headers)
+
+        // #then
+        expect(res.status).toBe(401)
+        const body = await res.json()
+        expect(body).toEqual({ok: false, error: 'unauthorized'})
+        expect(inspectExecutor).not.toHaveBeenCalled()
+      })
+    }
+
+    it('rejects with 401 (not 400) when a malformed body accompanies a missing bearer — proves auth runs before JSON parsing', async () => {
+      // #given
+      const cloneExecutor = vi.fn()
+      const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+      const malformedBody = 'not json{{{'
+
+      // #when — no Authorization header, body is malformed JSON
+      const res = await app.request('/clone', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': String(new TextEncoder().encode(malformedBody).length),
+        },
+        body: malformedBody,
+      })
+
+      // #then — 401, not 400 (malformed-body): auth ran first, JSON was never parsed
+      expect(res.status).toBe(401)
+      const body = await res.json()
+      expect(body).toEqual({ok: false, error: 'unauthorized'})
+      expect(cloneExecutor).not.toHaveBeenCalled()
+    })
+
+    it('rejects with 401 (not 413) when an oversized body accompanies a missing bearer — proves auth runs before the body-size gate', async () => {
+      // #given
+      const cloneExecutor = vi.fn()
+      const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+
+      // #when — no Authorization header, Content-Length far exceeds the 4096-byte cap
+      const res = await app.request('/clone', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': '999999',
+        },
+        body: JSON.stringify({owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN}),
+      })
+
+      // #then — 401, not 413: auth ran before the content-length check
+      expect(res.status).toBe(401)
+      const body = await res.json()
+      expect(body).toEqual({ok: false, error: 'unauthorized'})
+      expect(cloneExecutor).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('edge case — empty configured token', () => {
+    it.each(['', '   '])('refuses to build the app with token %j, so `Bearer ` alone can never authenticate', token => {
+      // #given / #when / #then
+      expect(() => createApp({token})).toThrow('control-API token must not be empty')
+    })
+  })
+
+  describe('edge case — /healthz and /readyz stay open', () => {
+    it('gET /healthz succeeds with no Authorization header even when a token is configured', async () => {
+      // #given
+      const app = createApp({token: AUTH_TOKEN})
+
+      // #when
+      const res = await app.request('/healthz')
+
+      // #then
+      expect(res.status).toBe(200)
+    })
+
+    it('gET /readyz answers by its own readiness logic (never 401) with no Authorization header', async () => {
+      // #given
+      const opencodeStatus = {status: 'ready' as const}
+      const app = createApp({opencodeStatus, token: AUTH_TOKEN})
+
+      // #when
+      const res = await app.request('/readyz')
+
+      // #then
+      expect(res.status).not.toBe(401)
+      expect(res.status).toBe(200)
+    })
+
+    it('header matching is case-insensitive (Fetch Headers semantics): lowercase "authorization" is accepted', async () => {
+      // #given
+      const cloneExecutor = makeCloneExecutor({
+        response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'},
+        statusCode: 200,
+      })
+      const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+
+      // #when — lowercase header name
+      const res = await postClone(
+        app,
+        {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN},
+        {authorization: `Bearer ${AUTH_TOKEN}`},
+      )
+
+      // #then
+      expect(res.status).toBe(200)
+    })
   })
 })

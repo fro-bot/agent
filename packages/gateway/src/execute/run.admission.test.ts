@@ -1635,6 +1635,54 @@ describe('failureKind threading (early-abort gates)', () => {
     expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('workspace-unreachable')
   })
 
+  it('workspace clone 401 (bad control-API bearer): FAILED transitionRun carries detailsPatch.failureKind = "workspace-unavailable", not "unreachable"', async () => {
+    // #given — ensureClone fails with an http-error/401 (workspace rejected the gateway's own
+    // bearer): a configuration problem, not a transient reachability blip.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const ensureClone = vi.fn().mockResolvedValue({
+      success: false as const,
+      error: {kind: 'workspace-failure' as const, workspaceKind: 'http-error' as const, status: 401},
+    })
+    const message = makeMessage()
+    const deps = makeDeps({ensureClone})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — the FAILED transitionRun call persists the internal 'workspace-unavailable' kind,
+    // not 'unreachable' — retrying will not fix a stale/mismatched bearer.
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('workspace-unavailable')
+
+    // #and — this projects to 'workspace-unavailable' via the operator mapping (not
+    // 'workspace-unreachable', which would invite a pointless retry)
+    const {toOperatorFailureKind} = await import('../operator-contract/run-status.js')
+    expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('workspace-unavailable')
+  })
+
+  it('workspace clone non-401 http-error (e.g. 503): FAILED transitionRun still carries detailsPatch.failureKind = "unreachable" (unchanged)', async () => {
+    // #given — only 401 is treated as a configuration problem; every other HTTP status stays
+    // the prior transient-reachability classification.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const ensureClone = vi.fn().mockResolvedValue({
+      success: false as const,
+      error: {kind: 'workspace-failure' as const, workspaceKind: 'http-error' as const, status: 503},
+    })
+    const message = makeMessage()
+    const deps = makeDeps({ensureClone})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('unreachable')
+  })
+
   it('readyz failure: FAILED transitionRun carries detailsPatch.failureKind = "unreachable"', async () => {
     // #given — readyz reports not-ready before ACK
     const {runMention} = await import('./run.js')

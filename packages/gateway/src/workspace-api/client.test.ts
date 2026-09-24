@@ -283,8 +283,10 @@ describe('WorkspaceClient.readyz', () => {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeClient(overrides?: {baseUrl?: string; timeoutMs?: number; inspectTimeoutMs?: number}) {
-  return createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 1000, ...overrides})
+const TEST_TOKEN = 'test-workspace-opencode-token'
+
+function makeClient(overrides?: {baseUrl?: string; timeoutMs?: number; inspectTimeoutMs?: number; token?: string}) {
+  return createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 1000, token: TEST_TOKEN, ...overrides})
 }
 
 function makeRequest(overrides?: Partial<CloneRequest>): CloneRequest {
@@ -361,9 +363,35 @@ describe('createWorkspaceClient', () => {
         'http://workspace:9100/clone',
         expect.objectContaining({
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`},
         }),
       )
+      vi.unstubAllGlobals()
+    })
+
+    it('sends the exact control-API bearer on /clone and never on /readyz', async () => {
+      // #given
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({
+        ok: true,
+        json: async () => ({ok: true, path: '/workspace/repos/testowner/testrepo', commit: 'abc123'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      await client.clone(req)
+      const cloneHeaders = (fetchMock.mock.calls[0]?.[1] as {headers?: Record<string, string>} | undefined)?.headers
+
+      fetchMock.mockResolvedValueOnce({ok: true, status: 200, json: async () => ({ready: true, opencode: 'ready'})})
+      await client.readyz()
+      const readyzInit = fetchMock.mock.calls[1]?.[1] as {headers?: Record<string, string>} | undefined
+
+      // #then — clone carries the exact bearer; readyz carries no Authorization header at all
+      expect(cloneHeaders).toEqual({'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`})
+      expect(
+        readyzInit?.headers === undefined || Object.keys(readyzInit.headers).includes('Authorization') === false,
+      ).toBe(true)
       vi.unstubAllGlobals()
     })
   })
@@ -874,7 +902,11 @@ describe('WorkspaceClient.inspect', () => {
       // #then
       expect(fetchMock).toHaveBeenCalledWith(
         'http://workspace:9100/inspect',
-        expect.objectContaining({method: 'POST', body: JSON.stringify(makeInspectRequest())}),
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify(makeInspectRequest()),
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`},
+        }),
       )
       vi.unstubAllGlobals()
     })
@@ -976,7 +1008,7 @@ describe('WorkspaceClient.inspect', () => {
       // #given — only timeoutMs (clone budget) is overridden; inspectTimeoutMs is left at its
       // own default (25s) rather than inheriting the clone value.
       const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
-      const client = createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 300_000})
+      const client = createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 300_000, token: TEST_TOKEN})
       const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation: VALID_OBSERVATION})})
       vi.stubGlobal('fetch', fetchMock)
 

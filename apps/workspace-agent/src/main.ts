@@ -151,10 +151,22 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   // from the parent on container stop, so we must abort explicitly to avoid orphaning it.
   const opencodeController = new AbortController()
 
-  const app = createApp({opencodeStatus, proxyListening: proxyListeningRef})
-
   // Read env before any server bind: fail-fast if WORKSPACE_OPENCODE_READY_TIMEOUT_MS is malformed.
   const opencodeReadyTimeoutMs = readReadyTimeoutMs(env)
+
+  // Read the control-API bearer once, before any server bind, and reuse it for both the Hono
+  // app's auth middleware (every route but /healthz and /readyz) and the 9200 OpenCode proxy
+  // below — never read WORKSPACE_OPENCODE_TOKEN a second time.
+  let token: string
+  try {
+    token = readSecretFn('WORKSPACE_OPENCODE_TOKEN')
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('workspace-agent: cannot start — missing WORKSPACE_OPENCODE_TOKEN', {message})
+    return exitFn(1)
+  }
+
+  const app = createApp({opencodeStatus, proxyListening: proxyListeningRef, token})
 
   // Bind :9100 and WAIT for the first of three outcomes before doing anything else that could
   // race an unprivileged process for a port:
@@ -222,7 +234,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   let shuttingDown = false
 
   try {
-    const token = readSecretFn('WORKSPACE_OPENCODE_TOKEN')
+    // Reuses the `token` read once, above, before any server bind — see that comment.
     proxy = createOpencodeProxyFn({
       token,
       upstreamUrl: `http://${OPENCODE_HOSTNAME}:${OPENCODE_PORT}`,
@@ -230,7 +242,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    console.error('workspace-agent: cannot start proxy — missing WORKSPACE_OPENCODE_TOKEN', {message})
+    console.error('workspace-agent: cannot start proxy', {message})
     // Process should not start without the proxy; exit with error code.
     process.exit(1)
   }
