@@ -121,8 +121,10 @@ export interface WorkspaceAgentDeps {
  * 1. Read env (readReadyTimeoutMs, readSecret) — BEFORE any server bind
  * 2. serve() — Hono HTTP server on :9100, AWAITED until actually listening, a bind 'error', or
  *    SERVER_LISTEN_TIMEOUT_MS elapses (whichever comes first) — the latter two exit(1)
- * 3. createOpencodeProxy() + proxy.listen() on :9200 — AWAITED until the bind attempt settles
- *    (success or failure; a failed bind still leaves the process in degraded mode, unchanged)
+ * 3. createOpencodeProxy() + proxy.listen() on :9200 — AWAITED until the bind attempt settles.
+ *    A failed bind is FATAL (exitFn(1), same as the :9100 failure below): once OpenCode runs
+ *    unprivileged (uid 10001) a control port nobody holds is a port it can take, including the
+ *    gateway's bearer token headed for :9200.
  * 4. runSupervisedOpencode() — supervised OpenCode lifecycle (fire-and-forget), spawned as the
  *    unprivileged agent uid ONLY once both control ports above are already bound — once OpenCode
  *    runs unprivileged it is just another process on the box, and must never have a window where
@@ -214,6 +216,10 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   }
 
   let proxy: OpencodeProxyHandle | undefined
+  // Hoisted above the proxy 'close'/'error' handlers (which read it) and the shutdown() closure
+  // (which sets it) — it gates whether an unexpected runtime port loss is fatal or an expected
+  // part of our own graceful shutdown.
+  let shuttingDown = false
 
   try {
     const token = readSecretFn('WORKSPACE_OPENCODE_TOKEN')
@@ -229,31 +235,50 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     process.exit(1)
   }
 
+  // Once :9200 has bound successfully, a 'close' or 'error' on the proxy server means the OS has
+  // released (or is about to release) the port. If that happens while OpenCode (uid 10001) is
+  // already running, the port is free for the unprivileged process to bind and intercept the
+  // gateway's bearer token headed for the real proxy — that's the same control-port-takeover risk
+  // the startup ordering above exists to prevent, just at runtime instead of at boot. Treat it as
+  // fatal: log and exitFn(1) so the container restarts and re-binds :9200 before OpenCode is
+  // spawned again. `proxyBindSucceeded` and `shuttingDown` gate this so it fires only for an
+  // unexpected runtime loss of the port — not for the initial failed-bind path below (already
+  // fatal via its own exitFn(1)) and not for the deliberate close in our own graceful-shutdown
+  // path (proxy.close() in cleanupProxy further down).
+  let proxyBindSucceeded = false
   proxy.server.on('close', () => {
     proxyListeningRef.listening = false
+    if (proxyBindSucceeded && !shuttingDown) {
+      console.error('workspace-agent: proxy server closed unexpectedly after startup — exiting to avoid ceding :9200')
+      exitFn(1)
+    }
   })
   proxy.server.on('error', () => {
     proxyListeningRef.listening = false
+    if (proxyBindSucceeded && !shuttingDown) {
+      console.error('workspace-agent: proxy server errored unexpectedly after startup — exiting to avoid ceding :9200')
+      exitFn(1)
+    }
   })
 
-  // AWAIT the :9200 bind attempt to SETTLE (success or failure) before spawning OpenCode.
-  // INTENTIONAL ASYMMETRY (unchanged from before the reorder): sync secret-read failure above
-  // calls process.exit(1) because the proxy cannot be constructed at all — there is no degraded
-  // mode without a token. An async listen() rejection is different: the proxy object exists,
-  // /readyz correctly returns 503 (proxyListeningRef stays false), and the operator can diagnose
-  // via logs. Keeping the process alive in degraded mode lets the clone API (:9100) continue
-  // serving and avoids a crash-loop restart race in container orchestrators — awaiting here only
-  // ensures the bind ATTEMPT has already happened (and thus can no longer be raced) before
-  // OpenCode is spawned; it does not turn a failed bind into a fatal error.
+  // AWAIT the :9200 bind attempt to SETTLE (success or failure) before spawning OpenCode. A
+  // failed bind is FATAL, the same as the :9100 failure above — log and exitFn(1) WITHOUT ever
+  // calling runSupervisedOpencodeFn. This predates the uid split: it used to leave the process in
+  // a "degraded mode" (clone API on :9100 still serving) because a stuck bind was only an
+  // availability problem. Now that OpenCode runs unprivileged (uid 10001), an unbound :9200 is a
+  // free port the agent can bind itself and receive the gateway's bearer token on — degraded mode
+  // would hand the agent the control channel it must never hold.
   await proxy
     .listen(PROXY_PORT, HOST)
     .then(() => {
       proxyListeningRef.listening = true
+      proxyBindSucceeded = true
     })
     .catch((error: unknown) => {
       proxyListeningRef.listening = false
       const message = error instanceof Error ? error.message : String(error)
-      console.error('workspace-agent: proxy failed to start', {message})
+      console.error('workspace-agent: proxy failed to bind :9200 — refusing to spawn OpenCode', {message})
+      return exitFn(1)
     })
 
   // Fire-and-forget: supervisor writes status transitions to opencodeStatus.
@@ -275,8 +300,6 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     const message = error instanceof Error ? error.message : String(error)
     console.error('workspace-agent: opencode supervisor crashed unexpectedly', {message})
   })
-
-  let shuttingDown = false
 
   function shutdown(signal: string): void {
     if (shuttingDown === true) return

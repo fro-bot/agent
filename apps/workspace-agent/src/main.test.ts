@@ -353,13 +353,15 @@ describe('startWorkspaceAgent', () => {
   })
 
   describe('proxy listen rejection wiring', () => {
-    it('leaves proxyListeningRef.listening = false when proxy.listen() rejects', async () => {
-      // #given — a fake proxy whose listen() always rejects
+    it('exits(1) via exitFn and never spawns OpenCode when proxy.listen() rejects — a free :9200 is a control port the unprivileged agent could take', async () => {
+      // #given — a fake proxy whose listen() always rejects (simulates a :9200 bind failure)
       const callLog: string[] = []
+      const exitLog: string[] = []
       const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
       const fakeEnv: NodeJS.ProcessEnv = {}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+      const fakeExitFn = makeFakeExitFn(exitLog)
 
       const proxyListeningRef: ProxyListeningRef = {listening: false}
 
@@ -375,33 +377,44 @@ describe('startWorkspaceAgent', () => {
         }
       })
 
-      // #when
-      await startWorkspaceAgent({
-        env: fakeEnv,
-        serveFn: fakeServeFn,
-        runSupervisedOpencodeFn: fakeSupervisorFn,
-        createOpencodeProxyFn: fakeProxyFactory,
-        readSecretFn: (_name: string) => 'fake-token',
-      })
-      // main.ts now AWAITS proxy.listen() (including its .catch()) directly, so this has
-      // already settled by the time startWorkspaceAgent resolves.
+      // #when / #then — a failed :9200 bind is fatal, exactly like a failed :9100 bind: exitFn(1)
+      // and runSupervisedOpencode (which would spawn OpenCode as uid 10001) is never called. A
+      // free :9200 left standing would let the unprivileged agent bind it and receive the
+      // gateway's bearer token instead of the real proxy.
+      await expect(
+        startWorkspaceAgent({
+          env: fakeEnv,
+          serveFn: fakeServeFn,
+          runSupervisedOpencodeFn: fakeSupervisorFn,
+          createOpencodeProxyFn: fakeProxyFactory,
+          readSecretFn: (_name: string) => 'fake-token',
+          exitFn: fakeExitFn,
+        }),
+      ).rejects.toThrow('exitFn(1)')
 
-      // #then — listen() rejected, so proxyListeningRef.listening must remain false
-      // (the .catch() handler in main.ts sets it to false explicitly)
+      expect(exitLog).toEqual(['exit(1)'])
       expect(proxyListeningRef.listening).toBe(false)
+      expect(callLog).not.toContain('runSupervisedOpencode')
     })
   })
 
   describe('proxy server close/error event wiring', () => {
-    it('sets proxyListeningRef.listening = false when the proxy server emits "close"', async () => {
-      // #given — a fake proxy that exposes the real server so we can fire events
+    // NOTE: listen() intentionally resolves (does NOT bind a real port — it's a fake) so
+    // proxyBindSucceeded flips true in main.ts, matching a successful :9200 bind in production.
+    // That's the precondition for the runtime-loss fatal-exit path below: only a 'close'/'error'
+    // AFTER a successful bind is a runtime problem, not an initial bind failure (handled
+    // separately and already fatal via its own exitFn(1) in the 'proxy listen rejection wiring'
+    // tests above).
+    it('exits(1) via exitFn when the proxy server emits "close" after a successful startup — a released :9200 is a port the unprivileged agent could take next', async () => {
+      // #given — a fake proxy that exposes the real server so we can fire events post-startup
       const callLog: string[] = []
+      const exitLog: string[] = []
       const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
       const fakeEnv: NodeJS.ProcessEnv = {}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+      const fakeExitFn = makeFakeExitFn(exitLog)
 
-      // Capture the server so we can emit events on it after startup
       let capturedServer: http.Server | undefined
       const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
         const server = new http.Server()
@@ -413,35 +426,40 @@ describe('startWorkspaceAgent', () => {
         }
       })
 
-      // #when — start the agent (wires the 'close' listener on proxy.server)
+      // #when — start the agent (this resolves the initial :9200 listen, wiring the 'close'
+      // listener and flipping proxyBindSucceeded = true in main.ts)
       await startWorkspaceAgent({
         env: fakeEnv,
         serveFn: fakeServeFn,
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        exitFn: fakeExitFn,
       })
-      // Flush microtasks so proxy.listen().then() has run and set listening = true
-      await Promise.resolve()
-      await Promise.resolve()
 
-      // #then — the 'close' event listener must have been registered by main.ts
       expect(capturedServer).toBeDefined()
       const server = capturedServer as http.Server
       expect(server.listenerCount('close')).toBeGreaterThan(0)
+      expect(exitLog).toEqual([]) // not yet — only the runtime 'close' below should trigger it
 
-      // Emit 'close' — main.ts's handler sets proxyListeningRef.listening = false.
-      // We verify the handler runs without error (no throw = handler is wired correctly).
-      server.emit('close')
+      // #when — simulate the OS releasing :9200 at runtime, well after startup, while OpenCode
+      // is (notionally) already running
+      expect(() => server.emit('close')).toThrow('exitFn(1)')
+
+      // #then — fatal: log + exit(1), so compose restarts the container and re-binds :9200
+      // before OpenCode is spawned again
+      expect(exitLog).toEqual(['exit(1)'])
     })
 
-    it('sets proxyListeningRef.listening = false when the proxy server emits "error"', async () => {
+    it('exits(1) via exitFn when the proxy server emits "error" after a successful startup', async () => {
       // #given — same setup as the 'close' test
       const callLog: string[] = []
+      const exitLog: string[] = []
       const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
       const fakeEnv: NodeJS.ProcessEnv = {}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+      const fakeExitFn = makeFakeExitFn(exitLog)
 
       let capturedServer: http.Server | undefined
       const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
@@ -461,22 +479,83 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        exitFn: fakeExitFn,
       })
-      await Promise.resolve()
-      await Promise.resolve()
 
-      // #then — the 'error' event listener must have been registered by main.ts
       expect(capturedServer).toBeDefined()
       const server = capturedServer as http.Server
+      expect(server.listenerCount('error')).toBeGreaterThan(0)
 
-      // main.ts wires an 'error' handler that sets proxyListeningRef.listening = false.
-      // We add a second listener to prevent Node from throwing an unhandled error event
-      // when we emit below. The count > 1 proves main.ts's handler was registered.
+      // #when — add a second listener so Node doesn't treat this as an unhandled 'error' event
+      // (which would throw synchronously for an UNRELATED reason before main.ts's handler runs)
       server.on('error', () => {})
-      expect(server.listenerCount('error')).toBeGreaterThan(1)
 
-      // Emit 'error' — main.ts's handler runs without throwing
-      server.emit('error', new Error('EADDRINUSE'))
+      // #then — main.ts's handler still fires exitFn(1)
+      expect(() => server.emit('error', new Error('EADDRINUSE'))).toThrow('exitFn(1)')
+      expect(exitLog).toEqual(['exit(1)'])
+    })
+
+    it('does NOT call exitFn for the "close" that our own proxy.close() triggers during graceful shutdown (SIGTERM)', async () => {
+      // #given — proves the shuttingDown guard: a close caused by our own proxy.close() inside
+      // shutdown() must not be treated as an unexpected runtime port loss. shutdown() sets
+      // `shuttingDown = true` BEFORE it ever calls proxy.close(), so the runtime-loss handler's
+      // `!shuttingDown` check must be false for that close.
+      process.removeAllListeners('SIGTERM')
+
+      const callLog: string[] = []
+      const exitLog: string[] = []
+      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {}
+      // makeControllableServeFn (not makeFakeServeFn): makeFakeServeFn fires the listening
+      // callback SYNCHRONOUSLY from inside serveFn, before the `boundServer = serveFn(...)`
+      // assignment in main.ts completes — harmless for tests that never reach shutdown(), but
+      // this test does, and shutdown()'s `server.close()` needs the real resolved server.
+      const {serveFn: fakeServeFn, fireListening} = makeControllableServeFn(callLog)
+      const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+      const fakeExitFn = makeFakeExitFn(exitLog)
+
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+        const server = new http.Server()
+        return {
+          server,
+          listen: async (_port: number, _hostname: string): Promise<void> => {},
+          // Mirrors production: closing the real net.Server emits 'close' on itself.
+          close: async (): Promise<void> => {
+            server.emit('close')
+          },
+        }
+      })
+
+      // shutdown() eventually calls process.exit(0)/(1) directly (not exitFn) once drain
+      // completes — stub it out so the test process doesn't actually exit.
+      const processExitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+
+      const startupPromise = startWorkspaceAgent({
+        env: fakeEnv,
+        serveFn: fakeServeFn,
+        runSupervisedOpencodeFn: fakeSupervisorFn,
+        createOpencodeProxyFn: fakeProxyFactory,
+        readSecretFn: (_name: string) => 'fake-token',
+        exitFn: fakeExitFn,
+      })
+      fireListening()
+      await startupPromise
+
+      expect(process.listenerCount('SIGTERM')).toBe(1)
+
+      // #when — trigger the real graceful-shutdown path
+      process.emit('SIGTERM')
+
+      // Flush the async cleanup chain: asyncCleanupAllAskpassDirs().finally(cleanupProxy).finally(...)
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
+
+      // #then — the runtime-loss exitFn must NOT have fired for our own deliberate close
+      expect(exitLog).toEqual([])
+
+      processExitSpy.mockRestore()
+      process.removeAllListeners('SIGTERM')
     })
   })
 
