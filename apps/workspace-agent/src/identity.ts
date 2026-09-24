@@ -54,6 +54,25 @@ export const AGENT_TMPDIR = `${AGENT_XDG_CACHE_HOME}/tmp`
 export const SERVICE_HOME = '/var/lib/workspace-agent/home'
 
 /**
+ * Name of the workspace-agent's own root-owned state directory, directly under the repos root
+ * (e.g. `/workspace/repos/.workspace-agent`). Created by the entrypoint
+ * (`deploy/scripts/ensure-protected-dir.mjs`) as `0:0` `0700` before the service becomes
+ * reachable — never agent-writable, never agent-traversable. Shared by name with
+ * `deploy/scripts/migrate-repo-ownership.mjs` (`STATE_DIR_NAME`); kept here too so clone.ts's
+ * staging path and the deploy image's directory never drift apart.
+ */
+export const WORKSPACE_STATE_DIR_NAME = '.workspace-agent'
+
+/**
+ * Name of the clone-staging subdirectory under the state dir
+ * (`/workspace/repos/.workspace-agent/staging`). A fresh clone lands here first — still
+ * root-owned, on the same volume as the final destination so the publishing `rename` is atomic
+ * — and is handed to AGENT_UID/AGENT_GID only after HEAD is resolved and validated, never
+ * before. clone.ts creates it (mode `0700`) beneath the state dir if missing.
+ */
+export const CLONE_STAGING_DIR_NAME = 'staging'
+
+/**
  * Absolute path to the baked OpenCode executable inside the workspace image.
  * deploy/workspace.Dockerfile installs the release tarball via
  * `tar -xz -C /usr/local/bin -f "/tmp/${oc_asset}.tar.gz"`, so the binary always lands at

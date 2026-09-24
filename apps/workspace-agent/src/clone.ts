@@ -13,12 +13,27 @@
  * 7. -c credential.helper= disables any operator-side credential helper.
  * 8. Stderr is scrubbed of x-access-token patterns before logging or returning.
  * 9. Token is never logged, never in error responses, never persisted.
- * 10. Clone is atomic: written to a temp dir, renamed to dest on success; partial clones never reach destPath.
+ * 10. Clone is atomic: staged in a private, root-owned staging directory
+ *     (`<reposRoot>/.workspace-agent/staging/`, see identity.ts), renamed to dest on success; partial
+ *     clones never reach destPath.
  * 11. GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_NOSYSTEM=1 seal off global/system git config for the clone
  *     (and the post-clone local rev-parse) subprocess — a fresh clone has no repo config yet, so those are
  *     the only places a `url.<x>.insteadOf` redirect could come from and hijack the credentialed request.
+ * 12. Staging, not the destination: a fresh clone is written under the ROOT-OWNED staging directory,
+ *     never directly under `<reposRoot>/<owner>/`, which the agent identity can traverse. HEAD is
+ *     resolved and validated there, before handoff — the service never runs git in an agent-owned tree
+ *     for a fresh clone.
+ * 13. Ownership handoff (handoff.ts) is filesystem calls only — `lstat`/`lchown`, never `git`, never
+ *     following a symlink, never crossing a filesystem boundary, and fails the clone outright on a
+ *     hardlinked file (a fresh HTTPS clone should never contain one) rather than guessing.
+ * 14. Once staging is handed to AGENT_UID/AGENT_GID and renamed into place, any git invocation against
+ *     an EXISTING checkout at that path (the `repo-exists` idempotency check, and the post-rename race
+ *     check) runs as AGENT_UID/AGENT_GID with the same neutralized, credential-free invocation shape
+ *     inspect.ts uses (git-safety.ts) — never as the root-owned service.
  */
 
+import type {HandoffOps} from './handoff.js'
+import type {GitRunnerFn} from './inspect.js'
 import type {CloneFailure, CloneRequest, CloneSuccess} from './types.js'
 import {execFile as execFileCb} from 'node:child_process'
 import {rmSync} from 'node:fs'
@@ -27,6 +42,11 @@ import os from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
 import {promisify} from 'node:util'
+
+import {buildNeutralGitEnv, gitInvocation} from './git-safety.js'
+import {handOffToAgent} from './handoff.js'
+import {AGENT_GID, AGENT_UID, CLONE_STAGING_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {runGit} from './inspect.js'
 
 const execFile = promisify(execFileCb)
 
@@ -41,6 +61,23 @@ export const MAX_CONCURRENT_CLONES = 5
 
 /** Maximum queued clone requests before rejecting with 503. */
 export const MAX_CLONE_QUEUE_DEPTH = 50
+
+/**
+ * Deadline for the post-clone ownership-handoff walk (handoff.ts), in milliseconds. Generous
+ * enough for a very large repo's worth of filesystem entries, but bounded so a pathological tree
+ * can never hold the per-repo lock — and the global clone semaphore slot — open indefinitely.
+ * Exceeding it maps to the existing `clone-timeout` error code (504), the same code an aborted
+ * `git clone` itself already reports.
+ */
+export const HANDOFF_DEADLINE_MS = 30_000
+
+/**
+ * Entry cap for the post-clone ownership-handoff walk. A fresh HTTPS clone of even a very large
+ * monorepo lands well under this. Exceeding it is treated as the same resource-exhaustion failure
+ * mode `too-many-files` already reports for an EMFILE from git itself, rather than inventing a
+ * new error code for what is, from the caller's perspective, the same kind of failure.
+ */
+export const MAX_HANDOFF_ENTRIES = 500_000
 
 /** Regex to scrub x-access-token credentials from git stderr/stdout. */
 const TOKEN_URL_RE = /x-access-token:[^@]+@/g
@@ -67,6 +104,10 @@ export interface CloneOptions {
   readonly maxConcurrent?: number
   /** Maximum queued requests. Default: MAX_CLONE_QUEUE_DEPTH. */
   readonly maxQueueDepth?: number
+  /** Ownership-handoff walk deadline. Default: HANDOFF_DEADLINE_MS. */
+  readonly handoffDeadlineMs?: number
+  /** Ownership-handoff walk entry cap. Default: MAX_HANDOFF_ENTRIES. */
+  readonly handoffMaxEntries?: number
 }
 
 export interface CloneHandlerDeps {
@@ -78,6 +119,14 @@ export interface CloneHandlerDeps {
   readonly options?: CloneOptions
   /** Injected mkdtemp for testability. */
   readonly mkdtempFn?: (prefix: string) => Promise<string>
+  /**
+   * Injected git runner for the `repo-exists` and post-rename race-check validation against an
+   * EXISTING checkout, run as AGENT_UID/AGENT_GID. Defaults to the confirmed-termination `runGit`
+   * (inspect.ts) — the same runner `/inspect` uses.
+   */
+  readonly gitRunner?: GitRunnerFn
+  /** Injected filesystem operations for the ownership-handoff walk (handoff.ts). Defaults to real node:fs/promises. */
+  readonly handoffOps?: HandoffOps
 }
 
 export interface CloneHandlerResult {
@@ -205,14 +254,19 @@ async function withCloneSemaphore<T>(
  * 2. Acquires per-repo lock (serializes concurrent requests for same repo).
  * 3. Derives the destination path internally.
  * 4. Creates the repos root if missing.
- * 5. Checks for existing clone (returns 409 repo-exists).
- * 6. Clones into a temp dir (atomic: rename on success, rm on failure).
+ * 5. Checks for an existing checkout at the destination (returns 409 repo-exists), validated as
+ *    AGENT_UID/AGENT_GID (isUsableGitCheckout).
+ * 6. Clones into a unique directory under the root-owned staging parent (mkdtemp), never beside
+ *    the destination and never under the agent-traversable owner dir.
  * 7. Writes a GIT_ASKPASS helper script via mkdtemp + O_EXCL open.
  *    Token is passed via GITHUB_TOKEN env var — NOT embedded in script body.
  * 8. Invokes git clone via execFile with AbortController timeout.
- * 9. Reads HEAD SHA (failure → clone-failed, not ok:true with 'unknown').
- * 10. Verifies the cloned path is still within the repos root (symlink defense).
- * 11. Cleans up the askpass temp dir in finally.
+ * 9. Reads HEAD SHA from staging, BEFORE handoff (failure → clone-failed, not ok:true with
+ *    'unknown').
+ * 10. Hands the staged tree to AGENT_UID/AGENT_GID via filesystem calls only (handoff.ts).
+ * 11. Renames staging → destination (atomic: rename on success, rm on failure).
+ * 12. Verifies the cloned path is still within the repos root (symlink defense).
+ * 13. Cleans up the askpass temp dir, and any not-yet-renamed staging dir, in finally.
  */
 export async function executeClone(request: CloneRequest, deps: CloneHandlerDeps = {}): Promise<CloneHandlerResult> {
   const {
@@ -220,11 +274,15 @@ export async function executeClone(request: CloneRequest, deps: CloneHandlerDeps
     reposRoot = WORKSPACE_REPOS_ROOT,
     options = {},
     mkdtempFn = async (prefix: string) => mkdtemp(prefix),
+    gitRunner = runGit,
+    handoffOps,
   } = deps
   const {
     timeoutMs = DEFAULT_CLONE_TIMEOUT_MS,
     maxConcurrent = MAX_CONCURRENT_CLONES,
     maxQueueDepth = MAX_CLONE_QUEUE_DEPTH,
+    handoffDeadlineMs = HANDOFF_DEADLINE_MS,
+    handoffMaxEntries = MAX_HANDOFF_ENTRIES,
   } = options
 
   const {owner, repo, token} = request
@@ -232,7 +290,11 @@ export async function executeClone(request: CloneRequest, deps: CloneHandlerDeps
   // Global concurrency semaphore.
   const semaphoreResult = await withCloneSemaphore(maxConcurrent, maxQueueDepth, async () =>
     withRepoLock(`${owner}/${repo}`, async () =>
-      executeCloneInner(owner, repo, token, reposRoot, timeoutMs, execFileFn, mkdtempFn),
+      executeCloneInner(owner, repo, token, reposRoot, timeoutMs, execFileFn, mkdtempFn, gitRunner, {
+        deadlineMs: handoffDeadlineMs,
+        maxEntries: handoffMaxEntries,
+        ops: handoffOps,
+      }),
     ),
   )
 
@@ -347,6 +409,38 @@ export function buildCloneGitEnv(
   return env
 }
 
+/**
+ * Validates that `canonicalPath` is a usable, non-bare git checkout with a resolvable HEAD
+ * commit — the same two-step check the `repo-exists` idempotency check and the post-rename
+ * race-check both need. Runs as AGENT_UID/AGENT_GID with the same neutralized, credential-free
+ * invocation shape inspect.ts uses (git-safety.ts) — never as the root-owned service, and never
+ * with `safe.directory` set to anything but this exact canonical path.
+ *
+ * Fails closed: a timeout, a confirmed-or-unconfirmed kill, a non-zero exit, or unexpected output
+ * from either step all report `false` — the caller must never treat any of those as repo-exists.
+ */
+async function isUsableGitCheckout(gitRunner: GitRunnerFn, canonicalPath: string, timeoutMs: number): Promise<boolean> {
+  const env = buildNeutralGitEnv()
+
+  const insideOutcome = await gitRunner(
+    gitInvocation(canonicalPath, canonicalPath, ['rev-parse', '--is-inside-work-tree']),
+    {cwd: canonicalPath, env, timeoutMs, uid: AGENT_UID, gid: AGENT_GID},
+  )
+  if (insideOutcome.kind !== 'ok' || insideOutcome.stdout.trim() !== 'true') return false
+
+  const headOutcome = await gitRunner(
+    gitInvocation(canonicalPath, canonicalPath, ['rev-parse', '--verify', 'HEAD^{commit}']),
+    {cwd: canonicalPath, env, timeoutMs, uid: AGENT_UID, gid: AGENT_GID},
+  )
+  return headOutcome.kind === 'ok' && headOutcome.stdout.trim().length > 0
+}
+
+interface HandoffLimits {
+  readonly deadlineMs: number
+  readonly maxEntries: number
+  readonly ops?: HandoffOps
+}
+
 async function executeCloneInner(
   owner: string,
   repo: string,
@@ -355,12 +449,17 @@ async function executeCloneInner(
   timeoutMs: number,
   execFileFn: ExecFileFn,
   mkdtempFn: (prefix: string) => Promise<string>,
+  gitRunner: GitRunnerFn,
+  handoffLimits: HandoffLimits,
 ): Promise<CloneHandlerResult> {
   const destPath = join(reposRoot, owner, repo)
   const cloneUrl = `https://github.com/${owner}/${repo}.git`
+  // Root-owned staging directory, created by the entrypoint (deploy/scripts/ensure-protected-dir.mjs)
+  // as 0:0 0700 — see identity.ts. On the same volume as destPath, so the publishing rename is atomic.
+  const stagingRoot = join(reposRoot, WORKSPACE_STATE_DIR_NAME, CLONE_STAGING_DIR_NAME)
 
   let askpassDir: string | null = null
-  let tmpClonePath: string | null = null
+  let stagingClonePath: string | null = null
 
   // AbortController for timeout.
   const controller = new AbortController()
@@ -369,9 +468,9 @@ async function executeCloneInner(
   try {
     // Ensure the owner dir exists.
     await mkdir(join(reposRoot, owner), {recursive: true, mode: 0o755})
-    // Idempotency: if the destination already exists, verify it is a usable git
-    // checkout before returning repo-exists. An empty or corrupt directory must
-    // not be treated as a successful prior clone — fail closed instead.
+    // Idempotency: if the destination already exists, verify it is a usable git checkout —
+    // as AGENT_UID/AGENT_GID (invariant #14) — before returning repo-exists. An empty or corrupt
+    // directory must not be treated as a successful prior clone — fail closed instead.
     try {
       const existingResolved = await realpath(destPath)
       // Symlink defense: verify the existing path is still within the repos root.
@@ -382,71 +481,26 @@ async function executeCloneInner(
           statusCode: 500,
         }
       }
-      // Verify it is a usable non-bare worktree with a resolvable HEAD commit.
-      // Two checks are required:
-      //   1. rev-parse --is-inside-work-tree must output exactly "true" — bare repos
-      //      and non-git directories both fail this check.
-      //   2. rev-parse --verify HEAD^{commit} must succeed — proves HEAD resolves to
-      //      a real commit object (not an empty/unborn branch).
-      // Use a minimal env (no GITHUB_TOKEN) for these local-only checks.
-      // Pass controller.signal so hung validation does not hold locks past timeout.
-      const localEnv: Record<string, string> = {
-        GIT_TRACE: '0',
-        GIT_TRACE_PACKET: '0',
-        GIT_TRACE_PERFORMANCE: '0',
-        GIT_CURL_VERBOSE: '0',
-        HOME: process.env.HOME ?? '/root',
-        PATH: process.env.PATH ?? '/usr/bin:/bin',
-      }
-      try {
-        const {stdout: insideWorkTree} = await execFileFn(
-          'git',
-          ['-C', existingResolved, 'rev-parse', '--is-inside-work-tree'],
-          {env: localEnv, signal: controller.signal},
-        )
-        if (insideWorkTree.trim() !== 'true') {
-          // Not inside a work tree (e.g. bare repo). Fail closed.
-          return {
-            response: {ok: false, error: 'head-resolution-failed'},
-            statusCode: 500,
-          }
-        }
-      } catch {
-        // rev-parse failed — directory exists but is not a valid git repo.
-        // Fail closed: do not return repo-exists for a non-git directory.
+      if (await isUsableGitCheckout(gitRunner, existingResolved, timeoutMs)) {
         return {
-          response: {ok: false, error: 'head-resolution-failed'},
-          statusCode: 500,
+          response: {ok: false, error: 'repo-exists'},
+          statusCode: 409,
         }
       }
-      try {
-        const {stdout: headCommit} = await execFileFn(
-          'git',
-          ['-C', existingResolved, 'rev-parse', '--verify', 'HEAD^{commit}'],
-          {env: localEnv, signal: controller.signal},
-        )
-        if (headCommit.trim().length === 0) {
-          // Empty output — unborn branch or corrupt checkout. Fail closed.
-          return {
-            response: {ok: false, error: 'head-resolution-failed'},
-            statusCode: 500,
-          }
-        }
-      } catch {
-        // HEAD^{commit} failed — unborn branch or corrupt checkout. Fail closed.
-        return {
-          response: {ok: false, error: 'head-resolution-failed'},
-          statusCode: 500,
-        }
-      }
-      // Valid non-bare worktree with resolvable HEAD confirmed — return repo-exists.
+      // Not a usable non-bare worktree with a resolvable HEAD — fail closed.
       return {
-        response: {ok: false, error: 'repo-exists'},
-        statusCode: 409,
+        response: {ok: false, error: 'head-resolution-failed'},
+        statusCode: 500,
       }
     } catch {
       // ENOENT — path does not exist, proceed with clone.
     }
+
+    // Ensure the staging directory exists beneath the (root-owned) state dir. mkdir recursive is
+    // a no-op when the entrypoint has already created it — this call exists so the service can
+    // still stage a clone on a machine where that hasn't happened yet (e.g. local/test runs).
+    await mkdir(stagingRoot, {recursive: true, mode: 0o700})
+
     // Create a unique private askpass directory (race-free, mode 0700).
     askpassDir = await mkdtempFn(join(os.tmpdir(), 'workspace-agent-askpass-'))
     activeAskpassDirs.add(askpassDir)
@@ -457,13 +511,13 @@ async function executeCloneInner(
     // body. See buildCloneGitEnv for why global/system config is disabled here.
     const spawnEnv = buildCloneGitEnv(token, askpassPath, process.env)
 
-    // Atomic clone: clone into a temp dir in the same parent (so rename is atomic).
-    const randomSuffix = Math.random().toString(36).slice(2, 10)
-    tmpClonePath = join(reposRoot, owner, `.tmp-${repo}-${randomSuffix}`)
+    // Stage the clone in a unique directory under the root-owned staging parent — never beside
+    // the destination, and never inside the agent-traversable owner dir (invariant #12).
+    stagingClonePath = await mkdtempFn(join(stagingRoot, 'clone-'))
 
     // Clone args — token NEVER appears here.
     // -c credential.helper= disables any operator-side credential helper.
-    const gitArgs = ['-c', 'credential.helper=', 'clone', cloneUrl, tmpClonePath]
+    const gitArgs = ['-c', 'credential.helper=', 'clone', cloneUrl, stagingClonePath]
 
     try {
       await execFileFn('git', gitArgs, {env: spawnEnv, signal: controller.signal})
@@ -504,10 +558,63 @@ async function executeCloneInner(
       }
     }
 
-    // Atomic rename: tmpClonePath → destPath.
+    // Validate HEAD BEFORE handoff (invariant #12) — the staged tree is still service(root)-owned
+    // at this point, so this is the only git invocation in this function that ever runs as root
+    // with a fresh clone. rev-parse is purely local; omit GITHUB_TOKEN from its env.
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    const {GITHUB_TOKEN: _GITHUB_TOKEN, ...localGitEnv} = spawnEnv
+    let commit: string
     try {
-      await rename(tmpClonePath, destPath)
-      tmpClonePath = null // Rename succeeded; don't rm in finally.
+      const {stdout} = await execFileFn('git', ['-C', stagingClonePath, 'rev-parse', 'HEAD'], {env: localGitEnv})
+      commit = stdout.trim()
+      if (commit.length === 0) {
+        return {
+          response: {ok: false, error: 'head-resolution-failed'},
+          statusCode: 500,
+        }
+      }
+    } catch {
+      return {
+        response: {ok: false, error: 'head-resolution-failed'},
+        statusCode: 500,
+      }
+    }
+
+    // Hand ownership to the unprivileged agent identity — filesystem calls only, never git
+    // (invariant #13). Only after this succeeds is the tree fit to publish or to run git against
+    // as AGENT_UID.
+    const handoffResult = await handOffToAgent(stagingClonePath, {
+      uid: AGENT_UID,
+      gid: AGENT_GID,
+      deadlineMs: handoffLimits.deadlineMs,
+      maxEntries: handoffLimits.maxEntries,
+      ops: handoffLimits.ops,
+    })
+    if (handoffResult.ok === false) {
+      if (handoffResult.reason === 'deadline-exceeded') {
+        return {
+          response: {ok: false, error: 'clone-timeout'},
+          statusCode: 504,
+        }
+      }
+      if (handoffResult.reason === 'too-many-entries') {
+        return {
+          response: {ok: false, error: 'too-many-files'},
+          statusCode: 500,
+        }
+      }
+      // hardlink | foreign-filesystem | unsupported-entry-type — none has a legitimate reason to
+      // appear in a fresh HTTPS clone; treat all three as a clone failure.
+      return {
+        response: {ok: false, error: 'clone-failed'},
+        statusCode: 500,
+      }
+    }
+
+    // Atomic rename: stagingClonePath → destPath. The tree is now AGENT_UID/AGENT_GID-owned.
+    try {
+      await rename(stagingClonePath, destPath)
+      stagingClonePath = null // Rename succeeded; don't rm in finally.
     } catch (error) {
       // Rename failure (e.g. cross-device link) → clone-failed.
       const raw = error instanceof Error ? error.message : String(error)
@@ -517,7 +624,9 @@ async function executeCloneInner(
       // git checkout. An empty or corrupt directory at destPath must not be treated as a
       // successful prior clone — fail closed instead.
       if (scrubbed.includes('ENOTEMPTY') || scrubbed.includes('EEXIST')) {
-        // Validate the race destination using the same logic as the initial existing-path check.
+        // Validate the race destination using the same logic as the initial existing-path check —
+        // as AGENT_UID/AGENT_GID (invariant #14): by the time a concurrent winner reaches this
+        // point its own handoff has already run, so the race destination is agent-owned.
         let raceResolved: string
         try {
           raceResolved = await realpath(destPath)
@@ -535,88 +644,19 @@ async function executeCloneInner(
             statusCode: 500,
           }
         }
-        // Verify it is a usable non-bare worktree with a resolvable HEAD commit.
-        // Same two-step check as the initial existing-path validation:
-        //   1. rev-parse --is-inside-work-tree must output exactly "true".
-        //   2. rev-parse --verify HEAD^{commit} must succeed.
-        // Pass controller.signal so hung validation does not hold locks past timeout.
-        const localEnv: Record<string, string> = {
-          GIT_TRACE: '0',
-          GIT_TRACE_PACKET: '0',
-          GIT_TRACE_PERFORMANCE: '0',
-          GIT_CURL_VERBOSE: '0',
-          HOME: process.env.HOME ?? '/root',
-          PATH: process.env.PATH ?? '/usr/bin:/bin',
-        }
-        try {
-          const {stdout: insideWorkTree} = await execFileFn(
-            'git',
-            ['-C', raceResolved, 'rev-parse', '--is-inside-work-tree'],
-            {env: localEnv, signal: controller.signal},
-          )
-          if (insideWorkTree.trim() !== 'true') {
-            // Not inside a work tree (e.g. bare repo). Fail closed.
-            return {
-              response: {ok: false, error: 'clone-failed'},
-              statusCode: 500,
-            }
-          }
-        } catch {
-          // rev-parse failed — directory exists but is not a valid git repo. Fail closed.
+        if (await isUsableGitCheckout(gitRunner, raceResolved, timeoutMs)) {
           return {
-            response: {ok: false, error: 'clone-failed'},
-            statusCode: 500,
+            response: {ok: false, error: 'repo-exists'},
+            statusCode: 409,
           }
         }
-        try {
-          const {stdout: raceHeadCommit} = await execFileFn(
-            'git',
-            ['-C', raceResolved, 'rev-parse', '--verify', 'HEAD^{commit}'],
-            {env: localEnv, signal: controller.signal},
-          )
-          if (raceHeadCommit.trim().length === 0) {
-            // Empty output — unborn branch or corrupt checkout. Fail closed.
-            return {
-              response: {ok: false, error: 'clone-failed'},
-              statusCode: 500,
-            }
-          }
-        } catch {
-          // HEAD^{commit} failed — unborn branch or corrupt checkout. Fail closed.
-          return {
-            response: {ok: false, error: 'clone-failed'},
-            statusCode: 500,
-          }
-        }
-        // Valid non-bare worktree with resolvable HEAD confirmed — return repo-exists.
         return {
-          response: {ok: false, error: 'repo-exists'},
-          statusCode: 409,
+          response: {ok: false, error: 'clone-failed'},
+          statusCode: 500,
         }
       }
       return {
         response: {ok: false, error: 'clone-failed'},
-        statusCode: 500,
-      }
-    }
-
-    // Read HEAD SHA — failure is a clone failure, not ok:true with 'unknown'.
-    // rev-parse is purely local; omit GITHUB_TOKEN from its env.
-    // eslint-disable-next-line @typescript-eslint/naming-convention
-    const {GITHUB_TOKEN: _GITHUB_TOKEN, ...localGitEnv} = spawnEnv
-    let commit: string
-    try {
-      const {stdout} = await execFileFn('git', ['-C', destPath, 'rev-parse', 'HEAD'], {env: localGitEnv})
-      commit = stdout.trim()
-      if (commit.length === 0) {
-        return {
-          response: {ok: false, error: 'head-resolution-failed'},
-          statusCode: 500,
-        }
-      }
-    } catch {
-      return {
-        response: {ok: false, error: 'head-resolution-failed'},
         statusCode: 500,
       }
     }
@@ -664,9 +704,10 @@ async function executeCloneInner(
   } finally {
     clearTimeout(timeoutHandle)
 
-    // Clean up partial temp clone if rename didn't happen.
-    if (tmpClonePath !== null) {
-      await rm(tmpClonePath, {recursive: true, force: true})
+    // Clean up partial staged clone if rename didn't happen (covers every failure path: clone
+    // failure, HEAD-resolution failure, handoff failure, timeout, and rename failure).
+    if (stagingClonePath !== null) {
+      await rm(stagingClonePath, {recursive: true, force: true})
     }
 
     // Always clean up the askpass temp dir.

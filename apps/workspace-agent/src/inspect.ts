@@ -35,9 +35,9 @@ import type {
 import {execFile} from 'node:child_process'
 import {realpath, stat} from 'node:fs/promises'
 import {join} from 'node:path'
-import process from 'node:process'
 
-import {AGENT_GID, AGENT_HOME, AGENT_UID} from './identity.js'
+import {buildNeutralGitEnv as buildInspectEnv, gitInvocation} from './git-safety.js'
+import {AGENT_GID, AGENT_UID} from './identity.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors clone.ts. */
 export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
@@ -155,87 +155,11 @@ export const runGit: GitRunnerFn = async (args, options) =>
     }, options.timeoutMs)
   })
 
-/**
- * Global git safety flags applied to EVERY inspection invocation.
- *
- * - `--no-optional-locks`: makes `git status` skip the opportunistic write of the refreshed
- *   stat-cache back to `.git/index`. This is the specific mechanism that keeps `status` read-only
- *   \u2014 without it, `git status` silently rewrites the index on disk even though it reports no
- *   changes were made.
- * - `--no-pager`: git never spawns `core.pager` for our non-interactive output.
- * - `-c core.fsmonitor=false`: neutralizes an agent-writable `.git/config` that could otherwise
- *   configure `core.fsmonitor` to execute an arbitrary command on every `status` call.
- * - `-c core.hooksPath=/dev/null`: points hook lookup at a location that can never contain
- *   executable hook scripts, defense-in-depth against a config-injected hooks path.
- * - `-c core.pager=cat`: defense-in-depth alongside `--no-pager` (config could otherwise re-enable
- *   paging for a subcommand that ignores the global flag).
- * - `-c credential.helper=`: disables any operator-side credential helper; inspection never needs
- *   credentials and must never be handed any.
- *
- * `filter.<name>.clean`/`.smudge`/`.process` drivers are NOT in this fixed list because the set of
- * configured names isn't fixed \u2014 they're enumerated and neutralized per call via env overrides;
- * see enumerateFilterDrivers()/buildFilterNeutralizationEnv() below.
- */
-const GIT_SAFETY_ARGS: readonly string[] = [
-  '--no-optional-locks',
-  '--no-pager',
-  '-c',
-  'core.fsmonitor=false',
-  '-c',
-  'core.hooksPath=/dev/null',
-  '-c',
-  'core.pager=cat',
-  '-c',
-  'credential.helper=',
-]
-
-/**
- * `-c safe.directory=` followed by `-c safe.directory=<canonicalPath>`: the FIRST entry resets
- * any `safe.directory` exceptions a repo's own (agent-writable) config might otherwise
- * contribute (confirmed against real git 2.55.0 that an empty `safe.directory` value clears
- * prior entries rather than adding one), and the SECOND grants exactly the canonical checkout
- * path, never `*` (which would trust every path) and never a parent path (which would also trust
- * sibling checkouts). Command-line `-c` config is honored for `safe.directory`; a repo's own
- * `.git/config` is NOT (confirmed against real git 2.55.0), which is exactly why this must be
- * passed as `-c` here rather than relying on anything committed inside the checkout. Required
- * once the checkout is owned by AGENT_UID and git also runs as AGENT_UID; kept unconditionally
- * (including for a same-uid caller) because the migration period can leave a checkout still
- * owned by the service uid while git already runs as AGENT_UID, or vice versa.
- */
-function safeDirectoryArgs(canonicalPath: string): readonly string[] {
-  return ['-c', 'safe.directory=', '-c', `safe.directory=${canonicalPath}`]
-}
-
-function gitInvocation(cwd: string, canonicalPath: string, subArgs: readonly string[]): readonly string[] {
-  return ['-C', cwd, ...GIT_SAFETY_ARGS, ...safeDirectoryArgs(canonicalPath), ...subArgs]
-}
-
-/**
- * Minimal git subprocess environment. Deliberately does NOT include GITHUB_TOKEN, proxy
- * variables, or any credential material - inspection is local-only and needs no network access.
- *
- * GIT_CONFIG_NOSYSTEM and GIT_CONFIG_GLOBAL=/dev/null disable the system and global config
- * levels entirely (HOME is fixed to AGENT_HOME rather than inherited from the calling process,
- * since the global config lookup git would otherwise perform there is disabled anyway, and this
- * process may still be the root-owned service during the migration period). This changes where
- * the filter-driver enumeration below reads from - down to local + worktree +
- * `include.path`/`includeIf` config reachable from those - which is intended: a global/system
- * config the agent doesn't own can no longer contribute a hostile filter driver or a
- * safe.directory exception at all.
- */
-function buildInspectEnv(): Record<string, string> {
-  return {
-    GIT_TERMINAL_PROMPT: '0',
-    GIT_TRACE: '0',
-    GIT_TRACE_PACKET: '0',
-    GIT_TRACE_PERFORMANCE: '0',
-    GIT_CURL_VERBOSE: '0',
-    GIT_CONFIG_NOSYSTEM: '1',
-    GIT_CONFIG_GLOBAL: '/dev/null',
-    HOME: AGENT_HOME,
-    PATH: process.env.PATH ?? '/usr/bin:/bin',
-  }
-}
+// GIT_SAFETY_ARGS, safeDirectoryArgs, gitInvocation, and buildInspectEnv (the neutralized
+// invocation shape for running git against an EXISTING checkout as AGENT_UID/AGENT_GID) now live
+// in git-safety.ts, shared with clone.ts's `repo-exists` and post-rename race-check validation —
+// see that module for the full rationale. Imported above under their original local names so
+// nothing else in this file, or inspect.test.ts, has to change.
 
 // ---------------------------------------------------------------------------
 // Filter-driver enumeration and neutralization — closes the vector where `git status` runs
