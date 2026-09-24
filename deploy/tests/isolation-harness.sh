@@ -174,11 +174,16 @@ CA_FILE="$(mktemp)"
 TMPFILES+=("$TOKEN_FILE" "$AUTH_FILE" "$CA_FILE")
 printf 'isolation-harness-dummy-bearer-token' >"$TOKEN_FILE"
 printf '{"anthropic":{"type":"api","key":"sk-isolation-harness-dummy"}}' >"$AUTH_FILE"
-# Not a real certificate — this phase only proves the mount is VISIBLE at its
-# new nested path (deploy/README.md's open question). CA *installation*
-# correctness (update-ca-certificates parsing a real PEM) is exercised by the
-# existing "Live egress containment smoke" step, not here.
-printf -- '-----BEGIN CERTIFICATE-----\nisolation-harness-dummy-ca\n-----END CERTIFICATE-----\n' >"$CA_FILE"
+# A real, throwaway self-signed CA. The entrypoint installs whatever is
+# mounted here into the system trust store, and a malformed PEM there can
+# break TLS for every client that loads the bundle — including the real
+# /clone to github.com in phase 4b. Nothing trusts this key for anything.
+CA_KEY_FILE="$(mktemp)"
+TMPFILES+=("$CA_KEY_FILE")
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj "/CN=isolation-harness-dummy-ca" \
+  -keyout "$CA_KEY_FILE" -out "$CA_FILE" >/dev/null 2>&1 \
+  || fail "setup: could not generate the throwaway CA certificate with openssl"
 
 MAIN_CID="$(docker run -d \
   "${WORKSPACE_SECURITY_ARGS[@]}" \
@@ -643,6 +648,16 @@ log "phase 4b: /clone hands new checkouts to the agent uid"
 
 CLONE_TOKEN="ghs_isolationHarnessDummyCloneToken1234567890"  # ghs_ + 40 chars, well past validateTokenShape's >=20 minimum
 clone_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"octocat\",\"repo\":\"Hello-World\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
+if ! echo "$clone_out" | grep -q '"ok":true'; then
+  # /clone reports only a coarse error code. Reproduce the network half with
+  # the same sealed git config, as root, so the log shows git's own reason.
+  echo "--- diagnostic: git ls-remote as root with sealed config ---" >&2
+  run_exec "$MAIN_CID" "0:0" sh -c 'GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/octocat/Hello-World.git HEAD 2>&1' >&2 || true
+  echo "--- diagnostic: staging and owner directories ---" >&2
+  run_exec "$MAIN_CID" "0:0" sh -c 'ls -la /workspace/repos /workspace/repos/.workspace-agent /workspace/repos/.workspace-agent/staging /workspace/repos/octocat 2>&1' >&2 || true
+  echo "--- diagnostic: workspace logs (tail) ---" >&2
+  docker logs --tail 40 "$MAIN_CID" >&2 2>&1 || true
+fi
 echo "$clone_out" | grep -q '"ok":true' || fail "clone: POST /clone octocat/Hello-World did not return ok:true — got: ${clone_out} (network-level failure? this container has no --network override, so it depends on the runner having outbound internet — see the block comment above before assuming a uid/ownership regression)"
 pass "POST /clone octocat/Hello-World succeeds over the harness's direct (unproxied) network path"
 
