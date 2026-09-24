@@ -329,6 +329,39 @@ SECRET_PID="$(run_exec "$MAIN_CID" "0:0" cat /tmp/isolation-harness-secret-holde
 must_succeed "root can read the dummy secret-holder's environ (setup sanity check)" "$MAIN_CID" "0:0" \
   sh -c "grep -q GITHUB_TOKEN /proc/${SECRET_PID}/environ"
 
+# ── Yama ptrace_scope and the /proc/<pid>/mem positive controls ────────────
+# Opening /proc/<pid>/mem is a PTRACE_MODE_ATTACH check (__ptrace_may_access()
+# with PTRACE_MODE_ATTACH), and with the Yama LSM's ptrace_scope >= 1
+# (restricted — the default on the GitHub Actions runner this harness runs
+# on), ATTACH is granted only to an ANCESTOR of the target process, or to a
+# caller holding CAP_SYS_PTRACE (which production's capability set, and this
+# harness's WORKSPACE_SECURITY_ARGS mirroring it, deliberately omits). The
+# `docker exec` root process used by must_succeed/must_fail is NOT an
+# ancestor of any process already running inside the container (the
+# secret-holder, or pid 1 itself) — it is a sibling spawned fresh by the
+# Docker engine. So on this kernel, root asserting "I can open THIS
+# pre-existing process's /proc/<pid>/mem" is FALSE for a reason that has
+# nothing to do with the uid boundary under test, which is exactly the bug a
+# prior revision of this harness hit (see the module comment history). The
+# fix: prove dd-can-open-/proc/<pid>/mem-AT-ALL under this kernel's Yama
+# policy using a target root DOES legitimately own as an ancestor — its own
+# child, spawned in the same shell. A descendant is always a valid ATTACH
+# target regardless of ptrace_scope (0 or 1). The uid-10001 control below
+# does the same against ITS OWN child, ruling out a mount or hidepid=...
+# artifact that would block 10001 from opening ANY /proc/*/mem file
+# (which would otherwise make the mem denials below pass for the wrong
+# reason). Neither control asserts access to the SECRET_PID or pid-1
+# targets the denials below test — see the ptrace_scope-conditioned logging
+# after each denial for what the denial result does and does not prove.
+# shellcheck disable=SC2016 # the $! / $p / $r are for the INNER sh -c script, not this outer bash line
+must_succeed "root can open a child process's /proc/<pid>/mem (Yama-compliant descendant target, setup sanity check)" \
+  "$MAIN_CID" "0:0" \
+  sh -c 'sleep 30 & p=$!; dd if=/proc/$p/mem of=/dev/null bs=1 count=0 2>&1; r=$?; kill "$p" 2>/dev/null; exit $r'
+# shellcheck disable=SC2016 # same as above — inner sh -c script, uid 10001's own child
+must_succeed "uid 10001 can open its own child process's /proc/<pid>/mem (rules out a mount/hidepid artifact, setup sanity check)" \
+  "$MAIN_CID" "$AGENT_USER" \
+  sh -c 'sleep 30 & p=$!; dd if=/proc/$p/mem of=/dev/null bs=1 count=0 2>&1; r=$?; kill "$p" 2>/dev/null; exit $r'
+
 # /proc/<pid>/mem probes use `dd ... count=0`, deliberately: dd still open()s
 # the file (where the kernel's ptrace_may_access() permission gate actually
 # lives, in proc_mem_open()) but issues ZERO read() calls. A real read() at
@@ -336,9 +369,23 @@ must_succeed "root can read the dummy secret-holder's environ (setup sanity chec
 # root — that unrelated I/O failure is not the property under test and would
 # make a positive control fail for the wrong reason. count=0 isolates exactly
 # the open()-time permission check.
+# NULs inside /proc/<pid>/environ are stripped to newlines INSIDE the exec'd
+# command, before the output ever reaches bash's own command substitution.
+# bash's $(...) can silently drop bytes once it hits a raw NUL (the source of
+# the "command substitution: ignored null byte in input" warning this
+# harness previously logged), which would make the `grep -qF "$DUMMY_TOKEN"`
+# below miss the token if it happened to land after a NUL boundary in the raw
+# environ blob — exactly in the scenario where the denial has ALREADY failed
+# and this check is the last line of defense. cat's raw (possibly NUL-laden)
+# output is redirected to a real file first — file redirection has no NUL
+# truncation issue, unlike command substitution — so cat's own exit status
+# ($st) survives intact; tr then reads that file and only the already-clean
+# text reaches docker exec's stdout, which is what bash's outer $(...) here
+# actually captures.
 secret_env_out=""
 set +e
-secret_env_out="$(run_exec "$MAIN_CID" "$AGENT_USER" cat "/proc/${SECRET_PID}/environ" 2>&1)"
+secret_env_out="$(run_exec "$MAIN_CID" "$AGENT_USER" sh -c \
+  "cat /proc/${SECRET_PID}/environ >/tmp/isolation-harness-environ-capture 2>&1; st=\$?; tr '\\0' '\\n' </tmp/isolation-harness-environ-capture; rm -f /tmp/isolation-harness-environ-capture; exit \$st")"
 secret_env_status=$?
 secret_mem_out="$(run_exec "$MAIN_CID" "$AGENT_USER" sh -c "dd if=/proc/${SECRET_PID}/mem of=/dev/null bs=1 count=0 2>&1")"
 secret_mem_status=$?
@@ -352,11 +399,22 @@ if printf '%s%s%s' "$secret_env_out" "$secret_mem_out" "$secret_fd_out" | grep -
   fail "denial: the dummy GITHUB_TOKEN leaked into environ/mem/fd output despite the operations failing"
 fi
 pass "uid 10001 cannot read environ/mem/fd of a root process holding a secret, and the secret never leaks into output"
+if [ "$ptrace_scope" = "0" ]; then
+  log "  mem denial mechanism at ptrace_scope=0: the uid/capability check alone (uid 10001 lacks CAP_SYS_PTRACE and does not match the secret-holder's uid) — Yama imposes no additional restriction at scope 0"
+else
+  log "  mem denial mechanism at ptrace_scope=${ptrace_scope}: BOTH the uid/capability check AND Yama's non-ancestor rule deny this to uid 10001. The mem denial alone does NOT isolate which one is doing the work here — see the environ denial just proven above (a PTRACE_MODE_READ check, which Yama never restricts), which proves the uid boundary independently of Yama"
+fi
 
 # ── workspace agent's own /proc/1/environ (holds WORKSPACE_OPENCODE_TOKEN_FILE
 # and, via config.ts's file-read path, is where a plain (non-_FILE) secret
 # value would land if ever passed that way) ─────────────────────────────────
-must_succeed "root can read its own /proc/1/environ (setup sanity check)" "$MAIN_CID" "0:0" cat /proc/1/environ
+# See the earlier NUL-stripping note (phase 2, secret-holder environ capture)
+# for why the raw environ is redirected to a file inside the container and
+# passed through tr before docker exec's stdout is captured, instead of
+# letting bash's own command substitution see raw NUL bytes directly.
+# shellcheck disable=SC2016 # the $? / $st are for the INNER sh -c script, not this outer bash line
+must_succeed "root can read its own /proc/1/environ (setup sanity check)" "$MAIN_CID" "0:0" \
+  sh -c 'cat /proc/1/environ >/tmp/isolation-harness-pid1-environ-capture 2>&1; st=$?; tr "\0" "\n" </tmp/isolation-harness-pid1-environ-capture; rm -f /tmp/isolation-harness-pid1-environ-capture; exit $st'
 must_fail "cannot read the workspace agent's own /proc/1/environ" "$MAIN_CID" "$AGENT_USER" cat /proc/1/environ
 pass "uid 10001 cannot read the workspace agent service's own /proc/1/environ"
 
@@ -375,11 +433,22 @@ pass "uid 10001 cannot read the workspace agent service's own /proc/1/environ"
 # against the dummy secret-holder (secret_mem_status); this block repeats it
 # explicitly against the workspace agent's own pid so ptrace/process_vm_readv
 # denial is proven against BOTH a synthetic target and the real supervisor.
-must_succeed "root can open its own /proc/1/mem (setup sanity check)" "$MAIN_CID" "0:0" \
-  sh -c 'dd if=/proc/1/mem of=/dev/null bs=1 count=0 2>&1'
+#
+# There is deliberately NO "root opens /proc/1/mem" positive control here: a
+# docker-exec root process is not an ancestor of pid 1 either, so under Yama
+# ptrace_scope >= 1 that assertion is FALSE on this runner's kernel — the
+# exact bug a prior revision of this harness hit. The child-based root and
+# uid-10001 positive controls earlier in phase 2 already established that dd
+# can open /proc/<pid>/mem at all under this kernel's Yama policy, against
+# targets each caller legitimately owns as an ancestor.
 must_fail "ptrace/process_vm_readv-equivalent access to the service's own memory" "$MAIN_CID" "$AGENT_USER" \
   sh -c 'dd if=/proc/1/mem of=/dev/null bs=1 count=0 2>&1'
-pass "uid 10001 cannot open /proc/1/mem for read (same kernel gate as ptrace(PTRACE_ATTACH)/process_vm_readv against the service)"
+if [ "$ptrace_scope" = "0" ]; then
+  log "  pid-1 mem denial mechanism at ptrace_scope=0: the uid/capability check alone (uid 10001 lacks CAP_SYS_PTRACE and does not match pid 1's uid)"
+else
+  log "  pid-1 mem denial mechanism at ptrace_scope=${ptrace_scope}: BOTH Yama's non-ancestor rule (a docker-exec root process is not pid 1's ancestor either) AND the uid/capability check deny this to uid 10001 — this denial alone does NOT isolate the uid boundary at scope >= 1; the /proc/1/environ denial proven above (PTRACE_MODE_READ, unaffected by Yama) proves that independently"
+fi
+pass "uid 10001 cannot open /proc/1/mem for read (same kernel gate as ptrace(PTRACE_ATTACH)/process_vm_readv against the service; the environ denial above is the Yama-independent proof of the uid boundary)"
 
 # ── cannot replace the checkout directory itself (root-owned 0755 parent) ──
 run_exec "$MAIN_CID" "0:0" sh -c \
@@ -509,8 +578,13 @@ esac
 # the read fails outright, the token is a fortiori not exposed via this
 # channel (an even stronger result than "present but not visible"); if it
 # succeeds, its content must not contain the token.
+# Same NUL-safety technique as the earlier environ captures: redirect the
+# raw (possibly NUL-laden) bytes to a file inside the container first so
+# cat's own exit status survives a failed read, then only the already-clean
+# (NUL-stripped) text reaches this script's command substitution.
 set +e
-oc_environ_raw="$(run_exec "$MAIN_CID" "0:0" cat "/proc/${OC_PID}/environ" 2>&1)"
+oc_environ_raw="$(run_exec "$MAIN_CID" "0:0" \
+  sh -c "cat /proc/${OC_PID}/environ >/tmp/isolation-harness-oc-environ-capture 2>&1; st=\$?; tr '\\0' '\\n' </tmp/isolation-harness-oc-environ-capture; rm -f /tmp/isolation-harness-oc-environ-capture; exit \$st")"
 oc_environ_status=$?
 set -e
 if [ "$oc_environ_status" -eq 0 ]; then

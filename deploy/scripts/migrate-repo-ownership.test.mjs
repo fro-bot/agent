@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {mkdtemp, mkdir, writeFile, readFile, symlink, link, lstat, rm, readdir, utimes} from 'node:fs/promises'
+import {mkdtemp, mkdir, writeFile, readFile, symlink, link, lstat, open, rm, readdir, utimes} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
@@ -137,18 +137,31 @@ test('a hardlink shared with a file outside the tree is broken before chown (pri
     assert.equal(result.ok, true)
     assert.ok(result.stats.hardlinksBroken >= 1, 'the hardlink must be recorded as broken')
 
-    const afterInside = await lstat(insidePath)
-    const afterOutside = await lstat(outsidePath)
-    assert.notEqual(afterInside.ino, afterOutside.ino, 'inside path must now be a distinct, private inode')
-    assert.equal(afterInside.nlink, 1, 'inside path must be its own inode with nlink=1')
-    assert.equal(afterOutside.nlink, 1, 'outside path must have been left as its own now-unshared inode')
+    // Open insidePath once and take both the stat and the content from the
+    // same FileHandle (fstat under the hood) — a separate lstat() followed by
+    // a separate readFile() on the same path is a TOCTOU race (CodeQL
+    // js/file-system-race): the path could be replaced between the two calls.
+    // insidePath is a real regular file (not a symlink) here, so fstat via an
+    // open FileHandle reports exactly what lstat would have reported on the
+    // same path (no symlink-following semantics differ for a regular file).
+    const insideHandle = await open(insidePath, 'r')
+    let content
+    try {
+      const afterInside = await insideHandle.stat()
+      const afterOutside = await lstat(outsidePath)
+      assert.notEqual(afterInside.ino, afterOutside.ino, 'inside path must now be a distinct, private inode')
+      assert.equal(afterInside.nlink, 1, 'inside path must be its own inode with nlink=1')
+      assert.equal(afterOutside.nlink, 1, 'outside path must have been left as its own now-unshared inode')
 
-    const outsideChown = calls.lchown.find(c => c.path === outsidePath)
-    assert.equal(outsideChown, undefined, 'the outside path must never be chowned')
-    const insideChown = calls.lchown.find(c => c.path === insidePath)
-    assert.ok(insideChown, 'the inside path must be chowned after the hardlink is broken')
+      const outsideChown = calls.lchown.find(c => c.path === outsidePath)
+      assert.equal(outsideChown, undefined, 'the outside path must never be chowned')
+      const insideChown = calls.lchown.find(c => c.path === insidePath)
+      assert.ok(insideChown, 'the inside path must be chowned after the hardlink is broken')
 
-    const content = await readFile(insidePath, 'utf8')
+      content = await insideHandle.readFile('utf8')
+    } finally {
+      await insideHandle.close()
+    }
     assert.equal(content, 'shared bytes\n', 'file content must be preserved across the hardlink break')
   } finally {
     await rm(root, {recursive: true, force: true})

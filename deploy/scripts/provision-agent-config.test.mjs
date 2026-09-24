@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {mkdtemp, writeFile, readFile, rm, stat} from 'node:fs/promises'
+import {mkdtemp, writeFile, readFile, rm, stat, open} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
@@ -36,9 +36,19 @@ test('writes auth.json with 0600 when a valid auth blob is provided', async () =
 
     assert.equal(result.ok, true)
     assert.equal(result.authProvisioned, true)
-    const st = await stat(authDestPath)
-    assert.equal(st.mode & 0o777, 0o600)
-    const written = await readFile(authDestPath, 'utf8')
+    // Open authDestPath once and take both the mode and the content from the
+    // same FileHandle (fstat under the hood) — a separate stat() followed by
+    // a separate readFile() on the same path is a TOCTOU race (CodeQL
+    // js/file-system-race): the path could be replaced between the two calls.
+    const authHandle = await open(authDestPath, 'r')
+    let written
+    try {
+      const st = await authHandle.stat()
+      assert.equal(st.mode & 0o777, 0o600)
+      written = await authHandle.readFile('utf8')
+    } finally {
+      await authHandle.close()
+    }
     assert.equal(written, authRaw)
   } finally {
     await rm(root, {recursive: true, force: true})
