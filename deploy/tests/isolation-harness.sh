@@ -58,6 +58,7 @@ WORKSPACE_SECURITY_ARGS=(
 CONTAINERS=()
 VOLUMES=()
 TMPFILES=()
+TMPDIRS=()
 PROPERTY_COUNT=0
 
 cleanup() {
@@ -71,6 +72,9 @@ cleanup() {
   done
   for f in "${TMPFILES[@]:-}"; do
     [ -n "$f" ] && rm -f "$f"
+  done
+  for d in "${TMPDIRS[@]:-}"; do
+    [ -n "$d" ] && rm -rf "$d"
   done
   if [ "$rc" -eq 0 ]; then
     echo "[isolation-harness] all ${PROPERTY_COUNT} properties verified — cleanup complete"
@@ -519,6 +523,265 @@ else
   log "root could not open /proc/${OC_PID}/environ at all (status=${oc_environ_status}: ${oc_environ_raw}) — expected, since the production capability set omits CAP_SYS_PTRACE and ptrace_may_access() requires it for cross-uid access. This is a STRONGER result than the token merely being absent from readable content."
   pass ":9200 bearer proxy reaches OpenCode; OpenCode's own /proc/<pid>/environ is not even readable cross-uid by root (missing CAP_SYS_PTRACE), so the bearer token cannot be exposed via that channel"
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4b: /clone hands new checkouts to the agent uid (real /clone, real repo)
+#
+# DEPENDS ON A CONTRACT NOT YET IMPLEMENTED as of this harness revision:
+# clone.ts still clones as the service (root), with no post-clone chown (see
+# this harness's earlier report). A separate lane is implementing the
+# contract below in apps/workspace-agent/src/clone.ts concurrently; these
+# assertions will FAIL on CI until that lands. That is expected, not a
+# harness bug — see the report's confidence notes.
+#
+# Repo choice: octocat/Hello-World — GitHub's own canonical demo repository,
+# used in GitHub's own API/CLI documentation for over a decade, a few commits
+# and a README only (seconds to clone), and about as unlikely to be deleted
+# or renamed as a GitHub-hosted repo can be.
+#
+# Network path: this container was started via plain `docker run` (no
+# --network flag), so it is on Docker's default bridge network, which NATs
+# out to the internet on a GitHub Actions runner exactly like every other
+# `docker run` in this harness and in ci.yaml's workspace-smoke job — none of
+# them attach to compose's internal-only sandbox-net or route through
+# mitmproxy. No proxy env is set on this container (see phase 0), so the
+# clone request goes DIRECT to github.com, the same as the rest of this
+# harness. If a future CI runner's default network has no egress, this whole
+# block will fail with a network-level clone-failed error, not a uid/ownership
+# error — that distinction is worth checking first if this ever goes red.
+#
+# Token: server-side shape validation (sanitizeOwner/sanitizeRepo/
+# validateTokenShape in sanitize.ts) requires `ghs_` + at least 16 more chars
+# — checked BEFORE any git subprocess runs, so a syntactically well-formed
+# but fake token clears that gate. octocat/Hello-World is public, so git
+# should not even need to present it to GitHub to succeed.
+# ─────────────────────────────────────────────────────────────────────────────
+log "phase 4b: /clone hands new checkouts to the agent uid"
+
+CLONE_TOKEN="ghs_isolationHarnessDummyCloneToken1234567890"  # ghs_ + 40 chars, well past validateTokenShape's >=20 minimum
+clone_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"octocat\",\"repo\":\"Hello-World\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
+echo "$clone_out" | grep -q '"ok":true' || fail "clone: POST /clone octocat/Hello-World did not return ok:true — got: ${clone_out} (network-level failure? this container has no --network override, so it depends on the runner having outbound internet — see the block comment above before assuming a uid/ownership regression)"
+pass "POST /clone octocat/Hello-World succeeds over the harness's direct (unproxied) network path"
+
+clone_root_owner="$(run_exec "$MAIN_CID" "0:0" stat -c '%u:%g:%a' /workspace/repos)"
+[ "$clone_root_owner" = "0:0:755" ] || fail "clone: /workspace/repos is ${clone_root_owner}, expected 0:0:755"
+clone_owner_dir_owner="$(run_exec "$MAIN_CID" "0:0" stat -c '%u:%g:%a' /workspace/repos/octocat)"
+[ "$clone_owner_dir_owner" = "0:0:755" ] || fail "clone: /workspace/repos/octocat is ${clone_owner_dir_owner}, expected 0:0:755"
+clone_non_agent_owned="$(run_exec "$MAIN_CID" "0:0" find /workspace/repos/octocat/Hello-World -not -user 10001 2>&1 || true)"
+[ -z "$clone_non_agent_owned" ] || fail "clone: file(s) inside the new checkout not owned by uid 10001: ${clone_non_agent_owned}"
+pass "clone: /workspace/repos and /workspace/repos/octocat stay 0:0 0755; the new checkout is entirely 10001-owned"
+
+clone_staging_listing="$(run_exec "$MAIN_CID" "0:0" sh -c 'find /workspace/repos/.workspace-agent/staging -mindepth 1 2>&1 || true')"
+[ -z "$clone_staging_listing" ] || fail "clone: /workspace/repos/.workspace-agent/staging/ is not empty after a completed clone: ${clone_staging_listing}"
+clone_stray_tmp="$(run_exec "$MAIN_CID" "0:0" sh -c "find /workspace/repos/octocat -maxdepth 1 -name '.tmp-*' 2>&1 || true")"
+[ -z "$clone_stray_tmp" ] || fail "clone: stray .tmp-* entries left under /workspace/repos/octocat: ${clone_stray_tmp}"
+pass "clone: staging directory is empty and no .tmp-* staging leftovers remain under the owner directory"
+
+must_succeed "clone: uid 10001 can create/edit a file in the new checkout" "$MAIN_CID" "$AGENT_USER" \
+  sh -c 'echo "isolation-harness-edit" > /workspace/repos/octocat/Hello-World/isolation-harness-edit.txt && grep -q isolation-harness-edit /workspace/repos/octocat/Hello-World/isolation-harness-edit.txt'
+pass "clone: uid 10001 can create and edit a file inside the checkout /clone produced"
+
+clone_inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"octocat\",\"repo\":\"Hello-World\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
+echo "$clone_inspect_out" | grep -q '"ok":true' || fail "clone: POST /inspect on the new checkout did not return ok:true — got: ${clone_inspect_out}"
+pass "clone: POST /inspect on the /clone-produced checkout succeeds"
+
+clone_repeat_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /tmp/clone-repeat-body.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"owner\":\"octocat\",\"repo\":\"Hello-World\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
+[ "$clone_repeat_out" = "409" ] || fail "clone: second POST /clone of the same repo returned HTTP ${clone_repeat_out}, expected 409 (repo-exists) — body: $(run_exec "$MAIN_CID" "0:0" cat /tmp/clone-repeat-body.json 2>&1 || true)"
+clone_repeat_body="$(run_exec "$MAIN_CID" "0:0" cat /tmp/clone-repeat-body.json 2>&1 || true)"
+echo "$clone_repeat_body" | grep -q 'repo-exists' || fail "clone: second /clone returned 409 but body does not say repo-exists: ${clone_repeat_body}"
+clone_repeat_logs="$(docker logs "$MAIN_CID" 2>&1 || true)"
+echo "$clone_repeat_logs" | grep -qi 'dubious ownership' && fail "clone: 'dubious ownership' appeared in workspace logs after the repeat /clone's repo-exists validation ran git as 10001 against the checkout"
+pass "clone: a second /clone of the same repo returns 409 repo-exists, with no dubious-ownership error in the workspace logs"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4c: the image's git produces the prompts the askpass helper expects
+#
+# #1658's askpass helper (apps/workspace-agent/src/clone.ts, writeAskpassHelper)
+# matches EXACT literal prompt text, not a glob. If Alpine's git (the image's
+# git, NOT this CI runner's or a dev machine's) phrases the prompt even
+# slightly differently, the helper refuses every prompt and every private
+# clone breaks again, silently, under a fully passing test suite that never
+# actually drives real git prompts. This block extracts the literals from the
+# BUILT ARTIFACT (dist/main.mjs, inside the image) rather than hand-copying
+# them from clone.ts source, then compares them against what the image's own
+# git ACTUALLY says.
+#
+# writeAskpassHelper is exported from clone.ts but main.ts (the bundle entry)
+# does not re-export it, so dist/main.mjs has no callable public export for
+# it — `node -e "import('...').then(m => m.writeAskpassHelper)"` would be
+# undefined. tsdown.config.ts sets no `minify` option (tsdown/rolldown
+# default unminified), confirmed by ci.yaml's own existing bundle-guard step
+# (`grep -q "startWorkspaceAgent" dist/main.mjs` — a plain identifier grep,
+# which only works unminified) and by tsdown.config.ts's own
+# bundleSymbolGuardPlugin doing the exact same plain-string containment
+# check. writeAskpassHelper IS reachable from the entry (executeClone calls
+# it, executeClone is wired into createApp's /clone route, createApp is
+# called from startWorkspaceAgent) so its code — including these string
+# literals — is bundled in, just not exported. Grepping dist/main.mjs's
+# source text for the literals is therefore the only viable extraction path
+# here; running the function is not.
+# ─────────────────────────────────────────────────────────────────────────────
+log "phase 4c: askpass prompt literals vs. the image's real git"
+
+PROMPT_CHECK_DIR="$(mktemp -d)"
+TMPDIRS+=("$PROMPT_CHECK_DIR")
+
+# CORRECT recorder: replies 'x-access-token' to a Username prompt, a dummy
+# value to anything else. This is NOT about answering "correctly" in any
+# auth sense (this run never needs to actually authenticate) — it matters
+# because git embeds whatever username it RECEIVED into the URL of the
+# Password prompt that follows ("Password for 'https://<username>@host': ").
+# The shipped literal is 'Password for 'https://x-access-token@github.com': '
+# (clone.ts writeAskpassHelper always answers Username with 'x-access-token'
+# — see clone.ts). Answering the Username prompt with anything else here
+# would make git ask a DIFFERENT password prompt than production ever sees,
+# and the comparison below would fail on every run regardless of what the
+# image's git or the shipped helper actually do — that was exactly the bug
+# in the previous revision of this block.
+cat > "${PROMPT_CHECK_DIR}/recorder-askpass.sh" <<'RECORDER_EOF'
+#!/bin/sh
+printf '%s\n' "$1" >> "${RECORDER_OUT:-/tmp/askpass-recorder-prompts.txt}"
+case "$1" in
+  Username*) printf 'x-access-token' ;;
+  *) printf 'isolation-harness-dummy-response' ;;
+esac
+RECORDER_EOF
+chmod 755 "${PROMPT_CHECK_DIR}/recorder-askpass.sh"
+
+# WRONG-USERNAME recorder: same shape, but answers Username with something
+# OTHER than 'x-access-token'. Used only for the regression-pinning control
+# below — reproduces, on demand, the exact failure mode the fix above closes.
+cat > "${PROMPT_CHECK_DIR}/recorder-askpass-wronguser.sh" <<'WRONGUSER_EOF'
+#!/bin/sh
+printf '%s\n' "$1" >> "${RECORDER_OUT:-/tmp/askpass-recorder-prompts.txt}"
+case "$1" in
+  Username*) printf 'isolation-harness-wrong-user' ;;
+  *) printf 'isolation-harness-dummy-response' ;;
+esac
+WRONGUSER_EOF
+chmod 755 "${PROMPT_CHECK_DIR}/recorder-askpass-wronguser.sh"
+
+# Extraction target: the FUNCTIONAL case-arm line in writeAskpassHelper, e.g.
+#   `  "Username for 'https://github.com': ") printf '%s' 'x-access-token' ;;`,
+# NOT clone.ts's own JSDoc comment for writeAskpassHelper, which ALSO quotes
+# these prompts verbatim in backticks for documentation:
+#   * literals (no globs) against git's real prompt text — `Username for 'https://github.com': `
+#   * and `Password for 'https://x-access-token@github.com': ` — confirmed against real git
+# Confirmed against the actual clone.ts source (read-only for this harness
+# revision): a plain `grep -c "Username for"` finds BOTH lines (2 matches) —
+# the comment line textually precedes the code line, so a naive first-match
+# extraction would silently grab the comment instead of the code if tsdown
+# preserves comments in the unminified bundle. The comment's backtick span
+# ends right after the closing "': `" with no trailing shell code; the real
+# case arm continues immediately with `") printf '%s' ...` after the closing
+# quote. Requiring that continuation on the same line is what tells them
+# apart, and matches exactly 1 line against real clone.ts source (verified
+# locally: `grep -c "Username for .*\") printf"` -> 1, matching line 346).
+# If the built bundle ever has zero or more than one such line — comment
+# formatting changed, the case arm was refactored, whatever — this fails
+# loudly instead of silently taking the first (possibly wrong) candidate.
+cat > "${PROMPT_CHECK_DIR}/extract-literals.sh" <<'EXTRACT_EOF'
+#!/bin/sh
+set -e
+BUNDLE=/app/apps/workspace-agent/dist/main.mjs
+USER_PATTERN='Username for .*") printf'
+PASS_PATTERN='Password for .*") printf'
+
+user_matches="$(grep -c "$USER_PATTERN" "$BUNDLE" || true)"
+if [ "$user_matches" -ne 1 ]; then
+  echo "expected exactly 1 line matching the Username case-arm shape in $BUNDLE, found $user_matches" >&2
+  exit 1
+fi
+grep "$USER_PATTERN" "$BUNDLE" | awk -F'"' '{print $2}' > /tmp/bundle-username-literal.txt
+
+pass_matches="$(grep -c "$PASS_PATTERN" "$BUNDLE" || true)"
+if [ "$pass_matches" -ne 1 ]; then
+  echo "expected exactly 1 line matching the Password case-arm shape in $BUNDLE, found $pass_matches" >&2
+  exit 1
+fi
+grep "$PASS_PATTERN" "$BUNDLE" | awk -F'"' '{print $2}' > /tmp/bundle-password-literal.txt
+EXTRACT_EOF
+chmod 755 "${PROMPT_CHECK_DIR}/extract-literals.sh"
+
+docker cp "${PROMPT_CHECK_DIR}/recorder-askpass.sh" "${MAIN_CID}:/tmp/recorder-askpass.sh"
+docker cp "${PROMPT_CHECK_DIR}/recorder-askpass-wronguser.sh" "${MAIN_CID}:/tmp/recorder-askpass-wronguser.sh"
+docker cp "${PROMPT_CHECK_DIR}/extract-literals.sh" "${MAIN_CID}:/tmp/extract-literals.sh"
+run_exec "$MAIN_CID" "0:0" chmod 755 /tmp/recorder-askpass.sh /tmp/recorder-askpass-wronguser.sh /tmp/extract-literals.sh
+run_exec "$MAIN_CID" "0:0" /tmp/extract-literals.sh \
+  || fail "askpass prompts: extract-literals.sh failed against the built bundle — dist/main.mjs may not be at /app/apps/workspace-agent/dist/main.mjs, the case-arm shape changed, or a JSDoc-vs-code ambiguity was found (see the script's own stderr above)"
+
+bundle_username_literal="$(run_exec "$MAIN_CID" "0:0" cat /tmp/bundle-username-literal.txt)"
+bundle_password_literal="$(run_exec "$MAIN_CID" "0:0" cat /tmp/bundle-password-literal.txt)"
+[ -n "$bundle_username_literal" ] || fail "askpass prompts: could not extract the Username literal from the built bundle (dist/main.mjs)"
+[ -n "$bundle_password_literal" ] || fail "askpass prompts: could not extract the Password literal from the built bundle (dist/main.mjs)"
+log "  bundle Username literal: '${bundle_username_literal}'"
+log "  bundle Password literal: '${bundle_password_literal}'"
+
+# run_prompt_probe <recorder-script-path> <host> <output-file> — runs 'git
+# credential fill' for protocol=https host=<host> against the given askpass
+# recorder, with sealed config (GIT_CONFIG_GLOBAL=/dev/null,
+# GIT_CONFIG_NOSYSTEM=1) so no repo/operator config can alter credential
+# prompting. GIT_TERMINAL_PROMPT=0 does not suppress GIT_ASKPASS-driven
+# prompting (git only falls back to the TTY prompt when no askpass mechanism
+# is configured at all) — mirrors clone.ts's own buildCloneGitEnv, which sets
+# both for the same reason.
+run_prompt_probe() {
+  local askpass_script="$1" host="$2" out_file="$3"
+  run_exec "$MAIN_CID" "0:0" rm -f "$out_file"
+  # RECORDER_OUT is only needed in the environment of the `git` invocation
+  # (after the pipe) — git inherits it into the askpass child it spawns.
+  run_exec "$MAIN_CID" "0:0" sh -c \
+    "printf 'protocol=https\nhost=${host}\n' | RECORDER_OUT='${out_file}' GIT_ASKPASS='${askpass_script}' GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -c credential.helper= credential fill >/dev/null 2>&1 || true"
+}
+
+run_prompt_probe /tmp/recorder-askpass.sh github.com /tmp/prompts-github.txt
+recorded_prompts="$(run_exec "$MAIN_CID" "0:0" cat /tmp/prompts-github.txt 2>&1 || true)"
+[ -n "$recorded_prompts" ] || fail "askpass prompts: 'git credential fill' never invoked the recorder askpass helper at all — git may already have cached credentials, or credential.helper= did not disable an operator-configured helper as expected"
+recorded_username_prompt="$(printf '%s\n' "$recorded_prompts" | sed -n '1p')"
+recorded_password_prompt="$(printf '%s\n' "$recorded_prompts" | sed -n '2p')"
+log "  recorded Username prompt (github.com, correct recorder): '${recorded_username_prompt}'"
+log "  recorded Password prompt (github.com, correct recorder): '${recorded_password_prompt}'"
+
+[ "$recorded_username_prompt" = "$bundle_username_literal" ] || \
+  fail "askpass prompts: the image's real git Username prompt ('${recorded_username_prompt}') does not EXACTLY match the shipped helper's literal ('${bundle_username_literal}') — the helper would refuse every private clone's username prompt"
+[ "$recorded_password_prompt" = "$bundle_password_literal" ] || \
+  fail "askpass prompts: the image's real git Password prompt ('${recorded_password_prompt}') does not EXACTLY match the shipped helper's literal ('${bundle_password_literal}') — the helper would refuse every private clone's password prompt"
+pass "the image's git produces prompts that exactly match the shipped askpass helper's literals (extracted from the built bundle, not hand-copied)"
+
+# Control A: same recorder, a DIFFERENT host. Real git output, not a string
+# mutation — this is the actual refusal case the helper's exact-literal
+# matching exists for (see clone.ts: a lookalike/different host must never
+# match). Proves the comparator can tell two REAL prompts apart, not just
+# that string concatenation produces a different string.
+run_prompt_probe /tmp/recorder-askpass.sh example.com /tmp/prompts-example.txt
+control_a_prompts="$(run_exec "$MAIN_CID" "0:0" cat /tmp/prompts-example.txt 2>&1 || true)"
+[ -n "$control_a_prompts" ] || fail "askpass prompts (control A): 'git credential fill' never invoked the recorder for host=example.com"
+control_a_username_prompt="$(printf '%s\n' "$control_a_prompts" | sed -n '1p')"
+control_a_password_prompt="$(printf '%s\n' "$control_a_prompts" | sed -n '2p')"
+log "  recorded Username prompt (example.com control): '${control_a_username_prompt}'"
+log "  recorded Password prompt (example.com control): '${control_a_password_prompt}'"
+if [ "$control_a_username_prompt" = "$bundle_username_literal" ]; then
+  fail "askpass prompts (control A): example.com's real Username prompt matched the github.com bundle literal — the comparison cannot discriminate hosts"
+fi
+if [ "$control_a_password_prompt" = "$bundle_password_literal" ]; then
+  fail "askpass prompts (control A): example.com's real Password prompt matched the github.com bundle literal — the comparison cannot discriminate hosts"
+fi
+pass "askpass prompt control A: real git prompts for a different host (example.com) do NOT match the github.com bundle literals"
+
+# Control B: github.com again, but the WRONG-USERNAME recorder. Pins the
+# exact regression this block's own recorder fix (above) closes: answering
+# the Username prompt with anything other than 'x-access-token' changes the
+# Password prompt's embedded username, and the real Password prompt must
+# then NOT match the bundle literal.
+run_prompt_probe /tmp/recorder-askpass-wronguser.sh github.com /tmp/prompts-wronguser.txt
+control_b_prompts="$(run_exec "$MAIN_CID" "0:0" cat /tmp/prompts-wronguser.txt 2>&1 || true)"
+[ -n "$control_b_prompts" ] || fail "askpass prompts (control B): 'git credential fill' never invoked the wrong-username recorder for host=github.com"
+control_b_password_prompt="$(printf '%s\n' "$control_b_prompts" | sed -n '2p')"
+log "  recorded Password prompt (github.com, wrong-username control): '${control_b_password_prompt}'"
+if [ "$control_b_password_prompt" = "$bundle_password_literal" ]; then
+  fail "askpass prompts (control B): a Password prompt built from a non-'x-access-token' username unexpectedly matched the bundle literal — the comparison cannot discriminate the embedded username"
+fi
+pass "askpass prompt control B: a Password prompt built from the wrong embedded username does NOT match the bundle literal (regression check for this block's own recorder fix)"
 
 # Signals across uids: the root supervisor can stop the uid-10001 OpenCode
 # process on shutdown (killChildGroup sends SIGTERM to -pgid as root, which
