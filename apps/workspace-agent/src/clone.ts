@@ -3,7 +3,9 @@
  *
  * SECURITY INVARIANTS (non-negotiable):
  * 1. Token is NEVER passed via argv, URL, or shell string.
- * 2. Token is injected via GIT_ASKPASS helper script (mkdtemp dir, O_EXCL file, chmod 0600, deleted in finally).
+ * 2. Token is injected via GIT_ASKPASS helper script (mkdtemp dir, O_EXCL file, chmod 0700 — git executes
+ *    this file, so owner-execute is required; it lives in a private 0700 mkdtemp dir and never contains
+ *    the token itself — deleted in finally).
  * 3. Token is passed to the askpass script via GITHUB_TOKEN env var — NOT embedded in the script body.
  * 4. GIT_TRACE=0, GIT_CURL_VERBOSE=0, GIT_TRACE_PACKET=0, GIT_TRACE_PERFORMANCE=0 in subprocess env.
  * 5. execFile only — no exec(), no shell interpolation.
@@ -234,6 +236,43 @@ export async function executeClone(request: CloneRequest, deps: CloneHandlerDeps
   return semaphoreResult
 }
 
+/**
+ * Writes the GIT_ASKPASS helper script into `dir` (which must already exist, e.g. from
+ * `mkdtemp`) and returns the script's path.
+ *
+ * The script never embeds the token in its body — it reads $GITHUB_TOKEN from its own
+ * process env at exec time, so the file on disk contains no secret.
+ *
+ * Mode is 0o700 (owner read/write/execute), not 0o600. Git *executes* this file when it
+ * needs to prompt for a credential (i.e. for any private repository); without the owner
+ * execute bit, git fails with "cannot exec '<path>': Permission denied" regardless of
+ * whether the process runs as root — execute permission is checked against the mode bits.
+ * The directory this file lives in is a private mkdtemp dir (mode 0700, not world- or
+ * group-readable), so adding owner-execute here adds no exposure.
+ */
+export async function writeAskpassHelper(dir: string): Promise<string> {
+  // Open askpass.sh with O_EXCL (exclusive creation — refuses if exists).
+  const askpassPath = join(dir, 'askpass.sh')
+  const fh = await open(askpassPath, 'wx', 0o700)
+  try {
+    // We construct the string to avoid triggering no-template-curly-in-string lint rule.
+    const githubTokenRef = ['$', '{GITHUB_TOKEN}'].join('')
+    const askpassScript = [
+      '#!/bin/sh',
+      'case "$1" in',
+      `  Username*) printf '%s' 'x-access-token' ;;`,
+      `  Password*) printf '%s' "${githubTokenRef}" ;;`,
+      `  *) exit 1 ;;`,
+      'esac',
+      '',
+    ].join('\n')
+    await fh.writeFile(askpassScript)
+  } finally {
+    await fh.close()
+  }
+  return askpassPath
+}
+
 async function executeCloneInner(
   owner: string,
   repo: string,
@@ -338,28 +377,7 @@ async function executeCloneInner(
     askpassDir = await mkdtempFn(join(os.tmpdir(), 'workspace-agent-askpass-'))
     activeAskpassDirs.add(askpassDir)
 
-    // Open askpass.sh with O_EXCL (exclusive creation — refuses if exists).
-    const askpassPath = join(askpassDir, 'askpass.sh')
-    const fh = await open(askpassPath, 'wx', 0o600)
-    try {
-      // Token is NOT embedded in the script body — it reads $GITHUB_TOKEN from env.
-      // This means the script file on disk contains no secret.
-      // Build the askpass script. The shell reads GITHUB_TOKEN from its environment.
-      // We construct the string to avoid triggering no-template-curly-in-string lint rule.
-      const githubTokenRef = ['$', '{GITHUB_TOKEN}'].join('')
-      const askpassScript = [
-        '#!/bin/sh',
-        'case "$1" in',
-        `  Username*) printf '%s' 'x-access-token' ;;`,
-        `  Password*) printf '%s' "${githubTokenRef}" ;;`,
-        `  *) exit 1 ;;`,
-        'esac',
-        '',
-      ].join('\n')
-      await fh.writeFile(askpassScript)
-    } finally {
-      await fh.close()
-    }
+    const askpassPath = await writeAskpassHelper(askpassDir)
 
     // Minimal env — only what git needs. Token via GITHUB_TOKEN, not in script body.
     const spawnEnv: Record<string, string> = {

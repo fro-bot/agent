@@ -238,7 +238,7 @@ describe('executeClone — happy path', () => {
     expect(scriptContent).toContain('Password*')
   })
 
-  it('opens askpass.sh with O_EXCL (wx flag) in the mkdtemp dir', async () => {
+  it('opens askpass.sh with O_EXCL (wx flag) and mode 0700 in the mkdtemp dir', async () => {
     // #given
     const execFileFn = makeExecFile([{stdout: ''}, {stdout: 'sha123\n'}])
 
@@ -251,7 +251,10 @@ describe('executeClone — happy path', () => {
     })
 
     // #then
-    expect(mockOpen).toHaveBeenCalledWith(FAKE_ASKPASS_PATH, 'wx', 0o600)
+    // 0700 (not 0600) is required: git executes this file to answer credential
+    // prompts, so the owner-execute bit must be set or git fails with
+    // "cannot exec '<path>': Permission denied" for any private repository.
+    expect(mockOpen).toHaveBeenCalledWith(FAKE_ASKPASS_PATH, 'wx', 0o700)
   })
 
   it('creates the repos root directory with mkdir -p', async () => {
