@@ -36,6 +36,17 @@ const OPENCODE_HOSTNAME = '127.0.0.1'
 const PROXY_PORT = 9200
 const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 
+/**
+ * How long to wait for the :9100 listen() bind to settle (listening or 'error') before treating
+ * startup as stalled and exiting. A loopback/wildcard TCP bind involves no upstream I/O — it
+ * either succeeds or fails (e.g. EADDRINUSE) within a single event-loop tick under normal
+ * conditions. 10s is pure margin for a slow tick under cold-start GC pressure, not a realistic
+ * wait, and stays comfortably under the :9100 healthcheck's first probe (10s interval — see
+ * deploy/compose.yaml) so a stalled bind is caught and the container restarted well within one
+ * healthcheck cycle instead of silently hanging forever.
+ */
+export const SERVER_LISTEN_TIMEOUT_MS = 10_000
+
 // ── Injectable dependency types ───────────────────────────────────────────────
 
 /** Serve function signature matching @hono/node-server's `serve`. */
@@ -56,6 +67,12 @@ export type RunSupervisedOpencodeFn = (options: RunSupervisedOpencodeOptions) =>
 
 /** Secret reader function. */
 export type ReadSecretFn = (name: string) => string
+
+/**
+ * Process-exit function. Typed as `never`-returning (matches `process.exit`) so callers can
+ * assume control flow does not continue past a call — TypeScript narrows accordingly.
+ */
+export type ExitFn = (code: number) => never
 
 /**
  * Injectable dependencies for `startWorkspaceAgent`.
@@ -87,6 +104,11 @@ export interface WorkspaceAgentDeps {
    * Injected for testing to avoid reading real secrets.
    */
   readonly readSecretFn?: ReadSecretFn
+  /**
+   * Process-exit function. Defaults to the real `process.exit`.
+   * Injected for testing so a bind failure/timeout doesn't kill the test runner.
+   */
+  readonly exitFn?: ExitFn
 }
 
 /**
@@ -97,7 +119,8 @@ export interface WorkspaceAgentDeps {
  *
  * **Startup order (reordered so OpenCode is never spawned before the control ports are bound):**
  * 1. Read env (readReadyTimeoutMs, readSecret) — BEFORE any server bind
- * 2. serve() — Hono HTTP server on :9100, AWAITED until actually listening
+ * 2. serve() — Hono HTTP server on :9100, AWAITED until actually listening, a bind 'error', or
+ *    SERVER_LISTEN_TIMEOUT_MS elapses (whichever comes first) — the latter two exit(1)
  * 3. createOpencodeProxy() + proxy.listen() on :9200 — AWAITED until the bind attempt settles
  *    (success or failure; a failed bind still leaves the process in degraded mode, unchanged)
  * 4. runSupervisedOpencode() — supervised OpenCode lifecycle (fire-and-forget), spawned as the
@@ -113,6 +136,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     runSupervisedOpencodeFn = runSupervisedOpencode,
     createOpencodeProxyFn = createOpencodeProxy,
     readSecretFn = readSecret,
+    exitFn = code => process.exit(code),
   } = deps
 
   // Supervisor writes all status transitions here; /healthz and /readyz read it.
@@ -130,17 +154,58 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   // Read env before any server bind: fail-fast if WORKSPACE_OPENCODE_READY_TIMEOUT_MS is malformed.
   const opencodeReadyTimeoutMs = readReadyTimeoutMs(env)
 
-  // Bind :9100 and WAIT for the OS to confirm it is actually listening (not just "serve() was
-  // called") before doing anything else that could race an unprivileged process for a port.
-  let resolveServerListening: () => void
-  const serverListening = new Promise<void>(resolve => {
-    resolveServerListening = resolve
+  // Bind :9100 and WAIT for the first of three outcomes before doing anything else that could
+  // race an unprivileged process for a port:
+  //   1. the listening callback fires — bind succeeded, proceed
+  //   2. the underlying server emits 'error' (e.g. EADDRINUSE) — log and exit(1)
+  //   3. SERVER_LISTEN_TIMEOUT_MS elapses with neither — log and exit(1)
+  // Before this reorder, an unhandled bind error crashed the process and the container
+  // restarted. Startup is now sequenced BEFORE OpenCode is spawned, so without an explicit
+  // 'error'/timeout path a failed bind would just hang the `await` forever — the process stays
+  // alive, never listens, never spawns OpenCode, and compose's healthcheck never passes but also
+  // never fails loudly. Racing all three outcomes restores the fail-fast/restart behavior.
+  const server = await new Promise<ServerType>((resolve, reject) => {
+    let settled = false
+    let boundServer: ServerType | undefined
+    let timer: ReturnType<typeof setTimeout>
+
+    function finish(outcome: {ok: true; server: ServerType} | {ok: false; error: Error}): void {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      boundServer?.removeListener('error', onError)
+      if (outcome.ok) {
+        resolve(outcome.server)
+      } else {
+        reject(outcome.error)
+      }
+    }
+
+    function onError(error: unknown): void {
+      finish({ok: false, error: error instanceof Error ? error : new Error(String(error))})
+    }
+
+    timer = setTimeout(() => {
+      finish({
+        ok: false,
+        error: new Error(`workspace-agent: :9100 did not start listening within ${SERVER_LISTEN_TIMEOUT_MS}ms`),
+      })
+    }, SERVER_LISTEN_TIMEOUT_MS)
+
+    // Attach the 'error' listener immediately after serveFn returns the underlying server — the
+    // OS bind attempt (@hono/node-server's serve() calls net.Server#listen internally) resolves
+    // asynchronously via libuv, always after this synchronous call returns, so the listener is in
+    // place before a bind failure can fire.
+    boundServer = serveFn({fetch: app.fetch, port: PORT, hostname: HOST}, info => {
+      console.warn(`workspace-agent listening on ${info.address}:${info.port}`)
+      finish({ok: true, server: boundServer as ServerType})
+    })
+    boundServer.on('error', onError)
+  }).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('workspace-agent: failed to bind :9100', {message})
+    return exitFn(1)
   })
-  const server = serveFn({fetch: app.fetch, port: PORT, hostname: HOST}, info => {
-    console.warn(`workspace-agent listening on ${info.address}:${info.port}`)
-    resolveServerListening()
-  })
-  await serverListening
 
   const opencodeLogger = {
     info: (msg: string, meta?: Record<string, unknown>) => console.warn(msg, meta ?? ''),

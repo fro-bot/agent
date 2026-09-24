@@ -47,13 +47,6 @@ export const AGENT_XDG_STATE_HOME = `${AGENT_HOME}/.local/state`
 export const AGENT_TMPDIR = `${AGENT_XDG_CACHE_HOME}/tmp`
 
 /**
- * Home directory for the root-owned workspace-agent SERVICE identity. Deliberately outside
- * `/root` and outside the agent's home tree so neither identity can read the other's dotfiles
- * or cached credentials.
- */
-export const SERVICE_HOME = '/var/lib/workspace-agent/home'
-
-/**
  * Name of the workspace-agent's own root-owned state directory, directly under the repos root
  * (e.g. `/workspace/repos/.workspace-agent`). Created by the entrypoint
  * (`deploy/scripts/ensure-protected-dir.mjs`) as `0:0` `0700` before the service becomes

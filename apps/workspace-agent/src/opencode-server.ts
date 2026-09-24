@@ -85,6 +85,19 @@ const CA_BUNDLE_ENV_NAMES = ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'GIT_SSL_CA
 // Locale variables, copied through only if the SERVICE process has them set.
 const LOCALE_ENV_NAMES = ['LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE'] as const
 
+// OpenCode feature-flag variables the image itself bakes in — an EXPLICIT list, not a
+// `OPENCODE_*` prefix match. OpenCode also reads secret-bearing variables under that same
+// prefix (e.g. OPENCODE_SERVER_PASSWORD, an OpenCode-recognized upstream env var), so a
+// prefix match would let a secret set on the SERVICE process flow to the agent. Each entry
+// below is copied through only if the SERVICE process has it set; anything else starting with
+// `OPENCODE_` is dropped, by construction.
+const OPENCODE_FEATURE_FLAG_ENV_NAMES = [
+  // deploy/workspace.Dockerfile: `ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true`
+  'OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER',
+  // deploy/workspace.Dockerfile: `ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true`
+  'OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS',
+] as const
+
 /**
  * Trusted PATH for the OpenCode child. OpenCode itself is always launched via the absolute
  * OPENCODE_EXECUTABLE_PATH (never resolved through PATH), but OpenCode's own tool calls (git,
@@ -103,13 +116,15 @@ function copyEnvIfSet(source: NodeJS.ProcessEnv, target: Record<string, string>,
  * Builds the OpenCode child environment by CONSTRUCTING it from a fixed allowlist — never by
  * copying and subtracting from `process.env`. Every key that ends up in the result is named
  * explicitly below; nothing from `parentEnv` reaches the child except the exact names listed in
- * PROXY_ENV_NAMES, CA_BUNDLE_ENV_NAMES, LOCALE_ENV_NAMES, and the `OPENCODE_*` prefix (the image's
- * own baked feature flags — see deploy/workspace.Dockerfile — which never collide with the
- * `WORKSPACE_*`-prefixed secrets the service holds; see config.ts). This means
- * WORKSPACE_OPENCODE_TOKEN, any `*_FILE` secret path, any other `WORKSPACE_*` control setting,
- * GITHUB_TOKEN, GH_TOKEN, AWS_*, inherited GIT_*, SSH_AUTH_SOCK, NODE_OPTIONS, LD_*, BASH_ENV,
- * and ENV can never appear in the output, by construction — there is no code path that would put
- * them there, not a filter that might miss one.
+ * PROXY_ENV_NAMES, CA_BUNDLE_ENV_NAMES, LOCALE_ENV_NAMES, and OPENCODE_FEATURE_FLAG_ENV_NAMES (the
+ * image's own baked feature flags — see deploy/workspace.Dockerfile). OPENCODE_FEATURE_FLAG_ENV_NAMES
+ * is an EXPLICIT list, not a prefix match: OpenCode itself reads secret-bearing variables under the
+ * `OPENCODE_*` prefix too (e.g. OPENCODE_SERVER_PASSWORD), so a prefix match on the SERVICE's own
+ * environment would let such a secret flow straight through. This means WORKSPACE_OPENCODE_TOKEN,
+ * any `*_FILE` secret path, any other `WORKSPACE_*` control setting, GITHUB_TOKEN, GH_TOKEN, AWS_*,
+ * inherited GIT_*, SSH_AUTH_SOCK, NODE_OPTIONS, LD_*, BASH_ENV, ENV, and any unlisted `OPENCODE_*`
+ * variable (including OPENCODE_SERVER_PASSWORD) can never appear in the output, by construction —
+ * there is no code path that would put them there, not a filter that might miss one.
  */
 export function buildOpencodeEnv(parentEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: Record<string, string> = {
@@ -127,12 +142,7 @@ export function buildOpencodeEnv(parentEnv: NodeJS.ProcessEnv = process.env): No
   for (const name of PROXY_ENV_NAMES) copyEnvIfSet(parentEnv, env, name)
   for (const name of CA_BUNDLE_ENV_NAMES) copyEnvIfSet(parentEnv, env, name)
   for (const name of LOCALE_ENV_NAMES) copyEnvIfSet(parentEnv, env, name)
-
-  for (const [key, value] of Object.entries(parentEnv)) {
-    if (key.startsWith('OPENCODE_') && value !== undefined) {
-      env[key] = value
-    }
-  }
+  for (const name of OPENCODE_FEATURE_FLAG_ENV_NAMES) copyEnvIfSet(parentEnv, env, name)
 
   return env
 }

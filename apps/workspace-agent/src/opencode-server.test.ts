@@ -2068,6 +2068,24 @@ describe('buildOpencodeEnv', () => {
     expect(env).not.toHaveProperty('NOT_OPENCODE_PREFIXED')
   })
 
+  it('drops OPENCODE_* keys that are not on the explicit allowlist, including secrets OpenCode itself reads', () => {
+    // #given — OPENCODE_SERVER_PASSWORD is a real OpenCode-recognised secret; the others are
+    // hypothetical future additions under the same prefix. A prefix rule would forward all three.
+    const env = buildOpencodeEnv({
+      OPENCODE_SERVER_PASSWORD: 'service-side-secret',
+      OPENCODE_SECRET_TOKEN: 'another-secret',
+      OPENCODE_FOO: 'unknown-flag',
+      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: 'true',
+    })
+
+    // #then — only the allowlisted flag survives
+    expect(env).not.toHaveProperty('OPENCODE_SERVER_PASSWORD')
+    expect(env).not.toHaveProperty('OPENCODE_SECRET_TOKEN')
+    expect(env).not.toHaveProperty('OPENCODE_FOO')
+    expect(env.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER).toBe('true')
+    expect(Object.values(env)).not.toContain('service-side-secret')
+  })
+
   it('copies locale variables only when set', () => {
     // #given
     const env = buildOpencodeEnv({LANG: 'en_US.UTF-8'})
