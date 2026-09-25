@@ -243,8 +243,8 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     console.error('workspace-agent: cannot start proxy', {message})
-    // Process should not start without the proxy; exit with error code.
-    process.exit(1)
+    // The token is already read above; this only covers createOpencodeProxyFn itself throwing.
+    return exitFn(1)
   }
 
   // Once :9200 has bound successfully, a 'close' or 'error' on the proxy server means the OS has

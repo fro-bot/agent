@@ -560,18 +560,18 @@ describe('startWorkspaceAgent', () => {
   })
 
   describe('error handling', () => {
-    it('throws (or exits) when readSecretFn throws (missing WORKSPACE_OPENCODE_TOKEN)', async () => {
-      // #given
+    it('exits(1) via the injected exitFn and never calls runSupervisedOpencodeFn when createOpencodeProxyFn throws', async () => {
+      // #given — token read and :9100 bind both succeed; only the proxy factory throws.
       const callLog: string[] = []
+      const exitLog: string[] = []
       const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
       const fakeEnv: NodeJS.ProcessEnv = {}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
-      const fakeProxyFactory = makeFakeProxyFactory(callLog)
-
-      // Mock process.exit to prevent the test process from actually exiting
-      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((_code?: number | string | null) => {
-        throw new Error(`process.exit(${_code})`)
+      const fakeExitFn = makeFakeExitFn(exitLog)
+      const throwingProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+        callLog.push('createOpencodeProxy')
+        throw new Error('cannot construct proxy')
       })
 
       // #when / #then
@@ -580,14 +580,14 @@ describe('startWorkspaceAgent', () => {
           env: fakeEnv,
           serveFn: fakeServeFn,
           runSupervisedOpencodeFn: fakeSupervisorFn,
-          createOpencodeProxyFn: fakeProxyFactory,
-          readSecretFn: (_name: string) => {
-            throw new Error('Missing required secret: WORKSPACE_OPENCODE_TOKEN')
-          },
+          createOpencodeProxyFn: throwingProxyFactory,
+          readSecretFn: (_name: string) => 'fake-token',
+          exitFn: fakeExitFn,
         }),
-      ).rejects.toThrow()
+      ).rejects.toThrow('exitFn(1)')
 
-      exitSpy.mockRestore()
+      expect(exitLog).toEqual(['exit(1)'])
+      expect(callLog).not.toContain('runSupervisedOpencode')
     })
 
     it('exits(1) via the injected exitFn and never binds :9100 when readSecretFn throws — the token is read before any server bind', async () => {
