@@ -9,10 +9,11 @@ import type {Buffer} from 'node:buffer'
 
 import type {GitRunnerFn, InspectHandlerDeps} from './inspect.js'
 import type {InspectRequest} from './types.js'
-import {execFileSync} from 'node:child_process'
+import {ChildProcess, execFileSync} from 'node:child_process'
 import {
   chmodSync,
   closeSync,
+  existsSync,
   fstatSync,
   mkdirSync,
   mkdtempSync,
@@ -29,7 +30,7 @@ import os from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
 
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {AGENT_GID, AGENT_UID} from './identity.js'
 import {inspectCheckout, runGit} from './inspect.js'
 
@@ -625,28 +626,350 @@ describe('inspectCheckout — errors', () => {
 
     const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-git-bin-unconfirmed-'))
     const fakeGitPath = join(fakeBinDir, 'git')
-    writeFileSync(fakeGitPath, '#!/bin/sh\nsleep 10\n')
+    const readyMarker = join(fakeBinDir, 'ready')
+    const readyMarkerTmp = `${readyMarker}.tmp`
+    // Write-then-rename: `echo $! > readyMarker` directly would truncate the file before writing
+    // the pid, so a poll landing mid-write could see an empty file (`existsSync` true, `parseInt`
+    // NaN). `mv` within the same directory is atomic — the poll never observes a partial write.
+    writeFileSync(
+      fakeGitPath,
+      `#!/bin/sh\nsleep 10 &\necho $! > "${readyMarkerTmp}"\nmv "${readyMarkerTmp}" "${readyMarker}"\nwait\n`,
+    )
     chmodSync(fakeGitPath, 0o755)
 
+    let sleepPid: number | undefined
     try {
-      // #when — the timeout must fire only AFTER the shell has forked `sleep`. If SIGKILL lands
-      // first, the shell dies holding the only pipe writer, the pipe closes, and the outcome is a
-      // confirmed `timeout` — which is correct behavior, but not the case under test. At 150ms a
-      // loaded runner could still be starting the shell, so this used to flake; 1s leaves the
-      // fork ample room. The grace window (2s, not caller-configurable) is what's waited out.
-      const outcome = await runGit(['status'], {
+      const controller = new AbortController()
+      const removeEventListenerSpy = vi.spyOn(controller.signal, 'removeEventListener')
+      const outcomePromise = runGit(['status'], {
         cwd: dir,
         env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
-        timeoutMs: 1_000,
+        // Large and effectively irrelevant to timing: `signal` is what actually terminates this
+        // run, once the poll below has positively confirmed the fork happened, so there's no race
+        // against process-scheduling latency left to guess a magic number for.
+        timeoutMs: 30_000,
+        signal: controller.signal,
       })
+
+      // #when — poll for the ready marker instead of guessing how long the shell needs to be
+      // scheduled and fork `sleep`; abort only once the fork is confirmed. A bounded 5s poll turns
+      // a shell that never even got scheduled into a loud, distinct test-setup error rather than a
+      // silently wrong GitOutcome.
+      const pollDeadlineMs = Date.now() + 5_000
+      while (existsSync(readyMarker) === false) {
+        if (Date.now() > pollDeadlineMs) {
+          throw new Error('test setup error: fake git never forked `sleep` — readyMarker never appeared within 5s')
+        }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      sleepPid = Number.parseInt(readFileSync(readyMarker, 'utf8').trim(), 10)
+      controller.abort()
+
+      const outcome = await outcomePromise
 
       // #then — distinct from the confirmed-timeout outcome above: this must NEVER claim the
       // process definitely stopped.
       expect(outcome).toEqual({kind: 'termination-unconfirmed'})
+
+      // #then — the grace-window settle path detaches the listener too, not just the exec-callback
+      // paths (ok/failed/confirmed-timeout).
+      expect(removeEventListenerSpy).toHaveBeenCalledWith('abort', expect.any(Function))
     } finally {
+      // The forked `sleep` is never reaped by `runGit` (that's the whole point of this test) — kill
+      // it ourselves so no stray process outlives the test.
+      if (sleepPid !== undefined && !Number.isNaN(sleepPid)) {
+        try {
+          process.kill(sleepPid, 'SIGKILL')
+        } catch {
+          // Already gone — nothing to clean up.
+        }
+      }
       rmSync(fakeBinDir, {recursive: true, force: true})
     }
   }, 10_000)
+})
+
+// ---------------------------------------------------------------------------
+// `signal` seam on GitRunnerOptions: the same confirmed-termination path as `timeoutMs`,
+// externally triggerable.
+// ---------------------------------------------------------------------------
+
+// Must not become `describe.concurrent`: several tests below spy on `ChildProcess.prototype.kill`
+// process-wide, so concurrently-running tests in this block would observe each other's kill calls.
+describe('runGit — abort signal', () => {
+  it('aborts after spawn and reports a confirmed timeout for an exec-replaced child', async () => {
+    // #given — the `exec sleep` stub from the confirmed-timeout test above: killing the tracked
+    // pid kills `sleep` itself (no fork), so termination is reliably confirmed regardless of
+    // exactly when the abort lands relative to the shell starting.
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-git-bin-abort-'))
+    const fakeGitPath = join(fakeBinDir, 'git')
+    writeFileSync(fakeGitPath, '#!/bin/sh\nexec sleep 5\n')
+    chmodSync(fakeGitPath, 0o755)
+
+    const controller = new AbortController()
+    try {
+      // #when — `timeoutMs` is far longer than this test could ever take: only the abort should
+      // be able to terminate this run.
+      const start = Date.now()
+      const outcomePromise = runGit(['status'], {
+        cwd: dir,
+        env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
+        timeoutMs: 30_000,
+        signal: controller.signal,
+      })
+      controller.abort()
+      const outcome = await outcomePromise
+      const elapsedMs = Date.now() - start
+
+      // #then — confirmed quickly, well inside the 2s reap grace, proving the abort drove the
+      // exact same SIGKILL-and-confirm path the timer would have.
+      expect(outcome).toEqual({kind: 'timeout'})
+      expect(elapsedMs).toBeLessThan(2_000)
+    } finally {
+      rmSync(fakeBinDir, {recursive: true, force: true})
+    }
+  })
+
+  it('an already-aborted signal terminates immediately, without waiting for timeoutMs', async () => {
+    // #given
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-git-bin-preaborted-'))
+    const fakeGitPath = join(fakeBinDir, 'git')
+    writeFileSync(fakeGitPath, '#!/bin/sh\nexec sleep 5\n')
+    chmodSync(fakeGitPath, 0o755)
+
+    const controller = new AbortController()
+    controller.abort()
+
+    try {
+      // #when — the signal is already aborted before `runGit` is even called.
+      const start = Date.now()
+      const outcome = await runGit(['status'], {
+        cwd: dir,
+        env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
+        timeoutMs: 30_000,
+        signal: controller.signal,
+      })
+      const elapsedMs = Date.now() - start
+
+      // #then — terminated immediately; nowhere close to the 30s timeoutMs.
+      expect(outcome).toEqual({kind: 'timeout'})
+      expect(elapsedMs).toBeLessThan(2_000)
+    } finally {
+      rmSync(fakeBinDir, {recursive: true, force: true})
+    }
+  })
+
+  it('an already-aborted signal does not turn a spawn failure into a timeout', async () => {
+    // #given — PATH resolves to nothing named `git` at all (spawn fails with ENOENT), so `child`
+    // never gets a live pid. Compare against the identical run without a signal to prove the
+    // abort seam doesn't change what a spawn failure resolves to.
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const emptyBinDir = mkdtempSync(join(os.tmpdir(), 'no-git-bin-'))
+
+    try {
+      // #when — baseline: no signal at all.
+      const withoutSignal = await runGit(['status'], {
+        cwd: dir,
+        env: {PATH: emptyBinDir},
+        timeoutMs: 5_000,
+      })
+
+      // #when — an already-aborted signal, same spawn failure.
+      const controller = new AbortController()
+      controller.abort()
+      const withAbortedSignal = await runGit(['status'], {
+        cwd: dir,
+        env: {PATH: emptyBinDir},
+        timeoutMs: 5_000,
+        signal: controller.signal,
+      })
+
+      // #then — the already-aborted signal must not turn the spawn failure into `timeout`; both
+      // runs report the exact same outcome.
+      expect(withoutSignal.kind).toBe('failed')
+      expect(withAbortedSignal).toEqual(withoutSignal)
+    } finally {
+      rmSync(emptyBinDir, {recursive: true, force: true})
+    }
+  })
+
+  it('does not leave an abort listener attached after a normal successful run', async () => {
+    // #given — a real, ordinary git invocation against a real repo; nothing ever aborts it.
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const controller = new AbortController()
+    const removeEventListenerSpy = vi.spyOn(controller.signal, 'removeEventListener')
+
+    // #when
+    const outcome = await runGit(['status'], {
+      cwd: dir,
+      env: {PATH: process.env.PATH ?? '/usr/bin:/bin'},
+      timeoutMs: 5_000,
+      signal: controller.signal,
+    })
+
+    // #then — the settle path always detaches the listener, even on an ordinary success, so the
+    // signal never lingers wired to a completed run.
+    expect(outcome.kind).toBe('ok')
+    expect(removeEventListenerSpy).toHaveBeenCalledWith('abort', expect.any(Function))
+
+    // #then — aborting after the listener was detached must be inert: no throw. (The
+    // listener-removal assertion above already proves it can't touch this already-settled
+    // outcome — asserting `outcome.kind` again here would be tautological.)
+    expect(() => {
+      controller.abort()
+    }).not.toThrow()
+  })
+
+  it('resolves once and kills once when the timer fires first and an abort follows during the grace window', async () => {
+    // #given — the fork-and-wait stub from the unconfirmed test above, NOT the `exec sleep`
+    // stub used elsewhere in this describe: `exec` makes the tracked pid BE `sleep`, so SIGKILL
+    // closes its pipe almost immediately and the exec callback settles before an abort could ever
+    // land inside the grace window. Forking `sleep` as a child the shell then `wait`s on means the
+    // backgrounded `sleep` keeps holding the inherited stdout/stderr pipe open for the full 2s
+    // grace window even after the shell itself is SIGKILLed — exactly what's needed to prove an
+    // abort genuinely racing an already-open grace window is a no-op, not just untested.
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-git-bin-both-triggers-timer-first-'))
+    const fakeGitPath = join(fakeBinDir, 'git')
+    const readyMarker = join(fakeBinDir, 'ready')
+    const readyMarkerTmp = `${readyMarker}.tmp`
+    writeFileSync(
+      fakeGitPath,
+      `#!/bin/sh\nsleep 10 &\necho $! > "${readyMarkerTmp}"\nmv "${readyMarkerTmp}" "${readyMarker}"\nwait\n`,
+    )
+    chmodSync(fakeGitPath, 0o755)
+
+    const killSpy = vi.spyOn(ChildProcess.prototype, 'kill')
+    const controller = new AbortController()
+    let sleepPid: number | undefined
+    let settled = false
+    try {
+      // #when — start the run first (this is what actually spawns the shell and starts
+      // `timeoutMs` ticking). `timeoutMs` (1_500ms) is large enough relative to realistic
+      // shell-fork latency that the fork realistically always wins the race against the timer —
+      // the fixed 2s grace window only starts counting once the timer's SIGKILL actually lands, so
+      // this margin doesn't cost the test much wall-clock time either.
+      const outcomePromise = runGit(['status'], {
+        cwd: dir,
+        env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
+        timeoutMs: 1_500,
+        signal: controller.signal,
+      })
+      outcomePromise
+        .then(() => {
+          settled = true
+        })
+        .catch(() => {
+          settled = true
+        })
+
+      // #then — confirm the fork happened before anything else. If the marker never appears, the
+      // 1_500ms timer beat the fork (SIGKILLed the shell before it could fork `sleep`) — a genuine
+      // test-setup race under extreme contention, not a broken stub — so say so explicitly instead
+      // of leaving the poll's generic timeout message to be misread as the latter.
+      const markerDeadlineMs = Date.now() + 5_000
+      while (existsSync(readyMarker) === false) {
+        if (Date.now() > markerDeadlineMs) {
+          throw new Error(
+            'test setup race: the 1_500ms timer fired (and killed the shell) before it could fork `sleep` — readyMarker never appeared within 5s',
+          )
+        }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      sleepPid = Number.parseInt(readFileSync(readyMarker, 'utf8').trim(), 10)
+
+      // #then — poll for positive evidence the timer actually fired (`killSpy` recorded a call)
+      // instead of guessing a fixed wait: proves the timer, not the abort below, is genuinely the
+      // first termination trigger, regardless of how long the timer actually took under load.
+      const killDeadlineMs = Date.now() + 5_000
+      while (killSpy.mock.calls.length === 0) {
+        if (Date.now() > killDeadlineMs) {
+          throw new Error('test setup error: the 1_500ms timer never fired — killSpy recorded no calls within 5s')
+        }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+
+      // #then — the backgrounded `sleep` is still holding the pipe open, so the exec callback
+      // cannot have run yet: the outcome promise is provably still pending. Aborting now genuinely
+      // lands INSIDE the open grace window, not after settlement.
+      expect(killSpy).toHaveBeenCalledTimes(1)
+      expect(settled).toBe(false)
+
+      controller.abort()
+      const outcome = await outcomePromise
+
+      // #then — a single outcome, and the `terminating` guard means the abort's own call into
+      // `terminate()` was a no-op: exactly one SIGKILL, not two.
+      expect(outcome).toEqual({kind: 'termination-unconfirmed'})
+      expect(killSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      // The forked `sleep` is never reaped by `runGit` — kill it ourselves so no stray process
+      // outlives the test.
+      if (sleepPid !== undefined && !Number.isNaN(sleepPid)) {
+        try {
+          process.kill(sleepPid, 'SIGKILL')
+        } catch {
+          // Already gone — nothing to clean up.
+        }
+      }
+      killSpy.mockRestore()
+      rmSync(fakeBinDir, {recursive: true, force: true})
+    }
+  }, 10_000)
+
+  it('resolves once and kills once when abort fires first, canceling the pending timer', async () => {
+    // #given
+    const {dir} = await makeCheckoutDir()
+    initRepo(dir)
+    commitFile(dir, 'a.txt', 'base\n', 'initial commit')
+
+    const fakeBinDir = mkdtempSync(join(os.tmpdir(), 'fake-git-bin-both-triggers-abort-first-'))
+    const fakeGitPath = join(fakeBinDir, 'git')
+    writeFileSync(fakeGitPath, '#!/bin/sh\nexec sleep 5\n')
+    chmodSync(fakeGitPath, 0o755)
+
+    const killSpy = vi.spyOn(ChildProcess.prototype, 'kill')
+    const controller = new AbortController()
+    try {
+      // #when — abort fires almost immediately, long before the 500ms timer would; `terminate()`
+      // clears `timeoutHandle`, so the timer can never fire a second termination.
+      const outcomePromise = runGit(['status'], {
+        cwd: dir,
+        env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
+        timeoutMs: 500,
+        signal: controller.signal,
+      })
+      controller.abort()
+      const outcome = await outcomePromise
+      expect(outcome).toEqual({kind: 'timeout'})
+      expect(killSpy).toHaveBeenCalledTimes(1)
+
+      // #then — wait past when the (canceled) timer would otherwise have fired, to prove it never
+      // triggers a second, redundant termination.
+      await new Promise(resolve => setTimeout(resolve, 700))
+      expect(killSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      killSpy.mockRestore()
+      rmSync(fakeBinDir, {recursive: true, force: true})
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
