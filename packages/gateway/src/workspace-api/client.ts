@@ -203,6 +203,13 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     // PR C returns {ok: false, error: <CloneErrorCode>} with HTTP 400/409/500/503/504.
     // We must parse the body to recover structured error codes before falling back to http-error.
     const httpStatus = response.status
+
+    // A 401 means the workspace rejected the gateway's bearer. Classify it before parsing the
+    // body so it stays http-error/401 even if a future CLONE_ERROR_CODE matches the 401 body.
+    if (httpStatus === 401) {
+      return err({kind: 'http-error', status: httpStatus})
+    }
+
     let parsed: unknown
     try {
       parsed = await response.json()
@@ -262,6 +269,12 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     }
 
     const httpStatus = response.status
+
+    // Same as clone(): a rejected bearer is http-error/401 regardless of the body.
+    if (httpStatus === 401) {
+      return err({kind: 'http-error', status: httpStatus})
+    }
+
     let parsed: unknown
     try {
       parsed = await response.json()

@@ -580,6 +580,43 @@ describe('createWorkspaceClient', () => {
       expect(result).toEqual(err({kind: 'http-error', status: 409}))
       vi.unstubAllGlobals()
     })
+
+    it('returns http-error/401 on the real server 401 response ({ok:false, error:"unauthorized"})', async () => {
+      // #given — the actual wire shape the workspace agent sends when the gateway's bearer
+      // (WORKSPACE_OPENCODE_TOKEN) is rejected. 'unauthorized' is not a CLONE_ERROR_CODE, so
+      // without a status check this would already fall through to http-error — this test pins
+      // that behavior against the real body, not just an empty one.
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'unauthorized'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error/401 even when the 401 body is a well-formed clone-error envelope (regression guard)', async () => {
+      // #given — a 401 response whose body happens to parse as a valid CloneFailure (some real
+      // CLONE_ERROR_CODE). If a future code ever collided with what the server sends on 401,
+      // body-shape-based classification would silently reclassify this as 'clone-error' instead
+      // of the auth failure it actually is. The explicit status check must win regardless of
+      // body shape.
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'clone-failed'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
   })
 
   describe('network-error', () => {
@@ -981,6 +1018,39 @@ describe('WorkspaceClient.inspect', () => {
 
       // #then
       expect(result).toEqual(err({kind: 'http-error', status: 502}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error/401 on the real server 401 response ({ok:false, error:"unauthorized"})', async () => {
+      // #given — the actual wire shape the workspace agent sends when the gateway's bearer
+      // (WORKSPACE_OPENCODE_TOKEN) is rejected. 'unauthorized' is not an InspectErrorCode, so
+      // without a status check this would already fall through to http-error — this test pins
+      // that behavior against the real body, not just an empty one.
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'unauthorized'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error/401 even when the 401 body is a well-formed inspect-error envelope (regression guard)', async () => {
+      // #given — a 401 response whose body happens to parse as a valid InspectFailure (some real
+      // InspectErrorCode). The explicit status check must classify this as the auth failure it
+      // actually is, regardless of body shape.
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'no-checkout'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
       vi.unstubAllGlobals()
     })
   })

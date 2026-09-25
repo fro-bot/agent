@@ -589,6 +589,40 @@ describe('startWorkspaceAgent', () => {
 
       exitSpy.mockRestore()
     })
+
+    it('exits(1) via the injected exitFn and never binds :9100 when readSecretFn throws — the token is read before any server bind', async () => {
+      // #given — the token read (readSecretFn) now happens before serve() is ever called (see
+      // startWorkspaceAgent's startup-order doc comment: "Read env ... BEFORE any server bind").
+      // Assert against the injected exitFn (not a process.exit spy) so this pins the real
+      // production exit path, and assert serveFn was never invoked — nothing bound.
+      const callLog: string[] = []
+      const exitLog: string[] = []
+      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {}
+      const fakeServeFn = makeFakeServeFn(callLog)
+      const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+      const fakeProxyFactory = makeFakeProxyFactory(callLog)
+      const fakeExitFn = makeFakeExitFn(exitLog)
+
+      // #when / #then
+      await expect(
+        startWorkspaceAgent({
+          env: fakeEnv,
+          serveFn: fakeServeFn,
+          runSupervisedOpencodeFn: fakeSupervisorFn,
+          createOpencodeProxyFn: fakeProxyFactory,
+          readSecretFn: (_name: string) => {
+            throw new Error('Missing required secret: WORKSPACE_OPENCODE_TOKEN')
+          },
+          exitFn: fakeExitFn,
+        }),
+      ).rejects.toThrow('exitFn(1)')
+
+      expect(exitLog).toEqual(['exit(1)'])
+      expect(callLog).not.toContain('serve')
+      expect(callLog).not.toContain('createOpencodeProxy')
+      expect(callLog).not.toContain('runSupervisedOpencode')
+    })
   })
 
   // ── :9100 bind gating — proves startup actually WAITS on the bind outcome ──────────────────
