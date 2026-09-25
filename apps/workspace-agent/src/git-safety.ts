@@ -49,7 +49,10 @@ export interface GitRunnerOptions {
   /**
    * Optional external trigger for the exact same confirmed-termination path as `timeoutMs`
    * (SIGKILL, then the same reap-grace race between `timeout` and `termination-unconfirmed`) —
-   * an already-aborted signal terminates immediately, without waiting for `timeoutMs`.
+   * an already-aborted signal terminates immediately, without waiting for `timeoutMs`. An abort
+   * reports EXACTLY what a timeout would report (`timeout` or `termination-unconfirmed`) — there
+   * is no way to distinguish "aborted" from "timed out" in the returned `GitOutcome`; a caller
+   * that needs to know which one happened must track that itself (e.g. check `signal.aborted`).
    */
   readonly signal?: AbortSignal
 }
@@ -131,6 +134,11 @@ export const runGit: GitRunnerFn = async (args, options) =>
     // fires, then the signal aborts before the grace window resolves, or vice versa).
     const terminate = (): void => {
       if (terminating) return
+      // A spawn failure (e.g. ENOENT for a missing `git` binary) never gets a live child process
+      // — `child.pid` stays undefined for its whole lifetime in that case. Terminating here would
+      // misreport that failure as `timeout` instead of letting the exec callback below resolve it
+      // as the `failed` outcome it actually is.
+      if (child.pid === undefined) return
       terminating = true
       timedOut = true
       clearTimeout(timeoutHandle)
