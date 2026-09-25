@@ -527,6 +527,7 @@ describe('createWorkspaceClient', () => {
       'too-many-files',
       'path-escaped-workspace',
       'checkout-handoff-failed',
+      'journal-in-progress',
     ]
 
     for (const code of errorCodes) {
@@ -797,6 +798,26 @@ describe('createWorkspaceClient', () => {
 
       // #then
       expect(result).toEqual(err({kind: 'clone-error', code: 'repo-exists'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('hTTP 409 with {ok:false, error:"journal-in-progress"} → clone-error, not parse-error', async () => {
+      // #given — apps/workspace-agent/src/clone.ts refuses to clone over an outstanding update
+      // or recovery journal with this code (checkout-update-recovery plan, Unit 3).
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        json: async () => ({ok: false, error: 'journal-in-progress'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then
+      expect(result).toEqual(err({kind: 'clone-error', code: 'journal-in-progress'}))
       vi.unstubAllGlobals()
     })
 

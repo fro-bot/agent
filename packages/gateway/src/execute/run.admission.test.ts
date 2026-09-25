@@ -1662,6 +1662,39 @@ describe('failureKind threading (early-abort gates)', () => {
     expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('workspace-unavailable')
   })
 
+  it('workspace clone journal-in-progress: FAILED transitionRun carries detailsPatch.failureKind = "workspace-unavailable", not "unreachable"', async () => {
+    // #given — ensureClone fails with clone-error/journal-in-progress (apps/workspace-agent's
+    // clone.ts refuses an outstanding update/recovery journal). A plain retry hits the exact
+    // same refusal until a later `/update` or `/fro-bot recover-checkout` resolves the journal,
+    // so it must not land in the retry-inviting bucket.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const ensureClone = vi.fn().mockResolvedValue({
+      success: false as const,
+      error: {
+        kind: 'workspace-failure' as const,
+        workspaceKind: 'clone-error' as const,
+        code: 'journal-in-progress' as const,
+      },
+    })
+    const message = makeMessage()
+    const deps = makeDeps({ensureClone})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — the FAILED transitionRun call persists the internal 'workspace-unavailable' kind,
+    // not 'unreachable' — retrying will not fix an outstanding journal on its own today.
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('workspace-unavailable')
+
+    // #and — this projects to 'workspace-unavailable' via the operator mapping (not
+    // 'workspace-unreachable', which would invite a pointless retry)
+    const {toOperatorFailureKind} = await import('../operator-contract/run-status.js')
+    expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('workspace-unavailable')
+  })
+
   it('workspace clone non-401 http-error (e.g. 503): FAILED transitionRun still carries detailsPatch.failureKind = "unreachable" (unchanged)', async () => {
     // #given — only 401 is treated as a configuration problem; every other HTTP status stays
     // the prior transient-reachability classification.

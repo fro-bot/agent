@@ -299,7 +299,9 @@ const PERMANENT_CLONE_ERROR_CODES: ReadonlySet<CloneErrorCode> = new Set<CloneEr
  * comparison that returns the same answer on every retry and that
  * `ensure-clone.ts` already logs at error level as a security signal —
  * telling the user to retry would be both futile and understate what may be
- * a tamper signal. Everything else (network/timeout/http/parse, and the
+ * a tamper signal. `workspace-failure`/`clone-error`/`journal-in-progress` is also
+ * `workspace-unavailable`, classified separately from `PERMANENT_CLONE_ERROR_CODES` below — see
+ * the comment at that branch for why. Everything else (network/timeout/http/parse, and the
  * transient clone-error codes including `clone-failed`) stays `unreachable`,
  * matching prior behavior.
  */
@@ -316,6 +318,20 @@ function classifyEnsureCloneFailure(failure: EnsureCloneFailure): RunCoreErrorKi
     failure.kind === 'workspace-failure' &&
     failure.workspaceKind === 'clone-error' &&
     PERMANENT_CLONE_ERROR_CODES.has(failure.code)
+  ) {
+    return 'workspace-unavailable'
+  }
+  // `journal-in-progress` is deliberately NOT folded into PERMANENT_CLONE_ERROR_CODES above: an
+  // outstanding journal is not deterministic in the same sense as a hardlinked handoff failure —
+  // it clears once a later `/update` or `/fro-bot recover-checkout` resolves it. But neither of
+  // those exists yet, so today a plain retry hits the exact same refusal every time; until Unit 7
+  // wires preparation's own `/update`-based reconciliation into the run path (which will replace
+  // this whole mapping), 'workspace-unavailable' (no blind retry invited) is closer to the truth
+  // than 'unreachable'.
+  if (
+    failure.kind === 'workspace-failure' &&
+    failure.workspaceKind === 'clone-error' &&
+    failure.code === 'journal-in-progress'
   ) {
     return 'workspace-unavailable'
   }

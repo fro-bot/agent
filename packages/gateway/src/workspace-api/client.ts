@@ -357,6 +357,7 @@ const CLONE_ERROR_CODES = new Set<string>([
   'head-resolution-failed',
   'overloaded',
   'checkout-handoff-failed',
+  'journal-in-progress',
 ])
 
 function isCloneErrorCode(value: string): value is CloneErrorCode {

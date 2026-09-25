@@ -62,6 +62,15 @@ export type CloneErrorCode =
    * `CloneFailure.code`, not a new field.
    */
   | 'checkout-handoff-failed'
+  /**
+   * A journal (apps/workspace-agent/src/journal.ts) already exists for this repository — an
+   * update or recovery mutation was interrupted (or is still in flight) and left state that
+   * clone must not silently clone over. NOT deterministic in the `PERMANENT_CLONE_ERROR_CODES`
+   * sense: it clears once a later `/update` or `/fro-bot recover-checkout` resolves the journal,
+   * both of which land in later units. Classified separately in `execute/run.ts`'s
+   * `classifyEnsureCloneFailure` — see the comment there.
+   */
+  | 'journal-in-progress'
 
 /** POST /inspect request body. */
 export interface InspectRequest {

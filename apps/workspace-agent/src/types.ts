@@ -64,6 +64,19 @@ export type CloneErrorCode =
    * see handoff.ts `HandoffFailureReason`) is carried in `CloneFailure.code`.
    */
   | 'checkout-handoff-failed'
+  /**
+   * A journal (journal.ts) already exists for this repository — an update or recovery mutation
+   * was interrupted (or is still in flight) and left state that clone must not silently clone
+   * over. NOT deterministic in the same sense as `checkout-handoff-failed`: once the outstanding
+   * journal is resolved (by `/update` or `/recover` in later units, or by an operator running
+   * `/fro-bot recover-checkout`), a retried clone can succeed. The gateway does not yet special-
+   * case this code (see `packages/gateway/src/workspace-api/client.ts`'s `CLONE_ERROR_CODES` and
+   * `packages/gateway/src/execute/run.ts`'s `PERMANENT_CLONE_ERROR_CODES`) — until it does, it
+   * falls through `classifyEnsureCloneFailure` to the default `'unreachable'` bucket, which invites
+   * a retry rather than pointing at recovery. Track updating that classification alongside Unit 4
+   * (`/update`) or Unit 7 (preparation in the run path).
+   */
+  | 'journal-in-progress'
 
 /** POST /inspect request body. */
 export interface InspectRequest {
