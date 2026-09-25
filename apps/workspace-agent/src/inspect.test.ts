@@ -862,15 +862,14 @@ describe('runGit — abort signal', () => {
     let settled = false
     try {
       // #when — start the run first (this is what actually spawns the shell and starts
-      // `timeoutMs` ticking), THEN poll for the ready marker it writes once it forks `sleep`.
-      // `timeoutMs` (500ms) is small relative to the fixed 2s grace window but generous relative
-      // to realistic shell-fork latency — confirmed by the poll below, so the assertion that the
-      // outcome is `termination-unconfirmed` (not a pre-fork confirmed `timeout`) rests on
-      // evidence, not a guess.
+      // `timeoutMs` ticking). `timeoutMs` (1_500ms) is large enough relative to realistic
+      // shell-fork latency that the fork realistically always wins the race against the timer —
+      // the fixed 2s grace window only starts counting once the timer's SIGKILL actually lands, so
+      // this margin doesn't cost the test much wall-clock time either.
       const outcomePromise = runGit(['status'], {
         cwd: dir,
         env: {PATH: `${fakeBinDir}:${process.env.PATH ?? '/usr/bin:/bin'}`},
-        timeoutMs: 500,
+        timeoutMs: 1_500,
         signal: controller.signal,
       })
       outcomePromise
@@ -881,21 +880,36 @@ describe('runGit — abort signal', () => {
           settled = true
         })
 
-      const pollDeadlineMs = Date.now() + 5_000
+      // #then — confirm the fork happened before anything else. If the marker never appears, the
+      // 1_500ms timer beat the fork (SIGKILLed the shell before it could fork `sleep`) — a genuine
+      // test-setup race under extreme contention, not a broken stub — so say so explicitly instead
+      // of leaving the poll's generic timeout message to be misread as the latter.
+      const markerDeadlineMs = Date.now() + 5_000
       while (existsSync(readyMarker) === false) {
-        if (Date.now() > pollDeadlineMs) {
-          throw new Error('test setup error: fake git never forked `sleep` — readyMarker never appeared within 5s')
+        if (Date.now() > markerDeadlineMs) {
+          throw new Error(
+            'test setup race: the 1_500ms timer fired (and killed the shell) before it could fork `sleep` — readyMarker never appeared within 5s',
+          )
         }
         await new Promise(resolve => setTimeout(resolve, 10))
       }
       sleepPid = Number.parseInt(readFileSync(readyMarker, 'utf8').trim(), 10)
 
-      // #then — wait past the 500ms timeout (proving the timer, not the abort below, is the first
-      // trigger), while still well inside the 2s grace window it opened. The backgrounded `sleep`
-      // is still holding the pipe open, so the exec callback cannot have run yet: the outcome
-      // promise is provably still pending. Aborting now genuinely lands INSIDE the open grace
-      // window, not after settlement.
-      await new Promise(resolve => setTimeout(resolve, 800))
+      // #then — poll for positive evidence the timer actually fired (`killSpy` recorded a call)
+      // instead of guessing a fixed wait: proves the timer, not the abort below, is genuinely the
+      // first termination trigger, regardless of how long the timer actually took under load.
+      const killDeadlineMs = Date.now() + 5_000
+      while (killSpy.mock.calls.length === 0) {
+        if (Date.now() > killDeadlineMs) {
+          throw new Error('test setup error: the 1_500ms timer never fired — killSpy recorded no calls within 5s')
+        }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+
+      // #then — the backgrounded `sleep` is still holding the pipe open, so the exec callback
+      // cannot have run yet: the outcome promise is provably still pending. Aborting now genuinely
+      // lands INSIDE the open grace window, not after settlement.
+      expect(killSpy).toHaveBeenCalledTimes(1)
       expect(settled).toBe(false)
 
       controller.abort()
