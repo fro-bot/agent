@@ -4,7 +4,7 @@ Small Hono HTTP service that runs **inside** the workspace container. The gatewa
 
 ## Purpose
 
-Exposes a single `POST /clone` endpoint that clones a GitHub repo into `/workspace/repos/{owner}/{repo}`. The gateway sends `{owner, repo, token}` — the agent derives the path internally and never accepts a caller-provided path.
+Exposes `POST /clone` (clones a GitHub repo into `/workspace/repos/{owner}/{repo}`) and `POST /inspect` (read-only observation of an existing checkout). The gateway sends `{owner, repo, token}` to `/clone` — the agent derives the path internally and never accepts a caller-provided path.
 
 ## Security invariants
 
@@ -21,6 +21,7 @@ Exposes a single `POST /clone` endpoint that clones a GitHub repo into `/workspa
 11. **Fresh clones stage before they publish.** A clone is written under the root-owned staging directory (`/workspace/repos/.workspace-agent/staging/`, created by the entrypoint; `clone.ts` creates `staging/` itself if missing, `0700`) — never beside the destination, and never under the agent-traversable owner directory. HEAD is resolved and validated there, **before** handoff, so the service never runs git in an agent-owned tree for a fresh clone. Publishing is a single `rename` into `/workspace/repos/{owner}/{repo}` (see `identity.ts` for the exact path constants).
 12. **Ownership handoff is filesystem calls only.** `handoff.ts` walks the staged tree with `lstat`/`lchown` — never `stat`, never `chown`, never git. It never follows a symlink (the link itself is `lchown`'d, its target never touched), never crosses a filesystem boundary (`st_dev` comparison), and fails the clone outright on a hardlinked file (`nlink > 1` has no legitimate reason to exist in a fresh HTTPS clone) rather than guessing. The walk is bounded by both a deadline and an entry cap.
 13. **Existing-checkout git runs as the agent, not the service.** Once a checkout is agent-owned, any git invocation against it (`repo-exists` idempotency check, post-rename race-check) runs as `AGENT_UID`/`AGENT_GID` with the same neutralized, credential-free invocation shape `/inspect` uses (`git-safety.ts`: sealed config, exact `safe.directory`, no credentials) — never as the root-owned service. The only git that ever runs as root with credentials is the clone itself, in root-owned staging.
+14. **Every control route requires the gateway's bearer, except `/healthz` and `/readyz`.** `/clone` and `/inspect` require `Authorization: Bearer <WORKSPACE_OPENCODE_TOKEN>` — the same root-only secret already used for the 9200 OpenCode proxy (`opencode-proxy.ts`), read once at startup and threaded into `createApp()` via the required `ServerDeps.auth` field (`server.ts`). `auth` is a discriminated union with no default: production must always pass `{kind: 'bearer', token}`; the `{kind: 'disabled-for-tests'}` variant exists solely so tests can opt out explicitly, and can never be reached by omission. The check runs before any body parsing, JSON parsing, or route logic; a missing, wrong-scheme, or wrong token gets a fixed 401 before anything else happens. Comparison is constant-time (`timingSafeEqual`, length-guarded first). Without this, uid 10001 (the unprivileged OpenCode agent, reachable over loopback on `:9100`) could call `/clone` or `/inspect` itself.
 
 ## Port
 
@@ -28,10 +29,14 @@ Exposes a single `POST /clone` endpoint that clones a GitHub repo into `/workspa
 
 ## Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | /healthz | Liveness probe — returns `{ok: true}` |
-| POST | /clone | Clone a GitHub repo into the workspace |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | /healthz | none | Liveness probe — returns `{ok: true}` |
+| GET | /readyz | none | Readiness probe — gates on OpenCode + proxy state |
+| POST | /clone | bearer | Clone a GitHub repo into the workspace |
+| POST | /inspect | bearer | Read-only observation of an existing checkout |
+
+Every route except `/healthz` and `/readyz` requires `Authorization: Bearer <WORKSPACE_OPENCODE_TOKEN>` — see security invariant 14 above. A missing, wrong-scheme, or wrong token returns `401 {"ok": false, "error": "unauthorized"}` before the route's own validation runs.
 
 ### POST /clone
 
@@ -58,6 +63,23 @@ Validation error (400):
 Server error (500):
 ```json
 {"ok": false, "error": "clone-failed" | "git-not-available" | "enospc", "code": "ENOSPC"}
+```
+
+### POST /inspect
+
+Read-only observation of an existing checkout (branch, SHA, dirty state, in-progress operation). Never clones, fetches, or mutates. Request body:
+```json
+{"owner": "fro-bot", "repo": "agent"}
+```
+
+Success (200):
+```json
+{"ok": true, "observation": {"head": {...}, "worktree": {...}, "operationInProgress": "none", "observedAt": "..."}}
+```
+
+Error (400/404/409/500/504):
+```json
+{"ok": false, "error": "invalid-owner" | "invalid-repo" | "malformed-body" | "body-too-large" | "no-checkout" | "checkout-substituted" | "inspection-failed" | "inspection-timeout"}
 ```
 
 ## Package layout

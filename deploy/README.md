@@ -444,6 +444,8 @@ The raw OpenCode SDK server binds to loopback (`127.0.0.1:54321`) only and is ne
 
 The workspace image builds the workspace agent and bakes the OpenCode CLI, so the container serves repo clones and hosts an OpenCode server. `deploy/secrets/workspace-opencode-token` is required (the bearer proxy and the gateway share it).
 
+The workspace control API (`/clone`, `/inspect` on :9100) now requires this same bearer, not just the :9200 OpenCode proxy — so the gateway and workspace images must always be upgraded and rolled back together. If the two images disagree on the token (e.g. a gateway rollback against a newer workspace image, or vice versa), every clone request gets rejected with HTTP 401 and surfaces to users as `workspace-unavailable`.
+
 #### Harness OpenCode binary
 
 The workspace runs the **harness build** of OpenCode — the patched binary published to [fro-bot/agent releases](https://github.com/fro-bot/agent/releases), not the stock `anomalyco/opencode` build. The harness binary carries session, plugin, and compaction fixes that apply to the mention-loop execution path.

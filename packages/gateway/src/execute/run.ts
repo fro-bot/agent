@@ -319,6 +319,13 @@ function classifyEnsureCloneFailure(failure: EnsureCloneFailure): RunCoreErrorKi
   ) {
     return 'workspace-unavailable'
   }
+  // A 401 means the workspace control API rejected the gateway's own bearer
+  // (WORKSPACE_OPENCODE_TOKEN) -- a stale-or-mismatched secret between the gateway and workspace
+  // images (see the auth invariant in apps/workspace-agent/AGENTS.md), not a transient
+  // reachability blip. Every other HTTP status stays 'unreachable', matching prior behavior.
+  if (failure.kind === 'workspace-failure' && failure.workspaceKind === 'http-error' && failure.status === 401) {
+    return 'workspace-unavailable'
+  }
   return 'unreachable'
 }
 
