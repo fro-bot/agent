@@ -248,3 +248,108 @@ export function buildNeutralGitEnv(): Record<string, string> {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
   }
 }
+
+// ---------------------------------------------------------------------------
+// Unit 3 (not implemented yet): network and local git profile builders.
+//
+// These are the STUBS the Unit 2 adversarial fixture suite
+// (apps/workspace-agent/src/update-fixtures/*.test.ts) is written against. Every exported
+// function below has a typed signature and a JSDoc contract, but its body throws — Unit 3
+// implements the body; Unit 2's suite is expected to fail red against these stubs until then.
+// ---------------------------------------------------------------------------
+
+/** A fully-built git invocation: the arg vector (after `git`), the environment, the working directory, and the identity to run as. */
+export interface GitProfile {
+  readonly args: readonly string[]
+  readonly env: Record<string, string>
+  readonly cwd: string
+  readonly uid?: number
+  readonly gid?: number
+}
+
+export interface NetworkGitProfileOptions {
+  /** Absolute path to the root-owned protected bare repo (`--git-dir` target). */
+  readonly bareRepoPath: string
+  /** The service's own HOME — never an agent-owned checkout, never AGENT_HOME. */
+  readonly serviceHome: string
+  /** Path to the existing askpass helper (clone.ts's `writeAskpassHelper` shape). */
+  readonly askpassPath: string
+  /** The GitHub installation token, delivered via env, never as an argv literal. */
+  readonly token: string
+  /** Path to the trusted CA bundle; omitted uses the process's default trust store. */
+  readonly caBundlePath?: string
+  /**
+   * The FULL parent process environment the service is actually running with (production passes
+   * `process.env`). The builder may draw ordinary, non-git-specific values from it (e.g. `PATH`,
+   * locale variables) but must NEVER let it influence git's own config, transport, TLS, or proxy
+   * behavior: every git-specific variable — `GIT_CONFIG_*` (including `GIT_CONFIG_PARAMETERS` and
+   * the `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n` triad), `GIT_SSH_COMMAND`, `GIT_ASKPASS`,
+   * `GIT_PROXY_COMMAND`, `GIT_SSL_NO_VERIFY`, `GIT_SSL_CAINFO`, `HOME`/`XDG_CONFIG_HOME` insofar as
+   * they would drive global-config lookup, and every `*_PROXY`/`*_proxy` variable — must be
+   * cleared or replaced with a value this builder chooses itself, regardless of what `parentEnv`
+   * contains. A profile built from a contaminated `parentEnv` must behave IDENTICALLY to one built
+   * from an empty environment, except for the explicitly plumbed-through values below.
+   */
+  readonly parentEnv: NodeJS.ProcessEnv
+  /**
+   * The ONLY sanctioned proxy configuration. A builder must never source a proxy (or a no-proxy
+   * exclusion) from `parentEnv`'s `*_PROXY`/`*_proxy` variables — omitting this option means NO
+   * proxy is used, full stop, even if `parentEnv` carries one.
+   */
+  readonly proxy?: {readonly https: string; readonly noProxy?: string}
+}
+
+/**
+ * Contract (Unit 3 — not implemented here): builds the sealed, root-identity git invocation used
+ * for every credential-bearing network operation (`ls-remote`, `fetch`, `pack-objects`) against
+ * the protected bare repo named by `bareRepoPath`.
+ *
+ * The built profile must:
+ * - Seal system and global config (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`) so no
+ *   config file this process can reach other than `--git-dir`'s own `config` is ever read —
+ *   regardless of what `parentEnv.HOME`, `parentEnv.XDG_CONFIG_HOME`, or `parentEnv.GIT_CONFIG_*`
+ *   already say.
+ * - Explicitly clear every ambient git-specific environment variable named in
+ *   `NetworkGitProfileOptions.parentEnv`'s doc comment, even when `parentEnv` already carries one
+ *   — never conditionally default to an ambient value (e.g. never
+ *   `parentEnv.GIT_CONFIG_GLOBAL ?? '/dev/null'`; always the literal `'/dev/null'`).
+ * - Set `cwd` to `serviceHome` and `--git-dir` to `bareRepoPath` — NEVER a cwd inside, or a
+ *   `--git-dir`/`--work-tree` pointing at, an agent-owned checkout. This is the mechanism that
+ *   makes every transport-rewrite vector in an agent-owned checkout's config irrelevant: this
+ *   profile never reads that config file at all.
+ * - Force `GIT_ALLOW_PROTOCOL=https`, `GIT_TERMINAL_PROMPT=0`, TLS verification on, HTTP redirects
+ *   off, `credential.helper=` cleared, and hooks disabled (`core.hooksPath=/dev/null`).
+ * - Wire `GIT_ASKPASS=askpassPath` and `GITHUB_TOKEN=token` (env only — the token must never
+ *   appear in `args`).
+ * - Propagate `caBundlePath` (as `GIT_SSL_CAINFO`) and, only when `proxy` is given, exactly the
+ *   proxy env vars it implies — no ambient `*_PROXY`/`*_proxy`/`GIT_PROXY_COMMAND` value is ever
+ *   consulted, and omitting `proxy` means the resulting env carries no proxy configuration at all.
+ */
+export function buildNetworkGitProfile(_options: NetworkGitProfileOptions): GitProfile {
+  throw new Error('not implemented: Unit 3')
+}
+
+export interface LocalUpdateGitProfileOptions {
+  /** Absolute, canonical path to the agent-owned checkout the merge runs against. */
+  readonly checkoutPath: string
+}
+
+/**
+ * Contract (Unit 3 — not implemented here): builds the uid-10001 local git invocation used for
+ * the fast-forward merge and its surrounding admission re-checks.
+ *
+ * The built profile must, beyond `GIT_SAFETY_ARGS`/`safeDirectoryArgs` (above):
+ * - Carry no credential helper, no askpass, and no proxy environment variable at all.
+ * - Set `GIT_ALLOW_PROTOCOL=` (empty) — an empty transport allowlist, so no transport, including
+ *   `file://` and `ext::`, is available to this invocation.
+ * - Disable replace refs (`GIT_NO_REPLACE_OBJECTS=1`) and partial/lazy fetch
+ *   (`-c remote.<name>.promisor=false` is a per-remote setting; this profile instead refuses via
+ *   `checkout-profile.ts`'s layout check — this builder only forces the invocation-level
+ *   equivalents it can apply unconditionally, `GIT_NO_REPLACE_OBJECTS=1` among them).
+ * - Force hooks, `core.fsmonitor`, the attributes file, sparse checkout, and submodule recursion
+ *   off via `-c` overrides that the checkout's own (agent-writable) config cannot re-enable
+ *   (`-c` on the command line always wins over `.git/config`).
+ */
+export function buildLocalUpdateGitProfile(_options: LocalUpdateGitProfileOptions): GitProfile {
+  throw new Error('not implemented: Unit 3')
+}
