@@ -16,6 +16,7 @@ import type {ServerType} from '@hono/node-server'
 import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
 import type {ProxyListeningRef} from './server.js'
+import type {JournalReconciliationLogger, ReconcileUpdateJournalsOnStartupDeps} from './update.js'
 
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
@@ -27,6 +28,7 @@ import {readReadyTimeoutMs, readSecret} from './config.js'
 import {createOpencodeProxy} from './opencode-proxy.js'
 import {runSupervisedOpencode} from './opencode-server.js'
 import {createApp} from './server.js'
+import {reconcileUpdateJournalsOnStartup} from './update.js'
 
 const PORT = 9100
 const HOST = '0.0.0.0'
@@ -46,6 +48,18 @@ const WORKSPACE_REPOS_ROOT = '/workspace/repos'
  * healthcheck cycle instead of silently hanging forever.
  */
 export const SERVER_LISTEN_TIMEOUT_MS = 10_000
+
+/**
+ * Hard ceiling on the startup update-journal reconciliation pass (main.ts →
+ * `reconcileUpdateJournalsOnStartup`, update.ts), before startup CONTINUES regardless. Every
+ * journal's own git calls are already individually bounded (confirmed-termination `runGit`, see
+ * that function's own doc comment) — this is a defense-in-depth ceiling for a pathological
+ * journal count, not the primary bound. Reconciliation failing to finish in time is logged and
+ * non-fatal: any journal left unresolved simply means the next `/update` for that repository
+ * refuses `needs-recovery` (the same safe fallback an individually-malformed or in-flight journal
+ * already produces) — recovery itself is Unit 5.
+ */
+export const JOURNAL_RECONCILE_TIMEOUT_MS = 20_000
 
 // ── Injectable dependency types ───────────────────────────────────────────────
 
@@ -67,6 +81,9 @@ export type RunSupervisedOpencodeFn = (options: RunSupervisedOpencodeOptions) =>
 
 /** Secret reader function. */
 export type ReadSecretFn = (name: string) => string
+
+/** Startup update-journal reconciliation function. Simplified signature matching `reconcileUpdateJournalsOnStartup`. */
+export type ReconcileUpdateJournalsFn = (deps: ReconcileUpdateJournalsOnStartupDeps) => Promise<void>
 
 /**
  * Process-exit function. Typed as `never`-returning (matches `process.exit`) so callers can
@@ -109,6 +126,11 @@ export interface WorkspaceAgentDeps {
    * Injected for testing so a bind failure/timeout doesn't kill the test runner.
    */
   readonly exitFn?: ExitFn
+  /**
+   * Startup update-journal reconciliation. Defaults to the real `reconcileUpdateJournalsOnStartup`
+   * (update.ts). Injected for testing to avoid real git subprocesses / a real journals directory.
+   */
+  readonly reconcileUpdateJournalsFn?: ReconcileUpdateJournalsFn
 }
 
 /**
@@ -139,6 +161,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     createOpencodeProxyFn = createOpencodeProxy,
     readSecretFn = readSecret,
     exitFn = code => process.exit(code),
+    reconcileUpdateJournalsFn = reconcileUpdateJournalsOnStartup,
   } = deps
 
   // Supervisor writes all status transitions here; /healthz and /readyz read it.
@@ -150,6 +173,15 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   // detached:true puts the child in its own process group — it does NOT inherit SIGTERM
   // from the parent on container stop, so we must abort explicitly to avoid orphaning it.
   const opencodeController = new AbortController()
+
+  // Hoisted above every use (including startup journal reconciliation, below, which runs before
+  // the :9100 bind) so there is exactly one logger object for the whole process, not one built
+  // here and a second one later for OpenCode/the proxy.
+  const opencodeLogger: JournalReconciliationLogger = {
+    info: (msg: string, meta?: Record<string, unknown>) => console.warn(msg, meta ?? ''),
+    warn: (msg: string, meta?: Record<string, unknown>) => console.warn(msg, meta ?? ''),
+    error: (msg: string, meta?: Record<string, unknown>) => console.error(msg, meta ?? ''),
+  }
 
   // Read env before any server bind: fail-fast if WORKSPACE_OPENCODE_READY_TIMEOUT_MS is malformed.
   const opencodeReadyTimeoutMs = readReadyTimeoutMs(env)
@@ -166,6 +198,36 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     return exitFn(1)
   }
 
+  // Reconcile outstanding /update journals BEFORE the server binds :9100 and starts accepting
+  // requests — the plan's reconciliation table applied once at boot, per repository, under that
+  // repository's own mutex. Bounded and non-fatal: an unfinished or unreconcilable journal is
+  // logged and left in place, never blocks startup, and never exits the process — the affected
+  // repository's next /update simply refuses needs-recovery, the same safe fallback a per-request
+  // reconciliation would produce anyway.
+  await Promise.race([
+    reconcileUpdateJournalsFn({reposRoot: WORKSPACE_REPOS_ROOT, logger: opencodeLogger}),
+    new Promise<void>(resolve => {
+      setTimeout(() => {
+        opencodeLogger.error(
+          'workspace-agent: startup journal reconciliation did not finish within the deadline — continuing startup regardless',
+          {timeoutMs: JOURNAL_RECONCILE_TIMEOUT_MS},
+        )
+        resolve()
+      }, JOURNAL_RECONCILE_TIMEOUT_MS)
+    }),
+  ]).catch((error: unknown) => {
+    // reconcileUpdateJournalsOnStartup itself never throws (it catches internally); this guards
+    // against a bug in an INJECTED fn (tests; a future refactor) doing the same, never blocking or
+    // failing startup because of it.
+    const message = error instanceof Error ? error.message : String(error)
+    opencodeLogger.error('workspace-agent: startup journal reconciliation threw unexpectedly — continuing startup', {
+      message,
+    })
+  })
+
+  // updateNetworkConfig (egress proxy / CA bundle for the /update network half) is not yet read
+  // from real deployment config here — a tracked follow-up (see ServerDeps.updateNetworkConfig's
+  // own doc comment in server.ts); omitting it here is deliberate, not an oversight.
   const app = createApp({opencodeStatus, proxyListening: proxyListeningRef, auth: {kind: 'bearer', token}})
 
   // Bind :9100 and WAIT for the first of three outcomes before doing anything else that could
@@ -220,12 +282,6 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     console.error('workspace-agent: failed to bind :9100', {message})
     return exitFn(1)
   })
-
-  const opencodeLogger = {
-    info: (msg: string, meta?: Record<string, unknown>) => console.warn(msg, meta ?? ''),
-    warn: (msg: string, meta?: Record<string, unknown>) => console.warn(msg, meta ?? ''),
-    error: (msg: string, meta?: Record<string, unknown>) => console.error(msg, meta ?? ''),
-  }
 
   let proxy: OpencodeProxyHandle | undefined
   // Hoisted above the proxy 'close'/'error' handlers (which read it) and the shutdown() closure

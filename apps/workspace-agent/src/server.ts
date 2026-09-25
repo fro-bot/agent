@@ -14,7 +14,11 @@ import type {
   InspectFailure,
   InspectRequest,
   ReadyzResponse,
+  UpdateRequest,
+  UpdateResult,
+  UpdateValidationFailure,
 } from './types.js'
+import type {UpdateHandlerDeps} from './update.js'
 
 import {Buffer} from 'node:buffer'
 import {timingSafeEqual} from 'node:crypto'
@@ -23,6 +27,7 @@ import {Hono} from 'hono'
 import {executeClone, scrubCredentials} from './clone.js'
 import {inspectCheckout} from './inspect.js'
 import {sanitizeOwner, sanitizeRepo, validateTokenShape} from './sanitize.js'
+import {executeUpdate} from './update.js'
 
 /** Maximum allowed request body size in bytes. */
 const MAX_BODY_BYTES = 4096
@@ -35,6 +40,39 @@ export type CloneExecutorFn = (request: CloneRequest, deps?: CloneHandlerDeps) =
 
 /** Simplified inspect executor signature for dependency injection. */
 export type InspectExecutorFn = (request: InspectRequest, deps?: InspectHandlerDeps) => Promise<InspectHandlerResult>
+
+/**
+ * Simplified update executor signature for dependency injection. Unlike `CloneExecutorFn`/
+ * `InspectExecutorFn`, `executeUpdate` returns the bare `UpdateResult` union directly (no
+ * `{response, statusCode}` wrapper) — the route below owns the result→status mapping itself; see
+ * `statusForUpdateResult`.
+ */
+export type UpdateExecutorFn = (request: UpdateRequest, deps?: UpdateHandlerDeps) => Promise<UpdateResult>
+
+/**
+ * Maps an `UpdateResult` to an HTTP status code.
+ *
+ * - `ready` → 200: the checkout is current.
+ * - `no-checkout` → 404: mirrors `/inspect`'s `no-checkout` → 404 — nothing exists at this path.
+ * - `refused` → 409: mirrors `/inspect`'s `checkout-substituted` → 409 and `/clone`'s
+ *   `repo-exists` → 409 — the checkout exists but its current state precludes this operation.
+ * - `failed`, `reason === 'fetch-timeout'` → 504: mirrors `/clone`'s `clone-timeout` → 504 exactly
+ *   (the closest existing precedent for "a network operation against the remote didn't complete
+ *   in time").
+ * - `failed`, `permanent === true` → 502: the remote gave a definitive, non-retryable rejection
+ *   (`fetch-not-found`, `fetch-forbidden`) — this side reports it as an upstream failure, not a
+ *   500 (which would imply a bug in this service).
+ * - `failed`, otherwise → 503: every other failure reason is transient — safe, and expected, to
+ *   retry later (auth rejected, rate-limited, unreachable, remote-moved, aborted,
+ *   inspection-failed, apply-failed, termination-unconfirmed).
+ */
+function statusForUpdateResult(result: UpdateResult): 200 | 404 | 409 | 502 | 503 | 504 {
+  if (result.kind === 'ready') return 200
+  if (result.kind === 'no-checkout') return 404
+  if (result.kind === 'refused') return 409
+  if (result.reason === 'fetch-timeout') return 504
+  return result.permanent ? 502 : 503
+}
 
 /**
  * OpenCode readiness state shared between the lifecycle and the server.
@@ -65,6 +103,21 @@ export interface ServerDeps {
   readonly cloneExecutor?: CloneExecutorFn
   /** Injected inspect executor for testability. */
   readonly inspectExecutor?: InspectExecutorFn
+  /** Injected update executor for testability. */
+  readonly updateExecutor?: UpdateExecutorFn
+  /**
+   * Trusted network config for the `/update` network half, read ONCE at startup (main.ts) and
+   * merged into every `/update` call's `executeUpdate` deps alongside the per-request abort
+   * signal. Not yet populated by production `main.ts` wiring — the egress proxy/CA-bundle values
+   * themselves are a follow-up; this field exists now so that follow-up is a `main.ts` change
+   * only, never another `createApp`/`ServerDeps` signature change. Shape mirrors
+   * `UpdateHandlerDeps.caBundlePath`/`.proxy` (git-safety.ts's `NetworkGitProfileOptions.proxy`)
+   * exactly, so passing it through is a straight merge, never a translation.
+   */
+  readonly updateNetworkConfig?: {
+    readonly caBundlePath?: string
+    readonly proxy?: {readonly https: string; readonly noProxy?: string}
+  }
   /** OpenCode server readiness reference. When absent, opencode field is omitted from /healthz. */
   readonly opencodeStatus?: OpencodeStatusRef
   /**
@@ -97,7 +150,15 @@ export interface ServerDeps {
  *   whether the control API is protected (`bearer`) or intentionally open (`disabled-for-tests`).
  */
 export function createApp(deps: ServerDeps): Hono {
-  const {cloneExecutor = executeClone, inspectExecutor = inspectCheckout, opencodeStatus, proxyListening, auth} = deps
+  const {
+    cloneExecutor = executeClone,
+    inspectExecutor = inspectCheckout,
+    updateExecutor = executeUpdate,
+    updateNetworkConfig,
+    opencodeStatus,
+    proxyListening,
+    auth,
+  } = deps
   const app = new Hono()
 
   // Control-API bearer check — every route except /healthz and /readyz. Registered before any
@@ -275,6 +336,71 @@ export function createApp(deps: ServerDeps): Hono {
 
     const {response, statusCode} = await inspectExecutor(request)
     return c.json(response, statusCode)
+  })
+
+  // POST /update — bring an ELIGIBLE existing checkout up to date with its remote default branch,
+  // or refuse/fail with a precise reason. Body validation mirrors /clone exactly (owner, repo,
+  // installation token) since the network half needs the same credential /clone does. Unlike
+  // /clone and /inspect, `executeUpdate` returns the bare `UpdateResult` union directly (no
+  // `{response, statusCode}` wrapper already computed) — see `statusForUpdateResult` above and
+  // `UpdateExecutorFn`'s own doc comment for why. No credential scrub on the way out: `UpdateResult`
+  // has no field that could ever carry token/credential material (verified against every variant
+  // in types.ts), unlike /clone's raw-git-stdout-derived response.
+  app.post('/update', async c => {
+    const contentLengthHeader = c.req.header('content-length')
+    if (contentLengthHeader === undefined || contentLengthHeader === null) {
+      const err: UpdateValidationFailure = {ok: false, error: 'body-too-large'}
+      return c.json(err, 413)
+    }
+    const contentLength = Number.parseInt(contentLengthHeader, 10)
+    if (Number.isNaN(contentLength) || contentLength > MAX_BODY_BYTES) {
+      const err: UpdateValidationFailure = {ok: false, error: 'body-too-large'}
+      return c.json(err, 413)
+    }
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      const err: UpdateValidationFailure = {ok: false, error: 'malformed-body'}
+      return c.json(err, 400)
+    }
+
+    if (typeof body !== 'object' || body === null) {
+      const err: UpdateValidationFailure = {ok: false, error: 'malformed-body'}
+      return c.json(err, 400)
+    }
+
+    const raw = body as Record<string, unknown>
+
+    const owner = sanitizeOwner(raw.owner)
+    if (owner === null) {
+      const err: UpdateValidationFailure = {ok: false, error: 'invalid-owner'}
+      return c.json(err, 400)
+    }
+
+    const repo = sanitizeRepo(raw.repo)
+    if (repo === null) {
+      const err: UpdateValidationFailure = {ok: false, error: 'invalid-repo'}
+      return c.json(err, 400)
+    }
+
+    if (validateTokenShape(raw.token) === false) {
+      const err: UpdateValidationFailure = {ok: false, error: 'invalid-token-shape'}
+      return c.json(err, 400)
+    }
+
+    const request: UpdateRequest = {owner, repo, token: raw.token}
+
+    const result = await updateExecutor(request, {
+      // The gateway's HTTP call has its own deadline; when the CLIENT disconnects (or its own
+      // request times out), this propagates that as an abort — honored through the fetch phase,
+      // ignored once the apply phase begins (executeUpdate's own documented contract).
+      signal: c.req.raw.signal,
+      caBundlePath: updateNetworkConfig?.caBundlePath,
+      proxy: updateNetworkConfig?.proxy,
+    })
+    return c.json(result, statusForUpdateResult(result))
   })
 
   // 404 for unknown routes

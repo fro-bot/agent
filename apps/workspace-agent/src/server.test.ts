@@ -1,6 +1,8 @@
 import type {CloneHandlerResult} from './clone.js'
 import type {InspectHandlerResult} from './inspect.js'
-import type {CloneExecutorFn, InspectExecutorFn, ServerDeps} from './server.js'
+import type {CloneExecutorFn, InspectExecutorFn, ServerDeps, UpdateExecutorFn} from './server.js'
+import type {UpdateRequest, UpdateResult} from './types.js'
+import type {UpdateHandlerDeps} from './update.js'
 
 import {Buffer} from 'node:buffer'
 
@@ -15,6 +17,11 @@ function makeCloneExecutor(result: CloneHandlerResult): CloneExecutorFn & Return
 
 function makeInspectExecutor(result: InspectHandlerResult): InspectExecutorFn & ReturnType<typeof vi.fn> {
   return vi.fn().mockResolvedValue(result) as InspectExecutorFn & ReturnType<typeof vi.fn>
+}
+
+/** Unlike make{Clone,Inspect}Executor, `executeUpdate` returns the bare `UpdateResult` union directly (no `{response, statusCode}` wrapper) — see `UpdateExecutorFn`'s own doc comment in server.ts. */
+function makeUpdateExecutor(result: UpdateResult): UpdateExecutorFn & ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(result) as UpdateExecutorFn & ReturnType<typeof vi.fn>
 }
 
 /**
@@ -55,6 +62,23 @@ async function postClone(
 ): Promise<Response> {
   const bodyStr = JSON.stringify(body)
   return app.request('/clone', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': String(new TextEncoder().encode(bodyStr).length),
+      ...extraHeaders,
+    },
+    body: bodyStr,
+  })
+}
+
+async function postUpdate(
+  app: ReturnType<typeof createApp>,
+  body: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<Response> {
+  const bodyStr = JSON.stringify(body)
+  return app.request('/update', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -970,6 +994,21 @@ describe('Control-API bearer authentication', () => {
         expect(body).toEqual({ok: false, error: 'unauthorized'})
         expect(inspectExecutor).not.toHaveBeenCalled()
       })
+
+      it(`POST /update returns 401 for ${name}, without invoking the update executor`, async () => {
+        // #given
+        const updateExecutor = makeUpdateExecutor({kind: 'no-checkout'})
+        const app = appWithBearerAuth(AUTH_TOKEN, {updateExecutor})
+
+        // #when
+        const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN}, headers)
+
+        // #then
+        expect(res.status).toBe(401)
+        const body = await res.json()
+        expect(body).toEqual({ok: false, error: 'unauthorized'})
+        expect(updateExecutor).not.toHaveBeenCalled()
+      })
     }
 
     it('rejects with 401 (not 400) when a malformed body accompanies a missing bearer — proves auth runs before JSON parsing', async () => {
@@ -1095,5 +1134,327 @@ describe('ServerDeps.auth variants are behaviourally distinct', () => {
 
     expect(disabledRes.status).toBe(200)
     expect(disabledInspectExecutor).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('POST /update — validation', () => {
+  it('returns 413 body-too-large when Content-Length header is missing', async () => {
+    // #given
+    const app = appWithoutAuth()
+
+    // #when
+    const res = await app.request('/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN}),
+    })
+
+    // #then
+    expect(res.status).toBe(413)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'body-too-large'})
+  })
+
+  it('returns 413 body-too-large when Content-Length exceeds 4096', async () => {
+    // #given
+    const app = appWithoutAuth()
+
+    // #when
+    const res = await app.request('/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'Content-Length': '999999'},
+      body: JSON.stringify({owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN}),
+    })
+
+    // #then
+    expect(res.status).toBe(413)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'body-too-large'})
+  })
+
+  it('returns 400 malformed-body for non-JSON body', async () => {
+    // #given
+    const app = appWithoutAuth()
+    const malformedBody = 'not json{{{'
+
+    // #when
+    const res = await app.request('/update', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(new TextEncoder().encode(malformedBody).length),
+      },
+      body: malformedBody,
+    })
+
+    // #then
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'malformed-body'})
+  })
+
+  it('returns 400 invalid-owner for traversal attempt', async () => {
+    // #given
+    const app = appWithoutAuth()
+
+    // #when
+    const res = await postUpdate(app, {owner: '../etc', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'invalid-owner'})
+  })
+
+  it('returns 400 invalid-repo for repo with slash', async () => {
+    // #given
+    const app = appWithoutAuth()
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'a/b', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'invalid-repo'})
+  })
+
+  it('returns 400 invalid-token-shape for a malformed token', async () => {
+    // #given
+    const app = appWithoutAuth()
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: 'not-a-real-token'})
+
+    // #then
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toEqual({ok: false, error: 'invalid-token-shape'})
+  })
+
+  it('never invokes the update executor when validation fails', async () => {
+    // #given
+    const updateExecutor = makeUpdateExecutor({kind: 'no-checkout'})
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    await postUpdate(app, {owner: '../etc', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(updateExecutor).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /update — result → status mapping', () => {
+  it('ready → 200, full result body passed through verbatim', async () => {
+    // #given
+    const result: UpdateResult = {
+      kind: 'ready',
+      change: 'fast-forward',
+      branch: 'main',
+      sha: 'b'.repeat(40),
+      fromSha: 'a'.repeat(40),
+      checkedAt: '2026-01-01T00:00:00.000Z',
+    }
+    const updateExecutor = makeUpdateExecutor(result)
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual(result)
+    expect(updateExecutor).toHaveBeenCalledTimes(1)
+  })
+
+  it('no-checkout → 404', async () => {
+    // #given
+    const updateExecutor = makeUpdateExecutor({kind: 'no-checkout'})
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(404)
+    const body = await res.json()
+    expect(body).toEqual({kind: 'no-checkout'})
+  })
+
+  it('refused (needs-recovery) → 409', async () => {
+    // #given
+    const result: UpdateResult = {kind: 'refused', reason: 'needs-recovery'}
+    const updateExecutor = makeUpdateExecutor(result)
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body).toEqual(result)
+  })
+
+  it('refused (dirty, with changedPaths) → 409, body carries the sample', async () => {
+    // #given
+    const result: UpdateResult = {kind: 'refused', reason: 'dirty', changedPaths: ['a.txt', 'b.txt']}
+    const updateExecutor = makeUpdateExecutor(result)
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body).toEqual(result)
+  })
+
+  it('failed, reason fetch-timeout → 504 (mirrors /clone clone-timeout)', async () => {
+    // #given
+    const result: UpdateResult = {kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false}
+    const updateExecutor = makeUpdateExecutor(result)
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(504)
+  })
+
+  it('failed, permanent true (fetch-not-found) → 502', async () => {
+    // #given
+    const result: UpdateResult = {kind: 'failed', reason: 'fetch-not-found', mutationStarted: false, permanent: true}
+    const updateExecutor = makeUpdateExecutor(result)
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(502)
+  })
+
+  it('failed, permanent true (fetch-forbidden) → 502', async () => {
+    // #given
+    const result: UpdateResult = {kind: 'failed', reason: 'fetch-forbidden', mutationStarted: false, permanent: true}
+    const updateExecutor = makeUpdateExecutor(result)
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(502)
+  })
+
+  it('failed, not permanent (fetch-auth-rejected) → 503', async () => {
+    // #given
+    const result: UpdateResult = {
+      kind: 'failed',
+      reason: 'fetch-auth-rejected',
+      mutationStarted: false,
+      permanent: false,
+    }
+    const updateExecutor = makeUpdateExecutor(result)
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(503)
+  })
+
+  it('failed, mutationStarted possibly (termination-unconfirmed) → 503, body carries the possibly flag', async () => {
+    // #given
+    const result: UpdateResult = {
+      kind: 'failed',
+      reason: 'termination-unconfirmed',
+      mutationStarted: 'possibly',
+      permanent: false,
+    }
+    const updateExecutor = makeUpdateExecutor(result)
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(res.status).toBe(503)
+    const body = await res.json()
+    expect(body).toEqual(result)
+  })
+})
+
+describe('POST /update — signal plumbing', () => {
+  it('passes c.req.raw.signal through to the update executor deps', async () => {
+    // #given
+    let capturedSignal: AbortSignal | undefined
+    const updateExecutor = vi.fn(async (_request: UpdateRequest, deps?: UpdateHandlerDeps) => {
+      capturedSignal = deps?.signal
+      return {kind: 'no-checkout'} satisfies UpdateResult
+    }) as UpdateExecutorFn & ReturnType<typeof vi.fn>
+    const app = appWithoutAuth({updateExecutor})
+
+    // #when
+    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then — Hono's app.request() constructs a real Request, which always carries a signal
+    expect(capturedSignal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('an already-aborted client request reaches the update executor with an aborted signal', async () => {
+    // #given
+    let capturedSignal: AbortSignal | undefined
+    const updateExecutor = vi.fn(async (_request: UpdateRequest, deps?: UpdateHandlerDeps) => {
+      capturedSignal = deps?.signal
+      return {kind: 'no-checkout'} satisfies UpdateResult
+    }) as UpdateExecutorFn & ReturnType<typeof vi.fn>
+    const app = appWithoutAuth({updateExecutor})
+    const controller = new AbortController()
+    controller.abort()
+
+    // #when
+    const bodyStr = JSON.stringify({owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+    await app.request('/update', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(new TextEncoder().encode(bodyStr).length),
+      },
+      body: bodyStr,
+      signal: controller.signal,
+    })
+
+    // #then
+    expect(capturedSignal?.aborted).toBe(true)
+  })
+
+  it('passes updateNetworkConfig.caBundlePath and .proxy through to the update executor deps', async () => {
+    // #given — proves the plumbing ServerDeps.updateNetworkConfig → executeUpdate deps exists,
+    // even though no production caller populates it yet (see server.ts's own doc comment)
+    let capturedCaBundlePath: string | undefined
+    let capturedProxy: {readonly https: string; readonly noProxy?: string} | undefined
+    const updateExecutor = vi.fn(async (_request: UpdateRequest, deps?: UpdateHandlerDeps) => {
+      capturedCaBundlePath = deps?.caBundlePath
+      capturedProxy = deps?.proxy
+      return {kind: 'no-checkout'} satisfies UpdateResult
+    }) as UpdateExecutorFn & ReturnType<typeof vi.fn>
+    const app = appWithoutAuth({
+      updateExecutor,
+      updateNetworkConfig: {caBundlePath: '/etc/ssl/ca.pem', proxy: {https: 'http://proxy:3128'}},
+    })
+
+    // #when
+    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(capturedCaBundlePath).toBe('/etc/ssl/ca.pem')
+    expect(capturedProxy).toEqual({https: 'http://proxy:3128'})
   })
 })

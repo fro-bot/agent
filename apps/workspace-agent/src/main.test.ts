@@ -149,6 +149,7 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
       })
 
       // #then
@@ -171,6 +172,7 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
       })
 
       // #then
@@ -201,6 +203,7 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
       })
 
       // #then — assert the exact reordered startup sequence
@@ -251,6 +254,7 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
       })
 
       // #then — by the time runSupervisedOpencode is invoked, the delayed proxy.listen() had
@@ -305,6 +309,7 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
       })
 
       // #then — env was read before serve was called
@@ -340,6 +345,7 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
       })
       // main.ts now AWAITS proxy.listen() directly (so OpenCode is never spawned before the
       // bind attempt settles), so proxyListeningRef.listening is already true by the time
@@ -389,6 +395,7 @@ describe('startWorkspaceAgent', () => {
           createOpencodeProxyFn: fakeProxyFactory,
           readSecretFn: (_name: string) => 'fake-token',
           exitFn: fakeExitFn,
+          reconcileUpdateJournalsFn: async () => {},
         }),
       ).rejects.toThrow('exitFn(1)')
 
@@ -435,6 +442,7 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
         exitFn: fakeExitFn,
+        reconcileUpdateJournalsFn: async () => {},
       })
 
       expect(capturedServer).toBeDefined()
@@ -480,6 +488,7 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
         exitFn: fakeExitFn,
+        reconcileUpdateJournalsFn: async () => {},
       })
 
       expect(capturedServer).toBeDefined()
@@ -537,7 +546,15 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
         exitFn: fakeExitFn,
+        reconcileUpdateJournalsFn: async () => {},
       })
+      // Flush pending microtasks and a macrotask before firing the listening callback — startup
+      // now awaits the (fake, near-instant) startup journal reconciliation pass before ever
+      // calling serveFn, which needs more than a single synchronous call to settle (see the
+      // `:9100 bind gating` describe block's own flush pattern for the same reason).
+      await Promise.resolve()
+      await Promise.resolve()
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
       fireListening()
       await startupPromise
 
@@ -583,6 +600,7 @@ describe('startWorkspaceAgent', () => {
           createOpencodeProxyFn: throwingProxyFactory,
           readSecretFn: (_name: string) => 'fake-token',
           exitFn: fakeExitFn,
+          reconcileUpdateJournalsFn: async () => {},
         }),
       ).rejects.toThrow('exitFn(1)')
 
@@ -615,6 +633,7 @@ describe('startWorkspaceAgent', () => {
             throw new Error('Missing required secret: WORKSPACE_OPENCODE_TOKEN')
           },
           exitFn: fakeExitFn,
+          reconcileUpdateJournalsFn: async () => {},
         }),
       ).rejects.toThrow('exitFn(1)')
 
@@ -650,6 +669,7 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
       })
 
       // Flush pending microtasks and a macrotask — a regression that stopped awaiting the bind
@@ -692,9 +712,16 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
         exitFn: fakeExitFn,
+        reconcileUpdateJournalsFn: async () => {},
       })
 
+      // Flush pending microtasks and a macrotask before firing the bind error — startup now
+      // awaits the (fake, near-instant) startup journal reconciliation pass before ever calling
+      // serveFn, which needs more than a single microtask tick to settle (see the sibling test
+      // above for the same flush pattern).
       await Promise.resolve()
+      await Promise.resolve()
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
       fireError(new Error('EADDRINUSE'))
 
       // #then
@@ -732,6 +759,7 @@ describe('startWorkspaceAgent', () => {
           createOpencodeProxyFn: fakeProxyFactory,
           readSecretFn: (_name: string) => 'fake-token',
           exitFn: fakeExitFn,
+          reconcileUpdateJournalsFn: async () => {},
         })
         await Promise.all([
           expect(startupPromise).rejects.toThrow('exitFn(1)'),

@@ -10,6 +10,8 @@
  * The caller never controls where the repo is cloned.
  */
 
+import type {LayoutRefusalReason, Obstruction} from './checkout-profile.js'
+
 /** POST /clone request body. */
 export interface CloneRequest {
   readonly owner: string
@@ -133,6 +135,155 @@ export type InspectErrorCode =
   | 'checkout-substituted'
   | 'inspection-failed'
   | 'inspection-timeout'
+
+/** POST /update request body. */
+export interface UpdateRequest {
+  readonly owner: string
+  readonly repo: string
+  /** Installation access token (ghs_*). Used only by the network half; never logged. */
+  readonly token: string
+}
+
+/** How the checkout's branch tip changed (or didn't) as a result of this update. */
+export type UpdateChangeKind = 'fast-forward' | 'unchanged'
+
+/**
+ * The checkout was already eligible and is now current — unchanged, or fast-forwarded to the
+ * remote tip. Carries CHECKED remote evidence; a `ready` result is never produced from an
+ * unchecked or cached observation.
+ */
+export interface UpdateReady {
+  readonly kind: 'ready'
+  readonly change: UpdateChangeKind
+  readonly branch: string
+  readonly sha: string
+  /** HEAD before the update, when `change` is `fast-forward`. Omitted when `change` is `unchanged`. */
+  readonly fromSha?: string
+  /** ISO-8601 timestamp, from an injected clock, when the remote evidence was checked. */
+  readonly checkedAt: string
+}
+
+/**
+ * Every reason `/update` can refuse to run for, closed and final — see the plan's Unit 2 "Policy"
+ * fixtures for why classifying `detached`/`non-default-branch`/`diverged`/`ahead`/`obstructed` is
+ * update.ts's job, not checkout-profile.ts's.
+ */
+export type UpdateRefusalReason =
+  | 'needs-recovery'
+  | 'checkout-substituted'
+  | 'unsupported-layout'
+  | 'unsupported-config'
+  | 'operation-in-progress'
+  | 'dirty'
+  | 'submodule-initialized'
+  | 'detached'
+  | 'non-default-branch'
+  | 'diverged'
+  | 'ahead'
+  | 'obstructed'
+
+/**
+ * The checkout is ineligible; no mutation was ever attempted, and NO network profile was ever
+ * built or spawned reaching this result — every admission check runs entirely local-only, as
+ * AGENT_UID. Discriminated by `reason`, each carrying exactly the detail its refusal reply needs.
+ */
+export type UpdateRefused =
+  | {readonly kind: 'refused'; readonly reason: 'needs-recovery'}
+  | {readonly kind: 'refused'; readonly reason: 'checkout-substituted'}
+  | {readonly kind: 'refused'; readonly reason: 'unsupported-layout'; readonly layoutReason: LayoutRefusalReason}
+  | {readonly kind: 'refused'; readonly reason: 'unsupported-config'; readonly disallowedKeys: readonly string[]}
+  | {readonly kind: 'refused'; readonly reason: 'operation-in-progress'; readonly operation: CheckoutOperation}
+  | {readonly kind: 'refused'; readonly reason: 'dirty'; readonly changedPaths: readonly string[]}
+  | {readonly kind: 'refused'; readonly reason: 'submodule-initialized'; readonly submodules: readonly string[]}
+  | {readonly kind: 'refused'; readonly reason: 'detached'}
+  | {readonly kind: 'refused'; readonly reason: 'non-default-branch'; readonly branch: string}
+  | {readonly kind: 'refused'; readonly reason: 'diverged'}
+  | {readonly kind: 'refused'; readonly reason: 'ahead'}
+  | {readonly kind: 'refused'; readonly reason: 'obstructed'; readonly obstructions: readonly Obstruction[]}
+
+/**
+ * Every reason `/update` can fail for, closed. Fetch-phase reasons (`fetch-*`, `remote-moved`)
+ * always carry `mutationStarted: false` — nothing in the checkout was ever touched. Apply-phase
+ * reasons (`apply-failed`, `termination-unconfirmed`) always leave the journal at `applying`,
+ * forcing recovery, since something in or around the checkout was touched or is of unconfirmed
+ * state.
+ */
+export type UpdateFailureReason =
+  /**
+   * The client's `AbortSignal` fired before the apply phase began (checked only up through the
+   * fetch phase — once the journal records `applying`, the mutation runs to completion or
+   * confirmed termination regardless of a later disconnect).
+   */
+  | 'aborted'
+  /**
+   * A local admission check could not determine an answer (a git subprocess timed out, its
+   * termination went unconfirmed, or it returned something this module can't parse) and failed
+   * closed rather than guessing.
+   */
+  | 'inspection-failed'
+  /** The remote rejected the credential (401, or an auth challenge never satisfied). Not permanent — a fresh token may succeed. */
+  | 'fetch-auth-rejected'
+  /** The remote reported 404 — explicit positive evidence the repository doesn't exist (or isn't visible to this token). Permanent. */
+  | 'fetch-not-found'
+  /** The remote reported 403 — explicit positive evidence access is denied. Permanent. */
+  | 'fetch-forbidden'
+  /** The remote reported 429. Not permanent — expected to clear. */
+  | 'fetch-rate-limited'
+  /** The remote host could not be reached (connection refused, DNS failure, TLS failure). Not permanent. */
+  | 'fetch-unreachable'
+  /** The fetch phase (ls-remote or fetch) did not complete within the network budget. Not permanent. */
+  | 'fetch-timeout'
+  /** A fetch-phase git invocation failed for a reason this module's classifier doesn't recognize. Not permanent — unclassified failures are never assumed permanent. */
+  | 'fetch-failed'
+  /** The remote's default-branch tip moved between observations, twice in a row (the one retry was exhausted). Not permanent. */
+  | 'remote-moved'
+  /**
+   * The apply phase (re-admission re-check, pack import, or the fast-forward merge itself) failed
+   * with a CONFIRMED (non-zero exit, or a positively-detected post-merge mismatch) outcome.
+   * `mutationStarted: true`.
+   */
+  | 'apply-failed'
+  /**
+   * A pack-stream or merge subprocess's termination could not be CONFIRMED (mirrors
+   * `PackStreamOutcome`'s/`GitOutcome`'s own `termination-unconfirmed`). `mutationStarted:
+   * 'possibly'` — never a synonym for `true`.
+   */
+  | 'termination-unconfirmed'
+
+/**
+ * An attempt was made and did not succeed. `mutationStarted` is `'possibly'` only when subprocess
+ * termination itself went unconfirmed — never a synonym for `true`.
+ */
+export interface UpdateFailed {
+  readonly kind: 'failed'
+  readonly reason: UpdateFailureReason
+  readonly mutationStarted: boolean | 'possibly'
+  readonly permanent: boolean
+}
+
+/**
+ * No checkout exists at this repository's path, and no journal is in flight for it either — the
+ * gateway should clone, not update.
+ */
+export interface UpdateNoCheckout {
+  readonly kind: 'no-checkout'
+}
+
+/** The discriminated result of a `/update` attempt. Never flags — exactly one of these four shapes. */
+export type UpdateResult = UpdateReady | UpdateRefused | UpdateFailed | UpdateNoCheckout
+
+/**
+ * POST /update validation failure — an HTTP-layer request-shape problem (oversized body,
+ * unparseable JSON, an invalid owner/repo/token) caught BEFORE `executeUpdate` is ever called.
+ * Deliberately a separate, `ok`-discriminated shape from `UpdateResult`: `UpdateResult`'s
+ * `refused`/`failed` variants are the DOMAIN outcome of a well-formed request `executeUpdate`
+ * actually attempted, and carry no HTTP-layer-only reasons (`malformed-body`, `body-too-large`,
+ * ...) in their closed unions.
+ */
+export interface UpdateValidationFailure {
+  readonly ok: false
+  readonly error: 'malformed-body' | 'body-too-large' | 'invalid-owner' | 'invalid-repo' | 'invalid-token-shape'
+}
 
 /** GET /healthz response. */
 export interface HealthzResponse {

@@ -50,10 +50,10 @@
  *    begin, so an already-aborted request never reaches `runNetworkAndApply`.
  */
 
-import type {LayoutRefusalReason, Obstruction} from './checkout-profile.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions, PackStreamOutcome} from './git-stream.js'
-import type {CheckoutHead, CheckoutOperation} from './types.js'
+import type {JournalListEntry} from './journal.js'
+import type {CheckoutHead, UpdateFailed, UpdateReady, UpdateRefused, UpdateRequest, UpdateResult} from './types.js'
 
 import {randomUUID} from 'node:crypto'
 import {lstat, mkdir, mkdtemp, realpath, rm} from 'node:fs/promises'
@@ -78,7 +78,7 @@ import {
 import {runPackStream} from './git-stream.js'
 import {AGENT_GID, AGENT_UID, FETCH_STORE_DIR_NAME, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {inspectCheckout} from './inspect.js'
-import {readJournal, removeJournal, writeJournal} from './journal.js'
+import {listJournals, readJournal, removeJournal, writeJournal} from './journal.js'
 import {repoMutexKey, withRepoLock} from './repo-mutex.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors clone.ts/inspect.ts. */
@@ -118,145 +118,6 @@ export const DEFAULT_MAX_PACK_BYTES = 2 * 1024 * 1024 * 1024
 /** Default service identity home directory — the root-owned identity that runs every network git operation. Never AGENT_HOME. */
 export const DEFAULT_SERVICE_HOME = process.env.HOME ?? '/root'
 
-/** POST /update request body. */
-export interface UpdateRequest {
-  readonly owner: string
-  readonly repo: string
-  /** Installation access token (ghs_*). Used only by the network half (slice 2b); never logged. */
-  readonly token: string
-}
-
-/** How the checkout's branch tip changed (or didn't) as a result of this update. */
-export type UpdateChangeKind = 'fast-forward' | 'unchanged'
-
-/**
- * The checkout was already eligible and is now current — unchanged, or fast-forwarded to the
- * remote tip. Carries CHECKED remote evidence; a `ready` result is never produced from an
- * unchecked or cached observation.
- */
-export interface UpdateReady {
-  readonly kind: 'ready'
-  readonly change: UpdateChangeKind
-  readonly branch: string
-  readonly sha: string
-  /** HEAD before the update, when `change` is `fast-forward`. Omitted when `change` is `unchanged`. */
-  readonly fromSha?: string
-  /** ISO-8601 timestamp, from an injected clock, when the remote evidence was checked. */
-  readonly checkedAt: string
-}
-
-/**
- * Every reason `/update` can refuse to run for, closed and final — including the reasons only
- * the network/apply half (slice 2b) can ever actually produce (`detached`, `non-default-branch`,
- * `diverged`, `ahead`, `obstructed`; see the plan's Unit 2 "Policy" fixtures, which document that
- * classifying these is this module's job, not checkout-profile.ts's), so slice 2b never has to
- * widen this union — only implement the branches that currently can't be reached.
- */
-export type UpdateRefusalReason =
-  | 'needs-recovery'
-  | 'checkout-substituted'
-  | 'unsupported-layout'
-  | 'unsupported-config'
-  | 'operation-in-progress'
-  | 'dirty'
-  | 'submodule-initialized'
-  | 'detached'
-  | 'non-default-branch'
-  | 'diverged'
-  | 'ahead'
-  | 'obstructed'
-
-/**
- * The checkout is ineligible; no mutation was ever attempted, and NO network profile was ever
- * built or spawned reaching this result — every admission check runs entirely local-only, as
- * AGENT_UID. Discriminated by `reason`, each carrying exactly the detail its refusal reply needs.
- */
-export type UpdateRefused =
-  | {readonly kind: 'refused'; readonly reason: 'needs-recovery'}
-  | {readonly kind: 'refused'; readonly reason: 'checkout-substituted'}
-  | {readonly kind: 'refused'; readonly reason: 'unsupported-layout'; readonly layoutReason: LayoutRefusalReason}
-  | {readonly kind: 'refused'; readonly reason: 'unsupported-config'; readonly disallowedKeys: readonly string[]}
-  | {readonly kind: 'refused'; readonly reason: 'operation-in-progress'; readonly operation: CheckoutOperation}
-  | {readonly kind: 'refused'; readonly reason: 'dirty'; readonly changedPaths: readonly string[]}
-  | {readonly kind: 'refused'; readonly reason: 'submodule-initialized'; readonly submodules: readonly string[]}
-  | {readonly kind: 'refused'; readonly reason: 'detached'}
-  | {readonly kind: 'refused'; readonly reason: 'non-default-branch'; readonly branch: string}
-  | {readonly kind: 'refused'; readonly reason: 'diverged'}
-  | {readonly kind: 'refused'; readonly reason: 'ahead'}
-  | {readonly kind: 'refused'; readonly reason: 'obstructed'; readonly obstructions: readonly Obstruction[]}
-
-/**
- * Every reason `/update` can fail for, closed. Fetch-phase reasons (`fetch-*`, `remote-moved`)
- * always carry `mutationStarted: false` — nothing in the checkout was ever touched. Apply-phase
- * reasons (`apply-failed`, `termination-unconfirmed`) always leave the journal at `applying`,
- * forcing recovery, since something in or around the checkout was touched or is of unconfirmed
- * state.
- */
-export type UpdateFailureReason =
-  /**
-   * The client's `AbortSignal` fired before the apply phase began (checked only up through the
-   * fetch phase — once the journal records `applying`, the mutation runs to completion or
-   * confirmed termination regardless of a later disconnect).
-   */
-  | 'aborted'
-  /**
-   * A local admission check could not determine an answer (a git subprocess timed out, its
-   * termination went unconfirmed, or it returned something this module can't parse) and failed
-   * closed rather than guessing.
-   */
-  | 'inspection-failed'
-  /** The remote rejected the credential (401, or an auth challenge never satisfied). Not permanent — a fresh token may succeed. */
-  | 'fetch-auth-rejected'
-  /** The remote reported 404 — explicit positive evidence the repository doesn't exist (or isn't visible to this token). Permanent. */
-  | 'fetch-not-found'
-  /** The remote reported 403 — explicit positive evidence access is denied. Permanent. */
-  | 'fetch-forbidden'
-  /** The remote reported 429. Not permanent — expected to clear. */
-  | 'fetch-rate-limited'
-  /** The remote host could not be reached (connection refused, DNS failure, TLS failure). Not permanent. */
-  | 'fetch-unreachable'
-  /** The fetch phase (ls-remote or fetch) did not complete within the network budget. Not permanent. */
-  | 'fetch-timeout'
-  /** A fetch-phase git invocation failed for a reason this module's classifier doesn't recognize. Not permanent — unclassified failures are never assumed permanent. */
-  | 'fetch-failed'
-  /** The remote's default-branch tip moved between observations, twice in a row (the one retry was exhausted). Not permanent. */
-  | 'remote-moved'
-  /**
-   * The apply phase (re-admission re-check, pack import, or the fast-forward merge itself) failed
-   * with a CONFIRMED (non-zero exit, or a positively-detected post-merge mismatch) outcome.
-   * `mutationStarted: true`.
-   */
-  | 'apply-failed'
-  /**
-   * A pack-stream or merge subprocess's termination could not be CONFIRMED (mirrors
-   * `PackStreamOutcome`'s/`GitOutcome`'s own `termination-unconfirmed`). `mutationStarted:
-   * 'possibly'` — never a synonym for `true`.
-   */
-  | 'termination-unconfirmed'
-
-/**
- * An attempt was made (or, for slice 2a, admission fully passed and the network/apply half was
- * reached) and did not succeed. `mutationStarted` is `'possibly'` only when subprocess
- * termination itself went unconfirmed — never a synonym for `true`.
- */
-export interface UpdateFailed {
-  readonly kind: 'failed'
-  readonly reason: UpdateFailureReason
-  readonly mutationStarted: boolean | 'possibly'
-  readonly permanent: boolean
-}
-
-/**
- * No checkout exists at this repository's path, and no journal is in flight for it either — the
- * gateway should clone, not update.
- */
-export interface UpdateNoCheckout {
-  readonly kind: 'no-checkout'
-}
-
-/** The discriminated result of a `/update` attempt. Never flags — exactly one of these four shapes. */
-export type UpdateResult = UpdateReady | UpdateRefused | UpdateFailed | UpdateNoCheckout
-
 /** Injectable dependencies for `executeUpdate`. Every field has a production-matching default. */
 export interface UpdateHandlerDeps {
   /**
@@ -285,6 +146,15 @@ export interface UpdateHandlerDeps {
   readonly remoteBaseUrl?: string
   /** Trusted CA bundle path for the network git profile. Network half only (slice 2b). */
   readonly caBundlePath?: string
+  /**
+   * Deployment egress-proxy configuration for the network git profile
+   * (`buildNetworkGitProfile`'s own `NetworkGitProfileOptions.proxy` — see that type's doc comment:
+   * omitting this means NO proxy is used, full stop, even if the process environment carries one).
+   * PLUMBING ONLY as of this slice: accepted here and threaded down to `NetworkAndApplyContext`,
+   * but `runNetworkAndApply` does not yet pass it to `buildNetworkGitProfile` — a tracked follow-up,
+   * not a silent gap (server.ts's `ServerDeps.updateNetworkConfig` doc comment cross-references it).
+   */
+  readonly proxy?: {readonly https: string; readonly noProxy?: string}
   /**
    * Writes the GIT_ASKPASS helper for the network profile. Defaults to clone.ts's
    * `writeAskpassHelper`. Network half only (slice 2b).
@@ -484,6 +354,116 @@ async function reconcileUpdateJournal(params: {
       fromSha: journal.fromSha,
       checkedAt: now().toISOString(),
     },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Startup journal reconciliation — called once, before the server accepts requests (main.ts).
+// Reuses `reconcileUpdateJournal` (above) per repository, under that repository's own mutex, so a
+// concurrent request arriving mid-reconciliation can never race the same journal file. Recovery
+// journals (`kind: 'recovery'`) are left entirely alone — Unit 5's job, not this one's.
+// ---------------------------------------------------------------------------
+
+export interface JournalReconciliationLogger {
+  readonly info: (msg: string, meta?: Record<string, unknown>) => void
+  readonly warn: (msg: string, meta?: Record<string, unknown>) => void
+  readonly error: (msg: string, meta?: Record<string, unknown>) => void
+}
+
+export interface ReconcileUpdateJournalsOnStartupDeps {
+  readonly reposRoot?: string
+  readonly gitRunner?: GitRunnerFn
+  readonly options?: {readonly timeoutMs?: number; readonly uid?: number; readonly gid?: number}
+  readonly now?: () => Date
+  /** Required — every decision this pass makes (cleared, left in place, skipped) is logged. */
+  readonly logger: JournalReconciliationLogger
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Reconciles every OUTSTANDING update journal exactly once, at startup, before the server accepts
+ * requests — the plan's reconciliation table applied at boot instead of lazily at the next
+ * `/update` call for each repository. Bounded by construction: `listJournals` is a single
+ * directory read (never recurses, never follows a symlink), and every journal's own git calls
+ * inherit `options.timeoutMs`'s per-call, confirmed-termination bound (git-safety.ts's `runGit`
+ * never hangs past it) — so this resolves in at most
+ * `journalCount × (a small fixed number of git calls) × timeoutMs`. Never throws: a directory-
+ * level fault (`JournalDirectoryError`) or an unexpected per-journal error is logged and skipped
+ * rather than blocking startup.
+ */
+export async function reconcileUpdateJournalsOnStartup(deps: ReconcileUpdateJournalsOnStartupDeps): Promise<void> {
+  const {reposRoot = WORKSPACE_REPOS_ROOT, gitRunner = runGit, options = {}, now = () => new Date(), logger} = deps
+  const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
+  const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+
+  let entries: readonly JournalListEntry[]
+  try {
+    entries = await listJournals(journalsDir)
+  } catch (error) {
+    logger.error('update: startup journal reconciliation could not list journals — leaving all as-is', {
+      error: errorMessage(error),
+    })
+    return
+  }
+
+  for (const entry of entries) {
+    if (entry.result.ok === false) {
+      logger.warn('update: startup reconciliation found a malformed journal — leaving it in place (needs-recovery)', {
+        fileName: entry.fileName,
+        reason: entry.result.reason,
+      })
+      continue
+    }
+
+    const journal = entry.result.journal
+    if (journal.kind === 'recovery') {
+      logger.info('update: startup reconciliation skipping a recovery journal (Unit 5)', {
+        owner: journal.owner,
+        repo: journal.repo,
+        phase: journal.phase,
+      })
+      continue
+    }
+
+    const {owner, repo, phase} = journal
+    const destPath = join(reposRoot, owner, repo)
+    try {
+      await withRepoLock(repoMutexKey(owner, repo), async () => {
+        const outcome = await reconcileUpdateJournal({
+          journalsDir,
+          owner,
+          repo,
+          destPath,
+          gitRunner,
+          timeoutMs,
+          uid,
+          gid,
+          now,
+        })
+        if (outcome.kind === 'continue' || outcome.kind === 'ready') {
+          logger.info('update: startup reconciliation cleared a journal', {owner, repo, phase})
+          return
+        }
+        logger.warn(
+          'update: startup reconciliation left a journal in place — the next /update will refuse needs-recovery',
+          {
+            owner,
+            repo,
+            phase,
+          },
+        )
+      })
+    } catch (error) {
+      logger.error('update: startup reconciliation failed unexpectedly for one journal — leaving it in place', {
+        owner,
+        repo,
+        phase,
+        error: errorMessage(error),
+      })
+    }
   }
 }
 

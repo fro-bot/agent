@@ -7,8 +7,9 @@
  */
 
 import type {GitRunnerFn} from './git-safety.js'
+import type {UpdateRequest} from './types.js'
 import type {LoopbackListener} from './update-fixtures/helpers.js'
-import type {UpdateHandlerDeps, UpdateRequest} from './update.js'
+import type {JournalReconciliationLogger, UpdateHandlerDeps} from './update.js'
 
 import {mkdir, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
@@ -32,7 +33,7 @@ import {
   opensslAvailable,
   startLoopbackListener,
 } from './update-fixtures/helpers.js'
-import {executeUpdate} from './update.js'
+import {executeUpdate, reconcileUpdateJournalsOnStartup} from './update.js'
 
 const OWNER = 'acme'
 const REPO = 'widgets'
@@ -107,6 +108,11 @@ function makeGitRunnerSpy(): {readonly runner: GitRunnerFn; readonly calls: (rea
 function expectNoNetworkContact(calls: readonly (readonly string[])[]): void {
   expect(calls.some(args => args.includes('--git-dir'))).toBe(false)
   expect(remoteListener.requests.length).toBe(0)
+}
+
+/** A `JournalReconciliationLogger` that discards every call — for tests that only assert on journal state. */
+function silentLogger(): JournalReconciliationLogger {
+  return {info: () => {}, warn: () => {}, error: () => {}}
 }
 
 /**
@@ -869,5 +875,139 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — client abort, before vs a
     } finally {
       await fixture.close()
     }
+  })
+})
+
+describe('reconcileUpdateJournalsOnStartup', () => {
+  it('clears a "fetched" journal for an eligible checkout', async () => {
+    // #given
+    await setupEligibleCheckout()
+    await writeJournal(journalsDirFor(), {
+      kind: 'update',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'fetched',
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    await reconcileUpdateJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: silentLogger(),
+    })
+
+    // #then
+    expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: false, reason: 'absent'})
+  })
+
+  it('clears an "applied" journal whose HEAD already matches the target SHA', async () => {
+    // #given
+    const {headSha} = await setupEligibleCheckout()
+    await writeJournal(journalsDirFor(), {
+      kind: 'update',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'applied',
+      fromSha: '0'.repeat(40),
+      toSha: headSha,
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    await reconcileUpdateJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: silentLogger(),
+    })
+
+    // #then
+    expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: false, reason: 'absent'})
+  })
+
+  it('leaves an "applying" journal in place (needs-recovery is Unit 5\u2019s job, not startup\u2019s)', async () => {
+    // #given
+    await setupEligibleCheckout()
+    const journal = {
+      kind: 'update' as const,
+      owner: OWNER,
+      repo: REPO,
+      phase: 'applying' as const,
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    }
+    await writeJournal(journalsDirFor(), journal)
+
+    // #when
+    await reconcileUpdateJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: silentLogger(),
+    })
+
+    // #then \u2014 untouched: a subsequent /update for this repo would still refuse needs-recovery
+    expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: true, journal})
+  })
+
+  it('leaves a malformed journal file in place', async () => {
+    // #given
+    await setupEligibleCheckout()
+    await mkdir(journalsDirFor(), {recursive: true, mode: 0o700})
+    const filePath = join(journalsDirFor(), `${OWNER}__${REPO}.json`)
+    await writeFile(filePath, '{not valid json')
+
+    // #when
+    await reconcileUpdateJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: silentLogger(),
+    })
+
+    // #then \u2014 still unparseable, i.e. still there and still malformed
+    expect(await readJournal(journalsDirFor(), OWNER, REPO)).toMatchObject({ok: false, reason: 'malformed'})
+  })
+
+  it('reconciles multiple repositories\u2019 journals independently in one pass', async () => {
+    // #given \u2014 one repo with a clearable "fetched" journal, another with a keep-in-place "applying" one
+    await setupEligibleCheckout('acme', 'widgets')
+    await writeJournal(journalsDirFor(), {
+      kind: 'update',
+      owner: 'acme',
+      repo: 'widgets',
+      phase: 'fetched',
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    })
+    await setupEligibleCheckout('acme', 'gadgets')
+    await writeJournal(journalsDirFor(), {
+      kind: 'update',
+      owner: 'acme',
+      repo: 'gadgets',
+      phase: 'applying',
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    await reconcileUpdateJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: silentLogger(),
+    })
+
+    // #then
+    expect(await readJournal(journalsDirFor(), 'acme', 'widgets')).toEqual({ok: false, reason: 'absent'})
+    expect((await readJournal(journalsDirFor(), 'acme', 'gadgets')).ok).toBe(true)
+  })
+
+  it('does nothing (never throws) when no journals directory exists', async () => {
+    // #given \u2014 fresh reposRoot, no journals directory ever created
+    // #when / #then
+    await expect(reconcileUpdateJournalsOnStartup({reposRoot, logger: silentLogger()})).resolves.toBeUndefined()
   })
 })
