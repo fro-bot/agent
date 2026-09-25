@@ -4,20 +4,23 @@
  * ineligible checkout, and never spends a network round-trip (let alone a credential) confirming
  * that a checkout already known to be ineligible is, in fact, ineligible.
  *
- * SLICE 2a (this file, this shape): the NETWORK-FREE half only — journal reconciliation, the
- * repo mutex, canonical-path containment, layout/config/operation/cleanliness/submodule
- * admission, and the client-abort check before the mutation phase. Every admission check below
- * runs entirely against the LOCAL checkout, as AGENT_UID, with NO fetch, NO bare-repo access, and
- * NO network git profile ever built or spawned — every refusal path returns before
- * `runNetworkAndApply` is ever called.
+ * LOCAL ADMISSION (network-free): journal reconciliation, the repo mutex, canonical-path
+ * containment, layout/config/operation/cleanliness/submodule admission, and the client-abort
+ * check before the network phase. Every admission check below runs entirely against the LOCAL
+ * checkout, as AGENT_UID, with NO fetch, NO bare-repo access, and NO network git profile ever
+ * built or spawned — every refusal path returns before `runNetworkAndApply` is ever called.
  *
- * SLICE 2b (not in this file yet): `runNetworkAndApply` currently always returns
- * `{kind: 'failed', reason: 'not-implemented', ...}`. It will be replaced with the bare-repo
- * fetch store, `ls-remote`/fetch against the protected bare repo, ancestry classification, the
- * obstruction preflight, journal `applying`, the `pack-objects | index-pack` stream
- * (git-stream.ts), the `--no-overwrite-ignore` fast-forward merge (`buildLocalUpdateGitProfile`),
- * post-merge re-verification, and journal `applied` -> clear. See the plan's Unit 4 and the
- * "High-Level Technical Design" sequence diagram for the full flow this stub will complete.
+ * NETWORK + APPLY (`runNetworkAndApply`): creates the protected bare fetch store if absent,
+ * observes the remote's default branch and tip (`ls-remote --symref`), fetches it into a unique
+ * ref with one retry on a moved tip, journals `fetched`, imports the new objects into the
+ * checkout via the confirmed-termination pack-stream (git-stream.ts, additive only — no ref/HEAD/
+ * working-tree change), classifies ancestry INSIDE THE CHECKOUT (now that both H and T are
+ * resolvable there — see that section's own header for why the bare store alone can't do this),
+ * and for the "behind" case: runs the obstruction preflight, journals `applying`, re-checks
+ * admission (the agent may have changed `.git` during the round-trip), fast-forwards under the
+ * sealed local profile, verifies HEAD landed on T, journals `applied`, and clears. See the plan's
+ * Unit 4 and the "High-Level Technical Design" sequence diagram for the directional design this
+ * adapts (module-internal section headers document exactly where and why).
  *
  * See docs/plans/2026-09-24-001-feat-workspace-checkout-update-recovery-plan.md, Requirements
  * Trace R1-R6 and Unit 4, for the contract this module implements.
@@ -48,18 +51,34 @@
  */
 
 import type {LayoutRefusalReason, Obstruction} from './checkout-profile.js'
-import type {GitRunnerFn} from './git-safety.js'
-import type {CheckoutOperation} from './types.js'
+import type {GitProfile, GitRunnerFn} from './git-safety.js'
+import type {PackStreamOptions, PackStreamOutcome} from './git-stream.js'
+import type {CheckoutHead, CheckoutOperation} from './types.js'
 
-import {realpath} from 'node:fs/promises'
-import {join} from 'node:path'
+import {randomUUID} from 'node:crypto'
+import {lstat, mkdir, mkdtemp, realpath, rm} from 'node:fs/promises'
+import {tmpdir} from 'node:os'
+import {dirname, join} from 'node:path'
+import process from 'node:process'
 
-import {checkCheckoutLayout, checkTempIndexCleanliness, inventoryCheckoutConfig} from './checkout-profile.js'
+import {
+  checkCheckoutLayout,
+  checkTempIndexCleanliness,
+  inventoryCheckoutConfig,
+  preflightObstructions,
+} from './checkout-profile.js'
 import {writeAskpassHelper} from './clone.js'
-import {buildNeutralGitEnv, gitInvocation, runGit} from './git-safety.js'
-import {AGENT_GID, AGENT_UID, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {
+  buildLocalUpdateGitProfile,
+  buildNetworkGitProfile,
+  buildNeutralGitEnv,
+  gitInvocation,
+  runGit,
+} from './git-safety.js'
+import {runPackStream} from './git-stream.js'
+import {AGENT_GID, AGENT_UID, FETCH_STORE_DIR_NAME, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {inspectCheckout} from './inspect.js'
-import {readJournal, removeJournal} from './journal.js'
+import {readJournal, removeJournal, writeJournal} from './journal.js'
 import {repoMutexKey, withRepoLock} from './repo-mutex.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors clone.ts/inspect.ts. */
@@ -89,6 +108,15 @@ export const DEFAULT_REMOTE_BASE_URL = 'https://github.com'
  * manifest of a possibly-enormous dirty tree.
  */
 export const MAX_DIRTY_SAMPLE_SIZE = 20
+
+/** Default budget for the apply phase (pack import + fast-forward merge), in milliseconds. Matches the plan's 25-second apply allocation. */
+export const DEFAULT_APPLY_TIMEOUT_MS = 25_000
+
+/** Default cap on total bytes piped through the pack stream. Generous but bounded — tunable via `UpdateHandlerDeps.maxPackBytes`. */
+export const DEFAULT_MAX_PACK_BYTES = 2 * 1024 * 1024 * 1024
+
+/** Default service identity home directory — the root-owned identity that runs every network git operation. Never AGENT_HOME. */
+export const DEFAULT_SERVICE_HOME = process.env.HOME ?? '/root'
 
 /** POST /update request body. */
 export interface UpdateRequest {
@@ -158,16 +186,17 @@ export type UpdateRefused =
   | {readonly kind: 'refused'; readonly reason: 'obstructed'; readonly obstructions: readonly Obstruction[]}
 
 /**
- * Every reason `/update` can fail for. `'not-implemented'` is slice 2a's own placeholder —
- * `runNetworkAndApply` always returns it today; slice 2b replaces that function's body (never
- * this union's shape at the call site) and will add the fetch/apply failure reasons it needs
- * (auth rejected, host unreachable, rate-limited, remote-moved, apply-failed,
- * termination-unconfirmed) alongside it.
+ * Every reason `/update` can fail for, closed. Fetch-phase reasons (`fetch-*`, `remote-moved`)
+ * always carry `mutationStarted: false` — nothing in the checkout was ever touched. Apply-phase
+ * reasons (`apply-failed`, `termination-unconfirmed`) always leave the journal at `applying`,
+ * forcing recovery, since something in or around the checkout was touched or is of unconfirmed
+ * state.
  */
 export type UpdateFailureReason =
   /**
-   * The client's `AbortSignal` fired before the network/apply half began. Never partway through
-   * a mutation in this slice, since slice 2a never starts one.
+   * The client's `AbortSignal` fired before the apply phase began (checked only up through the
+   * fetch phase — once the journal records `applying`, the mutation runs to completion or
+   * confirmed termination regardless of a later disconnect).
    */
   | 'aborted'
   /**
@@ -176,8 +205,34 @@ export type UpdateFailureReason =
    * closed rather than guessing.
    */
   | 'inspection-failed'
-  /** The network/apply half (slice 2b) is not implemented yet. See `runNetworkAndApply`. */
-  | 'not-implemented'
+  /** The remote rejected the credential (401, or an auth challenge never satisfied). Not permanent — a fresh token may succeed. */
+  | 'fetch-auth-rejected'
+  /** The remote reported 404 — explicit positive evidence the repository doesn't exist (or isn't visible to this token). Permanent. */
+  | 'fetch-not-found'
+  /** The remote reported 403 — explicit positive evidence access is denied. Permanent. */
+  | 'fetch-forbidden'
+  /** The remote reported 429. Not permanent — expected to clear. */
+  | 'fetch-rate-limited'
+  /** The remote host could not be reached (connection refused, DNS failure, TLS failure). Not permanent. */
+  | 'fetch-unreachable'
+  /** The fetch phase (ls-remote or fetch) did not complete within the network budget. Not permanent. */
+  | 'fetch-timeout'
+  /** A fetch-phase git invocation failed for a reason this module's classifier doesn't recognize. Not permanent — unclassified failures are never assumed permanent. */
+  | 'fetch-failed'
+  /** The remote's default-branch tip moved between observations, twice in a row (the one retry was exhausted). Not permanent. */
+  | 'remote-moved'
+  /**
+   * The apply phase (re-admission re-check, pack import, or the fast-forward merge itself) failed
+   * with a CONFIRMED (non-zero exit, or a positively-detected post-merge mismatch) outcome.
+   * `mutationStarted: true`.
+   */
+  | 'apply-failed'
+  /**
+   * A pack-stream or merge subprocess's termination could not be CONFIRMED (mirrors
+   * `PackStreamOutcome`'s/`GitOutcome`'s own `termination-unconfirmed`). `mutationStarted:
+   * 'possibly'` — never a synonym for `true`.
+   */
+  | 'termination-unconfirmed'
 
 /**
  * An attempt was made (or, for slice 2a, admission fully passed and the network/apply half was
@@ -235,9 +290,21 @@ export interface UpdateHandlerDeps {
    * `writeAskpassHelper`. Network half only (slice 2b).
    */
   readonly askpassWriter?: (dir: string) => Promise<string>
-  /** Network budget in milliseconds (ls-remote + fetch, including one retry). Defaults to DEFAULT_NETWORK_BUDGET_MS. Network half only (slice 2b). */
+  /** Network budget in milliseconds (ls-remote + fetch, including one retry). Defaults to DEFAULT_NETWORK_BUDGET_MS. Per-call timeout for every fetch-phase git invocation. */
   readonly networkBudgetMs?: number
-  /** Client abort signal. Checked once, immediately before the network/apply half would begin. */
+  /** Apply-phase budget in milliseconds (pack import + fast-forward merge). Defaults to DEFAULT_APPLY_TIMEOUT_MS. */
+  readonly applyTimeoutMs?: number
+  /** Cap on total bytes piped through the pack stream. Defaults to DEFAULT_MAX_PACK_BYTES. */
+  readonly maxPackBytes?: number
+  /** Root-owned service identity's home directory — cwd and HOME/XDG_CONFIG_HOME for every network git invocation. Defaults to DEFAULT_SERVICE_HOME. Never AGENT_HOME. */
+  readonly serviceHome?: string
+  /**
+   * Injected pack-stream runner for testability — the seam a test uses to force a confirmed or
+   * unconfirmed termination deterministically, without needing an actual hung subprocess.
+   * Defaults to the real `runPackStream` (git-stream.ts).
+   */
+  readonly packStreamRunner?: (options: PackStreamOptions) => Promise<PackStreamOutcome>
+  /** Client abort signal. Honored through the fetch phase; ignored once the apply phase begins (journal `applying`). */
   readonly signal?: AbortSignal
 }
 
@@ -421,31 +488,38 @@ async function reconcileUpdateJournal(params: {
 }
 
 // ---------------------------------------------------------------------------
-// Network + apply half — NOT IMPLEMENTED in slice 2a. Every admission check above already passed
-// by the time this is reached, so any checkout reaching this function is fully eligible; slice 2a
-// simply stops here. Slice 2b replaces this function's BODY only — the admission flow above it,
-// and every type this module exports, are designed to need no changes when it does.
+// Network + apply half (slice 2b). Every admission check above already passed by the time this is
+// reached, so any checkout reaching this function is fully eligible. See the plan's Unit 4
+// approach and the "High-Level Technical Design" sequence diagram for the flow this implements —
+// adapted in one respect: the obstruction preflight (`preflightObstructions`) reads `toSha`'s tree
+// from the CHECKOUT's own object database (see checkout-profile.ts), which does not exist there
+// until the pack import has run. So objects are imported (additive-only — no ref, HEAD, or
+// working-tree change) BEFORE the preflight, and the journal moves to `applying` only immediately
+// before the merge itself, the first step that touches HEAD/refs/the working tree.
 // ---------------------------------------------------------------------------
 
 /**
- * Context `runNetworkAndApply` needs to complete slice 2b — assembled by `executeUpdate` from
- * validated admission state (an eligible checkout, its observed HEAD/branch, and every injectable
- * dependency `UpdateHandlerDeps` accepts) so slice 2b's implementation never has to re-derive any
- * of it or change `executeUpdate`'s own shape to get it.
+ * Context `runNetworkAndApply` needs — assembled by `executeUpdate` from validated admission state
+ * (an eligible checkout, its observed HEAD, and every injectable dependency `UpdateHandlerDeps`
+ * accepts).
  */
 interface NetworkAndApplyContext {
   readonly owner: string
   readonly repo: string
   readonly token: string
+  readonly reposRoot: string
   readonly canonicalCheckoutPath: string
-  readonly branch: string
-  readonly headSha: string
+  readonly head: CheckoutHead
   readonly journalsDir: string
   readonly gitRunner: GitRunnerFn
   readonly remoteBaseUrl: string
   readonly caBundlePath: string | undefined
   readonly askpassWriter: (dir: string) => Promise<string>
+  readonly serviceHome: string
   readonly networkBudgetMs: number
+  readonly applyTimeoutMs: number
+  readonly maxPackBytes: number
+  readonly packStreamRunner: (options: PackStreamOptions) => Promise<PackStreamOutcome>
   readonly timeoutMs: number
   readonly uid: number | undefined
   readonly gid: number | undefined
@@ -453,17 +527,703 @@ interface NetworkAndApplyContext {
   readonly signal: AbortSignal | undefined
 }
 
+/** `<reposRoot>/.workspace-agent/<FETCH_STORE_DIR_NAME>/<owner>__<repo>.git` — matches identity.ts's documented fetch-store naming (the same `<owner>__<repo>` pairing journal.ts uses), a single flat, root-owned directory rather than a per-owner tree needing its own symlink-safety chain. */
+function fetchStorePathFor(reposRoot: string, owner: string, repo: string): string {
+  return join(reposRoot, WORKSPACE_STATE_DIR_NAME, FETCH_STORE_DIR_NAME, `${owner}__${repo}.git`)
+}
+
 /**
- * What slice 2b adds here: create the protected bare repo if absent, `ls-remote --symref HEAD` +
- * fetch the default branch (`buildNetworkGitProfile`, using `context.remoteBaseUrl` /
- * `caBundlePath` / `askpassWriter` / `networkBudgetMs`), re-observe and retry once within the
- * network budget, require the local branch to equal the observed default branch, ancestry-check H
- * against T (equal -> `ready`/`unchanged`), the obstruction preflight, journal `applying`, the
- * `pack-objects | index-pack` stream (git-stream.ts), the fast-forward merge
- * (`buildLocalUpdateGitProfile`), post-merge re-verification, and journal `applied` -> clear.
+ * Ensures the protected bare fetch store exists at `fetchStorePath`, creating it (and its parent
+ * chain, mode 0700) only when confirmed absent — mirrors journal.ts's directory-safety posture
+ * (never chowns/relaxes an existing directory, refuses outright if the target or its parent
+ * EXISTS but is a symlink) without duplicating its full implementation, since the fetch store's
+ * threat model (a root-owned bare git repo, never journal content) doesn't need the malformed-
+ * content parsing journal.ts's checks exist for.
  */
-async function runNetworkAndApply(_context: NetworkAndApplyContext): Promise<UpdateResult> {
-  return {kind: 'failed', reason: 'not-implemented', mutationStarted: false, permanent: false}
+async function ensureBareFetchStore(params: {
+  readonly fetchStorePath: string
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+}): Promise<'ok' | 'failed'> {
+  const {fetchStorePath, gitRunner, timeoutMs} = params
+  try {
+    const st = await lstat(fetchStorePath)
+    if (st.isSymbolicLink() || !st.isDirectory()) return 'failed'
+    return 'ok'
+  } catch {
+    // ENOENT — fall through to create.
+  }
+  const parent = dirname(fetchStorePath)
+  try {
+    const parentStat = await lstat(parent)
+    if (parentStat.isSymbolicLink()) return 'failed'
+  } catch {
+    // Parent absent too — mkdir recursive below creates the whole chain.
+  }
+  try {
+    await mkdir(parent, {recursive: true, mode: 0o700})
+  } catch {
+    return 'failed'
+  }
+  const outcome = await gitRunner(['init', '--quiet', '--bare', fetchStorePath], {
+    cwd: parent,
+    env: buildNeutralGitEnv(),
+    timeoutMs,
+  })
+  return outcome.kind === 'ok' ? 'ok' : 'failed'
+}
+
+/**
+ * Every reason a fetch-phase git invocation (`ls-remote`/`fetch`) can fail for, classified from
+ * its stderr — captured against the REAL Unit 2/slice-1 `git-http-server` fixture (see
+ * update.test.ts's "remote failure classification" describe block for the exact evidence each
+ * pattern is proven against): only an explicit 404 (`fatal: repository '...' not found`) or 403
+ * (`... error: 403`) is `permanent`; 401 (`fatal: Authentication failed`), 429
+ * (`... error: 429`), and connection failure (`Couldn't connect to server` / `Failed to connect`)
+ * are not — each is recoverable without any code or config change on this side.
+ */
+export type RemoteFailureReason =
+  | 'fetch-auth-rejected'
+  | 'fetch-not-found'
+  | 'fetch-forbidden'
+  | 'fetch-rate-limited'
+  | 'fetch-unreachable'
+  | 'fetch-failed'
+
+function classifyRemoteFailure(stderr: string): {readonly reason: RemoteFailureReason; readonly permanent: boolean} {
+  if (/^fatal: repository '.*' not found/m.test(stderr)) return {reason: 'fetch-not-found', permanent: true}
+  if (/error: 403\b/.test(stderr)) return {reason: 'fetch-forbidden', permanent: true}
+  if (/error: 429\b/.test(stderr)) return {reason: 'fetch-rate-limited', permanent: false}
+  if (/^fatal: Authentication failed/m.test(stderr)) return {reason: 'fetch-auth-rejected', permanent: false}
+  if (/Couldn't connect to server|Failed to connect/.test(stderr))
+    return {reason: 'fetch-unreachable', permanent: false}
+  return {reason: 'fetch-failed', permanent: false}
+}
+
+// ---------------------------------------------------------------------------
+// Remote observation — ls-remote --symref (default branch + tip) and fetch, both through the
+// sealed root-identity network git profile (buildNetworkGitProfile, git-safety.ts). Every call
+// here is the ONLY place this module ever dials out, and the ONLY place a credential is ever in
+// scope.
+// ---------------------------------------------------------------------------
+
+interface RemoteObservation {
+  readonly branch: string
+  readonly sha: string
+}
+
+type ObserveOutcome =
+  | {readonly kind: 'ok'; readonly observation: RemoteObservation}
+  | {readonly kind: 'failed'; readonly reason: RemoteFailureReason; readonly permanent: boolean}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'aborted'}
+
+const DEFAULT_BRANCH_SYMREF_RE = /ref: refs\/heads\/(\S+)\s+HEAD/
+const HEAD_SHA_LINE_RE = /^([0-9a-f]{40})\tHEAD$/m
+
+/**
+ * `GitOutcome`'s `timeout`/`termination-unconfirmed` report EXACTLY the same shape whether a
+ * per-call timeout fired or the caller's own `signal` was aborted (git-safety.ts's `runGit` doc
+ * comment: "there is no way to distinguish... a caller that needs to know which one happened must
+ * track that itself"). Checked AFTER the call resolves, never before — the abort may have fired
+ * during the call, not only before it started.
+ */
+function classifyTimeoutOrAbort(signal: AbortSignal | undefined): 'aborted' | 'timeout' {
+  return signal?.aborted === true ? 'aborted' : 'timeout'
+}
+
+/** Runs `ls-remote --symref <remoteUrl> HEAD` and parses the remote's default branch name and current tip SHA. */
+async function observeRemoteDefaultBranch(
+  profile: GitProfile,
+  remoteUrl: string,
+  gitRunner: GitRunnerFn,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): Promise<ObserveOutcome> {
+  const outcome = await gitRunner([...profile.args, 'ls-remote', '--symref', remoteUrl, 'HEAD'], {
+    cwd: profile.cwd,
+    env: profile.env,
+    timeoutMs,
+    signal,
+  })
+  if (outcome.kind === 'timeout' || outcome.kind === 'termination-unconfirmed')
+    return {kind: classifyTimeoutOrAbort(signal)}
+  if (outcome.kind !== 'ok') {
+    const {reason, permanent} = classifyRemoteFailure(outcome.stderr)
+    return {kind: 'failed', reason, permanent}
+  }
+  const branchMatch = DEFAULT_BRANCH_SYMREF_RE.exec(outcome.stdout)
+  const shaMatch = HEAD_SHA_LINE_RE.exec(outcome.stdout)
+  if (branchMatch?.[1] === undefined || shaMatch?.[1] === undefined) {
+    return {kind: 'failed', reason: 'fetch-failed', permanent: false}
+  }
+  return {kind: 'ok', observation: {branch: branchMatch[1], sha: shaMatch[1]}}
+}
+
+type FetchIntoRefOutcome =
+  | {readonly kind: 'ok'}
+  | {readonly kind: 'failed'; readonly reason: RemoteFailureReason; readonly permanent: boolean}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'aborted'}
+
+/** Runs `fetch <remoteUrl> <refspec>` — `refspec` may be `<branch>:<localRef>` (creates/updates `localRef`) or a bare SHA (fetches the object without creating a ref; requires the remote to allow SHA1-in-want, exactly as GitHub does). */
+async function fetchIntoRef(
+  profile: GitProfile,
+  remoteUrl: string,
+  refspec: string,
+  gitRunner: GitRunnerFn,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): Promise<FetchIntoRefOutcome> {
+  const outcome = await gitRunner([...profile.args, 'fetch', '--quiet', remoteUrl, refspec], {
+    cwd: profile.cwd,
+    env: profile.env,
+    timeoutMs,
+    signal,
+  })
+  if (outcome.kind === 'timeout' || outcome.kind === 'termination-unconfirmed')
+    return {kind: classifyTimeoutOrAbort(signal)}
+  if (outcome.kind !== 'ok') {
+    const {reason, permanent} = classifyRemoteFailure(outcome.stderr)
+    return {kind: 'failed', reason, permanent}
+  }
+  return {kind: 'ok'}
+}
+
+interface ObserveAndFetchResult {
+  readonly branch: string
+  readonly targetSha: string
+  readonly uniqueRef: string
+}
+
+type ObserveAndFetchOutcome =
+  | {readonly kind: 'ok'; readonly result: ObserveAndFetchResult}
+  | {readonly kind: 'refused'; readonly result: UpdateRefused}
+  | {readonly kind: 'failed'; readonly result: UpdateFailed}
+
+/**
+ * Observes the remote's default branch and tip, refuses `detached`/`non-default-branch` before
+ * ever fetching object data, then fetches the branch into a fresh unique ref and re-observes to
+ * detect a moved tip — retrying the fetch-then-observe pair once (two total attempts) before
+ * failing `remote-moved`. Every git invocation runs through the sealed network profile with
+ * `timeoutMs` as its PER-CALL bound; the caller (`runNetworkAndApply`) is responsible for the
+ * overall network-budget deadline.
+ */
+async function observeAndFetch(params: {
+  readonly profile: GitProfile
+  readonly remoteUrl: string
+  readonly head: CheckoutHead
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+  readonly signal: AbortSignal | undefined
+}): Promise<ObserveAndFetchOutcome> {
+  const {profile, remoteUrl, head, gitRunner, timeoutMs, signal} = params
+
+  const first = await observeRemoteDefaultBranch(profile, remoteUrl, gitRunner, timeoutMs, signal)
+  if (first.kind === 'aborted') {
+    return {kind: 'failed', result: {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}}
+  }
+  if (first.kind === 'timeout') {
+    return {kind: 'failed', result: {kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false}}
+  }
+  if (first.kind === 'failed') {
+    return {
+      kind: 'failed',
+      result: {kind: 'failed', reason: first.reason, mutationStarted: false, permanent: first.permanent},
+    }
+  }
+
+  if (head.kind === 'detached') return {kind: 'refused', result: {kind: 'refused', reason: 'detached'}}
+  if (head.branch !== first.observation.branch) {
+    return {kind: 'refused', result: {kind: 'refused', reason: 'non-default-branch', branch: head.branch}}
+  }
+
+  let previousSha = first.observation.sha
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const uniqueRef = `refs/fro-bot/fetch/${randomUUID()}`
+    const fetchOutcome = await fetchIntoRef(
+      profile,
+      remoteUrl,
+      `${first.observation.branch}:${uniqueRef}`,
+      gitRunner,
+      timeoutMs,
+      signal,
+    )
+    if (fetchOutcome.kind === 'aborted') {
+      return {kind: 'failed', result: {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}}
+    }
+    if (fetchOutcome.kind === 'timeout') {
+      return {
+        kind: 'failed',
+        result: {kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false},
+      }
+    }
+    if (fetchOutcome.kind === 'failed') {
+      return {
+        kind: 'failed',
+        result: {
+          kind: 'failed',
+          reason: fetchOutcome.reason,
+          mutationStarted: false,
+          permanent: fetchOutcome.permanent,
+        },
+      }
+    }
+
+    const reobserved = await observeRemoteDefaultBranch(profile, remoteUrl, gitRunner, timeoutMs, signal)
+    if (reobserved.kind === 'aborted') {
+      return {kind: 'failed', result: {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}}
+    }
+    if (reobserved.kind === 'timeout') {
+      return {
+        kind: 'failed',
+        result: {kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false},
+      }
+    }
+    if (reobserved.kind === 'failed') {
+      return {
+        kind: 'failed',
+        result: {kind: 'failed', reason: reobserved.reason, mutationStarted: false, permanent: reobserved.permanent},
+      }
+    }
+
+    if (reobserved.observation.sha === previousSha) {
+      return {kind: 'ok', result: {branch: first.observation.branch, targetSha: reobserved.observation.sha, uniqueRef}}
+    }
+    previousSha = reobserved.observation.sha
+  }
+
+  return {kind: 'failed', result: {kind: 'failed', reason: 'remote-moved', mutationStarted: false, permanent: false}}
+}
+
+// ---------------------------------------------------------------------------
+// Ancestry — classified INSIDE THE CHECKOUT, after the object import below, never from the bare
+// fetch store. H is a LOCAL commit the remote may never have seen at all (the ordinary "ahead"
+// case: the agent committed locally without pushing) — the bare store has no basis to resolve it,
+// and no remote (not even GitHub) can be asked to fetch an object it was never given. The checkout
+// is the only repository guaranteed to already hold H; importing T's objects into it (additive
+// only, see below) is what makes ancestry decidable at all for every case, not only "behind".
+// ---------------------------------------------------------------------------
+
+async function shaPresentInBare(
+  bareRepoPath: string,
+  sha: string,
+  gitRunner: GitRunnerFn,
+  timeoutMs: number,
+): Promise<boolean> {
+  const outcome = await gitRunner(['--git-dir', bareRepoPath, 'cat-file', '-e', `${sha}^{commit}`], {
+    cwd: bareRepoPath,
+    env: buildNeutralGitEnv(),
+    timeoutMs,
+  })
+  return outcome.kind === 'ok'
+}
+
+type AncestryKind = 'equal' | 'behind' | 'ahead' | 'diverged'
+
+/** `git merge-base --is-ancestor` in the checkout: exit 0 = ancestor, exit 1 = not an ancestor (informative, not a failure), anything else = inspection-failed. */
+async function classifyAncestryInCheckout(params: {
+  readonly canonicalCheckoutPath: string
+  readonly fromSha: string
+  readonly toSha: string
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}): Promise<AncestryKind | 'inspection-failed'> {
+  const {canonicalCheckoutPath, fromSha, toSha, gitRunner, timeoutMs, uid, gid} = params
+  if (fromSha === toSha) return 'equal'
+  const env = buildNeutralGitEnv()
+  const isAncestor = async (a: string, b: string): Promise<boolean | 'inspection-failed'> => {
+    const outcome = await gitRunner(
+      gitInvocation(canonicalCheckoutPath, canonicalCheckoutPath, ['merge-base', '--is-ancestor', a, b]),
+      {cwd: canonicalCheckoutPath, env, timeoutMs, uid, gid},
+    )
+    if (outcome.kind === 'ok') return true
+    if (outcome.kind === 'failed' && outcome.code === 1) return false
+    return 'inspection-failed'
+  }
+  const behind = await isAncestor(fromSha, toSha)
+  if (behind === 'inspection-failed') return 'inspection-failed'
+  if (behind) return 'behind'
+  const ahead = await isAncestor(toSha, fromSha)
+  if (ahead === 'inspection-failed') return 'inspection-failed'
+  return ahead ? 'ahead' : 'diverged'
+}
+
+// ---------------------------------------------------------------------------
+// Object import — pack-objects (root, bare store) | index-pack (AGENT_UID, checkout), via
+// git-stream.ts's confirmed-termination two-process pipe. ADDITIVE ONLY: writes packed objects
+// into the checkout's odb, touches no ref, no HEAD, no working tree, no index. This is what makes
+// `toSha` resolvable for the obstruction preflight below, without ever using a local fetch or
+// alternates (see the plan's "Objects cross as a pack stream" decision).
+// ---------------------------------------------------------------------------
+
+type PhaseOutcome = {readonly kind: 'ok'} | {readonly kind: 'failed'; readonly result: UpdateFailed}
+
+async function importPackObjects(params: {
+  readonly bareRepoPath: string
+  readonly canonicalCheckoutPath: string
+  /** H, excluded from the pack when present in the bare store (the ordinary "behind" case: a delta, not the full closure). Undefined — or absent from the bare store — packs the FULL closure of `toSha`, since a commit the remote never received can't be excluded from a pack built from the remote's own objects. */
+  readonly fromShaIfKnownToBare: string | undefined
+  readonly toSha: string
+  readonly packStreamRunner: (options: PackStreamOptions) => Promise<PackStreamOutcome>
+  readonly maxPackBytes: number
+  readonly applyTimeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}): Promise<PhaseOutcome> {
+  const {
+    bareRepoPath,
+    canonicalCheckoutPath,
+    fromShaIfKnownToBare,
+    toSha,
+    packStreamRunner,
+    maxPackBytes,
+    applyTimeoutMs,
+    uid,
+    gid,
+  } = params
+
+  const revs = fromShaIfKnownToBare === undefined ? `${toSha}\n` : `${toSha}\n^${fromShaIfKnownToBare}\n`
+
+  const outcome = await packStreamRunner({
+    writer: {
+      command: 'git',
+      args: ['--git-dir', bareRepoPath, 'pack-objects', '--quiet', '--revs', '--stdout'],
+      cwd: bareRepoPath,
+      env: buildNeutralGitEnv(),
+      stdin: revs,
+    },
+    reader: {
+      command: 'git',
+      args: [...gitInvocation(canonicalCheckoutPath, canonicalCheckoutPath, ['index-pack', '--stdin', '--strict'])],
+      cwd: canonicalCheckoutPath,
+      env: {...buildNeutralGitEnv(), GIT_ALLOW_PROTOCOL: ''},
+      uid,
+      gid,
+    },
+    maxBytes: maxPackBytes,
+    timeoutMs: applyTimeoutMs,
+  })
+
+  if (outcome.kind === 'ok') return {kind: 'ok'}
+  if (outcome.kind === 'termination-unconfirmed') {
+    return {
+      kind: 'failed',
+      result: {kind: 'failed', reason: 'termination-unconfirmed', mutationStarted: 'possibly', permanent: false},
+    }
+  }
+  // 'timeout' (confirmed-terminated) or 'failed' (writer-failed/reader-failed/byte-cap-exceeded/
+  // spawn-failed): `index-pack` publishes objects only via an atomic rename on success, so a
+  // confirmed non-success here never leaves a partially-written object in the checkout's odb —
+  // nothing observable was mutated.
+  return {kind: 'failed', result: {kind: 'failed', reason: 'apply-failed', mutationStarted: false, permanent: false}}
+}
+
+// ---------------------------------------------------------------------------
+// The fast-forward merge itself — the point of no return. Called only once the journal already
+// reads `applying` (set by the caller before the object import above) and the obstruction
+// preflight has passed. Re-runs layout/config/cleanliness/operation-state immediately before
+// mutating — the agent may have changed `.git` during the network round-trip — then
+// `merge --ff-only --no-overwrite-ignore` under the sealed LOCAL profile, then verifies HEAD
+// really landed on `toSha` before ever clearing the journal. Every non-clean outcome from this
+// point on LEAVES the journal at `applying`: once a mutation may have started, an interrupted or
+// unconfirmed attempt is never reported as "nothing changed" (R6).
+// ---------------------------------------------------------------------------
+
+async function runFastForward(params: {
+  readonly journalsDir: string
+  readonly owner: string
+  readonly repo: string
+  readonly reposRoot: string
+  readonly canonicalCheckoutPath: string
+  readonly fromSha: string
+  readonly toSha: string
+  readonly branch: string
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+  readonly applyTimeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+  readonly now: () => Date
+}): Promise<UpdateResult> {
+  const {
+    journalsDir,
+    owner,
+    repo,
+    reposRoot,
+    canonicalCheckoutPath,
+    fromSha,
+    toSha,
+    branch,
+    gitRunner,
+    timeoutMs,
+    applyTimeoutMs,
+    uid,
+    gid,
+    now,
+  } = params
+
+  const APPLY_FAILED_MUTATED: UpdateFailed = {
+    kind: 'failed',
+    reason: 'apply-failed',
+    mutationStarted: true,
+    permanent: false,
+  }
+
+  const layout = await checkCheckoutLayout({checkoutPath: canonicalCheckoutPath, timeoutMs, uid, gid})
+  if (layout.kind !== 'ok') return APPLY_FAILED_MUTATED
+
+  const configInventory = await inventoryCheckoutConfig({
+    checkoutPath: canonicalCheckoutPath,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  if (configInventory.kind !== 'allowed') return APPLY_FAILED_MUTATED
+
+  const cleanliness = await checkTempIndexCleanliness({
+    checkoutPath: canonicalCheckoutPath,
+    headSha: fromSha,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  if (cleanliness.kind !== 'clean') return APPLY_FAILED_MUTATED
+
+  const reinspected = await inspectCheckout(
+    {owner, repo},
+    {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
+  )
+  if (reinspected.response.ok !== true || reinspected.response.observation.operationInProgress !== 'none') {
+    return APPLY_FAILED_MUTATED
+  }
+
+  const localProfile = buildLocalUpdateGitProfile({checkoutPath: canonicalCheckoutPath})
+  const mergeOutcome = await gitRunner([...localProfile.args, 'merge', '--ff-only', '--no-overwrite-ignore', toSha], {
+    cwd: localProfile.cwd,
+    env: localProfile.env,
+    timeoutMs: applyTimeoutMs,
+    uid,
+    gid,
+  })
+  if (mergeOutcome.kind === 'termination-unconfirmed') {
+    return {kind: 'failed', reason: 'termination-unconfirmed', mutationStarted: 'possibly', permanent: false}
+  }
+  if (mergeOutcome.kind !== 'ok') return APPLY_FAILED_MUTATED
+
+  const headOutcome = await gitRunner([...localProfile.args, 'rev-parse', '--verify', 'HEAD^{commit}'], {
+    cwd: localProfile.cwd,
+    env: localProfile.env,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  if (headOutcome.kind !== 'ok' || headOutcome.stdout.trim() !== toSha) return APPLY_FAILED_MUTATED
+
+  await writeJournal(journalsDir, {
+    kind: 'update',
+    owner,
+    repo,
+    phase: 'applied',
+    fromSha,
+    toSha,
+    startedAt: now().toISOString(),
+  })
+  await removeJournal(journalsDir, owner, repo)
+
+  return {kind: 'ready', change: 'fast-forward', branch, sha: toSha, fromSha, checkedAt: now().toISOString()}
+}
+
+/**
+ * The network + apply half. Every admission check in `executeUpdate` has already passed by the
+ * time this runs, so `context.head`/`context.canonicalCheckoutPath` describe a fully eligible
+ * checkout. See the module header's "Network + apply half" section for the phase-by-phase design
+ * and the journal-phase interpretation this implements.
+ */
+async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<UpdateResult> {
+  const {
+    owner,
+    repo,
+    token,
+    reposRoot,
+    canonicalCheckoutPath,
+    head,
+    journalsDir,
+    gitRunner,
+    remoteBaseUrl,
+    caBundlePath,
+    askpassWriter,
+    serviceHome,
+    networkBudgetMs,
+    applyTimeoutMs,
+    maxPackBytes,
+    packStreamRunner,
+    timeoutMs,
+    uid,
+    gid,
+    now,
+    signal,
+  } = context
+
+  const fetchStorePath = fetchStorePathFor(reposRoot, owner, repo)
+  const storeReady = await ensureBareFetchStore({fetchStorePath, gitRunner, timeoutMs})
+  if (storeReady === 'failed') {
+    return {kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false}
+  }
+
+  const askpassDir = await mkdtemp(join(tmpdir(), 'workspace-agent-update-askpass-'))
+  let uniqueRef: string | undefined
+  try {
+    const askpassPath = await askpassWriter(askpassDir)
+    const networkProfile = buildNetworkGitProfile({
+      bareRepoPath: fetchStorePath,
+      serviceHome,
+      askpassPath,
+      token,
+      caBundlePath,
+      parentEnv: process.env,
+    })
+    const remoteUrl = `${remoteBaseUrl}/${owner}/${repo}.git`
+    const fromSha = head.sha
+
+    const observed = await observeAndFetch({
+      profile: networkProfile,
+      remoteUrl,
+      head,
+      gitRunner,
+      timeoutMs: networkBudgetMs,
+      signal,
+    })
+    if (observed.kind !== 'ok') return observed.result
+    uniqueRef = observed.result.uniqueRef
+    const {branch, targetSha} = observed.result
+
+    await writeJournal(journalsDir, {
+      kind: 'update',
+      owner,
+      repo,
+      phase: 'fetched',
+      fromSha,
+      toSha: targetSha,
+      startedAt: now().toISOString(),
+    })
+
+    // Last chance to honor a client abort before any checkout-touching activity begins — ignored
+    // from here on (journal moves to `applying` next, and stays honored-blind through the rest of
+    // this function: "once the journal records applying, the workspace runs the mutation to
+    // completion or confirmed termination regardless of the disconnect").
+    if (signal?.aborted === true) {
+      await removeJournal(journalsDir, owner, repo)
+      return {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}
+    }
+
+    await writeJournal(journalsDir, {
+      kind: 'update',
+      owner,
+      repo,
+      phase: 'applying',
+      fromSha,
+      toSha: targetSha,
+      startedAt: now().toISOString(),
+    })
+
+    // H may be a LOCAL commit the remote has never seen (the "ahead" case) — pack the full closure
+    // of T when the bare store doesn't already have H, never a delta built against an object that
+    // isn't there.
+    const hKnownToBare = await shaPresentInBare(fetchStorePath, fromSha, gitRunner, timeoutMs)
+    const imported = await importPackObjects({
+      bareRepoPath: fetchStorePath,
+      canonicalCheckoutPath,
+      fromShaIfKnownToBare: hKnownToBare ? fromSha : undefined,
+      toSha: targetSha,
+      packStreamRunner,
+      maxPackBytes,
+      applyTimeoutMs,
+      uid,
+      gid,
+    })
+    if (imported.kind === 'failed') {
+      if (imported.result.reason !== 'termination-unconfirmed') await removeJournal(journalsDir, owner, repo)
+      return imported.result
+    }
+
+    // T's objects are now resolvable in the checkout — alongside H, which the checkout always
+    // already had — so ancestry can finally be decided, for every case, not only "behind".
+    const ancestry = await classifyAncestryInCheckout({
+      canonicalCheckoutPath,
+      fromSha,
+      toSha: targetSha,
+      gitRunner,
+      timeoutMs,
+      uid,
+      gid,
+    })
+    if (ancestry === 'inspection-failed') {
+      // Can't confirm the checkout's state; leave the journal at `applying` for recovery.
+      return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+    }
+    if (ancestry === 'equal') {
+      await removeJournal(journalsDir, owner, repo)
+      return {kind: 'ready', change: 'unchanged', branch, sha: fromSha, checkedAt: now().toISOString()}
+    }
+    if (ancestry === 'ahead') {
+      await removeJournal(journalsDir, owner, repo)
+      return {kind: 'refused', reason: 'ahead'}
+    }
+    if (ancestry === 'diverged') {
+      await removeJournal(journalsDir, owner, repo)
+      return {kind: 'refused', reason: 'diverged'}
+    }
+
+    // ancestry === 'behind'
+    const preflight = await preflightObstructions({
+      checkoutPath: canonicalCheckoutPath,
+      fromSha,
+      toSha: targetSha,
+      gitRunner,
+      timeoutMs,
+      uid,
+      gid,
+    })
+    if (preflight.kind === 'obstructed') {
+      await removeJournal(journalsDir, owner, repo)
+      return {kind: 'refused', reason: 'obstructed', obstructions: preflight.obstructions}
+    }
+    if (preflight.kind === 'inspection-failed') {
+      // Can't confirm the checkout's state; leave the journal at `applying` for recovery.
+      return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+    }
+
+    return await runFastForward({
+      journalsDir,
+      owner,
+      repo,
+      reposRoot,
+      canonicalCheckoutPath,
+      fromSha,
+      toSha: targetSha,
+      branch,
+      gitRunner,
+      timeoutMs,
+      applyTimeoutMs,
+      uid,
+      gid,
+      now,
+    })
+  } finally {
+    await rm(askpassDir, {recursive: true, force: true}).catch(() => {})
+    if (uniqueRef !== undefined) {
+      await gitRunner(['--git-dir', fetchStorePath, 'update-ref', '-d', uniqueRef], {
+        cwd: fetchStorePath,
+        env: buildNeutralGitEnv(),
+        timeoutMs,
+      }).catch(() => {})
+    }
+  }
 }
 
 /**
@@ -482,6 +1242,10 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
     caBundlePath,
     askpassWriter = writeAskpassHelper,
     networkBudgetMs = DEFAULT_NETWORK_BUDGET_MS,
+    applyTimeoutMs = DEFAULT_APPLY_TIMEOUT_MS,
+    maxPackBytes = DEFAULT_MAX_PACK_BYTES,
+    serviceHome = DEFAULT_SERVICE_HOME,
+    packStreamRunner = runPackStream,
     signal,
   } = deps
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
@@ -581,20 +1345,24 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
       return {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}
     }
 
-    // Admission passed in full — the network/apply half is not implemented in this slice.
+    // Admission passed in full — bring the checkout up to date.
     return runNetworkAndApply({
       owner,
       repo,
       token: request.token,
+      reposRoot,
       canonicalCheckoutPath: destPath,
-      branch: observation.head.kind === 'attached' ? observation.head.branch : '',
-      headSha: observation.head.sha,
+      head: observation.head,
       journalsDir,
       gitRunner,
       remoteBaseUrl,
       caBundlePath,
       askpassWriter,
+      serviceHome,
       networkBudgetMs,
+      applyTimeoutMs,
+      maxPackBytes,
+      packStreamRunner,
       timeoutMs,
       uid,
       gid,

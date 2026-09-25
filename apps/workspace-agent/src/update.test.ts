@@ -17,6 +17,7 @@ import process from 'node:process'
 import {afterAll, afterEach, beforeAll, beforeEach, describe, expect, it} from 'vitest'
 import {buildCloneGitEnv} from './clone.js'
 import {runGit} from './git-safety.js'
+import {runPackStream} from './git-stream.js'
 import {JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal, writeJournal} from './journal.js'
 import {resetRepoLocksForTesting} from './repo-mutex.js'
@@ -154,25 +155,37 @@ describe('executeUpdate — journal reconciliation', () => {
   })
 
   it('clears a "fetched" journal and continues admission (the checkout was untouched at H)', async () => {
-    // #given an eligible checkout with a `fetched` journal left behind before any mutation began
-    await setupEligibleCheckout()
-    await writeJournal(journalsDirFor(), {
-      kind: 'update',
-      owner: OWNER,
-      repo: REPO,
-      phase: 'fetched',
-      fromSha: '0'.repeat(40),
-      toSha: '1'.repeat(40),
-      startedAt: new Date().toISOString(),
-    })
+    // #given a real network fixture, a checkout already at the remote's tip, and a `fetched`
+    // journal left behind before any mutation began
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      await writeJournal(journalsDirFor(), {
+        kind: 'update',
+        owner: OWNER,
+        repo: REPO,
+        phase: 'fetched',
+        fromSha: '0'.repeat(40),
+        toSha: '1'.repeat(40),
+        startedAt: new Date().toISOString(),
+      })
 
-    // #when
-    const result = await executeUpdate(req(), localDeps())
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture))
 
-    // #then — admission continued past the journal (this eligible checkout reaches the
-    // not-implemented network-half stub), and the journal was cleared.
-    expect(result).toEqual({kind: 'failed', reason: 'not-implemented', mutationStarted: false, permanent: false})
-    expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: false, reason: 'absent'})
+      // #then — admission continued past the journal (this eligible checkout is fully in sync
+      // with the remote), and the journal was cleared.
+      expect(result).toEqual({
+        kind: 'ready',
+        change: 'unchanged',
+        branch: 'main',
+        sha: fixture.headSha,
+        checkedAt: expect.any(String) as string,
+      })
+      expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: false, reason: 'absent'})
+    } finally {
+      await fixture.close()
+    }
   })
 
   it('reconciles an "applied" journal whose HEAD already matches the target SHA to `ready`, and clears it', async () => {
@@ -384,30 +397,20 @@ describe('executeUpdate — client abort', () => {
 })
 
 describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — fail-closed-against-default (real /clone-shaped checkout)', () => {
-  it('a checkout made the way /clone makes it (real git clone from the local HTTPS server) passes every admission step and reaches the network half', async () => {
+  it('a checkout made the way /clone makes it (real git clone from the local HTTPS server) passes every admission step and reaches `ready`', async () => {
     // #given a bare "remote" repo served over real HTTPS by the Unit 2/slice-1 git-http-server
     // fixture, populated with one commit, and a checkout produced by a REAL `git clone` against
     // that server — the same askpass/env shape clone.ts's own writeAskpassHelper/buildCloneGitEnv
     // produce, swapped only for the loopback host (see git-http-server.ts's own doc comment on
     // why a second, host-parameterized askpass helper is test-only and safe here).
-    const fixtureReposRoot = await makeTempDir('update-test-fixture-repos-')
-    const fetchWorkDir = await makeTempDir('update-test-fixture-work-')
-    const fetchWorkHome = await makeTempDir('update-test-fixture-work-home-')
+    const fixture = await setupNetworkFixture()
     const askpassDir = await makeTempDir('update-test-fixture-askpass-')
-
-    const remotePath = await bareRepoPath(fixtureReposRoot, OWNER, REPO)
-    gitSync(fixtureReposRoot, ['init', '-q', '--bare', '-b', 'main', remotePath], isolatedGitEnv(fetchWorkHome))
-    initRepo(fetchWorkDir, isolatedGitEnv(fetchWorkHome), 'main')
-    commitFile(fetchWorkDir, isolatedGitEnv(fetchWorkHome), 'README.md', 'hello\n', 'initial commit')
-    gitSync(fetchWorkDir, ['push', '-q', remotePath, 'main'], isolatedGitEnv(fetchWorkHome))
-
-    const server = await startGitHttpServer({reposRoot: fixtureReposRoot})
     try {
-      const host = new URL(server.baseUrl).host
+      const host = new URL(fixture.remoteBaseUrl).host
       const askpassPath = await writeLoopbackAskpassHelper(askpassDir, host)
       const cloneEnv = {
         ...buildCloneGitEnv('test-token', askpassPath, isolatedGitEnv(checkoutHome)),
-        GIT_SSL_CAINFO: server.caBundlePath,
+        GIT_SSL_CAINFO: fixture.caBundlePath,
       }
       await mkdir(join(reposRoot, OWNER), {recursive: true})
       // gitAsync, NOT gitSync: the fixture server runs IN this same process/event loop, and a
@@ -418,23 +421,453 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — fail-closed-against-defau
       // no-network setup.
       const clone = await gitAsync(
         reposRoot,
-        ['clone', '-q', `${server.baseUrl}/${OWNER}/${REPO}.git`, destPathFor()],
+        ['clone', '-q', `${fixture.remoteBaseUrl}/${OWNER}/${REPO}.git`, destPathFor()],
         cloneEnv,
       )
       expect(clone.ok, `clone failed: ${clone.stderr}`).toBe(true)
 
       // #when
-      const result = await executeUpdate(req(), localDeps())
+      const result = await executeUpdate(req(), networkDeps(fixture))
 
-      // #then — every admission step passed; the network/apply half (slice 2b) is the only thing
-      // stopping this from being `ready`.
-      expect(result).toEqual({kind: 'failed', reason: 'not-implemented', mutationStarted: false, permanent: false})
+      // #then — every admission step passed, and the checkout was already at the remote's tip.
+      expect(result).toEqual({
+        kind: 'ready',
+        change: 'unchanged',
+        branch: 'main',
+        sha: fixture.headSha,
+        checkedAt: expect.any(String) as string,
+      })
     } finally {
+      await fixture.close()
+      await rm(askpassDir, {recursive: true, force: true})
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Network fixture — a real "remote": a bare repo served over real HTTPS by the Unit 2/slice-1
+// git-http-server fixture. Slice 2b's network+apply half is exercised against this for every
+// scenario below (behind/unchanged/ahead/diverged/detached/non-default-branch/obstructed/remote
+// failures/remote-moved/hung-apply/abort). Gated on OPENSSL_AVAILABLE like the fail-closed test
+// above, since the fixture's self-signed cert needs a real `openssl` binary.
+// ---------------------------------------------------------------------------
+
+interface NetworkFixture {
+  readonly remoteBaseUrl: string
+  readonly caBundlePath: string
+  readonly remoteRepoPath: string
+  readonly headSha: string
+  readonly token: string
+  /** Commits and pushes directly to the bare "remote", simulating the remote moving. Returns the new tip SHA. */
+  readonly pushCommit: (name: string, content: string, message: string) => string
+  /** Injects (or clears) a canned failure for this fixture's own `<owner>/<repo>.git` path. */
+  readonly setFailure: (failure: '403' | '404' | '429' | 'hang' | undefined) => void
+  readonly close: () => Promise<void>
+}
+
+async function setupNetworkFixture(
+  options: {readonly owner?: string; readonly repo?: string; readonly requireToken?: string} = {},
+): Promise<NetworkFixture> {
+  const {owner = OWNER, repo = REPO, requireToken} = options
+  const fixtureReposRoot = await makeTempDir('update-net-repos-')
+  const workDir = await makeTempDir('update-net-work-')
+  const workHome = await makeTempDir('update-net-work-home-')
+  const token = requireToken ?? 'test-token'
+
+  const remoteRepoPath = await bareRepoPath(fixtureReposRoot, owner, repo)
+  gitSync(fixtureReposRoot, ['init', '-q', '--bare', '-b', 'main', remoteRepoPath], isolatedGitEnv(workHome))
+  initRepo(workDir, isolatedGitEnv(workHome), 'main')
+  const headSha = commitFile(workDir, isolatedGitEnv(workHome), 'README.md', 'hello\n', 'initial commit')
+  gitSync(workDir, ['push', '-q', remoteRepoPath, 'main'], isolatedGitEnv(workHome))
+
+  const server = await startGitHttpServer({reposRoot: fixtureReposRoot, requireToken})
+  const repoPath = `${owner}/${repo}.git`
+  return {
+    remoteBaseUrl: server.baseUrl,
+    caBundlePath: server.caBundlePath,
+    remoteRepoPath,
+    headSha,
+    token,
+    pushCommit(name, content, message) {
+      const sha = commitFile(workDir, isolatedGitEnv(workHome), name, content, message)
+      gitSync(workDir, ['push', '-q', remoteRepoPath, 'main'], isolatedGitEnv(workHome))
+      return sha
+    },
+    setFailure(failure) {
+      server.setFailure(repoPath, failure)
+    },
+    async close() {
       await server.close()
       await rm(fixtureReposRoot, {recursive: true, force: true})
-      await rm(fetchWorkDir, {recursive: true, force: true})
-      await rm(fetchWorkHome, {recursive: true, force: true})
-      await rm(askpassDir, {recursive: true, force: true})
+      await rm(workDir, {recursive: true, force: true})
+      await rm(workHome, {recursive: true, force: true})
+    },
+  }
+}
+
+/** Deps for a fixture-backed test: `localDeps()` plus the fixture's remote URL/CA and a loopback-host askpass writer. `serviceHome` reuses `checkoutHome` — any writable per-test temp dir works for the network profile's HOME/cwd. */
+function networkDeps(fixture: NetworkFixture, overrides: UpdateHandlerDeps = {}): UpdateHandlerDeps {
+  const host = new URL(fixture.remoteBaseUrl).host
+  return {
+    ...localDeps(),
+    remoteBaseUrl: fixture.remoteBaseUrl,
+    caBundlePath: fixture.caBundlePath,
+    askpassWriter: async dir => writeLoopbackAskpassHelper(dir, host),
+    serviceHome: checkoutHome,
+    ...overrides,
+  }
+}
+
+/** Clones the checkout from the fixture's bare "remote" via LOCAL transport (fast; the checkout's own `remote.origin.url` is irrelevant — `executeUpdate` always builds the remote URL itself from `deps.remoteBaseUrl` + the request). Call BEFORE `fixture.pushCommit(...)` to set up a "behind" scenario. */
+async function cloneCheckoutAtHead(fixture: NetworkFixture, owner = OWNER, repo = REPO): Promise<void> {
+  await mkdir(join(reposRoot, owner), {recursive: true})
+  gitSync(reposRoot, ['clone', '-q', fixture.remoteRepoPath, destPathFor(owner, repo)], isolatedGitEnv(checkoutHome))
+}
+
+/** Reads every `refs/fro-bot/fetch/*` ref left in the fixture's bare "remote" mirror under `reposRoot`'s fetch store \u2014 must always be empty after `executeUpdate` returns, success or failure. */
+function listLeftoverFetchRefs(owner = OWNER, repo = REPO): readonly string[] {
+  const fetchStorePath = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'fetch', `${owner}__${repo}.git`)
+  const outcome = gitSync(
+    fetchStorePath,
+    ['for-each-ref', '--format=%(refname)', 'refs/fro-bot/fetch/'],
+    isolatedGitEnv(checkoutHome),
+  )
+  return outcome.split('\n').filter(line => line.length > 0)
+}
+
+describe.skipIf(!OPENSSL_AVAILABLE)(
+  'executeUpdate — remote failure classification (real server, real git, real stderr)',
+  () => {
+    it('wrong token (401): fetch-auth-rejected, not permanent', async () => {
+      const fixture = await setupNetworkFixture({requireToken: 'right-token'})
+      try {
+        await cloneCheckoutAtHead(fixture)
+        const result = await executeUpdate({owner: OWNER, repo: REPO, token: 'wrong-token'}, networkDeps(fixture))
+        expect(result).toEqual({
+          kind: 'failed',
+          reason: 'fetch-auth-rejected',
+          mutationStarted: false,
+          permanent: false,
+        })
+      } finally {
+        await fixture.close()
+      }
+    })
+
+    it('403: fetch-forbidden, PERMANENT', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        fixture.setFailure('403')
+        const result = await executeUpdate(req(), networkDeps(fixture))
+        expect(result).toEqual({kind: 'failed', reason: 'fetch-forbidden', mutationStarted: false, permanent: true})
+      } finally {
+        await fixture.close()
+      }
+    })
+
+    it('404: fetch-not-found, PERMANENT', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        fixture.setFailure('404')
+        const result = await executeUpdate(req(), networkDeps(fixture))
+        expect(result).toEqual({kind: 'failed', reason: 'fetch-not-found', mutationStarted: false, permanent: true})
+      } finally {
+        await fixture.close()
+      }
+    })
+
+    it('429: fetch-rate-limited, not permanent', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        fixture.setFailure('429')
+        const result = await executeUpdate(req(), networkDeps(fixture))
+        expect(result).toEqual({kind: 'failed', reason: 'fetch-rate-limited', mutationStarted: false, permanent: false})
+      } finally {
+        await fixture.close()
+      }
+    })
+
+    it('unreachable (closed port): fetch-unreachable, not permanent, zero server requests', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        const result = await executeUpdate(req(), networkDeps(fixture, {remoteBaseUrl: 'https://127.0.0.1:1'}))
+        expect(result).toEqual({kind: 'failed', reason: 'fetch-unreachable', mutationStarted: false, permanent: false})
+      } finally {
+        await fixture.close()
+      }
+    })
+
+    it('hang past the network budget: fetch-timeout, not permanent', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        fixture.setFailure('hang')
+        const result = await executeUpdate(req(), networkDeps(fixture, {networkBudgetMs: 800}))
+        expect(result).toEqual({kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false})
+      } finally {
+        await fixture.close()
+      }
+    }, 15000)
+  },
+)
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — happy path (real network fixture)', () => {
+  it('behind by two commits: fast-forwards to the remote tip, reports fromSha, and leaves no leftover fetch ref', async () => {
+    // #given a checkout cloned before two more commits landed on the remote
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      const fromSha = fixture.headSha
+      fixture.pushCommit('b.txt', 'two', 'c2')
+      const toSha = fixture.pushCommit('c.txt', 'three', 'c3')
+
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture))
+
+      // #then
+      expect(result).toEqual({
+        kind: 'ready',
+        change: 'fast-forward',
+        branch: 'main',
+        sha: toSha,
+        fromSha,
+        checkedAt: expect.any(String) as string,
+      })
+      const landedSha = gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()
+      expect(landedSha).toBe(toSha)
+      const status = gitSync(destPathFor(), ['status', '--porcelain'], isolatedGitEnv(checkoutHome))
+      expect(status.trim()).toBe('')
+      expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: false, reason: 'absent'})
+      expect(listLeftoverFetchRefs()).toEqual([])
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('equal: reports unchanged without moving HEAD', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      const result = await executeUpdate(req(), networkDeps(fixture))
+      expect(result).toEqual({
+        kind: 'ready',
+        change: 'unchanged',
+        branch: 'main',
+        sha: fixture.headSha,
+        checkedAt: expect.any(String) as string,
+      })
+      expect(listLeftoverFetchRefs()).toEqual([])
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — policy: detached, non-default-branch, ahead, diverged', () => {
+  it('detached HEAD: refuses detached without importing any objects', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      gitSync(destPathFor(), ['checkout', '-q', fixture.headSha], isolatedGitEnv(checkoutHome))
+
+      const result = await executeUpdate(req(), networkDeps(fixture))
+
+      expect(result).toEqual({kind: 'refused', reason: 'detached'})
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it("non-default branch: refuses non-default-branch, naming the checkout's own branch", async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      gitSync(destPathFor(), ['checkout', '-q', '-b', 'feature'], isolatedGitEnv(checkoutHome))
+
+      const result = await executeUpdate(req(), networkDeps(fixture))
+
+      expect(result).toEqual({kind: 'refused', reason: 'non-default-branch', branch: 'feature'})
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('ahead: the checkout has a local commit the remote does not — refuses ahead', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      commitFile(destPathFor(), isolatedGitEnv(checkoutHome), 'local-only.txt', 'local', 'local commit')
+
+      const result = await executeUpdate(req(), networkDeps(fixture))
+
+      expect(result).toEqual({kind: 'refused', reason: 'ahead'})
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('diverged: the checkout and the remote each have commits the other lacks — refuses diverged', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      commitFile(destPathFor(), isolatedGitEnv(checkoutHome), 'local-only.txt', 'local', 'local commit')
+      fixture.pushCommit('remote-only.txt', 'remote', 'remote commit')
+
+      const result = await executeUpdate(req(), networkDeps(fixture))
+
+      expect(result).toEqual({kind: 'refused', reason: 'diverged'})
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — obstruction preflight (real network fixture)', () => {
+  it('an ignored file blocking an incoming path refuses obstructed, and leaves no leftover fetch ref', async () => {
+    // #given a checkout with a locally-ignored (never tracked, never reported dirty) file at a
+    // path the remote's next commit also introduces, with DIFFERENT content
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      await writeFile(join(destPathFor(), '.git', 'info', 'exclude'), 'obstructed.txt\n', {flag: 'a'})
+      await writeFile(join(destPathFor(), 'obstructed.txt'), 'locally-ignored-content\n')
+      fixture.pushCommit('obstructed.txt', 'incoming-content', 'adds obstructed.txt')
+
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture))
+
+      // #then
+      expect(result.kind).toBe('refused')
+      const obstructedPaths =
+        result.kind === 'refused' && result.reason === 'obstructed' ? result.obstructions.map(o => o.path) : []
+      expect(obstructedPaths).toContain('obstructed.txt')
+      expect(listLeftoverFetchRefs()).toEqual([])
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — remote moved between observations', () => {
+  it('moves twice in a row: retries the fetch-then-observe pair once, then fails remote-moved', async () => {
+    // #given a fake gitRunner that answers every `ls-remote` with a DIFFERENT SHA each time
+    // (simulating the remote's tip changing between every observation) and every `fetch` as a
+    // trivial success \u2014 everything else (admission, bare-store init) still runs through real git.
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      let lsRemoteCalls = 0
+      const movingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('ls-remote')) {
+          lsRemoteCalls += 1
+          const sha = 'a'.repeat(39) + String(lsRemoteCalls)
+          return {kind: 'ok', stdout: `ref: refs/heads/main\tHEAD\n${sha}\tHEAD\n`, stderr: ''}
+        }
+        if (args.includes('fetch') && args.includes('--quiet')) return {kind: 'ok', stdout: '', stderr: ''}
+        return runGit(args, options)
+      }
+
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: movingRunner}))
+
+      // #then \u2014 three observations total: the initial one, plus two retries of the pair.
+      expect(result).toEqual({kind: 'failed', reason: 'remote-moved', mutationStarted: false, permanent: false})
+      expect(lsRemoteCalls).toBe(3)
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — hung apply via an injectable seam', () => {
+  it('a pack-stream that reports termination-unconfirmed fails possibly, leaves the journal at applying, and a follow-up /update refuses needs-recovery with zero git calls', async () => {
+    // #given a fake packStreamRunner standing in for a hung `pack-objects | index-pack` pipe \u2014
+    // deterministic and instant, unlike an actually-hung subprocess
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      fixture.pushCommit('b.txt', 'two', 'c2')
+      const hungPackStreamRunner = async (): ReturnType<typeof runPackStream> => ({kind: 'termination-unconfirmed'})
+
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture, {packStreamRunner: hungPackStreamRunner}))
+
+      // #then
+      expect(result).toEqual({
+        kind: 'failed',
+        reason: 'termination-unconfirmed',
+        mutationStarted: 'possibly',
+        permanent: false,
+      })
+      const journal = await readJournal(journalsDirFor(), OWNER, REPO)
+      expect(journal.ok).toBe(true)
+      expect(journal.ok === true ? journal.journal.phase : undefined).toBe('applying')
+
+      // #when \u2014 a follow-up /update reconciles the journal WITHOUT any git call at all (journal
+      // reconciliation for `applying` refuses immediately, before touching the checkout or network)
+      const {runner, calls} = makeGitRunnerSpy()
+      const followUp = await executeUpdate(req(), networkDeps(fixture, {gitRunner: runner}))
+
+      // #then
+      expect(followUp).toEqual({kind: 'refused', reason: 'needs-recovery'})
+      expect(calls).toEqual([])
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — client abort, before vs after the apply phase begins', () => {
+  it('an already-aborted signal stops work before any mutation, reported as aborted (not a bare timeout)', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      fixture.pushCommit('b.txt', 'two', 'c2')
+      const controller = new AbortController()
+      controller.abort()
+
+      const result = await executeUpdate(req(), networkDeps(fixture, {signal: controller.signal}))
+
+      // #then — step 8's own pre-network abort check (executeUpdate) fires first, so the network
+      // half (and its bare fetch store) is never reached at all.
+      expect(result).toEqual({kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false})
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('a disconnect fired once the journal reads applying is ignored \u2014 the mutation still completes', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      const fromSha = fixture.headSha
+      const toSha = fixture.pushCommit('b.txt', 'two', 'c2')
+      const controller = new AbortController()
+      const abortMidStreamRunner: typeof runPackStream = async options => {
+        // Simulates a client disconnect landing exactly once the mutation (pack import) is under way.
+        controller.abort()
+        return runPackStream(options)
+      }
+
+      const result = await executeUpdate(
+        req(),
+        networkDeps(fixture, {signal: controller.signal, packStreamRunner: abortMidStreamRunner}),
+      )
+
+      expect(result).toEqual({
+        kind: 'ready',
+        change: 'fast-forward',
+        branch: 'main',
+        sha: toSha,
+        fromSha,
+        checkedAt: expect.any(String) as string,
+      })
+    } finally {
+      await fixture.close()
     }
   })
 })
