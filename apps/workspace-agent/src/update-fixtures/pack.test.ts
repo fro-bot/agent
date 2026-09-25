@@ -15,7 +15,7 @@
 import type {LoopbackListener} from './helpers.js'
 
 import {execFile} from 'node:child_process'
-import {readdir, rm, writeFile} from 'node:fs/promises'
+import {readdir, readFile, rm, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
@@ -158,12 +158,20 @@ describe('pack import — protected (Unit 3 git-stream.ts, not implemented yet)'
     const sha = commitFile(sourceRepo, isolatedGitEnv(sourceHome), 'a.txt', 'one', 'c1')
     const env = isolatedGitEnv(destHome)
 
-    // #when the PRODUCTION streaming primitive is used instead of the raw pipe above
-    // NOT IMPLEMENTED YET (Unit 3): this throws, so this test is expected to fail red until Unit
-    // 3 lands. It documents the exact contract: runPackStream must produce the same effect as
-    // runRawPackPipe above (full closure transferred, ok outcome, no alternates file).
+    // #when the PRODUCTION streaming primitive is used instead of the raw pipe above. Like
+    // runRawPackPipe, the revision argument `git pack-objects --revs` reads from ITS OWN stdin
+    // (pack-objects has no argv-based mode for this — confirmed against real git 2.55.0: an empty
+    // stdin with `--revs` alone yields a valid but EMPTY pack, and a positional sha alongside
+    // `--stdout` is a usage error) must go through `writer.stdin`, distinct from the
+    // writer→reader byte pipe runPackStream wires itself.
     const outcome = await runPackStream({
-      writer: {command: 'git', args: ['-C', sourceRepo, 'pack-objects', '--stdout', '--revs'], cwd: sourceRepo, env},
+      writer: {
+        command: 'git',
+        args: ['-C', sourceRepo, 'pack-objects', '--stdout', '--revs'],
+        cwd: sourceRepo,
+        env,
+        stdin: `${sha}\n`,
+      },
       reader: {command: 'git', args: ['-C', destRepo, 'index-pack', '--stdin', '--strict'], cwd: destRepo, env},
       maxBytes: 64 * 1024 * 1024,
       timeoutMs: 10_000,
@@ -245,18 +253,28 @@ describe('pack import — runPackStream contract (Unit 3 git-stream.ts, not impl
     expect(outcome.kind).toBe('timeout')
   })
 
-  it('a grandchild that holds the pipe open yields termination-unconfirmed, never timeout', async () => {
-    // #given a reader that spawns a DETACHED grandchild inheriting its stdin (the pipe from the
-    // writer) and immediately exits itself — the grandchild escapes into its own process group
-    // (Node's `detached: true` is the POSIX setsid equivalent), so killing the reader's own
-    // process group can never reach it, and the pipe never fully closes. Confirmed by hand against
-    // real process-group behaviour on this machine before writing this fixture (see the report).
+  it("a grandchild that holds the reader's stdout/stderr open yields termination-unconfirmed, never timeout", async () => {
+    // #given a reader that spawns a DETACHED grandchild INHERITING ITS STDOUT/STDERR (`sleep 60`,
+    // stdio ['ignore', 'inherit', 'inherit']) and immediately exits itself. The grandchild escapes
+    // into its own process group (Node's `detached: true` is the POSIX setsid equivalent), so
+    // SIGTERM/SIGKILL to the reader's own process group can never reach it — but it still holds a
+    // duplicated write-end fd of reader.stdout/stderr open, so those streams never see EOF and the
+    // reader's ChildProcess never emits 'close', even though the reader process itself is long
+    // reaped. This mirrors git-safety.ts's own proven case for `runGit` (a forked-and-waited
+    // grandchild that inherits stdio and outlives a single-pid SIGKILL — see
+    // inspect.test.ts's "reports termination-unconfirmed" test), adapted to a detached process
+    // group rather than a plain fork. The grandchild's pid is written to a file so this test can
+    // clean it up directly by pid in `finally` — the whole point of the scenario is that the
+    // process-GROUP kill misses it.
+    const grandchildPidFile = join(scriptsDir, 'grandchild.pid')
     const readerScript = join(scriptsDir, 'reader-spawns-grandchild.js')
     await writeFile(
       readerScript,
       [
         "const {spawn} = require('node:child_process')",
-        "const grandchild = spawn('sh', ['-c', 'cat > /dev/null'], {stdio: ['inherit', 'ignore', 'ignore'], detached: true})",
+        "const {writeFileSync} = require('node:fs')",
+        "const grandchild = spawn('sleep', ['60'], {stdio: ['ignore', 'inherit', 'inherit'], detached: true})",
+        'writeFileSync(process.env.GRANDCHILD_PID_FILE, String(grandchild.pid))',
         'grandchild.unref()',
         '',
       ].join('\n'),
@@ -264,18 +282,36 @@ describe('pack import — runPackStream contract (Unit 3 git-stream.ts, not impl
     const writerScript = join(scriptsDir, 'writer-slow.sh')
     await writeExecutableScript(writerScript, 'sleep 30')
 
-    // #when
-    // NOT IMPLEMENTED YET (Unit 3): this throws, so this test is expected to fail red until Unit 3
-    // lands.
-    const outcome = await runPackStream({
-      writer: {command: 'sh', args: [writerScript], cwd: scriptsDir, env: SCRIPT_ENV},
-      reader: {command: 'node', args: [readerScript], cwd: scriptsDir, env: SCRIPT_ENV},
-      maxBytes: 64 * 1024 * 1024,
-      timeoutMs: 500,
-    })
+    try {
+      // #when
+      const outcome = await runPackStream({
+        writer: {command: 'sh', args: [writerScript], cwd: scriptsDir, env: SCRIPT_ENV},
+        reader: {
+          command: 'node',
+          args: [readerScript],
+          cwd: scriptsDir,
+          env: {...SCRIPT_ENV, GRANDCHILD_PID_FILE: grandchildPidFile},
+        },
+        maxBytes: 64 * 1024 * 1024,
+        timeoutMs: 500,
+      })
 
-    // #then
-    expect(outcome.kind).toBe('termination-unconfirmed')
+      // #then
+      expect(outcome.kind).toBe('termination-unconfirmed')
+    } finally {
+      // #cleanup — kill the escaped grandchild directly by its recorded pid (never by process
+      // group: that's exactly what this scenario proves the runner itself cannot do), the same
+      // shape as inspect.test.ts's fake-git-binary cleanup, so it doesn't outlive this test.
+      const recordedPid = await readFile(grandchildPidFile, 'utf8').catch(() => '')
+      const grandchildPid = Number.parseInt(recordedPid, 10)
+      if (Number.isSafeInteger(grandchildPid) && grandchildPid > 1) {
+        try {
+          process.kill(grandchildPid, 'SIGKILL')
+        } catch {
+          // Already gone — nothing left to clean up.
+        }
+      }
+    }
   })
 
   it('the byte cap is exceeded mid-stream, so both processes are terminated before the writer finishes', async () => {

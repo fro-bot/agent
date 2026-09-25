@@ -334,3 +334,137 @@ describe('layout — protected (Unit 3 checkout-profile.ts, not implemented yet)
     expect(outcome.kind === 'refused' ? outcome.reason : null).toBe('partial-clone')
   })
 })
+
+describe('layout — linked worktree (real git, no stub)', () => {
+  it('git worktree add creates a second working directory that shares refs/objects with the checkout', async () => {
+    // #given a real commit, then a SECOND, linked working directory attached to the same repo
+    const env = isolatedGitEnv(checkoutHome)
+    commitFile(checkoutDir, env, 'a.txt', 'one', 'c1')
+    const linkedWorktreeParent = await makeTempDir('layout-linked-parent-')
+    const linkedWorktreeDir = join(linkedWorktreeParent, 'wt')
+
+    // #when
+    gitSync(checkoutDir, ['worktree', 'add', '--detach', linkedWorktreeDir, 'HEAD'], env)
+
+    // #then — the exploit genuinely works: `.git/worktrees/<name>` now exists, and `worktree list`
+    // reports both directories sharing the same repository
+    const worktreeList = gitSync(checkoutDir, ['worktree', 'list'], env)
+    expect(worktreeList).toContain(checkoutDir)
+    expect(worktreeList).toContain(linkedWorktreeDir)
+
+    gitSync(checkoutDir, ['worktree', 'remove', '--force', linkedWorktreeDir], env)
+    await rm(linkedWorktreeParent, {recursive: true, force: true})
+  })
+})
+
+describe('layout — bare repository (real git, no stub)', () => {
+  it('a bare clone reports itself as bare and has no separate .git directory', async () => {
+    // #given a real commit, then a real BARE clone of it (repository files live directly at the
+    // clone's own root — there is no `.git` subdirectory at all)
+    const env = isolatedGitEnv(checkoutHome)
+    commitFile(checkoutDir, env, 'a.txt', 'one', 'c1')
+    const bareDir = await makeTempDir('layout-bare-')
+    await rm(bareDir, {recursive: true, force: true})
+    gitSync(await makeTempDir('layout-bare-cwd-'), ['clone', '-q', '--bare', checkoutDir, bareDir], env)
+
+    // #when
+    const isBare = gitSync(bareDir, ['rev-parse', '--is-bare-repository'], env).trim()
+
+    // #then
+    expect(isBare).toBe('true')
+    await rm(bareDir, {recursive: true, force: true})
+  })
+})
+
+describe('layout — split index (real git, no stub)', () => {
+  it('git update-index --split-index creates a .git/sharedindex.* file', async () => {
+    // #given a real commit, then the index split via the real git feature
+    const env = isolatedGitEnv(checkoutHome)
+    commitFile(checkoutDir, env, 'a.txt', 'one', 'c1')
+
+    // #when
+    gitSync(checkoutDir, ['update-index', '--split-index'], env)
+
+    // #then — the exploit genuinely works: a shared-index file now exists alongside the main index
+    const {readdir} = await import('node:fs/promises')
+    const gitDirEntries = await readdir(join(checkoutDir, '.git'))
+    expect(gitDirEntries.some(name => name.startsWith('sharedindex.'))).toBe(true)
+  })
+})
+
+describe('layout — sparse index (real git, no stub)', () => {
+  it('git sparse-checkout init --cone --sparse-index enables a sparse index via the worktreeConfig extension', async () => {
+    // #given a real commit, then cone-mode sparse-checkout with a sparse index enabled — the real
+    // git feature this fixture reproduces, not a faked config write
+    const env = isolatedGitEnv(checkoutHome)
+    commitFile(checkoutDir, env, 'a.txt', 'one', 'c1')
+
+    // #when
+    gitSync(checkoutDir, ['sparse-checkout', 'init', '--cone', '--sparse-index'], env)
+
+    // #then — the exploit genuinely works: git itself now reports a sparse index, and the
+    // extension it rides in on (`extensions.worktreeConfig`) is visible in the checkout's own
+    // main config (not just the per-worktree config file)
+    const sparseIndexValue = gitSync(checkoutDir, ['config', '--worktree', 'index.sparse'], env).trim()
+    expect(sparseIndexValue).toBe('true')
+    const mainConfig = gitSync(
+      checkoutDir,
+      ['config', '--local', '--no-includes', '--get', 'extensions.worktreeConfig'],
+      env,
+    ).trim()
+    expect(mainConfig).toBe('true')
+  })
+})
+
+describe('layout — protected (Unit 3 checkout-profile.ts): linked worktree, bare repository, and unsupported index flags', () => {
+  it('checkCheckoutLayout refuses a linked worktree with reason "linked-worktree"', async () => {
+    const env = isolatedGitEnv(checkoutHome)
+    commitFile(checkoutDir, env, 'a.txt', 'one', 'c1')
+    const linkedWorktreeParent = await makeTempDir('layout-linked-parent-')
+    const linkedWorktreeDir = join(linkedWorktreeParent, 'wt')
+    gitSync(checkoutDir, ['worktree', 'add', '--detach', linkedWorktreeDir, 'HEAD'], env)
+
+    const outcome = await checkCheckoutLayout({checkoutPath: checkoutDir, timeoutMs: 5_000})
+
+    expect(outcome.kind).toBe('refused')
+    expect(outcome.kind === 'refused' ? outcome.reason : null).toBe('linked-worktree')
+    gitSync(checkoutDir, ['worktree', 'remove', '--force', linkedWorktreeDir], env)
+    await rm(linkedWorktreeParent, {recursive: true, force: true})
+  })
+
+  it('checkCheckoutLayout refuses a bare repository with reason "bare-repository"', async () => {
+    const env = isolatedGitEnv(checkoutHome)
+    commitFile(checkoutDir, env, 'a.txt', 'one', 'c1')
+    const bareDir = await makeTempDir('layout-bare-')
+    await rm(bareDir, {recursive: true, force: true})
+    gitSync(await makeTempDir('layout-bare-cwd-'), ['clone', '-q', '--bare', checkoutDir, bareDir], env)
+
+    const outcome = await checkCheckoutLayout({checkoutPath: bareDir, timeoutMs: 5_000})
+
+    expect(outcome.kind).toBe('refused')
+    expect(outcome.kind === 'refused' ? outcome.reason : null).toBe('bare-repository')
+    await rm(bareDir, {recursive: true, force: true})
+  })
+
+  it('checkCheckoutLayout refuses a split index with reason "unsupported-index-flag"', async () => {
+    const env = isolatedGitEnv(checkoutHome)
+    commitFile(checkoutDir, env, 'a.txt', 'one', 'c1')
+    gitSync(checkoutDir, ['update-index', '--split-index'], env)
+
+    const outcome = await checkCheckoutLayout({checkoutPath: checkoutDir, timeoutMs: 5_000})
+
+    expect(outcome.kind).toBe('refused')
+    expect(outcome.kind === 'refused' ? outcome.reason : null).toBe('unsupported-index-flag')
+  })
+
+  it('checkCheckoutLayout refuses a sparse index with reason "unsupported-index-flag"', async () => {
+    const env = isolatedGitEnv(checkoutHome)
+    commitFile(checkoutDir, env, 'a.txt', 'one', 'c1')
+    gitSync(checkoutDir, ['sparse-checkout', 'init', '--cone', '--sparse-index'], env)
+
+    const outcome = await checkCheckoutLayout({checkoutPath: checkoutDir, timeoutMs: 5_000})
+
+    expect(outcome.kind).toBe('refused')
+    expect(outcome.kind === 'refused' ? outcome.reason : null).toBe('unsupported-index-flag')
+  })
+})
