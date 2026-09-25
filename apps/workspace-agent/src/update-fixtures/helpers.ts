@@ -14,6 +14,7 @@
  */
 
 import type {IncomingHttpHeaders, IncomingMessage, Server, ServerResponse} from 'node:http'
+import type {Server as HttpsServer} from 'node:https'
 
 import {Buffer} from 'node:buffer'
 import {execFile, execFileSync} from 'node:child_process'
@@ -245,6 +246,29 @@ export async function startHttpsLoopbackListener(certPath: string, keyPath: stri
       await new Promise<void>(resolve => server.close(() => resolve()))
     },
   }
+}
+
+/**
+ * Starts an HTTPS server bound to 127.0.0.1 on an OS-assigned port, running `handler` for every
+ * request — the same certificate loading and OS-assigned-port bind plumbing
+ * `startHttpsLoopbackListener` uses internally (that function's own handler is fixed to
+ * request-recording-then-401; this variant lets a caller supply its own handler, e.g.
+ * update-fixtures/git-http-server.ts's CGI adapter for `git http-backend`).
+ *
+ * Returns the raw, already-listening `https.Server` (never wraps it in a `close()` of its own)
+ * so the caller can manage its own connection lifecycle — e.g. tracking and force-destroying
+ * sockets left open by an injected "hang" response, which `server.close()` alone would otherwise
+ * wait on forever during test cleanup.
+ */
+export async function startHttpsServerWithHandler(
+  certPath: string,
+  keyPath: string,
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<{readonly port: number; readonly server: HttpsServer}> {
+  const [cert, key] = await Promise.all([readFile(certPath), readFile(keyPath)])
+  const server = createHttpsServer({cert, key}, handler)
+  const port = await listenOnLoopback(server)
+  return {port, server}
 }
 
 // ---------------------------------------------------------------------------
