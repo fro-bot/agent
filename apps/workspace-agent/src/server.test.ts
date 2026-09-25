@@ -1,6 +1,6 @@
 import type {CloneHandlerResult} from './clone.js'
 import type {InspectHandlerResult} from './inspect.js'
-import type {CloneExecutorFn, InspectExecutorFn} from './server.js'
+import type {CloneExecutorFn, InspectExecutorFn, ServerDeps} from './server.js'
 
 import {Buffer} from 'node:buffer'
 
@@ -15,6 +15,20 @@ function makeCloneExecutor(result: CloneHandlerResult): CloneExecutorFn & Return
 
 function makeInspectExecutor(result: InspectHandlerResult): InspectExecutorFn & ReturnType<typeof vi.fn> {
   return vi.fn().mockResolvedValue(result) as InspectExecutorFn & ReturnType<typeof vi.fn>
+}
+
+/**
+ * Build an app with auth disabled — the `disabled-for-tests` `ServerDeps.auth` variant exists
+ * solely so tests that aren't exercising the bearer middleware can opt out explicitly instead of
+ * auth silently defaulting off.
+ */
+function appWithoutAuth(deps: Omit<ServerDeps, 'auth'> = {}): ReturnType<typeof createApp> {
+  return createApp({...deps, auth: {kind: 'disabled-for-tests'}})
+}
+
+/** Build an app with bearer auth enabled for the given token — the production `ServerDeps.auth` variant. */
+function appWithBearerAuth(token: string, deps: Omit<ServerDeps, 'auth'> = {}): ReturnType<typeof createApp> {
+  return createApp({...deps, auth: {kind: 'bearer', token}})
 }
 
 async function postInspect(
@@ -54,7 +68,7 @@ async function postClone(
 describe('GET /healthz', () => {
   it('returns 200 with ok: true (no opencode status)', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await app.request('/healthz')
@@ -68,7 +82,7 @@ describe('GET /healthz', () => {
   it('returns {ok: true, opencode: "starting"} when server is still starting', async () => {
     // #given
     const opencodeStatus = {status: 'starting' as const}
-    const app = createApp({opencodeStatus})
+    const app = appWithoutAuth({opencodeStatus})
 
     // #when
     const res = await app.request('/healthz')
@@ -82,7 +96,7 @@ describe('GET /healthz', () => {
   it('returns {ok: true, opencode: "ready"} when opencode server is ready', async () => {
     // #given
     const opencodeStatus = {status: 'ready' as const}
-    const app = createApp({opencodeStatus})
+    const app = appWithoutAuth({opencodeStatus})
 
     // #when
     const res = await app.request('/healthz')
@@ -96,7 +110,7 @@ describe('GET /healthz', () => {
   it('returns {ok: true, opencode: "down"} when opencode server failed to start', async () => {
     // #given
     const opencodeStatus = {status: 'down' as const}
-    const app = createApp({opencodeStatus})
+    const app = appWithoutAuth({opencodeStatus})
 
     // #when
     const res = await app.request('/healthz')
@@ -111,7 +125,7 @@ describe('GET /healthz', () => {
 describe('POST /clone — validation', () => {
   it('returns 400 malformed-body for non-JSON body', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
     const badBody = 'not json{{{'
 
     // #when
@@ -132,7 +146,7 @@ describe('POST /clone — validation', () => {
 
   it('returns 400 invalid-owner for traversal attempt', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await postClone(app, {owner: '../etc', repo: 'passwd', token: VALID_TOKEN})
@@ -145,7 +159,7 @@ describe('POST /clone — validation', () => {
 
   it('returns 400 invalid-owner for owner with slash', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await postClone(app, {owner: 'foo/bar', repo: 'repo', token: VALID_TOKEN})
@@ -158,7 +172,7 @@ describe('POST /clone — validation', () => {
 
   it('returns 400 invalid-repo for repo with slash', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'foo/bar', token: VALID_TOKEN})
@@ -171,7 +185,7 @@ describe('POST /clone — validation', () => {
 
   it('returns 400 invalid-token-shape for missing token', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent'})
@@ -184,7 +198,7 @@ describe('POST /clone — validation', () => {
 
   it('returns 400 invalid-token-shape for wrong token prefix', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: 'ghp_wrongprefix'})
@@ -198,7 +212,7 @@ describe('POST /clone — validation', () => {
   it('does not invoke clone executor when validation fails', async () => {
     // #given
     const cloneExecutor = vi.fn()
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     await postClone(app, {owner: '../etc', repo: 'passwd', token: VALID_TOKEN})
@@ -215,7 +229,7 @@ describe('POST /clone — success path', () => {
       response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'},
       statusCode: 200,
     })
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -232,7 +246,7 @@ describe('POST /clone — success path', () => {
       response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'sha'},
       statusCode: 200,
     })
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -253,7 +267,7 @@ describe('POST /clone — error paths', () => {
       response: {ok: false, error: 'repo-exists'},
       statusCode: 409,
     })
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -270,7 +284,7 @@ describe('POST /clone — error paths', () => {
       response: {ok: false, error: 'clone-failed'},
       statusCode: 500,
     })
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -287,7 +301,7 @@ describe('POST /clone — error paths', () => {
       response: {ok: false, error: 'enospc', code: 'ENOSPC'},
       statusCode: 500,
     })
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -304,7 +318,7 @@ describe('POST /clone — error paths', () => {
       response: {ok: false, error: 'clone-failed'},
       statusCode: 500,
     })
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -319,7 +333,7 @@ describe('POST /clone — error paths', () => {
 describe('Unknown routes', () => {
   it('returns 404 for unknown GET route', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await app.request('/unknown-route')
@@ -330,7 +344,7 @@ describe('Unknown routes', () => {
 
   it('returns 404 for unknown POST route', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await app.request('/fetch', {method: 'POST'})
@@ -343,7 +357,7 @@ describe('Unknown routes', () => {
 describe('POST /clone — body size limit (S3)', () => {
   it('returns 413 body-too-large when Content-Length exceeds 4096', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await app.request('/clone', {
@@ -363,7 +377,7 @@ describe('POST /clone — body size limit (S3)', () => {
 
   it('returns 413 body-too-large when Content-Length is absent', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when — no Content-Length header
     const res = await app.request('/clone', {
@@ -384,7 +398,7 @@ describe('POST /clone — body size limit (S3)', () => {
       response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'},
       statusCode: 200,
     })
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -404,7 +418,7 @@ describe('POST /clone — HTTP-layer credential scrubbing (T1)', () => {
       response: {ok: false, error: 'clone-failed', code: `x-access-token:${tokenLiteral}@github.com`},
       statusCode: 500,
     }) as CloneExecutorFn & ReturnType<typeof vi.fn>
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -423,7 +437,7 @@ describe('POST /clone — clone-timeout returns 504 (Fix #4)', () => {
       response: {ok: false, error: 'clone-timeout'},
       statusCode: 504,
     })
-    const app = createApp({cloneExecutor})
+    const app = appWithoutAuth({cloneExecutor})
 
     // #when
     const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
@@ -439,7 +453,7 @@ describe('GET /readyz', () => {
   it('returns 200 with ready: true when opencode status is "ready"', async () => {
     // #given — opencode ready, but no proxyListening ref (legacy/clone-only mode)
     const opencodeStatus = {status: 'ready' as const}
-    const app = createApp({opencodeStatus})
+    const app = appWithoutAuth({opencodeStatus})
 
     // #when
     const res = await app.request('/readyz')
@@ -453,7 +467,7 @@ describe('GET /readyz', () => {
   it('returns 503 with ready: false when opencode status is "starting"', async () => {
     // #given
     const opencodeStatus = {status: 'starting' as const}
-    const app = createApp({opencodeStatus})
+    const app = appWithoutAuth({opencodeStatus})
 
     // #when
     const res = await app.request('/readyz')
@@ -467,7 +481,7 @@ describe('GET /readyz', () => {
   it('returns 503 with ready: false when opencode status is "down"', async () => {
     // #given
     const opencodeStatus = {status: 'down' as const}
-    const app = createApp({opencodeStatus})
+    const app = appWithoutAuth({opencodeStatus})
 
     // #when
     const res = await app.request('/readyz')
@@ -480,7 +494,7 @@ describe('GET /readyz', () => {
 
   it('returns 503 (fail-closed) when no opencode status ref is provided', async () => {
     // #given — createApp without opencodeStatus (clone-only mode)
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await app.request('/readyz')
@@ -496,7 +510,7 @@ describe('GET /readyz', () => {
     const statuses = ['ready', 'starting', 'down'] as const
     for (const status of statuses) {
       const opencodeStatus = {status}
-      const app = createApp({opencodeStatus})
+      const app = appWithoutAuth({opencodeStatus})
 
       // #when
       const res = await app.request('/healthz')
@@ -508,7 +522,7 @@ describe('GET /readyz', () => {
 
   it('does not affect /healthz when no opencode status ref is provided', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await app.request('/healthz')
@@ -525,7 +539,7 @@ describe('GET /readyz — proxy-listening gate', () => {
     // #given — both conditions satisfied: the happy path
     const opencodeStatus = {status: 'ready' as const}
     const proxyListening = {listening: true}
-    const app = createApp({opencodeStatus, proxyListening})
+    const app = appWithoutAuth({opencodeStatus, proxyListening})
 
     // #when
     const res = await app.request('/readyz')
@@ -540,7 +554,7 @@ describe('GET /readyz — proxy-listening gate', () => {
     // #given — opencode booted but proxy leg is down
     const opencodeStatus = {status: 'ready' as const}
     const proxyListening = {listening: false}
-    const app = createApp({opencodeStatus, proxyListening})
+    const app = appWithoutAuth({opencodeStatus, proxyListening})
 
     // #when
     const res = await app.request('/readyz')
@@ -555,7 +569,7 @@ describe('GET /readyz — proxy-listening gate', () => {
     // #given — opencode still starting, proxy already listening
     const opencodeStatus = {status: 'starting' as const}
     const proxyListening = {listening: true}
-    const app = createApp({opencodeStatus, proxyListening})
+    const app = appWithoutAuth({opencodeStatus, proxyListening})
 
     // #when
     const res = await app.request('/readyz')
@@ -570,7 +584,7 @@ describe('GET /readyz — proxy-listening gate', () => {
     // #given — nothing is ready yet (early boot)
     const opencodeStatus = {status: 'starting' as const}
     const proxyListening = {listening: false}
-    const app = createApp({opencodeStatus, proxyListening})
+    const app = appWithoutAuth({opencodeStatus, proxyListening})
 
     // #when
     const res = await app.request('/readyz')
@@ -585,7 +599,7 @@ describe('GET /readyz — proxy-listening gate', () => {
     // #given — verify the response shape has not changed (only condition deepened)
     const opencodeStatus = {status: 'ready' as const}
     const proxyListening = {listening: true}
-    const app = createApp({opencodeStatus, proxyListening})
+    const app = appWithoutAuth({opencodeStatus, proxyListening})
 
     // #when
     const res = await app.request('/readyz')
@@ -636,7 +650,7 @@ describe('GET /readyz — proxy-listening gate', () => {
     // #given — proxy not listening, opencode starting
     const opencodeStatus = {status: 'starting' as const}
     const proxyListening = {listening: false}
-    const app = createApp({opencodeStatus, proxyListening})
+    const app = appWithoutAuth({opencodeStatus, proxyListening})
 
     // #when
     const res = await app.request('/healthz')
@@ -649,7 +663,7 @@ describe('GET /readyz — proxy-listening gate', () => {
     // #given
     const opencodeStatus = {status: 'ready' as const}
     const proxyListening = {listening: true}
-    const app = createApp({opencodeStatus, proxyListening})
+    const app = appWithoutAuth({opencodeStatus, proxyListening})
 
     // #when
     const res = await app.request('/healthz')
@@ -664,7 +678,7 @@ describe('GET /readyz — proxy-listening gate', () => {
     // #given — proxy was listening, then closed (e.g. crash/restart)
     const opencodeStatus = {status: 'ready' as const}
     const proxyListening = {listening: true}
-    const app = createApp({opencodeStatus, proxyListening})
+    const app = appWithoutAuth({opencodeStatus, proxyListening})
 
     // Verify initially ready
     const resBefore = await app.request('/readyz')
@@ -684,7 +698,7 @@ describe('GET /readyz — proxy-listening gate', () => {
 describe('POST /inspect — validation', () => {
   it('returns 413 body-too-large when Content-Length header is missing', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await app.request('/inspect', {
@@ -699,7 +713,7 @@ describe('POST /inspect — validation', () => {
 
   it('returns 400 malformed-body for non-JSON body', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
     const badBody = 'not json{{{'
 
     // #when
@@ -720,7 +734,7 @@ describe('POST /inspect — validation', () => {
 
   it('returns 400 invalid-owner for traversal attempt', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await postInspect(app, {owner: '../etc', repo: 'passwd'})
@@ -733,7 +747,7 @@ describe('POST /inspect — validation', () => {
 
   it('returns 400 invalid-repo for repo with slash', async () => {
     // #given
-    const app = createApp()
+    const app = appWithoutAuth()
 
     // #when
     const res = await postInspect(app, {owner: 'fro-bot', repo: 'foo/bar'})
@@ -747,7 +761,7 @@ describe('POST /inspect — validation', () => {
   it('does not invoke the inspect executor when validation fails', async () => {
     // #given
     const inspectExecutor = vi.fn()
-    const app = createApp({inspectExecutor})
+    const app = appWithoutAuth({inspectExecutor})
 
     // #when
     await postInspect(app, {owner: '../etc', repo: 'passwd'})
@@ -770,7 +784,7 @@ describe('POST /inspect — validation', () => {
       },
       statusCode: 200,
     })
-    const app = createApp({inspectExecutor})
+    const app = appWithoutAuth({inspectExecutor})
 
     // #when
     const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
@@ -791,7 +805,7 @@ describe('POST /inspect — response passthrough', () => {
       observedAt: '2026-01-01T00:00:00.000Z',
     }
     const inspectExecutor = makeInspectExecutor({response: {ok: true, observation}, statusCode: 200})
-    const app = createApp({inspectExecutor})
+    const app = appWithoutAuth({inspectExecutor})
 
     // #when
     const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
@@ -805,7 +819,7 @@ describe('POST /inspect — response passthrough', () => {
   it('returns 404 no-checkout when the executor reports no checkout', async () => {
     // #given
     const inspectExecutor = makeInspectExecutor({response: {ok: false, error: 'no-checkout'}, statusCode: 404})
-    const app = createApp({inspectExecutor})
+    const app = appWithoutAuth({inspectExecutor})
 
     // #when
     const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
@@ -822,7 +836,7 @@ describe('POST /inspect — response passthrough', () => {
       response: {ok: false, error: 'checkout-substituted'},
       statusCode: 409,
     })
-    const app = createApp({inspectExecutor})
+    const app = appWithoutAuth({inspectExecutor})
 
     // #when
     const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
@@ -839,7 +853,7 @@ describe('POST /inspect — response passthrough', () => {
       response: {ok: false, error: 'inspection-timeout'},
       statusCode: 504,
     })
-    const app = createApp({inspectExecutor})
+    const app = appWithoutAuth({inspectExecutor})
 
     // #when
     const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'})
@@ -862,7 +876,7 @@ describe('Control-API bearer authentication', () => {
         response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'},
         statusCode: 200,
       })
-      const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+      const app = appWithBearerAuth(AUTH_TOKEN, {cloneExecutor})
 
       // #when
       const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN}, AUTH_HEADER)
@@ -883,7 +897,7 @@ describe('Control-API bearer authentication', () => {
         observedAt: '2026-01-01T00:00:00.000Z',
       }
       const inspectExecutor = makeInspectExecutor({response: {ok: true, observation}, statusCode: 200})
-      const app = createApp({inspectExecutor, token: AUTH_TOKEN})
+      const app = appWithBearerAuth(AUTH_TOKEN, {inspectExecutor})
 
       // #when
       const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'}, AUTH_HEADER)
@@ -919,7 +933,7 @@ describe('Control-API bearer authentication', () => {
           response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'},
           statusCode: 200,
         })
-        const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+        const app = appWithBearerAuth(AUTH_TOKEN, {cloneExecutor})
 
         // #when
         const res = await postClone(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN}, headers)
@@ -945,7 +959,7 @@ describe('Control-API bearer authentication', () => {
           },
           statusCode: 200,
         })
-        const app = createApp({inspectExecutor, token: AUTH_TOKEN})
+        const app = appWithBearerAuth(AUTH_TOKEN, {inspectExecutor})
 
         // #when
         const res = await postInspect(app, {owner: 'fro-bot', repo: 'agent'}, headers)
@@ -961,7 +975,7 @@ describe('Control-API bearer authentication', () => {
     it('rejects with 401 (not 400) when a malformed body accompanies a missing bearer — proves auth runs before JSON parsing', async () => {
       // #given
       const cloneExecutor = vi.fn()
-      const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+      const app = appWithBearerAuth(AUTH_TOKEN, {cloneExecutor})
       const malformedBody = 'not json{{{'
 
       // #when — no Authorization header, body is malformed JSON
@@ -984,7 +998,7 @@ describe('Control-API bearer authentication', () => {
     it('rejects with 401 (not 413) when an oversized body accompanies a missing bearer — proves auth runs before the body-size gate', async () => {
       // #given
       const cloneExecutor = vi.fn()
-      const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+      const app = appWithBearerAuth(AUTH_TOKEN, {cloneExecutor})
 
       // #when — no Authorization header, Content-Length far exceeds the 4096-byte cap
       const res = await app.request('/clone', {
@@ -1007,14 +1021,14 @@ describe('Control-API bearer authentication', () => {
   describe('edge case — empty configured token', () => {
     it.each(['', '   '])('refuses to build the app with token %j, so `Bearer ` alone can never authenticate', token => {
       // #given / #when / #then
-      expect(() => createApp({token})).toThrow('control-API token must not be empty')
+      expect(() => appWithBearerAuth(token)).toThrow('control-API token must not be empty')
     })
   })
 
   describe('edge case — /healthz and /readyz stay open', () => {
     it('gET /healthz succeeds with no Authorization header even when a token is configured', async () => {
       // #given
-      const app = createApp({token: AUTH_TOKEN})
+      const app = appWithBearerAuth(AUTH_TOKEN)
 
       // #when
       const res = await app.request('/healthz')
@@ -1026,7 +1040,7 @@ describe('Control-API bearer authentication', () => {
     it('gET /readyz answers by its own readiness logic (never 401) with no Authorization header', async () => {
       // #given
       const opencodeStatus = {status: 'ready' as const}
-      const app = createApp({opencodeStatus, token: AUTH_TOKEN})
+      const app = appWithBearerAuth(AUTH_TOKEN, {opencodeStatus})
 
       // #when
       const res = await app.request('/readyz')
@@ -1042,7 +1056,7 @@ describe('Control-API bearer authentication', () => {
         response: {ok: true, path: '/workspace/repos/fro-bot/agent', commit: 'abc123'},
         statusCode: 200,
       })
-      const app = createApp({cloneExecutor, token: AUTH_TOKEN})
+      const app = appWithBearerAuth(AUTH_TOKEN, {cloneExecutor})
 
       // #when — lowercase header name
       const res = await postClone(
@@ -1054,5 +1068,32 @@ describe('Control-API bearer authentication', () => {
       // #then
       expect(res.status).toBe(200)
     })
+  })
+})
+
+describe('ServerDeps.auth variants are behaviourally distinct', () => {
+  it('bearer rejects an unauthenticated POST /inspect; disabled-for-tests does not', async () => {
+    // #given — same handler wiring, differing only in the auth variant
+    const observation = {
+      head: {kind: 'attached' as const, branch: 'main', sha: 'a'.repeat(40)},
+      worktree: {kind: 'clean' as const},
+      operationInProgress: 'none' as const,
+      observedAt: '2026-01-01T00:00:00.000Z',
+    }
+    const bearerInspectExecutor = makeInspectExecutor({response: {ok: true, observation}, statusCode: 200})
+    const disabledInspectExecutor = makeInspectExecutor({response: {ok: true, observation}, statusCode: 200})
+    const bearerApp = appWithBearerAuth(`auth-token-${'z'.repeat(32)}`, {inspectExecutor: bearerInspectExecutor})
+    const disabledApp = appWithoutAuth({inspectExecutor: disabledInspectExecutor})
+
+    // #when — no Authorization header on either request
+    const bearerRes = await postInspect(bearerApp, {owner: 'fro-bot', repo: 'agent'})
+    const disabledRes = await postInspect(disabledApp, {owner: 'fro-bot', repo: 'agent'})
+
+    // #then — the type-level distinction has a real runtime effect: bearer refuses, disabled allows
+    expect(bearerRes.status).toBe(401)
+    expect(bearerInspectExecutor).not.toHaveBeenCalled()
+
+    expect(disabledRes.status).toBe(200)
+    expect(disabledInspectExecutor).toHaveBeenCalledTimes(1)
   })
 })

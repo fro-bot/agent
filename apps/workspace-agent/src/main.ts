@@ -166,7 +166,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     return exitFn(1)
   }
 
-  const app = createApp({opencodeStatus, proxyListening: proxyListeningRef, token})
+  const app = createApp({opencodeStatus, proxyListening: proxyListeningRef, auth: {kind: 'bearer', token}})
 
   // Bind :9100 and WAIT for the first of three outcomes before doing anything else that could
   // race an unprivileged process for a port:

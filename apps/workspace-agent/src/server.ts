@@ -74,33 +74,38 @@ export interface ServerDeps {
    */
   readonly proxyListening?: ProxyListeningRef
   /**
-   * Expected control-API bearer token — the same `WORKSPACE_OPENCODE_TOKEN` secret the 9200
-   * OpenCode proxy already validates (see `opencode-proxy.ts`). When present, every route
-   * except `/healthz` and `/readyz` requires `Authorization: Bearer <token>`, checked before
-   * any body parsing, JSON parsing, or route logic — a missing, wrong-scheme, or wrong token
-   * gets a fixed 401 body. Comparison is constant-time (`timingSafeEqual`, length-guarded).
-   * The presented header value is never logged.
+   * Required control-API auth mode — every caller must state it explicitly, so an
+   * unauthenticated control API can never be built by omission.
    *
-   * When absent (test/dev convenience — production wiring in `main.ts` always supplies it from
-   * the secret), authentication is not enforced.
+   * `{kind: 'bearer', token}`: every route except `/healthz` and `/readyz` requires
+   * `Authorization: Bearer <token>`, checked before any body parsing, JSON parsing, or route
+   * logic — a missing, wrong-scheme, or wrong token gets a fixed 401 body. Comparison is
+   * constant-time (`timingSafeEqual`, length-guarded). The presented header value is never
+   * logged. `token` must be non-empty (whitespace-only is also rejected).
+   *
+   * `{kind: 'disabled-for-tests'}`: no auth middleware is installed. Test-only — production
+   * wiring in `main.ts` always passes the `bearer` variant, sourced from the
+   * `WORKSPACE_OPENCODE_TOKEN` secret.
    */
-  readonly token?: string
+  readonly auth: {readonly kind: 'bearer'; readonly token: string} | {readonly kind: 'disabled-for-tests'}
 }
 
 /**
  * Create the Hono application.
  *
- * @param deps - Optional dependency overrides for testing.
+ * @param deps - Dependency overrides. `deps.auth` is required — every caller must state
+ *   whether the control API is protected (`bearer`) or intentionally open (`disabled-for-tests`).
  */
-export function createApp(deps: ServerDeps = {}): Hono {
-  const {cloneExecutor = executeClone, inspectExecutor = inspectCheckout, opencodeStatus, proxyListening, token} = deps
+export function createApp(deps: ServerDeps): Hono {
+  const {cloneExecutor = executeClone, inspectExecutor = inspectCheckout, opencodeStatus, proxyListening, auth} = deps
   const app = new Hono()
 
   // Control-API bearer check — every route except /healthz and /readyz. Registered before any
   // route so it runs (and can short-circuit with 401) before body parsing, JSON parsing, or
   // owner/repo validation. Constant-time comparison; the presented header is never logged.
-  // See ServerDeps.token above and the reuse rationale in opencode-proxy.ts.
-  if (token !== undefined) {
+  // See ServerDeps.auth above and the reuse rationale in opencode-proxy.ts.
+  if (auth.kind === 'bearer') {
+    const {token} = auth
     // An empty expected token would authenticate `Authorization: Bearer ` with nothing after it.
     if (token.trim() === '') {
       throw new Error('createApp: control-API token must not be empty')
