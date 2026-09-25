@@ -994,12 +994,16 @@ describe('saveCache', () => {
   let authPath: string
 
   beforeEach(async () => {
+    // saveCache folds the runner's GITHUB_RUN_ATTEMPT into the save key; pin it so expected
+    // keys don't change when CI re-runs a job (attempt 2+).
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '1')
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cache-test-'))
     storagePath = path.join(tempDir, 'storage')
     authPath = path.join(tempDir, 'auth.json')
   })
 
   afterEach(async () => {
+    vi.unstubAllEnvs()
     await fs.rm(tempDir, {recursive: true, force: true})
   })
 
@@ -1030,8 +1034,7 @@ describe('saveCache', () => {
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
 
-    const originalRunAttempt = process.env.GITHUB_RUN_ATTEMPT
-    process.env.GITHUB_RUN_ATTEMPT = '2'
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '2')
 
     const saveCacheMock = vi.fn(async () => 12345)
     const adapter: CacheAdapter = {
@@ -1039,28 +1042,20 @@ describe('saveCache', () => {
       saveCache: saveCacheMock,
     }
 
-    try {
-      // #when saving cache on run attempt 2
-      const result = await saveCache({
-        components: testComponents,
-        runId: 98765,
-        logger: createTestLogger(),
-        storagePath,
-        authPath,
-        cacheAdapter: adapter,
-      })
+    // #when saving cache on run attempt 2
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
 
-      // #then the save key carries the actual run attempt, not a stale/hardcoded 1 --
-      // otherwise a re-run's save key would collide with the first attempt's
-      expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
-      expect(saveCacheMock).toHaveBeenCalledWith(expect.any(Array), expect.stringMatching(/-98765-2$/))
-    } finally {
-      if (originalRunAttempt == null) {
-        delete process.env.GITHUB_RUN_ATTEMPT
-      } else {
-        process.env.GITHUB_RUN_ATTEMPT = originalRunAttempt
-      }
-    }
+    // #then the save key carries the actual run attempt, not a stale/hardcoded 1 --
+    // otherwise a re-run's save key would collide with the first attempt's
+    expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+    expect(saveCacheMock).toHaveBeenCalledWith(expect.any(Array), expect.stringMatching(/-98765-2$/))
   })
 
   it('returns false and warns when save returns the failure sentinel', async () => {
