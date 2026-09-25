@@ -46,6 +46,12 @@ export interface GitRunnerOptions {
   readonly uid?: number
   /** Unprivileged gid to run git as. Defaults applied by callers from identity.ts (AGENT_GID). */
   readonly gid?: number
+  /**
+   * Optional external trigger for the exact same confirmed-termination path as `timeoutMs`
+   * (SIGKILL, then the same reap-grace race between `timeout` and `termination-unconfirmed`) —
+   * an already-aborted signal terminates immediately, without waiting for `timeoutMs`.
+   */
+  readonly signal?: AbortSignal
 }
 
 export type GitOutcome =
@@ -74,9 +80,14 @@ export type GitRunnerFn = (args: readonly string[], options: GitRunnerOptions) =
 export const runGit: GitRunnerFn = async (args, options) =>
   new Promise(resolve => {
     let settled = false
+    let terminating = false
     let timedOut = false
     let graceHandle: ReturnType<typeof setTimeout> | undefined
     let timeoutHandle: ReturnType<typeof setTimeout>
+
+    const detachAbortListener = (): void => {
+      options.signal?.removeEventListener('abort', onAbort)
+    }
 
     const child = execFile(
       'git',
@@ -94,6 +105,7 @@ export const runGit: GitRunnerFn = async (args, options) =>
         settled = true
         clearTimeout(timeoutHandle)
         clearTimeout(graceHandle)
+        detachAbortListener()
         if (timedOut) {
           resolve({kind: 'timeout'})
           return
@@ -111,8 +123,17 @@ export const runGit: GitRunnerFn = async (args, options) =>
       },
     )
 
-    timeoutHandle = setTimeout(() => {
+    // Confirmed-termination path shared by the timer AND `options.signal`: whichever fires first
+    // sends SIGKILL and starts the same reap-grace race between a confirmed `timeout` (the exec
+    // callback above still wins, proving the child's stdio actually closed) and
+    // `termination-unconfirmed` (grace window elapses first) — an abort is just another trigger
+    // for this path, never a distinct outcome. `terminating` guards against both firing (timer
+    // fires, then the signal aborts before the grace window resolves, or vice versa).
+    const terminate = (): void => {
+      if (terminating) return
+      terminating = true
       timedOut = true
+      clearTimeout(timeoutHandle)
       child.kill('SIGKILL')
       // Grace window in case SIGKILL doesn't reap promptly (unusual, but SIGKILL delivery is not
       // instantaneous). If the child still hasn't closed after this, the caller must never hang
@@ -123,9 +144,24 @@ export const runGit: GitRunnerFn = async (args, options) =>
       graceHandle = setTimeout(() => {
         if (settled) return
         settled = true
+        detachAbortListener()
         resolve({kind: 'termination-unconfirmed'})
       }, GIT_KILL_REAP_GRACE_MS)
-    }, options.timeoutMs)
+    }
+
+    function onAbort(): void {
+      terminate()
+    }
+
+    timeoutHandle = setTimeout(terminate, options.timeoutMs)
+
+    if (options.signal !== undefined) {
+      if (options.signal.aborted) {
+        terminate()
+      } else {
+        options.signal.addEventListener('abort', onAbort, {once: true})
+      }
+    }
   })
 
 /**
