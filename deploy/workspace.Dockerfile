@@ -16,8 +16,10 @@
 # SYSTEMATIC_VERSION tracks DEFAULT_SYSTEMATIC_VERSION in
 # packages/runtime/src/shared/constants.ts.
 
-# ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS build
+# ── Stage 1: build-deps (full workspace, dev deps, workspace-agent build) ──────
+# Forked into `workspace-test` below BEFORE dev dependencies are pruned, then
+# continued as `build` (prune to production) for the runtime stage to copy from.
+FROM node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS build-deps
 
 WORKDIR /workspace
 
@@ -94,6 +96,31 @@ RUN bun install --frozen-lockfile
 COPY apps/workspace-agent/ apps/workspace-agent/
 
 RUN bun run --filter @fro-bot/workspace-agent build
+
+# ── Stage 1b: workspace-test (forked from build-deps BEFORE dev-dep pruning) ──
+# Runs the workspace-agent test suite — including the Unit 2 adversarial
+# real-git fixtures under apps/workspace-agent/src/update-fixtures/ — against
+# THIS image's own Alpine `apk` git, not the CI runner's git, so the fixture
+# suite's transport/hook/filter/collision assertions exercise the exact git
+# binary the runtime image ships. Only reachable via `docker build --target
+# workspace-test`; the default build (no --target) never builds this stage
+# (BuildKit skips stages that are not ancestors of the requested target), so
+# it adds zero cost to the runtime image build.
+FROM build-deps AS workspace-test
+
+# git: same source as the runtime stage's `apk add git` below (Alpine apk, not
+# a separately curl-fetched binary) — the whole point of this stage is running
+# the fixtures against a git that matches what ships in runtime.
+# openssl: CLI binary the self-signed-cert fixtures shell out to
+# (generateSelfSignedCert in update-fixtures/helpers.ts). The runtime image has
+# no need for the openssl CLI (only its libs, transitively, for Node/OpenCode),
+# so this is confined to the test-only stage rather than added to runtime.
+RUN apk add --no-cache git openssl
+
+CMD ["sh", "-c", "set -e; git --version; exec bun run --filter @fro-bot/workspace-agent test"]
+
+# ── Stage 1 (continued): build (prune dev deps to production-only) ───────────
+FROM build-deps AS build
 
 # Trim the runtime image: re-resolve node_modules to production-only so the
 # final image does not carry the dev toolchain (vitest, tsdown, eslint, …). The
