@@ -4,11 +4,12 @@ import type {ExecFileFn} from './clone.js'
 import type {GitOutcome, GitRunnerFn, GitRunnerOptions} from './git-safety.js'
 import type {HandoffOps} from './handoff.js'
 
-import {chmod, mkdir, mkdtemp, open, realpath, rename, rm} from 'node:fs/promises'
+import {chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm} from 'node:fs/promises'
 
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {executeClone, resetCloneSemaphoreForTesting, scrubCredentials} from './clone.js'
 import {AGENT_GID, AGENT_UID} from './identity.js'
+import {repoMutexKey, resetRepoHoldsForTesting, resetRepoLocksForTesting, withRepoLock} from './repo-mutex.js'
 
 // #given mocked fs operations
 vi.mock('node:fs/promises', async () => {
@@ -22,6 +23,11 @@ vi.mock('node:fs/promises', async () => {
     rename: vi.fn().mockResolvedValue(undefined),
     rm: vi.fn().mockResolvedValue(undefined),
     realpath: vi.fn(),
+    // Journal-store reads (journal.ts, used by clone.ts's outstanding-journal check) go through
+    // these two. Defaulted to "nothing exists" in beforeEach so every pre-existing test below
+    // sees an absent journal and proceeds exactly as before Unit 3.
+    lstat: vi.fn(),
+    readFile: vi.fn(),
   }
 })
 
@@ -32,6 +38,8 @@ const mockOpen = vi.mocked(open)
 const mockRename = vi.mocked(rename)
 const mockRm = vi.mocked(rm)
 const mockRealpath = vi.mocked(realpath)
+const mockLstat = vi.mocked(lstat)
+const mockReadFile = vi.mocked(readFile)
 
 const TEST_REPOS_ROOT = '/workspace/repos'
 const FAKE_ASKPASS_DIR = '/tmp/workspace-agent-askpass-abc123'
@@ -123,6 +131,8 @@ function resetFakeMkdtempFn(): void {
 beforeEach(() => {
   vi.resetAllMocks()
   resetCloneSemaphoreForTesting()
+  resetRepoLocksForTesting()
+  resetRepoHoldsForTesting()
   // Re-setup default implementations after reset.
   mockMkdir.mockResolvedValue(undefined)
   mockMkdtemp.mockResolvedValue(FAKE_ASKPASS_DIR)
@@ -135,6 +145,10 @@ beforeEach(() => {
   mockRealpath.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
   // Default: resolved path after clone
   mockRealpath.mockResolvedValue(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+  // Default: no journal for any repo — journal.ts's directory-safety checks see nothing on disk,
+  // so readJournal reports 'absent' and clone proceeds exactly as it did before Unit 3.
+  mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+  mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
 })
 
 describe('executeClone — happy path', () => {
@@ -456,6 +470,8 @@ describe('executeClone — idempotency (repo-exists)', () => {
     // gitRunner: --is-inside-work-tree returns "true" and --verify HEAD^{commit} succeeds
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockMkdir.mockResolvedValue(undefined)
     mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
     mockRename.mockResolvedValue(undefined)
@@ -491,6 +507,8 @@ describe('executeClone — idempotency (repo-exists)', () => {
     // #given
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockMkdir.mockResolvedValue(undefined)
     mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
     mockRename.mockResolvedValue(undefined)
@@ -529,6 +547,8 @@ describe('executeClone — idempotency (repo-exists)', () => {
     // #given — realpath succeeds (path exists) but --is-inside-work-tree returns "false" (bare repo)
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockMkdir.mockResolvedValue(undefined)
     mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
     mockRename.mockResolvedValue(undefined)
@@ -558,6 +578,8 @@ describe('executeClone — idempotency (repo-exists)', () => {
     // #given — realpath succeeds (path exists) but --is-inside-work-tree fails (empty/non-git dir)
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockMkdir.mockResolvedValue(undefined)
     mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
     mockRename.mockResolvedValue(undefined)
@@ -589,6 +611,8 @@ describe('executeClone — idempotency (repo-exists)', () => {
     // --verify HEAD^{commit} returns empty string (unborn branch / corrupt checkout)
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockMkdir.mockResolvedValue(undefined)
     mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
     mockRename.mockResolvedValue(undefined)
@@ -621,6 +645,8 @@ describe('executeClone — idempotency (repo-exists)', () => {
     // #given — realpath succeeds (path exists); the confirmed-termination runner reports a timeout
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockMkdir.mockResolvedValue(undefined)
     mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
     mockRename.mockResolvedValue(undefined)
@@ -648,6 +674,8 @@ describe('executeClone — idempotency (repo-exists)', () => {
     // #given — realpath succeeds but resolves to a path outside the repos root (symlink attack)
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockMkdir.mockResolvedValue(undefined)
     mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
     mockRename.mockResolvedValue(undefined)
@@ -1476,6 +1504,8 @@ describe('executeClone — symlink / path escape defense', () => {
     vi.resetAllMocks()
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
     mockRename.mockResolvedValue(undefined)
     mockRm.mockResolvedValue(undefined)
@@ -1514,6 +1544,8 @@ describe('executeClone — cleanup on exception (T3)', () => {
     vi.resetAllMocks()
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mockMkdir.mockRejectedValueOnce(new Error('EACCES: permission denied'))
     mockRm.mockResolvedValue(undefined)
     mockRealpath.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
@@ -1541,6 +1573,8 @@ describe('executeClone — cleanup on exception (T3)', () => {
     vi.resetAllMocks()
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+    mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     fakeMkdtempFn.mockResolvedValue(FAKE_ASKPASS_DIR)
     mockOpen.mockRejectedValueOnce(new Error('EEXIST: file already exists'))
     mockRm.mockResolvedValue(undefined)
@@ -1749,4 +1783,136 @@ describe('executeClone — per-repo lock serialization (Test B)', () => {
     // Only ONE git clone was invoked (the others short-circuited on repo-exists check)
     expect(cloneCallCount).toBe(1)
   }, 15_000)
+})
+
+describe('executeClone — outstanding journal (Unit 3)', () => {
+  it('refuses with journal-in-progress and never touches git when a journal already exists for the repo', async () => {
+    // #given — a journal file (update, phase applying) already exists for this repo, discovered
+    // via the same real fs.lstat/readFile journal.ts uses — not an injected dependency.
+    const parentPath = `${TEST_REPOS_ROOT}/.workspace-agent`
+    const journalsDirPath = `${parentPath}/journals`
+    const journalFilePath = `${journalsDirPath}/${VALID_REQUEST.owner}__${VALID_REQUEST.repo}.json`
+
+    mockLstat.mockImplementation(async (path: unknown) => {
+      if (path === parentPath || path === journalsDirPath) return makeStats({isDirectory: true, isFile: false})
+      if (path === journalFilePath) return makeStats({isDirectory: false, isFile: true})
+      throw Object.assign(new Error('ENOENT'), {code: 'ENOENT'})
+    })
+    mockReadFile.mockImplementation(async (path: unknown) => {
+      if (path === journalFilePath) {
+        return JSON.stringify({
+          kind: 'update',
+          owner: VALID_REQUEST.owner,
+          repo: VALID_REQUEST.repo,
+          phase: 'applying',
+          fromSha: 'a'.repeat(40),
+          toSha: 'b'.repeat(40),
+          startedAt: '2026-09-24T00:00:00.000Z',
+        })
+      }
+      throw Object.assign(new Error('ENOENT'), {code: 'ENOENT'})
+    })
+
+    const execFileFn = makeExecFile([])
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+      handoffOps: makeHandoffOps(),
+    })
+
+    // #then — refused before any git process is spawned
+    expect(result.statusCode).toBe(409)
+    expect(result.response).toEqual({ok: false, error: 'journal-in-progress'})
+    expect(execFileFn).not.toHaveBeenCalled()
+  })
+
+  it('refuses with journal-in-progress when the journal file exists but is malformed — never treated as absent', async () => {
+    // #given — a journal file exists but fails to parse (foreign schema)
+    const parentPath = `${TEST_REPOS_ROOT}/.workspace-agent`
+    const journalsDirPath = `${parentPath}/journals`
+    const journalFilePath = `${journalsDirPath}/${VALID_REQUEST.owner}__${VALID_REQUEST.repo}.json`
+
+    mockLstat.mockImplementation(async (path: unknown) => {
+      if (path === parentPath || path === journalsDirPath) return makeStats({isDirectory: true, isFile: false})
+      if (path === journalFilePath) return makeStats({isDirectory: false, isFile: true})
+      throw Object.assign(new Error('ENOENT'), {code: 'ENOENT'})
+    })
+    mockReadFile.mockImplementation(async (path: unknown) => {
+      if (path === journalFilePath) return '{not valid json'
+      throw Object.assign(new Error('ENOENT'), {code: 'ENOENT'})
+    })
+
+    const execFileFn = makeExecFile([])
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+      handoffOps: makeHandoffOps(),
+    })
+
+    // #then
+    expect(result.statusCode).toBe(409)
+    expect(result.response).toEqual({ok: false, error: 'journal-in-progress'})
+    expect(execFileFn).not.toHaveBeenCalled()
+  })
+})
+
+describe('executeClone — shared repo mutex (Unit 3)', () => {
+  it('waits for an operation already holding the same repo-mutex key from repo-mutex.ts, then proceeds in order', async () => {
+    // #given — an external operation (standing in for /update, /recover, or backup delete) has
+    // already acquired the SAME mutex clone.ts uses — imported directly from repo-mutex.ts, not
+    // reconstructed, so this proves clone.ts shares the module-singleton lock rather than a
+    // structurally similar one of its own.
+    const order: string[] = []
+    let releaseExternal!: () => void
+    const externalDone = withRepoLock(repoMutexKey(VALID_REQUEST.owner, VALID_REQUEST.repo), async () => {
+      order.push('external-start')
+      await new Promise<void>(resolve => {
+        releaseExternal = resolve
+      })
+      order.push('external-end')
+    })
+
+    // Let the external operation actually acquire the lock (synchronous up to its own await).
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''},
+      {stdout: 'sha123\n', stderr: ''},
+    ])
+
+    // #when — clone starts while the external operation still holds the lock
+    const clonePromise = executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+      handoffOps: makeHandoffOps(),
+    }).then(result => {
+      order.push('clone-end')
+      return result
+    })
+
+    // Deterministic ordering assertion, not timing: clone must not have run yet.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(order).toEqual(['external-start'])
+    expect(execFileFn).not.toHaveBeenCalled()
+
+    releaseExternal()
+    await externalDone
+
+    // #then — clone only proceeds once the external holder releases, in strict order
+    const result = await clonePromise
+    expect(order).toEqual(['external-start', 'external-end', 'clone-end'])
+    expect(result.statusCode).toBe(200)
+  })
 })

@@ -7,14 +7,15 @@
  * 3. The proxy listening signal is wired: proxyListeningRef.listening becomes true after proxy.listen resolves.
  */
 
-import type {ExitFn, ServeFn} from './main.js'
+import type {CreateAppFn, ExitFn, ServeFn} from './main.js'
 import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
-import type {ProxyListeningRef} from './server.js'
+import type {ProxyListeningRef, ServerDeps} from './server.js'
 
 import http from 'node:http'
+import {Hono} from 'hono'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {SERVER_LISTEN_TIMEOUT_MS, startWorkspaceAgent} from './main.js'
+import {JOURNAL_RECONCILE_TIMEOUT_MS, SERVER_LISTEN_TIMEOUT_MS, startWorkspaceAgent} from './main.js'
 
 // ── Fake helpers ──────────────────────────────────────────────────────────────
 
@@ -72,6 +73,14 @@ function makeFakeProxyFactory(callLog: string[], proxyListeningRef?: ProxyListen
     callLog.push('createOpencodeProxy')
     return makeFakeProxy(callLog, proxyListeningRef)
   })
+}
+
+/** Build a fake createApp function that captures the `ServerDeps` it was called with, instead of building a real Hono app. */
+function makeCapturingCreateAppFn(captured: {value?: ServerDeps}): CreateAppFn {
+  return (deps: ServerDeps) => {
+    captured.value = deps
+    return new Hono()
+  }
 }
 
 /**
@@ -149,6 +158,8 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
       // #then
@@ -171,6 +182,8 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
       // #then
@@ -201,6 +214,8 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
       // #then — assert the exact reordered startup sequence
@@ -251,6 +266,8 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
       // #then — by the time runSupervisedOpencode is invoked, the delayed proxy.listen() had
@@ -305,6 +322,8 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
       // #then — env was read before serve was called
@@ -340,6 +359,8 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
       // main.ts now AWAITS proxy.listen() directly (so OpenCode is never spawned before the
       // bind attempt settles), so proxyListeningRef.listening is already true by the time
@@ -389,6 +410,8 @@ describe('startWorkspaceAgent', () => {
           createOpencodeProxyFn: fakeProxyFactory,
           readSecretFn: (_name: string) => 'fake-token',
           exitFn: fakeExitFn,
+          reconcileUpdateJournalsFn: async () => {},
+          reconcileRecoveryJournalsFn: async () => {},
         }),
       ).rejects.toThrow('exitFn(1)')
 
@@ -435,6 +458,8 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
         exitFn: fakeExitFn,
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
       expect(capturedServer).toBeDefined()
@@ -480,6 +505,8 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
         exitFn: fakeExitFn,
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
       expect(capturedServer).toBeDefined()
@@ -537,7 +564,16 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
         exitFn: fakeExitFn,
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
+      // Flush pending microtasks and a macrotask before firing the listening callback — startup
+      // now awaits the (fake, near-instant) startup journal reconciliation pass before ever
+      // calling serveFn, which needs more than a single synchronous call to settle (see the
+      // `:9100 bind gating` describe block's own flush pattern for the same reason).
+      await Promise.resolve()
+      await Promise.resolve()
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
       fireListening()
       await startupPromise
 
@@ -583,6 +619,8 @@ describe('startWorkspaceAgent', () => {
           createOpencodeProxyFn: throwingProxyFactory,
           readSecretFn: (_name: string) => 'fake-token',
           exitFn: fakeExitFn,
+          reconcileUpdateJournalsFn: async () => {},
+          reconcileRecoveryJournalsFn: async () => {},
         }),
       ).rejects.toThrow('exitFn(1)')
 
@@ -615,6 +653,8 @@ describe('startWorkspaceAgent', () => {
             throw new Error('Missing required secret: WORKSPACE_OPENCODE_TOKEN')
           },
           exitFn: fakeExitFn,
+          reconcileUpdateJournalsFn: async () => {},
+          reconcileRecoveryJournalsFn: async () => {},
         }),
       ).rejects.toThrow('exitFn(1)')
 
@@ -650,6 +690,8 @@ describe('startWorkspaceAgent', () => {
         runSupervisedOpencodeFn: fakeSupervisorFn,
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
       // Flush pending microtasks and a macrotask — a regression that stopped awaiting the bind
@@ -692,9 +734,17 @@ describe('startWorkspaceAgent', () => {
         createOpencodeProxyFn: fakeProxyFactory,
         readSecretFn: (_name: string) => 'fake-token',
         exitFn: fakeExitFn,
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
       })
 
+      // Flush pending microtasks and a macrotask before firing the bind error — startup now
+      // awaits the (fake, near-instant) startup journal reconciliation pass before ever calling
+      // serveFn, which needs more than a single microtask tick to settle (see the sibling test
+      // above for the same flush pattern).
       await Promise.resolve()
+      await Promise.resolve()
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
       fireError(new Error('EADDRINUSE'))
 
       // #then
@@ -732,6 +782,8 @@ describe('startWorkspaceAgent', () => {
           createOpencodeProxyFn: fakeProxyFactory,
           readSecretFn: (_name: string) => 'fake-token',
           exitFn: fakeExitFn,
+          reconcileUpdateJournalsFn: async () => {},
+          reconcileRecoveryJournalsFn: async () => {},
         })
         await Promise.all([
           expect(startupPromise).rejects.toThrow('exitFn(1)'),
@@ -744,5 +796,208 @@ describe('startWorkspaceAgent', () => {
         expect(callLog).not.toContain('runSupervisedOpencode')
       })
     })
+  })
+})
+
+describe('startWorkspaceAgent — startup journal reconciliation race timer (C5a)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('clears the losing race timer after a FAST successful reconciliation — no spurious deadline log later', async () => {
+    // #given — reconciliation resolves immediately, well inside the deadline
+    const callLog: string[] = []
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+      reconcileRecoveryJournalsFn: async () => {},
+    })
+    await vi.advanceTimersByTimeAsync(JOURNAL_RECONCILE_TIMEOUT_MS)
+
+    // #then — the deadline-timer log must never fire once reconciliation already finished
+    expect(errorSpy.mock.calls.some(call => String(call[0]).includes('did not finish within the deadline'))).toBe(false)
+  })
+})
+
+describe('startWorkspaceAgent — recovery-journal reconciliation (slice 5c)', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('runs recovery reconciliation BEFORE update reconciliation, and before :9100 binds', async () => {
+    // #given
+    const callLog: string[] = []
+    const order: string[] = []
+    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileRecoveryJournalsFn: async () => {
+        order.push('recovery')
+      },
+      reconcileUpdateJournalsFn: async () => {
+        order.push('update')
+      },
+    })
+
+    // #then
+    expect(order).toEqual(['recovery', 'update'])
+    expect(callLog[0]).toBe('serve')
+  })
+
+  it('a hanging recovery reconciliation does not block startup past its own deadline, and update reconciliation still runs after', async () => {
+    // #given
+    vi.useFakeTimers()
+    const callLog: string[] = []
+    const order: string[] = []
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+
+    // #when — recovery reconciliation never resolves; update reconciliation resolves immediately
+    const startPromise = startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileRecoveryJournalsFn: async () => new Promise<void>(() => {}),
+      reconcileUpdateJournalsFn: async () => {
+        order.push('update')
+      },
+    })
+    await vi.advanceTimersByTimeAsync(JOURNAL_RECONCILE_TIMEOUT_MS)
+    await startPromise
+
+    // #then — startup completed (bound :9100), update reconciliation still ran, and the deadline
+    // log names the stalled pass
+    expect(callLog).toContain('serve')
+    expect(order).toEqual(['update'])
+    expect(
+      errorSpy.mock.calls.some(call =>
+        String(call[0]).includes('startup recovery-journal reconciliation did not finish'),
+      ),
+    ).toBe(true)
+  })
+
+  it('clears the recovery reconciliation race timer after a FAST successful pass — no spurious deadline log later', async () => {
+    // #given
+    vi.useFakeTimers()
+    const callLog: string[] = []
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileRecoveryJournalsFn: async () => {},
+      reconcileUpdateJournalsFn: async () => {},
+    })
+    await vi.advanceTimersByTimeAsync(JOURNAL_RECONCILE_TIMEOUT_MS)
+
+    // #then
+    expect(
+      errorSpy.mock.calls.some(call =>
+        String(call[0]).includes('startup recovery-journal reconciliation did not finish'),
+      ),
+    ).toBe(false)
+  })
+})
+
+describe('startWorkspaceAgent — updateNetworkConfig wiring (A1)', () => {
+  it('passes proxy config derived from HTTPS_PROXY/NO_PROXY into createApp', async () => {
+    // #given
+    const callLog: string[] = []
+    const captured: {value?: ServerDeps} = {}
+    const fakeEnv: NodeJS.ProcessEnv = {
+      WORKSPACE_OPENCODE_TOKEN: 'tok',
+      HTTPS_PROXY: 'http://mitmproxy:8080',
+      NO_PROXY: '10.0.0.0/8',
+    }
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+      reconcileRecoveryJournalsFn: async () => {},
+      createAppFn: makeCapturingCreateAppFn(captured),
+    })
+
+    // #then
+    expect(captured.value?.updateNetworkConfig).toEqual({
+      proxy: {https: 'http://mitmproxy:8080', noProxy: '10.0.0.0/8'},
+    })
+  })
+
+  it('passes caBundlePath derived from GIT_SSL_CAINFO into createApp', async () => {
+    // #given
+    const callLog: string[] = []
+    const captured: {value?: ServerDeps} = {}
+    const fakeEnv: NodeJS.ProcessEnv = {
+      WORKSPACE_OPENCODE_TOKEN: 'tok',
+      GIT_SSL_CAINFO: '/etc/ssl/certs/mitmproxy-ca.pem',
+    }
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+      reconcileRecoveryJournalsFn: async () => {},
+      createAppFn: makeCapturingCreateAppFn(captured),
+    })
+
+    // #then
+    expect(captured.value?.updateNetworkConfig).toEqual({caBundlePath: '/etc/ssl/certs/mitmproxy-ca.pem'})
+  })
+
+  it('passes an empty updateNetworkConfig when no proxy or CA-bundle env vars are set', async () => {
+    // #given
+    const callLog: string[] = []
+    const captured: {value?: ServerDeps} = {}
+    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+      reconcileRecoveryJournalsFn: async () => {},
+      createAppFn: makeCapturingCreateAppFn(captured),
+    })
+
+    // #then
+    expect(captured.value?.updateNetworkConfig).toEqual({})
   })
 })

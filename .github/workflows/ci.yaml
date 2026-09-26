@@ -476,6 +476,24 @@ jobs:
             [ "${attempt}" -eq 3 ] && { echo "docker build failed after 3 attempts"; exit 1; }
             sleep $((attempt * 15))
           done
+      - name: Run workspace-agent tests inside the image (real Alpine git, Unit 2 fixtures)
+        run: |
+          # Builds the workspace-test target (forked before the runtime stage prunes
+          # dev deps — see deploy/workspace.Dockerfile) and runs the workspace-agent
+          # test suite inside it, so the adversarial real-git fixtures in
+          # apps/workspace-agent/src/update-fixtures/ exercise this image's own
+          # Alpine `apk` git rather than this runner's git. Same build context and
+          # retry pattern as the runtime image build above; `docker run` failing
+          # (non-zero exit from vitest) fails this step via the job's `set -e` default.
+          for attempt in 1 2 3; do
+            if docker build --target workspace-test -f deploy/workspace.Dockerfile -t fro-bot-workspace:test .; then
+              break
+            fi
+            echo "::warning::docker build (workspace-test) attempt ${attempt} failed"
+            [ "${attempt}" -eq 3 ] && { echo "docker build (workspace-test) failed after 3 attempts"; exit 1; }
+            sleep $((attempt * 15))
+          done
+          docker run --rm fro-bot-workspace:test
       - name: Smoke-test workspace image (clone API boots independently of OpenCode)
         run: |
           set -e

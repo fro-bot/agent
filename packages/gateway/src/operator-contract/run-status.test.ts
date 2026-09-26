@@ -503,6 +503,64 @@ describe('toOperatorRunStatus — checkoutProvenance', () => {
 })
 
 // ---------------------------------------------------------------------------
+// toOperatorRunStatus — checkoutPreparation projection (contract 1.8.0)
+// ---------------------------------------------------------------------------
+
+describe('toOperatorRunStatus — checkoutPreparation', () => {
+  const REFUSED_DIRTY_RAW = {outcome: 'refused', reason: 'dirty', changedPaths: ['a.txt']}
+  const FAILED_RAW = {outcome: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false}
+
+  it('a run refused before EXECUTING carries checkoutPreparation, never checkoutProvenance', () => {
+    // #given — the run this field exists for: refused before EXECUTING, so no provenance was ever recorded
+    const runState = makeRunState({phase: 'FAILED', details: {checkoutPreparation: REFUSED_DIRTY_RAW}})
+
+    // #when
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutPreparation).toEqual(REFUSED_DIRTY_RAW)
+    expect(result.checkoutProvenance).toBeUndefined()
+  })
+
+  it('a failed preparation attempt projects correctly', () => {
+    const runState = makeRunState({phase: 'FAILED', details: {checkoutPreparation: FAILED_RAW}})
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutPreparation).toEqual(FAILED_RAW)
+  })
+
+  it('a run with no stored preparation projects to absent and does not throw', () => {
+    const runState = makeRunState({phase: 'COMPLETED', details: {}})
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutPreparation).toBeUndefined()
+    expect(Object.prototype.hasOwnProperty.call(result, 'checkoutPreparation')).toBe(false)
+  })
+
+  it('malformed stored preparation is rejected, not passed through', () => {
+    // #given — missing the required disallowedKeys for this reason
+    const runState = makeRunState({
+      phase: 'FAILED',
+      details: {checkoutPreparation: {outcome: 'refused', reason: 'unsupported-config'}},
+    })
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    expect(result.checkoutPreparation).toBeUndefined()
+  })
+
+  it("a redacted repo's run does not leak preparation — the whole record is omitted", () => {
+    const runState = makeRunState({
+      entity_ref: 'secret-org/secret-repo#1',
+      details: {checkoutPreparation: REFUSED_DIRTY_RAW},
+    })
+    const deniedKey = {databaseId: 999, nodeId: 'MDEwOlJlcG9zaXRvcnk5OTk='}
+    const result = toOperatorRunStatus(runState, {...BASE_OPTS, repoKey: deniedKey, isRepoDenylisted: () => true})
+    expect(result).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // toOperatorFailureKind — internal→operator failure-kind mapping
 //
 // Structural note: toOperatorFailureKind(failureKind: unknown) takes only the single
