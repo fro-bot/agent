@@ -279,45 +279,73 @@ async function runRecoverCheckoutFlow(params: {
   }
   const {handle} = guardResult
 
-  const previewResult = await deps.workspaceClient.previewRecovery({owner, repo})
-  if (previewResult.success === false) {
-    log.error({repoSlug, err: previewResult.error.kind}, 'recover-checkout: preview transport error')
-    await Effect.runPromise(handle.release('FAILED', {kind: 'recover-checkout', outcome: 'preview-transport-error'}))
-    await editInteractionAsync(interaction, {content: INTERNAL_ERROR_COPY}, log)
-    return
+  let ownership: 'flow' | 'nonce' | 'released' = 'flow'
+  let stagedNonce: string | undefined
+  let failureOutcome = 'preview-error'
+  const releaseOwnedRun = async (phase: 'COMPLETED' | 'FAILED', outcome: string): Promise<void> => {
+    if (ownership === 'released') return
+    ownership = 'released'
+    await Effect.runPromise(handle.release(phase, {kind: 'recover-checkout', outcome}))
   }
 
-  const rendered = renderPreview(repoSlug, previewResult.data)
-  if (rendered.showConfirm === false || rendered.fingerprint === undefined) {
-    await Effect.runPromise(handle.release('COMPLETED', {kind: 'recover-checkout', outcome: 'preview-only'}))
-    await editInteractionAsync(interaction, {content: rendered.content}, log)
-    return
-  }
+  try {
+    const previewResult = await deps.workspaceClient.previewRecovery({owner, repo})
+    failureOutcome = 'post-acquire-error'
+    if (previewResult.success === false) {
+      log.error({repoSlug, err: previewResult.error.kind}, 'recover-checkout: preview transport error')
+      await releaseOwnedRun('FAILED', 'preview-transport-error')
+      await editInteractionAsync(interaction, {content: INTERNAL_ERROR_COPY}, log)
+      return
+    }
 
-  const firstEdit = await editInteractionAsync(
-    interaction,
-    {content: rendered.content, components: [buildConfirmCancelRow('pending')]},
-    log,
-  )
-  if (firstEdit.success === false) {
-    await Effect.runPromise(handle.release('FAILED', {kind: 'recover-checkout', outcome: 'post-preview-failed'}))
-    return
+    const rendered = renderPreview(repoSlug, previewResult.data)
+    if (rendered.showConfirm === false || rendered.fingerprint === undefined) {
+      await releaseOwnedRun('COMPLETED', 'preview-only')
+      await editInteractionAsync(interaction, {content: rendered.content}, log)
+      return
+    }
+
+    const firstEdit = await editInteractionAsync(
+      interaction,
+      {content: rendered.content, components: [buildConfirmCancelRow('pending')]},
+      log,
+    )
+    if (firstEdit.success === false) {
+      await releaseOwnedRun('FAILED', 'post-preview-failed')
+      return
+    }
+    // Result.data is discord.js's Message returned by interaction.editReply() — narrowed here
+    // rather than widening editInteractionAsync's own return type for every other caller.
+    const message = firstEdit.data as {id: string}
+    const binding: NonceBinding = {userId, guildId, channelId, messageId: message.id}
+    stagedNonce = nonceRegistry.create(binding, {owner, repo, fingerprint: rendered.fingerprint, handle}, () => {
+      // The nonce is the owner only after its button post succeeds. Expiry during that post still
+      // releases the run through the flow's ownership guard.
+      releaseOwnedRun('COMPLETED', 'expired').catch((error: unknown) =>
+        log.warn({repoSlug, err: String(error)}, 'recover-checkout: release-on-expiry failed'),
+      )
+      editInteractionAsync(interaction, {content: NOT_ACTIVE_REPLY, components: []}, log).catch((error: unknown) =>
+        log.warn({repoSlug, err: String(error)}, 'recover-checkout: expiry edit failed'),
+      )
+    })
+    // Re-post with the REAL nonce now that message.id (needed for the binding) is known.
+    const finalEdit = await editInteractionAsync(
+      interaction,
+      {content: rendered.content, components: [buildConfirmCancelRow(stagedNonce)]},
+      log,
+    )
+    if (finalEdit.success === false) {
+      nonceRegistry.cancel(stagedNonce)
+      stagedNonce = undefined
+      await releaseOwnedRun('FAILED', 'post-confirmation-failed')
+      return
+    }
+    if (ownership === 'flow') ownership = 'nonce'
+  } catch (error: unknown) {
+    if (stagedNonce !== undefined && ownership !== 'nonce') nonceRegistry.cancel(stagedNonce)
+    await releaseOwnedRun('FAILED', failureOutcome).catch(() => {})
+    throw error
   }
-  // Result.data is discord.js's Message returned by interaction.editReply() — narrowed here
-  // rather than widening editInteractionAsync's own return type for every other caller.
-  const message = firstEdit.data as {id: string}
-  const binding: NonceBinding = {userId, guildId, channelId, messageId: message.id}
-  const nonce = nonceRegistry.create(binding, {owner, repo, fingerprint: rendered.fingerprint, handle}, payload => {
-    // Expiry: release the lock, change nothing, edit the preview to the expired-status line.
-    Effect.runPromise(payload.handle.release('COMPLETED', {kind: 'recover-checkout', outcome: 'expired'})).catch(
-      (error: unknown) => log.warn({repoSlug, err: String(error)}, 'recover-checkout: release-on-expiry failed'),
-    )
-    editInteractionAsync(interaction, {content: NOT_ACTIVE_REPLY, components: []}, log).catch((error: unknown) =>
-      log.warn({repoSlug, err: String(error)}, 'recover-checkout: expiry edit failed'),
-    )
-  })
-  // Re-post with the REAL nonce now that message.id (needed for the binding) is known.
-  await editInteractionAsync(interaction, {content: rendered.content, components: [buildConfirmCancelRow(nonce)]}, log)
 }
 
 /** `/fro-bot recover-checkout` — fresh ManageChannels, no trigger-role fallback (destructive command). */
@@ -377,6 +405,13 @@ export async function handleRecoverConfirmOrCancelClick(
   const parsed = parseRecoverConfirmCustomId(interaction.customId)
   if (parsed === null) return // not our button
 
+  let ownedPayload: RecoverNoncePayload | null = null
+  const releaseClaimedRun = async (phase: 'COMPLETED' | 'FAILED', outcome: string): Promise<void> => {
+    const payload = ownedPayload
+    if (payload === null) return
+    ownedPayload = null
+    await Effect.runPromise(payload.handle.release(phase, {kind: 'recover-checkout', outcome}))
+  }
   try {
     await interaction.deferUpdate()
     const guildId = interaction.guildId
@@ -395,10 +430,11 @@ export async function handleRecoverConfirmOrCancelClick(
       await editInteractionAsync(interaction, {content: NOT_ACTIVE_REPLY, components: []}, log)
       return
     }
+    ownedPayload = payload
     const repoSlug = `${payload.owner}/${payload.repo}`
 
     if (parsed.action === 'cancel') {
-      await Effect.runPromise(payload.handle.release('COMPLETED', {kind: 'recover-checkout', outcome: 'cancelled'}))
+      await releaseClaimedRun('COMPLETED', 'cancelled')
       await editInteractionAsync(
         interaction,
         {content: `Cancelled. \`${repoSlug}\` was not changed.`, components: []},
@@ -411,9 +447,7 @@ export async function handleRecoverConfirmOrCancelClick(
     const guild = interaction.guild
     const authorized = guild !== null && (await hasManageChannels(guild, interaction.user.id, log))
     if (authorized === false) {
-      await Effect.runPromise(
-        payload.handle.release('FAILED', {kind: 'recover-checkout', outcome: 'unauthorized-at-confirm'}),
-      )
+      await releaseClaimedRun('FAILED', 'unauthorized-at-confirm')
       await editInteractionAsync(
         interaction,
         {
@@ -431,7 +465,7 @@ export async function handleRecoverConfirmOrCancelClick(
       currentBinding.data.owner === payload.owner &&
       currentBinding.data.repo === payload.repo
     if (stillBound === false) {
-      await Effect.runPromise(payload.handle.release('FAILED', {kind: 'recover-checkout', outcome: 'binding-changed'}))
+      await releaseClaimedRun('FAILED', 'binding-changed')
       await editInteractionAsync(
         interaction,
         {
@@ -446,7 +480,7 @@ export async function handleRecoverConfirmOrCancelClick(
     const authResult = await deps.appClient.authForRepo(payload.owner, payload.repo)
     if (authResult.success === false) {
       log.error({repoSlug, err: authResult.error.constructor.name}, 'recover-checkout: token mint failed at confirm')
-      await Effect.runPromise(payload.handle.release('FAILED', {kind: 'recover-checkout', outcome: 'auth-failed'}))
+      await releaseClaimedRun('FAILED', 'auth-failed')
       await editInteractionAsync(interaction, {content: INTERNAL_ERROR_COPY, components: []}, log)
       return
     }
@@ -459,16 +493,19 @@ export async function handleRecoverConfirmOrCancelClick(
     })
     if (recoverResult.success === false) {
       log.error({repoSlug, err: recoverResult.error.kind}, 'recover-checkout: recover transport error')
-      await Effect.runPromise(payload.handle.release('FAILED', {kind: 'recover-checkout', outcome: 'transport-error'}))
+      await releaseClaimedRun('FAILED', 'transport-error')
       await editInteractionAsync(interaction, {content: INTERNAL_ERROR_COPY, components: []}, log)
       return
     }
     const finalPhase = recoverResult.data.kind === 'ok' ? ('COMPLETED' as const) : ('FAILED' as const)
-    await Effect.runPromise(
-      payload.handle.release(finalPhase, {kind: 'recover-checkout', outcome: recoverResult.data.kind}),
-    )
+    await releaseClaimedRun(finalPhase, recoverResult.data.kind)
     await editInteractionAsync(interaction, {content: renderOutcome(repoSlug, recoverResult.data), components: []}, log)
   } catch (error: unknown) {
+    if (ownedPayload !== null) {
+      await releaseClaimedRun('FAILED', 'confirm-error').catch((releaseError: unknown) =>
+        log.warn({err: String(releaseError)}, 'recover-checkout: release-after-confirm-error failed'),
+      )
+    }
     log.error({err: String(error)}, 'recover-checkout: confirm/cancel handler threw')
     await editInteractionAsync(interaction, {content: INTERNAL_ERROR_COPY, components: []}, log).catch(() => {})
   }

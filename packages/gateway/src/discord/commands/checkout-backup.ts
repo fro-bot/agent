@@ -227,6 +227,21 @@ export async function handleBackupDeleteConfirmOrCancelClick(
       return
     }
 
+    const currentBinding = await deps.bindingsStore.getBindingByChannelId(interaction.channelId)
+    const stillBound =
+      currentBinding.success === true &&
+      currentBinding.data !== null &&
+      currentBinding.data.owner === payload.owner &&
+      currentBinding.data.repo === payload.repo
+    if (stillBound === false) {
+      await editInteractionAsync(
+        interaction,
+        {content: 'The repository bound to this channel changed. Run the delete command again.', components: []},
+        log,
+      )
+      return
+    }
+
     const deleteResult = await deps.workspaceClient.deleteBackup(payload.owner, payload.repo, payload.id)
     if (deleteResult.success === false) {
       await editInteractionAsync(interaction, {content: INTERNAL_ERROR_COPY, components: []}, log)

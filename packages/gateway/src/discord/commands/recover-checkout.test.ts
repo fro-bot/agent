@@ -140,6 +140,89 @@ describe('/fro-bot recover-checkout — authorization', () => {
 })
 
 describe('/fro-bot recover-checkout — preview rendering', () => {
+  it('releases the maintenance run when previewRecovery rejects', async () => {
+    const guild = makeGuild(true)
+    const {interaction} = makeSlashInteraction(guild)
+    const handle = makeReleaseHandle()
+    mockAcquireMaintenanceRun.mockReturnValue(Effect.succeed({outcome: 'acquired', handle}))
+    const deps = makeDeps()
+    vi.mocked(deps.workspaceClient.previewRecovery).mockRejectedValue(new Error('workspace unavailable'))
+
+    await expect(Effect.runPromise(createRecoverCheckoutCommand(deps)(interaction as never))).rejects.toThrow(
+      'workspace unavailable',
+    )
+
+    expect(handle.release).toHaveBeenCalledWith('FAILED', expect.objectContaining({outcome: 'preview-error'}))
+  })
+
+  it('releases the maintenance run when posting the nonce-bearing button edit fails', async () => {
+    const guild = makeGuild(true)
+    const {interaction, editReply} = makeSlashInteraction(guild)
+    const handle = makeReleaseHandle()
+    mockAcquireMaintenanceRun.mockReturnValue(Effect.succeed({outcome: 'acquired', handle}))
+    const deps = makeConfirmableDeps()
+    editReply.mockResolvedValueOnce({id: 'msg-1'}).mockRejectedValueOnce(new Error('discord unavailable'))
+
+    await Effect.runPromise(createRecoverCheckoutCommand(deps)(interaction as never))
+
+    expect(handle.release).toHaveBeenCalledWith(
+      'FAILED',
+      expect.objectContaining({outcome: 'post-confirmation-failed'}),
+    )
+    expect(getRecoverNonceRegistryForTesting()._pendingCount()).toBe(0)
+  })
+
+  it('releases the maintenance run once when rendering throws after acquisition', async () => {
+    const guild = makeGuild(true)
+    const {interaction} = makeSlashInteraction(guild)
+    const handle = makeReleaseHandle()
+    mockAcquireMaintenanceRun.mockReturnValue(Effect.succeed({outcome: 'acquired', handle}))
+    const deps = makeDeps()
+    vi.mocked(deps.workspaceClient.previewRecovery).mockResolvedValue({
+      success: true,
+      data: {kind: 'ok', preview: null},
+    } as never)
+
+    await expect(Effect.runPromise(createRecoverCheckoutCommand(deps)(interaction as never))).rejects.toThrow()
+
+    expect(handle.release).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases the maintenance run once when nonce creation throws', async () => {
+    const guild = makeGuild(true)
+    const {interaction} = makeSlashInteraction(guild)
+    const handle = makeReleaseHandle()
+    mockAcquireMaintenanceRun.mockReturnValue(Effect.succeed({outcome: 'acquired', handle}))
+    const deps = makeConfirmableDeps()
+    vi.spyOn(getRecoverNonceRegistryForTesting(), 'create').mockImplementationOnce(() => {
+      throw new Error('nonce generation failed')
+    })
+
+    await expect(Effect.runPromise(createRecoverCheckoutCommand(deps)(interaction as never))).rejects.toThrow(
+      'nonce generation failed',
+    )
+
+    expect(handle.release).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases the maintenance run once when the preview reply throws', async () => {
+    const guild = makeGuild(true)
+    const {interaction, editReply} = makeSlashInteraction(guild)
+    const handle = makeReleaseHandle()
+    mockAcquireMaintenanceRun.mockReturnValue(Effect.succeed({outcome: 'acquired', handle}))
+    const deps = makeConfirmableDeps()
+    editReply.mockRejectedValue(new Error('discord unavailable'))
+    vi.mocked(deps.gatewayLogger.warn).mockImplementationOnce(() => {
+      throw new Error('logger unavailable')
+    })
+
+    await expect(Effect.runPromise(createRecoverCheckoutCommand(deps)(interaction as never))).rejects.toThrow(
+      'logger unavailable',
+    )
+
+    expect(handle.release).toHaveBeenCalledTimes(1)
+  })
+
   it('an informational preview (no-checkout) shows no buttons and completes the maintenance run', async () => {
     const guild = makeGuild(true)
     const {interaction, editReply} = makeSlashInteraction(guild)
@@ -293,6 +376,26 @@ describe('/fro-bot recover-checkout — confirm/cancel buttons', () => {
     expect(handle.release).toHaveBeenCalledWith('COMPLETED', expect.objectContaining({outcome: 'ok'}))
   })
 
+  it('does not release a second time when final status rendering throws after terminal release', async () => {
+    const guild = makeGuild(true)
+    const handle = makeReleaseHandle()
+    const deps = makeConfirmableDeps()
+    const customId = await postConfirmablePreview(deps, guild, handle)
+    vi.mocked(deps.workspaceClient.recover).mockResolvedValue({
+      success: true,
+      data: {kind: 'ok', recoveryId: 'gen-1', sha: 'b'.repeat(40), branch: null},
+    } as never)
+    vi.mocked(deps.gatewayLogger.warn).mockImplementationOnce(() => {
+      throw new Error('logger unavailable')
+    })
+
+    const click = makeButtonInteraction(customId, {guild})
+    vi.mocked(click.interaction.editReply).mockRejectedValue(new Error('discord unavailable'))
+    await handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+
+    expect(handle.release).toHaveBeenCalledTimes(1)
+  })
+
   it('cancel: releases the run COMPLETED, reports cancelled, never calls recover', async () => {
     const guild = makeGuild(true)
     const handle = makeReleaseHandle()
@@ -392,5 +495,46 @@ describe('/fro-bot recover-checkout — confirm/cancel buttons', () => {
       expect.objectContaining({content: expect.stringContaining('no longer have permission')}),
     )
     expect(handle.release).toHaveBeenCalledWith('FAILED', expect.objectContaining({outcome: 'unauthorized-at-confirm'}))
+  })
+
+  it('releases the claimed maintenance run when confirm-time binding lookup rejects', async () => {
+    const guild = makeGuild(true)
+    const handle = makeReleaseHandle()
+    const deps = makeConfirmableDeps()
+    const customId = await postConfirmablePreview(deps, guild, handle)
+    vi.mocked(deps.bindingsStore.getBindingByChannelId).mockRejectedValue(new Error('binding store unavailable'))
+
+    const {interaction} = makeButtonInteraction(customId, {guild})
+    await handleRecoverConfirmOrCancelClick(interaction as never, deps)
+
+    expect(handle.release).toHaveBeenCalledWith('FAILED', expect.objectContaining({outcome: 'confirm-error'}))
+    expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
+  })
+
+  it('releases the claimed maintenance run when token minting rejects', async () => {
+    const guild = makeGuild(true)
+    const handle = makeReleaseHandle()
+    const deps = makeConfirmableDeps()
+    const customId = await postConfirmablePreview(deps, guild, handle)
+    vi.mocked(deps.appClient.authForRepo).mockRejectedValue(new Error('token service unavailable'))
+
+    const {interaction} = makeButtonInteraction(customId, {guild})
+    await handleRecoverConfirmOrCancelClick(interaction as never, deps)
+
+    expect(handle.release).toHaveBeenCalledWith('FAILED', expect.objectContaining({outcome: 'confirm-error'}))
+    expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
+  })
+
+  it('releases the claimed maintenance run when workspace recovery rejects', async () => {
+    const guild = makeGuild(true)
+    const handle = makeReleaseHandle()
+    const deps = makeConfirmableDeps()
+    const customId = await postConfirmablePreview(deps, guild, handle)
+    vi.mocked(deps.workspaceClient.recover).mockRejectedValue(new Error('workspace unavailable'))
+
+    const {interaction} = makeButtonInteraction(customId, {guild})
+    await handleRecoverConfirmOrCancelClick(interaction as never, deps)
+
+    expect(handle.release).toHaveBeenCalledWith('FAILED', expect.objectContaining({outcome: 'confirm-error'}))
   })
 })

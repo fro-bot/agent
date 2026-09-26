@@ -230,6 +230,51 @@ describe('/fro-bot checkout-backup delete', () => {
     )
   })
 
+  it('does not delete a backup after the channel is rebound to another repository', async () => {
+    const deps = makeDeps()
+    const entry = {
+      id: 'gen-1',
+      metadataOk: true,
+      createdAt: '2026-02-02T00:00:00.000Z',
+      sizeBytes: 2048,
+      sizeComplete: true,
+      originalHeadSha: 'b'.repeat(40),
+      originalBranch: 'main',
+    }
+    vi.mocked(deps.workspaceClient.listBackups).mockResolvedValue({
+      success: true,
+      data: {kind: 'ok', backups: [entry], totalBytes: 2048},
+    })
+    const guild = makeGuild(true)
+    const {interaction, editReply} = makeSlashInteraction(guild, 'delete', 'gen-1')
+    await Effect.runPromise(createCheckoutBackupCommand(deps)(interaction as never))
+    const confirmContent = editReply.mock.calls.at(-1)?.[0] as {
+      components: {toJSON: () => {components: {custom_id: string}[]}}[]
+    }
+    const customId = confirmContent.components[0]?.toJSON().components[0]?.custom_id ?? ''
+    vi.mocked(deps.bindingsStore.getBindingByChannelId).mockResolvedValueOnce({
+      success: true,
+      data: {
+        owner: 'other',
+        repo: 'repository',
+        channelId: 'ch-1',
+        channelName: 'project',
+        workspacePath: '/workspace/project',
+        createdAt: '2026-02-02T00:00:00.000Z',
+        createdByDiscordId: 'user-1',
+      },
+    })
+
+    const click = makeButtonInteraction(customId, {guild})
+    await handleBackupDeleteConfirmOrCancelClick(click.interaction as never, deps)
+
+    expect(deps.workspaceClient.deleteBackup).not.toHaveBeenCalled()
+    expect(click.editReply).toHaveBeenCalledWith(
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing
+      expect.objectContaining({content: expect.stringContaining('repository bound to this channel changed')}),
+    )
+  })
+
   it("expiry uses the plan's exact wording", async () => {
     const deps = makeDeps()
     const entry = {
