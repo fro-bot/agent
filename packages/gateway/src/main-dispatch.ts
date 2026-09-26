@@ -132,9 +132,9 @@ export async function dispatchArgv(): Promise<void> {
     // No subcommand (or unrecognized subcommand) — start the gateway program.
     // Config may not have loaded, so instantiate the logger at a fixed 'error'
     // level here rather than reading the configured level.
-    await Effect.runPromise(program).catch((error: unknown) => {
+    await Effect.runPromise(program).catch(() => {
       const startupLogger = makeLogger('error')
-      startupLogger.error({err: String(error)}, 'gateway startup failed')
+      startupLogger.error({}, 'gateway startup failed')
       process.exit(1)
     })
   }
