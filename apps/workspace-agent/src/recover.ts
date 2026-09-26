@@ -22,11 +22,16 @@ import type {Deadline, InvocationTracker, RemoteFailureReason} from './update.js
 import {createHash, randomUUID} from 'node:crypto'
 import {lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, statfs} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
-import {join} from 'node:path'
+import {dirname, join} from 'node:path'
 import {performance} from 'node:perf_hooks'
 import process from 'node:process'
 
-import {listBackups, QUARANTINE_METADATA_FILE_NAME, type QuarantineMetadata} from './backups.js'
+import {
+  listBackups,
+  QUARANTINE_CHECKOUT_DIR_NAME,
+  QUARANTINE_METADATA_FILE_NAME,
+  type QuarantineMetadata,
+} from './backups.js'
 import {checkCheckoutLayout, checkTempIndexCleanliness, inventoryCheckoutConfig} from './checkout-profile.js'
 import {HANDOFF_DEADLINE_MS, MAX_HANDOFF_ENTRIES, writeAskpassHelper} from './clone.js'
 import {
@@ -96,6 +101,8 @@ export interface DirtyCounts {
 /** Current usage against the fixed retention quota. */
 export interface RetentionUsage {
   readonly generationCount: number
+  /** (Review round E, E4) True if any existing generation's size could not be measured (malformed/unreadable metadata) — the quota check fails closed rather than treating it as zero bytes. */
+  readonly hasUnknownSize: boolean
   readonly totalBytes: number
   readonly maxGenerations: number
   readonly maxBytes: number
@@ -130,6 +137,23 @@ export interface OpaqueRecoveryPreview {
 
 export type RecoveryPreview = SafeRecoveryPreview | OpaqueRecoveryPreview
 
+/**
+ * (Review round E, E2) An interrupted UPDATE journal (`fetched`/`applying`/`applied`) reported as
+ * RECOVERABLE rather than a dead-end refusal — `/update` itself refuses this same state as
+ * `needs-recovery`, so recovery is the only way out. `fingerprint` digests the journal's own
+ * identity (phase + from/to SHAs), never a live git inspection of the checkout: the checkout may
+ * be mid-merge, which is exactly the state an interrupted update journal warns against trusting
+ * for ordinary git operations. A distinct top-level `PreviewRecoveryResult` kind — never folded
+ * into `RecoveryPreview` — so every existing `{kind: 'ok'}` consumer's `preview.inspectionSafe`
+ * narrowing is untouched.
+ */
+export interface RecoverableUpdatePreview {
+  readonly phase: UpdateJournalPhase
+  readonly fromSha: string
+  readonly toSha: string
+  readonly fingerprint: string
+}
+
 /** A journal (update or recovery) currently in flight for this repository \u2014 unlike update.ts's blanket `needs-recovery`, the OPERATOR-FACING preview names the exact phase, since that is precisely what recovery exists to act on. */
 export type JournalInProgressPhase = UpdateJournalPhase | RecoveryJournalPhase | 'malformed'
 
@@ -151,6 +175,7 @@ export type PreviewRecoveryResult =
   /** (Review round D, D4) An unconfirmed subprocess termination anywhere in this preview — a hold is set and NO preview (not even opaque) is ever returned for it. */
   | {readonly kind: 'failed'; readonly reason: 'termination-unconfirmed'}
   | {readonly kind: 'ok'; readonly preview: RecoveryPreview}
+  | {readonly kind: 'recoverable-update'; readonly update: RecoverableUpdatePreview}
 
 /** Default headroom multiplier for the free-space preflight — plan: "start at twice the estimated checkout size". */
 export const DEFAULT_DISK_HEADROOM_MULTIPLIER = 2
@@ -323,6 +348,12 @@ type CanonicalCheckoutResult =
   | {readonly kind: 'ok'; readonly path: string}
   | {readonly kind: 'no-checkout'}
   | {readonly kind: 'checkout-substituted'}
+  /** (Review round E, E9) A `realpath` failure OTHER than ENOENT (EACCES, ELOOP, ENOTDIR, …) is never "no checkout" — something exists but couldn't be positively resolved, which is exactly what `inspection-failed` means everywhere else in this module. */
+  | {readonly kind: 'inspection-failed'}
+
+function isEnoent(error: unknown): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT'
+}
 
 async function resolveCanonicalCheckout(
   reposRoot: string,
@@ -332,15 +363,15 @@ async function resolveCanonicalCheckout(
   let reposRootResolved: string
   try {
     reposRootResolved = await realpath(reposRoot)
-  } catch {
-    return {kind: 'no-checkout'}
+  } catch (error) {
+    return {kind: isEnoent(error) ? 'no-checkout' : 'inspection-failed'}
   }
   const destPath = join(reposRoot, owner, repo)
   let canonicalResolved: string
   try {
     canonicalResolved = await realpath(destPath)
-  } catch {
-    return {kind: 'no-checkout'}
+  } catch (error) {
+    return {kind: isEnoent(error) ? 'no-checkout' : 'inspection-failed'}
   }
   const expectedCanonical = join(reposRootResolved, owner, repo)
   if (canonicalResolved !== expectedCanonical) return {kind: 'checkout-substituted'}
@@ -416,7 +447,24 @@ async function computeRecoveryPreviewLocked(
   const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
   const journalRead = await readJournal(journalsDir, owner, repo)
   if (journalRead.ok === true) {
-    return {kind: 'refused', reason: 'journal-in-progress', phase: journalRead.journal.phase}
+    const journal = journalRead.journal
+    // (E2) An interrupted UPDATE journal is recoverable, never a dead end — a RECOVERY journal
+    // in progress still refuses outright (startup reconciliation, not a fresh /recover, owns it).
+    if (journal.kind === 'update') {
+      const updateFingerprint = computeFingerprint([
+        'update-recovery',
+        owner,
+        repo,
+        journal.phase,
+        journal.fromSha,
+        journal.toSha,
+      ])
+      return {
+        kind: 'recoverable-update',
+        update: {phase: journal.phase, fromSha: journal.fromSha, toSha: journal.toSha, fingerprint: updateFingerprint},
+      }
+    }
+    return {kind: 'refused', reason: 'journal-in-progress', phase: journal.phase}
   }
   if (journalRead.ok === false && journalRead.reason === 'malformed') {
     return {kind: 'refused', reason: 'journal-in-progress', phase: 'malformed'}
@@ -425,6 +473,7 @@ async function computeRecoveryPreviewLocked(
   const canonical = await resolveCanonicalCheckout(reposRoot, owner, repo)
   if (canonical.kind === 'no-checkout') return {kind: 'no-checkout'}
   if (canonical.kind === 'checkout-substituted') return {kind: 'refused', reason: 'checkout-substituted'}
+  if (canonical.kind === 'inspection-failed') return {kind: 'failed', reason: 'inspection-failed'}
   const canonicalPath = canonical.path
 
   // Admission gate: layout is pure filesystem (no git at all); config inventory is one inert
@@ -448,6 +497,7 @@ async function computeRecoveryPreviewLocked(
   const retention: RetentionUsage = {
     generationCount: retentionResult.backups.length,
     totalBytes: retentionResult.totalBytes,
+    hasUnknownSize: retentionResult.backups.some(backup => !backup.metadataOk),
     maxGenerations: RETENTION_MAX_GENERATIONS,
     maxBytes: RETENTION_MAX_BYTES,
   }
@@ -699,12 +749,18 @@ async function buildStagingCheckout(params: {
   return {kind: 'ok'}
 }
 
+/** `<reposRoot>/.workspace-agent/quarantine/<owner>__<repo>/<recoveryId>/` — the root-owned envelope directory for one generation. Never itself the preserved checkout — see `QUARANTINE_CHECKOUT_DIR_NAME`'s doc comment (E1). */
+function envelopePathFor(reposRoot: string, owner: string, repo: string, recoveryId: string): string {
+  return join(reposRoot, WORKSPACE_STATE_DIR_NAME, QUARANTINE_DIR_NAME, `${owner}__${repo}`, recoveryId)
+}
+
 /**
- * Preserves the existing checkout at `checkoutPath` by rename into
- * `<quarantine>/<owner>__<repo>/<recoveryId>/`, then writes a root-owned metadata.json alongside
- * it (temp-file-and-rename, mirrors journal.ts). The rename alone preserves the tree byte for
- * byte — including `.git`, ignored files, and local refs — since nothing but a directory-entry
- * move happens to the preserved content itself.
+ * Preserves the existing checkout at `checkoutPath` inside a fresh, root-owned ENVELOPE
+ * (`<quarantine>/<owner>__<repo>/<recoveryId>/`): the original is renamed to the envelope's
+ * `checkout/` subdirectory (never onto the envelope path itself — E1), and metadata.json is
+ * written as a SIBLING of `checkout/`, so nothing ever writes into (or collides with) the
+ * preserved content. Idempotent: if `checkout/` already exists, the rename is skipped (a prior
+ * attempt already completed it — reconciliation, E3, relies on this).
  */
 async function quarantineExistingCheckout(params: {
   readonly reposRoot: string
@@ -716,22 +772,24 @@ async function quarantineExistingCheckout(params: {
   readonly metadata: Omit<QuarantineMetadata, 'recoveryId' | 'owner' | 'repo'> | undefined
 }): Promise<'ok' | 'failed'> {
   const {reposRoot, owner, repo, recoveryId, checkoutPath, metadata} = params
-  const quarantineRepoDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, QUARANTINE_DIR_NAME, `${owner}__${repo}`)
+  const envelopePath = envelopePathFor(reposRoot, owner, repo, recoveryId)
+  const envelopeCheckoutPath = join(envelopePath, QUARANTINE_CHECKOUT_DIR_NAME)
   try {
-    await mkdir(quarantineRepoDir, {recursive: true, mode: 0o700})
+    await mkdir(envelopePath, {recursive: true, mode: 0o700})
   } catch {
     return 'failed'
   }
-  const generationPath = join(quarantineRepoDir, recoveryId)
-  try {
-    await rename(checkoutPath, generationPath)
-  } catch {
-    return 'failed'
+  if (!(await pathExists(envelopeCheckoutPath))) {
+    try {
+      await rename(checkoutPath, envelopeCheckoutPath)
+    } catch {
+      return 'failed'
+    }
   }
   if (metadata === undefined) return 'ok'
   const fullMetadata: QuarantineMetadata = {recoveryId, owner, repo, ...metadata}
-  const metadataPath = join(generationPath, QUARANTINE_METADATA_FILE_NAME)
-  const tempPath = join(generationPath, `.${QUARANTINE_METADATA_FILE_NAME}.tmp-${randomUUID()}`)
+  const metadataPath = join(envelopePath, QUARANTINE_METADATA_FILE_NAME)
+  const tempPath = join(envelopePath, `.${QUARANTINE_METADATA_FILE_NAME}.tmp-${randomUUID()}`)
   try {
     const handle = await open(tempPath, 'wx', 0o600)
     try {
@@ -801,11 +859,17 @@ export type RecoveryReconciliationOutcome = 'cleared' | 'left-in-place' | 'left-
 
 /**
  * Applies the plan's recovery reconciliation table to one journal. At NO phase is the original
- * deleted or the canonical path left empty: `building` only ever removes STAGING (the original,
- * if any, was never touched by that phase); `quarantining`/`installing`/`verifying` all run their
- * remaining steps in sequence (a crash at `quarantining` still needs the `installing` rename to
- * happen, and a crash at `installing` still needs `verifying`'s check) rather than assuming the
- * journal's recorded phase is the ONLY step left to do.
+ * deleted or the canonical path left empty. (Review round E, E3): restart-safe — a crash DURING
+ * replay itself must not be treated as if the journal's (possibly stale) `phase` field were the
+ * only truth. Whether staging (`stagingPath`) still exists is the primary signal: staging is
+ * consumed EXACTLY ONCE, by the install rename, so "staging still present" means install has not
+ * run yet (whatever is at the canonical path, if anything, is still the untouched original and may
+ * need quarantining first); "staging absent" means install already completed and the canonical
+ * path already holds the fresh checkout — quarantining/installing are both skipped entirely, never
+ * re-attempted against fresh content. Within "staging still present", the envelope's `checkout/`
+ * existing means a PRIOR attempt already completed the quarantine rename. Each phase transition is
+ * written durably via `advance()` BEFORE the next step runs, so a crash between two steps resumes
+ * correctly on the next replay.
  */
 async function reconcileOneRecoveryJournal(params: {
   readonly journalsDir: string
@@ -817,48 +881,55 @@ async function reconcileOneRecoveryJournal(params: {
   readonly gid: number | undefined
 }): Promise<RecoveryReconciliationOutcome> {
   const {journalsDir, reposRoot, journal, gitRunner, timeoutMs, uid, gid} = params
-  const {owner, repo, phase, recoveryId} = journal
+  const {owner, repo, recoveryId, targetSha, branch, startedAt} = journal
   const checkoutPath = join(reposRoot, owner, repo)
   const stagingPath = stagingPathFor(reposRoot, recoveryId)
+  const envelopeCheckoutPath = join(envelopePathFor(reposRoot, owner, repo, recoveryId), QUARANTINE_CHECKOUT_DIR_NAME)
 
-  if (phase === 'building') {
-    await rm(stagingPath, {recursive: true, force: true}).catch(() => {})
+  const advance = async (phase: RecoveryJournalPhase): Promise<void> => {
+    await writeJournal(journalsDir, {kind: 'recovery', owner, repo, phase, recoveryId, targetSha, branch, startedAt})
+  }
+
+  // (E7) A `building` journal means nothing durable exists yet but staging — remove it and clear.
+  // If staging removal fails, the journal MUST stay (never silently clear over an unremoved leak).
+  if (journal.phase === 'building') {
+    try {
+      await rm(stagingPath, {recursive: true, force: true})
+    } catch {
+      return 'left-in-place'
+    }
     await removeJournal(journalsDir, owner, repo)
     return 'cleared'
   }
 
-  if (phase === 'quarantining' && (await pathExists(checkoutPath))) {
-    const result = await quarantineExistingCheckout({
-      reposRoot,
-      owner,
-      repo,
-      recoveryId,
-      checkoutPath,
-      metadata: undefined,
-    })
-    if (result === 'failed') return 'left-in-place'
-  }
-
-  if ((phase === 'quarantining' || phase === 'installing') && !(await pathExists(checkoutPath))) {
-    // (D5) Neither the original (already quarantined, or never existed) nor the staged
-    // replacement exists — nothing this function can safely do. Distinct from an ordinary rename
-    // failure below: this is reported (and logged by the caller) as its own outcome, never as a
-    // success.
-    if (!(await pathExists(stagingPath))) return 'left-in-place-missing-checkout'
+  if (await pathExists(stagingPath)) {
+    if (!(await pathExists(envelopeCheckoutPath)) && (await pathExists(checkoutPath))) {
+      const result = await quarantineExistingCheckout({
+        reposRoot,
+        owner,
+        repo,
+        recoveryId,
+        checkoutPath,
+        metadata: undefined,
+      })
+      if (result === 'failed') return 'left-in-place'
+    }
+    await advance('installing')
     try {
+      await mkdir(join(reposRoot, owner), {recursive: true, mode: 0o755})
       await rename(stagingPath, checkoutPath)
     } catch {
       return 'left-in-place'
     }
+  } else if (!(await pathExists(checkoutPath))) {
+    return 'left-in-place-missing-checkout'
   }
+  await advance('verifying')
 
-  // (D5) Every recovery journal now carries its own target — verify the installed checkout
-  // against THAT, never merely against itself (self-consistency alone can't detect a checkout
-  // installed at the wrong commit or branch).
   const verified = await verifyInstalledCheckout({
     canonicalPath: checkoutPath,
-    branch: journal.branch,
-    sha: journal.targetSha,
+    branch,
+    sha: targetSha,
     gitRunner,
     timeoutMs,
     uid,
@@ -969,16 +1040,26 @@ type PreflightOutcome =
   | {readonly kind: 'refused'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
   | {readonly kind: 'refused'; readonly reason: 'insufficient-disk-space'}
 
-/** Quota (5 generations / 10 GiB) then free-space (`estimatedSizeBytes * diskHeadroomMultiplier`) — checked BEFORE anything is built or moved, per the plan's "refuses before building"/"refuses before any rename". */
+/**
+ * Quota (5 generations / 10 GiB) then free-space (`estimatedSizeBytes * diskHeadroomMultiplier`)
+ * — checked BEFORE anything is built or moved, per the plan's "refuses before building"/"refuses
+ * before any rename". (Review round E, E4) The quota check is PROJECTED — existing usage PLUS the
+ * incoming generation this call is about to create — never existing usage alone; a generation
+ * whose size could not be measured (malformed/unreadable metadata) fails the quota check closed
+ * (`hasUnknownSize`) rather than silently contributing zero bytes.
+ */
 async function checkRecoveryPreflight(params: {
   readonly reposRoot: string
   readonly estimatedSizeBytes: number
   readonly retention: RetentionUsage
+  readonly hasUnknownSize: boolean
   readonly diskHeadroomMultiplier: number
   readonly statfsFn: RecoveryStatfsFn
 }): Promise<PreflightOutcome> {
-  const {reposRoot, estimatedSizeBytes, retention, diskHeadroomMultiplier, statfsFn} = params
-  if (retention.generationCount >= retention.maxGenerations || retention.totalBytes >= retention.maxBytes) {
+  const {reposRoot, estimatedSizeBytes, retention, hasUnknownSize, diskHeadroomMultiplier, statfsFn} = params
+  const projectedCount = retention.generationCount + 1
+  const projectedBytes = retention.totalBytes + estimatedSizeBytes
+  if (hasUnknownSize || projectedCount > retention.maxGenerations || projectedBytes > retention.maxBytes) {
     return {kind: 'refused', reason: 'quota-exceeded', usage: retention}
   }
   let stats: {readonly bavail: number; readonly bsize: number}
@@ -1059,23 +1140,31 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   let retention: RetentionUsage = {
     generationCount: 0,
     totalBytes: 0,
+    hasUnknownSize: false,
     maxGenerations: RETENTION_MAX_GENERATIONS,
     maxBytes: RETENTION_MAX_BYTES,
   }
-  const hadExistingCheckout = preview.kind === 'ok'
+  // (E2) An interrupted UPDATE journal: checked out fingerprint against the JOURNAL's own
+  // identity (never a live git inspection — the checkout may be mid-merge). There IS a checkout
+  // to quarantine (whatever the interrupted update left behind), but its safe headSha/branch are
+  // unknown, so its own quarantine metadata degrades exactly like reconciliation's does.
+  const hadExistingCheckout = preview.kind === 'ok' || preview.kind === 'recoverable-update'
   if (preview.kind === 'ok') {
     if (preview.preview.fingerprint !== fingerprint) return {kind: 'refused', reason: 'checkout-changed'}
     estimatedSizeBytes = preview.preview.estimatedSizeBytes
     retention = preview.preview.retention
-  } else {
+  } else if (preview.kind === 'recoverable-update' && preview.update.fingerprint !== fingerprint)
+    return {kind: 'refused', reason: 'checkout-changed'}
+  if (preview.kind !== 'ok') {
+    // (E4) A `listBackups` failure must never fail OPEN as "zero existing generations" — refuse.
     const fresh = await listBackups(owner, repo, {reposRoot})
-    if (fresh.kind === 'ok') {
-      retention = {
-        generationCount: fresh.backups.length,
-        totalBytes: fresh.totalBytes,
-        maxGenerations: RETENTION_MAX_GENERATIONS,
-        maxBytes: RETENTION_MAX_BYTES,
-      }
+    if (fresh.kind !== 'ok') return {kind: 'failed', reason: 'inspection-failed'}
+    retention = {
+      generationCount: fresh.backups.length,
+      totalBytes: fresh.totalBytes,
+      hasUnknownSize: fresh.backups.some(backup => !backup.metadataOk),
+      maxGenerations: RETENTION_MAX_GENERATIONS,
+      maxBytes: RETENTION_MAX_BYTES,
     }
   }
 
@@ -1083,6 +1172,7 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     reposRoot,
     estimatedSizeBytes,
     retention,
+    hasUnknownSize: retention.hasUnknownSize,
     diskHeadroomMultiplier: ctx.diskHeadroomMultiplier,
     statfsFn: ctx.statfsFn,
   })
@@ -1119,6 +1209,12 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     if (fetched.kind !== 'ok') return {kind: 'failed', reason: 'fetch-failed'}
     target = fetched
 
+    // (E2) ATOMIC HAND-OVER: journal.ts keeps exactly one journal file per repository
+    // (`<owner>__<repo>.json`), written by temp-file-then-`rename`. Writing THIS recovery journal
+    // therefore atomically REPLACES whatever journal (including an interrupted update's) already
+    // sat at that path — there is no separate "remove the update journal" step, and no window
+    // where this repository has no journal at all: the old journal is superseded the instant this
+    // write's rename succeeds, never before.
     await writeJournal(journalsDir, {
       kind: 'recovery',
       owner,
@@ -1130,7 +1226,15 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       startedAt: now().toISOString(),
     })
 
-    await mkdir(stagingPath, {recursive: true, mode: 0o700})
+    // (E7) Created EXCLUSIVELY — never silently reused — so a leftover leaf from an earlier,
+    // never-cleaned-up attempt at this same (vanishingly unlikely, randomUUID) recoveryId fails
+    // closed instead of building on top of unknown content.
+    await mkdir(dirname(stagingPath), {recursive: true, mode: 0o700})
+    await mkdir(stagingPath, {mode: 0o700})
+    // (E6) One aggregate build deadline, installed on the tracker before staging init and kept
+    // through pack import and every subsequent build git call — cleared only after handoff.
+    const buildDeadline = createDeadline(ctx.buildTimeoutMs, monotonicNow)
+    tracker.setDeadline(buildDeadline)
     tracker.markApplyingPhase()
     const built = await buildStagingCheckout({
       stagingPath,
@@ -1144,6 +1248,18 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       maxPackBytes: ctx.maxPackBytes,
       timeoutMs: ctx.buildTimeoutMs,
     })
+    if (built.kind === 'failed') {
+      // (E7) A CONFIRMED (not unconfirmed) pre-quarantine failure: nothing durable exists but
+      // staging, so remove it and clear the journal. If staging removal itself fails, the journal
+      // MUST stay — never clear over an unremoved leak.
+      try {
+        await rm(stagingPath, {recursive: true, force: true})
+        await removeJournal(journalsDir, owner, repo)
+      } catch {
+        // journal stays in place
+      }
+      return {kind: 'failed', reason: 'build-failed'}
+    }
     if (built.kind !== 'ok') return {kind: 'failed', reason: 'build-failed'}
   } finally {
     await rm(askpassDir, {recursive: true, force: true}).catch(() => {})
@@ -1155,7 +1271,20 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     deadlineMs: HANDOFF_DEADLINE_MS,
     maxEntries: MAX_HANDOFF_ENTRIES,
   })
-  if (handoff.ok !== true) return {kind: 'failed', reason: 'build-failed'}
+  // (E6) The aggregate build deadline is cleared only now — handoff itself is filesystem-only,
+  // never a tracked git/pack-stream call, but it is still logically part of "the build".
+  tracker.setDeadline(undefined)
+  if (handoff.ok !== true) {
+    // (E7) Handoff failure is always CONFIRMED (filesystem-only lstat/lchown, no subprocess) —
+    // clean up the same way a confirmed build failure does.
+    try {
+      await rm(stagingPath, {recursive: true, force: true})
+      await removeJournal(journalsDir, owner, repo)
+    } catch {
+      // journal stays in place
+    }
+    return {kind: 'failed', reason: 'build-failed'}
+  }
 
   await writeJournal(journalsDir, {
     kind: 'recovery',
@@ -1167,23 +1296,21 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     branch: target.branch,
     startedAt: now().toISOString(),
   })
-  if (hadExistingCheckout && preview.kind === 'ok') {
-    const originalHeadSha = preview.preview.inspectionSafe ? preview.preview.headSha : undefined
-    const originalBranch = preview.preview.inspectionSafe ? preview.preview.branch : undefined
-    const quarantined = await quarantineExistingCheckout({
-      reposRoot,
-      owner,
-      repo,
-      recoveryId,
-      checkoutPath,
-      metadata: {
-        createdAt: now().toISOString(),
-        sizeBytes: estimatedSizeBytes,
-        entryCount: preview.preview.entryCount,
-        originalHeadSha,
-        originalBranch,
-      },
-    })
+  if (hadExistingCheckout) {
+    // (E2) An interrupted-update checkout's headSha/branch are never safe to read (it may be
+    // mid-merge) — its generation is quarantined WITHOUT metadata, exactly like crash
+    // reconciliation's own best-effort quarantine. A normal preview's metadata is unaffected.
+    const metadata =
+      preview.kind === 'ok'
+        ? {
+            createdAt: now().toISOString(),
+            sizeBytes: estimatedSizeBytes,
+            entryCount: preview.preview.entryCount,
+            originalHeadSha: preview.preview.inspectionSafe ? preview.preview.headSha : undefined,
+            originalBranch: preview.preview.inspectionSafe ? preview.preview.branch : undefined,
+          }
+        : undefined
+    const quarantined = await quarantineExistingCheckout({reposRoot, owner, repo, recoveryId, checkoutPath, metadata})
     if (quarantined !== 'ok') return {kind: 'failed', reason: 'quarantine-failed'}
   }
 

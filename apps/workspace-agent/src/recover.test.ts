@@ -294,7 +294,7 @@ describe('previewRecovery — fingerprint', () => {
 })
 
 describe('previewRecovery — journal-in-progress and maintenance-hold refusals', () => {
-  it('refuses journal-in-progress, naming the exact phase, for an in-flight update journal', async () => {
+  it('(E2) reports an in-flight UPDATE journal as recoverable, never a dead-end refusal', async () => {
     // #given
     await setupCleanCheckout()
     const journalsDir = join(reposRoot, '.workspace-agent', 'journals')
@@ -312,7 +312,15 @@ describe('previewRecovery — journal-in-progress and maintenance-hold refusals'
     const result = await previewRecovery(req(), deps())
 
     // #then
-    expect(result).toEqual({kind: 'refused', reason: 'journal-in-progress', phase: 'applying'})
+    expect(result).toEqual({
+      kind: 'recoverable-update',
+      update: {
+        phase: 'applying',
+        fromSha: '0'.repeat(40),
+        toSha: '1'.repeat(40),
+        fingerprint: expect.any(String) as string,
+      },
+    })
   })
 
   it('refuses journal-in-progress for an in-flight RECOVERY journal too', async () => {
@@ -462,13 +470,15 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
         expect(result.branch).toBe('main')
 
         // #and — quarantine preserved the original byte for byte, including .git
-        const quarantinePath = join(
+        const envelopePath = join(
           reposRoot,
           WORKSPACE_STATE_DIR_NAME,
           'quarantine',
           `${OWNER}__${REPO}`,
           result.recoveryId,
         )
+        const quarantinePath = join(envelopePath, 'checkout')
+        expect(existsSync(join(envelopePath, 'metadata.json'))).toBe(true)
         expect(gitSync(quarantinePath, ['log', '-1', '--format=%H'], isolatedGitEnv(checkoutHome)).trim()).toBe(
           localSha,
         )
@@ -644,6 +654,36 @@ describe('executeRecovery — quota and disk-space preflight refuse before build
       await fixture.close()
     }
   })
+})
+
+describe('executeRecovery — E4: retention accounting fails closed', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'refuses quota-exceeded when an existing generation has unknown (malformed-metadata) size, even with room left on paper',
+    async () => {
+      // #given one generation with valid, tiny metadata (nowhere near quota) but a SECOND with malformed metadata
+      await setupCleanCheckout()
+      await createFakeGeneration(OWNER, REPO, 'gen-good', 1)
+      const dir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`, 'gen-bad')
+      await mkdir(dir, {recursive: true})
+      await writeFile(join(dir, 'metadata.json'), '{not valid json')
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'ok') throw new Error('unreachable')
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+          recoveryDeps(fixture),
+        )
+
+        // #then
+        expect(result).toMatchObject({kind: 'refused', reason: 'quota-exceeded'})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
 })
 
 describe('executeRecovery — no checkout installs without quarantine', {timeout: 30_000}, () => {
@@ -927,7 +967,14 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
     // no longer available at reconciliation time), staging installed and verified
     const journal = await readJournal(journalsDir, OWNER, REPO)
     expect(journal.ok).toBe(false)
-    const quarantinePath = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`, recoveryId)
+    const quarantinePath = join(
+      reposRoot,
+      WORKSPACE_STATE_DIR_NAME,
+      'quarantine',
+      `${OWNER}__${REPO}`,
+      recoveryId,
+      'checkout',
+    )
     expect(existsSync(join(quarantinePath, '.git'))).toBe(true)
     expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(recoveredSha)
     expect(existsSync(stagingPathFor(recoveryId))).toBe(false)
@@ -1042,4 +1089,95 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
     expect((await readJournal(journalsDir, OWNER, REPO)).ok).toBe(true)
     expect(existsSync(destPathFor())).toBe(false)
   })
+})
+
+describe('executeRecovery — E2: recovers an interrupted UPDATE journal', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'update stuck at applying \u2192 preview shows it recoverable \u2192 recover succeeds \u2192 a follow-up /update then returns unchanged',
+    async () => {
+      // #given a checkout with an interrupted update journal (phase: applying) \u2014 /update itself
+      // would refuse this as needs-recovery
+      await setupCleanCheckout()
+      const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+      await writeJournal(journalsDir, {
+        kind: 'update',
+        owner: OWNER,
+        repo: REPO,
+        phase: 'applying',
+        fromSha: '0'.repeat(40),
+        toSha: '1'.repeat(40),
+        startedAt: new Date().toISOString(),
+      })
+
+      const preview = await previewRecovery(req(), deps())
+      expect(preview).toEqual({
+        kind: 'recoverable-update',
+        update: {
+          phase: 'applying',
+          fromSha: '0'.repeat(40),
+          toSha: '1'.repeat(40),
+          fingerprint: expect.any(String) as string,
+        },
+      })
+      if (preview.kind !== 'recoverable-update') throw new Error('unreachable')
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.update.fingerprint},
+          recoveryDeps(fixture),
+        )
+
+        // #then
+        expect(result.kind).toBe('ok')
+        if (result.kind !== 'ok') throw new Error('unreachable')
+        expect(result.sha).toBe(fixture.headSha)
+        // #and — the old update journal is gone (superseded, then cleared on recovery success)
+        expect((await readJournal(journalsDir, OWNER, REPO)).ok).toBe(false)
+
+        // #and — a follow-up /update sees the recovered checkout as unchanged
+        const host = new URL(fixture.remoteBaseUrl).host
+        const updateResult = await executeUpdate(
+          {owner: OWNER, repo: REPO, token: fixture.token},
+          {
+            reposRoot,
+            options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+            remoteBaseUrl: fixture.remoteBaseUrl,
+            caBundlePath: fixture.caBundlePath,
+            askpassWriter: async d => writeLoopbackAskpassHelper(d, host),
+            serviceHome: checkoutHome,
+          },
+        )
+        expect(updateResult).toMatchObject({kind: 'ready', change: 'unchanged'})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'a RECOVERY journal in progress still refuses outright, never treated as recoverable',
+    async () => {
+      // #given
+      await setupCleanCheckout()
+      const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+      await writeJournal(journalsDir, {
+        kind: 'recovery',
+        owner: OWNER,
+        repo: REPO,
+        phase: 'quarantining',
+        recoveryId: 'gen-1',
+        targetSha: '1'.repeat(40),
+        branch: 'main',
+        startedAt: new Date().toISOString(),
+      })
+
+      // #when
+      const result = await previewRecovery(req(), deps())
+
+      // #then
+      expect(result).toEqual({kind: 'refused', reason: 'journal-in-progress', phase: 'quarantining'})
+    },
+  )
 })

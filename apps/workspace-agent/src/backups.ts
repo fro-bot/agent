@@ -13,13 +13,27 @@
 import {lstat, readdir, readFile, rm} from 'node:fs/promises'
 import {join} from 'node:path'
 
-import {QUARANTINE_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {JOURNAL_DIR_NAME, QUARANTINE_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {readJournal} from './journal.js'
+import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors update.ts/inspect.ts. */
 export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 
 /** Name of the metadata file dropped alongside the preserved content inside each generation directory. */
 export const QUARANTINE_METADATA_FILE_NAME = 'metadata.json'
+
+/**
+ * (Review round E, E1) Name of the subdirectory, inside each generation ENVELOPE, that holds the
+ * renamed original checkout. The envelope (`<quarantine>/<owner>__<repo>/<id>/`) is a directory
+ * this service creates and owns; the preserved checkout is never renamed directly onto the
+ * envelope path, since the original tree could itself contain a file or directory literally named
+ * `metadata.json` — writing service metadata straight into the preserved tree would clobber it (or
+ * fail outright if that name is a directory in the original), and either way could leave the
+ * canonical checkout path empty with nothing usable in quarantine. `checkout/` is always a
+ * SIBLING of `metadata.json`, never its parent or child.
+ */
+export const QUARANTINE_CHECKOUT_DIR_NAME = 'checkout'
 
 /** Root-owned metadata dropped alongside a preserved checkout at quarantine time (slice 5b writes it; this module defines and strictly parses it now). */
 export interface QuarantineMetadata {
@@ -61,7 +75,10 @@ export type ListBackupsResult =
 
 export type DeleteBackupResult =
   | {readonly kind: 'ok'}
-  | {readonly kind: 'refused'; readonly reason: 'invalid-id' | 'not-found'}
+  | {
+      readonly kind: 'refused'
+      readonly reason: 'invalid-id' | 'not-found' | 'maintenance-hold' | 'recovery-in-progress'
+    }
   | {readonly kind: 'failed'}
 
 function isNonEmptyString(value: unknown): value is string {
@@ -260,6 +277,11 @@ export async function listBackups(owner: string, repo: string, deps: BackupsDeps
  * and a symlinked or non-directory "generation" (see `isSimplePathSegment` and the module header).
  * An `id` that belongs to a DIFFERENT repository is refused the same way a nonexistent one is —
  * it simply never exists as a child of THIS repository's quarantine directory.
+ *
+ * (Review round E, E8) Runs under the SAME per-repo mutex clone/update/recovery share, so a delete
+ * can never race a recovery mid-quarantine/install. Refuses outright on a maintenance hold or an
+ * in-progress RECOVERY journal for this repository (an in-progress UPDATE journal does not block a
+ * backup delete — it never touches quarantine).
  */
 export async function deleteBackup(
   owner: string,
@@ -268,28 +290,38 @@ export async function deleteBackup(
   deps: BackupsDeps = {},
 ): Promise<DeleteBackupResult> {
   if (!isSimplePathSegment(id)) return {kind: 'refused', reason: 'invalid-id'}
-
   const {reposRoot = WORKSPACE_REPOS_ROOT} = deps
-  const quarantineRepoDir = quarantineRepoDirFor(reposRoot, owner, repo)
 
-  const dirStatus = await checkQuarantineRepoDir(reposRoot, quarantineRepoDir)
-  if (dirStatus === 'absent') return {kind: 'refused', reason: 'not-found'}
-  if (dirStatus === 'failed') return {kind: 'failed'}
+  return withRepoLock(repoMutexKey(owner, repo), async (): Promise<DeleteBackupResult> => {
+    if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
+      return {kind: 'refused', reason: 'maintenance-hold'}
+    }
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const journalRead = await readJournal(journalsDir, owner, repo)
+    if (journalRead.ok === true && journalRead.journal.kind === 'recovery') {
+      return {kind: 'refused', reason: 'recovery-in-progress'}
+    }
 
-  const generationPath = join(quarantineRepoDir, id)
-  let st
-  try {
-    st = await lstat(generationPath)
-  } catch (error) {
-    if (errorCode(error) === 'ENOENT') return {kind: 'refused', reason: 'not-found'}
-    return {kind: 'failed'}
-  }
-  if (st.isSymbolicLink() || !st.isDirectory()) return {kind: 'refused', reason: 'invalid-id'}
+    const quarantineRepoDir = quarantineRepoDirFor(reposRoot, owner, repo)
+    const dirStatus = await checkQuarantineRepoDir(reposRoot, quarantineRepoDir)
+    if (dirStatus === 'absent') return {kind: 'refused', reason: 'not-found'}
+    if (dirStatus === 'failed') return {kind: 'failed'}
 
-  try {
-    await rm(generationPath, {recursive: true})
-  } catch {
-    return {kind: 'failed'}
-  }
-  return {kind: 'ok'}
+    const generationPath = join(quarantineRepoDir, id)
+    let st
+    try {
+      st = await lstat(generationPath)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return {kind: 'refused', reason: 'not-found'}
+      return {kind: 'failed'}
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) return {kind: 'refused', reason: 'invalid-id'}
+
+    try {
+      await rm(generationPath, {recursive: true})
+    } catch {
+      return {kind: 'failed'}
+    }
+    return {kind: 'ok'}
+  })
 }

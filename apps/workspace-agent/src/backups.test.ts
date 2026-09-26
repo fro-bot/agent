@@ -9,12 +9,16 @@ import {join} from 'node:path'
 
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {deleteBackup, listBackups, QUARANTINE_METADATA_FILE_NAME} from './backups.js'
+import {writeJournal} from './journal.js'
+import {markRepoHeld, repoMutexKey, resetRepoHoldsForTesting, resetRepoLocksForTesting} from './repo-mutex.js'
 import {makeTempDir} from './update-fixtures/helpers.js'
 
 let reposRoot: string
 
 beforeEach(async () => {
   reposRoot = await makeTempDir('backups-test-repos-')
+  resetRepoLocksForTesting()
+  resetRepoHoldsForTesting()
 })
 
 afterEach(async () => {
@@ -270,5 +274,64 @@ describe('deleteBackup — traversal, symlink, and cross-repo refusals leave eve
     expect(result).toEqual({kind: 'refused', reason: 'not-found'})
     const otherListed = await listBackups('acme', 'other-repo', {reposRoot})
     expect(otherListed.kind === 'ok' ? otherListed.backups.length : -1).toBe(1)
+  })
+})
+
+describe('deleteBackup — E8: repo exclusion (maintenance hold, in-progress recovery)', () => {
+  it('refuses maintenance-hold, touching nothing', async () => {
+    // #given
+    const target = await writeGeneration('gen-keep', makeMetadata())
+    markRepoHeld(repoMutexKey('acme', 'widgets'), 'termination-unconfirmed')
+
+    // #when
+    const result = await deleteBackup('acme', 'widgets', 'gen-keep', {reposRoot})
+
+    // #then
+    expect(result).toEqual({kind: 'refused', reason: 'maintenance-hold'})
+    await expect(lstat(target)).resolves.toBeDefined()
+  })
+
+  it('refuses recovery-in-progress for an in-flight recovery journal, touching nothing', async () => {
+    // #given
+    const target = await writeGeneration('gen-keep', makeMetadata())
+    const journalsDir = join(reposRoot, '.workspace-agent', 'journals')
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: 'acme',
+      repo: 'widgets',
+      phase: 'quarantining',
+      recoveryId: 'gen-other',
+      targetSha: '1'.repeat(40),
+      branch: 'main',
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    const result = await deleteBackup('acme', 'widgets', 'gen-keep', {reposRoot})
+
+    // #then
+    expect(result).toEqual({kind: 'refused', reason: 'recovery-in-progress'})
+    await expect(lstat(target)).resolves.toBeDefined()
+  })
+
+  it('an in-progress UPDATE journal does NOT block a backup delete', async () => {
+    // #given
+    await writeGeneration('gen-keep', makeMetadata())
+    const journalsDir = join(reposRoot, '.workspace-agent', 'journals')
+    await writeJournal(journalsDir, {
+      kind: 'update',
+      owner: 'acme',
+      repo: 'widgets',
+      phase: 'applying',
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    const result = await deleteBackup('acme', 'widgets', 'gen-keep', {reposRoot})
+
+    // #then
+    expect(result).toEqual({kind: 'ok'})
   })
 })
