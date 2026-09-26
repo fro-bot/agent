@@ -183,7 +183,7 @@ describe('dispatchCommand', () => {
     const interaction = {
       commandName: 'fro-bot',
       reply,
-      options: {getSubcommand: vi.fn().mockReturnValue('ping')},
+      options: {getSubcommand: vi.fn().mockReturnValue('ping'), getSubcommandGroup: vi.fn().mockReturnValue(null)},
     } as unknown as ChatInputCommandInteraction
     const registry = getCommandRegistry(makeMockDeps())
 
@@ -255,6 +255,7 @@ describe('dispatchCommand', () => {
       client: {user: {id: 'bot-user-id'}},
       options: {
         getSubcommand: vi.fn().mockReturnValue('add-project'),
+        getSubcommandGroup: vi.fn().mockReturnValue(null),
         getString: vi.fn().mockReturnValue('https://github.com/owner/repo'),
       },
       deferReply,

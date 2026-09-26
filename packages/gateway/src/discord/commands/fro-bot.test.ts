@@ -142,6 +142,7 @@ function makeInteraction(
     editReply,
     options: {
       getSubcommand: vi.fn().mockReturnValue(subcommand),
+      getSubcommandGroup: vi.fn().mockReturnValue(null),
       getString: vi.fn().mockReturnValue('run the checks'),
     },
   } as unknown as ChatInputCommandInteraction

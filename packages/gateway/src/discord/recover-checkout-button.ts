@@ -18,7 +18,14 @@
  * parsed custom_id is never treated as proof the clicker is authorized.
  */
 
+import type {ButtonInteraction} from 'discord.js'
+import type {RecoverCheckoutDeps} from './commands/recover-checkout.js'
+
 import {ActionRowBuilder, ButtonBuilder, ButtonStyle} from 'discord.js'
+import {INTERNAL_ERROR_COPY} from './commands/guild-command.js'
+import {runRecoverCheckoutFlow} from './commands/recover-checkout.js'
+import {editInteractionAsync} from './io.js'
+import {hasManageChannels} from './manage-channels-check.js'
 
 export const RECOVER_ENTRY_PREFIX = 'fb-recover-entry:'
 
@@ -71,4 +78,50 @@ export function buildRecoverEntryButton(data: RecoverEntryData): ActionRowBuilde
     .setStyle(ButtonStyle.Danger)
 
   return new ActionRowBuilder<ButtonBuilder>().addComponents(button)
+}
+
+/**
+ * The Recover-entry button click. Unlike the confirm/cancel buttons, this one has NO expiry and
+ * carries no nonce — it is only a channel pointer, so a click years later still works exactly like
+ * re-running `/fro-bot recover-checkout`: fresh ManageChannels, then the shared flow in
+ * `commands/recover-checkout.ts`.
+ *
+ * Hand-rolls `interaction.deferReply()` deliberately: this file is outside `discord/commands/`, so
+ * it is not scanned by `guild-command.test.ts`'s "only `guild-command.ts` may `deferReply`" rule,
+ * which applies solely to files inside that directory (slash-command pipelines routed through
+ * `makeGuildCommand`). A raw button click has no such pipeline to route through.
+ */
+export async function handleRecoverEntryButtonClick(
+  interaction: ButtonInteraction,
+  deps: RecoverCheckoutDeps,
+): Promise<void> {
+  const log = deps.gatewayLogger
+  try {
+    await interaction.deferReply({ephemeral: true})
+    const guild = interaction.guild
+    if (guild === null) {
+      await editInteractionAsync(interaction, {content: 'This can only be used in a server.'}, log)
+      return
+    }
+    const authorized = await hasManageChannels(guild, interaction.user.id, log)
+    if (authorized === false) {
+      await editInteractionAsync(
+        interaction,
+        {content: 'You do not have permission to recover this checkout (ManageChannels required).'},
+        log,
+      )
+      return
+    }
+    await runRecoverCheckoutFlow({
+      interaction,
+      channelId: interaction.channelId,
+      guildId: guild.id,
+      userId: interaction.user.id,
+      log,
+      deps,
+    })
+  } catch (error: unknown) {
+    log.error({err: String(error)}, 'recover-checkout: entry button handler threw')
+    await editInteractionAsync(interaction, {content: INTERNAL_ERROR_COPY}, log).catch(() => {})
+  }
 }

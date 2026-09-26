@@ -32,9 +32,12 @@ import {createBindingsStore} from './bindings/store.js'
 import {parseApprovalCustomId} from './discord/approvals.js'
 import {createCancelNoticeDispatcher} from './discord/cancel-notice.js'
 import {createDiscordClient, withLogContext} from './discord/client.js'
+import {handleBackupDeleteConfirmOrCancelClick} from './discord/commands/checkout-backup.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
+import {handleRecoverConfirmOrCancelClick} from './discord/commands/recover-checkout.js'
 import {editInteractionAsync} from './discord/io.js'
 import {handleMention, userIsAuthorized} from './discord/mentions.js'
+import {handleRecoverEntryButtonClick, parseRecoverEntryCustomId} from './discord/recover-checkout-button.js'
 import {abortRegistry} from './execute/abort-registry.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
@@ -530,7 +533,38 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
 
     // f. Wire client events
     client.on('interactionCreate', (interaction): void => {
-      // ── Button interactions: approval flow ────────────────────────────────
+      // ── Button interactions: recover-checkout / checkout-backup flows ─────────────────
+      if (interaction.isButton()) {
+        if (parseRecoverEntryCustomId(interaction.customId) !== null) {
+          // eslint-disable-next-line no-void
+          void handleRecoverEntryButtonClick(interaction, commandDeps).catch((error: unknown) => {
+            logger.error({err: String(error)}, 'button: unexpected error handling recover-entry interaction')
+          })
+          return
+        }
+        if (
+          interaction.customId.startsWith('fb-recover-confirm:') ||
+          interaction.customId.startsWith('fb-recover-cancel:')
+        ) {
+          // eslint-disable-next-line no-void
+          void handleRecoverConfirmOrCancelClick(interaction, commandDeps).catch((error: unknown) => {
+            logger.error({err: String(error)}, 'button: unexpected error handling recover-confirm interaction')
+          })
+          return
+        }
+        if (
+          interaction.customId.startsWith('fb-backup-delete-confirm:') ||
+          interaction.customId.startsWith('fb-backup-delete-cancel:')
+        ) {
+          // eslint-disable-next-line no-void
+          void handleBackupDeleteConfirmOrCancelClick(interaction, commandDeps).catch((error: unknown) => {
+            logger.error({err: String(error)}, 'button: unexpected error handling backup-delete interaction')
+          })
+          return
+        }
+      }
+
+      // ── Button interactions: approval flow ────────────────────────
       if (interaction.isButton()) {
         const parsed = parseApprovalCustomId(interaction.customId)
         if (parsed === null) return // not our button — ignore
