@@ -27,6 +27,7 @@ import type {Socket} from 'node:net'
 
 import {Buffer} from 'node:buffer'
 import {execFileSync, spawn} from 'node:child_process'
+import {existsSync} from 'node:fs'
 import {chmod, mkdir, open, rm} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
@@ -132,9 +133,14 @@ export function parseCgiHeaders(headerText: string): {
 // ---------------------------------------------------------------------------
 
 /** Resolved once per fixture instance (`startGitHttpServer`), not per request — `git --exec-path` is a fixed property of the installed git binary. */
-function resolveHttpBackendPath(): string {
-  const execPath = execFileSync('git', ['--exec-path'], {encoding: 'utf8'}).trim()
-  return join(execPath, 'git-http-backend')
+export function resolveHttpBackendPath(
+  execPath = execFileSync('git', ['--exec-path'], {encoding: 'utf8'}).trim(),
+): string {
+  const httpBackendPath = join(execPath, 'git-http-backend')
+  if (!existsSync(httpBackendPath)) {
+    throw new Error(`git-http-backend is missing at ${httpBackendPath}; install the git-daemon package on Alpine`)
+  }
+  return httpBackendPath
 }
 
 /** Builds the CGI/1.1 environment for one request. `Content-Type` and `Content-Length` are the two CGI meta-variables with no `HTTP_` prefix; every other header is forwarded as `HTTP_<NAME>` with dashes turned into underscores — the generic CGI header-forwarding rule, which is what lets `git http-backend` see `Content-Encoding: gzip` (as `HTTP_CONTENT_ENCODING`) and decompress the request body itself; this adapter never touches the body bytes. */

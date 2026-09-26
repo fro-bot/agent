@@ -468,6 +468,8 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
       await writeFile(join(dest, 'ignored.txt'), 'ignored content\n')
       await writeFile(join(dest, 'untracked.txt'), 'untracked content\n')
       const localSha = commitFile(dest, isolatedGitEnv(checkoutHome), 'local-only.txt', 'local', 'local-only commit')
+      const runAsAgent = process.getuid?.() === 0
+      if (runAsAgent) execFileSync('chmod', ['-R', 'a+rX', reposRoot])
       const originalManifest = await buildContentManifest(dest)
 
       const preview = await previewRecovery(req(), deps())
@@ -477,7 +479,16 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
       const fixture = await setupNetworkFixture()
       try {
         // #when
-        const result = await executeRecovery({...recoverReq(fixture), fingerprint}, recoveryDeps(fixture))
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {
+            options: {
+              uid: runAsAgent ? AGENT_UID : process.getuid?.(),
+              gid: runAsAgent ? AGENT_GID : process.getgid?.(),
+              timeoutMs: 10_000,
+            },
+          }),
+        )
 
         // #then
         expect(result.kind).toBe('ok')
@@ -505,9 +516,16 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
         expect(await buildContentManifest(quarantinePath)).toEqual(originalManifest)
 
         // #and — installed checkout is clean on the default branch
-        expect(gitSync(dest, ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(fixture.headSha)
-        expect(gitSync(dest, ['status', '--porcelain'], isolatedGitEnv(checkoutHome)).trim()).toBe('')
-        expect(gitSync(dest, ['symbolic-ref', '--short', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe('main')
+        const rootGitSafetyArgs = runAsAgent ? ['-c', 'safe.directory=', '-c', `safe.directory=${dest}`] : []
+        expect(gitSync(dest, [...rootGitSafetyArgs, 'rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(
+          fixture.headSha,
+        )
+        expect(
+          gitSync(dest, [...rootGitSafetyArgs, 'status', '--porcelain'], isolatedGitEnv(checkoutHome)).trim(),
+        ).toBe('')
+        expect(
+          gitSync(dest, [...rootGitSafetyArgs, 'symbolic-ref', '--short', 'HEAD'], isolatedGitEnv(checkoutHome)).trim(),
+        ).toBe('main')
         // #and — (E9) agent-owned, when this test itself runs as root (a helper, not an inline
         // conditional, so the assertion is never skipped silently by lint-suppressed intent)
         assertAgentOwnedIfRoot(dest)
@@ -1111,43 +1129,76 @@ async function buildContentManifest(root: string): Promise<readonly ManifestEntr
   const entries: ManifestEntry[] = []
   async function walk(relPath: string): Promise<void> {
     const absPath = join(root, relPath)
-    const st = await lstat(absPath)
-    const mode = st.mode & 0o777
-    if (st.isSymbolicLink()) {
+    let handle: Awaited<ReturnType<typeof open>>
+    try {
+      // Open before inspecting the pathname so regular-file metadata and bytes come from one
+      // descriptor. O_NONBLOCK avoids hanging if a raced path is replaced with a FIFO.
+      handle = await open(absPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ELOOP')) throw error
+
+      // O_NOFOLLOW rejects a symlink. Confirm the same symlink remains around readlink; any path
+      // replacement fails closed rather than adding a mixed manifest entry.
+      const before = await lstat(absPath)
+      if (!before.isSymbolicLink()) throw new Error(`Path changed while building manifest: ${relPath}`)
       const target = await readlink(absPath)
-      entries.push({path: relPath, type: 'symlink', mode, size: st.size, sha256: undefined, symlinkTarget: target})
-      return
-    }
-    if (st.isDirectory()) {
-      entries.push({path: relPath, type: 'dir', mode, size: 0, sha256: undefined, symlinkTarget: undefined})
-      const names = await readdir(absPath)
-      for (const name of [...names].sort()) await walk(relPath === '.' ? name : join(relPath, name))
-      return
-    }
-    let fileSt = st
-    let sha256: string | undefined
-    if (st.isFile()) {
-      // Read and capture metadata from the same descriptor; O_NOFOLLOW prevents a path swap to a
-      // symlink between lstat and open from escaping the manifest root.
-      const handle = await open(absPath, constants.O_RDONLY | constants.O_NOFOLLOW)
-      try {
-        fileSt = await handle.stat()
-        if (!fileSt.isFile()) throw new Error(`Expected regular file while building manifest: ${relPath}`)
-        sha256 = createHash('sha256')
-          .update(await handle.readFile())
-          .digest('hex')
-      } finally {
-        await handle.close()
+      const after = await lstat(absPath)
+      if (!after.isSymbolicLink() || before.dev !== after.dev || before.ino !== after.ino) {
+        throw new Error(`Path changed while building manifest: ${relPath}`)
       }
+      entries.push({
+        path: relPath,
+        type: 'symlink',
+        mode: before.mode & 0o777,
+        size: before.size,
+        sha256: undefined,
+        symlinkTarget: target,
+      })
+      return
     }
-    entries.push({
-      path: relPath,
-      type: st.isFile() ? 'file' : 'other',
-      mode: fileSt.mode & 0o777,
-      size: fileSt.size,
-      sha256,
-      symlinkTarget: undefined,
-    })
+
+    try {
+      const st = await handle.stat()
+      if (st.isDirectory()) {
+        // readdir currently takes a pathname. Check that it still names the opened directory on
+        // both sides of enumeration, rejecting swaps instead of silently mixing trees.
+        const before = await lstat(absPath)
+        if (!before.isDirectory() || before.dev !== st.dev || before.ino !== st.ino) {
+          throw new Error(`Path changed while building manifest: ${relPath}`)
+        }
+        const names = await readdir(absPath)
+        const after = await lstat(absPath)
+        if (!after.isDirectory() || after.dev !== st.dev || after.ino !== st.ino) {
+          throw new Error(`Path changed while building manifest: ${relPath}`)
+        }
+        entries.push({
+          path: relPath,
+          type: 'dir',
+          mode: st.mode & 0o777,
+          size: 0,
+          sha256: undefined,
+          symlinkTarget: undefined,
+        })
+        for (const name of [...names].sort()) await walk(relPath === '.' ? name : join(relPath, name))
+        return
+      }
+
+      const sha256 = st.isFile()
+        ? createHash('sha256')
+            .update(await handle.readFile())
+            .digest('hex')
+        : undefined
+      entries.push({
+        path: relPath,
+        type: st.isFile() ? 'file' : 'other',
+        mode: st.mode & 0o777,
+        size: st.size,
+        sha256,
+        symlinkTarget: undefined,
+      })
+    } finally {
+      await handle.close()
+    }
   }
   await walk('.')
   return [...entries].sort((a, b) => a.path.localeCompare(b.path))

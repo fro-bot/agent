@@ -18,7 +18,12 @@ import {join} from 'node:path'
 
 import {afterEach, describe, expect, it} from 'vitest'
 import {buildNetworkGitProfile} from '../git-safety.js'
-import {bareRepoPath, startGitHttpServer, writeLoopbackAskpassHelper} from './git-http-server.js'
+import {
+  bareRepoPath,
+  resolveHttpBackendPath,
+  startGitHttpServer,
+  writeLoopbackAskpassHelper,
+} from './git-http-server.js'
 import {
   commitFile,
   generateSelfSignedCert,
@@ -52,6 +57,24 @@ describe.skipIf(!OPENSSL_AVAILABLE)('HTTPS fixture certificate', () => {
       expect(certText).toContain('IP Address:127.0.0.1')
     } finally {
       await rm(certDir, {recursive: true, force: true})
+    }
+  })
+})
+
+describe('git-http-server backend prerequisite', () => {
+  it('reports when git-http-backend is missing from the git exec path', async () => {
+    // #given a git exec path that does not contain git-http-backend
+    const tempDir = await mkdtemp(join(os.tmpdir(), 'git-http-server-missing-backend-'))
+    const missingExecPath = join(tempDir, 'git-core')
+
+    try {
+      // #when resolving the fixture backend
+      const resolve = (): string => resolveHttpBackendPath(missingExecPath)
+
+      // #then the missing Alpine package is called out instead of failing as an opaque HTTP 500
+      expect(resolve).toThrow(/git-http-backend.*git-daemon/)
+    } finally {
+      await rm(tempDir, {recursive: true, force: true})
     }
   })
 })

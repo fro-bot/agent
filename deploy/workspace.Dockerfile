@@ -115,7 +115,7 @@ FROM build-deps AS workspace-test
 # (generateSelfSignedCert in update-fixtures/helpers.ts). The runtime image has
 # no need for the openssl CLI (only its libs, transitively, for Node/OpenCode),
 # so this is confined to the test-only stage rather than added to runtime.
-RUN apk add --no-cache git openssl
+RUN apk add --no-cache git git-daemon openssl
 
 CMD ["sh", "-c", "set -e; git --version; exec bun run --filter @fro-bot/workspace-agent test"]
 
