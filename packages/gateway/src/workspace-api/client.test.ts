@@ -1500,6 +1500,53 @@ describe('WorkspaceClient.update', () => {
       vi.unstubAllGlobals()
     })
 
+    it('200 ready/fast-forward with fromSha equal to sha (degenerate, no real advance) → parse-error, never normalized to unchanged', async () => {
+      const client = makeClient()
+      const body = {
+        kind: 'ready',
+        change: 'fast-forward',
+        branch: 'main',
+        sha: 'a'.repeat(40),
+        fromSha: 'a'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      }
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('200 ready/fast-forward missing fromSha → parse-error', async () => {
+      const client = makeClient()
+      const body = {
+        kind: 'ready',
+        change: 'fast-forward',
+        branch: 'main',
+        sha: 'a'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      }
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('200 ready/unchanged carrying a fromSha → parse-error', async () => {
+      const client = makeClient()
+      const body = {
+        kind: 'ready',
+        change: 'unchanged',
+        branch: 'main',
+        sha: 'a'.repeat(40),
+        fromSha: 'b'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      }
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
     it('non-JSON body → parse-error', async () => {
       const client = makeClient()
       const fetchMock = mockFetch({

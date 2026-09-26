@@ -806,11 +806,22 @@ function isUpdateResultStatus(status: number): boolean {
 
 const UPDATE_CHANGE_KINDS = new Set<string>(['fast-forward', 'unchanged'])
 
+/**
+ * `fast-forward` MUST carry a `fromSha` that is a well-formed SHA and differs from `sha` (no real
+ * advance otherwise); `unchanged` MUST NOT carry `fromSha` at all. Either violation is rejected
+ * here — at the trust boundary — as malformed wire data, not silently normalized downstream: a
+ * degenerate fast-forward reaching a caller unrejected would hide a genuine workspace-agent bug
+ * behind a falsely-reassuring "nothing changed" projection.
+ */
 function isUpdateReadyBody(v: Record<string, unknown>): boolean {
   if (typeof v.change !== 'string' || !UPDATE_CHANGE_KINDS.has(v.change)) return false
   if (typeof v.branch !== 'string' || v.branch.length === 0) return false
   if (!isValidSha(v.sha)) return false
-  if (v.fromSha !== undefined && !isValidSha(v.fromSha)) return false
+  if (v.change === 'fast-forward') {
+    if (!isValidSha(v.fromSha) || v.fromSha === v.sha) return false
+  } else if (v.fromSha !== undefined) {
+    return false
+  }
   return isValidIsoTimestamp(v.checkedAt)
 }
 

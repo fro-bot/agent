@@ -14,19 +14,82 @@
  * rewrite of every consumer.
  */
 
-import type {CheckoutObservation, InspectErrorCode, InspectWorkspaceError} from '../workspace-api/types.js'
+import type {
+  CheckoutObservation,
+  CheckoutOperation,
+  InspectErrorCode,
+  InspectWorkspaceError,
+  LayoutRefusalReason,
+  ObstructionKind,
+  UpdateFailed,
+  UpdateFailureReason,
+  UpdateReady,
+  UpdateRefused,
+} from '../workspace-api/types.js'
 
 // ---------------------------------------------------------------------------
-// RemoteFreshness — explicit "not checked" today, extensible tomorrow
+// RemoteFreshness — explicit "not checked" today; Unit 6 (this file) adds
+// `checked`, projected from a `/update` `ready` result.
 // ---------------------------------------------------------------------------
 
-/** Whether the run checked the remote for commits ahead of the local checkout. PR 1 never does. */
-export interface RemoteFreshness {
-  readonly kind: 'not-checked'
-}
+/** Whether the run checked the remote for commits ahead of the local checkout. */
+export type RemoteFreshness =
+  | {readonly kind: 'not-checked'}
+  /**
+   * Preparation ran `/update`, the remote default branch was observed, and the checkout is
+   * current with it. A discriminated union on `change`, not a boolean/optional pairing: the
+   * `unchanged` variant has no `fromSha` field at all (there is nothing to have come from), so an
+   * "unchanged but here's a fromSha anyway" state cannot be constructed by this module — see
+   * `toRemoteFreshnessFromUpdateReady`, the only constructor, for the runtime half of that
+   * guarantee (`fromSha` must differ from `sha` for a real `fast-forward`, which TypeScript's
+   * structural typing cannot enforce on two `string` fields).
+   */
+  | {
+      readonly kind: 'checked'
+      readonly defaultBranch: string
+      readonly sha: string
+      readonly checkedAt: string
+      readonly change: 'unchanged'
+    }
+  | {
+      readonly kind: 'checked'
+      readonly defaultBranch: string
+      readonly sha: string
+      readonly checkedAt: string
+      readonly change: 'fast-forward'
+      readonly fromSha: string
+    }
 
-/** Singleton — PR 1 has exactly one `RemoteFreshness` value. */
+/** Singleton for the common "not checked" case. */
 export const REMOTE_FRESHNESS_NOT_CHECKED: RemoteFreshness = {kind: 'not-checked'}
+
+/**
+ * Projects a workspace `/update` `ready` result into `RemoteFreshness`. The only constructor for
+ * the `checked` variant — nothing else in this module builds one by hand.
+ *
+ * The `fast-forward` invariant (`fromSha` present and differs from `sha`) is enforced at the wire
+ * boundary, not here: `workspace-api/client.ts`'s `isUpdateReadyBody` rejects a degenerate
+ * fast-forward (missing `fromSha`, or `fromSha === sha`) as `parse-error` before an `UpdateReady`
+ * carrying one can ever reach this function — so a caller only ever passes a `ready` result already
+ * proven valid. This function therefore never normalizes a bad value into `unchanged`: doing so
+ * would hide a genuine workspace-agent bug behind a falsely-reassuring "nothing changed"
+ * projection. If the invariant is somehow violated anyway (a caller bypassing the validated client,
+ * or a future regression in it), this throws rather than silently misrepresenting the checkout's
+ * state — fail loud, not fail quiet.
+ */
+export function toRemoteFreshnessFromUpdateReady(ready: UpdateReady): RemoteFreshness {
+  const {branch: defaultBranch, sha, checkedAt} = ready
+  if (ready.change === 'unchanged') {
+    return {kind: 'checked', defaultBranch, sha, checkedAt, change: 'unchanged'}
+  }
+  if (ready.fromSha === undefined || ready.fromSha === sha) {
+    throw new Error(
+      'toRemoteFreshnessFromUpdateReady: fast-forward UpdateReady missing a real fromSha — the wire ' +
+        'validator (isUpdateReadyBody) should have rejected this as parse-error before this function was called',
+    )
+  }
+  return {kind: 'checked', defaultBranch, sha, checkedAt, change: 'fast-forward', fromSha: ready.fromSha}
+}
 
 // ---------------------------------------------------------------------------
 // CheckoutProvenance — discriminated union, no booleans, no optional SHAs
@@ -178,7 +241,7 @@ function sanitizeBranchForCodeSpan(branch: string): string {
 }
 
 /** Render a branch name safely for the human-facing reply line's code span. */
-function formatBranchForReply(branch: string): string {
+export function formatBranchForReply(branch: string): string {
   return sanitizeBranchForCodeSpan(truncateForDisplay(branch, MAX_BRANCH_DISPLAY_LENGTH))
 }
 
@@ -212,24 +275,39 @@ function describeWorktreeForAgent(observation: CheckoutObservation): string {
 }
 
 /**
+ * Renders the remote-freshness clause shared by both `formatProvenanceForPrompt` branches. The
+ * `not-checked` case reproduces today's exact literal string (byte-identical output requirement).
+ */
+function describeRemoteFreshnessForPrompt(remote: RemoteFreshness): string {
+  if (remote.kind === 'not-checked') {
+    return 'Remote freshness was not checked — do not assume this is the latest default branch.'
+  }
+  const branch = quoteBranchForPrompt(remote.defaultBranch)
+  if (remote.change === 'unchanged') {
+    return `Remote checked: default branch ${branch} is unchanged at ${remote.sha}, observed at ${remote.checkedAt}.`
+  }
+  return `Remote checked: default branch ${branch} advanced from ${remote.fromSha} to ${remote.sha}, observed at ${remote.checkedAt}.`
+}
+
+/**
  * Build the agent-facing provenance block. The engine appends this after
  * whichever prompt builder ran (Discord's or a custom one) so no builder can
  * omit it. Keeps it short and factual: starting commit/branch, worktree
- * cleanliness, any in-progress operation, and that remote freshness was not
+ * cleanliness, any in-progress operation, and whether remote freshness was
  * checked — so the agent cannot assume it's reading the latest default
- * branch. Never tells the agent what to do.
+ * branch when it wasn't. Never tells the agent what to do.
  */
 export function formatProvenanceForPrompt(provenance: CheckoutProvenance): string {
   if (provenance.kind === 'unavailable') {
     return [
       '--- Checkout provenance ---',
       'The starting state of this checkout could not be determined (inspection unavailable).',
-      'Remote freshness was not checked.',
+      describeRemoteFreshnessForPrompt(provenance.remote),
       '--- End checkout provenance ---',
     ].join('\n')
   }
 
-  const {observation} = provenance
+  const {observation, remote} = provenance
   const lines = [
     '--- Checkout provenance ---',
     `Starting commit: ${describeHeadForAgent(observation)}`,
@@ -238,7 +316,7 @@ export function formatProvenanceForPrompt(provenance: CheckoutProvenance): strin
   if (observation.operationInProgress !== 'none') {
     lines.push(`Operation in progress: ${observation.operationInProgress}`)
   }
-  lines.push('Remote freshness was not checked — do not assume this is the latest default branch.')
+  lines.push(describeRemoteFreshnessForPrompt(remote))
   lines.push('--- End checkout provenance ---')
   return lines.join('\n')
 }
@@ -251,6 +329,24 @@ export function formatProvenanceForPrompt(provenance: CheckoutProvenance): strin
 const SHORT_SHA_LENGTH = 7
 
 /**
+ * Renders the plan's exact reply-only wording for a `ready` outcome with a checked remote (Unit 7's
+ * reply table: "Provenance line only") — a wholly different sentence shape from the
+ * not-checked/unavailable lines below, since a `ready` outcome IS the report (unlike "started
+ * from," which describes a point the run may have since diverged from). Uses `remote`'s own
+ * `defaultBranch`/`sha`/`fromSha` — never the (possibly stale, possibly absent) `observation` —
+ * since this is the freshest evidence preparation has.
+ */
+function formatCheckedReadyLine(remote: Extract<RemoteFreshness, {kind: 'checked'}>): string {
+  const branch = formatBranchForReply(remote.defaultBranch)
+  const shortSha = remote.sha.slice(0, SHORT_SHA_LENGTH)
+  if (remote.change === 'unchanged') {
+    return `The checkout is already at \`${shortSha}\` (branch \`${branch}\`), checked \`${remote.checkedAt}\`.`
+  }
+  const shortFromSha = remote.fromSha.slice(0, SHORT_SHA_LENGTH)
+  return `The checkout advanced from \`${shortFromSha}\` to \`${shortSha}\` (branch \`${branch}\`), checked \`${remote.checkedAt}\`.`
+}
+
+/**
  * Build the one-line, deterministic, code-generated provenance line shown to
  * the human on every final reply. Describes the STARTING point only — a run
  * that edits files or switches branches mid-run changes the tree, so this
@@ -259,7 +355,14 @@ const SHORT_SHA_LENGTH = 7
  * mid-operation, or unavailable).
  */
 export function formatProvenanceLine(repo: string, provenance: CheckoutProvenance): string {
+  if (provenance.kind === 'observed' && provenance.remote.kind === 'checked') {
+    return formatCheckedReadyLine(provenance.remote)
+  }
+
   if (provenance.kind === 'unavailable') {
+    if (provenance.remote.kind === 'checked') {
+      return `Started from \`${repo}\` — starting state unavailable. Remote checked \`${provenance.remote.checkedAt}\`.`
+    }
     return `Started from \`${repo}\` — starting state unavailable. Remote freshness not checked.`
   }
 
@@ -294,4 +397,116 @@ export function formatProvenanceLine(repo: string, provenance: CheckoutProvenanc
  */
 export function formatSubstitutedCheckoutLine(repo: string): string {
   return `Started from \`${repo}\` — starting state withheld: checkout is not the expected repository.`
+}
+
+// ---------------------------------------------------------------------------
+// CheckoutPreparation — persisted record for a REFUSED or FAILED preparation
+// attempt (Unit 7 wires the call site; this module only builds the value).
+// Unlike CheckoutProvenance, a run carrying this never reached EXECUTING.
+// ---------------------------------------------------------------------------
+
+/**
+ * Cap on the number of path-like detail entries (`changedPaths`, `submodules`, `disallowedKeys`,
+ * `obstructions`) carried into a persisted record — bounds payload size against a pathological
+ * count, the same posture as `MAX_BRANCH_DISPLAY_LENGTH` and `MAX_REPOS_PER_LISTING` elsewhere in
+ * this codebase. This is JSON persisted for a JSON-consuming operator dashboard, not Markdown
+ * rendered on Discord, so no backtick-neutralization is needed here (that is `formatBranchForReply`'s
+ * job, for the reply surface only) — only a length/count bound against attacker-influenced content
+ * (these paths/config-key names come from an agent-writable checkout).
+ */
+const MAX_PREPARATION_DETAIL_ENTRIES = 20
+
+/** Per-entry length cap for the detail arrays above — wider than `MAX_BRANCH_DISPLAY_LENGTH` since real repo paths are commonly deeper than a branch name, but still bounded against one pathological entry. */
+const MAX_PREPARATION_DETAIL_LENGTH = 200
+
+function capDetailArray(values: readonly string[]): readonly string[] {
+  return values.slice(0, MAX_PREPARATION_DETAIL_ENTRIES).map(v => truncateForDisplay(v, MAX_PREPARATION_DETAIL_LENGTH))
+}
+
+/**
+ * A refused preparation attempt, one variant per `UpdateRefusalReason` — mirrors `UpdateRefused`'s
+ * own shape field-for-field, since every field it carries is already bounded, non-sensitive detail
+ * (a git ref name, a closed-vocabulary config-key/operation/obstruction-kind string, or a checkout-
+ * relative path) needed to tell an operator WHY the run was refused.
+ */
+export type CheckoutPreparationRefused =
+  | {readonly outcome: 'refused'; readonly reason: 'needs-recovery'}
+  | {readonly outcome: 'refused'; readonly reason: 'checkout-substituted'}
+  | {readonly outcome: 'refused'; readonly reason: 'unsupported-layout'; readonly layoutReason: LayoutRefusalReason}
+  | {readonly outcome: 'refused'; readonly reason: 'unsupported-config'; readonly disallowedKeys: readonly string[]}
+  | {readonly outcome: 'refused'; readonly reason: 'operation-in-progress'; readonly operation: CheckoutOperation}
+  | {readonly outcome: 'refused'; readonly reason: 'dirty'; readonly changedPaths: readonly string[]}
+  | {readonly outcome: 'refused'; readonly reason: 'submodule-initialized'; readonly submodules: readonly string[]}
+  | {readonly outcome: 'refused'; readonly reason: 'detached'}
+  | {readonly outcome: 'refused'; readonly reason: 'non-default-branch'; readonly branch: string}
+  | {readonly outcome: 'refused'; readonly reason: 'diverged'}
+  | {readonly outcome: 'refused'; readonly reason: 'ahead'}
+  | {
+      readonly outcome: 'refused'
+      readonly reason: 'obstructed'
+      readonly obstructions: readonly {readonly path: string; readonly kind: ObstructionKind}[]
+    }
+  | {readonly outcome: 'refused'; readonly reason: 'maintenance-hold'}
+
+/** A failed preparation attempt — mirrors `UpdateFailed` field-for-field. */
+export interface CheckoutPreparationFailed {
+  readonly outcome: 'failed'
+  readonly reason: UpdateFailureReason
+  readonly mutationStarted: boolean | 'possibly'
+  readonly permanent: boolean
+}
+
+/** What preparation reported for a run that never reached EXECUTING. */
+export type CheckoutPreparation = CheckoutPreparationRefused | CheckoutPreparationFailed
+
+/**
+ * Builds a `CheckoutPreparation` from a workspace `/update` `refused` or `failed` result. The only
+ * constructor — nothing else in this module builds one by hand. Applies the detail caps above to
+ * every path-like or key-like array field; every other field is a closed-vocabulary string or
+ * primitive already safe to persist as-is.
+ */
+export function toCheckoutPreparation(result: UpdateRefused | UpdateFailed): CheckoutPreparation {
+  if (result.kind === 'failed') {
+    return {
+      outcome: 'failed',
+      reason: result.reason,
+      mutationStarted: result.mutationStarted,
+      permanent: result.permanent,
+    }
+  }
+
+  switch (result.reason) {
+    case 'needs-recovery':
+    case 'checkout-substituted':
+    case 'detached':
+    case 'diverged':
+    case 'ahead':
+    case 'maintenance-hold':
+      return {outcome: 'refused', reason: result.reason}
+    case 'unsupported-layout':
+      return {outcome: 'refused', reason: result.reason, layoutReason: result.layoutReason}
+    case 'unsupported-config':
+      return {outcome: 'refused', reason: result.reason, disallowedKeys: capDetailArray(result.disallowedKeys)}
+    case 'operation-in-progress':
+      return {outcome: 'refused', reason: result.reason, operation: result.operation}
+    case 'dirty':
+      return {outcome: 'refused', reason: result.reason, changedPaths: capDetailArray(result.changedPaths)}
+    case 'submodule-initialized':
+      return {outcome: 'refused', reason: result.reason, submodules: capDetailArray(result.submodules)}
+    case 'non-default-branch':
+      return {
+        outcome: 'refused',
+        reason: result.reason,
+        branch: truncateForDisplay(result.branch, MAX_BRANCH_DISPLAY_LENGTH),
+      }
+    case 'obstructed':
+      return {
+        outcome: 'refused',
+        reason: result.reason,
+        obstructions: result.obstructions.slice(0, MAX_PREPARATION_DETAIL_ENTRIES).map(o => ({
+          path: truncateForDisplay(o.path, MAX_PREPARATION_DETAIL_LENGTH),
+          kind: o.kind,
+        })),
+      }
+  }
 }

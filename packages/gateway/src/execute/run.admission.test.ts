@@ -15,6 +15,7 @@ import {
   makeMessage,
   makeReadyzFn,
   makeThread,
+  makeUpdateFn,
   mockRunOpenCodeCore,
   mockRuntime,
   OWNER,
@@ -26,6 +27,27 @@ import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import {getInFlightRuns} from './run.js'
 /* eslint-enable perfectionist/sort-imports */
+
+/**
+ * A `RunMentionDeps.update` mock for the "ensureClone succeeds" happy-path tests: the FIRST call
+ * (before ensureClone) reports `no-checkout`, triggering ensureClone; the SECOND call (the retry
+ * after ensureClone succeeds) reports `ready`, letting the run proceed to execution.
+ */
+function makeUpdateNoCheckoutThenReadyFn() {
+  return vi
+    .fn()
+    .mockResolvedValueOnce({success: true as const, data: {kind: 'no-checkout' as const}})
+    .mockResolvedValue({
+      success: true as const,
+      data: {
+        kind: 'ready' as const,
+        change: 'unchanged' as const,
+        branch: 'main',
+        sha: 'a'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      },
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Admission and gating — concurrency cap, per-channel in-flight guard,
@@ -140,13 +162,13 @@ describe('runMention', () => {
       const {runMention} = await import('./run.js')
       setupHappyPath()
       const ensureClone = makeEnsureCloneFn('success')
-      const deps = makeDeps({ensureClone})
+      const deps = makeDeps({ensureClone, update: makeUpdateNoCheckoutThenReadyFn()})
       const message = makeMessage()
 
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — ensureClone was called; execution proceeded
+      // #then — ensureClone was called (update reported no-checkout); execution proceeded
       expect(ensureClone).toHaveBeenCalledWith(OWNER, REPO)
       expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
     })
@@ -159,6 +181,7 @@ describe('runMention', () => {
       const releaseFn = vi.fn()
       const deps = makeDeps({
         ensureClone,
+        update: makeUpdateFn('no-checkout'),
         concurrency: {
           tryAcquire: vi.fn().mockReturnValue('ok'),
           release: releaseFn,
@@ -197,7 +220,7 @@ describe('runMention', () => {
         success: false as const,
         error: {kind: 'auth-failure' as const, reason: 'auth-error' as const},
       })
-      const deps = makeDeps({ensureClone})
+      const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
       const message = makeMessage()
 
       // #when
@@ -268,7 +291,7 @@ describe('runMention', () => {
       const canonicalPath = '/workspace/canonical/acme/widget'
       const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: canonicalPath})
       const staleBinding = {...makeBinding(), workspacePath: '/old/stale/path'}
-      const deps = makeDeps({ensureClone})
+      const deps = makeDeps({ensureClone, update: makeUpdateNoCheckoutThenReadyFn()})
       const msg = makeMessage()
 
       // #when
@@ -306,14 +329,30 @@ describe('runMention', () => {
         callOrder.push('ensureClone')
         return {success: true as const, data: '/workspace/acme/widget'}
       })
-      const deps = makeDeps({ensureClone})
+      let updateCalls = 0
+      const update = vi.fn().mockImplementation(async () => {
+        updateCalls += 1
+        callOrder.push('update')
+        if (updateCalls === 1) return {success: true as const, data: {kind: 'no-checkout' as const}}
+        return {
+          success: true as const,
+          data: {
+            kind: 'ready' as const,
+            change: 'unchanged' as const,
+            branch: 'main',
+            sha: 'a'.repeat(40),
+            checkedAt: '2026-01-01T00:00:00.000Z',
+          },
+        }
+      })
+      const deps = makeDeps({ensureClone, update})
       const message = makeMessage()
 
       // #when
       await runMention(message, makeBinding(), deps)
 
       // #then — exact order: lock acquired, renewal started, THEN checkout prep
-      expect(callOrder).toEqual(['acquireLock', 'heartbeat.start', 'ensureClone'])
+      expect(callOrder).toEqual(['acquireLock', 'heartbeat.start', 'update', 'ensureClone', 'update'])
     })
 
     it('a run that fails to acquire the lock never calls ensureClone', async () => {
@@ -377,7 +416,7 @@ describe('runMention', () => {
         })
       const ensureClone = makeEnsureCloneFn('failure')
       const message = makeMessage()
-      const deps = makeDeps({ensureClone})
+      const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
       // #when
       await runMention(message, makeBinding(), deps)
@@ -419,14 +458,30 @@ describe('runMention', () => {
         callOrder.push('ensureClone')
         return {success: true as const, data: '/workspace/acme/widget'}
       })
+      let updateCalls = 0
+      const update = vi.fn().mockImplementation(async () => {
+        updateCalls += 1
+        callOrder.push('update')
+        if (updateCalls === 1) return {success: true as const, data: {kind: 'no-checkout' as const}}
+        return {
+          success: true as const,
+          data: {
+            kind: 'ready' as const,
+            change: 'unchanged' as const,
+            branch: 'main',
+            sha: 'a'.repeat(40),
+            checkedAt: '2026-01-01T00:00:00.000Z',
+          },
+        }
+      })
       const request = makeInMemoryRequest()
-      const deps = makeDeps({ensureClone})
+      const deps = makeDeps({ensureClone, update})
 
       // #when
       await awaitLaunchWorkRun(launchWork, request, deps)
 
       // #then — exact order matches the Discord adapter path
-      expect(callOrder).toEqual(['acquireLock', 'heartbeat.start', 'ensureClone'])
+      expect(callOrder).toEqual(['acquireLock', 'heartbeat.start', 'update', 'ensureClone', 'update'])
     })
   })
 
@@ -1128,7 +1183,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     const ensureClone = makeEnsureCloneFn('failure')
     const observeFn = vi.fn().mockResolvedValue(undefined)
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone, runObserver: {observe: observeFn}})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout'), runObserver: {observe: observeFn}})
 
     // #when — await the run promise so executeWorkOnHeldSlot completes
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -1466,7 +1521,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     const ensureClone = vi.fn().mockRejectedValue(new Error('ensureClone threw unexpectedly'))
     const observeFn = vi.fn().mockResolvedValue(undefined)
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone, runObserver: {observe: observeFn}})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout'), runObserver: {observe: observeFn}})
 
     // #when — the run promise may reject (the throw propagates after terminalization)
     const admission = await launchWork(request, deps)
@@ -1544,7 +1599,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     const ensureClone = makeEnsureCloneFn('failure')
     const observeFn = vi.fn().mockResolvedValue(undefined)
     const message = makeMessage()
-    const deps = makeDeps({ensureClone, runObserver: {observe: observeFn}})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout'), runObserver: {observe: observeFn}})
 
     // #when
     await runMention(message, makeBinding(), deps)
@@ -1620,7 +1675,7 @@ describe('failureKind threading (early-abort gates)', () => {
     setupHappyPath()
     const ensureClone = makeEnsureCloneFn('failure')
     const message = makeMessage()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await runMention(message, makeBinding(), deps)
@@ -1645,7 +1700,7 @@ describe('failureKind threading (early-abort gates)', () => {
       error: {kind: 'workspace-failure' as const, workspaceKind: 'http-error' as const, status: 401},
     })
     const message = makeMessage()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await runMention(message, makeBinding(), deps)
@@ -1678,7 +1733,7 @@ describe('failureKind threading (early-abort gates)', () => {
       },
     })
     const message = makeMessage()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await runMention(message, makeBinding(), deps)
@@ -1705,7 +1760,7 @@ describe('failureKind threading (early-abort gates)', () => {
       error: {kind: 'workspace-failure' as const, workspaceKind: 'http-error' as const, status: 503},
     })
     const message = makeMessage()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await runMention(message, makeBinding(), deps)

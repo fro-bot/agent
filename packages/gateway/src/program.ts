@@ -41,7 +41,7 @@ import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createRunIndex} from './execute/run-index.js'
 import {getInFlightRuns} from './execute/run.js'
-import {createAppClient} from './github/app-client.js'
+import {AppNotInstalledError, createAppClient, InsufficientPermissionsError} from './github/app-client.js'
 import {createWorkflowDispatcher} from './github/dispatch.js'
 import {createRateLimiter} from './http/rate-limit.js'
 import {createDenylistCache} from './redaction/denylist.js'
@@ -654,9 +654,21 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
             error: (msg, meta) => logger.error(meta ?? {}, msg),
           },
         }),
-      // Report checkout provenance. Called right after ensureClone, still under the
-      // repo lock — see run.ts. Read-only: never clones, fetches, or mutates the checkout.
-      inspect: async (owner: string, repo: string) => workspaceClient.inspect({owner, repo}),
+      // Prepare the checkout via /update under the repo lock (see run.ts). A permanent
+      // installation failure maps to 401 (no retry); any other token-mint failure is retryable.
+      update: async (owner: string, repo: string, options: {readonly remainingBudgetMs: number}) => {
+        const authResult = await appClient.authForRepo(owner, repo)
+        if (authResult.success === false) {
+          if (
+            authResult.error instanceof AppNotInstalledError ||
+            authResult.error instanceof InsufficientPermissionsError
+          ) {
+            return err({kind: 'http-error' as const, status: 401})
+          }
+          return err({kind: 'network-error' as const})
+        }
+        return workspaceClient.update({owner, repo, token: authResult.data.token}, options)
+      },
       // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
       // The in-memory queue is lossy by design; dropping pending tasks on graceful
       // shutdown matches that contract and is consistent with the messageCreate

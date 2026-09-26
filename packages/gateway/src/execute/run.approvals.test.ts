@@ -406,7 +406,20 @@ describe('runMention', () => {
       const fakeApprovalMessage = {id: 'msg-approval-1', edit: vi.fn()}
       thread.send.mockResolvedValue(fakeApprovalMessage)
       const message = makeMessage(thread)
-      const deps = makeDeps({approvalRegistry, ensureClone})
+      const update = vi
+        .fn()
+        .mockResolvedValueOnce({success: true as const, data: {kind: 'no-checkout' as const}})
+        .mockResolvedValue({
+          success: true as const,
+          data: {
+            kind: 'ready' as const,
+            change: 'unchanged' as const,
+            branch: 'main',
+            sha: 'a'.repeat(40),
+            checkedAt: '2026-01-01T00:00:00.000Z',
+          },
+        })
+      const deps = makeDeps({approvalRegistry, ensureClone, update})
 
       // Capture the onPending callback from coordinator factory
       let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
@@ -714,7 +727,20 @@ describe('runMention', () => {
         createApprovalOnPending,
       }
 
-      const deps = makeDeps({ensureClone, runTimeoutMs: 600_000})
+      const update = vi
+        .fn()
+        .mockResolvedValueOnce({success: true as const, data: {kind: 'no-checkout' as const}})
+        .mockResolvedValue({
+          success: true as const,
+          data: {
+            kind: 'ready' as const,
+            change: 'unchanged' as const,
+            branch: 'main',
+            sha: 'a'.repeat(40),
+            checkedAt: '2026-01-01T00:00:00.000Z',
+          },
+        })
+      const deps = makeDeps({ensureClone, update, runTimeoutMs: 600_000})
 
       // #when — await the run promise so the run completes before asserting
       await awaitLaunchWorkRun(launchWork, request, deps)
