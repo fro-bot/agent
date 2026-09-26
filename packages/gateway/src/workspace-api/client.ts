@@ -10,6 +10,7 @@
 import type {Result} from '@fro-bot/runtime'
 
 import type {
+  BackupEntry,
   CheckoutObservation,
   CheckoutOperation,
   CloneErrorCode,
@@ -17,12 +18,30 @@ import type {
   CloneRequest,
   CloneSuccess,
   CloneWorkspaceError,
+  DeleteBackupResult,
+  DeleteBackupWorkspaceError,
+  ExecuteRecoveryRequest,
+  ExecuteRecoveryResult,
+  ExecuteRecoveryWorkspaceError,
   InspectErrorCode,
   InspectFailure,
   InspectRequest,
   InspectSuccess,
   InspectWorkspaceError,
+  JournalInProgressPhase,
+  ListBackupsResult,
+  ListBackupsWorkspaceError,
+  PreviewRecoveryRequest,
+  PreviewRecoveryResult,
+  PreviewRecoveryWorkspaceError,
   ReadyzResponse,
+  RecoverableUpdatePreview,
+  RecoveryPreview,
+  RetentionUsage,
+  UpdateRefusalReason,
+  UpdateRequest,
+  UpdateResult,
+  UpdateWorkspaceError,
   WorkspaceError,
 } from './types.js'
 
@@ -45,6 +64,16 @@ export interface WorkspaceClientOptions {
    * much shorter than clone. See DEFAULT_INSPECT_TIMEOUT_MS for sizing rationale.
    */
   readonly inspectTimeoutMs?: number
+  /** Ceiling for /update calls before any caller-supplied `remainingBudgetMs`. Defaults to DEFAULT_UPDATE_TIMEOUT_MS (100 seconds). */
+  readonly updateTimeoutMs?: number
+  /** Timeout for /recover/preview calls. Defaults to DEFAULT_PREVIEW_RECOVERY_TIMEOUT_MS (45 seconds). */
+  readonly previewRecoveryTimeoutMs?: number
+  /** Timeout for /recover calls. Defaults to DEFAULT_RECOVER_TIMEOUT_MS (5 minutes). */
+  readonly recoverTimeoutMs?: number
+  /** Timeout for GET /backups calls. Defaults to DEFAULT_LIST_BACKUPS_TIMEOUT_MS (60 seconds). */
+  readonly listBackupsTimeoutMs?: number
+  /** Timeout for DELETE /backups/:id calls. Defaults to DEFAULT_DELETE_BACKUP_TIMEOUT_MS (30 seconds). */
+  readonly deleteBackupTimeoutMs?: number
 }
 
 export interface WorkspaceClient {
@@ -76,6 +105,68 @@ export interface WorkspaceClient {
    *   malformed timestamp. The wire response is never trusted at face value.
    */
   readonly inspect: (request: InspectRequest) => Promise<Result<CheckoutObservation, InspectWorkspaceError>>
+  /**
+   * Bring an ELIGIBLE existing checkout up to date via POST /update. Returns the bare `UpdateResult`
+   * union (ready/refused/failed/no-checkout) as the Ok value — workspace-agent's `/update` route
+   * returns its domain result directly, not wrapped in `{ok, error}`, so this mirrors that shape
+   * exactly rather than re-deriving a client-only error taxonomy for it.
+   *
+   * `remainingBudgetMs`, when given, is honored as the ACTUAL request ceiling whenever it is
+   * shorter than the 100-second default (the lesser of the two always wins) — a caller with less
+   * than 100s of its own overall budget left must never let this call outlive it.
+   *
+   * Returns:
+   * - `ok(result)` on HTTP 200/404/409/502/503/504 with a body matching that status's `UpdateResult` shape.
+   * - `err({kind: 'http-error', status})` on any other status (400/401/413/500/...) — those are
+   *   HTTP-layer-only outcomes (validation failure, bad bearer, oversized body), never a domain result.
+   * - `err({kind: 'timeout'})` when the effective deadline (min(100s, remainingBudgetMs)) elapses.
+   * - `err({kind: 'network-error'})` on connection failure.
+   * - `err({kind: 'parse-error'})` on a malformed or status-incoherent response body.
+   */
+  readonly update: (
+    request: UpdateRequest,
+    options?: {readonly remainingBudgetMs?: number},
+  ) => Promise<Result<UpdateResult, UpdateWorkspaceError>>
+  /**
+   * Report what a `/recover` call would see, via POST /recover/preview. Never mutates.
+   *
+   * Returns `ok(result)` on HTTP 200/404/409/503 with the matching `PreviewRecoveryResult` shape;
+   * `err({kind: 'http-error', status})` on any other status; `err({kind: 'timeout'})` on expiry;
+   * `err({kind: 'network-error'})` on connection failure; `err({kind: 'parse-error'})` on a
+   * malformed or status-incoherent body.
+   */
+  readonly previewRecovery: (
+    request: PreviewRecoveryRequest,
+  ) => Promise<Result<PreviewRecoveryResult, PreviewRecoveryWorkspaceError>>
+  /**
+   * Confirm a previously previewed recovery via POST /recover: quarantine-and-replace.
+   *
+   * Returns `ok(result)` on HTTP 200/404/409/503 with the matching `ExecuteRecoveryResult` shape;
+   * `err({kind: 'http-error', status})` on any other status; timeout/network-error/parse-error as above.
+   */
+  readonly recover: (
+    request: ExecuteRecoveryRequest,
+  ) => Promise<Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>>
+  /**
+   * List quarantine generations via GET /backups/:owner/:repo.
+   *
+   * Returns `ok(result)` on HTTP 200/503 with the matching `ListBackupsResult` shape;
+   * `err({kind: 'http-error', status})` on any other status; timeout/network-error/parse-error as above.
+   */
+  readonly listBackups: (owner: string, repo: string) => Promise<Result<ListBackupsResult, ListBackupsWorkspaceError>>
+  /**
+   * Remove exactly one quarantine generation via DELETE /backups/:owner/:repo/:id.
+   *
+   * Returns `ok(result)` on HTTP 200/400/404/409/503 with the matching `DeleteBackupResult` shape —
+   * unlike every other route here, 400 IS a domain result (`{kind: 'refused', reason: 'invalid-id'}`),
+   * never a generic validation-only body, so it is parsed rather than folded into `http-error`.
+   * `err({kind: 'http-error', status})` on any other status; timeout/network-error/parse-error as above.
+   */
+  readonly deleteBackup: (
+    owner: string,
+    repo: string,
+    id: string,
+  ) => Promise<Result<DeleteBackupResult, DeleteBackupWorkspaceError>>
 }
 
 const DEFAULT_TIMEOUT_MS = 300_000 // 5 minutes
@@ -94,6 +185,40 @@ const DEFAULT_READYZ_TIMEOUT_MS = 5_000 // 5 seconds — fast gate check
  * 5-minute clone budget instead of the whole thing.
  */
 const DEFAULT_INSPECT_TIMEOUT_MS = 25_000 // 25 seconds — 2x10s bounded subprocesses + fs-work headroom
+
+/**
+ * Ceiling for /update calls — mirrors clone's network-bound nature (fetch + fast-forward apply)
+ * but /update never re-clones, so it gets its own smaller budget rather than reusing
+ * DEFAULT_TIMEOUT_MS. Always bounded further by any caller-supplied `remainingBudgetMs` (the
+ * lesser of the two wins — see `update()`'s own doc comment).
+ */
+const DEFAULT_UPDATE_TIMEOUT_MS = 100_000 // 100 seconds
+
+/**
+ * Ceiling for /recover/preview — read-only, but stacks up to ~3 sequential local git/fs checks
+ * (checkCheckoutLayout, inventoryCheckoutConfig, inspectCheckout) at workspace-agent's own 15s
+ * local-git budget each, plus a bounded 10s filesystem walk. 45s gives headroom above that
+ * worst-case stack instead of guessing a round number.
+ */
+const DEFAULT_PREVIEW_RECOVERY_TIMEOUT_MS = 45_000 // 45 seconds
+
+/**
+ * Ceiling for /recover — a MUTATING operation that fetches a fresh copy of the remote (like
+ * clone) plus quarantines the old checkout and installs the new one. Matches clone's own
+ * DEFAULT_TIMEOUT_MS (5 minutes) since the network+build phase is the same shape of work.
+ */
+const DEFAULT_RECOVER_TIMEOUT_MS = 300_000 // 5 minutes
+
+/**
+ * Ceiling for GET /backups — read-only, but can walk the filesystem of up to
+ * RETENTION_MAX_GENERATIONS (5) quarantine generations when their metadata.json is missing or
+ * malformed, each bounded at workspace-agent's own 15s walk timeout. 60s covers that worst case
+ * with margin.
+ */
+const DEFAULT_LIST_BACKUPS_TIMEOUT_MS = 60_000 // 60 seconds
+
+/** Ceiling for DELETE /backups/:id — a single recursive directory removal; generously above inspect's 25s. */
+const DEFAULT_DELETE_BACKUP_TIMEOUT_MS = 30_000 // 30 seconds
 
 // Mirrors WORKSPACE_REPOS_ROOT in apps/workspace-agent/src/clone.ts (separate
 // package/container boundary, so not imported). Module-private: callers use
@@ -123,6 +248,11 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     timeoutMs = DEFAULT_TIMEOUT_MS,
     readyzTimeoutMs = DEFAULT_READYZ_TIMEOUT_MS,
     inspectTimeoutMs = DEFAULT_INSPECT_TIMEOUT_MS,
+    updateTimeoutMs = DEFAULT_UPDATE_TIMEOUT_MS,
+    previewRecoveryTimeoutMs = DEFAULT_PREVIEW_RECOVERY_TIMEOUT_MS,
+    recoverTimeoutMs = DEFAULT_RECOVER_TIMEOUT_MS,
+    listBackupsTimeoutMs = DEFAULT_LIST_BACKUPS_TIMEOUT_MS,
+    deleteBackupTimeoutMs = DEFAULT_DELETE_BACKUP_TIMEOUT_MS,
   } = options
 
   async function readyz(): Promise<Result<ReadyzResponse, WorkspaceError>> {
@@ -309,7 +439,211 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     return ok(parsed.observation)
   }
 
-  return {clone, readyz, inspect}
+  async function update(
+    request: UpdateRequest,
+    updateOptions?: {readonly remainingBudgetMs?: number},
+  ): Promise<Result<UpdateResult, UpdateWorkspaceError>> {
+    const body = JSON.stringify(request)
+    const effectiveMs = Math.min(updateTimeoutMs, updateOptions?.remainingBudgetMs ?? updateTimeoutMs)
+
+    // A plain `setTimeout`-driven abort (not `AbortSignal.timeout`) so the effective ceiling is
+    // fake-timer-testable — see execute/run-core.ts's own deadline pattern for why native
+    // AbortSignal.timeout scheduling is not reliably fake-timer-controlled.
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), effectiveMs)
+
+    let response: Response
+    try {
+      response = await fetch(`${baseUrl}/update`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
+        body,
+        signal: controller.signal,
+      })
+    } catch (fetchError) {
+      clearTimeout(timer)
+      if (fetchError instanceof Error && (fetchError.name === 'AbortError' || fetchError.name === 'TimeoutError')) {
+        return err({kind: 'timeout'})
+      }
+      return err({kind: 'network-error'})
+    }
+    clearTimeout(timer)
+
+    const httpStatus = response.status
+    if (!isUpdateResultStatus(httpStatus)) {
+      return err({kind: 'http-error', status: httpStatus})
+    }
+
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      return err({kind: 'parse-error'})
+    }
+
+    if (!isUpdateResult(parsed, httpStatus)) {
+      return err({kind: 'parse-error'})
+    }
+
+    return ok(parsed)
+  }
+
+  async function previewRecovery(
+    request: PreviewRecoveryRequest,
+  ): Promise<Result<PreviewRecoveryResult, PreviewRecoveryWorkspaceError>> {
+    const body = JSON.stringify(request)
+    let response: Response
+    try {
+      response = await fetch(`${baseUrl}/recover/preview`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
+        body,
+        signal: AbortSignal.timeout(previewRecoveryTimeoutMs),
+      })
+    } catch (fetchError) {
+      if (fetchError instanceof Error && (fetchError.name === 'TimeoutError' || fetchError.name === 'AbortError')) {
+        return err({kind: 'timeout'})
+      }
+      return err({kind: 'network-error'})
+    }
+
+    const httpStatus = response.status
+    if (!isPreviewRecoveryResultStatus(httpStatus)) {
+      return err({kind: 'http-error', status: httpStatus})
+    }
+
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      return err({kind: 'parse-error'})
+    }
+
+    if (!isPreviewRecoveryResult(parsed, httpStatus)) {
+      return err({kind: 'parse-error'})
+    }
+
+    return ok(parsed)
+  }
+
+  async function recover(
+    request: ExecuteRecoveryRequest,
+  ): Promise<Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>> {
+    // SECURITY: body is never logged — it carries the IAT, same discipline as clone()/update().
+    const body = JSON.stringify(request)
+    let response: Response
+    try {
+      response = await fetch(`${baseUrl}/recover`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
+        body,
+        signal: AbortSignal.timeout(recoverTimeoutMs),
+      })
+    } catch (fetchError) {
+      if (fetchError instanceof Error && (fetchError.name === 'TimeoutError' || fetchError.name === 'AbortError')) {
+        return err({kind: 'timeout'})
+      }
+      return err({kind: 'network-error'})
+    }
+
+    const httpStatus = response.status
+    if (!isExecuteRecoveryResultStatus(httpStatus)) {
+      return err({kind: 'http-error', status: httpStatus})
+    }
+
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      return err({kind: 'parse-error'})
+    }
+
+    if (!isExecuteRecoveryResult(parsed, httpStatus)) {
+      return err({kind: 'parse-error'})
+    }
+
+    return ok(parsed)
+  }
+
+  async function listBackups(
+    owner: string,
+    repo: string,
+  ): Promise<Result<ListBackupsResult, ListBackupsWorkspaceError>> {
+    let response: Response
+    try {
+      response = await fetch(`${baseUrl}/backups/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+        method: 'GET',
+        headers: {Authorization: `Bearer ${token}`},
+        signal: AbortSignal.timeout(listBackupsTimeoutMs),
+      })
+    } catch (fetchError) {
+      if (fetchError instanceof Error && (fetchError.name === 'TimeoutError' || fetchError.name === 'AbortError')) {
+        return err({kind: 'timeout'})
+      }
+      return err({kind: 'network-error'})
+    }
+
+    const httpStatus = response.status
+    if (httpStatus !== 200 && httpStatus !== 503) {
+      return err({kind: 'http-error', status: httpStatus})
+    }
+
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      return err({kind: 'parse-error'})
+    }
+
+    if (!isListBackupsResult(parsed, httpStatus)) {
+      return err({kind: 'parse-error'})
+    }
+
+    return ok(parsed)
+  }
+
+  async function deleteBackup(
+    owner: string,
+    repo: string,
+    id: string,
+  ): Promise<Result<DeleteBackupResult, DeleteBackupWorkspaceError>> {
+    let response: Response
+    try {
+      response = await fetch(
+        `${baseUrl}/backups/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(id)}`,
+        {
+          method: 'DELETE',
+          headers: {Authorization: `Bearer ${token}`},
+          signal: AbortSignal.timeout(deleteBackupTimeoutMs),
+        },
+      )
+    } catch (fetchError) {
+      if (fetchError instanceof Error && (fetchError.name === 'TimeoutError' || fetchError.name === 'AbortError')) {
+        return err({kind: 'timeout'})
+      }
+      return err({kind: 'network-error'})
+    }
+
+    const httpStatus = response.status
+    if (!isDeleteBackupResultStatus(httpStatus)) {
+      return err({kind: 'http-error', status: httpStatus})
+    }
+
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      return err({kind: 'parse-error'})
+    }
+
+    if (!isDeleteBackupResult(parsed, httpStatus)) {
+      return err({kind: 'parse-error'})
+    }
+
+    return ok(parsed)
+  }
+
+  return {clone, readyz, inspect, update, previewRecovery, recover, listBackups, deleteBackup}
 }
 
 // ---------------------------------------------------------------------------
@@ -460,4 +794,332 @@ const INSPECT_ERROR_CODES = new Set<string>([
 
 function isInspectErrorCode(value: string): value is InspectErrorCode {
   return INSPECT_ERROR_CODES.has(value)
+}
+
+// ---------------------------------------------------------------------------
+// /update response parsing — status/body coherence enforced; nothing is cast.
+// ---------------------------------------------------------------------------
+
+function isUpdateResultStatus(status: number): boolean {
+  return status === 200 || status === 404 || status === 409 || status === 502 || status === 503 || status === 504
+}
+
+const UPDATE_CHANGE_KINDS = new Set<string>(['fast-forward', 'unchanged'])
+
+function isUpdateReadyBody(v: Record<string, unknown>): boolean {
+  if (typeof v.change !== 'string' || !UPDATE_CHANGE_KINDS.has(v.change)) return false
+  if (typeof v.branch !== 'string' || v.branch.length === 0) return false
+  if (!isValidSha(v.sha)) return false
+  if (v.fromSha !== undefined && !isValidSha(v.fromSha)) return false
+  return isValidIsoTimestamp(v.checkedAt)
+}
+
+const LAYOUT_REFUSAL_REASONS = new Set<string>([
+  'core-worktree',
+  'gitfile',
+  'symlinked-git-dir',
+  'symlinked-config',
+  'alternates',
+  'replace-refs',
+  'grafts',
+  'shallow',
+  'partial-clone',
+  'linked-worktree',
+  'unsupported-index-flag',
+  'bare-repository',
+])
+
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every(entry => typeof entry === 'string')
+}
+
+const OBSTRUCTION_KINDS = new Set<string>([
+  'exact-conflict',
+  'prefix-conflict',
+  'identical-content',
+  'symlink-ancestor',
+])
+
+function isObstructionArray(value: unknown): boolean {
+  if (!Array.isArray(value)) return false
+  return value.every(entry => {
+    if (typeof entry !== 'object' || entry === null) return false
+    const e = entry as Record<string, unknown>
+    return typeof e.path === 'string' && typeof e.kind === 'string' && OBSTRUCTION_KINDS.has(e.kind)
+  })
+}
+
+const UPDATE_REFUSAL_REASONS = new Set<UpdateRefusalReason>([
+  'needs-recovery',
+  'checkout-substituted',
+  'unsupported-layout',
+  'unsupported-config',
+  'operation-in-progress',
+  'dirty',
+  'submodule-initialized',
+  'detached',
+  'non-default-branch',
+  'diverged',
+  'ahead',
+  'obstructed',
+  'maintenance-hold',
+])
+
+/** Every refusal reason's own required extra field(s), field-by-field — never cast. */
+function isUpdateRefusedBody(v: Record<string, unknown>): boolean {
+  if (typeof v.reason !== 'string' || !UPDATE_REFUSAL_REASONS.has(v.reason as UpdateRefusalReason)) return false
+  switch (v.reason) {
+    case 'unsupported-layout':
+      return typeof v.layoutReason === 'string' && LAYOUT_REFUSAL_REASONS.has(v.layoutReason)
+    case 'unsupported-config':
+      return isStringArray(v.disallowedKeys)
+    case 'operation-in-progress':
+      return isCheckoutOperation(v.operation)
+    case 'dirty':
+      return isStringArray(v.changedPaths)
+    case 'submodule-initialized':
+      return isStringArray(v.submodules)
+    case 'non-default-branch':
+      return typeof v.branch === 'string' && v.branch.length > 0
+    case 'obstructed':
+      return isObstructionArray(v.obstructions)
+    default:
+      return true
+  }
+}
+
+const UPDATE_FAILURE_REASONS = new Set<string>([
+  'aborted',
+  'inspection-failed',
+  'fetch-auth-rejected',
+  'fetch-not-found',
+  'fetch-forbidden',
+  'fetch-rate-limited',
+  'fetch-unreachable',
+  'fetch-timeout',
+  'fetch-failed',
+  'remote-moved',
+  'apply-failed',
+  'termination-unconfirmed',
+])
+
+function isUpdateFailedBody(v: Record<string, unknown>): boolean {
+  if (typeof v.reason !== 'string' || !UPDATE_FAILURE_REASONS.has(v.reason)) return false
+  if (v.mutationStarted !== true && v.mutationStarted !== false && v.mutationStarted !== 'possibly') return false
+  return typeof v.permanent === 'boolean'
+}
+
+/**
+ * Status/body coherence, matching `apps/workspace-agent/src/server.ts`'s `statusForUpdateResult`
+ * exactly: 200→ready, 404→no-checkout, 409→refused, 504→failed+fetch-timeout,
+ * 502→failed+permanent, 503→failed+not-permanent. A body whose `kind`/`reason` disagrees with the
+ * HTTP status it arrived on is untrustworthy wire data — rejected rather than trusted at face value.
+ */
+function isUpdateResult(value: unknown, status: number): value is UpdateResult {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (status === 200) return v.kind === 'ready' && isUpdateReadyBody(v)
+  if (status === 404) return v.kind === 'no-checkout'
+  if (status === 409) return v.kind === 'refused' && isUpdateRefusedBody(v)
+  if (v.kind !== 'failed' || !isUpdateFailedBody(v)) return false
+  if (status === 504) return v.reason === 'fetch-timeout'
+  if (status === 502) return v.permanent === true
+  return v.permanent === false // status === 503
+}
+
+// ---------------------------------------------------------------------------
+// /recover/preview and /recover response parsing — shared shapes
+// ---------------------------------------------------------------------------
+
+function isDirtyCounts(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  return (
+    isNonNegativeInteger(v.staged) &&
+    isNonNegativeInteger(v.unstaged) &&
+    isNonNegativeInteger(v.untracked) &&
+    isNonNegativeInteger(v.conflicted)
+  )
+}
+
+function isRetentionUsage(value: unknown): value is RetentionUsage {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  return (
+    isNonNegativeInteger(v.generationCount) &&
+    typeof v.hasUnknownSize === 'boolean' &&
+    isNonNegativeInteger(v.totalBytes) &&
+    isNonNegativeInteger(v.maxGenerations) &&
+    isNonNegativeInteger(v.maxBytes)
+  )
+}
+
+function isRecoveryPreview(value: unknown): value is RecoveryPreview {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (typeof v.inspectionSafe !== 'boolean') return false
+  if (!isNonNegativeInteger(v.estimatedSizeBytes)) return false
+  if (!isNonNegativeInteger(v.entryCount)) return false
+  if (typeof v.sizeMeasurementComplete !== 'boolean') return false
+  if (!isRetentionUsage(v.retention)) return false
+  if (typeof v.fingerprint !== 'string') return false
+  if (v.inspectionSafe === false) return true
+  if (v.headSha !== undefined && !isValidSha(v.headSha)) return false
+  if (v.branch !== undefined && (typeof v.branch !== 'string' || v.branch.length === 0)) return false
+  if (!isDirtyCounts(v.dirty)) return false
+  if (!isCheckoutOperation(v.operationInProgress)) return false
+  return isNonNegativeInteger(v.ignoredCount)
+}
+
+const JOURNAL_IN_PROGRESS_PHASES = new Set<string>([
+  'fetched',
+  'applying',
+  'applied',
+  'building',
+  'quarantining',
+  'installing',
+  'verifying',
+  'malformed',
+])
+
+function isJournalInProgressPhase(value: unknown): value is JournalInProgressPhase {
+  return typeof value === 'string' && JOURNAL_IN_PROGRESS_PHASES.has(value)
+}
+
+const UPDATE_JOURNAL_PHASES = new Set<string>(['fetched', 'applying', 'applied'])
+
+function isRecoverableUpdatePreview(value: unknown): value is RecoverableUpdatePreview {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (typeof v.phase !== 'string' || !UPDATE_JOURNAL_PHASES.has(v.phase)) return false
+  if (!isValidSha(v.fromSha) || !isValidSha(v.toSha)) return false
+  if (!isValidIsoTimestamp(v.startedAt)) return false
+  if (!isNonNegativeInteger(v.estimatedSizeBytes) || !isNonNegativeInteger(v.entryCount)) return false
+  if (typeof v.sizeMeasurementComplete !== 'boolean') return false
+  return typeof v.fingerprint === 'string'
+}
+
+function isPreviewRecoveryResultStatus(status: number): boolean {
+  return status === 200 || status === 404 || status === 409 || status === 503
+}
+
+/** Status/body coherence, matching `server.ts`'s `statusForPreviewRecoveryResult` exactly. */
+function isPreviewRecoveryResult(value: unknown, status: number): value is PreviewRecoveryResult {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (status === 404) return v.kind === 'no-checkout'
+  if (status === 409) {
+    if (v.kind !== 'refused') return false
+    if (v.reason === 'checkout-substituted' || v.reason === 'maintenance-hold') return true
+    return v.reason === 'journal-in-progress' && isJournalInProgressPhase(v.phase)
+  }
+  if (status === 503) {
+    return v.kind === 'failed' && (v.reason === 'inspection-failed' || v.reason === 'termination-unconfirmed')
+  }
+  // status === 200
+  if (v.kind === 'ok') return isRecoveryPreview(v.preview)
+  return v.kind === 'recoverable-update' && isRecoverableUpdatePreview(v.update)
+}
+
+// ---------------------------------------------------------------------------
+// /recover response parsing
+// ---------------------------------------------------------------------------
+
+function isExecuteRecoveryResultStatus(status: number): boolean {
+  return status === 200 || status === 404 || status === 409 || status === 503
+}
+
+const EXECUTE_RECOVERY_FAILURE_REASONS = new Set<string>([
+  'inspection-failed',
+  'fetch-failed',
+  'build-failed',
+  'quarantine-failed',
+  'install-failed',
+  'verification-failed',
+  'termination-unconfirmed',
+])
+
+/** Status/body coherence, matching `server.ts`'s `statusForExecuteRecoveryResult` exactly. */
+function isExecuteRecoveryResult(value: unknown, status: number): value is ExecuteRecoveryResult {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (status === 404) return v.kind === 'no-checkout'
+  if (status === 409) {
+    if (v.kind !== 'refused') return false
+    if (v.reason === 'maintenance-hold' || v.reason === 'checkout-changed') return true
+    if (v.reason === 'journal-in-progress') return isJournalInProgressPhase(v.phase)
+    if (v.reason === 'quota-exceeded') return isRetentionUsage(v.usage)
+    return v.reason === 'insufficient-disk-space'
+  }
+  if (status === 503) {
+    return v.kind === 'failed' && typeof v.reason === 'string' && EXECUTE_RECOVERY_FAILURE_REASONS.has(v.reason)
+  }
+  // status === 200
+  return (
+    v.kind === 'ok' &&
+    typeof v.recoveryId === 'string' &&
+    v.recoveryId.length > 0 &&
+    isValidSha(v.sha) &&
+    typeof v.branch === 'string' &&
+    v.branch.length > 0
+  )
+}
+
+// ---------------------------------------------------------------------------
+// GET/DELETE /backups response parsing
+// ---------------------------------------------------------------------------
+
+function isBackupEntry(value: unknown): value is BackupEntry {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (typeof v.id !== 'string' || v.id.length === 0) return false
+  if (typeof v.metadataOk !== 'boolean') return false
+  if (!isValidIsoTimestamp(v.createdAt)) return false
+  if (!isNonNegativeInteger(v.sizeBytes)) return false
+  if (typeof v.sizeComplete !== 'boolean') return false
+  if (v.originalHeadSha !== undefined && !isValidSha(v.originalHeadSha)) return false
+  if (v.originalBranch !== undefined && typeof v.originalBranch !== 'string') return false
+  return true
+}
+
+/**
+ * `server.ts`'s `statusForListBackupsResult` is a straight `ok→200 | else→503` map — status is
+ * already checked by the caller before this runs, so only the body shape is validated here.
+ */
+function isListBackupsResult(value: unknown, status: number): value is ListBackupsResult {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (status === 503) return v.kind === 'failed'
+  if (v.kind !== 'ok') return false
+  if (!Array.isArray(v.backups) || !v.backups.every(isBackupEntry)) return false
+  return isNonNegativeInteger(v.totalBytes)
+}
+
+function isDeleteBackupResultStatus(status: number): boolean {
+  return status === 200 || status === 400 || status === 404 || status === 409 || status === 503
+}
+
+const DELETE_BACKUP_REFUSAL_REASONS = new Set<string>([
+  'invalid-id',
+  'not-found',
+  'maintenance-hold',
+  'recovery-in-progress',
+])
+
+/**
+ * Status/body coherence, matching `server.ts`'s `statusForDeleteBackupResult` exactly — including
+ * that 400 carries a DOMAIN `{kind: 'refused', reason: 'invalid-id'}` body here, unlike every other
+ * route in this client where 400 is a generic validation-only shape folded into `http-error`.
+ */
+function isDeleteBackupResult(value: unknown, status: number): value is DeleteBackupResult {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (status === 200) return v.kind === 'ok'
+  if (status === 503) return v.kind === 'failed'
+  if (v.kind !== 'refused' || typeof v.reason !== 'string' || !DELETE_BACKUP_REFUSAL_REASONS.has(v.reason)) {
+    return false
+  }
+  if (status === 400) return v.reason === 'invalid-id'
+  if (status === 404) return v.reason === 'not-found'
+  return v.reason === 'maintenance-hold' || v.reason === 'recovery-in-progress' // status === 409
 }

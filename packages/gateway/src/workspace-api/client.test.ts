@@ -1,4 +1,11 @@
-import type {CloneErrorCode, CloneRequest, InspectErrorCode} from './types.js'
+import type {
+  CloneErrorCode,
+  CloneRequest,
+  ExecuteRecoveryRequest,
+  InspectErrorCode,
+  PreviewRecoveryRequest,
+  UpdateRequest,
+} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
@@ -301,6 +308,21 @@ function mockFetch(response: {ok: boolean; status?: number; json?: () => Promise
       status: response.status ?? (response.ok ? 200 : 500),
       json: response.json ?? (async () => undefined),
     }
+  })
+}
+
+/**
+ * A `setTimeout`-driven abort (not native `AbortSignal.timeout`, which is not reliably
+ * fake-timer-controlled) is what `update()` uses internally — this fetch mock listens for that
+ * abort exactly the way a real `fetch()` would, and never settles on its own otherwise.
+ */
+function mockHangingFetch(): ReturnType<typeof vi.fn> {
+  return vi.fn().mockImplementation(async (_url: string, init: {signal: AbortSignal}) => {
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        reject(Object.assign(new Error('The operation was aborted'), {name: 'AbortError'}))
+      })
+    })
   })
 }
 
@@ -890,6 +912,18 @@ function makeInspectRequest(): {owner: string; repo: string} {
   return {owner: 'testowner', repo: 'testrepo'}
 }
 
+function makeUpdateRequest(overrides?: Partial<UpdateRequest>): UpdateRequest {
+  return {owner: 'testowner', repo: 'testrepo', token: 'ghs_testtoken123', ...overrides}
+}
+
+function makePreviewRecoveryRequest(): PreviewRecoveryRequest {
+  return {owner: 'testowner', repo: 'testrepo'}
+}
+
+function makeExecuteRecoveryRequest(overrides?: Partial<ExecuteRecoveryRequest>): ExecuteRecoveryRequest {
+  return {owner: 'testowner', repo: 'testrepo', token: 'ghs_testtoken123', fingerprint: 'fp-1', ...overrides}
+}
+
 describe('WorkspaceClient.inspect', () => {
   const VALID_OBSERVATION = {
     head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
@@ -1337,6 +1371,525 @@ describe('WorkspaceClient.inspect', () => {
 
       // #then
       expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// update tests
+// ---------------------------------------------------------------------------
+
+describe('WorkspaceClient.update', () => {
+  describe('happy path', () => {
+    it('returns ok(UpdateReady) on HTTP 200 with a fast-forward result', async () => {
+      // #given
+      const client = makeClient()
+      const readyResult = {
+        kind: 'ready',
+        change: 'fast-forward',
+        branch: 'main',
+        sha: 'b'.repeat(40),
+        fromSha: 'a'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      }
+      const fetchMock = mockFetch({ok: true, status: 200, json: async () => readyResult})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.update(makeUpdateRequest())
+
+      // #then
+      expect(result).toEqual(ok(readyResult))
+      vi.unstubAllGlobals()
+    })
+
+    it('sends the bearer token on Authorization', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 404, json: async () => ({kind: 'no-checkout'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      await client.update(makeUpdateRequest())
+
+      // #then
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://workspace:9100/update',
+        expect.objectContaining({
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`},
+        }),
+      )
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('status mapping', () => {
+    it('404 no-checkout → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'no-checkout'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 404, json: async () => body}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('409 refused → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'refused', reason: 'needs-recovery'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 409, json: async () => body}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('502 failed (permanent) → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'failed', reason: 'fetch-not-found', mutationStarted: false, permanent: true}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 502, json: async () => body}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('503 failed (not permanent) → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'failed', reason: 'fetch-auth-rejected', mutationStarted: false, permanent: false}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 503, json: async () => body}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('504 failed (fetch-timeout) → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 504, json: async () => body}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('400 (validation failure) → http-error, never parsed as a domain result', async () => {
+      const client = makeClient()
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ok: false, status: 400, json: async () => ({ok: false, error: 'invalid-owner'})}),
+      )
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(err({kind: 'http-error', status: 400}))
+      vi.unstubAllGlobals()
+    })
+
+    it('401 (bad bearer) → http-error', async () => {
+      const client = makeClient()
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'unauthorized'})}),
+      )
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
+
+    it('malformed body on 200 → parse-error, never cast', async () => {
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => ({unexpected: 'shape'})}))
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('non-JSON body → parse-error', async () => {
+      const client = makeClient()
+      const fetchMock = mockFetch({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new SyntaxError('bad json')
+        },
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      const result = await client.update(makeUpdateRequest())
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('deadline (100s default, bounded by a caller-supplied remainingBudgetMs)', () => {
+    it('aborts at ~5s when remainingBudgetMs=5000, not at the 100s default', async () => {
+      // #given
+      vi.useFakeTimers()
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockHangingFetch())
+
+      // #when
+      const resultPromise = client.update(makeUpdateRequest(), {remainingBudgetMs: 5_000})
+      await vi.advanceTimersByTimeAsync(5_000)
+      const result = await resultPromise
+
+      // #then
+      expect(result).toEqual(err({kind: 'timeout'}))
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    })
+
+    it('does NOT abort before remainingBudgetMs elapses', async () => {
+      // #given
+      vi.useFakeTimers()
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockHangingFetch())
+
+      // #when — advance to just short of the 5s ceiling
+      const resultPromise = client.update(makeUpdateRequest(), {remainingBudgetMs: 5_000})
+      await vi.advanceTimersByTimeAsync(4_999)
+      let settled = false
+      resultPromise
+        .then(() => {
+          settled = true
+        })
+        .catch(() => {
+          settled = true
+        })
+      await Promise.resolve()
+
+      // #then
+      expect(settled).toBe(false)
+
+      // Cleanup: let it actually settle so the test doesn't leak a dangling timer.
+      await vi.advanceTimersByTimeAsync(1)
+      await resultPromise
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    })
+
+    it('falls back to the 100s default ceiling when no remainingBudgetMs is given', async () => {
+      // #given
+      vi.useFakeTimers()
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockHangingFetch())
+
+      // #when
+      const resultPromise = client.update(makeUpdateRequest())
+      await vi.advanceTimersByTimeAsync(100_000)
+      const result = await resultPromise
+
+      // #then
+      expect(result).toEqual(err({kind: 'timeout'}))
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    })
+
+    it('a remainingBudgetMs LARGER than the 100s default is still capped at 100s (the lesser wins)', async () => {
+      // #given
+      vi.useFakeTimers()
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockHangingFetch())
+
+      // #when
+      const resultPromise = client.update(makeUpdateRequest(), {remainingBudgetMs: 600_000})
+      await vi.advanceTimersByTimeAsync(100_000)
+      const result = await resultPromise
+
+      // #then
+      expect(result).toEqual(err({kind: 'timeout'}))
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// previewRecovery tests
+// ---------------------------------------------------------------------------
+
+describe('WorkspaceClient.previewRecovery', () => {
+  describe('happy path', () => {
+    it('returns ok(result) on HTTP 200 with an opaque preview', async () => {
+      const client = makeClient()
+      const body = {
+        kind: 'ok',
+        preview: {
+          inspectionSafe: false,
+          estimatedSizeBytes: 10,
+          entryCount: 2,
+          sizeMeasurementComplete: true,
+          retention: {generationCount: 0, hasUnknownSize: false, totalBytes: 0, maxGenerations: 5, maxBytes: 1024},
+          fingerprint: 'fp',
+        },
+      }
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      const result = await client.previewRecovery(makePreviewRecoveryRequest())
+      expect(result).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('sends the bearer token', async () => {
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 404, json: async () => ({kind: 'no-checkout'})})
+      vi.stubGlobal('fetch', fetchMock)
+      await client.previewRecovery(makePreviewRecoveryRequest())
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://workspace:9100/recover/preview',
+        expect.objectContaining({
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`},
+        }),
+      )
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('status mapping', () => {
+    it('404 no-checkout → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'no-checkout'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 404, json: async () => body}))
+      expect(await client.previewRecovery(makePreviewRecoveryRequest())).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('409 refused → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'refused', reason: 'maintenance-hold'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 409, json: async () => body}))
+      expect(await client.previewRecovery(makePreviewRecoveryRequest())).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('503 failed → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'failed', reason: 'termination-unconfirmed'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 503, json: async () => body}))
+      expect(await client.previewRecovery(makePreviewRecoveryRequest())).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('400 → http-error', async () => {
+      const client = makeClient()
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ok: false, status: 400, json: async () => ({ok: false, error: 'invalid-owner'})}),
+      )
+      expect(await client.previewRecovery(makePreviewRecoveryRequest())).toEqual(err({kind: 'http-error', status: 400}))
+      vi.unstubAllGlobals()
+    })
+
+    it('malformed body → parse-error, never cast', async () => {
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => ({unexpected: 'shape'})}))
+      expect(await client.previewRecovery(makePreviewRecoveryRequest())).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// recover tests
+// ---------------------------------------------------------------------------
+
+describe('WorkspaceClient.recover', () => {
+  describe('happy path', () => {
+    it('returns ok(result) on HTTP 200', async () => {
+      const client = makeClient()
+      const body = {kind: 'ok', recoveryId: 'gen-1', sha: 'a'.repeat(40), branch: 'main'}
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      expect(await client.recover(makeExecuteRecoveryRequest())).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('sends the bearer token', async () => {
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 404, json: async () => ({kind: 'no-checkout'})})
+      vi.stubGlobal('fetch', fetchMock)
+      await client.recover(makeExecuteRecoveryRequest())
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://workspace:9100/recover',
+        expect.objectContaining({
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`},
+        }),
+      )
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('status mapping', () => {
+    it('404 no-checkout → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'no-checkout'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 404, json: async () => body}))
+      expect(await client.recover(makeExecuteRecoveryRequest())).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('409 refused (quota-exceeded, with usage) → ok(result)', async () => {
+      const client = makeClient()
+      const body = {
+        kind: 'refused',
+        reason: 'quota-exceeded',
+        usage: {generationCount: 5, hasUnknownSize: false, totalBytes: 1000, maxGenerations: 5, maxBytes: 1024},
+      }
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 409, json: async () => body}))
+      expect(await client.recover(makeExecuteRecoveryRequest())).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('503 failed → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'failed', reason: 'build-failed'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 503, json: async () => body}))
+      expect(await client.recover(makeExecuteRecoveryRequest())).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('401 → http-error', async () => {
+      const client = makeClient()
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'unauthorized'})}),
+      )
+      expect(await client.recover(makeExecuteRecoveryRequest())).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
+
+    it('malformed body → parse-error, never cast', async () => {
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => ({unexpected: 'shape'})}))
+      expect(await client.recover(makeExecuteRecoveryRequest())).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// listBackups tests
+// ---------------------------------------------------------------------------
+
+describe('WorkspaceClient.listBackups', () => {
+  describe('happy path', () => {
+    it('returns ok(result) on HTTP 200 with an empty list', async () => {
+      const client = makeClient()
+      const body = {kind: 'ok', backups: [], totalBytes: 0}
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      expect(await client.listBackups('testowner', 'testrepo')).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('sends the bearer token and GETs the owner/repo path', async () => {
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: true, status: 200, json: async () => ({kind: 'ok', backups: [], totalBytes: 0})})
+      vi.stubGlobal('fetch', fetchMock)
+      await client.listBackups('testowner', 'testrepo')
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://workspace:9100/backups/testowner/testrepo',
+        expect.objectContaining({method: 'GET', headers: {Authorization: `Bearer ${TEST_TOKEN}`}}),
+      )
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('status mapping', () => {
+    it('503 failed → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'failed'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 503, json: async () => body}))
+      expect(await client.listBackups('testowner', 'testrepo')).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('401 → http-error', async () => {
+      const client = makeClient()
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'unauthorized'})}),
+      )
+      expect(await client.listBackups('testowner', 'testrepo')).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
+
+    it('malformed body → parse-error, never cast', async () => {
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => ({unexpected: 'shape'})}))
+      expect(await client.listBackups('testowner', 'testrepo')).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// deleteBackup tests
+// ---------------------------------------------------------------------------
+
+describe('WorkspaceClient.deleteBackup', () => {
+  describe('happy path', () => {
+    it('returns ok({kind: "ok"}) on HTTP 200', async () => {
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => ({kind: 'ok'})}))
+      expect(await client.deleteBackup('testowner', 'testrepo', 'gen-1')).toEqual(ok({kind: 'ok'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('sends the bearer token and DELETEs the owner/repo/id path', async () => {
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: true, status: 200, json: async () => ({kind: 'ok'})})
+      vi.stubGlobal('fetch', fetchMock)
+      await client.deleteBackup('testowner', 'testrepo', 'gen-1')
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://workspace:9100/backups/testowner/testrepo/gen-1',
+        expect.objectContaining({method: 'DELETE', headers: {Authorization: `Bearer ${TEST_TOKEN}`}}),
+      )
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('status mapping', () => {
+    it('400 refused invalid-id → ok(result) — a DOMAIN result, not folded into http-error', async () => {
+      const client = makeClient()
+      const body = {kind: 'refused', reason: 'invalid-id'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 400, json: async () => body}))
+      expect(await client.deleteBackup('testowner', 'testrepo', 'bad..id')).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('404 refused not-found → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'refused', reason: 'not-found'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 404, json: async () => body}))
+      expect(await client.deleteBackup('testowner', 'testrepo', 'gen-1')).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('409 refused maintenance-hold → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'refused', reason: 'maintenance-hold'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 409, json: async () => body}))
+      expect(await client.deleteBackup('testowner', 'testrepo', 'gen-1')).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('503 failed → ok(result)', async () => {
+      const client = makeClient()
+      const body = {kind: 'failed'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 503, json: async () => body}))
+      expect(await client.deleteBackup('testowner', 'testrepo', 'gen-1')).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('401 → http-error', async () => {
+      const client = makeClient()
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'unauthorized'})}),
+      )
+      expect(await client.deleteBackup('testowner', 'testrepo', 'gen-1')).toEqual(
+        err({kind: 'http-error', status: 401}),
+      )
+      vi.unstubAllGlobals()
+    })
+
+    it('malformed body → parse-error, never cast', async () => {
+      const client = makeClient()
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => ({unexpected: 'shape'})}))
+      expect(await client.deleteBackup('testowner', 'testrepo', 'gen-1')).toEqual(err({kind: 'parse-error'}))
       vi.unstubAllGlobals()
     })
   })
