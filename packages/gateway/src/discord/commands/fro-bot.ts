@@ -28,9 +28,11 @@ import {Effect} from 'effect'
 import {editInteraction} from '../io.js'
 import {userIsAuthorized} from '../mentions.js'
 import {executeAddProject} from './add-project.js'
+import {createCheckoutBackupCommand} from './checkout-backup.js'
 import {buildDispatchSpec} from './dispatch.js'
 import {INTERNAL_ERROR_COPY, makeGuildCommand} from './guild-command.js'
 import {executePing} from './ping.js'
+import {createRecoverCheckoutCommand} from './recover-checkout.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -129,6 +131,23 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
         .setName('dispatch')
         .setDescription('Ask GitHub Actions to run the repository workflow')
         .addStringOption(opt => opt.setName('task').setDescription('Task to send to the Action').setRequired(true)),
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('recover-checkout')
+        .setDescription('Preserve this checkout and install a fresh one (requires ManageChannels)'),
+    )
+    .addSubcommandGroup(group =>
+      group
+        .setName('checkout-backup')
+        .setDescription('List or delete preserved checkout generations')
+        .addSubcommand(sub => sub.setName('list').setDescription('List preserved checkouts for this channel'))
+        .addSubcommand(sub =>
+          sub
+            .setName('delete')
+            .setDescription('Delete one preserved checkout by id')
+            .addStringOption(opt => opt.setName('id').setDescription('Backup id to delete').setRequired(true)),
+        ),
     ) as SlashCommandBuilder
 
   // Build pipeline executors once per factory call, closing over deps.
@@ -316,8 +335,21 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
     deps,
   )
 
+  const executeRecoverCheckout = createRecoverCheckoutCommand(deps)
+  const executeCheckoutBackup = createCheckoutBackupCommand(deps)
+
   const execute = (interaction: ChatInputCommandInteraction): Effect.Effect<void, Error> => {
+    // checkout-backup lives under a subcommand GROUP; check it before getSubcommand(true), which
+    // would still resolve to 'list'/'delete' but loses the group discriminant we need here.
+    if (interaction.options.getSubcommandGroup(false) === 'checkout-backup') {
+      return executeCheckoutBackup(interaction)
+    }
+
     const subcommand = interaction.options.getSubcommand(true)
+
+    if (subcommand === 'recover-checkout') {
+      return executeRecoverCheckout(interaction)
+    }
 
     if (subcommand === 'ping') {
       return executePing(interaction)

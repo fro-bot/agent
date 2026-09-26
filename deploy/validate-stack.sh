@@ -1049,6 +1049,36 @@ for forbidden_target, description in FORBIDDEN_MOUNT_TARGETS.items():
         )
 
 # ------------------------------------------------------------------
+# Invariant 9: workspace must not declare deploy.replicas > 1.
+#
+# The checkout-update-recovery primitives (repo-mutex.ts's per-repo operation
+# mutex, journal.ts's crash reconciliation, the root-owned bare-repo fetch
+# store) all assume exactly one workspace-agent process — a documented
+# precondition of the #1661 uid-isolation migration. A second replica would
+# let two processes race on the same protected fetch store, journal, and
+# quarantine tree with no cross-process coordination. Reject any workspace
+# deploy.replicas value greater than 1; absent or 1 is fine.
+#
+# Normalized shape (docker compose config JSON): deploy.replicas is an
+# integer (or a numeric string in the raw-YAML fallback).
+# ------------------------------------------------------------------
+workspace_deploy = workspace_svc.get("deploy") or {}
+workspace_replicas = workspace_deploy.get("replicas")
+if workspace_replicas is not None:
+    try:
+        _replicas_int = int(workspace_replicas)
+    except (ValueError, TypeError):
+        _replicas_int = None
+    if _replicas_int is not None and _replicas_int > 1:
+        failures.append(
+            f"FAIL: workspace declares deploy.replicas: {workspace_replicas!r} — the workspace-agent "
+            "is a single-container service (repo-mutex.ts's per-repo mutex, journal.ts's crash "
+            "reconciliation, and the protected bare-repo fetch store all assume exactly one process). "
+            "A second replica would let two processes race on the same protected state with no "
+            "cross-process coordination. Set workspace.deploy.replicas to 1 or remove the key."
+        )
+
+# ------------------------------------------------------------------
 # Report
 # ------------------------------------------------------------------
 if failures:
@@ -1065,6 +1095,7 @@ print(f"    non-internal network attachments: only allowlisted pairs {sorted(all
 print(f"    workspace mounts {REQUIRED_SOURCE!r} at {REQUIRED_TARGET!r}  ✓")
 print("    workspace uid isolation: user=0:0, cap_drop=ALL, cap_add=exact six-capability allowlist, "
       "no-new-privileges, protected secret/CA mounts  ✓")
+print("    workspace deploy.replicas: absent or 1  ✓")
 PYEOF
 
   echo "    Topology invariants: OK"

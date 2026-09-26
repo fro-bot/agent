@@ -34,11 +34,17 @@ export type {
   OperatorCheckoutHead,
   OperatorCheckoutObservation,
   OperatorCheckoutOperation,
+  OperatorCheckoutPreparation,
+  OperatorCheckoutPreparationFailed,
+  OperatorCheckoutPreparationRefused,
   OperatorCheckoutProvenance,
+  OperatorLayoutRefusalReason,
+  OperatorObstructionKind,
   OperatorRemoteFreshness,
+  OperatorUpdateFailureReason,
   OperatorWorktreeState,
 } from './provenance.js'
-export {parseOperatorCheckoutProvenance} from './provenance.js'
+export {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
 export {assertRedactionApplied, AUTHORIZATION_OBLIGATION, REDACTION_OBLIGATION} from './redaction.js'
 export type {RedactionContext} from './redaction.js'
 export type {RepoSummary} from './repo-summary.js'

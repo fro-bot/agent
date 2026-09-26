@@ -31,6 +31,11 @@ function makeMockDeps(): FroBotDeps {
       clone: vi.fn(),
       readyz: vi.fn().mockResolvedValue({success: true, data: {ready: true, opencode: 'ready'}}),
       inspect: vi.fn(),
+      update: vi.fn(),
+      previewRecovery: vi.fn(),
+      recover: vi.fn(),
+      listBackups: vi.fn(),
+      deleteBackup: vi.fn(),
     },
     installUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     logger: {
@@ -178,7 +183,7 @@ describe('dispatchCommand', () => {
     const interaction = {
       commandName: 'fro-bot',
       reply,
-      options: {getSubcommand: vi.fn().mockReturnValue('ping')},
+      options: {getSubcommand: vi.fn().mockReturnValue('ping'), getSubcommandGroup: vi.fn().mockReturnValue(null)},
     } as unknown as ChatInputCommandInteraction
     const registry = getCommandRegistry(makeMockDeps())
 
@@ -250,6 +255,7 @@ describe('dispatchCommand', () => {
       client: {user: {id: 'bot-user-id'}},
       options: {
         getSubcommand: vi.fn().mockReturnValue('add-project'),
+        getSubcommandGroup: vi.fn().mockReturnValue(null),
         getString: vi.fn().mockReturnValue('https://github.com/owner/repo'),
       },
       deferReply,
