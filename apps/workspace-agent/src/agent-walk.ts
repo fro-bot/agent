@@ -52,6 +52,30 @@ process.stdout.write(JSON.stringify({totalBytes, entryCount: entries, complete: 
 
 const WALK_KILL_REAP_GRACE_MS = 2_000
 
+/** Minimal duck-typed child handle this module needs — mirrors opencode-server.ts's `ChildHandle`/`SpawnFn` pattern, so a test can inject a fake without a real subprocess. `stdout`/`stderr` are optional EventEmitter-like objects, matching `child_process.ChildProcess`'s own shape when `stdio` requests a pipe. */
+export interface WalkChildHandle {
+  readonly pid?: number
+  readonly kill: (signal?: NodeJS.Signals | number) => boolean
+  readonly on: (event: string, listener: (...args: unknown[]) => void) => void
+  readonly stdout?: {readonly on: (event: string, listener: (...args: unknown[]) => void) => void} | null
+  readonly stderr?: {readonly on: (event: string, listener: (...args: unknown[]) => void) => void} | null
+}
+
+/** (Review round H, H5) Test-injectable spawn seam — the real `node:child_process` `spawn` satisfies this structurally (via `nodeWalkSpawn` below, which picks the 3-arg overload explicitly since `spawn` itself is overloaded). */
+export type WalkSpawnFn = (
+  command: string,
+  args: readonly string[],
+  options: {
+    readonly uid: number | undefined
+    readonly gid: number | undefined
+    readonly cwd: string
+    readonly env: NodeJS.ProcessEnv
+    readonly stdio: ('ignore' | 'pipe' | number)[]
+  },
+) => WalkChildHandle
+
+const nodeWalkSpawn: WalkSpawnFn = (command, args, options) => spawn(command, args, options)
+
 /** (Review round G, G1) Explicit byte cap per stream, enforced by this module — replaces `execFile`'s `maxBuffer`, which `spawn` has no equivalent of. Exceeding it fails the walk, never silently truncates. */
 const MAX_WALK_OUTPUT_BYTES = 8 * 1024 * 1024
 
@@ -133,6 +157,8 @@ async function spawnWalkProcess(
   options: {readonly uid: number | undefined; readonly gid: number | undefined; readonly timeoutMs: number},
   /** (F4) When set, inherited by the child as fd 3 — `measureSealedTree`'s scoped-access mechanism. Opened and closed by the CALLER; never held open by this function. */
   extraFd?: number,
+  /** (Review round H, H5) Test-only spawn injection — defaults to the real `spawn`. */
+  spawnFn: WalkSpawnFn = nodeWalkSpawn,
 ): Promise<SpawnScriptOutcome> {
   return new Promise(resolve => {
     let settled = false
@@ -140,7 +166,7 @@ async function spawnWalkProcess(
     let overflowed = false
     let graceHandle: ReturnType<typeof setTimeout> | undefined
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-    const stdoutChunks: Buffer[] = []
+    let stdoutChunks: Buffer[] = []
     let stdoutBytes = 0
 
     const args = [...WALK_NODE_FLAGS, '-e', script, '--', ...scriptArgs]
@@ -150,9 +176,9 @@ async function spawnWalkProcess(
     // did nothing. `spawn` honors `stdio` directly.
     const stdio: ('ignore' | 'pipe' | number)[] =
       extraFd === undefined ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe', extraFd]
-    let child: ReturnType<typeof spawn>
+    let child: WalkChildHandle
     try {
-      child = spawn(process.execPath, args, {
+      child = spawnFn(process.execPath, args, {
         uid: options.uid,
         gid: options.gid,
         cwd: WALK_CWD,
@@ -163,23 +189,54 @@ async function spawnWalkProcess(
       resolve({kind: 'failed'})
       return
     }
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdoutBytes += chunk.length
+    // (H5) Once settled as unconfirmed, the retained bytes are dropped (a leaked process could
+    // otherwise keep writing indefinitely) -- but the listener stays attached, still draining the
+    // pipe, so the child is never left blocked on a full stdout buffer.
+    const dropRetainedOutput = (): void => {
+      stdoutChunks = []
+      stdoutBytes = 0
+    }
+    child.stdout?.on('data', (chunk: unknown) => {
+      const buf = chunk as Buffer
+      if (settled) return
+      stdoutBytes += buf.length
       // (G1) Explicit byte cap replacing `execFile`'s `maxBuffer` — exceeding it FAILS the walk
       // (never a silently truncated partial result masquerading as complete JSON).
       if (stdoutBytes > MAX_WALK_OUTPUT_BYTES) {
         overflowed = true
         return
       }
-      stdoutChunks.push(chunk)
+      stdoutChunks.push(buf)
     })
     child.stderr?.on('data', () => {}) // drained, never buffered — the walk never needs stderr content
+
+    // (H5) Shared by BOTH the timeout-triggered kill and a post-spawn 'error': wait for a
+    // CONFIRMED 'close' within the reap-grace window; only if it never arrives is the outcome
+    // termination-unconfirmed. Idempotent — a second call while already waiting is a no-op.
+    const armReapGrace = (): void => {
+      if (graceHandle !== undefined) return
+      graceHandle = setTimeout(() => {
+        if (settled) return
+        settled = true
+        dropRetainedOutput()
+        resolve({kind: 'termination-unconfirmed'})
+      }, WALK_KILL_REAP_GRACE_MS)
+    }
+
     child.on('error', () => {
       if (settled) return
-      settled = true
-      clearTimeout(timeoutHandle)
-      clearTimeout(graceHandle)
-      resolve({kind: 'failed'})
+      // (H5) No pid ever assigned — the process never actually existed (e.g. ENOENT on the
+      // executable), so there is nothing to be UNCERTAIN about; this is a confirmed spawn failure.
+      if (child.pid === undefined) {
+        settled = true
+        clearTimeout(timeoutHandle)
+        clearTimeout(graceHandle)
+        resolve({kind: 'failed'})
+        return
+      }
+      // (H5) An error on an ALREADY-spawned child (e.g. a failed kill attempt) does not confirm the
+      // process is gone — wait for 'close' within the reap grace instead of resolving 'failed'.
+      armReapGrace()
     })
     child.on('close', code => {
       if (settled) return
@@ -199,11 +256,7 @@ async function spawnWalkProcess(
       terminating = true
       clearTimeout(timeoutHandle)
       child.kill('SIGKILL')
-      graceHandle = setTimeout(() => {
-        if (settled) return
-        settled = true
-        resolve({kind: 'termination-unconfirmed'})
-      }, WALK_KILL_REAP_GRACE_MS)
+      armReapGrace()
     }
 
     timeoutHandle = setTimeout(terminate, options.timeoutMs)
@@ -230,8 +283,10 @@ export async function runWalkScriptForTesting(
   options: {readonly uid: number | undefined; readonly gid: number | undefined; readonly timeoutMs: number},
   /** (Review round G, G4) Optional inherited fd 3, for tests that need to assert what the child sees at that descriptor (e.g. comparing `fstat(3)` to the intended target, or checking for descriptor leaks). */
   extraFd?: number,
+  /** (Review round H, H5) Optional fake-spawn injection, for deterministically testing spawn-failure and error-after-spawn outcomes without a real subprocess. */
+  spawnFn?: WalkSpawnFn,
 ): Promise<SpawnScriptOutcome> {
-  return spawnWalkProcess(script, [], options, extraFd)
+  return spawnWalkProcess(script, [], options, extraFd, spawnFn)
 }
 
 /**
@@ -280,7 +335,12 @@ function walk(p) {
 // the kernel, immune to any rename/symlink-swap race an attacker could stage; every entry BELOW
 // that point is still reached via ordinary no-follow lstat, exactly like the pathname-mode walker.
 entries += 1;
-if (!(Date.now() > deadlineAt || entries > maxEntries)) {
+// (Review round H, H3) The guard MUST set capped=true when it rejects traversal -- an
+// already-expired deadline or a cap too small to even admit the root must never report
+// complete:true over an empty result.
+if (Date.now() > deadlineAt || entries > maxEntries) {
+  capped = true;
+} else {
   let names;
   try { names = fs.readdirSync('/proc/self/fd/3'); } catch (e) { hadError = true; names = []; }
   for (const name of names) { if (capped) break; walk('/proc/self/fd/3/' + name); }
@@ -313,6 +373,25 @@ export type SealedWalkOutcome = AgentWalkOutcome | {readonly kind: 'unavailable'
 
 export type SealedWalkRunner = (options: SealedWalkOptions) => Promise<SealedWalkOutcome>
 
+/**
+ * (Review round H, H2) The fd-taking half of `measureSealedTree`, extracted as its own export so
+ * a CALLER that already holds an open descriptor — in particular a test that must open the
+ * target BEFORE locking down its ancestor, since a non-root test process shares its own uid with
+ * the "agent" identity it is simulating — can measure through it directly, without `measureSealedTree`
+ * re-attempting an `open()` that a since-tightened ancestor would now refuse. The fd is opened and
+ * closed by the CALLER; never held or closed by this function.
+ */
+export async function measureSealedTreeFromFd(
+  fd: number,
+  options: Omit<SealedWalkOptions, 'dirPath'>,
+): Promise<SealedWalkOutcome> {
+  if (process.platform !== 'linux') return {kind: 'unavailable'}
+  const scriptArgs = [String(options.maxEntries), String(options.deadlineMs)]
+  const outcome = await spawnWalkProcess(WALK_SCRIPT_FD, scriptArgs, options, fd)
+  if (outcome.kind !== 'ok') return outcome
+  return parseWalkOutput(outcome.stdout)
+}
+
 export const measureSealedTree: SealedWalkRunner = async options => {
   if (process.platform !== 'linux') return {kind: 'unavailable'}
   const {open} = await import('node:fs/promises')
@@ -323,10 +402,7 @@ export const measureSealedTree: SealedWalkRunner = async options => {
     return {kind: 'failed'}
   }
   try {
-    const scriptArgs = [String(options.maxEntries), String(options.deadlineMs)]
-    const outcome = await spawnWalkProcess(WALK_SCRIPT_FD, scriptArgs, options, handle.fd)
-    if (outcome.kind !== 'ok') return outcome
-    return parseWalkOutput(outcome.stdout)
+    return await measureSealedTreeFromFd(handle.fd, options)
   } finally {
     await handle.close()
   }

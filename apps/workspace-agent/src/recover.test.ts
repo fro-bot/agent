@@ -3,17 +3,18 @@
  * directories, exactly like update.test.ts. The only injected seam is `gitRunner`.
  */
 
+import type {AgentWalkRunner} from './agent-walk.js'
 import type {GitRunnerFn} from './git-safety.js'
 import type {ExecuteRecoveryDeps} from './recover.js'
-
 import {execFileSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {existsSync, mkdirSync, statSync} from 'node:fs'
 import {lstat, mkdir, readdir, readFile, readlink, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
-
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+
+import {runAgentWalk} from './agent-walk.js'
 import {listBackups} from './backups.js'
 import {runGit} from './git-safety.js'
 import {AGENT_GID, AGENT_UID, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
@@ -842,6 +843,52 @@ describe('executeRecovery — E4a: an incomplete size walk at confirm time refus
         // #then
         expect(result).toEqual({kind: 'failed', reason: 'inspection-failed'})
         expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim().length).toBe(40)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+})
+
+describe('executeRecovery — H4: an unconfirmed PRE-RENAME walk aborts before any mutation', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'the original stays at its canonical path, no envelope is created, the hold is set, and the journal is kept',
+    async () => {
+      // #given a normal, safely-inspectable checkout
+      await setupCleanCheckout()
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'ok' || !preview.preview.inspectionSafe) throw new Error('unreachable')
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #given — the FIRST walk (confirm-time preview re-derivation) succeeds normally; the
+        // SECOND walk (quarantine's own pre-rename measurement) reports termination-unconfirmed
+        let walkCalls = 0
+        const walkRunner: AgentWalkRunner = async options => {
+          walkCalls += 1
+          if (walkCalls === 2) return {kind: 'termination-unconfirmed'}
+          return runAgentWalk(options)
+        }
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+          recoveryDeps(fixture, {walkRunner}),
+        )
+
+        // #then
+        expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
+        expect(walkCalls).toBeGreaterThanOrEqual(2)
+        // #and — the original is untouched at its canonical path
+        expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim().length).toBe(40)
+        // #and — no quarantine envelope was ever created
+        const quarantineRepoDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`)
+        expect(existsSync(quarantineRepoDir)).toBe(false)
+        // #and — the repo hold is set
+        expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+        // #and — the journal from the in-flight recovery is KEPT, never cleared
+        const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+        expect((await readJournal(journalsDir, OWNER, REPO)).ok).toBe(true)
       } finally {
         await fixture.close()
       }

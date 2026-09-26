@@ -2,13 +2,14 @@
  * Tests for agent-walk.ts (Review round E, E5) — real subprocess spawns, real filesystem.
  */
 
+import {EventEmitter} from 'node:events'
 import {statSync} from 'node:fs'
 import {chmod, mkdir, open, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
 import {describe, expect, it} from 'vitest'
-import {measureSealedTree, runAgentWalk, runWalkScriptForTesting} from './agent-walk.js'
+import {measureSealedTree, measureSealedTreeFromFd, runAgentWalk, runWalkScriptForTesting} from './agent-walk.js'
 import {AGENT_GID, AGENT_UID} from './identity.js'
 import {makeTempDir} from './update-fixtures/helpers.js'
 
@@ -79,6 +80,26 @@ describe('runAgentWalk — bounds', () => {
       await rm(dir, {recursive: true, force: true})
     }
   })
+
+  it('h3: an ALREADY-expired deadline reports complete:false, never a complete empty tree', async () => {
+    const dir = await makeTempDir('agent-walk-test-')
+    try {
+      const outcome = await runAgentWalk(opts(dir, {deadlineMs: -1}))
+      expect(outcome).toEqual({kind: 'ok', totalBytes: 0, entryCount: 0, complete: false})
+    } finally {
+      await rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('h3: a zero entry cap reports complete:false, never a complete empty tree', async () => {
+    const dir = await makeTempDir('agent-walk-test-')
+    try {
+      const outcome = await runAgentWalk(opts(dir, {maxEntries: 0}))
+      expect(outcome).toEqual({kind: 'ok', totalBytes: 0, entryCount: 0, complete: false})
+    } finally {
+      await rm(dir, {recursive: true, force: true})
+    }
+  })
 })
 
 describe('runAgentWalk — failure modes', () => {
@@ -93,6 +114,37 @@ describe('runAgentWalk — failure modes', () => {
   })
 })
 
+describe('runWalkScriptForTesting -- H5: spawn-failure vs. error-after-spawn are distinguished', () => {
+  it('a spawn failure (no pid ever assigned) resolves failed, immediately, never termination-unconfirmed', async () => {
+    const emitter = new EventEmitter()
+    const fakeSpawnFn = () => {
+      queueMicrotask(() => emitter.emit('error', new Error('ENOENT: spawn failed')))
+      return {pid: undefined, kill: () => false, on: emitter.on.bind(emitter)}
+    }
+    const outcome = await runWalkScriptForTesting(
+      '',
+      {uid: undefined, gid: undefined, timeoutMs: 10_000},
+      undefined,
+      fakeSpawnFn,
+    )
+    expect(outcome.kind).toBe('failed')
+  })
+
+  it('an error on an ALREADY-spawned child with no close arriving resolves termination-unconfirmed, never failed', async () => {
+    const emitter = new EventEmitter()
+    const fakeSpawnFn = () => {
+      queueMicrotask(() => emitter.emit('error', new Error('kill failed: ESRCH')))
+      return {pid: 4242, kill: () => false, on: emitter.on.bind(emitter)}
+    }
+    const outcome = await runWalkScriptForTesting(
+      '',
+      {uid: undefined, gid: undefined, timeoutMs: 10_000},
+      undefined,
+      fakeSpawnFn,
+    )
+    expect(outcome.kind).toBe('termination-unconfirmed')
+  })
+})
 describe('runAgentWalk \u2014 F1: minimal, secret-free environment', () => {
   it('the child sees no ambient secrets, no NODE_OPTIONS, and a safe cwd', async () => {
     const originalEnv = {...process.env}
@@ -221,20 +273,41 @@ describe('measureSealedTree -- F4/G4: fd-scoped measurement of a genuinely agent
   )
 
   it.skipIf(process.platform !== 'linux' || IS_ROOT)(
-    'as non-root: walks as the current uid through a mode-0000 parent -- pathname access fails, only the fd works',
+    'as non-root: walks through a mode-0000 parent via an fd opened BEFORE lockdown -- pathname access then fails, only the fd works',
     async () => {
+      // (H2) A non-root TEST process shares its own uid with the "agent" identity it is simulating,
+      // so `measureSealedTree`'s own internal `open()` would be refused the instant the parent is
+      // locked down -- exactly like the real agent-uid child would be. Opening FIRST, then locking
+      // down, then measuring through `measureSealedTreeFromFd` mirrors what the real deployment does
+      // (root opens before the agent could ever be refused).
       const {parent, sealed} = await buildSealedTestTree()
       try {
-        await chmod(parent, 0o000)
-        const outcome = await measureSealedTree({
-          dirPath: sealed,
-          maxEntries: 10_000,
-          deadlineMs: 5_000,
-          uid: process.getuid?.(),
-          gid: process.getgid?.(),
-          timeoutMs: 10_000,
-        })
-        expect(outcome).toEqual({kind: 'ok', totalBytes: 5, entryCount: 2, complete: true})
+        const handle = await open(sealed, 'r')
+        try {
+          await chmod(parent, 0o000)
+          const outcome = await measureSealedTreeFromFd(handle.fd, {
+            maxEntries: 10_000,
+            deadlineMs: 5_000,
+            uid: process.getuid?.(),
+            gid: process.getgid?.(),
+            timeoutMs: 10_000,
+          })
+          expect(outcome).toEqual({kind: 'ok', totalBytes: 5, entryCount: 2, complete: true})
+
+          // #and -- a FRESH measureSealedTree(path) call, with no pre-opened fd, fails outright now
+          // that the ancestor is genuinely inaccessible, confirming the lockdown was real.
+          const freshOutcome = await measureSealedTree({
+            dirPath: sealed,
+            maxEntries: 10_000,
+            deadlineMs: 5_000,
+            uid: process.getuid?.(),
+            gid: process.getgid?.(),
+            timeoutMs: 10_000,
+          })
+          expect(freshOutcome.kind).toBe('failed')
+        } finally {
+          await handle.close()
+        }
       } finally {
         await chmod(parent, 0o700)
         await rm(parent, {recursive: true, force: true})
@@ -278,20 +351,37 @@ describe('measureSealedTree -- F4/G4: fd-scoped measurement of a genuinely agent
   )
 
   it.skipIf(process.platform !== 'linux')(
-    'no other file descriptor leaks into the child beyond stdio and the intended fd 3',
+    'h1: no surviving child descriptor is bound to the SENTINEL file (dev+inode identity, not fd number)',
     async () => {
+      // (H1) A bare `fd <= 3` check rejects legitimate Node/libuv descriptors (epoll, eventfd,
+      // signal pipes) and the transient fd `readdirSync` itself uses to enumerate /proc/self/fd;
+      // a bare fd-NUMBER match against the parent's sentinel can also coincide with an unrelated
+      // child fd. The only sound check is: does any SURVIVING descriptor's dev+inode match the
+      // sentinel FILE's identity, captured by the parent and embedded into the child's own script.
       const {parent, sealed} = await buildSealedTestTree()
       const sentinelPath = join(parent, 'sentinel.txt')
       await writeFile(sentinelPath, 'sentinel')
+      const sentinelSt = statSync(sentinelPath) // captured BEFORE any lockdown
       try {
         await chmod(parent, 0o700)
-        // (G4) A descriptor opened in THIS (parent) process BEFORE spawning -- Node's fs handles are
-        // O_CLOEXEC by default, so it must never appear in the child's own fd table.
+        // A descriptor opened in THIS (parent) process BEFORE spawning -- Node's fs handles are
+        // O_CLOEXEC by default, so it must never survive into the child's own fd table.
         const sentinelHandle = await open(sentinelPath, 'r')
         const targetHandle = await open(sealed, 'r')
         try {
-          const script =
-            "process.stdout.write(JSON.stringify(require('node:fs').readdirSync('/proc/self/fd').map(Number)))"
+          const script = `
+            const fs = require('node:fs');
+            const SENTINEL_DEV = ${Number(sentinelSt.dev)};
+            const SENTINEL_INO = ${Number(sentinelSt.ino)};
+            let matches = 0;
+            for (const name of fs.readdirSync('/proc/self/fd')) {
+              const fd = Number(name);
+              let st;
+              try { st = fs.fstatSync(fd); } catch (e) { continue; } // vanished during enumeration
+              if (st.dev === SENTINEL_DEV && st.ino === SENTINEL_INO) matches += 1;
+            }
+            process.stdout.write(JSON.stringify({matches}));
+          `
           const outcome = await runWalkScriptForTesting(
             script,
             {
@@ -303,13 +393,56 @@ describe('measureSealedTree -- F4/G4: fd-scoped measurement of a genuinely agent
           )
           expect(outcome.kind).toBe('ok')
           if (outcome.kind !== 'ok') throw new Error('unreachable')
-          const childFds = JSON.parse(outcome.stdout) as readonly number[]
-          expect(childFds).not.toContain(sentinelHandle.fd)
-          expect(childFds.every(fd => fd <= 3)).toBe(true)
+          const parsed = JSON.parse(outcome.stdout) as {matches: number}
+          expect(parsed.matches).toBe(0)
         } finally {
           await sentinelHandle.close()
           await targetHandle.close()
         }
+      } finally {
+        await chmod(parent, 0o700)
+        await rm(parent, {recursive: true, force: true})
+      }
+    },
+  )
+
+  it.skipIf(process.platform !== 'linux')(
+    'h3: an ALREADY-expired deadline reports complete:false, never a complete empty tree',
+    async () => {
+      const {parent, sealed} = await buildSealedTestTree()
+      try {
+        await chmod(parent, 0o700)
+        const outcome = await measureSealedTree({
+          dirPath: sealed,
+          maxEntries: 10_000,
+          deadlineMs: -1,
+          uid: IS_ROOT ? AGENT_UID : process.getuid?.(),
+          gid: IS_ROOT ? AGENT_GID : process.getgid?.(),
+          timeoutMs: 10_000,
+        })
+        expect(outcome).toEqual({kind: 'ok', totalBytes: 0, entryCount: 1, complete: false})
+      } finally {
+        await chmod(parent, 0o700)
+        await rm(parent, {recursive: true, force: true})
+      }
+    },
+  )
+
+  it.skipIf(process.platform !== 'linux')(
+    'h3: a zero entry cap reports complete:false, never a complete empty tree',
+    async () => {
+      const {parent, sealed} = await buildSealedTestTree()
+      try {
+        await chmod(parent, 0o700)
+        const outcome = await measureSealedTree({
+          dirPath: sealed,
+          maxEntries: 0,
+          deadlineMs: 5_000,
+          uid: IS_ROOT ? AGENT_UID : process.getuid?.(),
+          gid: IS_ROOT ? AGENT_GID : process.getgid?.(),
+          timeoutMs: 10_000,
+        })
+        expect(outcome).toEqual({kind: 'ok', totalBytes: 0, entryCount: 1, complete: false})
       } finally {
         await chmod(parent, 0o700)
         await rm(parent, {recursive: true, force: true})

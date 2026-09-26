@@ -95,6 +95,8 @@ export const DEFAULT_DISK_HEADROOM_MULTIPLIER = 2
 export interface ExecuteRecoveryDeps {
   readonly gitRunner?: GitRunnerFn
   readonly packStreamRunner?: (options: PackStreamOptions) => ReturnType<typeof runPackStream>
+  /** (Review round H, H4) Test seam — injectable so a test can simulate an unconfirmed termination during the PRE-rename pathname walk without a real subprocess. Defaults to the real `runAgentWalk`. */
+  readonly walkRunner?: AgentWalkRunner
   readonly reposRoot?: string
   readonly options?: {readonly timeoutMs?: number; readonly uid?: number; readonly gid?: number}
   readonly now?: () => Date
@@ -147,7 +149,14 @@ const WALK_TIMEOUT_BUFFER_MS = 5_000
 type WalkOrFailOutcome =
   | {readonly kind: 'ok'; readonly totalBytes: number; readonly entryCount: number; readonly complete: boolean}
   | {readonly kind: 'failed'}
+  | {readonly kind: 'termination-unconfirmed'}
 
+/**
+ * (Review round H, H4) `termination-unconfirmed` is preserved as its OWN outcome — never folded
+ * into `failed` — so a caller that must abort BEFORE a durable mutation (quarantine's pre-rename
+ * measurement) can tell "the walk cleanly failed" (safe to proceed treating the size as unknown)
+ * apart from "the walk's fate is genuinely uncertain" (must not proceed at all).
+ */
 async function walkCheckoutSize(params: {
   readonly walkRunner: AgentWalkRunner
   readonly rootPath: string
@@ -165,6 +174,7 @@ async function walkCheckoutSize(params: {
     gid,
     timeoutMs: deadlineMs + WALK_TIMEOUT_BUFFER_MS,
   })
+  if (outcome.kind === 'termination-unconfirmed') return {kind: 'termination-unconfirmed'}
   if (outcome.kind !== 'ok') return {kind: 'failed'}
   return outcome
 }
@@ -659,14 +669,11 @@ async function quarantineExistingCheckout(params: {
   const {walkRunner, sealedWalkRunner, walkMaxEntries, walkDeadlineMs, uid, gid} = params
   const envelopePath = envelopePathFor(reposRoot, owner, repo, recoveryId)
   const envelopeCheckoutPath = join(envelopePath, QUARANTINE_CHECKOUT_DIR_NAME)
-  try {
-    await mkdir(envelopePath, {recursive: true, mode: 0o700})
-  } catch {
-    return 'failed'
-  }
 
-  // (F4) Measure BEFORE the rename, at the canonical path, where the tree is still
-  // agent-traversable and the repo lock is held — the NORMAL path, needing no scoped-fd fallback.
+  // (Review round H, H4) Measure BEFORE the rename AND before the envelope itself is created (F4:
+  // the tree is still agent-traversable at the canonical path here, with the repo lock held). An
+  // uncertain outcome aborts here, before ANY durable state — not even an empty envelope
+  // directory — exists for this attempt, exactly like the sealed-fallback path already does (G3).
   let measured: WalkOrFailOutcome = {kind: 'failed'}
   const originalStillAtCheckoutPath = await pathExists(checkoutPath)
   if (originalStillAtCheckoutPath) {
@@ -678,6 +685,13 @@ async function quarantineExistingCheckout(params: {
       uid,
       gid,
     })
+    if (measured.kind === 'termination-unconfirmed') return 'termination-unconfirmed'
+  }
+
+  try {
+    await mkdir(envelopePath, {recursive: true, mode: 0o700})
+  } catch {
+    return 'failed'
   }
 
   if (!(await pathExists(envelopeCheckoutPath))) {
@@ -1394,6 +1408,7 @@ export async function executeRecovery(
   const {
     gitRunner: injectedGitRunner = runGit,
     packStreamRunner: injectedPackStreamRunner = runPackStream,
+    walkRunner: injectedWalkRunner,
     reposRoot = WORKSPACE_REPOS_ROOT,
     options = {},
     now = () => new Date(),
@@ -1419,7 +1434,11 @@ export async function executeRecovery(
   return withRepoLock(repoKey, async (): Promise<ExecuteRecoveryResult> => {
     if (repoHoldReason(repoKey) !== undefined) return {kind: 'refused', reason: 'maintenance-hold'}
 
-    const tracker = createInvocationTracker({gitRunner: injectedGitRunner, packStreamRunner: injectedPackStreamRunner})
+    const tracker = createInvocationTracker({
+      gitRunner: injectedGitRunner,
+      packStreamRunner: injectedPackStreamRunner,
+      walkRunner: injectedWalkRunner,
+    })
     const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
     const checkoutPath = join(reposRoot, owner, repo)
 
