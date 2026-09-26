@@ -6,7 +6,7 @@ This document maps the repository's directory layout and explains where code liv
 
 ```text
 fro-bot/agent/
-├── src/                        # GitHub Action logic — 4-layer architecture (~70.6k lines, 70,586 including tests)
+├── src/                        # GitHub Action logic — 4-layer architecture (~82.8k lines, 82,772 including tests)
 │   ├── shared/                 # Layer 0: pure types, utils, constants (only @bfra.me/es Result; no heavy deps)
 │   ├── services/               # Layer 1: external adapters (GitHub, cache, setup, object-store, artifact)
 │   │   ├── github/             # Octokit client, context parsing, NormalizedEvent
@@ -35,7 +35,7 @@ fro-bot/agent/
 │   │   └── src/
 │   │       ├── discord/        # Discord client, mentions, commands, streaming
 │   │       ├── github/         # GitHub App client, Actions workflow-dispatch adapter
-│   │       ├── execute/        # run-core, queue, concurrency, recovery
+│   │       ├── execute/        # run-core, queue, concurrency, recovery, checkout provenance
 │   │       ├── web/            # Operator HTTP routes, SSE, audit
 │   │       ├── workspace-api/  # Workspace API surface
 │   │       ├── approvals/      # Approval gate
@@ -51,7 +51,8 @@ fro-bot/agent/
 │           └── coordination/   # Heartbeat, lock, run-state
 │
 ├── deploy/                     # Docker Compose stack, Dockerfiles, mitmproxy egress topology
-│   └── scripts/                # Plain Node ESM (.mjs) deploy helpers; node --test runner
+│   ├── scripts/                # Plain Node ESM (.mjs) deploy helpers; node --test runner
+│   └── tests/                  # Real-container acceptance harness (uid isolation)
 │
 ├── scripts/                    # Repo-level build scripts (build-action-dist, unicode checks, release)
 │   └── release/                # Release dispatch scripts
@@ -65,7 +66,7 @@ fro-bot/agent/
 │
 ├── RFCs/                       # 19 RFC documents (architecture specs)
 ├── docs/
-│   ├── wiki/                   # 8 Obsidian deep-dive pages
+│   ├── wiki/                   # 9 Obsidian deep-dive pages + index.md
 │   ├── plans/                  # Architecture plans and design docs
 │   ├── solutions/              # Documented solutions to past problems
 │   ├── product/                # Product requirements and feature docs
@@ -90,17 +91,18 @@ fro-bot/agent/
 - **`src/features/`** — Business logic organized by capability; imports from `shared/` and `services/` only.
 - **`src/harness/`** — Entry points and phase orchestration; the only layer allowed to compose across all others.
 - **`apps/action/`** — Thin workspace package whose sole purpose is re-exporting `src/main.ts` and `src/post.ts`; its build produces the committed root `dist/`.
-- **`apps/workspace-agent/`** — Hono HTTP service that runs inside the workspace container; touch when adding workspace-side API endpoints.
+- **`apps/workspace-agent/`** — Hono HTTP service that runs inside the workspace container (clone setup with staged root→agent ownership handoff, read-only `POST /inspect` checkout observation, `POST /update` checkout fast-forward, `POST /recover/preview`+`/recover` quarantine-and-replace, `GET`/`DELETE /backups` generations, bearer-gated control API, per-repo mutex and journal store, checkout-update git primitives, supervised unprivileged OpenCode); touch when adding workspace-side API endpoints. Serialize every mutating repo operation through `src/repo-mutex.ts` (also the sticky, restart-only maintenance hold) and record in-flight update/recovery state in `src/journal.ts`; real-git adversarial fixtures live in `src/update-fixtures/`. Import uid/gid/path constants from `src/identity.ts` (mirrored in `deploy/workspace.Dockerfile`) and run any git against an existing checkout through `src/git-safety.ts` as the agent uid — never as the root service. Checkout size/entry counts go through `src/agent-walk.ts`'s agent-uid or sealed-fd walker, never a root-owned path lookup. Checkout types in `src/types.ts` are mirrored in `packages/gateway/src/workspace-api/types.ts` and pinned by `scripts/checkout-types-drift-guard.test.ts` — change both sides together.
 - **`packages/gateway/`** — Discord-first daemon and operator web surface; the largest package, containing the mention loop, command handlers, approval gate, and redaction pipeline.
 - **`packages/harness/`** — Patched-OpenCode build and publish pipeline; touch when updating the bundled OpenCode binary.
 - **`packages/runtime/`** — Shared runtime primitives consumed by both `src/` and `packages/gateway/`; owns the authoritative version-pin constants.
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
-- **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations; uses `node --test`, not Vitest.
+- **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations (auth validation, config merge, protected-dir creation, legacy checkout ownership migration, agent-side config provisioning); uses `node --test`, not Vitest.
+- **`deploy/tests/`** — `isolation-harness.sh`, the CI acceptance harness that proves the service/agent uid boundary in a real container started with production's security posture.
 - **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch.
 - **`evals/`** — Gated agent-outcome eval corpus that runs the real execution path against disposable fixture repos; the pure gate and baseline tests run in normal CI, while live scenarios require `FRO_BOT_EVAL=1`.
 - **`.github/workflows/`** — All CI/CD automation; 12 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.
-- **`docs/wiki/`** — 8 Obsidian deep-dive pages covering architecture, execution lifecycle, prompt design, and operator surface.
+- **`docs/wiki/`** — 9 Obsidian deep-dive pages (plus `index.md`) covering architecture, execution lifecycle, prompt design, background subagents, setup, troubleshooting, and the operator surface.
 - **`docs/solutions/`** — Documented solutions to past problems, organized by category with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing or debugging in a documented area.
 - **`assets/`** — Repository images and branding referenced by `README.md`.
 - **`dist/`** — Committed bundle output; CI fails if a fresh build produces a diff here.
@@ -158,7 +160,8 @@ Use this decision tree to find the right home for new code:
 - **New Action phase, trigger handler, comment handler, or reviewer** → `src/features/<capability>/` (e.g. `src/features/triggers/`, `src/features/comments/`); wire it into `src/harness/phases/` or `src/features/triggers/router.ts`.
 - **New Discord command** → `packages/gateway/src/discord/commands/`; register it in the commands index.
 - **New bundled CLI tool or version-pinned binary** (Bun, oMo, OpenCode, Systematic) → add a versioned-tool entry in `src/services/setup/` following the existing adapter pattern; pin the version constant in `packages/runtime/src/shared/constants.ts`.
-- **New workspace API endpoint** → `apps/workspace-agent/src/`; add the route to the Hono server.
+- **New workspace API endpoint** → `apps/workspace-agent/src/`; add the route to the Hono server (`createApp` in `apps/workspace-agent/src/server.ts` — it inherits the bearer check unless it is a probe) and call it from `packages/gateway/src/workspace-api/client.ts` with the bearer header. A route that mutates a repository's checkout, bare mirror, or quarantine tree must run inside `withRepoLock` (`src/repo-mutex.ts`) and journal its in-flight phase (`src/journal.ts`) before mutating — see `apps/workspace-agent/AGENTS.md`.
 - **Shared primitive used by both Action and gateway** → `packages/runtime/src/`; export from its `index.ts`.
 - **New GitHub API helper** → `src/services/github/api.ts` or a new file under `src/services/github/`.
 - **New deploy service or container** → `deploy/` (Dockerfile + compose service entry).
+- **New workspace-container security property** → assert it in `deploy/tests/isolation-harness.sh` (paired agent-denied / root-allowed check) and, if it is a compose setting, in `deploy/validate-stack.sh`.
