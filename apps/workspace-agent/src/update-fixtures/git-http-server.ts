@@ -63,6 +63,8 @@ export interface GitHttpServerHandle {
   readonly close: () => Promise<void>
   /** Injects (or, passing `undefined`, clears) a canned failure for `repoPath` (e.g. `'owner/repo.git'`, matching the `<owner>/<repo>.git` segment of the request URL). Takes effect on the next request. */
   readonly setFailure: (repoPath: string, failure: GitHttpServerFailureKind | undefined) => void
+  /** Total number of HTTP requests this server instance has received so far — lets a test assert "the real server was never contacted" for a scenario that fails before ever reaching it (e.g. a deliberately unreachable override URL). */
+  readonly requestCount: () => number
 }
 
 // ---------------------------------------------------------------------------
@@ -309,8 +311,10 @@ export async function startGitHttpServer(options: GitHttpServerOptions): Promise
   const failures = new Map<string, GitHttpServerFailureKind>()
   const children = new Set<ChildProcess>()
   const sockets = new Set<Socket>()
+  let requestCount = 0
 
   function handler(req: IncomingMessage, res: ServerResponse): void {
+    requestCount += 1
     const {pathname} = splitUrl(req.url ?? '/')
     const repoPath = extractRepoPathFromUrl(pathname)
     const failure = repoPath === null ? undefined : failures.get(repoPath)
@@ -359,6 +363,7 @@ export async function startGitHttpServer(options: GitHttpServerOptions): Promise
       if (failure === undefined) failures.delete(repoPath)
       else failures.set(repoPath, failure)
     },
+    requestCount: () => requestCount,
     async close() {
       for (const child of children) child.kill('SIGKILL')
       for (const socket of sockets) socket.destroy()

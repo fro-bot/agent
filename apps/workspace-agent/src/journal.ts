@@ -52,26 +52,43 @@ export type UpdateJournalPhase = 'fetched' | 'applying' | 'applied'
 /** Phases of an in-flight recovery (preserve-and-replace). See the plan's reconciliation table. */
 export type RecoveryJournalPhase = 'building' | 'quarantining' | 'installing' | 'verifying'
 
-/** An in-flight fast-forward update of an existing checkout. */
-export interface UpdateJournal {
-  readonly kind: 'update'
-  readonly owner: string
-  readonly repo: string
-  readonly phase: UpdateJournalPhase
-  /** HEAD SHA observed before the update started. */
-  readonly fromSha: string
-  /** Target SHA the update is advancing the checkout to. */
-  readonly toSha: string
-  /** ISO-8601 timestamp, from an injected clock, when the journal was first written. */
-  readonly startedAt: string
-  /**
-   * ISO-8601 timestamp, from an injected clock, when the fast-forward merge was VERIFIED complete
-   * — written only alongside `phase: 'applied'`. Lets a later reconciliation pass (a crash between
-   * this write and the journal's removal) report the time the merge actually finished instead of
-   * manufacturing a fresh `now()` for evidence that is, by then, stale.
-   */
-  readonly appliedAt?: string
-}
+/**
+ * An in-flight fast-forward update of an existing checkout. `appliedAt` is REQUIRED at phase
+ * `'applied'` (review round B, B7) — nothing has shipped with the old, briefly-optional field, so
+ * there is no legacy journal to stay lenient for. A parsed journal claiming `phase: 'applied'`
+ * without a valid `appliedAt` is `malformed`, never silently treated as absent or backfilled with
+ * a freshly-manufactured `now()` at reconciliation time (see update.ts's `reconcileUpdateJournal`,
+ * which now reads `journal.appliedAt` directly, with no `?? now()` fallback).
+ *
+ * Deliberately two plain object members rather than one interface plus an intersection override —
+ * TypeScript's discriminated-union narrowing on `phase` is reliable for a union of plain object
+ * literal types; an intersection-typed member (`Common & {phase: ...}`) does not narrow as
+ * dependably once one member's discriminant is itself a small union (`'fetched' | 'applying'`).
+ */
+export type UpdateJournal =
+  | {
+      readonly kind: 'update'
+      readonly owner: string
+      readonly repo: string
+      readonly phase: 'fetched' | 'applying'
+      /** HEAD SHA observed before the update started. */
+      readonly fromSha: string
+      /** Target SHA the update is advancing the checkout to. */
+      readonly toSha: string
+      /** ISO-8601 timestamp, from an injected clock, when the journal was first written. */
+      readonly startedAt: string
+    }
+  | {
+      readonly kind: 'update'
+      readonly owner: string
+      readonly repo: string
+      readonly phase: 'applied'
+      readonly fromSha: string
+      readonly toSha: string
+      readonly startedAt: string
+      /** ISO-8601 timestamp, from an injected clock, when the fast-forward merge was VERIFIED complete. */
+      readonly appliedAt: string
+    }
 
 /** An in-flight preserve-and-replace recovery of a checkout. */
 export interface RecoveryJournal {
@@ -159,19 +176,21 @@ function parseJournal(value: unknown): Journal | null {
   if (v.kind === 'update') {
     if (!isNonEmptyString(v.phase) || !UPDATE_PHASES.has(v.phase)) return null
     if (!isNonEmptyString(v.fromSha) || !isNonEmptyString(v.toSha)) return null
-    // appliedAt is OPTIONAL (only ever written alongside phase 'applied'), but when the key is
-    // present at all its value must still be a valid non-empty string — never silently coerced.
-    if (v.appliedAt !== undefined && !isNonEmptyString(v.appliedAt)) return null
-    return {
-      kind: 'update',
+    const common = {
+      kind: 'update' as const,
       owner: v.owner,
       repo: v.repo,
-      phase: v.phase as UpdateJournalPhase,
       fromSha: v.fromSha,
       toSha: v.toSha,
       startedAt: v.startedAt,
-      ...(v.appliedAt === undefined ? {} : {appliedAt: v.appliedAt}),
     }
+    if (v.phase === 'applied') {
+      // appliedAt is REQUIRED at this phase — a valid non-empty string, never silently coerced or
+      // defaulted. Missing or invalid ⇒ malformed, not absent.
+      if (!isNonEmptyString(v.appliedAt)) return null
+      return {...common, phase: 'applied', appliedAt: v.appliedAt}
+    }
+    return {...common, phase: v.phase as 'fetched' | 'applying'}
   }
 
   if (v.kind === 'recovery') {

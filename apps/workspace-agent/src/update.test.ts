@@ -31,6 +31,8 @@ import {
   isolatedGitEnv,
   makeTempDir,
   opensslAvailable,
+  sentinelFired,
+  sentinelPath,
   startLoopbackListener,
 } from './update-fixtures/helpers.js'
 import {executeUpdate, reconcileUpdateJournalsOnStartup} from './update.js'
@@ -206,6 +208,7 @@ describe('executeUpdate — journal reconciliation', () => {
       fromSha: '0'.repeat(40),
       toSha: headSha,
       startedAt: new Date().toISOString(),
+      appliedAt: new Date().toISOString(),
     })
 
     // #when
@@ -403,6 +406,50 @@ describe('executeUpdate — client abort', () => {
   })
 })
 
+describe('executeUpdate — ensureBareFetchStore hardening (review round B, B6)', () => {
+  // No network fixture needed for any of these — ensureBareFetchStore is the very first thing
+  // runNetworkAndApply does, before any real network contact, so a bad fetch-store path always
+  // fails before dialing out at all.
+
+  it('refuses fetch-failed when the fetch store path is a symlink (never followed)', async () => {
+    await setupEligibleCheckout()
+    const fetchDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'fetch')
+    await mkdir(fetchDir, {recursive: true})
+    const elsewhere = await makeTempDir('update-test-fetchstore-elsewhere-')
+    await symlink(elsewhere, join(fetchDir, `${OWNER}__${REPO}.git`))
+    try {
+      const result = await executeUpdate(req(), localDeps())
+      expect(result).toEqual({kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false})
+    } finally {
+      await rm(elsewhere, {recursive: true, force: true})
+    }
+  })
+
+  it('refuses fetch-failed when the fetch store path exists but is a regular file, not a directory', async () => {
+    await setupEligibleCheckout()
+    const fetchDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'fetch')
+    await mkdir(fetchDir, {recursive: true})
+    await writeFile(join(fetchDir, `${OWNER}__${REPO}.git`), 'not a bare repo')
+
+    const result = await executeUpdate(req(), localDeps())
+
+    expect(result).toEqual({kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false})
+  })
+
+  it('refuses fetch-failed on a non-ENOENT stat error — a path component is not a directory at all', async () => {
+    await setupEligibleCheckout()
+    const stateDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME)
+    await mkdir(stateDir, {recursive: true})
+    // `fetch` itself (the fetch store's PARENT) is a plain file, so lstat on the full nested
+    // fetch-store path fails with ENOTDIR — a real non-ENOENT error, never mistaken for absence.
+    await writeFile(join(stateDir, 'fetch'), 'blocking file')
+
+    const result = await executeUpdate(req(), localDeps())
+
+    expect(result).toEqual({kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false})
+  })
+})
+
 describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — fail-closed-against-default (real /clone-shaped checkout)', () => {
   it('a checkout made the way /clone makes it (real git clone from the local HTTPS server) passes every admission step and reaches `ready`', async () => {
     // #given a bare "remote" repo served over real HTTPS by the Unit 2/slice-1 git-http-server
@@ -469,6 +516,8 @@ interface NetworkFixture {
   readonly pushCommit: (name: string, content: string, message: string) => string
   /** Injects (or clears) a canned failure for this fixture's own `<owner>/<repo>.git` path. */
   readonly setFailure: (failure: '403' | '404' | '429' | 'hang' | undefined) => void
+  /** Total HTTP requests the fixture server has received so far — lets a test assert the real server was never contacted. */
+  readonly requestCount: () => number
   readonly close: () => Promise<void>
 }
 
@@ -503,6 +552,7 @@ async function setupNetworkFixture(
     setFailure(failure) {
       server.setFailure(repoPath, failure)
     },
+    requestCount: () => server.requestCount(),
     async close() {
       await server.close()
       await rm(fixtureReposRoot, {recursive: true, force: true})
@@ -603,6 +653,9 @@ describe.skipIf(!OPENSSL_AVAILABLE)(
         await cloneCheckoutAtHead(fixture)
         const result = await executeUpdate(req(), networkDeps(fixture, {remoteBaseUrl: 'https://127.0.0.1:1'}))
         expect(result).toEqual({kind: 'failed', reason: 'fetch-unreachable', mutationStarted: false, permanent: false})
+        // #and (B7) — the real fixture server was never contacted at all; the override URL alone
+        // was what failed.
+        expect(fixture.requestCount()).toBe(0)
       } finally {
         await fixture.close()
       }
@@ -641,6 +694,55 @@ describe.skipIf(!OPENSSL_AVAILABLE)(
     }, 15000)
   },
 )
+
+/** Forges every `ls-remote` call's outcome to canned failure stderr — for B3's sideband-spoofing tests, which never need a real server since they exercise pure stderr classification. */
+function stderrRunner(stderr: string): GitRunnerFn {
+  return async (args, options) => {
+    if (args.includes('ls-remote')) return {kind: 'failed', code: 128, stdout: '', stderr}
+    return runGit(args, options)
+  }
+}
+
+describe('executeUpdate — remote failure classification: anchored against sideband spoofing (review round B, B3)', () => {
+  it('a remote-prefixed 403/404 sideband line never classifies permanent', async () => {
+    await setupEligibleCheckout()
+    const stderr = "remote: error: 403\nremote: fatal: repository 'x' not found\n"
+
+    const result = await executeUpdate(req(), localDeps({gitRunner: stderrRunner(stderr)}))
+
+    expect(result).toEqual({kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false})
+  })
+
+  it('a syntactically-correct 403 fatal line for a DIFFERENT url never classifies permanent', async () => {
+    await setupEligibleCheckout()
+    const stderr =
+      "fatal: unable to access 'https://evil.example.com/acme/widgets.git/': The requested URL returned error: 403\n"
+
+    const result = await executeUpdate(req(), localDeps({gitRunner: stderrRunner(stderr)}))
+
+    expect(result).toEqual({kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false})
+  })
+
+  it('a 403 fatal line with trailing junk after the code never classifies permanent', async () => {
+    await setupEligibleCheckout()
+    const url = `http://127.0.0.1:${remoteListener.port}/${OWNER}/${REPO}.git`
+    const stderr = `fatal: unable to access '${url}/': The requested URL returned error: 403 (ignored)\n`
+
+    const result = await executeUpdate(req(), localDeps({gitRunner: stderrRunner(stderr)}))
+
+    expect(result).toEqual({kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false})
+  })
+
+  it('the EXACT anchored line for the real url still classifies permanent (control)', async () => {
+    await setupEligibleCheckout()
+    const url = `http://127.0.0.1:${remoteListener.port}/${OWNER}/${REPO}.git`
+    const stderr = `fatal: unable to access '${url}/': The requested URL returned error: 403\n`
+
+    const result = await executeUpdate(req(), localDeps({gitRunner: stderrRunner(stderr)}))
+
+    expect(result).toEqual({kind: 'failed', reason: 'fetch-forbidden', mutationStarted: false, permanent: true})
+  })
+})
 
 describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — happy path (real network fixture)', () => {
   it('behind by two commits: fast-forwards to the remote tip, reports fromSha, and leaves no leftover fetch ref', async () => {
@@ -688,6 +790,9 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — happy path (real network 
         checkedAt: expect.any(String) as string,
       })
       expect(listLeftoverFetchRefs()).toEqual([])
+      // #and (B7) — HEAD genuinely never moved.
+      const headSha = gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()
+      expect(headSha).toBe(fixture.headSha)
     } finally {
       await fixture.close()
     }
@@ -839,10 +944,17 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — policy: detached, non-def
     try {
       await cloneCheckoutAtHead(fixture)
       gitSync(destPathFor(), ['checkout', '-q', fixture.headSha], isolatedGitEnv(checkoutHome))
+      let packStreamCalls = 0
+      const spyPackStreamRunner: typeof runPackStream = async options => {
+        packStreamCalls += 1
+        return runPackStream(options)
+      }
 
-      const result = await executeUpdate(req(), networkDeps(fixture))
+      const result = await executeUpdate(req(), networkDeps(fixture, {packStreamRunner: spyPackStreamRunner}))
 
       expect(result).toEqual({kind: 'refused', reason: 'detached'})
+      // #and (B7) — the pack-stream runner (the only thing that ever imports objects) was never called.
+      expect(packStreamCalls).toBe(0)
     } finally {
       await fixture.close()
     }
@@ -927,22 +1039,236 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — remote moved between obse
     try {
       await cloneCheckoutAtHead(fixture)
       let lsRemoteCalls = 0
+      let fetchCalls = 0
       const movingRunner: GitRunnerFn = async (args, options) => {
         if (args.includes('ls-remote')) {
           lsRemoteCalls += 1
           const sha = 'a'.repeat(39) + String(lsRemoteCalls)
           return {kind: 'ok', stdout: `ref: refs/heads/main\tHEAD\n${sha}\tHEAD\n`, stderr: ''}
         }
-        if (args.includes('fetch') && args.includes('--quiet')) return {kind: 'ok', stdout: '', stderr: ''}
+        if (args.includes('fetch') && args.includes('--quiet')) {
+          fetchCalls += 1
+          return {kind: 'ok', stdout: '', stderr: ''}
+        }
         return runGit(args, options)
       }
 
       // #when
       const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: movingRunner}))
 
-      // #then \u2014 three observations total: the initial one, plus two retries of the pair.
+      // #then — three observations total: the initial one, plus two retries of the pair. Exactly
+      // two fetch attempts (one per retry), and (B1/B7) no refs/fro-bot/fetch/* ref survives either
+      // attempt, even though NEITHER attempt's ref was ever the winner (the sequence ended in failure).
       expect(result).toEqual({kind: 'failed', reason: 'remote-moved', mutationStarted: false, permanent: false})
       expect(lsRemoteCalls).toBe(3)
+      expect(fetchCalls).toBe(2)
+      expect(listLeftoverFetchRefs()).toEqual([])
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — fetch ref leak prevention (review round B, B1)', () => {
+  it("a moved-tip retry leaves no leftover fetch refs, even though the first attempt's ref was never the winner", async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      let fetchCalls = 0
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('fetch') && args.includes('--quiet')) {
+          fetchCalls += 1
+          const outcome = await runGit(args, options)
+          if (fetchCalls === 1) {
+            fixture.pushCommit('moved.txt', 'moved', 'moved commit')
+          }
+          return outcome
+        }
+        return runGit(args, options)
+      }
+
+      const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+      expect(result.kind).toBe('ready')
+      expect(fetchCalls).toBe(2)
+      expect(listLeftoverFetchRefs()).toEqual([])
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('a re-observe failure after a successful fetch leaves no leftover fetch ref', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      let lsRemoteCalls = 0
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('ls-remote')) {
+          lsRemoteCalls += 1
+          if (lsRemoteCalls === 2) {
+            return {kind: 'failed', code: 1, stdout: '', stderr: 'fatal: unable to access something\n'}
+          }
+        }
+        return runGit(args, options)
+      }
+
+      const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+      expect(result.kind).toBe('failed')
+      expect(listLeftoverFetchRefs()).toEqual([])
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)(
+  'executeUpdate — ancestry hardening against a planted replace ref (review round B, B4)',
+  () => {
+    it('a replace ref for H planted after admission does not change the fast-forward classification', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        const fromSha = fixture.headSha
+        const toSha = fixture.pushCommit('b.txt', 'two', 'c2')
+        const env = isolatedGitEnv(checkoutHome)
+        let planted = false
+        let removed = false
+        const forgingRunner: GitRunnerFn = async (args, options) => {
+          if (!planted && args.includes('ls-remote')) {
+            planted = true
+            const indexPath = join(checkoutHome, 'empty-index-for-replace-ref-test')
+            const emptyTree = gitSync(destPathFor(), ['write-tree'], {...env, GIT_INDEX_FILE: indexPath}).trim()
+            const orphan = gitSync(destPathFor(), ['commit-tree', emptyTree, '-m', 'orphan'], env).trim()
+            gitSync(destPathFor(), ['replace', fromSha, orphan], env)
+          }
+          if (planted && !removed && args.includes('ls-tree')) {
+            removed = true
+            gitSync(destPathFor(), ['replace', '-d', fromSha], env)
+          }
+          return runGit(args, options)
+        }
+
+        const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+        expect(result).toEqual({
+          kind: 'ready',
+          change: 'fast-forward',
+          branch: 'main',
+          sha: toSha,
+          fromSha,
+          checkedAt: expect.any(String) as string,
+        })
+        expect(planted).toBe(true)
+        expect(removed).toBe(true)
+      } finally {
+        await fixture.close()
+      }
+    })
+  },
+)
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — merge filter neutralization (review round B, B5)', () => {
+  it('a filter driver added between the pre-merge config re-check and the merge (seam) never runs', async () => {
+    const fixture = await setupNetworkFixture()
+    const sentinelDir = await makeTempDir('update-test-filter-sentinel-')
+    try {
+      await cloneCheckoutAtHead(fixture)
+      fixture.pushCommit('.gitattributes', '*.bin filter=evil\n', 'attrs')
+      fixture.pushCommit('new.bin', 'payload', 'add new.bin')
+      const env = isolatedGitEnv(checkoutHome)
+      const sentinelCommand = `echo fired >> "${sentinelPath(sentinelDir)}"`
+      let configInventoryCalls = 0
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('--no-includes') && args.includes('--list')) {
+          const outcome = await runGit(args, options)
+          configInventoryCalls += 1
+          if (configInventoryCalls === 2) {
+            // The SECOND config-inventory call is runFastForward's own pre-merge re-check —
+            // already passed by the time this runs. Planting the driver right after it (but
+            // before enumerateFilterDrivers, the very next call) is the exact race B5 closes.
+            gitSync(destPathFor(), ['config', 'filter.evil.smudge', sentinelCommand], env)
+            gitSync(destPathFor(), ['config', 'filter.evil.required', 'true'], env)
+          }
+          return outcome
+        }
+        return runGit(args, options)
+      }
+
+      const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+      expect(result.kind).toBe('ready')
+      expect(configInventoryCalls).toBe(2)
+      expect(await sentinelFired(sentinelDir)).toBe(false)
+    } finally {
+      await rm(sentinelDir, {recursive: true, force: true})
+      await fixture.close()
+    }
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — deadlines are shared, not per-call (review round B, B2)', () => {
+  it('the network deadline is shared across ls-remote/fetch/re-observe — expiry fails fetch-timeout without a fresh per-call allowance', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      let clock = 0
+      const monotonicNow = (): number => clock
+      let lsRemoteCalls = 0
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('ls-remote')) {
+          lsRemoteCalls += 1
+          clock += 10_000
+        }
+        return runGit(args, options)
+      }
+
+      const result = await executeUpdate(
+        req(),
+        networkDeps(fixture, {gitRunner: forgingRunner, networkBudgetMs: 1_000, monotonicNow}),
+      )
+
+      expect(result).toEqual({kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false})
+      // #and — the deadline expired right after the FIRST ls-remote; the fetch attempt that would
+      // otherwise follow never got a fresh allowance and was never even dispatched.
+      expect(lsRemoteCalls).toBe(1)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('the apply deadline is shared across shaPresentInBare/import/merge — a slow first apply step exhausts it before the pack import ever runs', async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      fixture.pushCommit('b.txt', 'two', 'c2')
+      let clock = 0
+      const monotonicNow = (): number => clock
+      let packStreamCalls = 0
+      const spyPackStreamRunner: typeof runPackStream = async options => {
+        packStreamCalls += 1
+        return runPackStream(options)
+      }
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('cat-file') && args.includes('-e')) {
+          clock += 10_000
+        }
+        return runGit(args, options)
+      }
+
+      const result = await executeUpdate(
+        req(),
+        networkDeps(fixture, {
+          gitRunner: forgingRunner,
+          packStreamRunner: spyPackStreamRunner,
+          applyTimeoutMs: 1_000,
+          monotonicNow,
+        }),
+      )
+
+      expect(result).toEqual({kind: 'failed', reason: 'apply-failed', mutationStarted: false, permanent: false})
+      expect(packStreamCalls).toBe(0)
+      expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: false, reason: 'absent'})
     } finally {
       await fixture.close()
     }
@@ -1014,8 +1340,13 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — client abort, before vs a
       const fromSha = fixture.headSha
       const toSha = fixture.pushCommit('b.txt', 'two', 'c2')
       const controller = new AbortController()
+      let journalPhaseAtInjection: string | undefined
       const abortMidStreamRunner: typeof runPackStream = async options => {
-        // Simulates a client disconnect landing exactly once the mutation (pack import) is under way.
+        // Simulates a client disconnect landing exactly once the mutation (pack import) is under
+        // way — (B7) confirmed here by actually re-reading the journal, rather than assuming it.
+        const journal = await readJournal(journalsDirFor(), OWNER, REPO)
+        journalPhaseAtInjection =
+          journal.ok === true && journal.journal.kind === 'update' ? journal.journal.phase : undefined
         controller.abort()
         return runPackStream(options)
       }
@@ -1033,6 +1364,9 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — client abort, before vs a
         fromSha,
         checkedAt: expect.any(String) as string,
       })
+      // #and (B7) — the disconnect really did land after the journal recorded `applying`, not
+      // merely before the mutation happened to finish.
+      expect(journalPhaseAtInjection).toBe('applying')
     } finally {
       await fixture.close()
     }
@@ -1075,6 +1409,7 @@ describe('reconcileUpdateJournalsOnStartup', () => {
       fromSha: '0'.repeat(40),
       toSha: headSha,
       startedAt: new Date().toISOString(),
+      appliedAt: new Date().toISOString(),
     })
 
     // #when

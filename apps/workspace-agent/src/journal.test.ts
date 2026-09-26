@@ -27,16 +27,20 @@ const SHA_B = 'b'.repeat(40)
 const SHA_C = 'c'.repeat(40)
 const STARTED_AT = '2026-09-24T00:00:00.000Z'
 
-function makeUpdateJournal(phase: UpdateJournalPhase): UpdateJournal {
-  return {
-    kind: 'update',
-    owner: 'acme',
-    repo: 'widgets',
-    phase,
-    fromSha: SHA_A,
-    toSha: SHA_B,
-    startedAt: STARTED_AT,
+function makeUpdateJournal(phase: UpdateJournalPhase, appliedAt = STARTED_AT): UpdateJournal {
+  if (phase === 'applied') {
+    return {
+      kind: 'update',
+      owner: 'acme',
+      repo: 'widgets',
+      phase,
+      fromSha: SHA_A,
+      toSha: SHA_B,
+      startedAt: STARTED_AT,
+      appliedAt,
+    }
   }
+  return {kind: 'update', owner: 'acme', repo: 'widgets', phase, fromSha: SHA_A, toSha: SHA_B, startedAt: STARTED_AT}
 }
 
 function makeRecoveryJournal(phase: RecoveryJournalPhase): RecoveryJournal {
@@ -200,6 +204,33 @@ describe('readJournal — malformed input is refused, never treated as absent', 
     await writeFile(
       join(journalsDir, 'acme__widgets.json'),
       JSON.stringify({kind: 'reticulate-splines', owner: 'acme', repo: 'widgets', startedAt: STARTED_AT}),
+    )
+
+    // #when
+    const result = await readJournal(journalsDir, 'acme', 'widgets')
+
+    // #then
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toBe('malformed')
+  })
+
+  it("refuses an 'applied' update journal missing appliedAt (review round B, B7)", async () => {
+    // #given a phase 'applied' journal written without appliedAt — nothing has shipped, so this
+    // is never a legacy journal to stay lenient for; it must be malformed, never defaulted.
+    const journalsDir = journalsDirFor(tempRoot)
+    await mkdir(journalsDir, {recursive: true, mode: 0o700})
+    await writeFile(
+      join(journalsDir, 'acme__widgets.json'),
+      JSON.stringify({
+        kind: 'update',
+        owner: 'acme',
+        repo: 'widgets',
+        phase: 'applied',
+        fromSha: SHA_A,
+        toSha: SHA_B,
+        startedAt: STARTED_AT,
+      }),
     )
 
     // #when
