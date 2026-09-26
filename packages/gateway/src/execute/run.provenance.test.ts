@@ -5,13 +5,12 @@ import {
   awaitLaunchWorkRun,
   buildMockRunState,
   makeBinding,
-  makeCleanObservation,
   makeDeps,
   makeEnsureCloneFn,
   makeInMemoryRequest,
-  makeInspectFn,
   makeMessage,
   makeStatusControllerMock,
+  makeUpdateFn,
   mockCreateDiscordStreamSink,
   mockRunOpenCodeCore,
   mockRuntime,
@@ -19,9 +18,10 @@ import {
 } from './test-helpers.js'
 
 // ---------------------------------------------------------------------------
-// Checkout provenance — inspection under the lock, persistence onto run
-// state, engine-level prompt insertion, the human-facing deterministic
-// reply line on every delivery mode, and the corrected clone-failure mapping.
+// Checkout provenance — preparation (Unit 7's /update) under the lock, persistence onto run
+// state, engine-level prompt insertion, the human-facing deterministic reply line on every
+// delivery mode, and the corrected clone-failure mapping (ensureClone runs only when /update
+// reports `no-checkout`).
 // ---------------------------------------------------------------------------
 
 describe('checkout provenance', () => {
@@ -29,30 +29,46 @@ describe('checkout provenance', () => {
     vi.clearAllMocks()
   })
 
-  it('a run records its starting provenance on run state (EXECUTING detailsPatch)', async () => {
+  it('a run records its starting provenance on run state (EXECUTING detailsPatch), built from the /update ready result', async () => {
     // #given
     const {launchWork} = await import('./run.js')
     setupHappyPath()
-    const observation = makeCleanObservation({sha: 'b'.repeat(40), branch: 'feature/x'})
-    const inspect = makeInspectFn('observed')
-    ;(inspect as unknown as {mockResolvedValue: (v: unknown) => void}).mockResolvedValue({
+    const update = vi.fn().mockResolvedValue({
       success: true,
-      data: observation,
+      data: {
+        kind: 'ready',
+        change: 'unchanged',
+        branch: 'feature/x',
+        sha: 'b'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      },
     })
     const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect})
+    const deps = makeDeps({update})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
 
-    // #then — the EXECUTING transition carries checkoutProvenance in its detailsPatch
+    // #then — the EXECUTING transition carries checkoutProvenance in its detailsPatch, with a
+    // `checked` remote synthesized from the /update ready result — never `not-checked`.
     const executingCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'EXECUTING')
     expect(executingCall).toBeDefined()
     const options = executingCall?.[7]
     expect(options?.detailsPatch?.checkoutProvenance).toEqual({
       kind: 'observed',
-      observation,
-      remote: {kind: 'not-checked'},
+      observation: {
+        head: {kind: 'attached', branch: 'feature/x', sha: 'b'.repeat(40)},
+        worktree: {kind: 'clean'},
+        operationInProgress: 'none',
+        observedAt: '2026-01-01T00:00:00.000Z',
+      },
+      remote: {
+        kind: 'checked',
+        defaultBranch: 'feature/x',
+        sha: 'b'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+        change: 'unchanged',
+      },
     })
   })
 
@@ -61,7 +77,7 @@ describe('checkout provenance', () => {
     const {launchWork} = await import('./run.js')
     setupHappyPath()
     const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect: makeInspectFn('observed')})
+    const deps = makeDeps({update: makeUpdateFn('ready')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -70,7 +86,7 @@ describe('checkout provenance', () => {
     expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
     const promptText = mockRunOpenCodeCore.mock.calls[0]?.[0]?.promptText as string
     expect(promptText).toContain('Checkout provenance')
-    expect(promptText).toContain('Remote freshness was not checked')
+    expect(promptText).toContain('Remote checked: default branch')
   })
 
   it("the agent's prompt carries provenance on a custom/web promptBuilder path — proves engine-level insertion", async () => {
@@ -78,7 +94,7 @@ describe('checkout provenance', () => {
     const {launchWork} = await import('./run.js')
     setupHappyPath()
     const request = {...makeInMemoryRequest(), promptBuilder: () => 'CUSTOM WEB PROMPT'}
-    const deps = makeDeps({inspect: makeInspectFn('observed')})
+    const deps = makeDeps({update: makeUpdateFn('ready')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -90,7 +106,7 @@ describe('checkout provenance', () => {
     expect(promptText).toContain('Checkout provenance')
   })
 
-  it('the final reply carries the deterministic line on success (buffer channel — the ONLY channel the web transport uses)', async () => {
+  it('the final reply carries the deterministic checked-ready line on success (buffer channel — the ONLY channel the web transport uses)', async () => {
     // #given
     const {launchWork} = await import('./run.js')
     setupHappyPath()
@@ -98,7 +114,7 @@ describe('checkout provenance', () => {
       ;(params as {sink: {append: (t: string) => void}}).sink.append('the agent answer')
     })
     const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect: makeInspectFn('observed')})
+    const deps = makeDeps({update: makeUpdateFn('ready')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -106,8 +122,8 @@ describe('checkout provenance', () => {
     // #then
     const buffered = request._replySink.buffered()
     expect(buffered).toContain('the agent answer')
-    expect(buffered).toContain('Started from `acme/widget@')
-    expect(buffered).toContain('Remote freshness not checked.')
+    expect(buffered).toContain('The checkout is already at `')
+    expect(buffered).toContain(', checked `')
   })
 
   it('the final reply carries the deterministic line on generic failure — the failure-note text Discord delivers', async () => {
@@ -117,7 +133,7 @@ describe('checkout provenance', () => {
     const {RunCoreError} = await import('./run-core.js')
     mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
     const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect: makeInspectFn('observed')})
+    const deps = makeDeps({update: makeUpdateFn('ready')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -126,24 +142,7 @@ describe('checkout provenance', () => {
     const sends = request._replySink._sends
     const failureSend = sends.find(s => s.content.includes('stream closed unexpectedly'))
     expect(failureSend).toBeDefined()
-    expect(failureSend?.content).toContain('Started from `acme/widget@')
-  })
-
-  it('inspection unavailable → the run proceeds (runOpenCodeCore still called) and the line says so', async () => {
-    // #given
-    const {launchWork} = await import('./run.js')
-    setupHappyPath()
-    const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect: makeInspectFn('unavailable')})
-
-    // #when
-    await awaitLaunchWorkRun(launchWork, request, deps)
-
-    // #then — proceeded, not failed
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
-    const buffered = request._replySink.buffered()
-    expect(buffered).toContain('starting state unavailable')
-    expect(buffered).toContain('Remote freshness not checked')
+    expect(failureSend?.content).toContain('The checkout is already at `')
   })
 
   it('checkout-substituted → the run fails through the post-lock path, the lock is released, and no agent session starts', async () => {
@@ -178,7 +177,7 @@ describe('checkout provenance', () => {
     })
 
     const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect: makeInspectFn('checkout-substituted')})
+    const deps = makeDeps({update: makeUpdateFn('checkout-substituted')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -229,7 +228,7 @@ describe('checkout provenance', () => {
     })
 
     const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect: makeInspectFn('checkout-substituted')})
+    const deps = makeDeps({update: makeUpdateFn('checkout-substituted')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -245,17 +244,13 @@ describe('checkout provenance', () => {
       'Started from `acme/widget` — starting state withheld: checkout is not the expected repository.',
     )
     expect(failureSend?.content).not.toMatch(/@[0-9a-f]{7}/)
-    expect(failureSend?.content).not.toContain('Remote freshness')
   })
 
   it('eXECUTING lost the adoption race to an operator cancel: no provenance write ever lands', async () => {
-    // #given — inspect() succeeds (an observation is available and would normally be
-    // persisted via the EXECUTING detailsPatch), but the ACKNOWLEDGED -> EXECUTING
-    // transition 412s and a re-read shows the run was already cancelled by an operator.
-    // Pins existing behavior (run.ts's cancel-wins-adoption-race exit at the EXECUTING
-    // transition never writes provenance) — this test passes both before and after the
-    // comment-only change at that exit; there is no code-behavior fix here to induce a
-    // failure from.
+    // #given — /update succeeds with ready (a checked provenance would normally be persisted
+    // via the EXECUTING detailsPatch), but the ACKNOWLEDGED -> EXECUTING transition 412s and a
+    // re-read shows the run was already cancelled by an operator. Pins existing behavior (run.ts's
+    // cancel-wins-adoption-race exit at the EXECUTING transition never writes provenance).
     const {launchWork} = await import('./run.js')
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
     mockRuntime.acquireLock.mockResolvedValue({
@@ -297,7 +292,7 @@ describe('checkout provenance', () => {
     } as unknown as CoordinationConfig
 
     const request = makeInMemoryRequest()
-    const deps = makeDeps({coordinationConfig, inspect: makeInspectFn('observed')})
+    const deps = makeDeps({coordinationConfig, update: makeUpdateFn('ready')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -321,18 +316,30 @@ describe('checkout provenance', () => {
     expect(request._replySink._sends).toHaveLength(0)
   })
 
-  it('inspection is called after ensureClone and under the lock (call order)', async () => {
+  it('/update is called under the lock; ensureClone runs only after a no-checkout result, then /update is retried', async () => {
     // #given
     const {launchWork} = await import('./run.js')
     setupHappyPath()
     const callOrder: string[] = []
+    let updateCallCount = 0
     const ensureClone = vi.fn().mockImplementation(async () => {
       callOrder.push('ensureClone')
       return {success: true as const, data: '/workspace/acme/widget'}
     })
-    const inspect = vi.fn().mockImplementation(async () => {
-      callOrder.push('inspect')
-      return {success: true as const, data: makeCleanObservation()}
+    const update = vi.fn().mockImplementation(async () => {
+      updateCallCount += 1
+      callOrder.push(`update-${updateCallCount}`)
+      if (updateCallCount === 1) return {success: true as const, data: {kind: 'no-checkout' as const}}
+      return {
+        success: true as const,
+        data: {
+          kind: 'ready' as const,
+          change: 'unchanged' as const,
+          branch: 'main',
+          sha: 'a'.repeat(40),
+          checkedAt: '2026-01-01T00:00:00.000Z',
+        },
+      }
     })
     mockRuntime.acquireLock.mockImplementation(async () => {
       callOrder.push('acquireLock')
@@ -354,17 +361,37 @@ describe('checkout provenance', () => {
     })
 
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone, inspect})
+    const deps = makeDeps({ensureClone, update})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then
-    expect(callOrder).toEqual(['acquireLock', 'heartbeat.start', 'ensureClone', 'inspect'])
+    expect(callOrder).toEqual(['acquireLock', 'heartbeat.start', 'update-1', 'ensureClone', 'update-2'])
+  })
+
+  it('a no-checkout result on retry (after ensureClone) is treated as a workspace bug, not a transient blip', async () => {
+    // #given — update keeps reporting no-checkout even after ensureClone just ensured the
+    // checkout exists; this can only mean the workspace-agent's own view is inconsistent.
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({update: makeUpdateFn('no-checkout')})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — the operator-side "an operator needs to look at it" message, not a retry invitation
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.length > 0)
+    expect(errorSend).toBeDefined()
+    expect(errorSend?.content).toContain('An operator needs to look at it')
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
   it('corrected clone-failure mapping: an operator-side clone-error (invalid-repo) no longer yields the retry message', async () => {
-    // #given — clone-error code that is operator-side and will not resolve on its own
+    // #given — /update reports no-checkout so ensureClone runs; ensureClone then fails with a
+    // clone-error code that is operator-side and will not resolve on its own
     const {launchWork} = await import('./run.js')
     setupHappyPath()
     const ensureClone = makeEnsureCloneFn('success')
@@ -373,7 +400,7 @@ describe('checkout provenance', () => {
       error: {kind: 'workspace-failure', workspaceKind: 'clone-error', code: 'invalid-repo'},
     })
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -388,7 +415,7 @@ describe('checkout provenance', () => {
     expect(errorSend?.content).not.toMatch(/may not exist|doesn't have access/)
     expect(errorSend?.content).toContain('An operator needs to look at it')
 
-    // #and — inspect was never called (ensureClone failed before it)
+    // #and — no OpenCode session starts
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
@@ -405,7 +432,7 @@ describe('checkout provenance', () => {
       error: {kind: 'workspace-failure', workspaceKind: 'clone-error', code: 'checkout-handoff-failed'},
     })
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -417,8 +444,6 @@ describe('checkout provenance', () => {
     expect(errorSend?.content).not.toContain('not reachable')
     expect(errorSend?.content).not.toContain('try again later')
     expect(errorSend?.content).toContain('An operator needs to look at it')
-
-    // #and — inspect was never called (ensureClone failed before it)
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
@@ -434,7 +459,7 @@ describe('checkout provenance', () => {
       error: {kind: 'workspace-failure', workspaceKind: 'response-mismatch'},
     })
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -447,8 +472,6 @@ describe('checkout provenance', () => {
     expect(errorSend?.content).not.toContain('not reachable')
     expect(errorSend?.content).not.toContain('try again later')
     expect(errorSend?.content).toContain('An operator needs to look at it')
-
-    // #and — inspect was never called (ensureClone failed before it)
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
@@ -465,7 +488,7 @@ describe('checkout provenance', () => {
       error: {kind: 'workspace-failure', workspaceKind: 'clone-error', code: 'clone-failed'},
     })
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -485,7 +508,7 @@ describe('checkout provenance', () => {
       .fn()
       .mockResolvedValue({success: false, error: {kind: 'auth-failure', reason: 'not-installed'}})
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -506,7 +529,7 @@ describe('checkout provenance', () => {
       .fn()
       .mockResolvedValue({success: false, error: {kind: 'auth-failure', reason: 'insufficient-permissions'}})
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -526,7 +549,7 @@ describe('checkout provenance', () => {
     setupHappyPath()
     const ensureClone = vi.fn().mockResolvedValue({success: false, error: {kind: 'auth-failure', reason: 'auth-error'}})
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -544,7 +567,7 @@ describe('checkout provenance', () => {
     setupHappyPath()
     const ensureClone = vi.fn().mockResolvedValue({success: false, error: {kind: 'auth-failure'}})
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -561,7 +584,7 @@ describe('checkout provenance', () => {
     setupHappyPath()
     const ensureClone = vi.fn().mockResolvedValue({success: false, error: {kind: 'auth-failure', reason: 'timeout'}})
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -578,7 +601,7 @@ describe('checkout provenance', () => {
     setupHappyPath()
     const ensureClone = makeEnsureCloneFn('failure')
     const request = makeInMemoryRequest()
-    const deps = makeDeps({ensureClone})
+    const deps = makeDeps({ensureClone, update: makeUpdateFn('no-checkout')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -605,9 +628,9 @@ describe('checkout provenance', () => {
 // times (append call deleted) would fail these.
 // ---------------------------------------------------------------------------
 
-/** Count non-overlapping occurrences of the provenance line's stable opening marker. */
+/** Count non-overlapping occurrences of the checked-ready line's stable opening marker. */
 function countProvenanceMarker(text: string): number {
-  return (text.match(/Started from `acme\/widget/g) ?? []).length
+  return (text.match(/The checkout is already at `/g) ?? []).length
 }
 
 /** Stream-sink mock with a real accumulating buffer (unlike the static default). */
@@ -638,7 +661,7 @@ describe('the deterministic provenance line appears exactly once per delivery mo
     const ctrl = makeStatusControllerMock({resolveToAnswerResult: {transition: 'handled'}})
     mockCreateDiscordStreamSink.mockReturnValue(makeTrackingStreamSinkMock())
     const message = makeMessage()
-    const deps = makeDeps({statusMode: 'live-status', inspect: makeInspectFn('observed')})
+    const deps = makeDeps({statusMode: 'live-status', update: makeUpdateFn('ready')})
 
     // #when
     await runMention(message, makeBinding(), deps)
@@ -658,7 +681,7 @@ describe('the deterministic provenance line appears exactly once per delivery mo
     const streamSink = makeTrackingStreamSinkMock()
     mockCreateDiscordStreamSink.mockReturnValue(streamSink)
     const message = makeMessage()
-    const deps = makeDeps({statusMode: 'typing-only', inspect: makeInspectFn('observed')})
+    const deps = makeDeps({statusMode: 'typing-only', update: makeUpdateFn('ready')})
 
     // #when
     await runMention(message, makeBinding(), deps)
@@ -677,7 +700,7 @@ describe('the deterministic provenance line appears exactly once per delivery mo
       ;(params as {sink: {append: (t: string) => void}}).sink.append('the agent answer')
     })
     const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect: makeInspectFn('observed')})
+    const deps = makeDeps({update: makeUpdateFn('ready')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
@@ -695,7 +718,7 @@ describe('the deterministic provenance line appears exactly once per delivery mo
     setupHappyPath()
     mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed', true))
     const request = makeInMemoryRequest()
-    const deps = makeDeps({inspect: makeInspectFn('observed')})
+    const deps = makeDeps({update: makeUpdateFn('ready')})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)

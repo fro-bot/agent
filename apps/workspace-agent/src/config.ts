@@ -172,3 +172,50 @@ export function readReadyTimeoutMs(env: NodeJS.ProcessEnv = process.env): number
 
   return parsed
 }
+
+/** Trusted network config threaded into every `/update` network-half call (`ServerDeps.updateNetworkConfig`, server.ts; `UpdateHandlerDeps.proxy`/`.caBundlePath`, update.ts). */
+export interface UpdateNetworkConfig {
+  readonly caBundlePath?: string
+  readonly proxy?: {readonly https: string; readonly noProxy?: string}
+}
+
+/**
+ * Reads the egress-proxy and CA-bundle configuration `/update`'s network half needs, from the same
+ * sources already trusted elsewhere in this service:
+ * - Proxy: `HTTPS_PROXY`/`https_proxy` (uppercase preferred; same two names clone.ts's own
+ *   `buildCloneGitEnv` propagates for exactly the same reason — the workspace's sandbox-net is
+ *   internal-only, so git has no route out without an explicit proxy) and `NO_PROXY`/`no_proxy`.
+ *   Absent or empty — unlike `buildNetworkGitProfile`'s own contract, which treats an omitted
+ *   `proxy` as "never consult the ambient environment" — this function IS the one sanctioned place
+ *   ambient proxy env is read, exactly once, at startup; every later `/update` call receives the
+ *   already-resolved value, never re-reads `process.env` itself.
+ * - CA bundle: `GIT_SSL_CAINFO` — the same env var name `opencode-server.ts`'s `CA_BUNDLE_ENV_NAMES`
+ *   already forwards into the OpenCode child process for the identical purpose (trusting the
+ *   mitmproxy-installed CA). Reusing the identical name means a single value in the container's
+ *   environment configures CA trust for both OpenCode's own egress and `/update`'s network git
+ *   calls, instead of inventing a second, workspace-agent-specific variable. May be legitimately
+ *   absent: `buildNetworkGitProfile` falls back to the process's default trust store, which
+ *   already includes the mitmproxy CA when it is installed system-wide (see that function's own
+ *   doc comment).
+ *
+ * @param env - Environment object to read from. Defaults to `process.env`.
+ */
+export function readUpdateNetworkConfig(env: NodeJS.ProcessEnv = process.env): UpdateNetworkConfig {
+  const https = firstNonEmpty(env.HTTPS_PROXY, env.https_proxy)
+  const noProxy = firstNonEmpty(env.NO_PROXY, env.no_proxy)
+  const caBundlePath = firstNonEmpty(env.GIT_SSL_CAINFO)
+
+  const proxy = https === undefined ? undefined : noProxy === undefined ? {https} : {https, noProxy}
+
+  return {
+    ...(caBundlePath === undefined ? {} : {caBundlePath}),
+    ...(proxy === undefined ? {} : {proxy}),
+  }
+}
+
+function firstNonEmpty(...values: readonly (string | undefined)[]): string | undefined {
+  for (const value of values) {
+    if (value !== undefined && value !== '') return value
+  }
+  return undefined
+}

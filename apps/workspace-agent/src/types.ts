@@ -10,6 +10,9 @@
  * The caller never controls where the repo is cloned.
  */
 
+import type {LayoutRefusalReason, Obstruction} from './checkout-profile.js'
+import type {RecoveryJournalPhase, UpdateJournalPhase} from './journal.js'
+
 /** POST /clone request body. */
 export interface CloneRequest {
   readonly owner: string
@@ -64,6 +67,19 @@ export type CloneErrorCode =
    * see handoff.ts `HandoffFailureReason`) is carried in `CloneFailure.code`.
    */
   | 'checkout-handoff-failed'
+  /**
+   * A journal (journal.ts) already exists for this repository — an update or recovery mutation
+   * was interrupted (or is still in flight) and left state that clone must not silently clone
+   * over. NOT deterministic in the same sense as `checkout-handoff-failed`: once the outstanding
+   * journal is resolved (by `/update` or `/recover` in later units, or by an operator running
+   * `/fro-bot recover-checkout`), a retried clone can succeed. The gateway does not yet special-
+   * case this code (see `packages/gateway/src/workspace-api/client.ts`'s `CLONE_ERROR_CODES` and
+   * `packages/gateway/src/execute/run.ts`'s `PERMANENT_CLONE_ERROR_CODES`) — until it does, it
+   * falls through `classifyEnsureCloneFailure` to the default `'unreachable'` bucket, which invites
+   * a retry rather than pointing at recovery. Track updating that classification alongside Unit 4
+   * (`/update`) or Unit 7 (preparation in the run path).
+   */
+  | 'journal-in-progress'
 
 /** POST /inspect request body. */
 export interface InspectRequest {
@@ -121,6 +137,176 @@ export type InspectErrorCode =
   | 'inspection-failed'
   | 'inspection-timeout'
 
+/** POST /update request body. */
+export interface UpdateRequest {
+  readonly owner: string
+  readonly repo: string
+  /** Installation access token (ghs_*). Used only by the network half; never logged. */
+  readonly token: string
+}
+
+/** How the checkout's branch tip changed (or didn't) as a result of this update. */
+export type UpdateChangeKind = 'fast-forward' | 'unchanged'
+
+/**
+ * The checkout was already eligible and is now current — unchanged, or fast-forwarded to the
+ * remote tip. Carries CHECKED remote evidence; a `ready` result is never produced from an
+ * unchecked or cached observation.
+ */
+export interface UpdateReady {
+  readonly kind: 'ready'
+  readonly change: UpdateChangeKind
+  readonly branch: string
+  readonly sha: string
+  /** HEAD before the update, when `change` is `fast-forward`. Omitted when `change` is `unchanged`. */
+  readonly fromSha?: string
+  /** ISO-8601 timestamp, from an injected clock, when the remote evidence was checked. */
+  readonly checkedAt: string
+}
+
+/**
+ * Every reason `/update` can refuse to run for, closed and final — see the plan's Unit 2 "Policy"
+ * fixtures for why classifying `detached`/`non-default-branch`/`diverged`/`ahead`/`obstructed` is
+ * update.ts's job, not checkout-profile.ts's.
+ */
+export type UpdateRefusalReason =
+  | 'needs-recovery'
+  | 'checkout-substituted'
+  | 'unsupported-layout'
+  | 'unsupported-config'
+  | 'operation-in-progress'
+  | 'dirty'
+  | 'submodule-initialized'
+  | 'detached'
+  | 'non-default-branch'
+  | 'diverged'
+  | 'ahead'
+  | 'obstructed'
+  /**
+   * This repository is under a sticky, in-process maintenance hold (repo-mutex.ts's
+   * `markRepoHeld`/`repoHoldReason`) — some earlier `/update` (or `/clone`) ended with an
+   * UNCONFIRMED subprocess termination, so the service cannot rule out a leaked process still
+   * touching this repository's on-disk state. Checked FIRST, before journal reconciliation —
+   * before anything else — and cleared only by a process restart.
+   */
+  | 'maintenance-hold'
+
+/**
+ * The checkout is ineligible; no mutation was ever attempted, and NO network profile was ever
+ * built or spawned reaching this result — every admission check runs entirely local-only, as
+ * AGENT_UID. Discriminated by `reason`, each carrying exactly the detail its refusal reply needs.
+ */
+export type UpdateRefused =
+  | {readonly kind: 'refused'; readonly reason: 'needs-recovery'}
+  | {readonly kind: 'refused'; readonly reason: 'checkout-substituted'}
+  | {readonly kind: 'refused'; readonly reason: 'unsupported-layout'; readonly layoutReason: LayoutRefusalReason}
+  | {readonly kind: 'refused'; readonly reason: 'unsupported-config'; readonly disallowedKeys: readonly string[]}
+  | {readonly kind: 'refused'; readonly reason: 'operation-in-progress'; readonly operation: CheckoutOperation}
+  | {readonly kind: 'refused'; readonly reason: 'dirty'; readonly changedPaths: readonly string[]}
+  | {readonly kind: 'refused'; readonly reason: 'submodule-initialized'; readonly submodules: readonly string[]}
+  | {readonly kind: 'refused'; readonly reason: 'detached'}
+  | {readonly kind: 'refused'; readonly reason: 'non-default-branch'; readonly branch: string}
+  | {readonly kind: 'refused'; readonly reason: 'diverged'}
+  | {readonly kind: 'refused'; readonly reason: 'ahead'}
+  | {readonly kind: 'refused'; readonly reason: 'obstructed'; readonly obstructions: readonly Obstruction[]}
+  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
+
+/**
+ * Every reason `/update` can fail for, closed. Fetch-phase reasons (`fetch-*`, `remote-moved`)
+ * always carry `mutationStarted: false` — nothing in the checkout was ever touched, and the
+ * journal (if any exists yet at that point) is cleared. `apply-failed`'s `mutationStarted` and
+ * journal disposition depend on whether the fast-forward merge command itself had already been
+ * spawned — see that reason's own doc comment. `termination-unconfirmed` always leaves the journal
+ * at `applying` UNLESS it happened before the journal ever reached `applying` in the first place
+ * (a network-phase git call whose termination could not be confirmed) — in that earlier case there
+ * is no `applying` journal to leave behind, and `mutationStarted` is `false`; the repository is
+ * placed under a maintenance hold either way (repo-mutex.ts's `markRepoHeld`), since an unconfirmed
+ * termination means a leaked process may still be running regardless of which phase it happened in.
+ */
+export type UpdateFailureReason =
+  /**
+   * The client's `AbortSignal` fired before the apply phase began (checked only up through the
+   * fetch phase — once the journal records `applying`, the mutation runs to completion or
+   * confirmed termination regardless of a later disconnect).
+   */
+  | 'aborted'
+  /**
+   * A local admission check could not determine an answer (a git subprocess timed out, its
+   * termination went unconfirmed, or it returned something this module can't parse) and failed
+   * closed rather than guessing.
+   */
+  | 'inspection-failed'
+  /** The remote rejected the credential (401, or an auth challenge never satisfied). Not permanent — a fresh token may succeed. */
+  | 'fetch-auth-rejected'
+  /** The remote reported 404 — explicit positive evidence the repository doesn't exist (or isn't visible to this token). Permanent. */
+  | 'fetch-not-found'
+  /** The remote reported 403 — explicit positive evidence access is denied. Permanent. */
+  | 'fetch-forbidden'
+  /** The remote reported 429. Not permanent — expected to clear. */
+  | 'fetch-rate-limited'
+  /** The remote host could not be reached (connection refused, DNS failure, TLS failure). Not permanent. */
+  | 'fetch-unreachable'
+  /** The fetch phase (ls-remote or fetch) did not complete within the network budget. Not permanent. */
+  | 'fetch-timeout'
+  /** A fetch-phase git invocation failed for a reason this module's classifier doesn't recognize. Not permanent — unclassified failures are never assumed permanent. */
+  | 'fetch-failed'
+  /** The remote's default-branch tip moved between observations, twice in a row (the one retry was exhausted). Not permanent. */
+  | 'remote-moved'
+  /**
+   * A CONFIRMED (non-zero exit, or a positively-detected mismatch — never an unconfirmed
+   * termination, which is always reported as `termination-unconfirmed` instead) failure somewhere
+   * in the apply phase. `mutationStarted` depends on exactly WHERE: the object import and every
+   * pre-merge re-admission re-check (layout, config, cleanliness, submodules, re-observed
+   * head/branch/operation state) run before the fast-forward merge itself is ever spawned — the
+   * checkout's refs, HEAD, and working tree are untouched at that point (the import is additive-
+   * only), so those report `mutationStarted: false` and the journal is cleared. Once the merge
+   * command has actually been spawned, any subsequent confirmed failure (a non-zero exit, or a
+   * post-merge verification mismatch — branch, HEAD SHA, or working-tree cleanliness against the
+   * target) reports `mutationStarted: true` and the journal stays at `applying` for recovery.
+   */
+  | 'apply-failed'
+  /**
+   * A pack-stream or merge subprocess's termination could not be CONFIRMED (mirrors
+   * `PackStreamOutcome`'s/`GitOutcome`'s own `termination-unconfirmed`). `mutationStarted:
+   * 'possibly'` — never a synonym for `true`.
+   */
+  | 'termination-unconfirmed'
+
+/**
+ * An attempt was made and did not succeed. `mutationStarted` is `'possibly'` only when subprocess
+ * termination itself went unconfirmed — never a synonym for `true`.
+ */
+export interface UpdateFailed {
+  readonly kind: 'failed'
+  readonly reason: UpdateFailureReason
+  readonly mutationStarted: boolean | 'possibly'
+  readonly permanent: boolean
+}
+
+/**
+ * No checkout exists at this repository's path, and no journal is in flight for it either — the
+ * gateway should clone, not update.
+ */
+export interface UpdateNoCheckout {
+  readonly kind: 'no-checkout'
+}
+
+/** The discriminated result of a `/update` attempt. Never flags — exactly one of these four shapes. */
+export type UpdateResult = UpdateReady | UpdateRefused | UpdateFailed | UpdateNoCheckout
+
+/**
+ * POST /update validation failure — an HTTP-layer request-shape problem (oversized body,
+ * unparseable JSON, an invalid owner/repo/token) caught BEFORE `executeUpdate` is ever called.
+ * Deliberately a separate, `ok`-discriminated shape from `UpdateResult`: `UpdateResult`'s
+ * `refused`/`failed` variants are the DOMAIN outcome of a well-formed request `executeUpdate`
+ * actually attempted, and carry no HTTP-layer-only reasons (`malformed-body`, `body-too-large`,
+ * ...) in their closed unions.
+ */
+export interface UpdateValidationFailure {
+  readonly ok: false
+  readonly error: 'malformed-body' | 'body-too-large' | 'invalid-owner' | 'invalid-repo' | 'invalid-token-shape'
+}
+
 /** GET /healthz response. */
 export interface HealthzResponse {
   readonly ok: true
@@ -137,3 +323,166 @@ export interface ReadyzResponse {
    */
   readonly opencode: 'ready' | 'starting' | 'down' | 'degraded' | 'unknown'
 }
+
+/** POST /recover/preview request body. */
+export interface PreviewRecoveryRequest {
+  readonly owner: string
+  readonly repo: string
+}
+
+export interface DirtyCounts {
+  readonly staged: number
+  readonly unstaged: number
+  readonly untracked: number
+  readonly conflicted: number
+}
+
+/** Current usage against the fixed retention quota. */
+export interface RetentionUsage {
+  readonly generationCount: number
+  /** True if any existing generation's size could not be measured (malformed/unreadable metadata) — the quota check fails closed rather than treating it as zero bytes. */
+  readonly hasUnknownSize: boolean
+  readonly totalBytes: number
+  readonly maxGenerations: number
+  readonly maxBytes: number
+}
+
+/** Full preview — `inspectionSafe: true` — every admission check the checkout would face passed. */
+export interface SafeRecoveryPreview {
+  readonly inspectionSafe: true
+  readonly headSha: string | undefined
+  readonly branch: string | undefined
+  readonly dirty: DirtyCounts
+  readonly operationInProgress: CheckoutOperation
+  readonly ignoredCount: number
+  readonly estimatedSizeBytes: number
+  readonly entryCount: number
+  readonly sizeMeasurementComplete: boolean
+  readonly retention: RetentionUsage
+  readonly fingerprint: string
+}
+
+/** Opaque preview — `inspectionSafe: false` — admission would refuse the checkout; no git ever ran in it. */
+export interface OpaqueRecoveryPreview {
+  readonly inspectionSafe: false
+  readonly estimatedSizeBytes: number
+  readonly entryCount: number
+  readonly sizeMeasurementComplete: boolean
+  readonly retention: RetentionUsage
+  readonly fingerprint: string
+}
+
+export type RecoveryPreview = SafeRecoveryPreview | OpaqueRecoveryPreview
+
+/**
+ * An interrupted UPDATE journal reported as RECOVERABLE via `/recover`, rather than a dead-end
+ * refusal. (Review round F, F6) Carries a filesystem-only (no git) size/entry-count observation of
+ * the checkout at confirm time, so the projected quota and disk-headroom checks have real evidence
+ * instead of a fixed zero. `fingerprint` digests the journal's own identity (phase, from/to SHAs,
+ * AND `startedAt` — distinguishing one interrupted-update instance from a later one at the same
+ * phase/SHAs) together with the size observation, never a live git inspection.
+ */
+export interface RecoverableUpdatePreview {
+  readonly phase: UpdateJournalPhase
+  readonly fromSha: string
+  readonly toSha: string
+  readonly startedAt: string
+  readonly estimatedSizeBytes: number
+  readonly entryCount: number
+  readonly sizeMeasurementComplete: boolean
+  readonly fingerprint: string
+}
+
+/** A journal (update or recovery) currently in flight for this repository. */
+export type JournalInProgressPhase = UpdateJournalPhase | RecoveryJournalPhase | 'malformed'
+
+export type PreviewRecoveryResult =
+  | {readonly kind: 'no-checkout'}
+  | {readonly kind: 'refused'; readonly reason: 'checkout-substituted'}
+  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
+  | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
+  | {readonly kind: 'failed'; readonly reason: 'inspection-failed'}
+  | {readonly kind: 'failed'; readonly reason: 'termination-unconfirmed'}
+  | {readonly kind: 'ok'; readonly preview: RecoveryPreview}
+  | {readonly kind: 'recoverable-update'; readonly update: RecoverableUpdatePreview}
+
+/** POST /recover request body. */
+export interface ExecuteRecoveryRequest {
+  readonly owner: string
+  readonly repo: string
+  readonly token: string
+  /** The fingerprint the operator saw from `previewRecovery`; recomputed and compared under the mutex. */
+  readonly fingerprint: string
+}
+
+export type ExecuteRecoveryFailureReason =
+  | 'inspection-failed'
+  | 'fetch-failed'
+  | 'build-failed'
+  | 'quarantine-failed'
+  | 'install-failed'
+  | 'verification-failed'
+  | 'termination-unconfirmed'
+
+export type ExecuteRecoveryResult =
+  | {readonly kind: 'no-checkout'}
+  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
+  | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
+  | {readonly kind: 'refused'; readonly reason: 'checkout-changed'}
+  | {readonly kind: 'refused'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
+  | {readonly kind: 'refused'; readonly reason: 'insufficient-disk-space'}
+  | {readonly kind: 'failed'; readonly reason: ExecuteRecoveryFailureReason}
+  | {readonly kind: 'ok'; readonly recoveryId: string; readonly sha: string; readonly branch: string}
+
+/**
+ * POST /recover/preview validation failure — an HTTP-layer request-shape problem caught BEFORE
+ * `previewRecovery` is ever called. Mirrors `UpdateValidationFailure`'s pattern.
+ */
+export interface PreviewRecoveryValidationFailure {
+  readonly ok: false
+  readonly error: 'malformed-body' | 'body-too-large' | 'invalid-owner' | 'invalid-repo'
+}
+
+/** POST /recover validation failure — an HTTP-layer request-shape problem caught BEFORE `executeRecovery` is ever called. */
+export interface ExecuteRecoveryValidationFailure {
+  readonly ok: false
+  readonly error:
+    | 'malformed-body'
+    | 'body-too-large'
+    | 'invalid-owner'
+    | 'invalid-repo'
+    | 'invalid-token-shape'
+    | 'invalid-fingerprint'
+}
+
+/** GET/DELETE /backups/... validation failure — owner/repo path-segment problems caught BEFORE `listBackups`/`deleteBackup` is ever called. An invalid `id` reuses `DeleteBackupResult`'s own `{kind: 'refused', reason: 'invalid-id'}` shape instead of a second, redundant type. */
+export interface BackupsValidationFailure {
+  readonly ok: false
+  readonly error: 'invalid-owner' | 'invalid-repo'
+}
+
+/** One listable quarantine generation. `metadataOk: false` means metadata.json failed to parse — the entry is still listed and deletable, but size/HEAD/branch are unknown rather than guessed. */
+export interface BackupEntry {
+  readonly id: string
+  readonly metadataOk: boolean
+  readonly createdAt: string
+  readonly sizeBytes: number
+  /** False when the size is unknown. */
+  readonly sizeComplete: boolean
+  readonly originalHeadSha: string | undefined
+  readonly originalBranch: string | undefined
+}
+
+/** GET /backups/:owner/:repo response. */
+export type ListBackupsResult =
+  | {readonly kind: 'ok'; readonly backups: readonly BackupEntry[]; readonly totalBytes: number}
+  | {readonly kind: 'failed'}
+
+/** DELETE /backups/:owner/:repo/:id response. */
+export type DeleteBackupResult =
+  | {readonly kind: 'ok'}
+  | {
+      readonly kind: 'refused'
+      readonly reason: 'invalid-id' | 'not-found' | 'maintenance-hold' | 'recovery-in-progress'
+    }
+  | {readonly kind: 'failed'}

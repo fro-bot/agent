@@ -37,6 +37,10 @@ import {
 import {Effect} from 'effect'
 
 export type {AwsCredentials, ObjectStoreConfig} from '@fro-bot/runtime'
+// Re-exported so non-run.ts callers (e.g. discord/ maintenance-run helpers) never import
+// @fro-bot/runtime directly for heartbeat lifecycle glue — this file stays the single seam.
+export {createHeartbeatController} from '@fro-bot/runtime'
+export type {HeartbeatController, HeartbeatStopResult} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Shared logger type used by all coordination functions
