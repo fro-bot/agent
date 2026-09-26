@@ -56,7 +56,7 @@ import type {JournalListEntry} from './journal.js'
 import type {CheckoutHead, UpdateFailed, UpdateReady, UpdateRefused, UpdateRequest, UpdateResult} from './types.js'
 
 import {randomUUID} from 'node:crypto'
-import {lstat, mkdir, mkdtemp, realpath, rm} from 'node:fs/promises'
+import {lstat, mkdir, mkdtemp, readdir, realpath, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {dirname, join} from 'node:path'
 import {performance} from 'node:perf_hooks'
@@ -483,38 +483,39 @@ export async function reconcileUpdateJournalsOnStartup(deps: ReconcileUpdateJour
           return
         }
 
-        // (C2) One tracker for this repository's reconciliation — any unconfirmed termination it
-        // sees, from ANY git call `reconcileUpdateJournal` makes, wins over that call's own return
-        // value: the journal must stay in place and the repository must be held.
+        // (D1) One tracker for this repository's reconciliation, routed through the shared
+        // `runTrackedInvocation` choke point so an unconfirmed termination holds the repository
+        // and leaves the journal in place EVEN IF `reconcileUpdateJournal` throws, not only when it
+        // returns normally.
         const tracker = createInvocationTracker({gitRunner})
-        const outcome = await reconcileUpdateJournal({
-          journalsDir,
-          owner,
-          repo,
-          destPath,
+        await runTrackedInvocation(
+          repoKey,
           tracker,
-          timeoutMs,
-          uid,
-          gid,
-        })
-        if (tracker.sawUnconfirmed()) {
-          markRepoHeld(repoKey, 'termination-unconfirmed')
-          logger.warn(
-            "update: startup reconciliation's subprocess termination could not be confirmed — holding the repository and leaving its journal in place",
-            {owner, repo, phase},
-          )
-          return
-        }
-        if (outcome.kind === 'continue' || outcome.kind === 'ready') {
-          logger.info('update: startup reconciliation cleared a journal', {owner, repo, phase})
-          return
-        }
-        logger.warn(
-          'update: startup reconciliation left a journal in place — the next /update will refuse needs-recovery',
-          {
-            owner,
-            repo,
-            phase,
+          async () => {
+            const outcome = await reconcileUpdateJournal({
+              journalsDir,
+              owner,
+              repo,
+              destPath,
+              tracker,
+              timeoutMs,
+              uid,
+              gid,
+            })
+            if (outcome.kind === 'continue' || outcome.kind === 'ready') {
+              logger.info('update: startup reconciliation cleared a journal', {owner, repo, phase})
+              return
+            }
+            logger.warn(
+              'update: startup reconciliation left a journal in place — the next /update will refuse needs-recovery',
+              {owner, repo, phase},
+            )
+          },
+          () => {
+            logger.warn(
+              "update: startup reconciliation's subprocess termination could not be confirmed — holding the repository and leaving its journal in place",
+              {owner, repo, phase},
+            )
           },
         )
       })
@@ -576,6 +577,20 @@ export interface InvocationTracker {
   /** Records that this invocation's journal has reached (or passed) the `applying` phase — the point of no return for `mutationStarted` classification ('possibly' vs `false`) on an unconfirmed termination. */
   readonly markApplyingPhase: () => void
   readonly isApplyingPhase: () => boolean
+  /**
+   * (Review round D, D2) Tracks the ACTUAL mutating dispatch (the fast-forward merge — the only
+   * subprocess that touches ref/HEAD/working-tree state), never the journal phase alone: the
+   * additive-only pack import is dispatched/resolved too, but resolving it (confirmed, whatever
+   * the outcome) returns the state to 'none' rather than 'confirmed' — an uncertain, unrelated
+   * READ after a CONFIRMED import must never be misread as a possible mutation.
+   */
+  readonly markMutationDispatched: () => void
+  /** A dispatched mutating subprocess (the pack import) reached a CONFIRMED outcome that does NOT itself count as "the" mutation — resets to 'none' unless already 'confirmed'. */
+  readonly markMutationResolved: () => void
+  /** The real mutation (the merge) reached a CONFIRMED outcome — sticky `true` from here on, regardless of any later, unrelated uncertainty (e.g. ref cleanup). */
+  readonly markMutationConfirmed: () => void
+  /** `false` if no mutating subprocess was ever dispatched; `'possibly'` if one is dispatched but its outcome is still uncertain; `true` once the merge is confirmed. */
+  readonly mutationStartedStatus: () => boolean | 'possibly'
 }
 
 export function createInvocationTracker(params: {
@@ -585,6 +600,7 @@ export function createInvocationTracker(params: {
   const {gitRunner: baseGitRunner, packStreamRunner: basePackStreamRunner = runPackStream} = params
   let unconfirmed = false
   let applyingPhase = false
+  let mutationState: 'none' | 'dispatched' | 'confirmed' = 'none'
   let activeDeadline: Deadline | undefined
 
   // Fresh on EVERY dispatch — never a value a caller computed once and reused across several of
@@ -622,7 +638,54 @@ export function createInvocationTracker(params: {
       applyingPhase = true
     },
     isApplyingPhase: () => applyingPhase,
+    markMutationDispatched: () => {
+      if (mutationState !== 'confirmed') mutationState = 'dispatched'
+    },
+    markMutationResolved: () => {
+      if (mutationState !== 'confirmed') mutationState = 'none'
+    },
+    markMutationConfirmed: () => {
+      mutationState = 'confirmed'
+    },
+    mutationStartedStatus: () => {
+      if (mutationState === 'confirmed') return true
+      if (mutationState === 'dispatched') return 'possibly'
+      return false
+    },
   }
+}
+
+/**
+ * (Review round D, D1) A return-only choke point misses exceptions: if `tracker` records
+ * uncertainty and `fn` then THROWS (rather than returning), a bare `if (tracker.sawUnconfirmed())`
+ * placed only after a normal return is never reached, so `markRepoHeld` is skipped and the
+ * per-repo mutex releases with the hold never set. This is the ONE place that sets the hold from a
+ * tracked invocation — `executeUpdate`, `reconcileUpdateJournalsOnStartup`, `executeRecovery`, and
+ * `reconcileRecoveryJournalsOnStartup` (recover.ts) all route through it instead of duplicating the
+ * try/catch/finally pattern. `onUnconfirmed()` builds the module-specific override result
+ * (`UpdateResult` here, `ExecuteRecoveryResult` in recover.ts) — built and returned INSTEAD of
+ * rethrowing `fn`'s own exception whenever uncertainty was recorded, since "a subprocess we can't
+ * account for" is a more actionable signal than whatever exception happened to surface alongside
+ * it. A `fn` that throws WITHOUT any recorded uncertainty still rethrows normally.
+ */
+export async function runTrackedInvocation<T>(
+  key: string,
+  tracker: InvocationTracker,
+  fn: () => Promise<T>,
+  onUnconfirmed: () => T,
+): Promise<T> {
+  let outcome: T | undefined
+  let caught: unknown
+  try {
+    outcome = await fn()
+  } catch (error) {
+    caught = error
+  } finally {
+    if (tracker.sawUnconfirmed()) markRepoHeld(key, 'termination-unconfirmed')
+  }
+  if (tracker.sawUnconfirmed()) return onUnconfirmed()
+  if (caught !== undefined) throw caught
+  return outcome as T
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +773,47 @@ async function checkProtectedFetchDir(path: string): Promise<ProtectedDirCheck> 
  * malformed-content parsing journal.ts's checks exist for. `git init --template=` (empty) so a
  * freshly created store never gets git's own sample-hooks template copied into it.
  */
+/**
+ * (Review round D, D3) A directory that passes `checkProtectedFetchDir` (real, non-symlink, mode
+ * 0700) is NOT necessarily an initialized bare repo — a crash between the leaf `mkdir` and `git
+ * init --bare` below leaves exactly that: an empty, otherwise-valid 0700 directory, which would
+ * pass forever and fail every later fetch against it. Confirms via `rev-parse
+ * --is-bare-repository` (authoritative, via the tracked runner) rather than a filesystem-shape
+ * guess. An empty directory (confirmed via `readdir`, never assumed) is safe to `git init --bare`
+ * into IN PLACE; anything else — SOME but not all of a repo's structure present — refuses outright
+ * rather than guessing what state it's in.
+ */
+async function validateOrRepairBareStore(
+  fetchStorePath: string,
+  gitRunner: GitRunnerFn,
+  timeoutMs: number,
+): Promise<'ok' | 'failed' | 'unconfirmed'> {
+  const check = await gitRunner(['--git-dir', fetchStorePath, 'rev-parse', '--is-bare-repository'], {
+    cwd: fetchStorePath,
+    env: buildNeutralGitEnv(),
+    timeoutMs,
+  })
+  if (check.kind === 'termination-unconfirmed') return 'unconfirmed'
+  if (check.kind === 'ok' && check.stdout.trim() === 'true') return 'ok'
+
+  let entries: readonly string[]
+  try {
+    entries = await readdir(fetchStorePath)
+  } catch {
+    return 'failed'
+  }
+  if (entries.length > 0) return 'failed'
+
+  const initOutcome = await gitRunner(['init', '--quiet', '--bare', '--template=', fetchStorePath], {
+    cwd: dirname(fetchStorePath),
+    env: buildNeutralGitEnv(),
+    timeoutMs,
+  })
+  if (initOutcome.kind === 'ok') return 'ok'
+  if (initOutcome.kind === 'termination-unconfirmed') return 'unconfirmed'
+  return 'failed'
+}
+
 export async function ensureBareFetchStore(params: {
   readonly fetchStorePath: string
   readonly gitRunner: GitRunnerFn
@@ -718,7 +822,7 @@ export async function ensureBareFetchStore(params: {
   const {fetchStorePath, gitRunner, timeoutMs} = params
 
   const existing = await checkProtectedFetchDir(fetchStorePath)
-  if (existing.kind === 'ok') return 'ok'
+  if (existing.kind === 'ok') return validateOrRepairBareStore(fetchStorePath, gitRunner, timeoutMs)
   if (existing.kind === 'failed') return 'failed'
 
   const parent = dirname(fetchStorePath)
@@ -1389,7 +1493,11 @@ async function runFastForward(params: {
 
   if (deadline.expired()) return preMergeFailed()
 
-  // Point of no return — every failure below LEAVES the journal at `applying`.
+  // Point of no return — every failure below LEAVES the journal at `applying`. (D2) Dispatched
+  // right before the actual subprocess spawn, confirmed right after: this IS the mutation that
+  // matters — once confirmed, `mutationStartedStatus()` stays `true` even if something unrelated
+  // later (post-merge verification, ref cleanup) is uncertain.
+  tracker.markMutationDispatched()
   const mergeOutcome = await gitRunner([...localProfile.args, 'merge', '--ff-only', '--no-overwrite-ignore', toSha], {
     cwd: localProfile.cwd,
     env: mergeEnv,
@@ -1400,6 +1508,7 @@ async function runFastForward(params: {
   if (mergeOutcome.kind === 'termination-unconfirmed') {
     return {kind: 'failed', reason: 'termination-unconfirmed', mutationStarted: 'possibly', permanent: false}
   }
+  tracker.markMutationConfirmed()
   const POST_MERGE_FAILED: UpdateFailed = {
     kind: 'failed',
     reason: 'apply-failed',
@@ -1574,6 +1683,10 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       await clearJournal()
       return {kind: 'failed', reason: 'apply-failed', mutationStarted: false, permanent: false}
     }
+    // (D2) Dispatched before the pack-stream call, resolved right after — resolving (whatever the
+    // outcome, so long as it's CONFIRMED) returns to 'none': the import is additive-only and never
+    // counts as "the" mutation on its own, only the merge below does.
+    tracker.markMutationDispatched()
     const imported = await importPackObjects({
       bareRepoPath: fetchStorePath,
       canonicalCheckoutPath,
@@ -1586,9 +1699,13 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       gid,
     })
     if (imported.kind === 'failed') {
-      if (imported.result.reason !== 'termination-unconfirmed') await clearJournal()
+      if (imported.result.reason !== 'termination-unconfirmed') {
+        tracker.markMutationResolved()
+        await clearJournal()
+      }
       return imported.result
     }
+    tracker.markMutationResolved()
 
     // T's objects are now resolvable in the checkout — alongside H, which the checkout always
     // already had — so ancestry can finally be decided, for every case, not only "behind".
@@ -1778,146 +1895,144 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
       return {kind: 'refused', reason: 'maintenance-hold'}
     }
 
-    // (C2) Every step below (through the end of the network/apply half) is wrapped in one IIFE so
-    // EVERY exit — an early admission refusal/failure just as much as `runNetworkAndApply`'s own
-    // result — funnels through the SINGLE choke point below, which overrides based on `tracker`
-    // rather than on what any individual step concluded.
-    const admissionResult = await (async (): Promise<UpdateResult> => {
-      // Step 1: reconcile this repository's journal before anything else, under the mutex, so it
-      // can never race a concurrent write of the same journal.
-      const reconciliation = await reconcileUpdateJournal({
-        journalsDir,
-        owner,
-        repo,
-        destPath,
-        tracker,
-        timeoutMs,
-        uid,
-        gid,
-      })
-      if (reconciliation.kind !== 'continue') return reconciliation.result
+    // (D1) `runTrackedInvocation` is the single choke point: it runs every step below (through
+    // the end of the network/apply half) and, if `tracker` ever recorded an unconfirmed
+    // termination — whether this async function returns normally OR throws — sets the maintenance
+    // hold and returns the override below INSTEAD of the naive result or a propagated exception.
+    return runTrackedInvocation(
+      repoMutexKey(owner, repo),
+      tracker,
+      async (): Promise<UpdateResult> => {
+        // Step 1: reconcile this repository's journal before anything else, under the mutex, so it
+        // can never race a concurrent write of the same journal.
+        const reconciliation = await reconcileUpdateJournal({
+          journalsDir,
+          owner,
+          repo,
+          destPath,
+          tracker,
+          timeoutMs,
+          uid,
+          gid,
+        })
+        if (reconciliation.kind !== 'continue') return reconciliation.result
 
-      // Step 2: canonical-path containment, exactly as inspect.ts — reused via `inspectCheckout`,
-      // which in the same call also supplies HEAD/branch state and in-progress-operation detection
-      // (step 4 below).
-      const inspected = await inspectCheckout(
-        {owner, repo},
-        {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
-      )
-      if (inspected.response.ok === false) {
-        const {error} = inspected.response
-        if (error === 'no-checkout') return {kind: 'no-checkout'}
-        if (error === 'checkout-substituted') return {kind: 'refused', reason: 'checkout-substituted'}
-        // 'inspection-failed' | 'inspection-timeout' — a local check couldn't determine an answer.
-        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-      }
-      const observation = inspected.response.observation
-
-      // Step 3: layout.
-      const layout = await checkCheckoutLayout({checkoutPath: destPath, timeoutMs, uid, gid})
-      if (layout.kind === 'refused') return {kind: 'refused', reason: 'unsupported-layout', layoutReason: layout.reason}
-      if (layout.kind === 'inspection-failed') {
-        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-      }
-
-      // Step 4: initialized submodules. Deliberately BEFORE the config allowlist (step 5): `git
-      // submodule init`/`update --init` always writes `submodule.<name>.url`/`.active` into local
-      // config, which the allowlist below refuses regardless — checking submodules first reports
-      // the more specific, more actionable `submodule-initialized` reason instead of a generic
-      // `unsupported-config` for this common case (confirmed empirically: unsetting those two keys
-      // while leaving `.git/modules/<name>` in place makes `git submodule status` itself report the
-      // submodule as no longer initialized, so the two checks are inherently coupled — ordering is
-      // what decides which refusal reason a caller actually sees).
-      const submodules = await checkNoInitializedSubmodules({checkoutPath: destPath, gitRunner, timeoutMs, uid, gid})
-      if (submodules.kind === 'refused') {
-        return {kind: 'refused', reason: 'submodule-initialized', submodules: submodules.submodules}
-      }
-      if (submodules.kind === 'inspection-failed') {
-        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-      }
-
-      // Step 5: the closed config allowlist.
-      const configInventory = await inventoryCheckoutConfig({checkoutPath: destPath, gitRunner, timeoutMs, uid, gid})
-      if (configInventory.kind === 'refused') {
-        return {kind: 'refused', reason: 'unsupported-config', disallowedKeys: configInventory.disallowedKeys}
-      }
-      if (configInventory.kind === 'inspection-failed') {
-        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-      }
-
-      // Step 6: in-progress merge/rebase/am/cherry-pick/revert/bisect, from step 2's observation.
-      if (observation.operationInProgress !== 'none') {
-        return {kind: 'refused', reason: 'operation-in-progress', operation: observation.operationInProgress}
-      }
-
-      // Step 7: temp-index cleanliness against HEAD — never the checkout's own (agent-writable)
-      // persisted index.
-      const cleanliness = await checkTempIndexCleanliness({
-        checkoutPath: destPath,
-        headSha: observation.head.sha,
-        gitRunner,
-        timeoutMs,
-        uid,
-        gid,
-      })
-      if (cleanliness.kind === 'dirty') {
-        return {
-          kind: 'refused',
-          reason: 'dirty',
-          changedPaths: cleanliness.changedPaths.slice(0, MAX_DIRTY_SAMPLE_SIZE),
+        // Step 2: canonical-path containment, exactly as inspect.ts — reused via `inspectCheckout`,
+        // which in the same call also supplies HEAD/branch state and in-progress-operation detection
+        // (step 4 below).
+        const inspected = await inspectCheckout(
+          {owner, repo},
+          {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
+        )
+        if (inspected.response.ok === false) {
+          const {error} = inspected.response
+          if (error === 'no-checkout') return {kind: 'no-checkout'}
+          if (error === 'checkout-substituted') return {kind: 'refused', reason: 'checkout-substituted'}
+          // 'inspection-failed' | 'inspection-timeout' — a local check couldn't determine an answer.
+          return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
         }
-      }
-      if (cleanliness.kind === 'inspection-failed') {
-        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-      }
+        const observation = inspected.response.observation
 
-      // Step 8: client abort, checked once, immediately before the network/apply half would begin.
-      if (signal?.aborted === true) {
-        return {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}
-      }
+        // Step 3: layout.
+        const layout = await checkCheckoutLayout({checkoutPath: destPath, timeoutMs, uid, gid})
+        if (layout.kind === 'refused')
+          return {kind: 'refused', reason: 'unsupported-layout', layoutReason: layout.reason}
+        if (layout.kind === 'inspection-failed') {
+          return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+        }
 
-      // Admission passed in full — bring the checkout up to date.
-      return runNetworkAndApply({
-        owner,
-        repo,
-        token: request.token,
-        reposRoot,
-        canonicalCheckoutPath: destPath,
-        head: observation.head,
-        journalsDir,
-        tracker,
-        remoteBaseUrl,
-        caBundlePath,
-        proxy,
-        askpassWriter,
-        serviceHome,
-        networkBudgetMs,
-        applyTimeoutMs,
-        maxPackBytes,
-        timeoutMs,
-        uid,
-        gid,
-        now,
-        signal,
-        monotonicNow,
-        logger,
-      })
-    })()
+        // Step 4: initialized submodules. Deliberately BEFORE the config allowlist (step 5): `git
+        // submodule init`/`update --init` always writes `submodule.<name>.url`/`.active` into local
+        // config, which the allowlist below refuses regardless — checking submodules first reports
+        // the more specific, more actionable `submodule-initialized` reason instead of a generic
+        // `unsupported-config` for this common case (confirmed empirically: unsetting those two keys
+        // while leaving `.git/modules/<name>` in place makes `git submodule status` itself report the
+        // submodule as no longer initialized, so the two checks are inherently coupled — ordering is
+        // what decides which refusal reason a caller actually sees).
+        const submodules = await checkNoInitializedSubmodules({checkoutPath: destPath, gitRunner, timeoutMs, uid, gid})
+        if (submodules.kind === 'refused') {
+          return {kind: 'refused', reason: 'submodule-initialized', submodules: submodules.submodules}
+        }
+        if (submodules.kind === 'inspection-failed') {
+          return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+        }
 
-    // (C2) Single choke point: ANY unconfirmed termination this tracker saw, at ANY phase of this
-    // invocation — admission, journal reconciliation, or the network/apply half — wins over
-    // whatever the naive result above says. `mutationStarted` is 'possibly' once the journal has
-    // reached `applying` (`runNetworkAndApply` marks that via `tracker.markApplyingPhase()`),
-    // `false` before it.
-    if (tracker.sawUnconfirmed()) {
-      markRepoHeld(repoMutexKey(owner, repo), 'termination-unconfirmed')
-      return {
+        // Step 5: the closed config allowlist.
+        const configInventory = await inventoryCheckoutConfig({checkoutPath: destPath, gitRunner, timeoutMs, uid, gid})
+        if (configInventory.kind === 'refused') {
+          return {kind: 'refused', reason: 'unsupported-config', disallowedKeys: configInventory.disallowedKeys}
+        }
+        if (configInventory.kind === 'inspection-failed') {
+          return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+        }
+
+        // Step 6: in-progress merge/rebase/am/cherry-pick/revert/bisect, from step 2's observation.
+        if (observation.operationInProgress !== 'none') {
+          return {kind: 'refused', reason: 'operation-in-progress', operation: observation.operationInProgress}
+        }
+
+        // Step 7: temp-index cleanliness against HEAD — never the checkout's own (agent-writable)
+        // persisted index.
+        const cleanliness = await checkTempIndexCleanliness({
+          checkoutPath: destPath,
+          headSha: observation.head.sha,
+          gitRunner,
+          timeoutMs,
+          uid,
+          gid,
+        })
+        if (cleanliness.kind === 'dirty') {
+          return {
+            kind: 'refused',
+            reason: 'dirty',
+            changedPaths: cleanliness.changedPaths.slice(0, MAX_DIRTY_SAMPLE_SIZE),
+          }
+        }
+        if (cleanliness.kind === 'inspection-failed') {
+          return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+        }
+
+        // Step 8: client abort, checked once, immediately before the network/apply half would begin.
+        if (signal?.aborted === true) {
+          return {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}
+        }
+
+        // Admission passed in full — bring the checkout up to date.
+        return runNetworkAndApply({
+          owner,
+          repo,
+          token: request.token,
+          reposRoot,
+          canonicalCheckoutPath: destPath,
+          head: observation.head,
+          journalsDir,
+          tracker,
+          remoteBaseUrl,
+          caBundlePath,
+          proxy,
+          askpassWriter,
+          serviceHome,
+          networkBudgetMs,
+          applyTimeoutMs,
+          maxPackBytes,
+          timeoutMs,
+          uid,
+          gid,
+          now,
+          signal,
+          monotonicNow,
+          logger,
+        })
+      },
+      (): UpdateResult => ({
         kind: 'failed',
         reason: 'termination-unconfirmed',
-        mutationStarted: tracker.isApplyingPhase() ? 'possibly' : false,
+        // (D2) Reflects the ACTUAL mutating dispatch (the merge), not merely "the journal reached
+        // applying" — an uncertain bare-store read or an uncertain unrelated check never inflates
+        // this to 'possibly', and a confirmed merge stays `true` regardless of later uncertainty.
+        mutationStarted: tracker.mutationStartedStatus(),
         permanent: false,
-      }
-    }
-    return admissionResult
+      }),
+    )
   })
 }

@@ -50,6 +50,8 @@ function makeRecoveryJournal(phase: RecoveryJournalPhase): RecoveryJournal {
     repo: 'widgets',
     phase,
     recoveryId: 'gen-1',
+    targetSha: SHA_B,
+    branch: 'main',
     startedAt: STARTED_AT,
   }
 }
@@ -321,6 +323,8 @@ describe('listJournals', () => {
       repo: 'gadgets',
       phase: 'building',
       recoveryId: 'gen-1',
+      targetSha: SHA_B,
+      branch: 'main',
       startedAt: '2026-09-24T00:01:00.000Z',
     }
 

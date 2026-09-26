@@ -49,7 +49,7 @@ import {
 } from './identity.js'
 import {inspectCheckout} from './inspect.js'
 import {listJournals, readJournal, removeJournal, writeJournal} from './journal.js'
-import {markRepoHeld, repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
+import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
 import {
   createDeadline,
   createInvocationTracker,
@@ -62,6 +62,7 @@ import {
   fetchIntoRef,
   fetchStorePathFor,
   observeRemoteDefaultBranch,
+  runTrackedInvocation,
 } from './update.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors update.ts/inspect.ts. */
@@ -147,6 +148,8 @@ export type PreviewRecoveryResult =
   | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
   | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
   | {readonly kind: 'failed'; readonly reason: 'inspection-failed'}
+  /** (Review round D, D4) An unconfirmed subprocess termination anywhere in this preview — a hold is set and NO preview (not even opaque) is ever returned for it. */
+  | {readonly kind: 'failed'; readonly reason: 'termination-unconfirmed'}
   | {readonly kind: 'ok'; readonly preview: RecoveryPreview}
 
 /** Default headroom multiplier for the free-space preflight — plan: "start at twice the estimated checkout size". */
@@ -525,7 +528,7 @@ export async function previewRecovery(
   deps: PreviewRecoveryDeps = {},
 ): Promise<PreviewRecoveryResult> {
   const {
-    gitRunner = runGit,
+    gitRunner: injectedGitRunner = runGit,
     reposRoot = WORKSPACE_REPOS_ROOT,
     options = {},
     now = () => new Date(),
@@ -535,20 +538,31 @@ export async function previewRecovery(
   } = deps
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const {owner, repo} = request
+  const repoKey = repoMutexKey(owner, repo)
 
-  return withRepoLock(repoMutexKey(owner, repo), async () =>
-    computeRecoveryPreviewLocked(owner, repo, {
-      gitRunner,
-      reposRoot,
-      timeoutMs,
-      uid,
-      gid,
-      now,
-      walkDeadlineMs,
-      walkMaxEntries,
-      monotonicNow,
-    }),
-  )
+  // (D4) Wraps the ENTIRE standalone preview in a tracker + the shared D1 choke point: an
+  // unconfirmed termination anywhere holds the repository and returns `termination-unconfirmed`,
+  // never a preview — opaque or otherwise — built on an uncertain read.
+  return withRepoLock(repoKey, async () => {
+    const tracker = createInvocationTracker({gitRunner: injectedGitRunner})
+    return runTrackedInvocation(
+      repoKey,
+      tracker,
+      async () =>
+        computeRecoveryPreviewLocked(owner, repo, {
+          gitRunner: tracker.gitRunner,
+          reposRoot,
+          timeoutMs,
+          uid,
+          gid,
+          now,
+          walkDeadlineMs,
+          walkMaxEntries,
+          monotonicNow,
+        }),
+      (): PreviewRecoveryResult => ({kind: 'failed', reason: 'termination-unconfirmed'}),
+    )
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -769,40 +783,6 @@ async function verifyInstalledCheckout(params: {
   return cleanliness.kind === 'clean' ? 'ok' : 'failed'
 }
 
-/** Self-consistency verification used ONLY by crash reconciliation, which has no stored target branch/sha to compare against (RecoveryJournal carries only owner/repo/phase/recoveryId/startedAt) — reads whatever HEAD currently is and confirms it resolves, is attached, and is clean against itself. */
-async function verifyInstalledCheckoutSelfConsistent(params: {
-  readonly canonicalPath: string
-  readonly gitRunner: GitRunnerFn
-  readonly timeoutMs: number
-  readonly uid: number | undefined
-  readonly gid: number | undefined
-}): Promise<'ok' | 'failed'> {
-  const {canonicalPath, gitRunner, timeoutMs, uid, gid} = params
-  const env = buildNeutralGitEnv()
-  const headOutcome = await gitRunner(
-    gitInvocation(canonicalPath, canonicalPath, ['rev-parse', '--verify', 'HEAD^{commit}']),
-    {cwd: canonicalPath, env, timeoutMs, uid, gid},
-  )
-  if (headOutcome.kind !== 'ok') return 'failed'
-  const sha = headOutcome.stdout.trim()
-
-  const branchOutcome = await gitRunner(
-    gitInvocation(canonicalPath, canonicalPath, ['symbolic-ref', '--short', 'HEAD']),
-    {cwd: canonicalPath, env, timeoutMs, uid, gid},
-  )
-  if (branchOutcome.kind !== 'ok') return 'failed'
-
-  const cleanliness = await checkTempIndexCleanliness({
-    checkoutPath: canonicalPath,
-    headSha: sha,
-    gitRunner,
-    timeoutMs,
-    uid,
-    gid,
-  })
-  return cleanliness.kind === 'clean' ? 'ok' : 'failed'
-}
-
 /** `<reposRoot>/.workspace-agent/staging/recover-<recoveryId>` — deterministic from `recoveryId` alone (never a random mkdtemp name) so crash reconciliation can find it without the journal carrying an extra field. */
 function stagingPathFor(reposRoot: string, recoveryId: string): string {
   return join(reposRoot, WORKSPACE_STATE_DIR_NAME, CLONE_STAGING_DIR_NAME, `recover-${recoveryId}`)
@@ -817,7 +797,7 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-export type RecoveryReconciliationOutcome = 'cleared' | 'left-in-place'
+export type RecoveryReconciliationOutcome = 'cleared' | 'left-in-place' | 'left-in-place-missing-checkout'
 
 /**
  * Applies the plan's recovery reconciliation table to one journal. At NO phase is the original
@@ -860,6 +840,11 @@ async function reconcileOneRecoveryJournal(params: {
   }
 
   if ((phase === 'quarantining' || phase === 'installing') && !(await pathExists(checkoutPath))) {
+    // (D5) Neither the original (already quarantined, or never existed) nor the staged
+    // replacement exists — nothing this function can safely do. Distinct from an ordinary rename
+    // failure below: this is reported (and logged by the caller) as its own outcome, never as a
+    // success.
+    if (!(await pathExists(stagingPath))) return 'left-in-place-missing-checkout'
     try {
       await rename(stagingPath, checkoutPath)
     } catch {
@@ -867,8 +852,13 @@ async function reconcileOneRecoveryJournal(params: {
     }
   }
 
-  const verified = await verifyInstalledCheckoutSelfConsistent({
+  // (D5) Every recovery journal now carries its own target — verify the installed checkout
+  // against THAT, never merely against itself (self-consistency alone can't detect a checkout
+  // installed at the wrong commit or branch).
+  const verified = await verifyInstalledCheckout({
     canonicalPath: checkoutPath,
+    branch: journal.branch,
+    sha: journal.targetSha,
     gitRunner,
     timeoutMs,
     uid,
@@ -932,30 +922,36 @@ export async function reconcileRecoveryJournalsOnStartup(deps: ReconcileRecovery
           })
           return
         }
+        // (D1) Routed through the shared choke point so a throw from `reconcileOneRecoveryJournal`
+        // still holds the repository, not only an ordinary non-'cleared' return.
         const tracker = createInvocationTracker({gitRunner})
-        const outcome = await reconcileOneRecoveryJournal({
-          journalsDir,
-          reposRoot,
-          journal,
-          gitRunner: tracker.gitRunner,
-          timeoutMs,
-          uid,
-          gid,
-        })
-        if (tracker.sawUnconfirmed()) {
-          markRepoHeld(repoKey, 'termination-unconfirmed')
-          logger.warn('recover: reconciliation subprocess termination could not be confirmed — holding repository', {
-            owner,
-            repo,
-            phase,
-          })
-          return
-        }
-        logger[outcome === 'cleared' ? 'info' : 'warn'](`recover: startup reconciliation ${outcome} a journal`, {
-          owner,
-          repo,
-          phase,
-        })
+        await runTrackedInvocation(
+          repoKey,
+          tracker,
+          async () => {
+            const outcome = await reconcileOneRecoveryJournal({
+              journalsDir,
+              reposRoot,
+              journal,
+              gitRunner: tracker.gitRunner,
+              timeoutMs,
+              uid,
+              gid,
+            })
+            logger[outcome === 'cleared' ? 'info' : 'warn'](`recover: startup reconciliation ${outcome} a journal`, {
+              owner,
+              repo,
+              phase,
+            })
+          },
+          () => {
+            logger.warn('recover: reconciliation subprocess termination could not be confirmed — holding repository', {
+              owner,
+              repo,
+              phase,
+            })
+          },
+        )
       })
     } catch (error) {
       logger.error('recover: startup reconciliation failed unexpectedly for one journal — leaving it in place', {
@@ -1092,15 +1088,11 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   })
   if (preflight.kind !== 'ok') return preflight
 
-  await writeJournal(journalsDir, {
-    kind: 'recovery',
-    owner,
-    repo,
-    phase: 'building',
-    recoveryId,
-    startedAt: now().toISOString(),
-  })
-
+  // (Review round D, D5) The FIRST journal write is deferred until the recovery target (branch +
+  // sha) is actually known — see below, right before staging begins — so `targetSha`/`branch` are
+  // never absent from any recovery journal this function writes. Nothing before that point mutates
+  // anything durable (the bare fetch store is root-owned and self-healing — D3), so there is
+  // nothing for a crash in this earlier window to leave inconsistent.
   const fetchStorePath = fetchStorePathFor(reposRoot, owner, repo)
   const storeReady = await ensureBareFetchStore({fetchStorePath, gitRunner, timeoutMs})
   if (storeReady !== 'ok') return {kind: 'failed', reason: 'fetch-failed'}
@@ -1126,6 +1118,17 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     tracker.setDeadline(undefined)
     if (fetched.kind !== 'ok') return {kind: 'failed', reason: 'fetch-failed'}
     target = fetched
+
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner,
+      repo,
+      phase: 'building',
+      recoveryId,
+      targetSha: target.sha,
+      branch: target.branch,
+      startedAt: now().toISOString(),
+    })
 
     await mkdir(stagingPath, {recursive: true, mode: 0o700})
     tracker.markApplyingPhase()
@@ -1160,6 +1163,8 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     repo,
     phase: 'quarantining',
     recoveryId,
+    targetSha: target.sha,
+    branch: target.branch,
     startedAt: now().toISOString(),
   })
   if (hadExistingCheckout && preview.kind === 'ok') {
@@ -1188,6 +1193,8 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     repo,
     phase: 'installing',
     recoveryId,
+    targetSha: target.sha,
+    branch: target.branch,
     startedAt: now().toISOString(),
   })
   try {
@@ -1203,6 +1210,8 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     repo,
     phase: 'verifying',
     recoveryId,
+    targetSha: target.sha,
+    branch: target.branch,
     startedAt: now().toISOString(),
   })
   const verified = await verifyInstalledCheckout({
@@ -1265,46 +1274,42 @@ export async function executeRecovery(
     const tracker = createInvocationTracker({gitRunner: injectedGitRunner, packStreamRunner: injectedPackStreamRunner})
     const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
     const checkoutPath = join(reposRoot, owner, repo)
-    let outcome: ExecuteRecoveryResult | undefined
-    let caught: unknown
 
-    try {
-      outcome = await runRecoveryMutation({
-        owner,
-        repo,
-        token: request.token,
-        fingerprint: request.fingerprint,
-        reposRoot,
-        journalsDir,
-        checkoutPath,
-        tracker,
-        timeoutMs,
-        uid,
-        gid,
-        now,
-        walkDeadlineMs,
-        walkMaxEntries,
-        monotonicNow,
-        remoteBaseUrl,
-        caBundlePath,
-        proxy,
-        askpassWriter,
-        serviceHome,
-        networkBudgetMs,
-        buildTimeoutMs,
-        maxPackBytes,
-        diskHeadroomMultiplier,
-        statfsFn,
-        recoveryId: recoveryIdFn(),
-      })
-    } catch (error) {
-      caught = error
-    } finally {
-      if (tracker.sawUnconfirmed()) markRepoHeld(repoKey, 'termination-unconfirmed')
-    }
-
-    if (tracker.sawUnconfirmed()) return {kind: 'failed', reason: 'termination-unconfirmed'}
-    if (caught !== undefined) throw caught
-    return outcome as ExecuteRecoveryResult
+    // (D1) Shared choke point (update.ts) — sets the hold in a try/finally so it fires even if
+    // `runRecoveryMutation` throws, not only on an ordinary return.
+    return runTrackedInvocation(
+      repoKey,
+      tracker,
+      async () =>
+        runRecoveryMutation({
+          owner,
+          repo,
+          token: request.token,
+          fingerprint: request.fingerprint,
+          reposRoot,
+          journalsDir,
+          checkoutPath,
+          tracker,
+          timeoutMs,
+          uid,
+          gid,
+          now,
+          walkDeadlineMs,
+          walkMaxEntries,
+          monotonicNow,
+          remoteBaseUrl,
+          caBundlePath,
+          proxy,
+          askpassWriter,
+          serviceHome,
+          networkBudgetMs,
+          buildTimeoutMs,
+          maxPackBytes,
+          diskHeadroomMultiplier,
+          statfsFn,
+          recoveryId: recoveryIdFn(),
+        }),
+      (): ExecuteRecoveryResult => ({kind: 'failed', reason: 'termination-unconfirmed'}),
+    )
   })
 }

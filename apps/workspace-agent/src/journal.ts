@@ -90,7 +90,13 @@ export type UpdateJournal =
       readonly appliedAt: string
     }
 
-/** An in-flight preserve-and-replace recovery of a checkout. */
+/**
+ * An in-flight preserve-and-replace recovery of a checkout. `targetSha`/`branch` (review round D,
+ * D5) are REQUIRED — nothing has shipped without them, so there is no legacy journal to stay
+ * lenient for — and let crash reconciliation's `verifying` phase compare the installed checkout
+ * against the ACTUAL recovery target, rather than merely checking it against itself
+ * (self-consistency alone can't detect a checkout installed at the wrong commit or branch).
+ */
 export interface RecoveryJournal {
   readonly kind: 'recovery'
   readonly owner: string
@@ -98,6 +104,10 @@ export interface RecoveryJournal {
   readonly phase: RecoveryJournalPhase
   /** Identifier of the quarantine generation this recovery is creating (or has created). */
   readonly recoveryId: string
+  /** The remote SHA this recovery is installing. */
+  readonly targetSha: string
+  /** The remote's default branch this recovery is installing. */
+  readonly branch: string
   /** ISO-8601 timestamp, from an injected clock, when the journal was first written. */
   readonly startedAt: string
 }
@@ -196,12 +206,15 @@ function parseJournal(value: unknown): Journal | null {
   if (v.kind === 'recovery') {
     if (!isNonEmptyString(v.phase) || !RECOVERY_PHASES.has(v.phase)) return null
     if (!isNonEmptyString(v.recoveryId)) return null
+    if (!isNonEmptyString(v.targetSha) || !isNonEmptyString(v.branch)) return null
     return {
       kind: 'recovery',
       owner: v.owner,
       repo: v.repo,
       phase: v.phase as RecoveryJournalPhase,
       recoveryId: v.recoveryId,
+      targetSha: v.targetSha,
+      branch: v.branch,
       startedAt: v.startedAt,
     }
   }

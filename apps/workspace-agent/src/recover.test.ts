@@ -325,6 +325,8 @@ describe('previewRecovery — journal-in-progress and maintenance-hold refusals'
       repo: REPO,
       phase: 'quarantining',
       recoveryId: 'gen-1',
+      targetSha: '1'.repeat(40),
+      branch: 'main',
       startedAt: new Date().toISOString(),
     })
 
@@ -346,6 +348,27 @@ describe('previewRecovery — journal-in-progress and maintenance-hold refusals'
 
     // #then
     expect(result).toEqual({kind: 'refused', reason: 'maintenance-hold'})
+    expect(calls).toEqual([])
+  })
+})
+
+describe('previewRecovery — D4: tracked, never returns a preview built on uncertainty', () => {
+  it('an unconfirmed config-inventory call sets the hold and fails termination-unconfirmed — never an opaque preview', async () => {
+    await setupCleanCheckout()
+    const forgingRunner: GitRunnerFn = async (args, options) => {
+      if (args.includes('config') && args.includes('--list')) return {kind: 'termination-unconfirmed'}
+      return runGit(args, options)
+    }
+
+    const result = await previewRecovery(req(), deps({gitRunner: forgingRunner}))
+
+    expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
+    expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+
+    // #and — a follow-up preview refuses maintenance-hold with zero git calls
+    const {runner, calls} = makeGitRunnerSpy()
+    const followUp = await previewRecovery(req(), deps({gitRunner: runner}))
+    expect(followUp).toEqual({kind: 'refused', reason: 'maintenance-hold'})
     expect(calls).toEqual([])
   })
 })
@@ -409,7 +432,7 @@ describe('previewRecovery — the filesystem size/entry-count walk is bounded, a
   })
 })
 
-describe('executeRecovery — happy path (real remote, real git)', () => {
+describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_000}, () => {
   it.skipIf(!OPENSSL_AVAILABLE)(
     'preserves a dirty checkout byte-for-byte in quarantine and installs a clean checkout a follow-up executeUpdate reports unchanged',
     async () => {
@@ -478,7 +501,7 @@ describe('executeRecovery — happy path (real remote, real git)', () => {
   )
 })
 
-describe('executeRecovery — opaque checkout (hostile config)', () => {
+describe('executeRecovery — opaque checkout (hostile config)', {timeout: 30_000}, () => {
   it.skipIf(!OPENSSL_AVAILABLE)('recovers a hostile-config checkout without ever running git in it', async () => {
     // #given a checkout with a planted filter driver — not on the closed config allowlist
     await setupCleanCheckout()
@@ -513,7 +536,7 @@ describe('executeRecovery — opaque checkout (hostile config)', () => {
   })
 })
 
-describe('executeRecovery — fingerprint mismatch refuses checkout-changed', () => {
+describe('executeRecovery — fingerprint mismatch refuses checkout-changed', {timeout: 30_000}, () => {
   it.skipIf(!OPENSSL_AVAILABLE)('a new local commit landing after preview refuses and moves nothing', async () => {
     // #given
     await setupCleanCheckout()
@@ -575,7 +598,7 @@ async function createFakeGeneration(owner: string, repo: string, id: string, siz
   )
 }
 
-describe('executeRecovery — quota and disk-space preflight refuse before building', () => {
+describe('executeRecovery — quota and disk-space preflight refuse before building', {timeout: 30_000}, () => {
   it.skipIf(!OPENSSL_AVAILABLE)('refuses quota-exceeded at 5 generations, moving nothing', async () => {
     // #given
     await setupCleanCheckout()
@@ -623,7 +646,7 @@ describe('executeRecovery — quota and disk-space preflight refuse before build
   })
 })
 
-describe('executeRecovery — no checkout installs without quarantine', () => {
+describe('executeRecovery — no checkout installs without quarantine', {timeout: 30_000}, () => {
   it.skipIf(!OPENSSL_AVAILABLE)('installs a fresh checkout with no prior generation written', async () => {
     // #given no checkout at all for this owner/repo
     const preview = await previewRecovery(req(), deps())
@@ -646,7 +669,7 @@ describe('executeRecovery — no checkout installs without quarantine', () => {
   })
 })
 
-describe('executeRecovery — concurrency serializes with itself and with executeUpdate', () => {
+describe('executeRecovery — concurrency serializes with itself and with executeUpdate', {timeout: 30_000}, () => {
   it.skipIf(!OPENSSL_AVAILABLE)(
     'a second concurrent recover, started with the same (now-stale) fingerprint, is fully serialized behind the first',
     async () => {
@@ -711,91 +734,79 @@ describe('executeRecovery — concurrency serializes with itself and with execut
   )
 })
 
-/** A gitRunner whose Nth call follows `sequence` (clamped to the last entry once exhausted): 'unconfirmed' reports a termination-unconfirmed outcome, 'throw' raises a REAL exception (not a git outcome), 'real' delegates to actual git. */
-function makeSequencedGitRunner(sequence: readonly ('unconfirmed' | 'throw' | 'real')[]): {
-  readonly runner: GitRunnerFn
-  readonly reset: () => void
-} {
-  let index = 0
-  const runner: GitRunnerFn = async (args, options) => {
-    const step = sequence[Math.min(index, sequence.length - 1)]
-    index += 1
-    if (step === 'unconfirmed') return {kind: 'termination-unconfirmed'}
-    if (step === 'throw') throw new Error('simulated crash after uncertainty')
-    return runGit(args, options)
-  }
-  return {runner, reset: () => (index = 0)}
-}
+describe(
+  'executeRecovery — unconfirmed subprocess termination holds the repo and keeps the journal',
+  {timeout: 30_000},
+  () => {
+    it.skipIf(!OPENSSL_AVAILABLE)(
+      'an unconfirmed termination during the build phase fails termination-unconfirmed, sets the hold, and never clears the journal',
+      async () => {
+        // #given a clean checkout and a packStreamRunner whose only call reports uncertainty
+        await setupCleanCheckout()
+        const preview = await previewRecovery(req(), deps())
+        if (preview.kind !== 'ok') throw new Error('unreachable')
+        const packStreamRunner = async () => ({kind: 'termination-unconfirmed'}) as const
 
-describe('executeRecovery — unconfirmed subprocess termination holds the repo and keeps the journal', () => {
-  it.skipIf(!OPENSSL_AVAILABLE)(
-    'an unconfirmed termination during the build phase fails termination-unconfirmed, sets the hold, and never clears the journal',
-    async () => {
-      // #given a clean checkout and a packStreamRunner whose only call reports uncertainty
-      await setupCleanCheckout()
-      const preview = await previewRecovery(req(), deps())
-      if (preview.kind !== 'ok') throw new Error('unreachable')
-      const packStreamRunner = async () => ({kind: 'termination-unconfirmed'}) as const
+        const fixture = await setupNetworkFixture()
+        try {
+          // #when
+          const result = await executeRecovery(
+            {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+            recoveryDeps(fixture, {packStreamRunner}),
+          )
 
-      const fixture = await setupNetworkFixture()
-      try {
-        // #when
-        const result = await executeRecovery(
-          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
-          recoveryDeps(fixture, {packStreamRunner}),
-        )
+          // #then
+          expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
+          expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+          const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+          const journal = await readJournal(journalsDir, OWNER, REPO)
+          expect(journal.ok).toBe(true)
+          if (!journal.ok) throw new Error('unreachable')
+          expect(journal.journal.phase).toBe('building')
+          // #and — the original checkout was never touched
+          if (!preview.preview.inspectionSafe) throw new Error('unreachable')
+          expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(
+            preview.preview.headSha,
+          )
+        } finally {
+          await fixture.close()
+        }
+      },
+    )
 
-        // #then
-        expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
-        expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
-        const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
-        const journal = await readJournal(journalsDir, OWNER, REPO)
-        expect(journal.ok).toBe(true)
-        if (!journal.ok) throw new Error('unreachable')
-        expect(journal.journal.phase).toBe('building')
-        // #and — the original checkout was never touched
-        if (!preview.preview.inspectionSafe) throw new Error('unreachable')
-        expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(
-          preview.preview.headSha,
-        )
-      } finally {
-        await fixture.close()
-      }
-    },
-  )
+    it.skipIf(!OPENSSL_AVAILABLE)(
+      'an unconfirmed bare-store init (before ANY journal exists) still holds the repository via the shared D1 choke point',
+      async () => {
+        // #given a normal preview for a valid fingerprint, then a gitRunner whose bare fetch-store
+        // `git init --bare` call — the very first mutating call `runRecoveryMutation` makes, before
+        // any journal is written — reports uncertainty
+        await setupCleanCheckout()
+        const preview = await previewRecovery(req(), deps())
+        if (preview.kind !== 'ok') throw new Error('unreachable')
+        const forgingRunner: GitRunnerFn = async (args, options) => {
+          if (args.includes('init') && args.includes('--bare')) return {kind: 'termination-unconfirmed'}
+          return runGit(args, options)
+        }
 
-  it.skipIf(!OPENSSL_AVAILABLE)(
-    'uncertainty followed by a LATER rejection still resolves to termination-unconfirmed, never an unhandled throw',
-    async () => {
-      // #given the config-inventory call reports uncertainty (degrading to an opaque preview), and
-      // the very next git call (the bare fetch-store init) then throws a genuine exception
-      await setupCleanCheckout()
-      const {runner, reset} = makeSequencedGitRunner(['unconfirmed', 'throw'])
-      const preview = await previewRecovery(req(), deps({gitRunner: runner}))
-      if (preview.kind !== 'ok') throw new Error('unreachable')
-      reset()
+        const fixture = await setupNetworkFixture()
+        try {
+          // #when
+          const result = await executeRecovery(
+            {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+            recoveryDeps(fixture, {gitRunner: forgingRunner}),
+          )
 
-      const fixture = await setupNetworkFixture()
-      try {
-        // #when
-        const result = await executeRecovery(
-          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
-          recoveryDeps(fixture, {gitRunner: runner}),
-        )
-
-        // #then — the choke point runs in a `finally`, so it fires even though `runRecoveryMutation`
-        // THREW rather than returned.
-        expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
-        expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
-        const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
-        const journal = await readJournal(journalsDir, OWNER, REPO)
-        expect(journal.ok).toBe(true)
-      } finally {
-        await fixture.close()
-      }
-    },
-  )
-})
+          // #then — the shared choke point (update.ts's `runTrackedInvocation`) overrides the naive
+          // `fetch-failed` result and sets the hold, even though nothing was ever journaled.
+          expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
+          expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+        } finally {
+          await fixture.close()
+        }
+      },
+    )
+  },
+)
 
 const noopLogger = {info: () => {}, warn: () => {}, error: () => {}}
 
@@ -810,6 +821,51 @@ function createStagingCheckout(path: string, branch = 'main'): string {
   return commitFile(path, isolatedGitEnv(checkoutHome), 'README.md', 'recovered\n', 'recovered commit')
 }
 
+describe('reconcileRecoveryJournalsOnStartup — D1: exceptions bypass the hold', () => {
+  it('an unconfirmed termination followed by an unexpected throw still holds the repository and leaves its journal in place', async () => {
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-d1'
+    await mkdir(join(reposRoot, OWNER), {recursive: true})
+    const installedSha = createStagingCheckout(destPathFor())
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'verifying',
+      recoveryId,
+      targetSha: installedSha,
+      branch: 'main',
+      startedAt: new Date().toISOString(),
+    })
+    const forgingRunner: GitRunnerFn = async (args, options) => {
+      if (args.includes('rev-parse') && args.includes('--verify')) return {kind: 'termination-unconfirmed'}
+      return runGit(args, options)
+    }
+    let warnCalls = 0
+    const throwingLogger = {
+      info: () => {},
+      warn: () => {
+        warnCalls += 1
+        if (warnCalls === 1) throw new Error('boom: logger misbehaved')
+      },
+      error: () => {},
+    }
+
+    await expect(
+      reconcileRecoveryJournalsOnStartup({
+        reposRoot,
+        gitRunner: forgingRunner,
+        options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+        logger: throwingLogger,
+      }),
+    ).resolves.toBeUndefined()
+
+    expect((await readJournal(journalsDir, OWNER, REPO)).ok).toBe(true)
+    expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+    expect(warnCalls).toBe(2)
+  })
+})
+
 describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each phase boundary', () => {
   it('building: removes the partial staging dir and clears the journal; the original (if any) is untouched', async () => {
     // #given
@@ -823,6 +879,8 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
       repo: REPO,
       phase: 'building',
       recoveryId,
+      targetSha: '1'.repeat(40),
+      branch: 'main',
       startedAt: new Date().toISOString(),
     })
 
@@ -853,6 +911,8 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
       repo: REPO,
       phase: 'quarantining',
       recoveryId,
+      targetSha: recoveredSha,
+      branch: 'main',
       startedAt: new Date().toISOString(),
     })
 
@@ -885,6 +945,8 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
       repo: REPO,
       phase: 'installing',
       recoveryId,
+      targetSha: recoveredSha,
+      branch: 'main',
       startedAt: new Date().toISOString(),
     })
 
@@ -914,6 +976,8 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
       repo: REPO,
       phase: 'verifying',
       recoveryId,
+      targetSha: recoveredSha,
+      branch: 'main',
       startedAt: new Date().toISOString(),
     })
 
@@ -928,5 +992,54 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
     const journal = await readJournal(journalsDir, OWNER, REPO)
     expect(journal.ok).toBe(false)
     expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(recoveredSha)
+  })
+
+  it('(D5) verifying: an installed checkout at the WRONG target sha is left in place, never cleared', async () => {
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-verifying-mismatch'
+    await mkdir(join(reposRoot, OWNER), {recursive: true})
+    createStagingCheckout(destPathFor())
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'verifying',
+      recoveryId,
+      targetSha: '1'.repeat(40),
+      branch: 'main',
+      startedAt: new Date().toISOString(),
+    })
+
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    expect((await readJournal(journalsDir, OWNER, REPO)).ok).toBe(true)
+  })
+
+  it('(D5) installing: both the checkout path and the staging directory are missing — left in place, never reports success', async () => {
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-installing-both-missing'
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'installing',
+      recoveryId,
+      targetSha: '1'.repeat(40),
+      branch: 'main',
+      startedAt: new Date().toISOString(),
+    })
+
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    expect((await readJournal(journalsDir, OWNER, REPO)).ok).toBe(true)
+    expect(existsSync(destPathFor())).toBe(false)
   })
 })
