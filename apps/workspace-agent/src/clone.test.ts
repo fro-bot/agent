@@ -9,7 +9,7 @@ import {chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm} from
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {executeClone, resetCloneSemaphoreForTesting, scrubCredentials} from './clone.js'
 import {AGENT_GID, AGENT_UID} from './identity.js'
-import {repoMutexKey, resetRepoLocksForTesting, withRepoLock} from './repo-mutex.js'
+import {repoMutexKey, resetRepoHoldsForTesting, resetRepoLocksForTesting, withRepoLock} from './repo-mutex.js'
 
 // #given mocked fs operations
 vi.mock('node:fs/promises', async () => {
@@ -132,6 +132,7 @@ beforeEach(() => {
   vi.resetAllMocks()
   resetCloneSemaphoreForTesting()
   resetRepoLocksForTesting()
+  resetRepoHoldsForTesting()
   // Re-setup default implementations after reset.
   mockMkdir.mockResolvedValue(undefined)
   mockMkdtemp.mockResolvedValue(FAKE_ASKPASS_DIR)

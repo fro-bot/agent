@@ -64,6 +64,13 @@ export interface UpdateJournal {
   readonly toSha: string
   /** ISO-8601 timestamp, from an injected clock, when the journal was first written. */
   readonly startedAt: string
+  /**
+   * ISO-8601 timestamp, from an injected clock, when the fast-forward merge was VERIFIED complete
+   * — written only alongside `phase: 'applied'`. Lets a later reconciliation pass (a crash between
+   * this write and the journal's removal) report the time the merge actually finished instead of
+   * manufacturing a fresh `now()` for evidence that is, by then, stale.
+   */
+  readonly appliedAt?: string
 }
 
 /** An in-flight preserve-and-replace recovery of a checkout. */
@@ -152,6 +159,9 @@ function parseJournal(value: unknown): Journal | null {
   if (v.kind === 'update') {
     if (!isNonEmptyString(v.phase) || !UPDATE_PHASES.has(v.phase)) return null
     if (!isNonEmptyString(v.fromSha) || !isNonEmptyString(v.toSha)) return null
+    // appliedAt is OPTIONAL (only ever written alongside phase 'applied'), but when the key is
+    // present at all its value must still be a valid non-empty string — never silently coerced.
+    if (v.appliedAt !== undefined && !isNonEmptyString(v.appliedAt)) return null
     return {
       kind: 'update',
       owner: v.owner,
@@ -160,6 +170,7 @@ function parseJournal(value: unknown): Journal | null {
       fromSha: v.fromSha,
       toSha: v.toSha,
       startedAt: v.startedAt,
+      ...(v.appliedAt === undefined ? {} : {appliedAt: v.appliedAt}),
     }
   }
 

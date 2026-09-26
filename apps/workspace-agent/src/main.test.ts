@@ -7,12 +7,13 @@
  * 3. The proxy listening signal is wired: proxyListeningRef.listening becomes true after proxy.listen resolves.
  */
 
-import type {ExitFn, ServeFn} from './main.js'
+import type {CreateAppFn, ExitFn, ServeFn} from './main.js'
 import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
-import type {ProxyListeningRef} from './server.js'
+import type {ProxyListeningRef, ServerDeps} from './server.js'
 
 import http from 'node:http'
+import {Hono} from 'hono'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {SERVER_LISTEN_TIMEOUT_MS, startWorkspaceAgent} from './main.js'
 
@@ -72,6 +73,14 @@ function makeFakeProxyFactory(callLog: string[], proxyListeningRef?: ProxyListen
     callLog.push('createOpencodeProxy')
     return makeFakeProxy(callLog, proxyListeningRef)
   })
+}
+
+/** Build a fake createApp function that captures the `ServerDeps` it was called with, instead of building a real Hono app. */
+function makeCapturingCreateAppFn(captured: {value?: ServerDeps}): CreateAppFn {
+  return (deps: ServerDeps) => {
+    captured.value = deps
+    return new Hono()
+  }
 }
 
 /**
@@ -772,5 +781,79 @@ describe('startWorkspaceAgent', () => {
         expect(callLog).not.toContain('runSupervisedOpencode')
       })
     })
+  })
+})
+
+describe('startWorkspaceAgent — updateNetworkConfig wiring (A1)', () => {
+  it('passes proxy config derived from HTTPS_PROXY/NO_PROXY into createApp', async () => {
+    // #given
+    const callLog: string[] = []
+    const captured: {value?: ServerDeps} = {}
+    const fakeEnv: NodeJS.ProcessEnv = {
+      WORKSPACE_OPENCODE_TOKEN: 'tok',
+      HTTPS_PROXY: 'http://mitmproxy:8080',
+      NO_PROXY: '10.0.0.0/8',
+    }
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+      createAppFn: makeCapturingCreateAppFn(captured),
+    })
+
+    // #then
+    expect(captured.value?.updateNetworkConfig).toEqual({
+      proxy: {https: 'http://mitmproxy:8080', noProxy: '10.0.0.0/8'},
+    })
+  })
+
+  it('passes caBundlePath derived from GIT_SSL_CAINFO into createApp', async () => {
+    // #given
+    const callLog: string[] = []
+    const captured: {value?: ServerDeps} = {}
+    const fakeEnv: NodeJS.ProcessEnv = {
+      WORKSPACE_OPENCODE_TOKEN: 'tok',
+      GIT_SSL_CAINFO: '/etc/ssl/certs/mitmproxy-ca.pem',
+    }
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+      createAppFn: makeCapturingCreateAppFn(captured),
+    })
+
+    // #then
+    expect(captured.value?.updateNetworkConfig).toEqual({caBundlePath: '/etc/ssl/certs/mitmproxy-ca.pem'})
+  })
+
+  it('passes an empty updateNetworkConfig when no proxy or CA-bundle env vars are set', async () => {
+    // #given
+    const callLog: string[] = []
+    const captured: {value?: ServerDeps} = {}
+    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+      createAppFn: makeCapturingCreateAppFn(captured),
+    })
+
+    // #then
+    expect(captured.value?.updateNetworkConfig).toEqual({})
   })
 })

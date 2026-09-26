@@ -51,3 +51,44 @@ export async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promis
 export function resetRepoLocksForTesting(): void {
   repoLocks.clear()
 }
+
+/**
+ * A sticky, in-process maintenance hold on a single repository — set when some operation for that
+ * repository ended with an UNCONFIRMED subprocess termination (see git-safety.ts's/git-stream.ts's
+ * `termination-unconfirmed`: SIGKILL was sent, but the child's exit was never observed within the
+ * reap-grace window). An unconfirmed termination means the workspace-agent genuinely does not know
+ * whether that subprocess (or a descendant it spawned) is still running, possibly still touching
+ * the repository's checkout, protected bare mirror, or quarantine generations. A held repository
+ * refuses every later mutating operation (clone, update, and — in Unit 5 — recovery) rather than
+ * risk two operations touching the same on-disk state concurrently.
+ *
+ * Cleared ONLY by a process restart, never by a timer or a later successful operation: this
+ * process is the container's own supervisor (see repo-mutex.ts's module header — the workspace is
+ * always exactly one container), so a restart is the only event that can actually guarantee any
+ * leaked subprocess (and everything it might still be doing) is gone. A hold that could clear
+ * itself on a schedule would reintroduce exactly the race this exists to prevent.
+ */
+export type RepoHoldReason = 'termination-unconfirmed'
+
+/** All currently-held repositories, keyed by `repoMutexKey(owner, repo)`, mapped to why they were held. */
+const repoHolds = new Map<string, RepoHoldReason>()
+
+/**
+ * Marks `key` as held for `reason`. Idempotent — marking an already-held repository again (even
+ * for a different reason) is a no-op; the FIRST hold reason recorded for a repository is
+ * preserved, since it is the earliest evidence that something may still be running.
+ */
+export function markRepoHeld(key: string, reason: RepoHoldReason): void {
+  if (repoHolds.has(key)) return
+  repoHolds.set(key, reason)
+}
+
+/** The hold reason for `key`, or `undefined` if the repository is not currently held. */
+export function repoHoldReason(key: string): RepoHoldReason | undefined {
+  return repoHolds.get(key)
+}
+
+/** Reset hold state — for testing only. */
+export function resetRepoHoldsForTesting(): void {
+  repoHolds.clear()
+}

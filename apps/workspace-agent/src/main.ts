@@ -15,7 +15,7 @@ import type {AddressInfo} from 'node:net'
 import type {ServerType} from '@hono/node-server'
 import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
-import type {ProxyListeningRef} from './server.js'
+import type {ProxyListeningRef, ServerDeps} from './server.js'
 import type {JournalReconciliationLogger, ReconcileUpdateJournalsOnStartupDeps} from './update.js'
 
 import process from 'node:process'
@@ -24,7 +24,7 @@ import {fileURLToPath} from 'node:url'
 import {serve} from '@hono/node-server'
 
 import {asyncCleanupAllAskpassDirs} from './clone.js'
-import {readReadyTimeoutMs, readSecret} from './config.js'
+import {readReadyTimeoutMs, readSecret, readUpdateNetworkConfig} from './config.js'
 import {createOpencodeProxy} from './opencode-proxy.js'
 import {runSupervisedOpencode} from './opencode-server.js'
 import {createApp} from './server.js'
@@ -85,6 +85,9 @@ export type ReadSecretFn = (name: string) => string
 /** Startup update-journal reconciliation function. Simplified signature matching `reconcileUpdateJournalsOnStartup`. */
 export type ReconcileUpdateJournalsFn = (deps: ReconcileUpdateJournalsOnStartupDeps) => Promise<void>
 
+/** Hono app factory function. Simplified signature matching `createApp`. */
+export type CreateAppFn = (deps: ServerDeps) => ReturnType<typeof createApp>
+
 /**
  * Process-exit function. Typed as `never`-returning (matches `process.exit`) so callers can
  * assume control flow does not continue past a call — TypeScript narrows accordingly.
@@ -131,6 +134,12 @@ export interface WorkspaceAgentDeps {
    * (update.ts). Injected for testing to avoid real git subprocesses / a real journals directory.
    */
   readonly reconcileUpdateJournalsFn?: ReconcileUpdateJournalsFn
+  /**
+   * Hono app factory. Defaults to the real `createApp` (server.ts). Injected for testing so a
+   * test can capture exactly the `ServerDeps` startup built — in particular `updateNetworkConfig`,
+   * derived once from env — without needing to drive a real HTTP request through the bound app.
+   */
+  readonly createAppFn?: CreateAppFn
 }
 
 /**
@@ -162,6 +171,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     readSecretFn = readSecret,
     exitFn = code => process.exit(code),
     reconcileUpdateJournalsFn = reconcileUpdateJournalsOnStartup,
+    createAppFn = createApp,
   } = deps
 
   // Supervisor writes all status transitions here; /healthz and /readyz read it.
@@ -225,10 +235,17 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     })
   })
 
-  // updateNetworkConfig (egress proxy / CA bundle for the /update network half) is not yet read
-  // from real deployment config here — a tracked follow-up (see ServerDeps.updateNetworkConfig's
-  // own doc comment in server.ts); omitting it here is deliberate, not an oversight.
-  const app = createApp({opencodeStatus, proxyListening: proxyListeningRef, auth: {kind: 'bearer', token}})
+  // Egress-proxy / CA-bundle configuration for the /update network half, read ONCE here from the
+  // same env vars clone.ts already trusts for proxy (config.ts's `readUpdateNetworkConfig`'s own
+  // doc comment has the full rationale) — never read again per-request.
+  const updateNetworkConfig = readUpdateNetworkConfig(env)
+
+  const app = createAppFn({
+    opencodeStatus,
+    proxyListening: proxyListeningRef,
+    auth: {kind: 'bearer', token},
+    updateNetworkConfig,
+  })
 
   // Bind :9100 and WAIT for the first of three outcomes before doing anything else that could
   // race an unprivileged process for a port:

@@ -79,7 +79,7 @@ import {runPackStream} from './git-stream.js'
 import {AGENT_GID, AGENT_UID, FETCH_STORE_DIR_NAME, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {inspectCheckout} from './inspect.js'
 import {listJournals, readJournal, removeJournal, writeJournal} from './journal.js'
-import {repoMutexKey, withRepoLock} from './repo-mutex.js'
+import {markRepoHeld, repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors clone.ts/inspect.ts. */
 export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
@@ -150,9 +150,8 @@ export interface UpdateHandlerDeps {
    * Deployment egress-proxy configuration for the network git profile
    * (`buildNetworkGitProfile`'s own `NetworkGitProfileOptions.proxy` — see that type's doc comment:
    * omitting this means NO proxy is used, full stop, even if the process environment carries one).
-   * PLUMBING ONLY as of this slice: accepted here and threaded down to `NetworkAndApplyContext`,
-   * but `runNetworkAndApply` does not yet pass it to `buildNetworkGitProfile` — a tracked follow-up,
-   * not a silent gap (server.ts's `ServerDeps.updateNetworkConfig` doc comment cross-references it).
+   * Sourced once at startup (`main.ts`'s `readUpdateNetworkConfig`, config.ts) and passed straight
+   * through every `/update` call — this module never reads `process.env` for it itself.
    */
   readonly proxy?: {readonly https: string; readonly noProxy?: string}
   /**
@@ -352,7 +351,10 @@ async function reconcileUpdateJournal(params: {
       branch: branchOutcome.stdout.trim(),
       sha: headSha,
       fromSha: journal.fromSha,
-      checkedAt: now().toISOString(),
+      // Carries the journal's OWN `appliedAt` — the moment the merge was actually verified
+      // complete — rather than manufacturing a fresh `now()` for evidence collected earlier.
+      // Falls back to `now()` only for a journal written before this field existed.
+      checkedAt: journal.appliedAt ?? now().toISOString(),
     },
   }
 }
@@ -494,6 +496,7 @@ interface NetworkAndApplyContext {
   readonly gitRunner: GitRunnerFn
   readonly remoteBaseUrl: string
   readonly caBundlePath: string | undefined
+  readonly proxy: {readonly https: string; readonly noProxy?: string} | undefined
   readonly askpassWriter: (dir: string) => Promise<string>
   readonly serviceHome: string
   readonly networkBudgetMs: number
@@ -524,7 +527,7 @@ async function ensureBareFetchStore(params: {
   readonly fetchStorePath: string
   readonly gitRunner: GitRunnerFn
   readonly timeoutMs: number
-}): Promise<'ok' | 'failed'> {
+}): Promise<'ok' | 'failed' | 'unconfirmed'> {
   const {fetchStorePath, gitRunner, timeoutMs} = params
   try {
     const st = await lstat(fetchStorePath)
@@ -550,7 +553,9 @@ async function ensureBareFetchStore(params: {
     env: buildNeutralGitEnv(),
     timeoutMs,
   })
-  return outcome.kind === 'ok' ? 'ok' : 'failed'
+  if (outcome.kind === 'ok') return 'ok'
+  if (outcome.kind === 'termination-unconfirmed') return 'unconfirmed'
+  return 'failed'
 }
 
 /**
@@ -597,6 +602,8 @@ type ObserveOutcome =
   | {readonly kind: 'failed'; readonly reason: RemoteFailureReason; readonly permanent: boolean}
   | {readonly kind: 'timeout'}
   | {readonly kind: 'aborted'}
+  /** The subprocess's termination could not be CONFIRMED — distinct from `timeout` (a confirmed kill). */
+  | {readonly kind: 'unconfirmed'}
 
 const DEFAULT_BRANCH_SYMREF_RE = /ref: refs\/heads\/(\S+)\s+HEAD/
 const HEAD_SHA_LINE_RE = /^([0-9a-f]{40})\tHEAD$/m
@@ -626,8 +633,8 @@ async function observeRemoteDefaultBranch(
     timeoutMs,
     signal,
   })
-  if (outcome.kind === 'timeout' || outcome.kind === 'termination-unconfirmed')
-    return {kind: classifyTimeoutOrAbort(signal)}
+  if (outcome.kind === 'termination-unconfirmed') return {kind: 'unconfirmed'}
+  if (outcome.kind === 'timeout') return {kind: classifyTimeoutOrAbort(signal)}
   if (outcome.kind !== 'ok') {
     const {reason, permanent} = classifyRemoteFailure(outcome.stderr)
     return {kind: 'failed', reason, permanent}
@@ -645,6 +652,8 @@ type FetchIntoRefOutcome =
   | {readonly kind: 'failed'; readonly reason: RemoteFailureReason; readonly permanent: boolean}
   | {readonly kind: 'timeout'}
   | {readonly kind: 'aborted'}
+  /** The subprocess's termination could not be CONFIRMED — distinct from `timeout` (a confirmed kill). */
+  | {readonly kind: 'unconfirmed'}
 
 /** Runs `fetch <remoteUrl> <refspec>` — `refspec` may be `<branch>:<localRef>` (creates/updates `localRef`) or a bare SHA (fetches the object without creating a ref; requires the remote to allow SHA1-in-want, exactly as GitHub does). */
 async function fetchIntoRef(
@@ -661,8 +670,8 @@ async function fetchIntoRef(
     timeoutMs,
     signal,
   })
-  if (outcome.kind === 'timeout' || outcome.kind === 'termination-unconfirmed')
-    return {kind: classifyTimeoutOrAbort(signal)}
+  if (outcome.kind === 'termination-unconfirmed') return {kind: 'unconfirmed'}
+  if (outcome.kind === 'timeout') return {kind: classifyTimeoutOrAbort(signal)}
   if (outcome.kind !== 'ok') {
     const {reason, permanent} = classifyRemoteFailure(outcome.stderr)
     return {kind: 'failed', reason, permanent}
@@ -699,7 +708,16 @@ async function observeAndFetch(params: {
 }): Promise<ObserveAndFetchOutcome> {
   const {profile, remoteUrl, head, gitRunner, timeoutMs, signal} = params
 
+  // A network subprocess whose termination could not be CONFIRMED is never treated the same as a
+  // confirmed timeout: the caller (`runNetworkAndApply`) reads `reason` and places the repository
+  // under a maintenance hold for exactly this reason — a leaked process may still be running.
+  const UNCONFIRMED_RESULT: ObserveAndFetchOutcome = {
+    kind: 'failed',
+    result: {kind: 'failed', reason: 'termination-unconfirmed', mutationStarted: false, permanent: false},
+  }
+
   const first = await observeRemoteDefaultBranch(profile, remoteUrl, gitRunner, timeoutMs, signal)
+  if (first.kind === 'unconfirmed') return UNCONFIRMED_RESULT
   if (first.kind === 'aborted') {
     return {kind: 'failed', result: {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}}
   }
@@ -729,6 +747,7 @@ async function observeAndFetch(params: {
       timeoutMs,
       signal,
     )
+    if (fetchOutcome.kind === 'unconfirmed') return UNCONFIRMED_RESULT
     if (fetchOutcome.kind === 'aborted') {
       return {kind: 'failed', result: {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}}
     }
@@ -751,6 +770,7 @@ async function observeAndFetch(params: {
     }
 
     const reobserved = await observeRemoteDefaultBranch(profile, remoteUrl, gitRunner, timeoutMs, signal)
+    if (reobserved.kind === 'unconfirmed') return UNCONFIRMED_RESULT
     if (reobserved.kind === 'aborted') {
       return {kind: 'failed', result: {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}}
     }
@@ -902,14 +922,97 @@ async function importPackObjects(params: {
 }
 
 // ---------------------------------------------------------------------------
+// Re-verification — re-observes the checkout's HEAD/branch/operation state and compares it
+// against what admission (or the very start of this network round-trip) actually saw. The agent
+// may have changed `.git` at any point during a network round-trip; every place that is about to
+// either (a) trust a PREVIOUSLY-observed H without re-checking it, or (b) launch the
+// fast-forward merge, re-verifies FIRST via this shared check.
+// ---------------------------------------------------------------------------
+
+type ReverifyOutcome = 'ok' | 'drifted' | 'inspection-failed'
+
+async function reverifyCheckoutState(params: {
+  readonly owner: string
+  readonly repo: string
+  readonly reposRoot: string
+  readonly branch: string
+  readonly fromSha: string
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+  readonly now: () => Date
+}): Promise<ReverifyOutcome> {
+  const {owner, repo, reposRoot, branch, fromSha, gitRunner, timeoutMs, uid, gid, now} = params
+  const reinspected = await inspectCheckout(
+    {owner, repo},
+    {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
+  )
+  if (reinspected.response.ok !== true) return 'inspection-failed'
+  const {observation} = reinspected.response
+  if (observation.operationInProgress !== 'none') return 'drifted'
+  if (observation.head.kind !== 'attached') return 'drifted'
+  if (observation.head.branch !== branch) return 'drifted'
+  if (observation.head.sha !== fromSha) return 'drifted'
+  return 'ok'
+}
+
+/**
+ * Confirms the checkout landed EXACTLY where the merge claims: HEAD at `toSha`, still on the
+ * admitted `branch` (a fast-forward never changes which branch is checked out, but this confirms
+ * it rather than assuming it), and clean against `toSha`. Any one of these failing means the
+ * merge's own confirmed exit is not the whole story — R6 forbids reporting success without this.
+ */
+async function verifyPostMergeState(params: {
+  readonly canonicalCheckoutPath: string
+  readonly branch: string
+  readonly toSha: string
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}): Promise<boolean> {
+  const {canonicalCheckoutPath, branch, toSha, gitRunner, timeoutMs, uid, gid} = params
+  const env = buildNeutralGitEnv()
+
+  const headOutcome = await gitRunner(
+    gitInvocation(canonicalCheckoutPath, canonicalCheckoutPath, ['rev-parse', '--verify', 'HEAD^{commit}']),
+    {cwd: canonicalCheckoutPath, env, timeoutMs, uid, gid},
+  )
+  if (headOutcome.kind !== 'ok' || headOutcome.stdout.trim() !== toSha) return false
+
+  const branchOutcome = await gitRunner(
+    gitInvocation(canonicalCheckoutPath, canonicalCheckoutPath, ['symbolic-ref', '--short', 'HEAD']),
+    {cwd: canonicalCheckoutPath, env, timeoutMs, uid, gid},
+  )
+  if (branchOutcome.kind !== 'ok' || branchOutcome.stdout.trim() !== branch) return false
+
+  const cleanliness = await checkTempIndexCleanliness({
+    checkoutPath: canonicalCheckoutPath,
+    headSha: toSha,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  return cleanliness.kind === 'clean'
+}
+
+// ---------------------------------------------------------------------------
 // The fast-forward merge itself — the point of no return. Called only once the journal already
 // reads `applying` (set by the caller before the object import above) and the obstruction
-// preflight has passed. Re-runs layout/config/cleanliness/operation-state immediately before
-// mutating — the agent may have changed `.git` during the network round-trip — then
-// `merge --ff-only --no-overwrite-ignore` under the sealed LOCAL profile, then verifies HEAD
-// really landed on `toSha` before ever clearing the journal. Every non-clean outcome from this
-// point on LEAVES the journal at `applying`: once a mutation may have started, an interrupted or
-// unconfirmed attempt is never reported as "nothing changed" (R6).
+// preflight has passed. Re-runs layout/config/cleanliness/submodule/head-branch-SHA admission
+// immediately before mutating — the agent may have changed `.git` during the network round-trip —
+// then `merge --ff-only --no-overwrite-ignore` under the sealed LOCAL profile, then verifies via
+// `verifyPostMergeState` before ever clearing the journal.
+//
+// mutationStarted / journal disposition split exactly at the merge command itself: every pre-merge
+// re-admission check runs against an UNCHANGED checkout (the object import above is additive-only,
+// touching no ref/HEAD/working-tree state) — a failure there clears the journal and reports
+// `mutationStarted: false`. Once the merge command is actually spawned, any subsequent failure
+// (confirmed non-zero exit, `termination-unconfirmed`, or a failed post-merge verification) LEAVES
+// the journal at `applying`: once a mutation may have started, an interrupted or unconfirmed
+// attempt is never reported as "nothing changed" (R6).
 // ---------------------------------------------------------------------------
 
 async function runFastForward(params: {
@@ -945,15 +1048,15 @@ async function runFastForward(params: {
     now,
   } = params
 
-  const APPLY_FAILED_MUTATED: UpdateFailed = {
-    kind: 'failed',
-    reason: 'apply-failed',
-    mutationStarted: true,
-    permanent: false,
+  // Pre-merge: the checkout is still UNCHANGED (the object import is additive-only) — any failure
+  // here clears the journal and reports mutationStarted:false, never `true`.
+  const preMergeFailed = async (): Promise<UpdateFailed> => {
+    await removeJournal(journalsDir, owner, repo)
+    return {kind: 'failed', reason: 'apply-failed', mutationStarted: false, permanent: false}
   }
 
   const layout = await checkCheckoutLayout({checkoutPath: canonicalCheckoutPath, timeoutMs, uid, gid})
-  if (layout.kind !== 'ok') return APPLY_FAILED_MUTATED
+  if (layout.kind !== 'ok') return preMergeFailed()
 
   const configInventory = await inventoryCheckoutConfig({
     checkoutPath: canonicalCheckoutPath,
@@ -962,7 +1065,7 @@ async function runFastForward(params: {
     uid,
     gid,
   })
-  if (configInventory.kind !== 'allowed') return APPLY_FAILED_MUTATED
+  if (configInventory.kind !== 'allowed') return preMergeFailed()
 
   const cleanliness = await checkTempIndexCleanliness({
     checkoutPath: canonicalCheckoutPath,
@@ -972,16 +1075,32 @@ async function runFastForward(params: {
     uid,
     gid,
   })
-  if (cleanliness.kind !== 'clean') return APPLY_FAILED_MUTATED
+  if (cleanliness.kind !== 'clean') return preMergeFailed()
 
-  const reinspected = await inspectCheckout(
-    {owner, repo},
-    {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
-  )
-  if (reinspected.response.ok !== true || reinspected.response.observation.operationInProgress !== 'none') {
-    return APPLY_FAILED_MUTATED
-  }
+  const submodules = await checkNoInitializedSubmodules({
+    checkoutPath: canonicalCheckoutPath,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  if (submodules.kind !== 'ok') return preMergeFailed()
 
+  const reverify = await reverifyCheckoutState({
+    owner,
+    repo,
+    reposRoot,
+    branch,
+    fromSha,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+    now,
+  })
+  if (reverify !== 'ok') return preMergeFailed()
+
+  // Point of no return — every failure below LEAVES the journal at `applying`.
   const localProfile = buildLocalUpdateGitProfile({checkoutPath: canonicalCheckoutPath})
   const mergeOutcome = await gitRunner([...localProfile.args, 'merge', '--ff-only', '--no-overwrite-ignore', toSha], {
     cwd: localProfile.cwd,
@@ -993,17 +1112,18 @@ async function runFastForward(params: {
   if (mergeOutcome.kind === 'termination-unconfirmed') {
     return {kind: 'failed', reason: 'termination-unconfirmed', mutationStarted: 'possibly', permanent: false}
   }
-  if (mergeOutcome.kind !== 'ok') return APPLY_FAILED_MUTATED
+  const POST_MERGE_FAILED: UpdateFailed = {
+    kind: 'failed',
+    reason: 'apply-failed',
+    mutationStarted: true,
+    permanent: false,
+  }
+  if (mergeOutcome.kind !== 'ok') return POST_MERGE_FAILED
 
-  const headOutcome = await gitRunner([...localProfile.args, 'rev-parse', '--verify', 'HEAD^{commit}'], {
-    cwd: localProfile.cwd,
-    env: localProfile.env,
-    timeoutMs,
-    uid,
-    gid,
-  })
-  if (headOutcome.kind !== 'ok' || headOutcome.stdout.trim() !== toSha) return APPLY_FAILED_MUTATED
+  const verified = await verifyPostMergeState({canonicalCheckoutPath, branch, toSha, gitRunner, timeoutMs, uid, gid})
+  if (verified !== true) return POST_MERGE_FAILED
 
+  const appliedAt = now().toISOString()
   await writeJournal(journalsDir, {
     kind: 'update',
     owner,
@@ -1011,11 +1131,12 @@ async function runFastForward(params: {
     phase: 'applied',
     fromSha,
     toSha,
-    startedAt: now().toISOString(),
+    startedAt: appliedAt,
+    appliedAt,
   })
   await removeJournal(journalsDir, owner, repo)
 
-  return {kind: 'ready', change: 'fast-forward', branch, sha: toSha, fromSha, checkedAt: now().toISOString()}
+  return {kind: 'ready', change: 'fast-forward', branch, sha: toSha, fromSha, checkedAt: appliedAt}
 }
 
 /**
@@ -1036,6 +1157,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
     gitRunner,
     remoteBaseUrl,
     caBundlePath,
+    proxy,
     askpassWriter,
     serviceHome,
     networkBudgetMs,
@@ -1051,6 +1173,9 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
 
   const fetchStorePath = fetchStorePathFor(reposRoot, owner, repo)
   const storeReady = await ensureBareFetchStore({fetchStorePath, gitRunner, timeoutMs})
+  if (storeReady === 'unconfirmed') {
+    return {kind: 'failed', reason: 'termination-unconfirmed', mutationStarted: false, permanent: false}
+  }
   if (storeReady === 'failed') {
     return {kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false}
   }
@@ -1065,6 +1190,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       askpassPath,
       token,
       caBundlePath,
+      proxy,
       parentEnv: process.env,
     })
     const remoteUrl = `${remoteBaseUrl}/${owner}/${repo}.git`
@@ -1143,11 +1269,31 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       gid,
     })
     if (ancestry === 'inspection-failed') {
-      // Can't confirm the checkout's state; leave the journal at `applying` for recovery.
+      // A CONCLUSIVE exit before the merge has ever launched: the checkout is still unchanged
+      // (the import above is additive-only) — clear the journal rather than forcing recovery for
+      // what may be a transient read failure.
+      await removeJournal(journalsDir, owner, repo)
       return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
     }
     if (ancestry === 'equal') {
+      // H already equals T — but H was observed at ADMISSION time, before this entire network
+      // round-trip. Re-verify the checkout hasn't drifted underneath us before trusting it.
+      const reverify = await reverifyCheckoutState({
+        owner,
+        repo,
+        reposRoot,
+        branch,
+        fromSha,
+        gitRunner,
+        timeoutMs,
+        uid,
+        gid,
+        now,
+      })
       await removeJournal(journalsDir, owner, repo)
+      if (reverify !== 'ok') {
+        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+      }
       return {kind: 'ready', change: 'unchanged', branch, sha: fromSha, checkedAt: now().toISOString()}
     }
     if (ancestry === 'ahead') {
@@ -1174,7 +1320,9 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       return {kind: 'refused', reason: 'obstructed', obstructions: preflight.obstructions}
     }
     if (preflight.kind === 'inspection-failed') {
-      // Can't confirm the checkout's state; leave the journal at `applying` for recovery.
+      // Same rationale as the ancestry inspection-failed case above: conclusive, pre-merge, checkout
+      // still unchanged — clear the journal.
+      await removeJournal(journalsDir, owner, repo)
       return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
     }
 
@@ -1220,6 +1368,7 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
     now = () => new Date(),
     remoteBaseUrl = DEFAULT_REMOTE_BASE_URL,
     caBundlePath,
+    proxy,
     askpassWriter = writeAskpassHelper,
     networkBudgetMs = DEFAULT_NETWORK_BUDGET_MS,
     applyTimeoutMs = DEFAULT_APPLY_TIMEOUT_MS,
@@ -1235,6 +1384,13 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
   const destPath = join(reposRoot, owner, repo)
 
   return withRepoLock(repoMutexKey(owner, repo), async (): Promise<UpdateResult> => {
+    // Step 0: the sticky maintenance hold, checked before EVERYTHING else — even journal
+    // reconciliation. A held repository means some earlier operation ended with an unconfirmed
+    // subprocess termination; nothing below can be trusted until a process restart clears it.
+    if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
+      return {kind: 'refused', reason: 'maintenance-hold'}
+    }
+
     // Step 1: reconcile this repository's journal before anything else, under the mutex, so it
     // can never race a concurrent write of the same journal.
     const reconciliation = await reconcileUpdateJournal({
@@ -1326,7 +1482,7 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
     }
 
     // Admission passed in full — bring the checkout up to date.
-    return runNetworkAndApply({
+    const result = await runNetworkAndApply({
       owner,
       repo,
       token: request.token,
@@ -1337,6 +1493,7 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
       gitRunner,
       remoteBaseUrl,
       caBundlePath,
+      proxy,
       askpassWriter,
       serviceHome,
       networkBudgetMs,
@@ -1349,5 +1506,12 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
       now,
       signal,
     })
+
+    // A single choke point for the maintenance hold: every termination-unconfirmed outcome
+    // `runNetworkAndApply` can produce, at any phase, flows back through here.
+    if (result.kind === 'failed' && result.reason === 'termination-unconfirmed') {
+      markRepoHeld(repoMutexKey(owner, repo), 'termination-unconfirmed')
+    }
+    return result
   })
 }

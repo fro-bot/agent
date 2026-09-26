@@ -181,6 +181,14 @@ export type UpdateRefusalReason =
   | 'diverged'
   | 'ahead'
   | 'obstructed'
+  /**
+   * This repository is under a sticky, in-process maintenance hold (repo-mutex.ts's
+   * `markRepoHeld`/`repoHoldReason`) — some earlier `/update` (or `/clone`) ended with an
+   * UNCONFIRMED subprocess termination, so the service cannot rule out a leaked process still
+   * touching this repository's on-disk state. Checked FIRST, before journal reconciliation —
+   * before anything else — and cleared only by a process restart.
+   */
+  | 'maintenance-hold'
 
 /**
  * The checkout is ineligible; no mutation was ever attempted, and NO network profile was ever
@@ -200,13 +208,19 @@ export type UpdateRefused =
   | {readonly kind: 'refused'; readonly reason: 'diverged'}
   | {readonly kind: 'refused'; readonly reason: 'ahead'}
   | {readonly kind: 'refused'; readonly reason: 'obstructed'; readonly obstructions: readonly Obstruction[]}
+  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
 
 /**
  * Every reason `/update` can fail for, closed. Fetch-phase reasons (`fetch-*`, `remote-moved`)
- * always carry `mutationStarted: false` — nothing in the checkout was ever touched. Apply-phase
- * reasons (`apply-failed`, `termination-unconfirmed`) always leave the journal at `applying`,
- * forcing recovery, since something in or around the checkout was touched or is of unconfirmed
- * state.
+ * always carry `mutationStarted: false` — nothing in the checkout was ever touched, and the
+ * journal (if any exists yet at that point) is cleared. `apply-failed`'s `mutationStarted` and
+ * journal disposition depend on whether the fast-forward merge command itself had already been
+ * spawned — see that reason's own doc comment. `termination-unconfirmed` always leaves the journal
+ * at `applying` UNLESS it happened before the journal ever reached `applying` in the first place
+ * (a network-phase git call whose termination could not be confirmed) — in that earlier case there
+ * is no `applying` journal to leave behind, and `mutationStarted` is `false`; the repository is
+ * placed under a maintenance hold either way (repo-mutex.ts's `markRepoHeld`), since an unconfirmed
+ * termination means a leaked process may still be running regardless of which phase it happened in.
  */
 export type UpdateFailureReason =
   /**
@@ -238,9 +252,16 @@ export type UpdateFailureReason =
   /** The remote's default-branch tip moved between observations, twice in a row (the one retry was exhausted). Not permanent. */
   | 'remote-moved'
   /**
-   * The apply phase (re-admission re-check, pack import, or the fast-forward merge itself) failed
-   * with a CONFIRMED (non-zero exit, or a positively-detected post-merge mismatch) outcome.
-   * `mutationStarted: true`.
+   * A CONFIRMED (non-zero exit, or a positively-detected mismatch — never an unconfirmed
+   * termination, which is always reported as `termination-unconfirmed` instead) failure somewhere
+   * in the apply phase. `mutationStarted` depends on exactly WHERE: the object import and every
+   * pre-merge re-admission re-check (layout, config, cleanliness, submodules, re-observed
+   * head/branch/operation state) run before the fast-forward merge itself is ever spawned — the
+   * checkout's refs, HEAD, and working tree are untouched at that point (the import is additive-
+   * only), so those report `mutationStarted: false` and the journal is cleared. Once the merge
+   * command has actually been spawned, any subsequent confirmed failure (a non-zero exit, or a
+   * post-merge verification mismatch — branch, HEAD SHA, or working-tree cleanliness against the
+   * target) reports `mutationStarted: true` and the journal stays at `applying` for recovery.
    */
   | 'apply-failed'
   /**

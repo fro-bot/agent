@@ -51,7 +51,7 @@ import {buildNeutralGitEnv, gitInvocation, runGit} from './git-safety.js'
 import {handOffToAgent} from './handoff.js'
 import {AGENT_GID, AGENT_UID, CLONE_STAGING_DIR_NAME, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal} from './journal.js'
-import {repoMutexKey, withRepoLock} from './repo-mutex.js'
+import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
 
 const execFile = promisify(execFileCb)
 
@@ -457,6 +457,20 @@ async function executeCloneInner(
   const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
+    // Refuse outright if this repository is under a sticky maintenance hold (repo-mutex.ts) —
+    // before anything else, even the journal check below. A hold means some earlier operation
+    // (update.ts's `/update`, today) ended with an UNCONFIRMED subprocess termination: the service
+    // cannot rule out a leaked process still touching this repository's on-disk state, so a fresh
+    // clone must not risk racing it. Reuses `journal-in-progress`'s wire code and 409 status
+    // (rather than a new `CloneErrorCode`) because adding one would require a matching gateway
+    // mirror and drift-guard update (scripts/checkout-types-drift-guard.test.ts) that is out of
+    // scope here — see update.ts's `UpdateRefusalReason` "maintenance-hold" for the full
+    // rationale. Both codes mean the same thing to a caller: don't clone this repository right
+    // now, an earlier operation left it in an uncertain state.
+    if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
+      return {response: {ok: false, error: 'journal-in-progress'}, statusCode: 409}
+    }
+
     // Refuse outright if an update or recovery journal is already outstanding for this repo —
     // before touching anything else. A journal (found, or found but malformed — either is
     // "outstanding", never treated the same as no journal at all, see journal.ts) means an

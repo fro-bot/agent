@@ -21,7 +21,7 @@ import {runGit} from './git-safety.js'
 import {runPackStream} from './git-stream.js'
 import {JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal, writeJournal} from './journal.js'
-import {resetRepoLocksForTesting} from './repo-mutex.js'
+import {resetRepoHoldsForTesting, resetRepoLocksForTesting} from './repo-mutex.js'
 import {bareRepoPath, startGitHttpServer, writeLoopbackAskpassHelper} from './update-fixtures/git-http-server.js'
 import {
   commitFile,
@@ -51,6 +51,7 @@ beforeEach(async () => {
   reposRoot = await makeTempDir('update-test-repos-')
   checkoutHome = await makeTempDir('update-test-checkout-home-')
   resetRepoLocksForTesting()
+  resetRepoHoldsForTesting()
 })
 
 afterEach(async () => {
@@ -607,13 +608,33 @@ describe.skipIf(!OPENSSL_AVAILABLE)(
       }
     })
 
-    it('hang past the network budget: fetch-timeout, not permanent', async () => {
+    it('hang past the network budget: termination-unconfirmed (git-remote-https grandchild survives the kill), not permanent, and places a maintenance hold', async () => {
+      // #given a fixture that accepts the connection and never responds — git's HTTP transport is
+      // handled by a `git-remote-https` GRANDCHILD process, which can outlive a SIGTERM/SIGKILL of
+      // the `git ls-remote`/`git fetch` parent (exactly the "grandchild holds stdout/stderr open"
+      // scenario update-fixtures/pack.test.ts documents for the pack-stream case) — so this
+      // real hang reports `termination-unconfirmed`, never a confirmed `fetch-timeout`.
       const fixture = await setupNetworkFixture()
       try {
         await cloneCheckoutAtHead(fixture)
         fixture.setFailure('hang')
+
+        // #when
         const result = await executeUpdate(req(), networkDeps(fixture, {networkBudgetMs: 800}))
-        expect(result).toEqual({kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false})
+
+        // #then
+        expect(result).toEqual({
+          kind: 'failed',
+          reason: 'termination-unconfirmed',
+          mutationStarted: false,
+          permanent: false,
+        })
+
+        // #and — the maintenance hold refuses a follow-up /update with zero git calls
+        const {runner, calls} = makeGitRunnerSpy()
+        const followUp = await executeUpdate(req(), localDeps({gitRunner: runner}))
+        expect(followUp).toEqual({kind: 'refused', reason: 'maintenance-hold'})
+        expect(calls).toEqual([])
       } finally {
         await fixture.close()
       }
@@ -667,6 +688,145 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — happy path (real network 
         checkedAt: expect.any(String) as string,
       })
       expect(listLeftoverFetchRefs()).toEqual([])
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('(A3) post-merge verification catches a branch mismatch after a confirmed merge exit: apply-failed, mutationStarted:true, journal stays applying', async () => {
+    // #given a real "behind" fast-forward, but the ONE `symbolic-ref --short HEAD` call in this
+    // flow (verifyPostMergeState, POST-merge — nothing else calls it for a fresh, non-reconciled
+    // update) is intercepted to report a branch other than the one the merge actually landed on.
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      fixture.pushCommit('b.txt', 'two', 'c2')
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('symbolic-ref') && args.includes('--short') && args.includes('HEAD')) {
+          return {kind: 'ok', stdout: 'not-main\n', stderr: ''}
+        }
+        return runGit(args, options)
+      }
+
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+      // #then — the merge itself succeeded (a real fast-forward ran), but verification refused to
+      // trust it: mutationStarted:true (the merge command WAS spawned), journal left at `applying`.
+      expect(result).toEqual({kind: 'failed', reason: 'apply-failed', mutationStarted: true, permanent: false})
+      const journal = await readJournal(journalsDirFor(), OWNER, REPO)
+      expect(journal.ok).toBe(true)
+      expect(journal.ok === true ? journal.journal.phase : undefined).toBe('applying')
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('(A3) post-merge verification catches a dirty tree after a confirmed merge exit: apply-failed, mutationStarted:true, journal stays applying', async () => {
+    // #given a real "behind" fast-forward; `checkTempIndexCleanliness`'s underlying status call
+    // (`git status --porcelain=v2`, WITHOUT `--branch` — distinct from inspectCheckout's own call)
+    // fires THREE times in a normal flow: admission (executeUpdate step 7, against H), PRE-merge
+    // (runFastForward's re-admission, against H again), and POST-merge (verifyPostMergeState,
+    // against T). The THIRD occurrence — the post-merge one — is forged dirty.
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      fixture.pushCommit('b.txt', 'two', 'c2')
+      let cleanlinessStatusCalls = 0
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('status') && args.includes('--porcelain=v2') && !args.includes('--branch')) {
+          cleanlinessStatusCalls += 1
+          if (cleanlinessStatusCalls === 3) {
+            return {kind: 'ok', stdout: '1 .M N... 100644 100644 100644 aaa bbb file.txt\0', stderr: ''}
+          }
+        }
+        return runGit(args, options)
+      }
+
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+      // #then
+      expect(result).toEqual({kind: 'failed', reason: 'apply-failed', mutationStarted: true, permanent: false})
+      const journal = await readJournal(journalsDirFor(), OWNER, REPO)
+      expect(journal.ok).toBe(true)
+      expect(journal.ok === true ? journal.journal.phase : undefined).toBe('applying')
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('(A4) pre-merge re-admission refuses when the branch changed since admission: apply-failed, mutationStarted:false, journal cleared', async () => {
+    // #given a real "behind" fast-forward; `inspectCheckout`'s status call (`--porcelain=v2
+    // --branch`) fires twice in a normal flow: once at ADMISSION (executeUpdate step 2), once in
+    // runFastForward's PRE-merge re-verification (reverifyCheckoutState). The second occurrence
+    // reports a different branch — simulating the agent switching branches mid-round-trip.
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      const fromSha = fixture.headSha
+      fixture.pushCommit('b.txt', 'two', 'c2')
+      let branchStatusCalls = 0
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('status') && args.includes('--porcelain=v2') && args.includes('--branch')) {
+          branchStatusCalls += 1
+          if (branchStatusCalls === 2) {
+            return {
+              kind: 'ok',
+              stdout: `# branch.oid ${fromSha}\n# branch.head agent-branch\n`,
+              stderr: '',
+            }
+          }
+        }
+        return runGit(args, options)
+      }
+
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+      // #then — the merge command was NEVER spawned (caught before the "point of no return"):
+      // mutationStarted:false, journal CLEARED, not left at `applying`.
+      expect(result).toEqual({kind: 'failed', reason: 'apply-failed', mutationStarted: false, permanent: false})
+      expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: false, reason: 'absent'})
+      const landedSha = gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()
+      expect(landedSha).toBe(fromSha)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it("(A6) reconciling a crashed-after-applied journal reports the journal's OWN appliedAt, not a fresh timestamp", async () => {
+    // #given a real fast-forward completes normally, landing the checkout at toSha
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      const fromSha = fixture.headSha
+      const toSha = fixture.pushCommit('b.txt', 'two', 'c2')
+      const firstResult = await executeUpdate(req(), networkDeps(fixture))
+      expect(firstResult.kind).toBe('ready')
+
+      await writeJournal(journalsDirFor(), {
+        kind: 'update',
+        owner: OWNER,
+        repo: REPO,
+        phase: 'applied',
+        fromSha,
+        toSha,
+        startedAt: '2020-01-01T00:00:00.000Z',
+        appliedAt: '2020-01-01T00:00:00.000Z',
+      })
+
+      const reconcileNow = (): Date => new Date(2099, 0, 1)
+      const reconciled = await executeUpdate(req(), networkDeps(fixture, {now: reconcileNow}))
+
+      expect(reconciled).toEqual({
+        kind: 'ready',
+        change: 'fast-forward',
+        branch: 'main',
+        sha: toSha,
+        fromSha,
+        checkedAt: '2020-01-01T00:00:00.000Z',
+      })
     } finally {
       await fixture.close()
     }
@@ -790,7 +950,7 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — remote moved between obse
 })
 
 describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — hung apply via an injectable seam', () => {
-  it('a pack-stream that reports termination-unconfirmed fails possibly, leaves the journal at applying, and a follow-up /update refuses needs-recovery with zero git calls', async () => {
+  it('a pack-stream that reports termination-unconfirmed fails possibly, leaves the journal at applying, places a maintenance hold, and a follow-up /update refuses maintenance-hold with zero git calls', async () => {
     // #given a fake packStreamRunner standing in for a hung `pack-objects | index-pack` pipe \u2014
     // deterministic and instant, unlike an actually-hung subprocess
     const fixture = await setupNetworkFixture()
@@ -813,13 +973,14 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — hung apply via an injecta
       expect(journal.ok).toBe(true)
       expect(journal.ok === true ? journal.journal.phase : undefined).toBe('applying')
 
-      // #when \u2014 a follow-up /update reconciles the journal WITHOUT any git call at all (journal
-      // reconciliation for `applying` refuses immediately, before touching the checkout or network)
+      // #when — a follow-up /update refuses WITHOUT any git call at all: the maintenance hold
+      // (repo-mutex.ts) set by the unconfirmed pack-stream termination is checked FIRST, before
+      // even journal reconciliation.
       const {runner, calls} = makeGitRunnerSpy()
       const followUp = await executeUpdate(req(), networkDeps(fixture, {gitRunner: runner}))
 
       // #then
-      expect(followUp).toEqual({kind: 'refused', reason: 'needs-recovery'})
+      expect(followUp).toEqual({kind: 'refused', reason: 'maintenance-hold'})
       expect(calls).toEqual([])
     } finally {
       await fixture.close()
