@@ -13,25 +13,21 @@
  * a pure filesystem walk) and no further git ever runs there.
  */
 
+import type {AgentWalkRunner} from './agent-walk.js'
+import type {QuarantineMetadata, QuarantineSource} from './backups.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions} from './git-stream.js'
 import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase, UpdateJournalPhase} from './journal.js'
 import type {CheckoutOperation} from './types.js'
 import type {Deadline, InvocationTracker, RemoteFailureReason} from './update.js'
-
 import {createHash, randomUUID} from 'node:crypto'
-import {lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, statfs} from 'node:fs/promises'
+import {lstat, mkdir, mkdtemp, open, realpath, rename, rm, statfs} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {dirname, join} from 'node:path'
 import {performance} from 'node:perf_hooks'
 import process from 'node:process'
-
-import {
-  listBackups,
-  QUARANTINE_CHECKOUT_DIR_NAME,
-  QUARANTINE_METADATA_FILE_NAME,
-  type QuarantineMetadata,
-} from './backups.js'
+import {runAgentWalk} from './agent-walk.js'
+import {listBackups, QUARANTINE_CHECKOUT_DIR_NAME, QUARANTINE_METADATA_FILE_NAME} from './backups.js'
 import {checkCheckoutLayout, checkTempIndexCleanliness, inventoryCheckoutConfig} from './checkout-profile.js'
 import {HANDOFF_DEADLINE_MS, MAX_HANDOFF_ENTRIES, writeAskpassHelper} from './clone.js'
 import {
@@ -120,8 +116,10 @@ export interface SafeRecoveryPreview {
   readonly ignoredCount: number
   readonly estimatedSizeBytes: number
   readonly entryCount: number
+  /** (Review round E, E4) False if the size/entry-count walk hit its deadline or entry cap -- estimatedSizeBytes/entryCount are then a LOWER BOUND, never trusted for a quota decision at confirm time. */
+  readonly sizeMeasurementComplete: boolean
   readonly retention: RetentionUsage
-  /** Digest of headSha, dirty counts, and size+entryCount \u2014 see computeFingerprint's doc comment. */
+  /** Digest of headSha, dirty counts, and size+entryCount -- see computeFingerprint's doc comment. */
   readonly fingerprint: string
 }
 
@@ -130,8 +128,9 @@ export interface OpaqueRecoveryPreview {
   readonly inspectionSafe: false
   readonly estimatedSizeBytes: number
   readonly entryCount: number
+  readonly sizeMeasurementComplete: boolean
   readonly retention: RetentionUsage
-  /** Digest of ONLY size+entryCount \u2014 see computeFingerprint's doc comment. */
+  /** Digest of ONLY size+entryCount -- see computeFingerprint's doc comment. */
   readonly fingerprint: string
 }
 
@@ -241,102 +240,48 @@ async function defaultStatfs(path: string): Promise<{readonly bavail: number; re
 
 export interface PreviewRecoveryDeps {
   readonly gitRunner?: GitRunnerFn
+  /** (Review round E, E5) Injected agent-uid walk runner. Defaults to the real subprocess-spawning `runAgentWalk`. */
+  readonly walkRunner?: AgentWalkRunner
   readonly reposRoot?: string
   readonly options?: {readonly timeoutMs?: number; readonly uid?: number; readonly gid?: number}
   readonly now?: () => Date
   readonly walkDeadlineMs?: number
   readonly walkMaxEntries?: number
-  /** Injected monotonic clock for the filesystem walk's own deadline. Defaults to `performance.now()`. */
-  readonly monotonicNow?: () => number
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem size/entry-count walk \u2014 read-only mirror of handoff.ts's own bounded-walk shape:
-// `lstat`, never `stat`; a symlink is never followed (only its own size is counted); never crosses
-// a filesystem boundary (`st_dev`); bounded by both a wall-clock deadline and an entry-count cap,
-// both checked before every entry is processed. Unlike handoff.ts this never chowns/chmods
-// anything and never fails closed on an unusual node type (fifo/socket/device) \u2014 this walk
-// produces an ESTIMATE for an operator preview, not a security-relevant handoff; a pathological or
-// unusual entry degrades the estimate rather than the whole preview.
+// Filesystem size/entry-count walk (Review round E, E5) - delegates to agent-walk.ts's
+// AgentWalkRunner, run AS THE AGENT IDENTITY rather than in-process as this (root) service. See
+// agent-walk.ts's module header for the full rationale. Never runs in-process on a path the agent
+// can reach.
 // ---------------------------------------------------------------------------
 
-interface WalkSizeResult {
-  readonly totalBytes: number
-  readonly entryCount: number
-  /** False when the deadline or entry cap was hit \u2014 the reported totals are a lower-bound estimate, not exact. */
-  readonly complete: boolean
-}
+/** Extra time, beyond the walk's own internal deadline, allowed for the subprocess to observe that deadline and print its result before this module gives up on it as unconfirmed. */
+const WALK_TIMEOUT_BUFFER_MS = 5_000
 
-interface WalkContext {
-  rootDev: number | undefined
-  readonly deadlineAt: number
+type WalkOrFailOutcome =
+  | {readonly kind: 'ok'; readonly totalBytes: number; readonly entryCount: number; readonly complete: boolean}
+  | {readonly kind: 'failed'}
+
+async function walkCheckoutSize(params: {
+  readonly walkRunner: AgentWalkRunner
+  readonly rootPath: string
   readonly maxEntries: number
-  readonly now: () => number
-  entries: number
-  totalBytes: number
-  capped: boolean
-}
-
-async function walkSize(entryPath: string, ctx: WalkContext): Promise<void> {
-  if (ctx.capped) return
-  if (ctx.now() > ctx.deadlineAt) {
-    ctx.capped = true
-    return
-  }
-  if (ctx.entries >= ctx.maxEntries) {
-    ctx.capped = true
-    return
-  }
-  ctx.entries += 1
-
-  let st
-  try {
-    st = await lstat(entryPath)
-  } catch {
-    return // vanished mid-walk \u2014 not fatal for an estimate
-  }
-
-  if (ctx.rootDev === undefined) ctx.rootDev = st.dev
-  else if (st.dev !== ctx.rootDev) return // foreign filesystem \u2014 never descend, never count its bytes
-
-  if (st.isSymbolicLink()) {
-    ctx.totalBytes += st.size // never followed \u2014 only the symlink's own size is counted
-    return
-  }
-  if (st.isDirectory()) {
-    let names: readonly string[]
-    try {
-      names = await readdir(entryPath)
-    } catch {
-      return
-    }
-    for (const name of names) {
-      if (ctx.capped) return
-      await walkSize(join(entryPath, name), ctx)
-    }
-    return
-  }
-  if (st.isFile()) {
-    ctx.totalBytes += st.size
-  }
-  // fifo/socket/device, etc.: 0 bytes contributed, already counted as an entry above.
-}
-
-async function walkCheckoutSize(
-  rootPath: string,
-  options: {readonly deadlineMs: number; readonly maxEntries: number; readonly now: () => number},
-): Promise<WalkSizeResult> {
-  const ctx: WalkContext = {
-    rootDev: undefined,
-    deadlineAt: options.now() + options.deadlineMs,
-    maxEntries: options.maxEntries,
-    now: options.now,
-    entries: 0,
-    totalBytes: 0,
-    capped: false,
-  }
-  await walkSize(rootPath, ctx)
-  return {totalBytes: ctx.totalBytes, entryCount: ctx.entries, complete: !ctx.capped}
+  readonly deadlineMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}): Promise<WalkOrFailOutcome> {
+  const {walkRunner, rootPath, maxEntries, deadlineMs, uid, gid} = params
+  const outcome = await walkRunner({
+    rootPath,
+    maxEntries,
+    deadlineMs,
+    uid,
+    gid,
+    timeoutMs: deadlineMs + WALK_TIMEOUT_BUFFER_MS,
+  })
+  if (outcome.kind !== 'ok') return {kind: 'failed'}
+  return outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +372,7 @@ async function computeRecoveryPreviewLocked(
   repo: string,
   params: {
     readonly gitRunner: GitRunnerFn
+    readonly walkRunner: AgentWalkRunner
     readonly reposRoot: string
     readonly timeoutMs: number
     readonly uid: number
@@ -434,10 +380,9 @@ async function computeRecoveryPreviewLocked(
     readonly now: () => Date
     readonly walkDeadlineMs: number
     readonly walkMaxEntries: number
-    readonly monotonicNow: () => number
   },
 ): Promise<PreviewRecoveryResult> {
-  const {gitRunner, reposRoot, timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries, monotonicNow} = params
+  const {gitRunner, walkRunner, reposRoot, timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries} = params
 
   // Checked first, before even the journal — mirrors update.ts's own step 0.
   if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
@@ -486,18 +431,23 @@ async function computeRecoveryPreviewLocked(
     inspectionSafe = configInventory.kind === 'allowed'
   }
 
-  const walk = await walkCheckoutSize(canonicalPath, {
-    deadlineMs: walkDeadlineMs,
+  // (E5) AS THE AGENT — never in-process as this (root) service.
+  const walk = await walkCheckoutSize({
+    walkRunner,
+    rootPath: canonicalPath,
     maxEntries: walkMaxEntries,
-    now: monotonicNow,
+    deadlineMs: walkDeadlineMs,
+    uid,
+    gid,
   })
+  if (walk.kind !== 'ok') return {kind: 'failed', reason: 'inspection-failed'}
 
-  const retentionResult = await listBackups(owner, repo, {reposRoot})
+  const retentionResult = await listBackups(owner, repo, {reposRoot, walkRunner, uid, gid})
   if (retentionResult.kind !== 'ok') return {kind: 'failed', reason: 'inspection-failed'}
   const retention: RetentionUsage = {
     generationCount: retentionResult.backups.length,
     totalBytes: retentionResult.totalBytes,
-    hasUnknownSize: retentionResult.backups.some(backup => !backup.metadataOk),
+    hasUnknownSize: retentionResult.backups.some(backup => !backup.metadataOk || !backup.sizeComplete),
     maxGenerations: RETENTION_MAX_GENERATIONS,
     maxBytes: RETENTION_MAX_BYTES,
   }
@@ -510,6 +460,7 @@ async function computeRecoveryPreviewLocked(
         inspectionSafe: false,
         estimatedSizeBytes: walk.totalBytes,
         entryCount: walk.entryCount,
+        sizeMeasurementComplete: walk.complete,
         retention,
         fingerprint,
       },
@@ -563,6 +514,7 @@ async function computeRecoveryPreviewLocked(
       ignoredCount,
       estimatedSizeBytes: walk.totalBytes,
       entryCount: walk.entryCount,
+      sizeMeasurementComplete: walk.complete,
       retention,
       fingerprint,
     },
@@ -579,12 +531,12 @@ export async function previewRecovery(
 ): Promise<PreviewRecoveryResult> {
   const {
     gitRunner: injectedGitRunner = runGit,
+    walkRunner: injectedWalkRunner = runAgentWalk,
     reposRoot = WORKSPACE_REPOS_ROOT,
     options = {},
     now = () => new Date(),
     walkDeadlineMs = DEFAULT_WALK_DEADLINE_MS,
     walkMaxEntries = DEFAULT_WALK_MAX_ENTRIES,
-    monotonicNow = () => performance.now(),
   } = deps
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const {owner, repo} = request
@@ -594,13 +546,14 @@ export async function previewRecovery(
   // unconfirmed termination anywhere holds the repository and returns `termination-unconfirmed`,
   // never a preview — opaque or otherwise — built on an uncertain read.
   return withRepoLock(repoKey, async () => {
-    const tracker = createInvocationTracker({gitRunner: injectedGitRunner})
+    const tracker = createInvocationTracker({gitRunner: injectedGitRunner, walkRunner: injectedWalkRunner})
     return runTrackedInvocation(
       repoKey,
       tracker,
       async () =>
         computeRecoveryPreviewLocked(owner, repo, {
           gitRunner: tracker.gitRunner,
+          walkRunner: tracker.walkRunner,
           reposRoot,
           timeoutMs,
           uid,
@@ -608,7 +561,6 @@ export async function previewRecovery(
           now,
           walkDeadlineMs,
           walkMaxEntries,
-          monotonicNow,
         }),
       (): PreviewRecoveryResult => ({kind: 'failed', reason: 'termination-unconfirmed'}),
     )
@@ -761,6 +713,13 @@ function envelopePathFor(reposRoot: string, owner: string, repo: string, recover
  * written as a SIBLING of `checkout/`, so nothing ever writes into (or collides with) the
  * preserved content. Idempotent: if `checkout/` already exists, the rename is skipped (a prior
  * attempt already completed it — reconciliation, E3, relies on this).
+ *
+ * (Review round E, E2 regression fix) ALWAYS writes metadata — never `undefined` — so a
+ * quarantine created by taking over an interrupted update (or by crash reconciliation) never
+ * becomes a permanently `hasUnknownSize` generation that blocks every later recovery. Size/entry
+ * count are measured with the E5 agent-uid walker AFTER the rename (measuring what's actually
+ * preserved); `originalHeadSha`/`originalBranch` are supplied by the caller and are `undefined`
+ * whenever reading them would be unsafe (interrupted-update/reconciliation sources).
  */
 async function quarantineExistingCheckout(params: {
   readonly reposRoot: string
@@ -768,10 +727,18 @@ async function quarantineExistingCheckout(params: {
   readonly repo: string
   readonly recoveryId: string
   readonly checkoutPath: string
-  /** Omitted during best-effort crash reconciliation, where the original preview evidence is no longer available — the rename alone still fully preserves the content; the generation is just listed with `metadataOk: false`. */
-  readonly metadata: Omit<QuarantineMetadata, 'recoveryId' | 'owner' | 'repo'> | undefined
+  readonly source: QuarantineSource
+  readonly originalHeadSha: string | undefined
+  readonly originalBranch: string | undefined
+  readonly now: () => Date
+  readonly walkRunner: AgentWalkRunner
+  readonly walkMaxEntries: number
+  readonly walkDeadlineMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
 }): Promise<'ok' | 'failed'> {
-  const {reposRoot, owner, repo, recoveryId, checkoutPath, metadata} = params
+  const {reposRoot, owner, repo, recoveryId, checkoutPath, source, originalHeadSha, originalBranch, now} = params
+  const {walkRunner, walkMaxEntries, walkDeadlineMs, uid, gid} = params
   const envelopePath = envelopePathFor(reposRoot, owner, repo, recoveryId)
   const envelopeCheckoutPath = join(envelopePath, QUARANTINE_CHECKOUT_DIR_NAME)
   try {
@@ -786,8 +753,27 @@ async function quarantineExistingCheckout(params: {
       return 'failed'
     }
   }
-  if (metadata === undefined) return 'ok'
-  const fullMetadata: QuarantineMetadata = {recoveryId, owner, repo, ...metadata}
+
+  const measured = await walkCheckoutSize({
+    walkRunner,
+    rootPath: envelopeCheckoutPath,
+    maxEntries: walkMaxEntries,
+    deadlineMs: walkDeadlineMs,
+    uid,
+    gid,
+  })
+  const fullMetadata: QuarantineMetadata = {
+    recoveryId,
+    owner,
+    repo,
+    createdAt: now().toISOString(),
+    sizeBytes: measured.kind === 'ok' ? measured.totalBytes : 0,
+    entryCount: measured.kind === 'ok' ? measured.entryCount : 0,
+    sizeComplete: measured.kind === 'ok' && measured.complete,
+    source,
+    ...(originalHeadSha === undefined ? {} : {originalHeadSha}),
+    ...(originalBranch === undefined ? {} : {originalBranch}),
+  }
   const metadataPath = join(envelopePath, QUARANTINE_METADATA_FILE_NAME)
   const tempPath = join(envelopePath, `.${QUARANTINE_METADATA_FILE_NAME}.tmp-${randomUUID()}`)
   try {
@@ -876,11 +862,13 @@ async function reconcileOneRecoveryJournal(params: {
   readonly reposRoot: string
   readonly journal: RecoveryJournal
   readonly gitRunner: GitRunnerFn
+  readonly walkRunner: AgentWalkRunner
+  readonly now: () => Date
   readonly timeoutMs: number
   readonly uid: number | undefined
   readonly gid: number | undefined
 }): Promise<RecoveryReconciliationOutcome> {
-  const {journalsDir, reposRoot, journal, gitRunner, timeoutMs, uid, gid} = params
+  const {journalsDir, reposRoot, journal, gitRunner, walkRunner, now, timeoutMs, uid, gid} = params
   const {owner, repo, recoveryId, targetSha, branch, startedAt} = journal
   const checkoutPath = join(reposRoot, owner, repo)
   const stagingPath = stagingPathFor(reposRoot, recoveryId)
@@ -910,7 +898,15 @@ async function reconcileOneRecoveryJournal(params: {
         repo,
         recoveryId,
         checkoutPath,
-        metadata: undefined,
+        source: 'reconciliation',
+        originalHeadSha: undefined,
+        originalBranch: undefined,
+        now,
+        walkRunner,
+        walkMaxEntries: DEFAULT_WALK_MAX_ENTRIES,
+        walkDeadlineMs: DEFAULT_WALK_DEADLINE_MS,
+        uid,
+        gid,
       })
       if (result === 'failed') return 'left-in-place'
     }
@@ -942,6 +938,7 @@ async function reconcileOneRecoveryJournal(params: {
 
 export interface ReconcileRecoveryJournalsOnStartupDeps {
   readonly gitRunner?: GitRunnerFn
+  readonly now?: () => Date
   readonly reposRoot?: string
   readonly options?: {readonly timeoutMs?: number; readonly uid?: number; readonly gid?: number}
   readonly logger: {
@@ -963,7 +960,7 @@ function errorMessage(error: unknown): string {
  * per-journal error is logged and the journal is left in place rather than blocking startup.
  */
 export async function reconcileRecoveryJournalsOnStartup(deps: ReconcileRecoveryJournalsOnStartupDeps): Promise<void> {
-  const {reposRoot = WORKSPACE_REPOS_ROOT, gitRunner = runGit, options = {}, logger} = deps
+  const {reposRoot = WORKSPACE_REPOS_ROOT, gitRunner = runGit, now = () => new Date(), options = {}, logger} = deps
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
 
@@ -1005,6 +1002,8 @@ export async function reconcileRecoveryJournalsOnStartup(deps: ReconcileRecovery
               reposRoot,
               journal,
               gitRunner: tracker.gitRunner,
+              walkRunner: tracker.walkRunner,
+              now,
               timeoutMs,
               uid,
               gid,
@@ -1116,9 +1115,11 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   const {timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries, monotonicNow} = ctx
   const gitRunner = tracker.gitRunner
   const packStreamRunner = tracker.packStreamRunner
+  const walkRunner = tracker.walkRunner
 
   const preview = await computeRecoveryPreviewLocked(owner, repo, {
     gitRunner,
+    walkRunner,
     reposRoot,
     timeoutMs,
     uid,
@@ -1126,7 +1127,6 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     now,
     walkDeadlineMs,
     walkMaxEntries,
-    monotonicNow,
   })
   if (preview.kind === 'refused')
     return {
@@ -1150,6 +1150,13 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   // unknown, so its own quarantine metadata degrades exactly like reconciliation's does.
   const hadExistingCheckout = preview.kind === 'ok' || preview.kind === 'recoverable-update'
   if (preview.kind === 'ok') {
+    // (E4) An incomplete walk is never trusted as a lower bound for a quota/disk decision — refuse
+    // rather than admit on a possibly-undercounted size, exactly at the point this evidence is
+    // actually ACTED on (never in previewRecovery itself, which reports the degraded estimate as
+    // information, not a decision). Checked BEFORE the fingerprint comparison: an incomplete walk
+    // makes the fingerprint ITSELF unreliable (it digests the walk's own totals), so "the size
+    // could not be measured" is always the more honest answer than a spurious `checkout-changed`.
+    if (!preview.preview.sizeMeasurementComplete) return {kind: 'failed', reason: 'inspection-failed'}
     if (preview.preview.fingerprint !== fingerprint) return {kind: 'refused', reason: 'checkout-changed'}
     estimatedSizeBytes = preview.preview.estimatedSizeBytes
     retention = preview.preview.retention
@@ -1157,12 +1164,12 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     return {kind: 'refused', reason: 'checkout-changed'}
   if (preview.kind !== 'ok') {
     // (E4) A `listBackups` failure must never fail OPEN as "zero existing generations" — refuse.
-    const fresh = await listBackups(owner, repo, {reposRoot})
+    const fresh = await listBackups(owner, repo, {reposRoot, walkRunner, uid, gid})
     if (fresh.kind !== 'ok') return {kind: 'failed', reason: 'inspection-failed'}
     retention = {
       generationCount: fresh.backups.length,
       totalBytes: fresh.totalBytes,
-      hasUnknownSize: fresh.backups.some(backup => !backup.metadataOk),
+      hasUnknownSize: fresh.backups.some(backup => !backup.metadataOk || !backup.sizeComplete),
       maxGenerations: RETENTION_MAX_GENERATIONS,
       maxBytes: RETENTION_MAX_BYTES,
     }
@@ -1297,20 +1304,26 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     startedAt: now().toISOString(),
   })
   if (hadExistingCheckout) {
-    // (E2) An interrupted-update checkout's headSha/branch are never safe to read (it may be
-    // mid-merge) — its generation is quarantined WITHOUT metadata, exactly like crash
-    // reconciliation's own best-effort quarantine. A normal preview's metadata is unaffected.
-    const metadata =
-      preview.kind === 'ok'
-        ? {
-            createdAt: now().toISOString(),
-            sizeBytes: estimatedSizeBytes,
-            entryCount: preview.preview.entryCount,
-            originalHeadSha: preview.preview.inspectionSafe ? preview.preview.headSha : undefined,
-            originalBranch: preview.preview.inspectionSafe ? preview.preview.branch : undefined,
-          }
-        : undefined
-    const quarantined = await quarantineExistingCheckout({reposRoot, owner, repo, recoveryId, checkoutPath, metadata})
+    // (E2 regression fix) ALWAYS quarantines with real metadata (measured fresh by
+    // quarantineExistingCheckout itself, via the E5 walker) — an interrupted-update checkout's
+    // headSha/branch are never safe to read (it may be mid-merge), so only THOSE two fields are
+    // omitted for that source; size/entry count are never skipped.
+    const quarantined = await quarantineExistingCheckout({
+      reposRoot,
+      owner,
+      repo,
+      recoveryId,
+      checkoutPath,
+      source: preview.kind === 'ok' ? 'recovery' : 'interrupted-update',
+      originalHeadSha: preview.kind === 'ok' && preview.preview.inspectionSafe ? preview.preview.headSha : undefined,
+      originalBranch: preview.kind === 'ok' && preview.preview.inspectionSafe ? preview.preview.branch : undefined,
+      now,
+      walkRunner,
+      walkMaxEntries: ctx.walkMaxEntries,
+      walkDeadlineMs: ctx.walkDeadlineMs,
+      uid,
+      gid,
+    })
     if (quarantined !== 'ok') return {kind: 'failed', reason: 'quarantine-failed'}
   }
 

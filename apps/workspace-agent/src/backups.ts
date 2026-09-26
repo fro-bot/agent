@@ -10,9 +10,11 @@
  * writes it first.
  */
 
+import type {AgentWalkRunner} from './agent-walk.js'
 import {lstat, readdir, readFile, rm} from 'node:fs/promises'
 import {join} from 'node:path'
 
+import {runAgentWalk} from './agent-walk.js'
 import {JOURNAL_DIR_NAME, QUARANTINE_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal} from './journal.js'
 import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
@@ -35,7 +37,16 @@ export const QUARANTINE_METADATA_FILE_NAME = 'metadata.json'
  */
 export const QUARANTINE_CHECKOUT_DIR_NAME = 'checkout'
 
-/** Root-owned metadata dropped alongside a preserved checkout at quarantine time (slice 5b writes it; this module defines and strictly parses it now). */
+/** Which code path created this generation — review round E, E2/E4. */
+export type QuarantineSource = 'recovery' | 'interrupted-update' | 'reconciliation'
+
+const QUARANTINE_SOURCES: readonly QuarantineSource[] = ['recovery', 'interrupted-update', 'reconciliation']
+
+function isQuarantineSource(value: unknown): value is QuarantineSource {
+  return typeof value === 'string' && (QUARANTINE_SOURCES as readonly string[]).includes(value)
+}
+
+/** Root-owned metadata ALWAYS dropped alongside a preserved checkout at quarantine time — written by recover.ts, defined and strictly parsed here. */
 export interface QuarantineMetadata {
   readonly recoveryId: string
   readonly owner: string
@@ -44,10 +55,13 @@ export interface QuarantineMetadata {
   readonly createdAt: string
   readonly sizeBytes: number
   readonly entryCount: number
-  /** HEAD SHA the ORIGINAL (preserved) checkout was at. Absent for an unborn/no-HEAD checkout. */
+  /** (E4) False if the size/entry-count measurement at quarantine time was incomplete or failed outright — `sizeBytes`/`entryCount` are then a lower bound (0 if it failed entirely), never trusted for a quota decision. */
+  readonly sizeComplete: boolean
+  /** HEAD SHA the ORIGINAL (preserved) checkout was at. Absent for an unborn/no-HEAD checkout, OR whenever reading it would be unsafe (mid-merge — interrupted-update/reconciliation sources). */
   readonly originalHeadSha?: string
-  /** Branch the ORIGINAL checkout was on. Absent if it was detached. */
+  /** Branch the ORIGINAL checkout was on. Absent if it was detached, OR unsafe to read. */
   readonly originalBranch?: string
+  readonly source: QuarantineSource
 }
 
 export type QuarantineMetadataReadResult =
@@ -61,12 +75,21 @@ export interface BackupEntry {
   readonly metadataOk: boolean
   readonly createdAt: string
   readonly sizeBytes: number
+  /** (E4) False when the size is unknown — either `metadataOk:false`, or metadata parsed but its own `sizeComplete` was false and no fallback measurement (E4b, `listBackups`'s `walkRunner`) could complete either. */
+  readonly sizeComplete: boolean
   readonly originalHeadSha: string | undefined
   readonly originalBranch: string | undefined
 }
 
 export interface BackupsDeps {
   readonly reposRoot?: string
+  /** (E4b) Injected agent-uid walk runner, used ONLY to measure a generation whose metadata is missing/malformed — defaults to the real subprocess-spawning `runAgentWalk`. */
+  readonly walkRunner?: AgentWalkRunner
+  readonly uid?: number
+  readonly gid?: number
+  readonly walkDeadlineMs?: number
+  readonly walkMaxEntries?: number
+  readonly walkTimeoutMs?: number
 }
 
 export type ListBackupsResult =
@@ -106,6 +129,8 @@ function parseQuarantineMetadata(value: unknown): QuarantineMetadata | null {
   if (!isNonNegativeInt(v.sizeBytes) || !isNonNegativeInt(v.entryCount)) return null
   if (v.originalHeadSha !== undefined && !isNonEmptyString(v.originalHeadSha)) return null
   if (v.originalBranch !== undefined && !isNonEmptyString(v.originalBranch)) return null
+  if (typeof v.sizeComplete !== 'boolean') return null
+  if (!isQuarantineSource(v.source)) return null
   return {
     recoveryId: v.recoveryId,
     owner: v.owner,
@@ -113,6 +138,8 @@ function parseQuarantineMetadata(value: unknown): QuarantineMetadata | null {
     createdAt: v.createdAt,
     sizeBytes: v.sizeBytes,
     entryCount: v.entryCount,
+    sizeComplete: v.sizeComplete,
+    source: v.source,
     ...(v.originalHeadSha === undefined ? {} : {originalHeadSha: v.originalHeadSha}),
     ...(v.originalBranch === undefined ? {} : {originalBranch: v.originalBranch}),
   }
@@ -219,7 +246,15 @@ function isSimplePathSegment(id: string): boolean {
  * counted against the retention quota it can't prove it fits within.
  */
 export async function listBackups(owner: string, repo: string, deps: BackupsDeps = {}): Promise<ListBackupsResult> {
-  const {reposRoot = WORKSPACE_REPOS_ROOT} = deps
+  const {
+    reposRoot = WORKSPACE_REPOS_ROOT,
+    walkRunner = runAgentWalk,
+    uid,
+    gid,
+    walkDeadlineMs = 10_000,
+    walkMaxEntries = 200_000,
+    walkTimeoutMs = 15_000,
+  } = deps
   const quarantineRepoDir = quarantineRepoDirFor(reposRoot, owner, repo)
 
   const dirStatus = await checkQuarantineRepoDir(reposRoot, quarantineRepoDir)
@@ -246,25 +281,41 @@ export async function listBackups(owner: string, repo: string, deps: BackupsDeps
     if (st.isSymbolicLink() || !st.isDirectory()) continue // never a legitimate generation shape
 
     const read = await readQuarantineMetadata(generationPath)
-    if (read.ok === true) {
+    if (read.ok === true && read.metadata.sizeComplete) {
       backups.push({
         id: name,
         metadataOk: true,
         createdAt: read.metadata.createdAt,
         sizeBytes: read.metadata.sizeBytes,
+        sizeComplete: true,
         originalHeadSha: read.metadata.originalHeadSha,
         originalBranch: read.metadata.originalBranch,
       })
       totalBytes += read.metadata.sizeBytes
       continue
     }
+
+    // (E4b) Missing/malformed/incomplete-at-write-time metadata: try to measure the preserved
+    // `checkout/` directly, AS THE AGENT, rather than failing closed as unknown forever.
+    const measured = await walkRunner({
+      rootPath: join(generationPath, QUARANTINE_CHECKOUT_DIR_NAME),
+      maxEntries: walkMaxEntries,
+      deadlineMs: walkDeadlineMs,
+      uid,
+      gid,
+      timeoutMs: walkTimeoutMs,
+    })
+    const measuredOk = measured.kind === 'ok' && measured.complete
+    const sizeBytes = measuredOk && measured.kind === 'ok' ? measured.totalBytes : 0
+    if (measuredOk) totalBytes += sizeBytes
     backups.push({
       id: name,
-      metadataOk: false,
-      createdAt: st.mtime.toISOString(),
-      sizeBytes: 0,
-      originalHeadSha: undefined,
-      originalBranch: undefined,
+      metadataOk: read.ok,
+      createdAt: read.ok ? read.metadata.createdAt : st.mtime.toISOString(),
+      sizeBytes,
+      sizeComplete: measuredOk,
+      originalHeadSha: read.ok ? read.metadata.originalHeadSha : undefined,
+      originalBranch: read.ok ? read.metadata.originalBranch : undefined,
     })
   }
 

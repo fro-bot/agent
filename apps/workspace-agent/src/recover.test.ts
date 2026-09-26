@@ -6,14 +6,16 @@
 import type {GitRunnerFn} from './git-safety.js'
 import type {ExecuteRecoveryDeps} from './recover.js'
 
-import {existsSync, mkdirSync} from 'node:fs'
-import {mkdir, readFile, rename, rm, symlink, writeFile} from 'node:fs/promises'
+import {createHash} from 'node:crypto'
+import {existsSync, mkdirSync, statSync} from 'node:fs'
+import {lstat, mkdir, readdir, readFile, readlink, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {listBackups} from './backups.js'
 import {runGit} from './git-safety.js'
-import {JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {AGENT_GID, AGENT_UID, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal, writeJournal} from './journal.js'
 import {executeRecovery, previewRecovery, reconcileRecoveryJournalsOnStartup} from './recover.js'
 import {
@@ -397,23 +399,21 @@ describe('previewRecovery — the filesystem size/entry-count walk is bounded, a
     expect(result.preview.entryCount).toBe(5)
   })
 
-  it('is bounded by its own deadline \u2014 an already-elapsed deadline stops right after the root', async () => {
-    // #given an injected clock that reports the deadline as already blown on the very next check
+  it('is bounded by its own deadline — a tight budget against enough real entries caps before finishing, and reports sizeMeasurementComplete:false', async () => {
+    // #given — (E5) the walk runs as a real subprocess with its OWN clock; enough real files make
+    // a 1ms budget provably insufficient, unlike a synthetic-clock injection.
     await setupCleanCheckout()
-    let calls = 0
-    const monotonicNow = (): number => {
-      calls += 1
-      // Call 1 computes the deadline; call 2 is the root's OWN check (must still pass, so the
-      // root itself is counted); call 3+ (every child) reports the deadline as already blown.
-      return calls <= 2 ? 0 : 1_000_000
+    for (let i = 0; i < 2_000; i += 1) {
+      await writeFile(join(destPathFor(), `extra-${i}.txt`), 'x')
     }
 
     // #when
-    const result = await previewRecovery(req(), deps({walkDeadlineMs: 100, monotonicNow}))
+    const result = await previewRecovery(req(), deps({walkDeadlineMs: 1}))
 
     // #then
     if (result.kind !== 'ok' || !result.preview.inspectionSafe) throw new Error('unreachable')
-    expect(result.preview.entryCount).toBe(1)
+    expect(result.preview.entryCount).toBeLessThan(2_022)
+    expect(result.preview.sizeMeasurementComplete).toBe(false)
   })
 
   it('counts a symlink itself but never follows it into whatever it points to', async () => {
@@ -453,6 +453,7 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
       await writeFile(join(dest, 'ignored.txt'), 'ignored content\n')
       await writeFile(join(dest, 'untracked.txt'), 'untracked content\n')
       const localSha = commitFile(dest, isolatedGitEnv(checkoutHome), 'local-only.txt', 'local', 'local-only commit')
+      const originalManifest = await buildContentManifest(dest)
 
       const preview = await previewRecovery(req(), deps())
       if (preview.kind !== 'ok' || !preview.preview.inspectionSafe) throw new Error('unreachable')
@@ -484,11 +485,17 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
         )
         expect(await readFile(join(quarantinePath, 'untracked.txt'), 'utf8')).toBe('untracked content\n')
         expect(await readFile(join(quarantinePath, 'ignored.txt'), 'utf8')).toBe('ignored content\n')
+        // #and — (E9) a COMPLETE content manifest (path/type/mode/size/sha256/symlink target) of
+        // the quarantined tree, INCLUDING `.git`, is byte-for-byte identical to the original.
+        expect(await buildContentManifest(quarantinePath)).toEqual(originalManifest)
 
-        // #and — installed checkout is clean on the default branch, agent-owned
+        // #and — installed checkout is clean on the default branch
         expect(gitSync(dest, ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(fixture.headSha)
         expect(gitSync(dest, ['status', '--porcelain'], isolatedGitEnv(checkoutHome)).trim()).toBe('')
         expect(gitSync(dest, ['symbolic-ref', '--short', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe('main')
+        // #and — (E9) agent-owned, when this test itself runs as root (a helper, not an inline
+        // conditional, so the assertion is never skipped silently by lint-suppressed intent)
+        assertAgentOwnedIfRoot(dest)
 
         // #and — a follow-up executeUpdate sees it as unchanged
         const host = new URL(fixture.remoteBaseUrl).host
@@ -510,6 +517,107 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
     },
   )
 })
+
+describe(
+  'executeRecovery -- E9: envelope collision safety (original checkout contains metadata.json)',
+  {timeout: 30_000},
+  () => {
+    it.skipIf(!OPENSSL_AVAILABLE)(
+      'a tracked metadata.json FILE inside the original is preserved untouched under checkout/, alongside correct service metadata',
+      async () => {
+        await setupCleanCheckout()
+        const dest = destPathFor()
+        const localSha = commitFile(
+          dest,
+          isolatedGitEnv(checkoutHome),
+          'metadata.json',
+          '{"app":"data"}',
+          'app metadata file',
+        )
+        const preview = await previewRecovery(req(), deps())
+        if (preview.kind !== 'ok') throw new Error('unreachable')
+
+        const fixture = await setupNetworkFixture()
+        try {
+          const result = await executeRecovery(
+            {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+            recoveryDeps(fixture),
+          )
+
+          expect(result.kind).toBe('ok')
+          if (result.kind !== 'ok') throw new Error('unreachable')
+          const envelopePath = join(
+            reposRoot,
+            WORKSPACE_STATE_DIR_NAME,
+            'quarantine',
+            `${OWNER}__${REPO}`,
+            result.recoveryId,
+          )
+          expect(await readFile(join(envelopePath, 'checkout', 'metadata.json'), 'utf8')).toBe('{"app":"data"}')
+          expect(
+            gitSync(join(envelopePath, 'checkout'), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim(),
+          ).toBe(localSha)
+          const serviceMetadata = JSON.parse(await readFile(join(envelopePath, 'metadata.json'), 'utf8')) as {
+            source: string
+          }
+          expect(serviceMetadata.source).toBe('recovery')
+        } finally {
+          await fixture.close()
+        }
+      },
+    )
+
+    it.skipIf(!OPENSSL_AVAILABLE)(
+      'a tracked metadata.json/ DIRECTORY inside the original is preserved untouched under checkout/, alongside correct service metadata',
+      async () => {
+        await setupCleanCheckout()
+        const dest = destPathFor()
+        await mkdir(join(dest, 'metadata.json'), {recursive: true})
+        const localSha = commitFile(
+          dest,
+          isolatedGitEnv(checkoutHome),
+          'metadata.json/inner.txt',
+          'inner',
+          'app metadata dir',
+        )
+        const preview = await previewRecovery(req(), deps())
+        if (preview.kind !== 'ok') throw new Error('unreachable')
+
+        const fixture = await setupNetworkFixture()
+        try {
+          const result = await executeRecovery(
+            {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+            recoveryDeps(fixture),
+          )
+
+          expect(result.kind).toBe('ok')
+          if (result.kind !== 'ok') throw new Error('unreachable')
+          const envelopePath = join(
+            reposRoot,
+            WORKSPACE_STATE_DIR_NAME,
+            'quarantine',
+            `${OWNER}__${REPO}`,
+            result.recoveryId,
+          )
+          const originalMetadataDir = join(envelopePath, 'checkout', 'metadata.json')
+          expect(existsSync(originalMetadataDir)).toBe(true)
+          expect((await lstat(originalMetadataDir)).isDirectory()).toBe(true)
+          expect(await readFile(join(originalMetadataDir, 'inner.txt'), 'utf8')).toBe('inner')
+          expect(
+            gitSync(join(envelopePath, 'checkout'), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim(),
+          ).toBe(localSha)
+          expect((await lstat(join(envelopePath, 'metadata.json'))).isFile()).toBe(true)
+          const serviceMetadata = JSON.parse(await readFile(join(envelopePath, 'metadata.json'), 'utf8')) as {
+            source: string
+          }
+          expect(serviceMetadata.source).toBe('recovery')
+        } finally {
+          await fixture.close()
+        }
+      },
+    )
+  },
+)
 
 describe('executeRecovery — opaque checkout (hostile config)', {timeout: 30_000}, () => {
   it.skipIf(!OPENSSL_AVAILABLE)('recovers a hostile-config checkout without ever running git in it', async () => {
@@ -654,6 +762,37 @@ describe('executeRecovery — quota and disk-space preflight refuse before build
       await fixture.close()
     }
   })
+})
+
+describe('executeRecovery — E4a: an incomplete size walk at confirm time refuses, never admits a lower bound', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'refuses inspection-failed when the walk was incomplete at preview time, even though the fingerprint still matches',
+    async () => {
+      // #given a checkout large enough that a 1ms walk budget cannot finish
+      await setupCleanCheckout()
+      for (let i = 0; i < 2_000; i += 1) {
+        await writeFile(join(destPathFor(), `extra-${i}.txt`), 'x')
+      }
+      const preview = await previewRecovery(req(), deps({walkDeadlineMs: 1}))
+      if (preview.kind !== 'ok' || !preview.preview.inspectionSafe) throw new Error('unreachable')
+      expect(preview.preview.sizeMeasurementComplete).toBe(false)
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when — confirm re-measures with the SAME tight deadline
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+          recoveryDeps(fixture, {walkDeadlineMs: 1}),
+        )
+
+        // #then
+        expect(result).toEqual({kind: 'failed', reason: 'inspection-failed'})
+        expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim().length).toBe(40)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
 })
 
 describe('executeRecovery — E4: retention accounting fails closed', () => {
@@ -847,6 +986,59 @@ describe(
     )
   },
 )
+
+interface ManifestEntry {
+  readonly path: string
+  readonly type: 'file' | 'dir' | 'symlink' | 'other'
+  readonly mode: number
+  readonly size: number
+  readonly sha256: string | undefined
+  readonly symlinkTarget: string | undefined
+}
+
+/** (E9) A complete content-manifest of `root`: relative path, type, mode, size, sha256 of bytes (files only), symlink target (symlinks only). Sorted for a stable comparison. */
+async function buildContentManifest(root: string): Promise<readonly ManifestEntry[]> {
+  const entries: ManifestEntry[] = []
+  async function walk(relPath: string): Promise<void> {
+    const absPath = join(root, relPath)
+    const st = await lstat(absPath)
+    const mode = st.mode & 0o777
+    if (st.isSymbolicLink()) {
+      const target = await readlink(absPath)
+      entries.push({path: relPath, type: 'symlink', mode, size: st.size, sha256: undefined, symlinkTarget: target})
+      return
+    }
+    if (st.isDirectory()) {
+      entries.push({path: relPath, type: 'dir', mode, size: 0, sha256: undefined, symlinkTarget: undefined})
+      const names = await readdir(absPath)
+      for (const name of [...names].sort()) await walk(relPath === '.' ? name : join(relPath, name))
+      return
+    }
+    const sha256 = st.isFile()
+      ? createHash('sha256')
+          .update(await readFile(absPath))
+          .digest('hex')
+      : undefined
+    entries.push({
+      path: relPath,
+      type: st.isFile() ? 'file' : 'other',
+      mode,
+      size: st.size,
+      sha256,
+      symlinkTarget: undefined,
+    })
+  }
+  await walk('.')
+  return [...entries].sort((a, b) => a.path.localeCompare(b.path))
+}
+
+/** (E9) Asserts agent ownership ONLY when this test process itself runs as root — setuid to a non-root uid is otherwise a no-op the OS silently refuses outside a real container, exactly like every other uid/gid assertion in this suite. */
+function assertAgentOwnedIfRoot(path: string): void {
+  if (process.getuid?.() !== 0) return
+  const st = statSync(path)
+  expect(st.uid).toBe(AGENT_UID)
+  expect(st.gid).toBe(AGENT_GID)
+}
 
 const noopLogger = {info: () => {}, warn: () => {}, error: () => {}}
 
@@ -1156,6 +1348,51 @@ describe('executeRecovery — E2: recovers an interrupted UPDATE journal', () =>
     },
   )
 
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'regression: a second, normal recovery succeeds after an interrupted-update recovery -- the generation is never permanently hasUnknownSize',
+    async () => {
+      await setupCleanCheckout()
+      const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+      await writeJournal(journalsDir, {
+        kind: 'update',
+        owner: OWNER,
+        repo: REPO,
+        phase: 'applying',
+        fromSha: '0'.repeat(40),
+        toSha: '1'.repeat(40),
+        startedAt: new Date().toISOString(),
+      })
+      const firstPreview = await previewRecovery(req(), deps())
+      if (firstPreview.kind !== 'recoverable-update') throw new Error('unreachable')
+
+      const fixture = await setupNetworkFixture()
+      try {
+        const first = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: firstPreview.update.fingerprint},
+          recoveryDeps(fixture),
+        )
+        expect(first.kind).toBe('ok')
+
+        const backups = await listBackups(OWNER, REPO, {reposRoot})
+        expect(backups.kind).toBe('ok')
+        if (backups.kind !== 'ok') throw new Error('unreachable')
+        expect(backups.backups).toHaveLength(1)
+        expect(backups.backups[0]?.metadataOk).toBe(true)
+        expect(backups.backups[0]?.sizeComplete).toBe(true)
+
+        const secondPreview = await previewRecovery(req(), deps())
+        if (secondPreview.kind !== 'ok') throw new Error('unreachable')
+        const second = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: secondPreview.preview.fingerprint},
+          recoveryDeps(fixture),
+        )
+
+        expect(second.kind).toBe('ok')
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
   it.skipIf(!OPENSSL_AVAILABLE)(
     'a RECOVERY journal in progress still refuses outright, never treated as recoverable',
     async () => {

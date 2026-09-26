@@ -50,18 +50,18 @@
  *    begin, so an already-aborted request never reaches `runNetworkAndApply`.
  */
 
+import type {AgentWalkRunner} from './agent-walk.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions, PackStreamOutcome} from './git-stream.js'
 import type {JournalListEntry} from './journal.js'
 import type {CheckoutHead, UpdateFailed, UpdateReady, UpdateRefused, UpdateRequest, UpdateResult} from './types.js'
-
 import {randomUUID} from 'node:crypto'
 import {lstat, mkdir, mkdtemp, readdir, realpath, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {dirname, join} from 'node:path'
 import {performance} from 'node:perf_hooks'
 import process from 'node:process'
-
+import {runAgentWalk} from './agent-walk.js'
 import {
   checkCheckoutLayout,
   checkTempIndexCleanliness,
@@ -570,6 +570,8 @@ export function createDeadline(budgetMs: number, now: () => number): Deadline {
 export interface InvocationTracker {
   readonly gitRunner: GitRunnerFn
   readonly packStreamRunner: (options: PackStreamOptions) => Promise<PackStreamOutcome>
+  /** (Review round E, E5) Additive — wraps the injected agent-uid walk runner (agent-walk.ts) the same way `gitRunner`/`packStreamRunner` are wrapped: clamped to the active deadline, and any `termination-unconfirmed` outcome sets `sawUnconfirmed()`. */
+  readonly walkRunner: AgentWalkRunner
   /** True once ANY dispatch through this tracker reported `termination-unconfirmed`. Sticky. */
   readonly sawUnconfirmed: () => boolean
   /** Installs (or clears, via `undefined`) the active phase deadline every dispatch clamps to. */
@@ -596,8 +598,13 @@ export interface InvocationTracker {
 export function createInvocationTracker(params: {
   readonly gitRunner: GitRunnerFn
   readonly packStreamRunner?: (options: PackStreamOptions) => Promise<PackStreamOutcome>
+  readonly walkRunner?: AgentWalkRunner
 }): InvocationTracker {
-  const {gitRunner: baseGitRunner, packStreamRunner: basePackStreamRunner = runPackStream} = params
+  const {
+    gitRunner: baseGitRunner,
+    packStreamRunner: basePackStreamRunner = runPackStream,
+    walkRunner: baseWalkRunner = runAgentWalk,
+  } = params
   let unconfirmed = false
   let applyingPhase = false
   let mutationState: 'none' | 'dispatched' | 'confirmed' = 'none'
@@ -627,9 +634,18 @@ export function createInvocationTracker(params: {
     return outcome
   }
 
+  const walkRunner: AgentWalkRunner = async options => {
+    const timeoutMs = clampTimeout(options.timeoutMs)
+    if (timeoutMs === 'expired') return {kind: 'failed'}
+    const outcome = await baseWalkRunner({...options, timeoutMs})
+    if (outcome.kind === 'termination-unconfirmed') unconfirmed = true
+    return outcome
+  }
+
   return {
     gitRunner,
     packStreamRunner,
+    walkRunner,
     sawUnconfirmed: () => unconfirmed,
     setDeadline: deadline => {
       activeDeadline = deadline

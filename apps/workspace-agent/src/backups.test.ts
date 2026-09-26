@@ -37,6 +37,8 @@ function makeMetadata(overrides: Partial<QuarantineMetadata> = {}): QuarantineMe
     createdAt: '2026-09-24T00:00:00.000Z',
     sizeBytes: 1024,
     entryCount: 5,
+    sizeComplete: true,
+    source: 'recovery',
     originalHeadSha: 'a'.repeat(40),
     originalBranch: 'main',
     ...overrides,
@@ -50,7 +52,8 @@ async function writeGeneration(
   repo = 'widgets',
 ): Promise<string> {
   const dir = join(quarantineRepoDir(owner, repo), id)
-  await mkdir(dir, {recursive: true})
+  // (E1) A real generation always has an envelope `checkout/` subdirectory alongside metadata.json.
+  await mkdir(join(dir, 'checkout'), {recursive: true})
   if (metadata !== undefined) {
     await writeFile(join(dir, QUARANTINE_METADATA_FILE_NAME), JSON.stringify(metadata))
   }
@@ -79,6 +82,7 @@ describe('listBackups', () => {
           metadataOk: true,
           createdAt: '2026-09-24T00:00:00.000Z',
           sizeBytes: 1024,
+          sizeComplete: true,
           originalHeadSha: 'a'.repeat(40),
           originalBranch: 'main',
         },
@@ -145,6 +149,7 @@ describe('listBackups — malformed and non-generation entries', () => {
         metadataOk: false,
         createdAt: expect.any(String) as string,
         sizeBytes: 0,
+        sizeComplete: true,
         originalHeadSha: undefined,
         originalBranch: undefined,
       },
