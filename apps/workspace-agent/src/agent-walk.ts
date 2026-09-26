@@ -14,6 +14,8 @@
 import {execFile} from 'node:child_process'
 import process from 'node:process'
 
+import {AGENT_HOME, AGENT_TMPDIR} from './identity.js'
+
 /** Self-contained (no imports beyond the two required at the top) — spawned via `node -e`, receiving argv AFTER `--`: rootPath, maxEntries, deadlineMs. Never follows a symlink; never crosses a filesystem boundary; bounded by both a wall-clock deadline and an entry-count cap. */
 const WALK_SCRIPT = `
 const fs = require('node:fs');
@@ -21,29 +23,59 @@ const path = require('node:path');
 const [rootPath, maxEntriesStr, deadlineMsStr] = process.argv.slice(1);
 const maxEntries = Number(maxEntriesStr);
 const deadlineAt = Date.now() + Number(deadlineMsStr);
-let entries = 0, totalBytes = 0, capped = false, rootDev;
-function walk(p) {
+let entries = 0, totalBytes = 0, capped = false, hadError = false, rootDev;
+function walk(p, isRoot) {
   if (capped) return;
   if (Date.now() > deadlineAt || entries >= maxEntries) { capped = true; return; }
   entries += 1;
   let st;
-  try { st = fs.lstatSync(p); } catch { return; }
+  try { st = fs.lstatSync(p); } catch (e) {
+    if (isRoot) { process.exitCode = 1; process.exit(1); }
+    hadError = true;
+    return;
+  }
   if (rootDev === undefined) rootDev = st.dev;
   else if (st.dev !== rootDev) return;
   if (st.isSymbolicLink()) { totalBytes += st.size; return; }
   if (st.isDirectory()) {
     let names;
-    try { names = fs.readdirSync(p); } catch { return; }
-    for (const name of names) { if (capped) return; walk(path.join(p, name)); }
+    try { names = fs.readdirSync(p); } catch (e) { hadError = true; return; }
+    for (const name of names) { if (capped) return; walk(path.join(p, name), false); }
     return;
   }
   if (st.isFile()) totalBytes += st.size;
 }
-walk(rootPath);
-process.stdout.write(JSON.stringify({totalBytes, entryCount: entries, complete: !capped}));
+walk(rootPath, true);
+process.stdout.write(JSON.stringify({totalBytes, entryCount: entries, complete: !capped && !hadError}));
 `
 
 const WALK_KILL_REAP_GRACE_MS = 2_000
+
+/** Fixed, service-controlled PATH — never the parent's, mirrors git-safety.ts's own network-profile PATH. */
+const WALK_PATH = '/usr/bin:/bin'
+
+/** Safe, ambient-content-free working directory for the walk subprocess. */
+const WALK_CWD = '/'
+
+/**
+ * (Review round F, F1) Built from scratch — NEVER `{...process.env}` — so the agent-uid child can
+ * never inherit `WORKSPACE_OPENCODE_TOKEN`, `GITHUB_TOKEN`, any secret-file path, `NODE_OPTIONS`,
+ * `NODE_PATH`, `LD_*`, or any other ambient variable the root service happens to be carrying.
+ * Mirrors opencode-server.ts's `buildOpencodeEnv` allowlist-construction STYLE (an explicit object
+ * literal, not a filter over the parent env) without importing anything OpenCode-specific.
+ */
+function buildWalkEnv(): NodeJS.ProcessEnv {
+  return {PATH: WALK_PATH, HOME: AGENT_HOME, TMPDIR: AGENT_TMPDIR, LANG: 'C'}
+}
+
+/**
+ * Hardening flags applied to the walk subprocess. `--no-experimental-fetch` is deliberately
+ * OMITTED: fetch has been a stable (non-experimental) global since Node 21, so `--no-experimental-
+ * fetch` is an invalid negation on Node 24+ and would make the CHILD FAIL TO START at all —
+ * verified empirically (`node --no-experimental-fetch -e ...` → "invalid negation"). The walk
+ * never uses fetch anyway, so there is nothing this flag would have protected here.
+ */
+const WALK_NODE_FLAGS: readonly string[] = ['--disallow-code-generation-from-strings', '--no-addons']
 
 export interface AgentWalkOptions {
   readonly rootPath: string
@@ -77,26 +109,45 @@ function parseWalkOutput(stdout: string): AgentWalkOutcome {
   return {kind: 'ok', totalBytes: v.totalBytes, entryCount: v.entryCount, complete: v.complete}
 }
 
+type SpawnScriptOutcome =
+  | {readonly kind: 'ok'; readonly stdout: string}
+  | {readonly kind: 'failed'}
+  | {readonly kind: 'termination-unconfirmed'}
+
 /**
- * Runs the bounded walk as `options.uid`/`options.gid`, confirmed-termination semantics matching
- * `runGit`: on `options.timeoutMs` elapsing, SIGKILL is sent; if the child's stdio hasn't closed
- * (the exec callback fired) within `WALK_KILL_REAP_GRACE_MS`, the outcome is
- * `termination-unconfirmed` — NEVER `failed` — since a leaked process may still be running.
+ * Spawns `process.execPath` with `WALK_NODE_FLAGS`, `-e`, `script`, `--`, `...scriptArgs`, as
+ * `options.uid`/`options.gid`, `cwd: WALK_CWD`, `env: buildWalkEnv()` -- the F1-hardened spawn
+ * shape shared by the real walk AND `runWalkScriptForTesting` (F1's own test seam), so a test
+ * exercises the EXACT production spawn, not a hand-copied approximation of it. Confirmed-
+ * termination semantics match `runGit`: SIGKILL on `options.timeoutMs`, then a reap-grace race
+ * between a confirmed exit and `termination-unconfirmed` -- never `failed` -- since a leaked
+ * process may still be running.
  */
-export const runAgentWalk: AgentWalkRunner = async options =>
-  new Promise(resolve => {
+async function spawnWalkProcess(
+  script: string,
+  scriptArgs: readonly string[],
+  options: {readonly uid: number | undefined; readonly gid: number | undefined; readonly timeoutMs: number},
+): Promise<SpawnScriptOutcome> {
+  return new Promise(resolve => {
     let settled = false
     let terminating = false
     let graceHandle: ReturnType<typeof setTimeout> | undefined
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined
 
-    const args = ['-e', WALK_SCRIPT, '--', options.rootPath, String(options.maxEntries), String(options.deadlineMs)]
+    const args = [...WALK_NODE_FLAGS, '-e', script, '--', ...scriptArgs]
     let child: ReturnType<typeof execFile>
     try {
       child = execFile(
         process.execPath,
         args,
-        {uid: options.uid, gid: options.gid, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024},
+        {
+          uid: options.uid,
+          gid: options.gid,
+          cwd: WALK_CWD,
+          env: buildWalkEnv(),
+          encoding: 'utf8',
+          maxBuffer: 8 * 1024 * 1024,
+        },
         (error, stdout) => {
           if (settled) return
           settled = true
@@ -106,7 +157,7 @@ export const runAgentWalk: AgentWalkRunner = async options =>
             resolve({kind: 'failed'})
             return
           }
-          resolve(parseWalkOutput(stdout))
+          resolve({kind: 'ok', stdout})
         },
       )
     } catch {
@@ -136,3 +187,26 @@ export const runAgentWalk: AgentWalkRunner = async options =>
 
     timeoutHandle = setTimeout(terminate, options.timeoutMs)
   })
+}
+
+/** Runs the bounded walk as `options.uid`/`options.gid` — see `spawnWalkProcess`'s doc comment for the spawn/termination contract. */
+export const runAgentWalk: AgentWalkRunner = async options => {
+  const scriptArgs = [options.rootPath, String(options.maxEntries), String(options.deadlineMs)]
+  const outcome = await spawnWalkProcess(WALK_SCRIPT, scriptArgs, options)
+  if (outcome.kind !== 'ok') return outcome
+  return parseWalkOutput(outcome.stdout)
+}
+
+/**
+ * (Review round F, F1) TEST-ONLY seam: runs an ARBITRARY diagnostic script through the exact same
+ * hardened spawn path (flags, env, cwd, uid/gid, confirmed-termination) `runAgentWalk` uses, so a
+ * test can verify what the REAL production spawn actually exposes to the child -- e.g. a script
+ * that prints `process.env`/`process.cwd()` -- rather than asserting against a hand-built copy of
+ * the env-construction logic. Never used by production code.
+ */
+export async function runWalkScriptForTesting(
+  script: string,
+  options: {readonly uid: number | undefined; readonly gid: number | undefined; readonly timeoutMs: number},
+): Promise<SpawnScriptOutcome> {
+  return spawnWalkProcess(script, [], options)
+}
