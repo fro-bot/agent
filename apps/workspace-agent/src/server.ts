@@ -5,14 +5,25 @@
  * isolated instances without shared state.
  */
 
+import type {BackupsDeps} from './backups.js'
 import type {CloneHandlerDeps, CloneHandlerResult} from './clone.js'
 import type {InspectHandlerDeps, InspectHandlerResult} from './inspect.js'
+import type {ExecuteRecoveryDeps, PreviewRecoveryDeps} from './recover.js'
 import type {
+  BackupsValidationFailure,
   CloneFailure,
   CloneRequest,
+  DeleteBackupResult,
+  ExecuteRecoveryRequest,
+  ExecuteRecoveryResult,
+  ExecuteRecoveryValidationFailure,
   HealthzResponse,
   InspectFailure,
   InspectRequest,
+  ListBackupsResult,
+  PreviewRecoveryRequest,
+  PreviewRecoveryResult,
+  PreviewRecoveryValidationFailure,
   ReadyzResponse,
   UpdateRequest,
   UpdateResult,
@@ -24,8 +35,10 @@ import {Buffer} from 'node:buffer'
 import {timingSafeEqual} from 'node:crypto'
 
 import {Hono} from 'hono'
+import {deleteBackup, listBackups} from './backups.js'
 import {executeClone, scrubCredentials} from './clone.js'
 import {inspectCheckout} from './inspect.js'
+import {executeRecovery, previewRecovery} from './recover.js'
 import {sanitizeOwner, sanitizeRepo, validateTokenShape} from './sanitize.js'
 import {executeUpdate} from './update.js'
 
@@ -48,6 +61,29 @@ export type InspectExecutorFn = (request: InspectRequest, deps?: InspectHandlerD
  * `statusForUpdateResult`.
  */
 export type UpdateExecutorFn = (request: UpdateRequest, deps?: UpdateHandlerDeps) => Promise<UpdateResult>
+
+/** Simplified preview-recovery executor signature for dependency injection. Bare `PreviewRecoveryResult`, no `{response, statusCode}` wrapper — see `statusForPreviewRecoveryResult`. */
+export type PreviewRecoveryExecutorFn = (
+  request: PreviewRecoveryRequest,
+  deps?: PreviewRecoveryDeps,
+) => Promise<PreviewRecoveryResult>
+
+/** Simplified execute-recovery executor signature for dependency injection. Bare `ExecuteRecoveryResult` — see `statusForExecuteRecoveryResult`. */
+export type ExecuteRecoveryExecutorFn = (
+  request: ExecuteRecoveryRequest,
+  deps?: ExecuteRecoveryDeps,
+) => Promise<ExecuteRecoveryResult>
+
+/** Simplified list-backups executor signature for dependency injection. */
+export type ListBackupsExecutorFn = (owner: string, repo: string, deps?: BackupsDeps) => Promise<ListBackupsResult>
+
+/** Simplified delete-backup executor signature for dependency injection. */
+export type DeleteBackupExecutorFn = (
+  owner: string,
+  repo: string,
+  id: string,
+  deps?: BackupsDeps,
+) => Promise<DeleteBackupResult>
 
 /**
  * Maps an `UpdateResult` to an HTTP status code.
@@ -72,6 +108,84 @@ function statusForUpdateResult(result: UpdateResult): 200 | 404 | 409 | 502 | 50
   if (result.kind === 'refused') return 409
   if (result.reason === 'fetch-timeout') return 504
   return result.permanent ? 502 : 503
+}
+
+/**
+ * Maps a `PreviewRecoveryResult` to an HTTP status code, mirroring `statusForUpdateResult`.
+ *
+ * - `ok`, `recoverable-update` — 200: the preview itself succeeded; `recoverable-update` just
+ *   reports a different situation (an interrupted update journal) than the ordinary preview shape.
+ * - `no-checkout` — 404: mirrors `/inspect`/`/update`.
+ * - `refused` — 409: the checkout/repository's current state precludes a preview (substituted,
+ *   held, or a journal already in flight) — mirrors `/update`'s `refused` → 409.
+ * - `failed` — 503: both reasons (`inspection-failed`, `termination-unconfirmed`) are transient
+ *   local-check failures, safe to retry — mirrors `/update`'s non-permanent-failure fallback.
+ */
+function statusForPreviewRecoveryResult(result: PreviewRecoveryResult): 200 | 404 | 409 | 503 {
+  if (result.kind === 'ok' || result.kind === 'recoverable-update') return 200
+  if (result.kind === 'no-checkout') return 404
+  if (result.kind === 'refused') return 409
+  return 503
+}
+
+/**
+ * Maps an `ExecuteRecoveryResult` to an HTTP status code, mirroring `statusForUpdateResult`.
+ *
+ * - `ok` — 200.
+ * - `no-checkout` — 404.
+ * - `refused` — 409 for every reason (`maintenance-hold`, `journal-in-progress`,
+ *   `checkout-changed`, `quota-exceeded`, `insufficient-disk-space`): each is the checkout or
+ *   repository's CURRENT state precluding this confirm, never a request-shape problem.
+ * - `failed` — 503: `ExecuteRecoveryResult`'s failed variant carries no `permanent` flag (unlike
+ *   `UpdateResult`) — every reason (including `termination-unconfirmed`) is treated as transient.
+ */
+function statusForExecuteRecoveryResult(result: ExecuteRecoveryResult): 200 | 404 | 409 | 503 {
+  if (result.kind === 'ok') return 200
+  if (result.kind === 'no-checkout') return 404
+  if (result.kind === 'refused') return 409
+  return 503
+}
+
+/** `ok` → 200; `failed` (an unreadable quarantine directory, or an unexpected fs error) → 503 — transient, safe to retry. */
+function statusForListBackupsResult(result: ListBackupsResult): 200 | 503 {
+  return result.kind === 'ok' ? 200 : 503
+}
+
+/**
+ * Maps a `DeleteBackupResult` to an HTTP status code.
+ *
+ * - `ok` — 200 (with the `{kind: 'ok'}` body, consistent with every other route here returning
+ *   its full result union — never a bodyless 204).
+ * - `refused`, `invalid-id` — 400: a request-shape problem (the id itself is malformed), never a
+ *   state conflict.
+ * - `refused`, `not-found` — 404: mirrors `/inspect`'s/`/update`'s `no-checkout` → 404 for "nothing
+ *   exists at this identifier".
+ * - `refused`, `maintenance-hold` | `recovery-in-progress` — 409: the repository's current state
+ *   precludes deletion right now — mirrors every other `refused` → 409 mapping in this file.
+ * - `failed` — 503: an unexpected fs error deleting the generation — transient, safe to retry.
+ */
+function statusForDeleteBackupResult(result: DeleteBackupResult): 200 | 400 | 404 | 409 | 503 {
+  if (result.kind === 'ok') return 200
+  if (result.kind === 'refused') {
+    if (result.reason === 'invalid-id') return 400
+    if (result.reason === 'not-found') return 404
+    return 409
+  }
+  return 503
+}
+
+/**
+ * True only for a simple, single path segment — mirrors backups.ts's own (private) `isSimplePathSegment`
+ * so a backup generation id is rejected at BOTH layers before ever reaching `deleteBackup`: no `/`
+ * or `\`, no `..`/`.`, no embedded NUL, never empty. Hono decodes `%2F` in a path param to a literal
+ * `/` before this ever runs, so it is caught by the same `includes('/')` check as a raw slash.
+ */
+function isSimplePathSegment(id: string): boolean {
+  if (id.length === 0) return false
+  if (id === '.' || id === '..') return false
+  if (id.includes('/') || id.includes('\\')) return false
+  if (id.includes('\0')) return false
+  return true
 }
 
 /**
@@ -105,6 +219,14 @@ export interface ServerDeps {
   readonly inspectExecutor?: InspectExecutorFn
   /** Injected update executor for testability. */
   readonly updateExecutor?: UpdateExecutorFn
+  /** Injected recovery-preview executor for testability. */
+  readonly previewRecoveryExecutor?: PreviewRecoveryExecutorFn
+  /** Injected recovery executor for testability. */
+  readonly executeRecoveryExecutor?: ExecuteRecoveryExecutorFn
+  /** Injected list-backups executor for testability. */
+  readonly listBackupsExecutor?: ListBackupsExecutorFn
+  /** Injected delete-backup executor for testability. */
+  readonly deleteBackupExecutor?: DeleteBackupExecutorFn
   /**
    * Trusted network config for the `/update` network half, read ONCE at startup (main.ts) and
    * merged into every `/update` call's `executeUpdate` deps alongside the per-request abort
@@ -154,6 +276,10 @@ export function createApp(deps: ServerDeps): Hono {
     cloneExecutor = executeClone,
     inspectExecutor = inspectCheckout,
     updateExecutor = executeUpdate,
+    previewRecoveryExecutor = previewRecovery,
+    executeRecoveryExecutor = executeRecovery,
+    listBackupsExecutor = listBackups,
+    deleteBackupExecutor = deleteBackup,
     updateNetworkConfig,
     opencodeStatus,
     proxyListening,
@@ -401,6 +527,164 @@ export function createApp(deps: ServerDeps): Hono {
       proxy: updateNetworkConfig?.proxy,
     })
     return c.json(result, statusForUpdateResult(result))
+  })
+
+  // POST /recover/preview — read-only report of what a `/recover` call would see, without ever
+  // mutating anything. Body validation mirrors /inspect (owner, repo only — no token: preview
+  // never touches the network). `previewRecoveryExecutor` returns the bare `PreviewRecoveryResult`
+  // union directly, like `/update` — see `statusForPreviewRecoveryResult`.
+  app.post('/recover/preview', async c => {
+    const contentLengthHeader = c.req.header('content-length')
+    if (contentLengthHeader === undefined || contentLengthHeader === null) {
+      const err: PreviewRecoveryValidationFailure = {ok: false, error: 'body-too-large'}
+      return c.json(err, 413)
+    }
+    const contentLength = Number.parseInt(contentLengthHeader, 10)
+    if (Number.isNaN(contentLength) || contentLength > MAX_BODY_BYTES) {
+      const err: PreviewRecoveryValidationFailure = {ok: false, error: 'body-too-large'}
+      return c.json(err, 413)
+    }
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      const err: PreviewRecoveryValidationFailure = {ok: false, error: 'malformed-body'}
+      return c.json(err, 400)
+    }
+
+    if (typeof body !== 'object' || body === null) {
+      const err: PreviewRecoveryValidationFailure = {ok: false, error: 'malformed-body'}
+      return c.json(err, 400)
+    }
+
+    const raw = body as Record<string, unknown>
+
+    const owner = sanitizeOwner(raw.owner)
+    if (owner === null) {
+      const err: PreviewRecoveryValidationFailure = {ok: false, error: 'invalid-owner'}
+      return c.json(err, 400)
+    }
+
+    const repo = sanitizeRepo(raw.repo)
+    if (repo === null) {
+      const err: PreviewRecoveryValidationFailure = {ok: false, error: 'invalid-repo'}
+      return c.json(err, 400)
+    }
+
+    const request: PreviewRecoveryRequest = {owner, repo}
+
+    const result = await previewRecoveryExecutor(request)
+    return c.json(result, statusForPreviewRecoveryResult(result))
+  })
+
+  // POST /recover — confirms a previously previewed recovery: quarantines the existing checkout
+  // (if any) and installs a fresh one at the remote's current default branch tip. Body validation
+  // mirrors /update (owner, repo, installation token) plus the fingerprint the operator saw from
+  // /recover/preview. `executeRecoveryExecutor` returns the bare `ExecuteRecoveryResult` union
+  // directly — see `statusForExecuteRecoveryResult`. `ExecuteRecoveryDeps` carries no abort-signal
+  // field yet, so there is nothing to pass through from `c.req.raw.signal` here.
+  app.post('/recover', async c => {
+    const contentLengthHeader = c.req.header('content-length')
+    if (contentLengthHeader === undefined || contentLengthHeader === null) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'body-too-large'}
+      return c.json(err, 413)
+    }
+    const contentLength = Number.parseInt(contentLengthHeader, 10)
+    if (Number.isNaN(contentLength) || contentLength > MAX_BODY_BYTES) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'body-too-large'}
+      return c.json(err, 413)
+    }
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'malformed-body'}
+      return c.json(err, 400)
+    }
+
+    if (typeof body !== 'object' || body === null) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'malformed-body'}
+      return c.json(err, 400)
+    }
+
+    const raw = body as Record<string, unknown>
+
+    const owner = sanitizeOwner(raw.owner)
+    if (owner === null) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'invalid-owner'}
+      return c.json(err, 400)
+    }
+
+    const repo = sanitizeRepo(raw.repo)
+    if (repo === null) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'invalid-repo'}
+      return c.json(err, 400)
+    }
+
+    if (validateTokenShape(raw.token) === false) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'invalid-token-shape'}
+      return c.json(err, 400)
+    }
+
+    if (typeof raw.fingerprint !== 'string' || raw.fingerprint.length === 0) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'invalid-fingerprint'}
+      return c.json(err, 400)
+    }
+
+    const request: ExecuteRecoveryRequest = {owner, repo, token: raw.token, fingerprint: raw.fingerprint}
+
+    const result = await executeRecoveryExecutor(request)
+    return c.json(result, statusForExecuteRecoveryResult(result))
+  })
+
+  // GET /backups/:owner/:repo — lists every quarantine generation for a repository. Owner/repo are
+  // PATH params here (not a JSON body — GET has none), validated with the same sanitizers /clone
+  // and every other route use.
+  app.get('/backups/:owner/:repo', async c => {
+    const owner = sanitizeOwner(c.req.param('owner'))
+    if (owner === null) {
+      const err: BackupsValidationFailure = {ok: false, error: 'invalid-owner'}
+      return c.json(err, 400)
+    }
+
+    const repo = sanitizeRepo(c.req.param('repo'))
+    if (repo === null) {
+      const err: BackupsValidationFailure = {ok: false, error: 'invalid-repo'}
+      return c.json(err, 400)
+    }
+
+    const result = await listBackupsExecutor(owner, repo)
+    return c.json(result, statusForListBackupsResult(result))
+  })
+
+  // DELETE /backups/:owner/:repo/:id — removes exactly one quarantine generation. `id` is
+  // validated HERE (rejecting `..`, any path separator — including a `%2F`-encoded one, which Hono
+  // decodes to a literal `/` before this ever runs — and an empty segment) as a SECOND layer on top
+  // of `deleteBackup`'s own internal check, per the module's "reject the string first, never
+  // sanitize-then-join" posture: neither layer alone is trusted to be the only gate.
+  app.delete('/backups/:owner/:repo/:id', async c => {
+    const owner = sanitizeOwner(c.req.param('owner'))
+    if (owner === null) {
+      const err: BackupsValidationFailure = {ok: false, error: 'invalid-owner'}
+      return c.json(err, 400)
+    }
+
+    const repo = sanitizeRepo(c.req.param('repo'))
+    if (repo === null) {
+      const err: BackupsValidationFailure = {ok: false, error: 'invalid-repo'}
+      return c.json(err, 400)
+    }
+
+    const id = c.req.param('id')
+    if (!isSimplePathSegment(id)) {
+      const result: DeleteBackupResult = {kind: 'refused', reason: 'invalid-id'}
+      return c.json(result, statusForDeleteBackupResult(result))
+    }
+
+    const result = await deleteBackupExecutor(owner, repo, id)
+    return c.json(result, statusForDeleteBackupResult(result))
   })
 
   // 404 for unknown routes

@@ -1,7 +1,23 @@
 import type {CloneHandlerResult} from './clone.js'
 import type {InspectHandlerResult} from './inspect.js'
-import type {CloneExecutorFn, InspectExecutorFn, ServerDeps, UpdateExecutorFn} from './server.js'
-import type {UpdateRequest, UpdateResult} from './types.js'
+import type {
+  CloneExecutorFn,
+  DeleteBackupExecutorFn,
+  ExecuteRecoveryExecutorFn,
+  InspectExecutorFn,
+  ListBackupsExecutorFn,
+  PreviewRecoveryExecutorFn,
+  ServerDeps,
+  UpdateExecutorFn,
+} from './server.js'
+import type {
+  DeleteBackupResult,
+  ExecuteRecoveryResult,
+  ListBackupsResult,
+  PreviewRecoveryResult,
+  UpdateRequest,
+  UpdateResult,
+} from './types.js'
 import type {UpdateHandlerDeps} from './update.js'
 
 import {Buffer} from 'node:buffer'
@@ -22,6 +38,26 @@ function makeInspectExecutor(result: InspectHandlerResult): InspectExecutorFn & 
 /** Unlike make{Clone,Inspect}Executor, `executeUpdate` returns the bare `UpdateResult` union directly (no `{response, statusCode}` wrapper) — see `UpdateExecutorFn`'s own doc comment in server.ts. */
 function makeUpdateExecutor(result: UpdateResult): UpdateExecutorFn & ReturnType<typeof vi.fn> {
   return vi.fn().mockResolvedValue(result) as UpdateExecutorFn & ReturnType<typeof vi.fn>
+}
+
+function makePreviewRecoveryExecutor(
+  result: PreviewRecoveryResult,
+): PreviewRecoveryExecutorFn & ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(result) as PreviewRecoveryExecutorFn & ReturnType<typeof vi.fn>
+}
+
+function makeExecuteRecoveryExecutor(
+  result: ExecuteRecoveryResult,
+): ExecuteRecoveryExecutorFn & ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(result) as ExecuteRecoveryExecutorFn & ReturnType<typeof vi.fn>
+}
+
+function makeListBackupsExecutor(result: ListBackupsResult): ListBackupsExecutorFn & ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(result) as ListBackupsExecutorFn & ReturnType<typeof vi.fn>
+}
+
+function makeDeleteBackupExecutor(result: DeleteBackupResult): DeleteBackupExecutorFn & ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(result) as DeleteBackupExecutorFn & ReturnType<typeof vi.fn>
 }
 
 /**
@@ -79,6 +115,40 @@ async function postUpdate(
 ): Promise<Response> {
   const bodyStr = JSON.stringify(body)
   return app.request('/update', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': String(new TextEncoder().encode(bodyStr).length),
+      ...extraHeaders,
+    },
+    body: bodyStr,
+  })
+}
+
+async function postRecoverPreview(
+  app: ReturnType<typeof createApp>,
+  body: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<Response> {
+  const bodyStr = JSON.stringify(body)
+  return app.request('/recover/preview', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': String(new TextEncoder().encode(bodyStr).length),
+      ...extraHeaders,
+    },
+    body: bodyStr,
+  })
+}
+
+async function postRecover(
+  app: ReturnType<typeof createApp>,
+  body: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<Response> {
+  const bodyStr = JSON.stringify(body)
+  return app.request('/recover', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1009,6 +1079,54 @@ describe('Control-API bearer authentication', () => {
         expect(body).toEqual({ok: false, error: 'unauthorized'})
         expect(updateExecutor).not.toHaveBeenCalled()
       })
+
+      it(`POST /recover/preview returns 401 for ${name}, without invoking the preview executor`, async () => {
+        const previewRecoveryExecutor = vi.fn().mockResolvedValue({kind: 'no-checkout'})
+        const app = appWithBearerAuth(AUTH_TOKEN, {previewRecoveryExecutor})
+
+        const res = await postRecoverPreview(app, {owner: 'fro-bot', repo: 'agent'}, headers)
+
+        expect(res.status).toBe(401)
+        expect(await res.json()).toEqual({ok: false, error: 'unauthorized'})
+        expect(previewRecoveryExecutor).not.toHaveBeenCalled()
+      })
+
+      it(`POST /recover returns 401 for ${name}, without invoking the recovery executor`, async () => {
+        const executeRecoveryExecutor = vi.fn().mockResolvedValue({kind: 'no-checkout'})
+        const app = appWithBearerAuth(AUTH_TOKEN, {executeRecoveryExecutor})
+
+        const res = await postRecover(
+          app,
+          {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'},
+          headers,
+        )
+
+        expect(res.status).toBe(401)
+        expect(await res.json()).toEqual({ok: false, error: 'unauthorized'})
+        expect(executeRecoveryExecutor).not.toHaveBeenCalled()
+      })
+
+      it(`GET /backups/:owner/:repo returns 401 for ${name}, without invoking the list executor`, async () => {
+        const listBackupsExecutor = vi.fn().mockResolvedValue({kind: 'ok', backups: [], totalBytes: 0})
+        const app = appWithBearerAuth(AUTH_TOKEN, {listBackupsExecutor})
+
+        const res = await app.request('/backups/fro-bot/agent', {headers})
+
+        expect(res.status).toBe(401)
+        expect(await res.json()).toEqual({ok: false, error: 'unauthorized'})
+        expect(listBackupsExecutor).not.toHaveBeenCalled()
+      })
+
+      it(`DELETE /backups/:owner/:repo/:id returns 401 for ${name}, without invoking the delete executor`, async () => {
+        const deleteBackupExecutor = vi.fn().mockResolvedValue({kind: 'ok'})
+        const app = appWithBearerAuth(AUTH_TOKEN, {deleteBackupExecutor})
+
+        const res = await app.request('/backups/fro-bot/agent/gen-1', {method: 'DELETE', headers})
+
+        expect(res.status).toBe(401)
+        expect(await res.json()).toEqual({ok: false, error: 'unauthorized'})
+        expect(deleteBackupExecutor).not.toHaveBeenCalled()
+      })
     }
 
     it('rejects with 401 (not 400) when a malformed body accompanies a missing bearer — proves auth runs before JSON parsing', async () => {
@@ -1456,5 +1574,364 @@ describe('POST /update — signal plumbing', () => {
     // #then
     expect(capturedCaBundlePath).toBe('/etc/ssl/ca.pem')
     expect(capturedProxy).toEqual({https: 'http://proxy:3128'})
+  })
+})
+
+describe('POST /recover/preview — validation', () => {
+  it('returns 413 body-too-large when Content-Length header is missing', async () => {
+    const app = appWithoutAuth()
+    const res = await app.request('/recover/preview', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({owner: 'fro-bot', repo: 'agent'}),
+    })
+    expect(res.status).toBe(413)
+    expect(await res.json()).toEqual({ok: false, error: 'body-too-large'})
+  })
+
+  it('returns 400 malformed-body for non-JSON body', async () => {
+    const app = appWithoutAuth()
+    const malformedBody = 'not json{{{'
+    const res = await app.request('/recover/preview', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(new TextEncoder().encode(malformedBody).length),
+      },
+      body: malformedBody,
+    })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'malformed-body'})
+  })
+
+  it('returns 400 invalid-owner for traversal attempt', async () => {
+    const app = appWithoutAuth()
+    const res = await postRecoverPreview(app, {owner: '../etc', repo: 'agent'})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-owner'})
+  })
+
+  it('returns 400 invalid-repo for repo with slash', async () => {
+    const app = appWithoutAuth()
+    const res = await postRecoverPreview(app, {owner: 'fro-bot', repo: 'a/b'})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-repo'})
+  })
+
+  it('never invokes the preview executor when validation fails', async () => {
+    const previewRecoveryExecutor = makePreviewRecoveryExecutor({kind: 'no-checkout'})
+    const app = appWithoutAuth({previewRecoveryExecutor})
+    await postRecoverPreview(app, {owner: '../etc', repo: 'agent'})
+    expect(previewRecoveryExecutor).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /recover/preview — result → status mapping', () => {
+  it('ok → 200, full result body passed through verbatim', async () => {
+    const result: PreviewRecoveryResult = {
+      kind: 'ok',
+      preview: {
+        inspectionSafe: false,
+        estimatedSizeBytes: 100,
+        entryCount: 5,
+        sizeMeasurementComplete: true,
+        retention: {generationCount: 0, hasUnknownSize: false, totalBytes: 0, maxGenerations: 5, maxBytes: 1024},
+        fingerprint: 'abc',
+      },
+    }
+    const previewRecoveryExecutor = makePreviewRecoveryExecutor(result)
+    const app = appWithoutAuth({previewRecoveryExecutor})
+
+    const res = await postRecoverPreview(app, {owner: 'fro-bot', repo: 'agent'})
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual(result)
+    expect(previewRecoveryExecutor).toHaveBeenCalledTimes(1)
+  })
+
+  it('recoverable-update → 200', async () => {
+    const result: PreviewRecoveryResult = {
+      kind: 'recoverable-update',
+      update: {phase: 'applying', fromSha: 'a'.repeat(40), toSha: 'b'.repeat(40), fingerprint: 'xyz'},
+    }
+    const app = appWithoutAuth({previewRecoveryExecutor: makePreviewRecoveryExecutor(result)})
+
+    const res = await postRecoverPreview(app, {owner: 'fro-bot', repo: 'agent'})
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual(result)
+  })
+
+  it('no-checkout → 404', async () => {
+    const app = appWithoutAuth({previewRecoveryExecutor: makePreviewRecoveryExecutor({kind: 'no-checkout'})})
+    const res = await postRecoverPreview(app, {owner: 'fro-bot', repo: 'agent'})
+    expect(res.status).toBe(404)
+  })
+
+  it('refused (maintenance-hold) → 409', async () => {
+    const result: PreviewRecoveryResult = {kind: 'refused', reason: 'maintenance-hold'}
+    const app = appWithoutAuth({previewRecoveryExecutor: makePreviewRecoveryExecutor(result)})
+    const res = await postRecoverPreview(app, {owner: 'fro-bot', repo: 'agent'})
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual(result)
+  })
+
+  it('failed (termination-unconfirmed) → 503', async () => {
+    const result: PreviewRecoveryResult = {kind: 'failed', reason: 'termination-unconfirmed'}
+    const app = appWithoutAuth({previewRecoveryExecutor: makePreviewRecoveryExecutor(result)})
+    const res = await postRecoverPreview(app, {owner: 'fro-bot', repo: 'agent'})
+    expect(res.status).toBe(503)
+  })
+})
+
+describe('POST /recover — validation', () => {
+  it('returns 413 body-too-large when Content-Length header is missing', async () => {
+    const app = appWithoutAuth()
+    const res = await app.request('/recover', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'}),
+    })
+    expect(res.status).toBe(413)
+    expect(await res.json()).toEqual({ok: false, error: 'body-too-large'})
+  })
+
+  it('returns 400 malformed-body for non-JSON body', async () => {
+    const app = appWithoutAuth()
+    const malformedBody = 'not json{{{'
+    const res = await app.request('/recover', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(new TextEncoder().encode(malformedBody).length),
+      },
+      body: malformedBody,
+    })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'malformed-body'})
+  })
+
+  it('returns 400 invalid-owner for traversal attempt', async () => {
+    const app = appWithoutAuth()
+    const res = await postRecover(app, {owner: '../etc', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-owner'})
+  })
+
+  it('returns 400 invalid-repo for repo with slash', async () => {
+    const app = appWithoutAuth()
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'a/b', token: VALID_TOKEN, fingerprint: 'abc'})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-repo'})
+  })
+
+  it('returns 400 invalid-token-shape for a malformed token', async () => {
+    const app = appWithoutAuth()
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: 'nope', fingerprint: 'abc'})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-token-shape'})
+  })
+
+  it('returns 400 invalid-fingerprint for a missing fingerprint', async () => {
+    const app = appWithoutAuth()
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-fingerprint'})
+  })
+
+  it('returns 400 invalid-fingerprint for an empty-string fingerprint', async () => {
+    const app = appWithoutAuth()
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: ''})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-fingerprint'})
+  })
+
+  it('never invokes the recovery executor when validation fails', async () => {
+    const executeRecoveryExecutor = makeExecuteRecoveryExecutor({kind: 'no-checkout'})
+    const app = appWithoutAuth({executeRecoveryExecutor})
+    await postRecover(app, {owner: '../etc', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+    expect(executeRecoveryExecutor).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /recover — result → status mapping', () => {
+  it('ok → 200, full result body passed through verbatim', async () => {
+    const result: ExecuteRecoveryResult = {kind: 'ok', recoveryId: 'gen-1', sha: 'a'.repeat(40), branch: 'main'}
+    const executeRecoveryExecutor = makeExecuteRecoveryExecutor(result)
+    const app = appWithoutAuth({executeRecoveryExecutor})
+
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual(result)
+    expect(executeRecoveryExecutor).toHaveBeenCalledTimes(1)
+  })
+
+  it('no-checkout → 404', async () => {
+    const app = appWithoutAuth({executeRecoveryExecutor: makeExecuteRecoveryExecutor({kind: 'no-checkout'})})
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+    expect(res.status).toBe(404)
+  })
+
+  it('refused (checkout-changed) → 409', async () => {
+    const result: ExecuteRecoveryResult = {kind: 'refused', reason: 'checkout-changed'}
+    const app = appWithoutAuth({executeRecoveryExecutor: makeExecuteRecoveryExecutor(result)})
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual(result)
+  })
+
+  it('refused (quota-exceeded, with usage) → 409, body carries the usage', async () => {
+    const result: ExecuteRecoveryResult = {
+      kind: 'refused',
+      reason: 'quota-exceeded',
+      usage: {generationCount: 5, hasUnknownSize: false, totalBytes: 1000, maxGenerations: 5, maxBytes: 1024},
+    }
+    const app = appWithoutAuth({executeRecoveryExecutor: makeExecuteRecoveryExecutor(result)})
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual(result)
+  })
+
+  it('failed (termination-unconfirmed) → 503', async () => {
+    const result: ExecuteRecoveryResult = {kind: 'failed', reason: 'termination-unconfirmed'}
+    const app = appWithoutAuth({executeRecoveryExecutor: makeExecuteRecoveryExecutor(result)})
+    const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+    expect(res.status).toBe(503)
+  })
+})
+
+describe('GET /backups/:owner/:repo — validation and status mapping', () => {
+  it('returns 400 invalid-owner for traversal attempt', async () => {
+    const app = appWithoutAuth()
+    const res = await app.request('/backups/..%2Fetc/agent')
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-owner'})
+  })
+
+  it('returns 400 invalid-repo for a repo segment containing a slash', async () => {
+    const app = appWithoutAuth()
+    const res = await app.request('/backups/fro-bot/a%2Fb')
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-repo'})
+  })
+
+  it('never invokes the list executor when validation fails', async () => {
+    const listBackupsExecutor = makeListBackupsExecutor({kind: 'ok', backups: [], totalBytes: 0})
+    const app = appWithoutAuth({listBackupsExecutor})
+    await app.request('/backups/..%2Fetc/agent')
+    expect(listBackupsExecutor).not.toHaveBeenCalled()
+  })
+
+  it('ok → 200, full result body passed through verbatim', async () => {
+    const result: ListBackupsResult = {
+      kind: 'ok',
+      backups: [
+        {
+          id: 'gen-1',
+          metadataOk: true,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          sizeBytes: 100,
+          sizeComplete: true,
+          originalHeadSha: 'a'.repeat(40),
+          originalBranch: 'main',
+        },
+      ],
+      totalBytes: 100,
+    }
+    const listBackupsExecutor = makeListBackupsExecutor(result)
+    const app = appWithoutAuth({listBackupsExecutor})
+
+    const res = await app.request('/backups/fro-bot/agent')
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual(result)
+    expect(listBackupsExecutor).toHaveBeenCalledWith('fro-bot', 'agent')
+  })
+
+  it('failed → 503', async () => {
+    const app = appWithoutAuth({listBackupsExecutor: makeListBackupsExecutor({kind: 'failed'})})
+    const res = await app.request('/backups/fro-bot/agent')
+    expect(res.status).toBe(503)
+  })
+})
+
+describe('DELETE /backups/:owner/:repo/:id — validation and status mapping', () => {
+  it('returns 400 invalid-owner for traversal attempt', async () => {
+    const app = appWithoutAuth()
+    const res = await app.request('/backups/..%2Fetc/agent/gen-1', {method: 'DELETE'})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-owner'})
+  })
+
+  it('returns 400 invalid-repo for a repo segment containing a slash', async () => {
+    const app = appWithoutAuth()
+    const res = await app.request('/backups/fro-bot/a%2Fb/gen-1', {method: 'DELETE'})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-repo'})
+  })
+
+  it('never reaches the delete executor for a `.`/`..` id — the URL parser itself collapses the dot-segment (encoded or not, per WHATWG URL dot-segment normalization) before Hono ever routes it, one layer earlier than isSimplePathSegment', async () => {
+    const deleteBackupExecutor = makeDeleteBackupExecutor({kind: 'ok'})
+    const app = appWithoutAuth({deleteBackupExecutor})
+    const res = await app.request('/backups/fro-bot/agent/%2E%2E', {method: 'DELETE'})
+    expect(res.status).not.toBe(200)
+    expect(deleteBackupExecutor).not.toHaveBeenCalled()
+  })
+
+  it('refused invalid-id → 400 for a %2F-encoded id, never reaching the delete executor', async () => {
+    const deleteBackupExecutor = makeDeleteBackupExecutor({kind: 'ok'})
+    const app = appWithoutAuth({deleteBackupExecutor})
+    const res = await app.request('/backups/fro-bot/agent/a%2Fb', {method: 'DELETE'})
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({kind: 'refused', reason: 'invalid-id'})
+    expect(deleteBackupExecutor).not.toHaveBeenCalled()
+  })
+
+  it('refused invalid-id → 400 for an empty id segment, never reaching the delete executor', async () => {
+    const deleteBackupExecutor = makeDeleteBackupExecutor({kind: 'ok'})
+    const app = appWithoutAuth({deleteBackupExecutor})
+    const res = await app.request('/backups/fro-bot/agent/', {method: 'DELETE'})
+    expect(res.status).not.toBe(200)
+    expect(deleteBackupExecutor).not.toHaveBeenCalled()
+  })
+
+  it('ok → 200, full result body passed through verbatim, forwarding owner/repo/id to the executor', async () => {
+    const deleteBackupExecutor = makeDeleteBackupExecutor({kind: 'ok'})
+    const app = appWithoutAuth({deleteBackupExecutor})
+
+    const res = await app.request('/backups/fro-bot/agent/gen-1', {method: 'DELETE'})
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({kind: 'ok'})
+    expect(deleteBackupExecutor).toHaveBeenCalledWith('fro-bot', 'agent', 'gen-1')
+  })
+
+  it('refused (not-found) → 404', async () => {
+    const result: DeleteBackupResult = {kind: 'refused', reason: 'not-found'}
+    const app = appWithoutAuth({deleteBackupExecutor: makeDeleteBackupExecutor(result)})
+    const res = await app.request('/backups/fro-bot/agent/gen-1', {method: 'DELETE'})
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual(result)
+  })
+
+  it('refused (maintenance-hold) → 409', async () => {
+    const result: DeleteBackupResult = {kind: 'refused', reason: 'maintenance-hold'}
+    const app = appWithoutAuth({deleteBackupExecutor: makeDeleteBackupExecutor(result)})
+    const res = await app.request('/backups/fro-bot/agent/gen-1', {method: 'DELETE'})
+    expect(res.status).toBe(409)
+  })
+
+  it('refused (recovery-in-progress) → 409', async () => {
+    const result: DeleteBackupResult = {kind: 'refused', reason: 'recovery-in-progress'}
+    const app = appWithoutAuth({deleteBackupExecutor: makeDeleteBackupExecutor(result)})
+    const res = await app.request('/backups/fro-bot/agent/gen-1', {method: 'DELETE'})
+    expect(res.status).toBe(409)
+  })
+
+  it('failed → 503', async () => {
+    const app = appWithoutAuth({deleteBackupExecutor: makeDeleteBackupExecutor({kind: 'failed'})})
+    const res = await app.request('/backups/fro-bot/agent/gen-1', {method: 'DELETE'})
+    expect(res.status).toBe(503)
   })
 })

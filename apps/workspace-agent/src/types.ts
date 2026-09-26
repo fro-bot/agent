@@ -11,6 +11,7 @@
  */
 
 import type {LayoutRefusalReason, Obstruction} from './checkout-profile.js'
+import type {RecoveryJournalPhase, UpdateJournalPhase} from './journal.js'
 
 /** POST /clone request body. */
 export interface CloneRequest {
@@ -322,3 +323,155 @@ export interface ReadyzResponse {
    */
   readonly opencode: 'ready' | 'starting' | 'down' | 'degraded' | 'unknown'
 }
+
+/** POST /recover/preview request body. */
+export interface PreviewRecoveryRequest {
+  readonly owner: string
+  readonly repo: string
+}
+
+export interface DirtyCounts {
+  readonly staged: number
+  readonly unstaged: number
+  readonly untracked: number
+  readonly conflicted: number
+}
+
+/** Current usage against the fixed retention quota. */
+export interface RetentionUsage {
+  readonly generationCount: number
+  /** True if any existing generation's size could not be measured (malformed/unreadable metadata) — the quota check fails closed rather than treating it as zero bytes. */
+  readonly hasUnknownSize: boolean
+  readonly totalBytes: number
+  readonly maxGenerations: number
+  readonly maxBytes: number
+}
+
+/** Full preview — `inspectionSafe: true` — every admission check the checkout would face passed. */
+export interface SafeRecoveryPreview {
+  readonly inspectionSafe: true
+  readonly headSha: string | undefined
+  readonly branch: string | undefined
+  readonly dirty: DirtyCounts
+  readonly operationInProgress: CheckoutOperation
+  readonly ignoredCount: number
+  readonly estimatedSizeBytes: number
+  readonly entryCount: number
+  readonly sizeMeasurementComplete: boolean
+  readonly retention: RetentionUsage
+  readonly fingerprint: string
+}
+
+/** Opaque preview — `inspectionSafe: false` — admission would refuse the checkout; no git ever ran in it. */
+export interface OpaqueRecoveryPreview {
+  readonly inspectionSafe: false
+  readonly estimatedSizeBytes: number
+  readonly entryCount: number
+  readonly sizeMeasurementComplete: boolean
+  readonly retention: RetentionUsage
+  readonly fingerprint: string
+}
+
+export type RecoveryPreview = SafeRecoveryPreview | OpaqueRecoveryPreview
+
+/** An interrupted UPDATE journal reported as RECOVERABLE via `/recover`, rather than a dead-end refusal. `fingerprint` digests the journal's own identity (phase + from/to SHAs), never a live git inspection. */
+export interface RecoverableUpdatePreview {
+  readonly phase: UpdateJournalPhase
+  readonly fromSha: string
+  readonly toSha: string
+  readonly fingerprint: string
+}
+
+/** A journal (update or recovery) currently in flight for this repository. */
+export type JournalInProgressPhase = UpdateJournalPhase | RecoveryJournalPhase | 'malformed'
+
+export type PreviewRecoveryResult =
+  | {readonly kind: 'no-checkout'}
+  | {readonly kind: 'refused'; readonly reason: 'checkout-substituted'}
+  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
+  | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
+  | {readonly kind: 'failed'; readonly reason: 'inspection-failed'}
+  | {readonly kind: 'failed'; readonly reason: 'termination-unconfirmed'}
+  | {readonly kind: 'ok'; readonly preview: RecoveryPreview}
+  | {readonly kind: 'recoverable-update'; readonly update: RecoverableUpdatePreview}
+
+/** POST /recover request body. */
+export interface ExecuteRecoveryRequest {
+  readonly owner: string
+  readonly repo: string
+  readonly token: string
+  /** The fingerprint the operator saw from `previewRecovery`; recomputed and compared under the mutex. */
+  readonly fingerprint: string
+}
+
+export type ExecuteRecoveryFailureReason =
+  | 'inspection-failed'
+  | 'fetch-failed'
+  | 'build-failed'
+  | 'quarantine-failed'
+  | 'install-failed'
+  | 'verification-failed'
+  | 'termination-unconfirmed'
+
+export type ExecuteRecoveryResult =
+  | {readonly kind: 'no-checkout'}
+  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
+  | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
+  | {readonly kind: 'refused'; readonly reason: 'checkout-changed'}
+  | {readonly kind: 'refused'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
+  | {readonly kind: 'refused'; readonly reason: 'insufficient-disk-space'}
+  | {readonly kind: 'failed'; readonly reason: ExecuteRecoveryFailureReason}
+  | {readonly kind: 'ok'; readonly recoveryId: string; readonly sha: string; readonly branch: string}
+
+/**
+ * POST /recover/preview validation failure — an HTTP-layer request-shape problem caught BEFORE
+ * `previewRecovery` is ever called. Mirrors `UpdateValidationFailure`'s pattern.
+ */
+export interface PreviewRecoveryValidationFailure {
+  readonly ok: false
+  readonly error: 'malformed-body' | 'body-too-large' | 'invalid-owner' | 'invalid-repo'
+}
+
+/** POST /recover validation failure — an HTTP-layer request-shape problem caught BEFORE `executeRecovery` is ever called. */
+export interface ExecuteRecoveryValidationFailure {
+  readonly ok: false
+  readonly error:
+    | 'malformed-body'
+    | 'body-too-large'
+    | 'invalid-owner'
+    | 'invalid-repo'
+    | 'invalid-token-shape'
+    | 'invalid-fingerprint'
+}
+
+/** GET/DELETE /backups/... validation failure — owner/repo path-segment problems caught BEFORE `listBackups`/`deleteBackup` is ever called. An invalid `id` reuses `DeleteBackupResult`'s own `{kind: 'refused', reason: 'invalid-id'}` shape instead of a second, redundant type. */
+export interface BackupsValidationFailure {
+  readonly ok: false
+  readonly error: 'invalid-owner' | 'invalid-repo'
+}
+
+/** One listable quarantine generation. `metadataOk: false` means metadata.json failed to parse — the entry is still listed and deletable, but size/HEAD/branch are unknown rather than guessed. */
+export interface BackupEntry {
+  readonly id: string
+  readonly metadataOk: boolean
+  readonly createdAt: string
+  readonly sizeBytes: number
+  /** False when the size is unknown. */
+  readonly sizeComplete: boolean
+  readonly originalHeadSha: string | undefined
+  readonly originalBranch: string | undefined
+}
+
+/** GET /backups/:owner/:repo response. */
+export type ListBackupsResult =
+  | {readonly kind: 'ok'; readonly backups: readonly BackupEntry[]; readonly totalBytes: number}
+  | {readonly kind: 'failed'}
+
+/** DELETE /backups/:owner/:repo/:id response. */
+export type DeleteBackupResult =
+  | {readonly kind: 'ok'}
+  | {
+      readonly kind: 'refused'
+      readonly reason: 'invalid-id' | 'not-found' | 'maintenance-hold' | 'recovery-in-progress'
+    }
+  | {readonly kind: 'failed'}

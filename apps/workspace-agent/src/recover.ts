@@ -17,8 +17,15 @@ import type {AgentWalkRunner} from './agent-walk.js'
 import type {QuarantineMetadata, QuarantineSource} from './backups.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions} from './git-stream.js'
-import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase, UpdateJournalPhase} from './journal.js'
-import type {CheckoutOperation} from './types.js'
+import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase} from './journal.js'
+import type {
+  DirtyCounts,
+  ExecuteRecoveryRequest,
+  ExecuteRecoveryResult,
+  PreviewRecoveryRequest,
+  PreviewRecoveryResult,
+  RetentionUsage,
+} from './types.js'
 import type {Deadline, InvocationTracker, RemoteFailureReason} from './update.js'
 import {createHash, randomUUID} from 'node:crypto'
 import {lstat, mkdir, mkdtemp, open, realpath, rename, rm, statfs} from 'node:fs/promises'
@@ -82,130 +89,8 @@ export const DEFAULT_WALK_MAX_ENTRIES = 200_000
 export const RETENTION_MAX_GENERATIONS = 5
 export const RETENTION_MAX_BYTES = 10 * 1024 * 1024 * 1024
 
-export interface PreviewRecoveryRequest {
-  readonly owner: string
-  readonly repo: string
-}
-
-export interface DirtyCounts {
-  readonly staged: number
-  readonly unstaged: number
-  readonly untracked: number
-  readonly conflicted: number
-}
-
-/** Current usage against the fixed retention quota. */
-export interface RetentionUsage {
-  readonly generationCount: number
-  /** (Review round E, E4) True if any existing generation's size could not be measured (malformed/unreadable metadata) — the quota check fails closed rather than treating it as zero bytes. */
-  readonly hasUnknownSize: boolean
-  readonly totalBytes: number
-  readonly maxGenerations: number
-  readonly maxBytes: number
-}
-
-/** Full preview — `inspectionSafe: true` — every admission check the checkout would face passed. */
-export interface SafeRecoveryPreview {
-  readonly inspectionSafe: true
-  /** HEAD SHA, or undefined for an unborn/no-HEAD checkout. */
-  readonly headSha: string | undefined
-  /** Current branch, or undefined if HEAD is detached. */
-  readonly branch: string | undefined
-  readonly dirty: DirtyCounts
-  readonly operationInProgress: CheckoutOperation
-  readonly ignoredCount: number
-  readonly estimatedSizeBytes: number
-  readonly entryCount: number
-  /** (Review round E, E4) False if the size/entry-count walk hit its deadline or entry cap -- estimatedSizeBytes/entryCount are then a LOWER BOUND, never trusted for a quota decision at confirm time. */
-  readonly sizeMeasurementComplete: boolean
-  readonly retention: RetentionUsage
-  /** Digest of headSha, dirty counts, and size+entryCount -- see computeFingerprint's doc comment. */
-  readonly fingerprint: string
-}
-
-/** Opaque preview \u2014 `inspectionSafe: false` \u2014 admission would refuse the checkout (e.g. a hostile config); no git ever ran in it. */
-export interface OpaqueRecoveryPreview {
-  readonly inspectionSafe: false
-  readonly estimatedSizeBytes: number
-  readonly entryCount: number
-  readonly sizeMeasurementComplete: boolean
-  readonly retention: RetentionUsage
-  /** Digest of ONLY size+entryCount -- see computeFingerprint's doc comment. */
-  readonly fingerprint: string
-}
-
-export type RecoveryPreview = SafeRecoveryPreview | OpaqueRecoveryPreview
-
-/**
- * (Review round E, E2) An interrupted UPDATE journal (`fetched`/`applying`/`applied`) reported as
- * RECOVERABLE rather than a dead-end refusal — `/update` itself refuses this same state as
- * `needs-recovery`, so recovery is the only way out. `fingerprint` digests the journal's own
- * identity (phase + from/to SHAs), never a live git inspection of the checkout: the checkout may
- * be mid-merge, which is exactly the state an interrupted update journal warns against trusting
- * for ordinary git operations. A distinct top-level `PreviewRecoveryResult` kind — never folded
- * into `RecoveryPreview` — so every existing `{kind: 'ok'}` consumer's `preview.inspectionSafe`
- * narrowing is untouched.
- */
-export interface RecoverableUpdatePreview {
-  readonly phase: UpdateJournalPhase
-  readonly fromSha: string
-  readonly toSha: string
-  readonly fingerprint: string
-}
-
-/** A journal (update or recovery) currently in flight for this repository \u2014 unlike update.ts's blanket `needs-recovery`, the OPERATOR-FACING preview names the exact phase, since that is precisely what recovery exists to act on. */
-export type JournalInProgressPhase = UpdateJournalPhase | RecoveryJournalPhase | 'malformed'
-
-/**
- * `'inspection-failed'` covers every non-mutating local check that could not determine an answer
- * — INCLUDING an unconfirmed subprocess termination: `checkCheckoutLayout`/`inventoryCheckoutConfig`/
- * `inspectCheckout` all already collapse `termination-unconfirmed` into their own `inspection-failed`
- * (or, for `inspectCheckout`, `inspection-timeout`) outcomes before this module ever sees them, so
- * this preview has no reliable signal to distinguish "confirmed failure" from "unconfirmed
- * termination" and therefore never calls `markRepoHeld` itself — unlike update.ts, which reads that
- * distinction directly from `GitOutcome`/`PackStreamOutcome` before either is collapsed.
- */
-export type PreviewRecoveryResult =
-  | {readonly kind: 'no-checkout'}
-  | {readonly kind: 'refused'; readonly reason: 'checkout-substituted'}
-  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
-  | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
-  | {readonly kind: 'failed'; readonly reason: 'inspection-failed'}
-  /** (Review round D, D4) An unconfirmed subprocess termination anywhere in this preview — a hold is set and NO preview (not even opaque) is ever returned for it. */
-  | {readonly kind: 'failed'; readonly reason: 'termination-unconfirmed'}
-  | {readonly kind: 'ok'; readonly preview: RecoveryPreview}
-  | {readonly kind: 'recoverable-update'; readonly update: RecoverableUpdatePreview}
-
 /** Default headroom multiplier for the free-space preflight — plan: "start at twice the estimated checkout size". */
 export const DEFAULT_DISK_HEADROOM_MULTIPLIER = 2
-
-/** Confirms a previously previewed recovery. See the module header and executeRecovery's own doc comment for the full admission-gated mutation model. */
-export interface ExecuteRecoveryRequest {
-  readonly owner: string
-  readonly repo: string
-  readonly token: string
-  /** The fingerprint the operator saw from `previewRecovery`; recomputed and compared under the mutex. */
-  readonly fingerprint: string
-}
-
-export type ExecuteRecoveryFailureReason =
-  | 'inspection-failed'
-  | 'fetch-failed'
-  | 'build-failed'
-  | 'quarantine-failed'
-  | 'install-failed'
-  | 'verification-failed'
-  | 'termination-unconfirmed'
-
-export type ExecuteRecoveryResult =
-  | {readonly kind: 'no-checkout'}
-  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
-  | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
-  | {readonly kind: 'refused'; readonly reason: 'checkout-changed'}
-  | {readonly kind: 'refused'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
-  | {readonly kind: 'refused'; readonly reason: 'insufficient-disk-space'}
-  | {readonly kind: 'failed'; readonly reason: ExecuteRecoveryFailureReason}
-  | {readonly kind: 'ok'; readonly recoveryId: string; readonly sha: string; readonly branch: string}
 
 export interface ExecuteRecoveryDeps {
   readonly gitRunner?: GitRunnerFn

@@ -11,6 +11,7 @@
  */
 
 import type {AgentWalkRunner} from './agent-walk.js'
+import type {BackupEntry, DeleteBackupResult, ListBackupsResult} from './types.js'
 import {lstat, readdir, readFile, rm} from 'node:fs/promises'
 import {join} from 'node:path'
 
@@ -69,18 +70,6 @@ export type QuarantineMetadataReadResult =
   | {readonly ok: false; readonly reason: 'absent'}
   | {readonly ok: false; readonly reason: 'malformed'; readonly detail: string}
 
-/** One listable generation. `metadataOk: false` means metadata.json failed to parse — the entry is still listed and deletable, but size/HEAD/branch are unknown rather than guessed (see listBackups's own doc comment for why). */
-export interface BackupEntry {
-  readonly id: string
-  readonly metadataOk: boolean
-  readonly createdAt: string
-  readonly sizeBytes: number
-  /** (E4) False when the size is unknown — either `metadataOk:false`, or metadata parsed but its own `sizeComplete` was false and no fallback measurement (E4b, `listBackups`'s `walkRunner`) could complete either. */
-  readonly sizeComplete: boolean
-  readonly originalHeadSha: string | undefined
-  readonly originalBranch: string | undefined
-}
-
 export interface BackupsDeps {
   readonly reposRoot?: string
   /** (E4b) Injected agent-uid walk runner, used ONLY to measure a generation whose metadata is missing/malformed — defaults to the real subprocess-spawning `runAgentWalk`. */
@@ -91,18 +80,6 @@ export interface BackupsDeps {
   readonly walkMaxEntries?: number
   readonly walkTimeoutMs?: number
 }
-
-export type ListBackupsResult =
-  | {readonly kind: 'ok'; readonly backups: readonly BackupEntry[]; readonly totalBytes: number}
-  | {readonly kind: 'failed'}
-
-export type DeleteBackupResult =
-  | {readonly kind: 'ok'}
-  | {
-      readonly kind: 'refused'
-      readonly reason: 'invalid-id' | 'not-found' | 'maintenance-hold' | 'recovery-in-progress'
-    }
-  | {readonly kind: 'failed'}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
