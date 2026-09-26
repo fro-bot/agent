@@ -7,7 +7,7 @@ import type {QuarantineMetadata} from './backups.js'
 import {lstat, mkdir, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {deleteBackup, listBackups, QUARANTINE_METADATA_FILE_NAME} from './backups.js'
 import {writeJournal} from './journal.js'
 import {
@@ -18,6 +18,24 @@ import {
   resetRepoLocksForTesting,
 } from './repo-mutex.js'
 import {makeTempDir} from './update-fixtures/helpers.js'
+
+const metadataSwap = vi.hoisted(() => ({targetPath: ''}))
+
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = (await importOriginal()) as typeof import('node:fs/promises')
+  return {
+    ...actual,
+    lstat: async (...args: Parameters<typeof actual.lstat>) => {
+      const stat = await actual.lstat(...args)
+      if (String(args[0]) === metadataSwap.targetPath) {
+        metadataSwap.targetPath = ''
+        await actual.unlink(args[0])
+        await actual.symlink(join(reposRoot, 'outside-metadata.json'), args[0])
+      }
+      return stat
+    },
+  }
+})
 
 let reposRoot: string
 
@@ -120,6 +138,30 @@ describe('listBackups', () => {
 })
 
 describe('listBackups — malformed and non-generation entries', () => {
+  it('fails closed when metadata is replaced by a symlink after lstat', async () => {
+    // #given — lstat sees a regular file, then the mocked boundary swaps in a symlink
+    const dir = await writeGeneration('gen-raced', makeMetadata())
+    const metadataPath = join(dir, QUARANTINE_METADATA_FILE_NAME)
+    await writeFile(join(reposRoot, 'outside-metadata.json'), JSON.stringify(makeMetadata({sizeBytes: 999_999})))
+    metadataSwap.targetPath = metadataPath
+
+    // #when
+    const result = await listBackups('acme', 'widgets', {
+      reposRoot,
+      uid: undefined,
+      gid: undefined,
+      walkRunner: async () => ({kind: 'ok', totalBytes: 7, entryCount: 1, complete: true}),
+    })
+
+    // #then — outside metadata is not trusted; generation is degraded and measured instead
+    expect(result.kind).toBe('ok')
+    if (result.kind !== 'ok') throw new Error('unreachable')
+    expect(result.backups[0]?.metadataOk).toBe(false)
+    expect(result.backups[0]?.sizeBytes).toBe(7)
+    expect(result.totalBytes).toBe(7)
+    expect(metadataSwap.targetPath).toBe('')
+  })
+
   it('lists a generation with malformed metadata as metadataOk:false, degraded fields, never counted in totalBytes', async () => {
     // #given \u2014 a generation directory with invalid JSON metadata
     const dir = await writeGeneration('gen-broken', undefined)
@@ -323,6 +365,24 @@ describe('deleteBackup — traversal, symlink, and cross-repo refusals leave eve
 })
 
 describe('deleteBackup — E8: repo exclusion (maintenance hold, in-progress recovery)', () => {
+  it.each([
+    ['malformed', async (journalPath: string) => writeFile(journalPath, '{not valid json')],
+    ['unreadable', async (journalPath: string) => mkdir(journalPath)],
+  ] as const)('fails closed for a %s journal, retaining the quarantine backup', async (_kind, createJournal) => {
+    // #given
+    const target = await writeGeneration('gen-keep', makeMetadata())
+    const journalsDir = join(reposRoot, '.workspace-agent', 'journals')
+    await mkdir(journalsDir, {recursive: true})
+    await createJournal(join(journalsDir, 'acme__widgets.json'))
+
+    // #when
+    const result = await deleteBackup('acme', 'widgets', 'gen-keep', {reposRoot})
+
+    // #then
+    expect(result).toEqual({kind: 'failed'})
+    await expect(lstat(target)).resolves.toBeDefined()
+  })
+
   it('refuses maintenance-hold, touching nothing', async () => {
     // #given
     const target = await writeGeneration('gen-keep', makeMetadata())

@@ -14,6 +14,7 @@
  */
 
 import type {AgentWalkRunner, SealedWalkRunner} from './agent-walk.js'
+import type {CheckoutLayoutRunner} from './checkout-profile.js'
 import type {QuarantineMetadata, QuarantineSource} from './backups.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions} from './git-stream.js'
@@ -94,6 +95,7 @@ export const DEFAULT_DISK_HEADROOM_MULTIPLIER = 2
 
 export interface ExecuteRecoveryDeps {
   readonly gitRunner?: GitRunnerFn
+  readonly layoutRunner?: CheckoutLayoutRunner
   readonly packStreamRunner?: (options: PackStreamOptions) => ReturnType<typeof runPackStream>
   /** (Review round H, H4) Test seam — injectable so a test can simulate an unconfirmed termination during the PRE-rename pathname walk without a real subprocess. Defaults to the real `runAgentWalk`. */
   readonly walkRunner?: AgentWalkRunner
@@ -127,6 +129,7 @@ async function defaultStatfs(path: string): Promise<{readonly bavail: number; re
 
 export interface PreviewRecoveryDeps {
   readonly gitRunner?: GitRunnerFn
+  readonly layoutRunner?: CheckoutLayoutRunner
   /** (Review round E, E5) Injected agent-uid walk runner. Defaults to the real subprocess-spawning `runAgentWalk`. */
   readonly walkRunner?: AgentWalkRunner
   readonly reposRoot?: string
@@ -268,6 +271,7 @@ async function computeRecoveryPreviewLocked(
   params: {
     readonly gitRunner: GitRunnerFn
     readonly walkRunner: AgentWalkRunner
+    readonly layoutRunner: CheckoutLayoutRunner
     readonly reposRoot: string
     readonly timeoutMs: number
     readonly uid: number
@@ -277,7 +281,7 @@ async function computeRecoveryPreviewLocked(
     readonly walkMaxEntries: number
   },
 ): Promise<PreviewRecoveryResult> {
-  const {gitRunner, walkRunner, reposRoot, timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries} = params
+  const {gitRunner, walkRunner, layoutRunner, reposRoot, timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries} = params
 
   // Checked first, before even the journal — mirrors update.ts's own step 0.
   if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
@@ -351,7 +355,8 @@ async function computeRecoveryPreviewLocked(
   // Admission gate: layout is pure filesystem (no git at all); config inventory is one inert
   // `git config --list` call — never a working-tree-reading command, so running it does not
   // violate "no git in the checkout" for a hostile-config checkout the way `git status` would.
-  const layout = await checkCheckoutLayout({checkoutPath: canonicalPath, timeoutMs, uid, gid})
+  const layout = await checkCheckoutLayout({checkoutPath: canonicalPath, timeoutMs, uid, gid, runner: layoutRunner})
+  if (layout.kind === 'termination-unconfirmed') return {kind: 'failed', reason: 'inspection-failed'}
   let inspectionSafe = layout.kind === 'ok'
   if (inspectionSafe) {
     const configInventory = await inventoryCheckoutConfig({checkoutPath: canonicalPath, gitRunner, timeoutMs, uid, gid})
@@ -459,6 +464,7 @@ export async function previewRecovery(
   const {
     gitRunner: injectedGitRunner = runGit,
     walkRunner: injectedWalkRunner = runAgentWalk,
+    layoutRunner: injectedLayoutRunner,
     reposRoot = WORKSPACE_REPOS_ROOT,
     options = {},
     now = () => new Date(),
@@ -473,7 +479,7 @@ export async function previewRecovery(
   // unconfirmed termination anywhere holds the repository and returns `termination-unconfirmed`,
   // never a preview — opaque or otherwise — built on an uncertain read.
   return withRepoLock(repoKey, async () => {
-    const tracker = createInvocationTracker({gitRunner: injectedGitRunner, walkRunner: injectedWalkRunner})
+    const tracker = createInvocationTracker({gitRunner: injectedGitRunner, walkRunner: injectedWalkRunner, layoutRunner: injectedLayoutRunner})
     return runTrackedInvocation(
       repoKey,
       tracker,
@@ -481,6 +487,7 @@ export async function previewRecovery(
         computeRecoveryPreviewLocked(owner, repo, {
           gitRunner: tracker.gitRunner,
           walkRunner: tracker.walkRunner,
+          layoutRunner: tracker.layoutRunner,
           reposRoot,
           timeoutMs,
           uid,
@@ -1112,11 +1119,13 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   const gitRunner = tracker.gitRunner
   const packStreamRunner = tracker.packStreamRunner
   const walkRunner = tracker.walkRunner
+  const layoutRunner = tracker.layoutRunner
   const sealedWalkRunner = tracker.sealedWalkRunner
 
   const preview = await computeRecoveryPreviewLocked(owner, repo, {
     gitRunner,
     walkRunner,
+    layoutRunner,
     reposRoot,
     timeoutMs,
     uid,
@@ -1438,6 +1447,7 @@ export async function executeRecovery(
       gitRunner: injectedGitRunner,
       packStreamRunner: injectedPackStreamRunner,
       walkRunner: injectedWalkRunner,
+      layoutRunner: deps.layoutRunner,
     })
     const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
     const checkoutPath = join(reposRoot, owner, repo)

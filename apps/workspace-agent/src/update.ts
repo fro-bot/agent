@@ -51,6 +51,8 @@
  */
 
 import type {AgentWalkRunner, SealedWalkRunner} from './agent-walk.js'
+import type {CheckoutLayoutRunner} from './checkout-profile.js'
+import type {ObstructionPathRunner} from './checkout-layout-child.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions, PackStreamOutcome} from './git-stream.js'
 import type {JournalListEntry} from './journal.js'
@@ -68,6 +70,7 @@ import {
   inventoryCheckoutConfig,
   preflightObstructions,
 } from './checkout-profile.js'
+import {runCheckoutLayoutChild, runCheckoutObstructionChild} from './checkout-layout-child.js'
 import {writeAskpassHelper} from './clone.js'
 import {
   buildFilterNeutralizationEnv,
@@ -129,6 +132,8 @@ export interface UpdateHandlerDeps {
    * `runGit` (git-safety.ts).
    */
   readonly gitRunner?: GitRunnerFn
+  readonly layoutRunner?: CheckoutLayoutRunner
+  readonly obstructionRunner?: ObstructionPathRunner
   /** Workspace repos root. Defaults to WORKSPACE_REPOS_ROOT. */
   readonly reposRoot?: string
   /** Local admission options. */
@@ -574,6 +579,10 @@ export interface InvocationTracker {
   readonly walkRunner: AgentWalkRunner
   /** (Review round G, G3) Additive — wraps the injected fd-scoped sealed-tree walk runner (agent-walk.ts's `measureSealedTree`) the same way `walkRunner` is wrapped: clamped to the active deadline, and any `termination-unconfirmed` outcome sets `sawUnconfirmed()`. A DIRECT, untracked call to `measureSealedTree` would silently drop that signal — exactly the bug this closes. */
   readonly sealedWalkRunner: SealedWalkRunner
+  /** Agent-UID filesystem layout inspection; uncertainty is sticky like every other child runner. */
+  readonly layoutRunner: CheckoutLayoutRunner
+  /** Bounded agent-UID inspection of exact obstruction paths. */
+  readonly obstructionRunner: ObstructionPathRunner
   /** True once ANY dispatch through this tracker reported `termination-unconfirmed`. Sticky. */
   readonly sawUnconfirmed: () => boolean
   /** Installs (or clears, via `undefined`) the active phase deadline every dispatch clamps to. */
@@ -602,12 +611,16 @@ export function createInvocationTracker(params: {
   readonly packStreamRunner?: (options: PackStreamOptions) => Promise<PackStreamOutcome>
   readonly walkRunner?: AgentWalkRunner
   readonly sealedWalkRunner?: SealedWalkRunner
+  readonly layoutRunner?: CheckoutLayoutRunner
+  readonly obstructionRunner?: ObstructionPathRunner
 }): InvocationTracker {
   const {
     gitRunner: baseGitRunner,
     packStreamRunner: basePackStreamRunner = runPackStream,
     walkRunner: baseWalkRunner = runAgentWalk,
     sealedWalkRunner: baseSealedWalkRunner = measureSealedTree,
+    layoutRunner: baseLayoutRunner = runCheckoutLayoutChild,
+    obstructionRunner: baseObstructionRunner = runCheckoutObstructionChild,
   } = params
   let unconfirmed = false
   let applyingPhase = false
@@ -654,11 +667,29 @@ export function createInvocationTracker(params: {
     return outcome
   }
 
+  const layoutRunner: CheckoutLayoutRunner = async options => {
+    const timeoutMs = clampTimeout(options.timeoutMs)
+    if (timeoutMs === 'expired') return {kind: 'failed'}
+    const outcome = await baseLayoutRunner({...options, timeoutMs})
+    if (outcome.kind === 'termination-unconfirmed') unconfirmed = true
+    return outcome
+  }
+
+  const obstructionRunner: ObstructionPathRunner = async options => {
+    const timeoutMs = clampTimeout(options.timeoutMs)
+    if (timeoutMs === 'expired') return {kind: 'failed'}
+    const outcome = await baseObstructionRunner({...options, timeoutMs})
+    if (outcome.kind === 'termination-unconfirmed') unconfirmed = true
+    return outcome
+  }
+
   return {
     gitRunner,
     packStreamRunner,
     walkRunner,
     sealedWalkRunner,
+    layoutRunner,
+    obstructionRunner,
     sawUnconfirmed: () => unconfirmed,
     setDeadline: deadline => {
       activeDeadline = deadline
@@ -1456,6 +1487,7 @@ async function runFastForward(params: {
     timeoutMs: deadline.remainingMs(),
     uid,
     gid,
+    runner: tracker.layoutRunner,
   })
   if (layout.kind !== 'ok') return preMergeFailed()
 
@@ -1818,6 +1850,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       fromSha,
       toSha: targetSha,
       gitRunner,
+      obstructionRunner: tracker.obstructionRunner,
       timeoutMs: applyDeadline.remainingMs(),
       uid,
       gid,
@@ -1831,6 +1864,14 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       // still unchanged — clear the journal.
       await clearJournal()
       return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+    }
+    if (preflight.kind === 'termination-unconfirmed') {
+      return {
+        kind: 'failed',
+        reason: 'termination-unconfirmed',
+        mutationStarted: tracker.mutationStartedStatus(),
+        permanent: false,
+      }
     }
 
     return await runFastForward({
@@ -1914,7 +1955,12 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
     // wraps the injected runners so termination uncertainty anywhere is recorded in one place.
     // `gitRunner`/`packStreamRunner` below are the TRACKED versions; every admission step and
     // `runNetworkAndApply` use these, never the raw injected ones.
-    const tracker = createInvocationTracker({gitRunner: injectedGitRunner, packStreamRunner: injectedPackStreamRunner})
+    const tracker = createInvocationTracker({
+      gitRunner: injectedGitRunner,
+      packStreamRunner: injectedPackStreamRunner,
+      layoutRunner: deps.layoutRunner,
+      obstructionRunner: deps.obstructionRunner,
+    })
     const gitRunner = tracker.gitRunner
 
     // Step 0: the sticky maintenance hold, checked before EVERYTHING else — even journal
@@ -1963,10 +2009,10 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
         const observation = inspected.response.observation
 
         // Step 3: layout.
-        const layout = await checkCheckoutLayout({checkoutPath: destPath, timeoutMs, uid, gid})
+        const layout = await checkCheckoutLayout({checkoutPath: destPath, timeoutMs, uid, gid, runner: tracker.layoutRunner})
         if (layout.kind === 'refused')
           return {kind: 'refused', reason: 'unsupported-layout', layoutReason: layout.reason}
-        if (layout.kind === 'inspection-failed') {
+        if (layout.kind !== 'ok') {
           return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
         }
 

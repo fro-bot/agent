@@ -4,8 +4,26 @@ import {lstat, mkdir, mkdtemp, rm, symlink, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {JournalDirectoryError, listJournals, readJournal, removeJournal, writeJournal} from './journal.js'
+
+const race = vi.hoisted(() => ({enabled: false, canonicalPath: '', originalPath: '', attackerPath: ''}))
+
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = (await importOriginal()) as typeof import('node:fs/promises')
+  return {
+    ...actual,
+    lstat: async (path: string) => {
+      const stat = await actual.lstat(path)
+      if (race.enabled === true && path === race.canonicalPath) {
+        race.enabled = false
+        await actual.rename(path, race.originalPath)
+        await actual.symlink(race.attackerPath, path)
+      }
+      return stat
+    },
+  }
+})
 
 let tempRoot: string
 
@@ -14,6 +32,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  race.enabled = false
   await rm(tempRoot, {recursive: true, force: true})
 })
 
@@ -144,6 +163,28 @@ describe('readJournal — absent', () => {
 })
 
 describe('readJournal — malformed input is refused, never treated as absent', () => {
+  it('does not read an attacker symlink swapped in after the file check', async () => {
+    // #given
+    const journalsDir = journalsDirFor(tempRoot)
+    await mkdir(journalsDir, {recursive: true, mode: 0o700})
+    const canonicalPath = join(journalsDir, 'acme__widgets.json')
+    const originalPath = join(journalsDir, 'acme__widgets.original.json')
+    const attackerPath = join(tempRoot, 'attacker.json')
+    const original = makeUpdateJournal('fetched')
+    const attacker = {...makeUpdateJournal('applying'), toSha: SHA_C}
+    await writeFile(canonicalPath, JSON.stringify(original))
+    await writeFile(attackerPath, JSON.stringify(attacker))
+    Object.assign(race, {canonicalPath, originalPath, attackerPath, enabled: true})
+
+    // #when — swap the path after lstat has verified its original regular file.
+    const result = await readJournal(journalsDir, 'acme', 'widgets')
+
+    // #then — the read must never return content from the symlink target.
+    expect(result).toEqual({ok: true, journal: original})
+    await rm(canonicalPath, {force: true})
+    await rm(originalPath, {force: true})
+  })
+
   it('refuses truncated JSON', async () => {
     // #given
     const journalsDir = journalsDirFor(tempRoot)

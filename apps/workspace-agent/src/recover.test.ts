@@ -8,8 +8,8 @@ import type {GitRunnerFn} from './git-safety.js'
 import type {ExecuteRecoveryDeps} from './recover.js'
 import {execFileSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
-import {existsSync, mkdirSync, statSync} from 'node:fs'
-import {lstat, mkdir, readdir, readFile, readlink, rename, rm, symlink, writeFile} from 'node:fs/promises'
+import {constants, existsSync, mkdirSync, statSync} from 'node:fs'
+import {lstat, mkdir, open, readdir, readFile, readlink, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
@@ -369,6 +369,18 @@ describe('previewRecovery — journal-in-progress and maintenance-hold refusals'
 })
 
 describe('previewRecovery — D4: tracked, never returns a preview built on uncertainty', () => {
+  it('holds the repository and refuses the preview when layout-child termination is unconfirmed', async () => {
+    await setupCleanCheckout()
+
+    const result = await previewRecovery(
+      req(),
+      deps({layoutRunner: async () => ({kind: 'termination-unconfirmed'})}),
+    )
+
+    expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
+    expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+  })
+
   it('an unconfirmed config-inventory call sets the hold and fails termination-unconfirmed — never an opaque preview', async () => {
     await setupCleanCheckout()
     const forgingRunner: GitRunnerFn = async (args, options) => {
@@ -1115,16 +1127,25 @@ async function buildContentManifest(root: string): Promise<readonly ManifestEntr
       for (const name of [...names].sort()) await walk(relPath === '.' ? name : join(relPath, name))
       return
     }
-    const sha256 = st.isFile()
-      ? createHash('sha256')
-          .update(await readFile(absPath))
-          .digest('hex')
-      : undefined
+    let fileSt = st
+    let sha256: string | undefined
+    if (st.isFile()) {
+      // Read and capture metadata from the same descriptor; O_NOFOLLOW prevents a path swap to a
+      // symlink between lstat and open from escaping the manifest root.
+      const handle = await open(absPath, constants.O_RDONLY | constants.O_NOFOLLOW)
+      try {
+        fileSt = await handle.stat()
+        if (!fileSt.isFile()) throw new Error(`Expected regular file while building manifest: ${relPath}`)
+        sha256 = createHash('sha256').update(await handle.readFile()).digest('hex')
+      } finally {
+        await handle.close()
+      }
+    }
     entries.push({
       path: relPath,
       type: st.isFile() ? 'file' : 'other',
-      mode,
-      size: st.size,
+      mode: fileSt.mode & 0o777,
+      size: fileSt.size,
       sha256,
       symlinkTarget: undefined,
     })

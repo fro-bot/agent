@@ -18,10 +18,12 @@
  */
 
 import type {GitRunnerFn} from './git-safety.js'
+import type {ObstructionPathRunner} from './checkout-layout-child.js'
 
-import {lchown, lstat, mkdtemp, readdir, readFile, readlink, realpath, rm, stat} from 'node:fs/promises'
+import {lchown, lstat, mkdtemp, realpath, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
+import {runCheckoutLayoutChild, runCheckoutObstructionChild} from './checkout-layout-child.js'
 
 import {
   buildFilterNeutralizationEnv,
@@ -34,26 +36,6 @@ import {
 // ---------------------------------------------------------------------------
 // Shared small helpers
 // ---------------------------------------------------------------------------
-
-/** True if `target` exists (following symlinks) — used for plain presence checks (alternates, grafts, shallow). */
-async function pathExists(target: string): Promise<boolean> {
-  try {
-    await stat(target)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/** True if `dir` exists and contains at least one entry. A missing directory is treated as "no entries", never a failure. */
-async function directoryHasEntries(dir: string): Promise<boolean> {
-  try {
-    const entries = await readdir(dir)
-    return entries.length > 0
-  } catch {
-    return false
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Config inventory
@@ -184,79 +166,25 @@ export type LayoutCheckOutcome =
   | {readonly kind: 'ok'}
   | {readonly kind: 'refused'; readonly reason: LayoutRefusalReason}
   | {readonly kind: 'inspection-failed'}
+  | {readonly kind: 'termination-unconfirmed'}
+
+export type CheckoutLayoutRunner = (options: {
+  readonly checkoutPath: string
+  readonly timeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}) => Promise<
+  | {readonly kind: 'ok'; readonly stdout: string}
+  | {readonly kind: 'failed'}
+  | {readonly kind: 'termination-unconfirmed'}
+>
 
 export interface LayoutCheckOptions {
   readonly checkoutPath: string
   readonly timeoutMs: number
   readonly uid?: number
   readonly gid?: number
-}
-
-interface ParsedConfigEntry {
-  readonly section: string
-  readonly key: string
-}
-
-/**
- * Minimal git-config-file scanner used ONLY to check for the PRESENCE of a handful of specific
- * keys (`core.worktree`, `extensions.*`, `remote.*.promisor`, `core.splitIndex`, `index.sparse`) —
- * never to resolve or act on their values. Deliberately implemented as a raw text scan over
- * `.git/config`'s own bytes (read directly via `readFile`, after confirming via `lstat` that the
- * path is a real, non-symlinked file) rather than by invoking `git config`, so this check can
- * never itself be redirected by whatever the file claims about itself — the full, git-semantics-
- * accurate key inventory (used for the actual admission allowlist decision) is `inventoryCheckoutConfig`
- * above, which the plan runs immediately before merge, not this layout pass.
- */
-function parseGitConfigSectionKeys(text: string): readonly ParsedConfigEntry[] {
-  const entries: ParsedConfigEntry[] = []
-  let currentSection = ''
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim()
-    if (line.length === 0 || line.startsWith('#') || line.startsWith(';')) continue
-    const sectionMatch = /^\[([^\s\]"]+)(?:\s+"[^"]*")?\]/.exec(line)
-    const sectionName = sectionMatch?.[1]
-    if (sectionName !== undefined) {
-      currentSection = sectionName.toLowerCase()
-      continue
-    }
-    if (currentSection.length === 0) continue
-    const keyMatch = /^([A-Z][A-Z0-9-]*)\b/i.exec(line)
-    const keyName = keyMatch?.[1]
-    if (keyName !== undefined) {
-      entries.push({section: currentSection, key: keyName.toLowerCase()})
-    }
-  }
-  return entries
-}
-
-async function packedRefsContainsReplace(packedRefsPath: string): Promise<boolean> {
-  let text: string
-  try {
-    text = await readFile(packedRefsPath, 'utf8')
-  } catch {
-    return false
-  }
-  return text.split('\n').some(line => line.includes(' refs/replace/'))
-}
-
-async function hasSharedIndexFile(gitDir: string): Promise<boolean> {
-  try {
-    const entries = await readdir(gitDir)
-    return entries.some(name => name.startsWith('sharedindex.'))
-  } catch {
-    return false
-  }
-}
-
-/** A `.git` that doesn't exist at all is either a bare repository (checkoutPath itself is the git dir) or not a git checkout at all — the latter fails closed as `inspection-failed`, never as `ok`. */
-async function checkBareRepositoryLayout(canonical: string): Promise<LayoutCheckOutcome> {
-  const [hasHead, hasObjects, hasRefs] = await Promise.all([
-    pathExists(join(canonical, 'HEAD')),
-    pathExists(join(canonical, 'objects')),
-    pathExists(join(canonical, 'refs')),
-  ])
-  if (hasHead && hasObjects && hasRefs) return {kind: 'refused', reason: 'bare-repository'}
-  return {kind: 'inspection-failed'}
+  readonly runner?: CheckoutLayoutRunner
 }
 
 /**
@@ -269,90 +197,34 @@ async function checkBareRepositoryLayout(canonical: string): Promise<LayoutCheck
  * any other `extensions.*` beyond a fresh clone).
  *
  * Every check inspects the filesystem and repository metadata directly — NEVER by trusting
- * anything the checkout's own (agent-writable) `.git/config` claims about itself: `.git`/`.git/config`
- * symlink-ness is checked with `lstat` (never following the link), and `.git/config`'s own text is
- * read as raw bytes rather than resolved through `git config` (see `parseGitConfigSectionKeys`).
+ * anything the checkout's own (agent-writable) `.git/config` claims about itself. The entire
+ * pathname inspection runs as the agent uid in a bounded child; config and packed-refs are opened
+ * with no-follow/nonblocking descriptor flags before their bytes are read.
  */
 export async function checkCheckoutLayout(options: LayoutCheckOptions): Promise<LayoutCheckOutcome> {
-  const {checkoutPath} = options
-
-  let canonical: string
+  const outcome = await (options.runner ?? runCheckoutLayoutChild)({
+    checkoutPath: options.checkoutPath,
+    timeoutMs: options.timeoutMs,
+    uid: options.uid,
+    gid: options.gid,
+  })
+  if (outcome.kind === 'termination-unconfirmed') return outcome
+  if (outcome.kind !== 'ok') return {kind: 'inspection-failed'}
+  let parsed: unknown
   try {
-    canonical = await realpath(checkoutPath)
+    parsed = JSON.parse(outcome.stdout)
   } catch {
     return {kind: 'inspection-failed'}
   }
-
-  const gitPath = join(canonical, '.git')
-  let gitStat: Awaited<ReturnType<typeof lstat>>
-  try {
-    gitStat = await lstat(gitPath)
-  } catch {
-    return checkBareRepositoryLayout(canonical)
-  }
-
-  if (gitStat.isSymbolicLink()) return {kind: 'refused', reason: 'symlinked-git-dir'}
-  if (gitStat.isDirectory() === false) {
-    if (gitStat.isFile()) return {kind: 'refused', reason: 'gitfile'}
-    return {kind: 'inspection-failed'}
-  }
-
-  const gitDir = gitPath
-  const configPath = join(gitDir, 'config')
-  let configStat: Awaited<ReturnType<typeof lstat>>
-  try {
-    configStat = await lstat(configPath)
-  } catch {
-    return {kind: 'inspection-failed'}
-  }
-  if (configStat.isSymbolicLink()) return {kind: 'refused', reason: 'symlinked-config'}
-  if (configStat.isFile() === false) return {kind: 'inspection-failed'}
-
-  let configText: string
-  try {
-    configText = await readFile(configPath, 'utf8')
-  } catch {
-    return {kind: 'inspection-failed'}
-  }
-  const configEntries = parseGitConfigSectionKeys(configText)
-
-  const hasCoreWorktree = configEntries.some(entry => entry.section === 'core' && entry.key === 'worktree')
-  if (hasCoreWorktree) return {kind: 'refused', reason: 'core-worktree'}
-
-  const hasAlternates =
-    (await pathExists(join(gitDir, 'objects', 'info', 'alternates'))) ||
-    (await pathExists(join(gitDir, 'objects', 'info', 'http-alternates')))
-  if (hasAlternates) return {kind: 'refused', reason: 'alternates'}
-
-  const hasReplaceRefs =
-    (await directoryHasEntries(join(gitDir, 'refs', 'replace'))) ||
-    (await packedRefsContainsReplace(join(gitDir, 'packed-refs')))
-  if (hasReplaceRefs) return {kind: 'refused', reason: 'replace-refs'}
-
-  if (await pathExists(join(gitDir, 'info', 'grafts'))) return {kind: 'refused', reason: 'grafts'}
-
-  if (await pathExists(join(gitDir, 'shallow'))) return {kind: 'refused', reason: 'shallow'}
-
-  const isPartialClone = configEntries.some(
-    entry =>
-      (entry.section === 'extensions' && entry.key === 'partialclone') ||
-      (entry.section === 'remote' && entry.key === 'promisor'),
-  )
-  if (isPartialClone) return {kind: 'refused', reason: 'partial-clone'}
-
-  if (await directoryHasEntries(join(gitDir, 'worktrees'))) return {kind: 'refused', reason: 'linked-worktree'}
-
-  const hasUnsupportedIndexFlag =
-    (await hasSharedIndexFile(gitDir)) ||
-    configEntries.some(
-      entry =>
-        (entry.section === 'core' && (entry.key === 'splitindex' || entry.key === 'sparsecheckout')) ||
-        (entry.section === 'index' && (entry.key === 'sparse' || entry.key === 'version')) ||
-        (entry.section === 'extensions' && entry.key !== 'partialclone'),
-    )
-  if (hasUnsupportedIndexFlag) return {kind: 'refused', reason: 'unsupported-index-flag'}
-
-  return {kind: 'ok'}
+  if (typeof parsed !== 'object' || parsed === null || !('kind' in parsed)) return {kind: 'inspection-failed'}
+  const result = parsed as {readonly kind: unknown; readonly reason?: unknown}
+  if (result.kind === 'ok') return {kind: 'ok'}
+  if (result.kind === 'inspection-failed') return {kind: 'inspection-failed'}
+  if (result.kind === 'refused' && typeof result.reason === 'string' && [
+    'core-worktree', 'gitfile', 'symlinked-git-dir', 'symlinked-config', 'alternates', 'replace-refs',
+    'grafts', 'shallow', 'partial-clone', 'linked-worktree', 'unsupported-index-flag', 'bare-repository',
+  ].includes(result.reason)) return {kind: 'refused', reason: result.reason as LayoutRefusalReason}
+  return {kind: 'inspection-failed'}
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +406,9 @@ export type ObstructionPreflightOutcome =
   | {readonly kind: 'clear'}
   | {readonly kind: 'obstructed'; readonly obstructions: readonly Obstruction[]}
   | {readonly kind: 'inspection-failed'}
+  | {readonly kind: 'termination-unconfirmed'}
+
+export const MAX_OBSTRUCTION_CONTENT_BYTES = 1024 * 1024
 
 export interface ObstructionPreflightOptions {
   readonly checkoutPath: string
@@ -543,6 +418,7 @@ export interface ObstructionPreflightOptions {
   readonly timeoutMs: number
   readonly uid?: number
   readonly gid?: number
+  readonly obstructionRunner?: ObstructionPathRunner
 }
 
 interface TreeEntry {
@@ -592,7 +468,16 @@ function parseLsTreeEntries(stdout: string): readonly TreeEntry[] {
 export async function preflightObstructions(
   options: ObstructionPreflightOptions,
 ): Promise<ObstructionPreflightOutcome> {
-  const {checkoutPath, fromSha, toSha, gitRunner = runGit, timeoutMs, uid, gid} = options
+  const {
+    checkoutPath,
+    fromSha,
+    toSha,
+    gitRunner = runGit,
+    timeoutMs,
+    uid,
+    gid,
+    obstructionRunner = runCheckoutObstructionChild,
+  } = options
 
   let canonical: string
   try {
@@ -644,7 +529,17 @@ export async function preflightObstructions(
       continue
     }
 
-    const kind = await classifyExactObstruction(canonical, entry, entryStat, run)
+    const kind = await classifyExactObstruction({
+      canonical,
+      entry,
+      entryStat,
+      run,
+      obstructionRunner,
+      timeoutMs,
+      uid,
+      gid,
+    })
+    if (kind === 'termination-unconfirmed') return {kind}
     if (kind === 'inspection-failed') return {kind: 'inspection-failed'}
     reportedPaths.add(entry.path)
     obstructions.push({path: entry.path, kind})
@@ -692,24 +587,36 @@ async function findAncestorObstruction(
 
 /** Classifies an exact-path collision (on-disk entry exists, untracked in `fromSha`, not a directory) as `identical-content` when its bytes/target match what `toSha` introduces, `exact-conflict` otherwise. A type mismatch (file vs symlink) is never `identical-content`. */
 async function classifyExactObstruction(
-  canonical: string,
-  entry: TreeEntry,
-  entryStat: Awaited<ReturnType<typeof lstat>>,
-  run: (args: readonly string[]) => Promise<Awaited<ReturnType<GitRunnerFn>>>,
-): Promise<ObstructionKind | 'inspection-failed'> {
+  params: {
+    readonly canonical: string
+    readonly entry: TreeEntry
+    readonly entryStat: Awaited<ReturnType<typeof lstat>>
+    readonly run: (args: readonly string[]) => Promise<Awaited<ReturnType<GitRunnerFn>>>
+    readonly obstructionRunner: ObstructionPathRunner
+    readonly timeoutMs: number
+    readonly uid: number | undefined
+    readonly gid: number | undefined
+  },
+): Promise<ObstructionKind | 'inspection-failed' | 'termination-unconfirmed'> {
+  const {canonical, entry, entryStat, run, obstructionRunner, timeoutMs, uid, gid} = params
   const incomingIsSymlink = entry.mode === '120000'
   const onDiskIsSymlink = entryStat.isSymbolicLink()
 
   if (incomingIsSymlink !== onDiskIsSymlink) return 'exact-conflict'
 
-  let onDiskContent: string
-  try {
-    onDiskContent = onDiskIsSymlink
-      ? await readlink(join(canonical, entry.path))
-      : await readFile(join(canonical, entry.path), 'utf8')
-  } catch {
-    return 'exact-conflict'
-  }
+  const observed = await obstructionRunner({
+    checkoutPath: canonical,
+    relativePath: entry.path,
+    maxBytes: MAX_OBSTRUCTION_CONTENT_BYTES,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  if (observed.kind === 'termination-unconfirmed') return observed.kind
+  if (observed.kind === 'special' || observed.kind === 'too-large' || observed.kind === 'failed') return 'exact-conflict'
+  if (onDiskIsSymlink && observed.kind !== 'symlink') return 'exact-conflict'
+  if (!onDiskIsSymlink && observed.kind !== 'file') return 'exact-conflict'
+  const onDiskContent = observed.kind === 'symlink' ? observed.target : observed.text
 
   const blobOutcome = await run(['cat-file', '-p', entry.sha])
   if (blobOutcome.kind !== 'ok') return 'inspection-failed'

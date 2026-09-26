@@ -3,7 +3,6 @@
  */
 
 import {EventEmitter} from 'node:events'
-import {statSync} from 'node:fs'
 import {chmod, mkdir, open, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
@@ -319,11 +318,11 @@ describe('measureSealedTree -- F4/G4: fd-scoped measurement of a genuinely agent
     'the child receives fd 3 bound to the EXACT target directory (ino/dev match), never a substitute',
     async () => {
       const {parent, sealed} = await buildSealedTestTree()
-      const targetSt = statSync(sealed)
       try {
         await chmod(parent, 0o700)
         const handle = await open(sealed, 'r')
         try {
+          const targetSt = await handle.stat()
           const script =
             "const st = require('node:fs').fstatSync(3); process.stdout.write(JSON.stringify({ino: Number(st.ino), dev: Number(st.dev)}))"
           const outcome = await runWalkScriptForTesting(
@@ -361,7 +360,6 @@ describe('measureSealedTree -- F4/G4: fd-scoped measurement of a genuinely agent
       const {parent, sealed} = await buildSealedTestTree()
       const sentinelPath = join(parent, 'sentinel.txt')
       await writeFile(sentinelPath, 'sentinel')
-      const sentinelSt = statSync(sentinelPath) // captured BEFORE any lockdown
       try {
         await chmod(parent, 0o700)
         // A descriptor opened in THIS (parent) process BEFORE spawning -- Node's fs handles are
@@ -369,6 +367,7 @@ describe('measureSealedTree -- F4/G4: fd-scoped measurement of a genuinely agent
         const sentinelHandle = await open(sentinelPath, 'r')
         const targetHandle = await open(sealed, 'r')
         try {
+          const sentinelSt = await sentinelHandle.stat()
           const script = `
             const fs = require('node:fs');
             const SENTINEL_DEV = ${Number(sentinelSt.dev)};

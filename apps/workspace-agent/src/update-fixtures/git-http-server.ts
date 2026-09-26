@@ -239,12 +239,14 @@ async function runGitHttpBackend(params: {
     })
 
     child.on('error', () => {
+      if (settled) return
       if (!headersParsed) res.writeHead(500)
       res.end()
       finish()
     })
 
     child.on('close', () => {
+      if (settled) return
       if (!headersParsed) res.writeHead(500)
       res.end()
       finish()

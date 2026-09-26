@@ -15,12 +15,13 @@ import type {GitOutcome, GitRunnerFn} from './git-safety.js'
 import type {BackupEntry, DeleteBackupResult, ListBackupsResult} from './types.js'
 import type {InvocationTracker} from './update.js'
 import {randomUUID} from 'node:crypto'
-import {lstat, open, readdir, readFile, rename, rm} from 'node:fs/promises'
+import {lstat, open, readdir, rename, rm} from 'node:fs/promises'
 import {join} from 'node:path'
 
 import {runAgentWalk} from './agent-walk.js'
 import {AGENT_GID, AGENT_UID, JOURNAL_DIR_NAME, QUARANTINE_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal} from './journal.js'
+import {readFileNoFollow} from './read-file-no-follow.js'
 import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
 import {createInvocationTracker, runTrackedInvocation} from './update.js'
 
@@ -65,6 +66,8 @@ export const QUARANTINE_METADATA_FILE_NAME = 'metadata.json'
  * SIBLING of `metadata.json`, never its parent or child.
  */
 export const QUARANTINE_CHECKOUT_DIR_NAME = 'checkout'
+
+const MAX_QUARANTINE_METADATA_FILE_BYTES = 1024 * 1024
 
 /** Which code path created this generation — review round E, E2/E4. */
 export type QuarantineSource = 'recovery' | 'interrupted-update' | 'reconciliation'
@@ -167,7 +170,7 @@ export async function readQuarantineMetadata(generationPath: string): Promise<Qu
 
   let raw: string
   try {
-    raw = await readFile(filePath, 'utf8')
+    raw = (await readFileNoFollow(filePath, MAX_QUARANTINE_METADATA_FILE_BYTES)).toString('utf8')
   } catch (error) {
     return {ok: false, reason: 'malformed', detail: `cannot read metadata file: ${errorMessage(error)}`}
   }
@@ -409,6 +412,7 @@ export async function deleteBackup(
     }
     const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
     const journalRead = await readJournal(journalsDir, owner, repo)
+    if (journalRead.ok === false && journalRead.reason === 'malformed') return {kind: 'failed'}
     if (journalRead.ok === true && journalRead.journal.kind === 'recovery') {
       return {kind: 'refused', reason: 'recovery-in-progress'}
     }

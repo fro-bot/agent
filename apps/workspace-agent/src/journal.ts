@@ -43,8 +43,9 @@
  */
 
 import {randomUUID} from 'node:crypto'
-import {lstat, mkdir, open, readdir, readFile, rename, rm} from 'node:fs/promises'
+import {lstat, mkdir, open, readdir, rename, rm} from 'node:fs/promises'
 import {dirname, join} from 'node:path'
+import {readFileNoFollow} from './read-file-no-follow.js'
 
 /** Phases of an in-flight checkout update. See the plan's reconciliation table. */
 export type UpdateJournalPhase = 'fetched' | 'applying' | 'applied'
@@ -167,6 +168,8 @@ const RECOVERY_PHASES: ReadonlySet<string> = new Set<RecoveryJournalPhase>([
   'installing',
   'verifying',
 ])
+
+const MAX_JOURNAL_FILE_BYTES = 1024 * 1024
 
 /**
  * True only for a canonical journal file name (`<owner>__<repo>.json`) — never a leftover temp
@@ -337,24 +340,11 @@ async function ensureJournalsDir(journalsDir: string): Promise<void> {
 
 /** Reads and parses a single journal file at `filePath`. Never follows a symlink at that path. */
 async function readJournalFile(filePath: string): Promise<JournalReadResult> {
-  let st
-  try {
-    st = await lstat(filePath)
-  } catch (error) {
-    if (errorCode(error) === 'ENOENT') return {ok: false, reason: 'absent'}
-    return {ok: false, reason: 'malformed', detail: `cannot stat journal file: ${errorMessage(error)}`}
-  }
-  if (st.isSymbolicLink()) {
-    return {ok: false, reason: 'malformed', detail: 'journal file is a symlink, not a regular file — refusing'}
-  }
-  if (!st.isFile()) {
-    return {ok: false, reason: 'malformed', detail: 'journal path exists but is not a regular file'}
-  }
-
   let raw: string
   try {
-    raw = await readFile(filePath, 'utf8')
+    raw = (await readFileNoFollow(filePath, MAX_JOURNAL_FILE_BYTES)).toString('utf8')
   } catch (error) {
+    if (errorCode(error) === 'ENOENT') return {ok: false, reason: 'absent'}
     return {ok: false, reason: 'malformed', detail: `cannot read journal file: ${errorMessage(error)}`}
   }
 

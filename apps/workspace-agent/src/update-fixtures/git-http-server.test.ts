@@ -11,6 +11,7 @@
  * function's doc comment in git-http-server.ts for why parameterizing is safe there and nowhere
  * else. `buildNetworkGitProfile` itself is exercised completely unmodified.
  */
+import {execFileSync} from 'node:child_process'
 import {mkdtemp, rm} from 'node:fs/promises'
 import os from 'node:os'
 import {join} from 'node:path'
@@ -18,13 +19,42 @@ import {join} from 'node:path'
 import {afterEach, describe, expect, it} from 'vitest'
 import {buildNetworkGitProfile} from '../git-safety.js'
 import {bareRepoPath, startGitHttpServer, writeLoopbackAskpassHelper} from './git-http-server.js'
-import {commitFile, gitAsync, gitSync, initRepo, isolatedGitEnv, makeTempDir, opensslAvailable} from './helpers.js'
+import {
+  commitFile,
+  generateSelfSignedCert,
+  gitAsync,
+  gitSync,
+  initRepo,
+  isolatedGitEnv,
+  makeTempDir,
+  opensslAvailable,
+} from './helpers.js'
 
 /** Computed once at module load: this fixture's self-signed cert needs a real `openssl` binary — reported as a skip, not a silent pass, when unavailable (mirrors transport.test.ts's own gate). */
 const OPENSSL_AVAILABLE = opensslAvailable()
 
 const OWNER = 'acme'
 const REPO = 'widgets'
+
+describe.skipIf(!OPENSSL_AVAILABLE)('HTTPS fixture certificate', () => {
+  it('includes an IP subject alternative name for its 127.0.0.1 origin', async () => {
+    // #given a generated fixture certificate
+    const certDir = await makeTempDir('workspace-agent-fixture-cert-test-')
+    try {
+      const {certPath} = await generateSelfSignedCert(certDir)
+
+      // #when inspecting the certificate identity
+      const certText = execFileSync('openssl', ['x509', '-in', certPath, '-noout', '-ext', 'subjectAltName'], {
+        encoding: 'utf8',
+      })
+
+      // #then the IP origin is explicitly covered, independent of CN fallback behavior
+      expect(certText).toContain('IP Address:127.0.0.1')
+    } finally {
+      await rm(certDir, {recursive: true, force: true})
+    }
+  })
+})
 
 interface Fixture {
   readonly reposRoot: string

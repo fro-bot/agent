@@ -11,6 +11,7 @@ import type {UpdateRequest} from './types.js'
 import type {LoopbackListener} from './update-fixtures/helpers.js'
 import type {JournalReconciliationLogger, UpdateHandlerDeps} from './update.js'
 
+import {execFileSync} from 'node:child_process'
 import {chmod, mkdir, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
@@ -152,6 +153,37 @@ async function setupEligibleCheckout(owner = OWNER, repo = REPO): Promise<{reado
 }
 
 describe('createInvocationTracker (review round C, C2)', () => {
+  it('tracks an unconfirmed checkout-layout child termination', async () => {
+    const tracker = createInvocationTracker({
+      gitRunner: async () => ({kind: 'ok', stdout: '', stderr: ''}),
+      layoutRunner: async () => ({kind: 'termination-unconfirmed'}),
+    })
+
+    const outcome = await tracker.layoutRunner({checkoutPath: '/repo', timeoutMs: 1000, uid: 1, gid: 1})
+
+    expect(outcome).toEqual({kind: 'termination-unconfirmed'})
+    expect(tracker.sawUnconfirmed()).toBe(true)
+  })
+
+  it('tracks an unconfirmed exact-obstruction child termination', async () => {
+    const tracker = createInvocationTracker({
+      gitRunner: async () => ({kind: 'ok', stdout: '', stderr: ''}),
+      obstructionRunner: async () => ({kind: 'termination-unconfirmed'}),
+    })
+
+    const outcome = await tracker.obstructionRunner({
+      checkoutPath: '/repo',
+      relativePath: 'ignored.txt',
+      maxBytes: 1024,
+      timeoutMs: 1000,
+      uid: 1,
+      gid: 1,
+    })
+
+    expect(outcome).toEqual({kind: 'termination-unconfirmed'})
+    expect(tracker.sawUnconfirmed()).toBe(true)
+  })
+
   it('sawUnconfirmed() is false until a git dispatch reports termination-unconfirmed, then stays true', async () => {
     const outcomes: GitRunnerFn = async () => ({kind: 'ok', stdout: '', stderr: ''})
     let callCount = 0
@@ -393,6 +425,25 @@ describe('executeUpdate — canonical-path containment', () => {
 })
 
 describe('executeUpdate — layout and config admission', () => {
+  it('holds the repository and skips network access when layout-child termination is unconfirmed', async () => {
+    await setupEligibleCheckout()
+    const {runner, calls} = makeGitRunnerSpy()
+
+    const result = await executeUpdate(
+      req(),
+      localDeps({gitRunner: runner, layoutRunner: async () => ({kind: 'termination-unconfirmed'})}),
+    )
+
+    expect(result).toEqual({
+      kind: 'failed',
+      reason: 'termination-unconfirmed',
+      mutationStarted: false,
+      permanent: false,
+    })
+    expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+    expectNoNetworkContact(calls)
+  })
+
   it('refuses unsupported-layout when .git is a symlink resolving WITHIN the checkout (real git, real symlink)', async () => {
     // #given an eligible checkout whose `.git` is relocated to a sibling name inside the SAME
     // checkout directory and replaced with a symlink back to it. The symlink target still
@@ -1272,6 +1323,32 @@ describe.skipIf(!OPENSSL_AVAILABLE)(
           result.kind === 'refused' && result.reason === 'obstructed' ? result.obstructions.map(o => o.path) : []
         expect(obstructedPaths).toContain('obstructed.txt')
         expect(listLeftoverFetchRefs()).toEqual([])
+      } finally {
+        await fixture.close()
+      }
+    })
+
+    it('an unconfirmed obstruction inspector holds the repo and never fast-forwards', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        await writeFile(join(destPathFor(), '.git', 'info', 'exclude'), 'obstructed.txt\n', {flag: 'a'})
+        execFileSync('mkfifo', [join(destPathFor(), 'obstructed.txt')])
+        fixture.pushCommit('obstructed.txt', 'incoming-content', 'adds obstructed.txt')
+
+        const result = await executeUpdate(
+          req(),
+          networkDeps(fixture, {obstructionRunner: async () => ({kind: 'termination-unconfirmed'})}),
+        )
+
+        expect(result).toEqual({
+          kind: 'failed',
+          reason: 'termination-unconfirmed',
+          mutationStarted: false,
+          permanent: false,
+        })
+        expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+        expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(fixture.headSha)
       } finally {
         await fixture.close()
       }
