@@ -11,7 +11,8 @@
  * `termination-unconfirmed`.
  */
 
-import {execFile} from 'node:child_process'
+import {Buffer} from 'node:buffer'
+import {spawn} from 'node:child_process'
 import process from 'node:process'
 
 import {AGENT_HOME, AGENT_TMPDIR} from './identity.js'
@@ -50,6 +51,9 @@ process.stdout.write(JSON.stringify({totalBytes, entryCount: entries, complete: 
 `
 
 const WALK_KILL_REAP_GRACE_MS = 2_000
+
+/** (Review round G, G1) Explicit byte cap per stream, enforced by this module — replaces `execFile`'s `maxBuffer`, which `spawn` has no equivalent of. Exceeding it fails the walk, never silently truncates. */
+const MAX_WALK_OUTPUT_BYTES = 8 * 1024 * 1024
 
 /** Fixed, service-controlled PATH — never the parent's, mirrors git-safety.ts's own network-profile PATH. */
 const WALK_PATH = '/usr/bin:/bin'
@@ -133,46 +137,60 @@ async function spawnWalkProcess(
   return new Promise(resolve => {
     let settled = false
     let terminating = false
+    let overflowed = false
     let graceHandle: ReturnType<typeof setTimeout> | undefined
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    const stdoutChunks: Buffer[] = []
+    let stdoutBytes = 0
 
     const args = [...WALK_NODE_FLAGS, '-e', script, '--', ...scriptArgs]
-    let child: ReturnType<typeof execFile>
+    // (G1) `spawn`, not `execFile`: `execFile`'s internal `spawn` call does not forward a custom
+    // `stdio` array (verified against Node 24's `lib/child_process.js` — an extra inherited fd
+    // never reaches the child through `execFile`), so `measureSealedTree`'s fd-3 handoff silently
+    // did nothing. `spawn` honors `stdio` directly.
+    const stdio: ('ignore' | 'pipe' | number)[] =
+      extraFd === undefined ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe', extraFd]
+    let child: ReturnType<typeof spawn>
     try {
-      child = execFile(
-        process.execPath,
-        args,
-        {
-          uid: options.uid,
-          gid: options.gid,
-          cwd: WALK_CWD,
-          env: buildWalkEnv(),
-          encoding: 'utf8',
-          maxBuffer: 8 * 1024 * 1024,
-          ...(extraFd === undefined ? {} : {stdio: ['ignore', 'pipe', 'pipe', extraFd]}),
-        },
-        (error, stdout) => {
-          if (settled) return
-          settled = true
-          clearTimeout(timeoutHandle)
-          clearTimeout(graceHandle)
-          if (error !== null) {
-            resolve({kind: 'failed'})
-            return
-          }
-          resolve({kind: 'ok', stdout})
-        },
-      )
+      child = spawn(process.execPath, args, {
+        uid: options.uid,
+        gid: options.gid,
+        cwd: WALK_CWD,
+        env: buildWalkEnv(),
+        stdio,
+      })
     } catch {
       resolve({kind: 'failed'})
       return
     }
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutBytes += chunk.length
+      // (G1) Explicit byte cap replacing `execFile`'s `maxBuffer` — exceeding it FAILS the walk
+      // (never a silently truncated partial result masquerading as complete JSON).
+      if (stdoutBytes > MAX_WALK_OUTPUT_BYTES) {
+        overflowed = true
+        return
+      }
+      stdoutChunks.push(chunk)
+    })
+    child.stderr?.on('data', () => {}) // drained, never buffered — the walk never needs stderr content
     child.on('error', () => {
       if (settled) return
       settled = true
       clearTimeout(timeoutHandle)
       clearTimeout(graceHandle)
       resolve({kind: 'failed'})
+    })
+    child.on('close', code => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeoutHandle)
+      clearTimeout(graceHandle)
+      if (overflowed || code !== 0) {
+        resolve({kind: 'failed'})
+        return
+      }
+      resolve({kind: 'ok', stdout: Buffer.concat(stdoutChunks).toString('utf8')})
     })
 
     const terminate = (): void => {
@@ -210,8 +228,10 @@ export const runAgentWalk: AgentWalkRunner = async options => {
 export async function runWalkScriptForTesting(
   script: string,
   options: {readonly uid: number | undefined; readonly gid: number | undefined; readonly timeoutMs: number},
+  /** (Review round G, G4) Optional inherited fd 3, for tests that need to assert what the child sees at that descriptor (e.g. comparing `fstat(3)` to the intended target, or checking for descriptor leaks). */
+  extraFd?: number,
 ): Promise<SpawnScriptOutcome> {
-  return spawnWalkProcess(script, [], options)
+  return spawnWalkProcess(script, [], options, extraFd)
 }
 
 /**
@@ -223,10 +243,50 @@ export async function runWalkScriptForTesting(
  * descriptor to the one directory root chose to hand it, opened by root before the child ever
  * starts. Linux-only (procfs `/proc/self/fd`); `measureSealedTree` checks availability first.
  */
-const WALK_SCRIPT_FD = WALK_SCRIPT.replace(
-  'const [rootPath, maxEntriesStr, deadlineMsStr] = process.argv.slice(1);',
-  "const [maxEntriesStr, deadlineMsStr] = process.argv.slice(1); const rootPath = '/proc/self/fd/3';",
-)
+const WALK_SCRIPT_FD = `
+const fs = require('node:fs');
+const path = require('node:path');
+const [maxEntriesStr, deadlineMsStr] = process.argv.slice(1);
+const maxEntries = Number(maxEntriesStr);
+const deadlineAt = Date.now() + Number(deadlineMsStr);
+let entries = 0, totalBytes = 0, capped = false, hadError = false;
+// (Review round G, G2) fstat the INHERITED FD DIRECTLY — never lstat the /proc/self/fd/3 PATH
+// itself, which reports the SYMLINK's own tiny size and never recurses into the directory it
+// points to (the exact bug this replaces: a prior version lstat'd the path and reported
+// complete:true having walked nothing).
+let rootSt;
+try { rootSt = fs.fstatSync(3); } catch (e) { process.exitCode = 1; process.exit(1); }
+if (!rootSt.isDirectory()) { process.exitCode = 1; process.exit(1); }
+const rootDev = rootSt.dev;
+function walk(p) {
+  if (capped) return;
+  if (Date.now() > deadlineAt || entries >= maxEntries) { capped = true; return; }
+  entries += 1;
+  let st;
+  try { st = fs.lstatSync(p); } catch (e) { hadError = true; return; }
+  if (st.dev !== rootDev) return;
+  if (st.isSymbolicLink()) { totalBytes += st.size; return; }
+  if (st.isDirectory()) {
+    let names;
+    try { names = fs.readdirSync(p); } catch (e) { hadError = true; return; }
+    for (const name of names) { if (capped) return; walk(path.join(p, name)); }
+    return;
+  }
+  if (st.isFile()) totalBytes += st.size;
+}
+// The root counts as one entry via the FSTAT result already obtained above (never re-derived by
+// lstat-ing the symlink). Its children are reached by deliberately dereferencing the TRUSTED
+// procfs anchor EXACTLY ONCE via readdirSync — safe because fd 3 is bound to a specific inode by
+// the kernel, immune to any rename/symlink-swap race an attacker could stage; every entry BELOW
+// that point is still reached via ordinary no-follow lstat, exactly like the pathname-mode walker.
+entries += 1;
+if (!(Date.now() > deadlineAt || entries > maxEntries)) {
+  let names;
+  try { names = fs.readdirSync('/proc/self/fd/3'); } catch (e) { hadError = true; names = []; }
+  for (const name of names) { if (capped) break; walk('/proc/self/fd/3/' + name); }
+}
+process.stdout.write(JSON.stringify({totalBytes, entryCount: entries, complete: !capped && !hadError}));
+`
 
 /**
  * (Review round F, F4) Measures an agent-UNTRAVERSABLE tree (a quarantine envelope's `checkout/`,
@@ -240,14 +300,20 @@ const WALK_SCRIPT_FD = WALK_SCRIPT.replace(
  * REJECTED alternative: chmod'ing the envelope open \u2014 the review explicitly ruled this out (it
  * would let the agent traverse OTHER generations' envelopes too, not just measure this one).
  */
-export async function measureSealedTree(options: {
+export interface SealedWalkOptions {
   readonly dirPath: string
   readonly maxEntries: number
   readonly deadlineMs: number
   readonly uid: number | undefined
   readonly gid: number | undefined
   readonly timeoutMs: number
-}): Promise<AgentWalkOutcome | {readonly kind: 'unavailable'}> {
+}
+
+export type SealedWalkOutcome = AgentWalkOutcome | {readonly kind: 'unavailable'}
+
+export type SealedWalkRunner = (options: SealedWalkOptions) => Promise<SealedWalkOutcome>
+
+export const measureSealedTree: SealedWalkRunner = async options => {
   if (process.platform !== 'linux') return {kind: 'unavailable'}
   const {open} = await import('node:fs/promises')
   let handle: Awaited<ReturnType<typeof open>>

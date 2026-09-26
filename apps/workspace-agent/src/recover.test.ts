@@ -1337,6 +1337,47 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
   })
 })
 
+describe('reconcileRecoveryJournalsOnStartup — G3: sealed-fallback termination-unconfirmed stops replay and sets the hold', () => {
+  it('an injected sealed walker reporting termination-unconfirmed leaves the journal untouched, installs nothing, and sets the repo hold', async () => {
+    // #given the rename half is already done (checkout/ populated, no original left at the
+    // canonical path) and metadata.json is absent — exactly the F7 scenario that reaches the
+    // sealed-tree fallback, since the envelope's ancestors block a plain agent-uid pathname walk.
+    await setupCleanCheckout()
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-g3'
+    const recoveredSha = createStagingCheckout(stagingPathFor(recoveryId))
+    const envelopePath = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`, recoveryId)
+    await mkdir(join(envelopePath, 'checkout'), {recursive: true})
+    await rename(destPathFor(), join(envelopePath, 'checkout'))
+    const originalJournal = {
+      kind: 'recovery' as const,
+      owner: OWNER,
+      repo: REPO,
+      phase: 'quarantining' as const,
+      recoveryId,
+      targetSha: recoveredSha,
+      branch: 'main',
+      startedAt: new Date().toISOString(),
+    }
+    await writeJournal(journalsDir, originalJournal)
+
+    // #when — the injected sealed walker reports uncertainty instead of a real measurement
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      sealedWalkRunner: async () => ({kind: 'termination-unconfirmed'}),
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    // #then — journal unchanged (still `quarantining`, still present), no metadata written,
+    // nothing installed at the canonical path, and the repo hold is set
+    expect(await readJournal(journalsDir, OWNER, REPO)).toEqual({ok: true, journal: originalJournal})
+    expect(existsSync(join(envelopePath, 'metadata.json'))).toBe(false)
+    expect(existsSync(destPathFor())).toBe(false)
+    expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+  })
+})
+
 describe('reconcileRecoveryJournalsOnStartup — F7: completes missing metadata even when the rename already happened', () => {
   it('a replay whose PRIOR attempt already renamed checkout/ but crashed before writing metadata.json still writes it', async () => {
     // #given the rename half is already done (a prior replay attempt got this far and crashed) --

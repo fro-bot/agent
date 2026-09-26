@@ -13,7 +13,7 @@
  * a pure filesystem walk) and no further git ever runs there.
  */
 
-import type {AgentWalkRunner} from './agent-walk.js'
+import type {AgentWalkRunner, SealedWalkRunner} from './agent-walk.js'
 import type {QuarantineMetadata, QuarantineSource} from './backups.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions} from './git-stream.js'
@@ -33,7 +33,7 @@ import {tmpdir} from 'node:os'
 import {dirname, join} from 'node:path'
 import {performance} from 'node:perf_hooks'
 import process from 'node:process'
-import {measureSealedTree, runAgentWalk} from './agent-walk.js'
+import {runAgentWalk} from './agent-walk.js'
 import {listBackups, QUARANTINE_CHECKOUT_DIR_NAME, readQuarantineMetadata, writeQuarantineMetadata} from './backups.js'
 import {checkCheckoutLayout, checkTempIndexCleanliness, inventoryCheckoutConfig} from './checkout-profile.js'
 import {HANDOFF_DEADLINE_MS, MAX_HANDOFF_ENTRIES, writeAskpassHelper} from './clone.js'
@@ -649,13 +649,14 @@ async function quarantineExistingCheckout(params: {
   readonly originalBranch: string | undefined
   readonly now: () => Date
   readonly walkRunner: AgentWalkRunner
+  readonly sealedWalkRunner: SealedWalkRunner
   readonly walkMaxEntries: number
   readonly walkDeadlineMs: number
   readonly uid: number | undefined
   readonly gid: number | undefined
-}): Promise<'ok' | 'failed'> {
+}): Promise<'ok' | 'failed' | 'termination-unconfirmed'> {
   const {reposRoot, owner, repo, recoveryId, checkoutPath, source, originalHeadSha, originalBranch, now} = params
-  const {walkRunner, walkMaxEntries, walkDeadlineMs, uid, gid} = params
+  const {walkRunner, sealedWalkRunner, walkMaxEntries, walkDeadlineMs, uid, gid} = params
   const envelopePath = envelopePathFor(reposRoot, owner, repo, recoveryId)
   const envelopeCheckoutPath = join(envelopePath, QUARANTINE_CHECKOUT_DIR_NAME)
   try {
@@ -689,8 +690,12 @@ async function quarantineExistingCheckout(params: {
     // (F4) Legacy/replay: `checkout/` was already renamed into the envelope by a PRIOR attempt,
     // and there was nothing left at the canonical path to measure beforehand — the envelope's own
     // ancestors are root-owned mode 0700, blocking a plain agent-uid pathname walk, so the fd-
-    // scoped sealed-tree walker is the only remaining option.
-    const sealed = await measureSealedTree({
+    // scoped sealed-tree walker is the only remaining option. (G3) Routed through the CALLER's
+    // `sealedWalkRunner` (the tracker's wrapped one, never a direct `measureSealedTree` call) so an
+    // unconfirmed termination here is recorded on the SAME tracker `runTrackedInvocation` checks —
+    // a direct call would silently drop that signal. Propagated to the caller immediately, before
+    // ANY metadata is written, so replay/execute never advances past uncertainty.
+    const sealed = await sealedWalkRunner({
       dirPath: envelopeCheckoutPath,
       maxEntries: walkMaxEntries,
       deadlineMs: walkDeadlineMs,
@@ -698,6 +703,7 @@ async function quarantineExistingCheckout(params: {
       gid,
       timeoutMs: walkDeadlineMs + WALK_TIMEOUT_BUFFER_MS,
     })
+    if (sealed.kind === 'termination-unconfirmed') return 'termination-unconfirmed'
     if (sealed.kind === 'ok') measured = sealed
   }
 
@@ -789,12 +795,13 @@ async function reconcileOneRecoveryJournal(params: {
   readonly journal: RecoveryJournal
   readonly gitRunner: GitRunnerFn
   readonly walkRunner: AgentWalkRunner
+  readonly sealedWalkRunner: SealedWalkRunner
   readonly now: () => Date
   readonly timeoutMs: number
   readonly uid: number | undefined
   readonly gid: number | undefined
 }): Promise<RecoveryReconciliationOutcome> {
-  const {journalsDir, reposRoot, journal, gitRunner, walkRunner, now, timeoutMs, uid, gid} = params
+  const {journalsDir, reposRoot, journal, gitRunner, walkRunner, sealedWalkRunner, now, timeoutMs, uid, gid} = params
   const {owner, repo, recoveryId, targetSha, branch, startedAt} = journal
   const checkoutPath = join(reposRoot, owner, repo)
   const stagingPath = stagingPathFor(reposRoot, recoveryId)
@@ -842,11 +849,17 @@ async function reconcileOneRecoveryJournal(params: {
         originalBranch: undefined,
         now,
         walkRunner,
+        sealedWalkRunner,
         walkMaxEntries: DEFAULT_WALK_MAX_ENTRIES,
         walkDeadlineMs: DEFAULT_WALK_DEADLINE_MS,
         uid,
         gid,
       })
+      // (G3) Uncertainty stops replay before ANY further transition — never advance to
+      // `installing`, never rename staging, never clear the journal. The outer
+      // `runTrackedInvocation` (this journal's own tracker) sets the hold once this function
+      // returns, since `sealedWalkRunner` above already recorded the uncertainty on it.
+      if (result === 'termination-unconfirmed') return 'left-in-place'
       if (result === 'failed') return 'left-in-place'
     }
     await advance('installing')
@@ -877,6 +890,8 @@ async function reconcileOneRecoveryJournal(params: {
 
 export interface ReconcileRecoveryJournalsOnStartupDeps {
   readonly gitRunner?: GitRunnerFn
+  /** (Review round G, G3) Test seam — injectable so a test can simulate an unconfirmed termination during the fd-scoped sealed-tree fallback measurement without a real subprocess. Defaults to the real `measureSealedTree`. */
+  readonly sealedWalkRunner?: SealedWalkRunner
   readonly now?: () => Date
   readonly reposRoot?: string
   readonly options?: {readonly timeoutMs?: number; readonly uid?: number; readonly gid?: number}
@@ -899,7 +914,14 @@ function errorMessage(error: unknown): string {
  * per-journal error is logged and the journal is left in place rather than blocking startup.
  */
 export async function reconcileRecoveryJournalsOnStartup(deps: ReconcileRecoveryJournalsOnStartupDeps): Promise<void> {
-  const {reposRoot = WORKSPACE_REPOS_ROOT, gitRunner = runGit, now = () => new Date(), options = {}, logger} = deps
+  const {
+    reposRoot = WORKSPACE_REPOS_ROOT,
+    gitRunner = runGit,
+    sealedWalkRunner: injectedSealedWalkRunner,
+    now = () => new Date(),
+    options = {},
+    logger,
+  } = deps
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
 
@@ -931,7 +953,7 @@ export async function reconcileRecoveryJournalsOnStartup(deps: ReconcileRecovery
         }
         // (D1) Routed through the shared choke point so a throw from `reconcileOneRecoveryJournal`
         // still holds the repository, not only an ordinary non-'cleared' return.
-        const tracker = createInvocationTracker({gitRunner})
+        const tracker = createInvocationTracker({gitRunner, sealedWalkRunner: injectedSealedWalkRunner})
         await runTrackedInvocation(
           repoKey,
           tracker,
@@ -942,6 +964,7 @@ export async function reconcileRecoveryJournalsOnStartup(deps: ReconcileRecovery
               journal,
               gitRunner: tracker.gitRunner,
               walkRunner: tracker.walkRunner,
+              sealedWalkRunner: tracker.sealedWalkRunner,
               now,
               timeoutMs,
               uid,
@@ -1075,6 +1098,7 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   const gitRunner = tracker.gitRunner
   const packStreamRunner = tracker.packStreamRunner
   const walkRunner = tracker.walkRunner
+  const sealedWalkRunner = tracker.sealedWalkRunner
 
   const preview = await computeRecoveryPreviewLocked(owner, repo, {
     gitRunner,
@@ -1297,11 +1321,17 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       originalBranch: preview.kind === 'ok' && preview.preview.inspectionSafe ? preview.preview.branch : undefined,
       now,
       walkRunner,
+      sealedWalkRunner,
       walkMaxEntries: ctx.walkMaxEntries,
       walkDeadlineMs: ctx.walkDeadlineMs,
       uid,
       gid,
     })
+    // (G3) `!== 'ok'` already covers BOTH 'failed' and 'termination-unconfirmed' — either way this
+    // stops here, before the 'installing' journal write and the staging rename. The outer
+    // `runTrackedInvocation` (executeRecovery's choke point) overrides this whole result to
+    // `{kind:'failed', reason:'termination-unconfirmed'}` if `sealedWalkRunner` above recorded
+    // uncertainty — this return value is a safe placeholder for that case, never the final answer.
     if (quarantined !== 'ok') return {kind: 'failed', reason: 'quarantine-failed'}
   }
 

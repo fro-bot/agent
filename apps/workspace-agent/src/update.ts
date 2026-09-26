@@ -50,7 +50,7 @@
  *    begin, so an already-aborted request never reaches `runNetworkAndApply`.
  */
 
-import type {AgentWalkRunner} from './agent-walk.js'
+import type {AgentWalkRunner, SealedWalkRunner} from './agent-walk.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions, PackStreamOutcome} from './git-stream.js'
 import type {JournalListEntry} from './journal.js'
@@ -61,7 +61,7 @@ import {tmpdir} from 'node:os'
 import {dirname, join} from 'node:path'
 import {performance} from 'node:perf_hooks'
 import process from 'node:process'
-import {runAgentWalk} from './agent-walk.js'
+import {measureSealedTree, runAgentWalk} from './agent-walk.js'
 import {
   checkCheckoutLayout,
   checkTempIndexCleanliness,
@@ -572,6 +572,8 @@ export interface InvocationTracker {
   readonly packStreamRunner: (options: PackStreamOptions) => Promise<PackStreamOutcome>
   /** (Review round E, E5) Additive — wraps the injected agent-uid walk runner (agent-walk.ts) the same way `gitRunner`/`packStreamRunner` are wrapped: clamped to the active deadline, and any `termination-unconfirmed` outcome sets `sawUnconfirmed()`. */
   readonly walkRunner: AgentWalkRunner
+  /** (Review round G, G3) Additive — wraps the injected fd-scoped sealed-tree walk runner (agent-walk.ts's `measureSealedTree`) the same way `walkRunner` is wrapped: clamped to the active deadline, and any `termination-unconfirmed` outcome sets `sawUnconfirmed()`. A DIRECT, untracked call to `measureSealedTree` would silently drop that signal — exactly the bug this closes. */
+  readonly sealedWalkRunner: SealedWalkRunner
   /** True once ANY dispatch through this tracker reported `termination-unconfirmed`. Sticky. */
   readonly sawUnconfirmed: () => boolean
   /** Installs (or clears, via `undefined`) the active phase deadline every dispatch clamps to. */
@@ -599,11 +601,13 @@ export function createInvocationTracker(params: {
   readonly gitRunner: GitRunnerFn
   readonly packStreamRunner?: (options: PackStreamOptions) => Promise<PackStreamOutcome>
   readonly walkRunner?: AgentWalkRunner
+  readonly sealedWalkRunner?: SealedWalkRunner
 }): InvocationTracker {
   const {
     gitRunner: baseGitRunner,
     packStreamRunner: basePackStreamRunner = runPackStream,
     walkRunner: baseWalkRunner = runAgentWalk,
+    sealedWalkRunner: baseSealedWalkRunner = measureSealedTree,
   } = params
   let unconfirmed = false
   let applyingPhase = false
@@ -642,10 +646,19 @@ export function createInvocationTracker(params: {
     return outcome
   }
 
+  const sealedWalkRunner: SealedWalkRunner = async options => {
+    const timeoutMs = clampTimeout(options.timeoutMs)
+    if (timeoutMs === 'expired') return {kind: 'failed'}
+    const outcome = await baseSealedWalkRunner({...options, timeoutMs})
+    if (outcome.kind === 'termination-unconfirmed') unconfirmed = true
+    return outcome
+  }
+
   return {
     gitRunner,
     packStreamRunner,
     walkRunner,
+    sealedWalkRunner,
     sawUnconfirmed: () => unconfirmed,
     setDeadline: deadline => {
       activeDeadline = deadline

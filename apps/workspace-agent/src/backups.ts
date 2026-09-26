@@ -10,14 +10,15 @@
  * writes it first.
  */
 
-import type {AgentWalkRunner} from './agent-walk.js'
+import type {AgentWalkOutcome, AgentWalkRunner} from './agent-walk.js'
 import type {GitOutcome, GitRunnerFn} from './git-safety.js'
 import type {BackupEntry, DeleteBackupResult, ListBackupsResult} from './types.js'
+import type {InvocationTracker} from './update.js'
 import {randomUUID} from 'node:crypto'
 import {lstat, open, readdir, readFile, rename, rm} from 'node:fs/promises'
 import {join} from 'node:path'
 
-import {measureSealedTree, runAgentWalk} from './agent-walk.js'
+import {runAgentWalk} from './agent-walk.js'
 import {AGENT_GID, AGENT_UID, JOURNAL_DIR_NAME, QUARANTINE_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal} from './journal.js'
 import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
@@ -27,29 +28,24 @@ import {createInvocationTracker, runTrackedInvocation} from './update.js'
 const neverCalledGitRunner: GitRunnerFn = async (): Promise<GitOutcome> => ({kind: 'timeout'})
 
 /**
- * (F4/F5) Wraps a base `AgentWalkRunner` so a `termination-unconfirmed` or incomplete/failed
- * PLAIN pathname walk falls back to `measureSealedTree` — F4's fd-scoped mechanism for measuring a
- * tree whose ancestors are root-owned and block ordinary agent-uid traversal. `measureSealedTree`
- * reporting `unavailable` (non-Linux) surfaces the ORIGINAL direct outcome unchanged, so a
- * plain-walk-capable environment (e.g. this test suite's own temp directories, whose ancestors are
- * NOT actually root-owned) is never worse off than before this wrapper existed.
+ * (F4/F5, review round G, G3) Tries a plain agent-uid pathname walk (via `tracker.walkRunner`)
+ * first — the envelope's ancestors ARE agent-traversable in some deployments/tests — falling back
+ * to the fd-scoped sealed-tree walker (`tracker.sealedWalkRunner`) only when that's incomplete or
+ * failed. BOTH sub-calls go through the SAME tracker instance (never a raw, untracked
+ * `measureSealedTree` call — G3's fix), so an unconfirmed termination in EITHER one is recorded on
+ * it. `measureSealedTree` reporting `unavailable` (non-Linux) surfaces the ORIGINAL direct outcome
+ * unchanged, so a plain-walk-capable environment is never worse off than before this existed.
  */
-function withSealedFallback(baseWalkRunner: AgentWalkRunner): AgentWalkRunner {
-  return async options => {
-    const direct = await baseWalkRunner(options)
-    if (direct.kind === 'termination-unconfirmed') return direct
-    if (direct.kind === 'ok' && direct.complete) return direct
-    const sealed = await measureSealedTree({
-      dirPath: options.rootPath,
-      maxEntries: options.maxEntries,
-      deadlineMs: options.deadlineMs,
-      uid: options.uid,
-      gid: options.gid,
-      timeoutMs: options.timeoutMs,
-    })
-    if (sealed.kind === 'unavailable') return direct
-    return sealed
-  }
+async function measureGenerationCheckout(
+  tracker: InvocationTracker,
+  options: Parameters<AgentWalkRunner>[0],
+): Promise<AgentWalkOutcome> {
+  const direct = await tracker.walkRunner(options)
+  if (direct.kind === 'termination-unconfirmed') return direct
+  if (direct.kind === 'ok' && direct.complete) return direct
+  const sealed = await tracker.sealedWalkRunner({dirPath: options.rootPath, ...options})
+  if (sealed.kind === 'unavailable') return direct
+  return sealed
 }
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors update.ts/inspect.ts. */
@@ -308,7 +304,7 @@ export async function listBackups(owner: string, repo: string, deps: BackupsDeps
   // ARE agent-traversable in some deployments/tests), falling back to the fd-scoped sealed-tree
   // walker only when that's incomplete/failed — exactly the scoped-access mechanism F4 introduced,
   // reused here rather than re-implemented.
-  const tracker = createInvocationTracker({gitRunner: neverCalledGitRunner, walkRunner: withSealedFallback(walkRunner)})
+  const tracker = createInvocationTracker({gitRunner: neverCalledGitRunner, walkRunner})
   const repoKey = repoMutexKey(owner, repo)
   const quarantineRepoDir = quarantineRepoDirFor(reposRoot, owner, repo)
 
@@ -359,7 +355,7 @@ export async function listBackups(owner: string, repo: string, deps: BackupsDeps
       repoKey,
       tracker,
       async () =>
-        tracker.walkRunner({
+        measureGenerationCheckout(tracker, {
           rootPath: join(generationPath, QUARANTINE_CHECKOUT_DIR_NAME),
           maxEntries: walkMaxEntries,
           deadlineMs: walkDeadlineMs,
