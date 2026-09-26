@@ -103,7 +103,7 @@ let result; try { result=inspect(); } catch (_) { result={kind:'inspection-faile
 process.stdout.write(JSON.stringify(result));
 `
 
-const OBSTRUCTION_SCRIPT = String.raw`
+const OBSTRUCTION_SCRIPT = `
 const fs=require('node:fs');
 const path=require('node:path');
 const [rootArg,relativePath,maxBytesArg]=process.argv.slice(1);
@@ -160,14 +160,25 @@ type ChildScriptOutcome =
   | {readonly kind: 'failed'}
   | {readonly kind: 'termination-unconfirmed'}
 
-function runBoundedChild(options: ChildScriptOptions): Promise<ChildScriptOutcome> {
+async function runBoundedChild(options: ChildScriptOptions): Promise<ChildScriptOutcome> {
   return new Promise(resolve => {
     let child: ReturnType<typeof spawn>
     try {
-      child = spawn(process.execPath, ['--disallow-code-generation-from-strings', '--no-addons', '-e', options.script, '--', ...options.args], {
-        cwd: '/', env: CHILD_ENV, uid: options.uid, gid: options.gid, stdio: ['ignore', 'pipe', 'ignore'],
-      })
-    } catch { resolve({kind: 'failed'}); return }
+      child = spawn(
+        process.execPath,
+        ['--disallow-code-generation-from-strings', '--no-addons', '-e', options.script, '--', ...options.args],
+        {
+          cwd: '/',
+          env: CHILD_ENV,
+          uid: options.uid,
+          gid: options.gid,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        },
+      )
+    } catch {
+      resolve({kind: 'failed'})
+      return
+    }
     let settled = false
     let bytes = 0
     let overflowed = false
@@ -226,7 +237,11 @@ function runBoundedChild(options: ChildScriptOptions): Promise<ChildScriptOutcom
 
 function parseObstructionResult(stdout: string): ObstructionPathResult {
   let parsed: unknown
-  try { parsed = JSON.parse(stdout) } catch { return {kind: 'failed'} }
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return {kind: 'failed'}
+  }
   if (typeof parsed !== 'object' || parsed === null || !('kind' in parsed)) return {kind: 'failed'}
   const value = parsed as {readonly kind: unknown; readonly text?: unknown; readonly target?: unknown}
   if (value.kind === 'file' && typeof value.text === 'string') return {kind: 'file', text: value.text}
@@ -235,7 +250,7 @@ function parseObstructionResult(stdout: string): ObstructionPathResult {
   return {kind: 'failed'}
 }
 
-export function runCheckoutLayoutChild(options: CheckoutLayoutChildOptions): Promise<CheckoutLayoutChildOutcome> {
+export async function runCheckoutLayoutChild(options: CheckoutLayoutChildOptions): Promise<CheckoutLayoutChildOutcome> {
   return runBoundedChild({
     script: LAYOUT_SCRIPT,
     args: [options.checkoutPath],
@@ -246,7 +261,7 @@ export function runCheckoutLayoutChild(options: CheckoutLayoutChildOptions): Pro
   })
 }
 
-export function runCheckoutObstructionChild(options: ObstructionPathOptions): Promise<ObstructionPathResult> {
+export async function runCheckoutObstructionChild(options: ObstructionPathOptions): Promise<ObstructionPathResult> {
   return runBoundedChild({
     script: OBSTRUCTION_SCRIPT,
     args: [options.checkoutPath, options.relativePath, String(options.maxBytes)],

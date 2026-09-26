@@ -372,10 +372,7 @@ describe('previewRecovery — D4: tracked, never returns a preview built on unce
   it('holds the repository and refuses the preview when layout-child termination is unconfirmed', async () => {
     await setupCleanCheckout()
 
-    const result = await previewRecovery(
-      req(),
-      deps({layoutRunner: async () => ({kind: 'termination-unconfirmed'})}),
-    )
+    const result = await previewRecovery(req(), deps({layoutRunner: async () => ({kind: 'termination-unconfirmed'})}))
 
     expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
     expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
@@ -1136,7 +1133,9 @@ async function buildContentManifest(root: string): Promise<readonly ManifestEntr
       try {
         fileSt = await handle.stat()
         if (!fileSt.isFile()) throw new Error(`Expected regular file while building manifest: ${relPath}`)
-        sha256 = createHash('sha256').update(await handle.readFile()).digest('hex')
+        sha256 = createHash('sha256')
+          .update(await handle.readFile())
+          .digest('hex')
       } finally {
         await handle.close()
       }

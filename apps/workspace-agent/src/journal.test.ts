@@ -7,10 +7,12 @@ import {join} from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {JournalDirectoryError, listJournals, readJournal, removeJournal, writeJournal} from './journal.js'
 
+type FsPromises = typeof import('node:fs/promises')
+
 const race = vi.hoisted(() => ({enabled: false, canonicalPath: '', originalPath: '', attackerPath: ''}))
 
 vi.mock('node:fs/promises', async importOriginal => {
-  const actual = (await importOriginal()) as typeof import('node:fs/promises')
+  const actual = await importOriginal<FsPromises>()
   return {
     ...actual,
     lstat: async (path: string) => {

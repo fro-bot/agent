@@ -17,14 +17,13 @@
  * the same helper `inspect.ts` uses for its own `git status` neutralization.
  */
 
-import type {GitRunnerFn} from './git-safety.js'
 import type {ObstructionPathRunner} from './checkout-layout-child.js'
+import type {GitRunnerFn} from './git-safety.js'
 
 import {lchown, lstat, mkdtemp, realpath, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {runCheckoutLayoutChild, runCheckoutObstructionChild} from './checkout-layout-child.js'
-
 import {
   buildFilterNeutralizationEnv,
   buildNeutralGitEnv,
@@ -220,10 +219,25 @@ export async function checkCheckoutLayout(options: LayoutCheckOptions): Promise<
   const result = parsed as {readonly kind: unknown; readonly reason?: unknown}
   if (result.kind === 'ok') return {kind: 'ok'}
   if (result.kind === 'inspection-failed') return {kind: 'inspection-failed'}
-  if (result.kind === 'refused' && typeof result.reason === 'string' && [
-    'core-worktree', 'gitfile', 'symlinked-git-dir', 'symlinked-config', 'alternates', 'replace-refs',
-    'grafts', 'shallow', 'partial-clone', 'linked-worktree', 'unsupported-index-flag', 'bare-repository',
-  ].includes(result.reason)) return {kind: 'refused', reason: result.reason as LayoutRefusalReason}
+  if (
+    result.kind === 'refused' &&
+    typeof result.reason === 'string' &&
+    [
+      'core-worktree',
+      'gitfile',
+      'symlinked-git-dir',
+      'symlinked-config',
+      'alternates',
+      'replace-refs',
+      'grafts',
+      'shallow',
+      'partial-clone',
+      'linked-worktree',
+      'unsupported-index-flag',
+      'bare-repository',
+    ].includes(result.reason)
+  )
+    return {kind: 'refused', reason: result.reason as LayoutRefusalReason}
   return {kind: 'inspection-failed'}
 }
 
@@ -586,18 +600,16 @@ async function findAncestorObstruction(
 }
 
 /** Classifies an exact-path collision (on-disk entry exists, untracked in `fromSha`, not a directory) as `identical-content` when its bytes/target match what `toSha` introduces, `exact-conflict` otherwise. A type mismatch (file vs symlink) is never `identical-content`. */
-async function classifyExactObstruction(
-  params: {
-    readonly canonical: string
-    readonly entry: TreeEntry
-    readonly entryStat: Awaited<ReturnType<typeof lstat>>
-    readonly run: (args: readonly string[]) => Promise<Awaited<ReturnType<GitRunnerFn>>>
-    readonly obstructionRunner: ObstructionPathRunner
-    readonly timeoutMs: number
-    readonly uid: number | undefined
-    readonly gid: number | undefined
-  },
-): Promise<ObstructionKind | 'inspection-failed' | 'termination-unconfirmed'> {
+async function classifyExactObstruction(params: {
+  readonly canonical: string
+  readonly entry: TreeEntry
+  readonly entryStat: Awaited<ReturnType<typeof lstat>>
+  readonly run: (args: readonly string[]) => Promise<Awaited<ReturnType<GitRunnerFn>>>
+  readonly obstructionRunner: ObstructionPathRunner
+  readonly timeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}): Promise<ObstructionKind | 'inspection-failed' | 'termination-unconfirmed'> {
   const {canonical, entry, entryStat, run, obstructionRunner, timeoutMs, uid, gid} = params
   const incomingIsSymlink = entry.mode === '120000'
   const onDiskIsSymlink = entryStat.isSymbolicLink()
@@ -613,7 +625,8 @@ async function classifyExactObstruction(
     gid,
   })
   if (observed.kind === 'termination-unconfirmed') return observed.kind
-  if (observed.kind === 'special' || observed.kind === 'too-large' || observed.kind === 'failed') return 'exact-conflict'
+  if (observed.kind === 'special' || observed.kind === 'too-large' || observed.kind === 'failed')
+    return 'exact-conflict'
   if (onDiskIsSymlink && observed.kind !== 'symlink') return 'exact-conflict'
   if (!onDiskIsSymlink && observed.kind !== 'file') return 'exact-conflict'
   const onDiskContent = observed.kind === 'symlink' ? observed.target : observed.text

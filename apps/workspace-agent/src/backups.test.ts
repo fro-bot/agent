@@ -19,10 +19,13 @@ import {
 } from './repo-mutex.js'
 import {makeTempDir} from './update-fixtures/helpers.js'
 
+type FsPromises = typeof import('node:fs/promises')
+
 const metadataSwap = vi.hoisted(() => ({targetPath: ''}))
+let reposRoot: string
 
 vi.mock('node:fs/promises', async importOriginal => {
-  const actual = (await importOriginal()) as typeof import('node:fs/promises')
+  const actual = await importOriginal<FsPromises>()
   return {
     ...actual,
     lstat: async (...args: Parameters<typeof actual.lstat>) => {
@@ -36,8 +39,6 @@ vi.mock('node:fs/promises', async importOriginal => {
     },
   }
 })
-
-let reposRoot: string
 
 beforeEach(async () => {
   reposRoot = await makeTempDir('backups-test-repos-')

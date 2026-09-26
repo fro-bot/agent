@@ -1,3 +1,4 @@
+import {Buffer} from 'node:buffer'
 import {constants} from 'node:fs'
 import {open} from 'node:fs/promises'
 

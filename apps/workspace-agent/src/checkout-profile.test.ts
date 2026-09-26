@@ -10,12 +10,11 @@
 import type {GitOutcome, GitRunnerFn} from './git-safety.js'
 
 import {execFileSync} from 'node:child_process'
-import {lchown, mkdtemp, open, rm} from 'node:fs/promises'
+import {lchown, mkdir, mkdtemp, open, rm, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {mkdir, writeFile} from 'node:fs/promises'
 import {runCheckoutObstructionChild} from './checkout-layout-child.js'
 import {checkCheckoutLayout, checkTempIndexCleanliness, preflightObstructions} from './checkout-profile.js'
 
@@ -55,6 +54,13 @@ beforeEach(async () => {
 afterEach(async () => {
   await rm(checkoutPath, {recursive: true, force: true})
 })
+
+async function makeCheckout(): Promise<string> {
+  const gitDir = join(checkoutPath, '.git')
+  await mkdir(gitDir, {recursive: true})
+  await writeFile(join(gitDir, 'config'), '[core]\nrepositoryformatversion = 0\n')
+  return gitDir
+}
 
 describe('checkTempIndexCleanliness — temp index directory ownership handoff', () => {
   it('chowns the temp index directory to the given uid/gid before any git call runs', async () => {
@@ -116,13 +122,6 @@ describe('checkTempIndexCleanliness — temp index directory ownership handoff',
 })
 
 describe('checkCheckoutLayout — bounded descriptor reads', () => {
-  async function makeCheckout(): Promise<string> {
-    const gitDir = join(checkoutPath, '.git')
-    await mkdir(gitDir, {recursive: true})
-    await writeFile(join(gitDir, 'config'), '[core]\nrepositoryformatversion = 0\n')
-    return gitDir
-  }
-
   it('fails closed on a FIFO config without blocking the caller', async () => {
     const gitDir = await makeCheckout()
     await rm(join(gitDir, 'config'))
@@ -177,15 +176,18 @@ describe('preflightObstructions — special exact-path collisions', () => {
     // If the regression returns, let the old blocking read finish so the test process is not left
     // with a pending FIFO open. The fixed inspector rejects the FIFO well before this writer runs.
     const writer = new Promise<void>(resolve => {
-      setTimeout(async () => {
-        try {
-          const handle = await open(fifoPath, 'w')
-          await handle.writeFile(incomingContent)
-          await handle.close()
-        } catch {
-          // The fixed implementation may already have removed the FIFO during cleanup.
-        }
-        resolve()
+      setTimeout(() => {
+        ;(async () => {
+          try {
+            const handle = await open(fifoPath, 'w')
+            await handle.writeFile(incomingContent)
+            await handle.close()
+          } catch {
+            // The fixed implementation may already have removed the FIFO during cleanup.
+          } finally {
+            resolve()
+          }
+        })().catch(resolve)
       }, 500)
     })
     const startedAt = Date.now()

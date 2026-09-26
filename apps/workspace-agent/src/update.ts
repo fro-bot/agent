@@ -51,8 +51,8 @@
  */
 
 import type {AgentWalkRunner, SealedWalkRunner} from './agent-walk.js'
-import type {CheckoutLayoutRunner} from './checkout-profile.js'
 import type {ObstructionPathRunner} from './checkout-layout-child.js'
+import type {CheckoutLayoutRunner} from './checkout-profile.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions, PackStreamOutcome} from './git-stream.js'
 import type {JournalListEntry} from './journal.js'
@@ -64,13 +64,13 @@ import {dirname, join} from 'node:path'
 import {performance} from 'node:perf_hooks'
 import process from 'node:process'
 import {measureSealedTree, runAgentWalk} from './agent-walk.js'
+import {runCheckoutLayoutChild, runCheckoutObstructionChild} from './checkout-layout-child.js'
 import {
   checkCheckoutLayout,
   checkTempIndexCleanliness,
   inventoryCheckoutConfig,
   preflightObstructions,
 } from './checkout-profile.js'
-import {runCheckoutLayoutChild, runCheckoutObstructionChild} from './checkout-layout-child.js'
 import {writeAskpassHelper} from './clone.js'
 import {
   buildFilterNeutralizationEnv,
@@ -2009,7 +2009,13 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
         const observation = inspected.response.observation
 
         // Step 3: layout.
-        const layout = await checkCheckoutLayout({checkoutPath: destPath, timeoutMs, uid, gid, runner: tracker.layoutRunner})
+        const layout = await checkCheckoutLayout({
+          checkoutPath: destPath,
+          timeoutMs,
+          uid,
+          gid,
+          runner: tracker.layoutRunner,
+        })
         if (layout.kind === 'refused')
           return {kind: 'refused', reason: 'unsupported-layout', layoutReason: layout.reason}
         if (layout.kind !== 'ok') {

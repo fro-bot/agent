@@ -14,8 +14,8 @@
  */
 
 import type {AgentWalkRunner, SealedWalkRunner} from './agent-walk.js'
-import type {CheckoutLayoutRunner} from './checkout-profile.js'
 import type {QuarantineMetadata, QuarantineSource} from './backups.js'
+import type {CheckoutLayoutRunner} from './checkout-profile.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions} from './git-stream.js'
 import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase, UpdateJournal} from './journal.js'
@@ -281,7 +281,8 @@ async function computeRecoveryPreviewLocked(
     readonly walkMaxEntries: number
   },
 ): Promise<PreviewRecoveryResult> {
-  const {gitRunner, walkRunner, layoutRunner, reposRoot, timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries} = params
+  const {gitRunner, walkRunner, layoutRunner, reposRoot, timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries} =
+    params
 
   // Checked first, before even the journal — mirrors update.ts's own step 0.
   if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
@@ -479,7 +480,11 @@ export async function previewRecovery(
   // unconfirmed termination anywhere holds the repository and returns `termination-unconfirmed`,
   // never a preview — opaque or otherwise — built on an uncertain read.
   return withRepoLock(repoKey, async () => {
-    const tracker = createInvocationTracker({gitRunner: injectedGitRunner, walkRunner: injectedWalkRunner, layoutRunner: injectedLayoutRunner})
+    const tracker = createInvocationTracker({
+      gitRunner: injectedGitRunner,
+      walkRunner: injectedWalkRunner,
+      layoutRunner: injectedLayoutRunner,
+    })
     return runTrackedInvocation(
       repoKey,
       tracker,
