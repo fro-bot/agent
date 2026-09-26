@@ -110,6 +110,19 @@ export interface RecoveryJournal {
   readonly branch: string
   /** ISO-8601 timestamp, from an injected clock, when the journal was first written. */
   readonly startedAt: string
+  /**
+   * (Review round F, F3) The UPDATE journal this recovery SUPERSEDED, present only when this
+   * recovery took over an interrupted update via the `recoverable-update` path — journal.ts keeps
+   * exactly one journal file per repository, so writing this recovery journal's `building` phase
+   * atomically replaces (never explicitly deletes) the update journal that was there; without this
+   * field the interrupted-update evidence, and the `/update` `needs-recovery` barrier it enforces,
+   * would be lost on a confirmed pre-quarantine build failure or a crash-then-`building`-
+   * reconciliation. Restored (never deleted) by pre-quarantine rollback; discarded only once
+   * quarantine succeeds (recover.ts never carries it into the `quarantining`/`installing`/
+   * `verifying` phase journals it writes), since by then the evidence lives in the envelope's own
+   * `source: 'interrupted-update'` metadata instead.
+   */
+  readonly supersededUpdate?: UpdateJournal
 }
 
 /** A journal is exactly one of these two shapes — never a generic bag of optional flags. */
@@ -178,35 +191,53 @@ function isNonEmptyString(value: unknown): value is string {
  * shape. Parsed, not cast: every field is checked before being trusted, including the `phase`
  * enum matching the journal's own `kind`.
  */
+/** Parses the update-journal shape only — shared by top-level `parseJournal` and `RecoveryJournal.supersededUpdate` parsing (F3). Does NOT check `v.kind` itself; callers gate on that first. */
+function parseUpdateJournalFields(v: Record<string, unknown>): UpdateJournal | null {
+  if (!isNonEmptyString(v.owner) || !isNonEmptyString(v.repo) || !isNonEmptyString(v.startedAt)) return null
+  if (!isNonEmptyString(v.phase) || !UPDATE_PHASES.has(v.phase)) return null
+  if (!isNonEmptyString(v.fromSha) || !isNonEmptyString(v.toSha)) return null
+  const common = {
+    kind: 'update' as const,
+    owner: v.owner,
+    repo: v.repo,
+    fromSha: v.fromSha,
+    toSha: v.toSha,
+    startedAt: v.startedAt,
+  }
+  if (v.phase === 'applied') {
+    // appliedAt is REQUIRED at this phase — a valid non-empty string, never silently coerced or
+    // defaulted. Missing or invalid ⇒ malformed, not absent.
+    if (!isNonEmptyString(v.appliedAt)) return null
+    return {...common, phase: 'applied', appliedAt: v.appliedAt}
+  }
+  return {...common, phase: v.phase as 'fetched' | 'applying'}
+}
+
+/**
+ * Parses `value` into a `Journal`, or returns `null` if it does not match the known discriminated
+ * shape. Parsed, not cast: every field is checked before being trusted, including the `phase`
+ * enum matching the journal's own `kind`.
+ */
 function parseJournal(value: unknown): Journal | null {
   if (typeof value !== 'object' || value === null) return null
   const v = value as Record<string, unknown>
   if (!isNonEmptyString(v.owner) || !isNonEmptyString(v.repo) || !isNonEmptyString(v.startedAt)) return null
 
-  if (v.kind === 'update') {
-    if (!isNonEmptyString(v.phase) || !UPDATE_PHASES.has(v.phase)) return null
-    if (!isNonEmptyString(v.fromSha) || !isNonEmptyString(v.toSha)) return null
-    const common = {
-      kind: 'update' as const,
-      owner: v.owner,
-      repo: v.repo,
-      fromSha: v.fromSha,
-      toSha: v.toSha,
-      startedAt: v.startedAt,
-    }
-    if (v.phase === 'applied') {
-      // appliedAt is REQUIRED at this phase — a valid non-empty string, never silently coerced or
-      // defaulted. Missing or invalid ⇒ malformed, not absent.
-      if (!isNonEmptyString(v.appliedAt)) return null
-      return {...common, phase: 'applied', appliedAt: v.appliedAt}
-    }
-    return {...common, phase: v.phase as 'fetched' | 'applying'}
-  }
+  if (v.kind === 'update') return parseUpdateJournalFields(v)
 
   if (v.kind === 'recovery') {
     if (!isNonEmptyString(v.phase) || !RECOVERY_PHASES.has(v.phase)) return null
     if (!isNonEmptyString(v.recoveryId)) return null
     if (!isNonEmptyString(v.targetSha) || !isNonEmptyString(v.branch)) return null
+    let supersededUpdate: UpdateJournal | undefined
+    if (v.supersededUpdate !== undefined) {
+      if (typeof v.supersededUpdate !== 'object' || v.supersededUpdate === null) return null
+      const sv = v.supersededUpdate as Record<string, unknown>
+      if (sv.kind !== 'update') return null
+      const parsed = parseUpdateJournalFields(sv)
+      if (parsed === null) return null
+      supersededUpdate = parsed
+    }
     return {
       kind: 'recovery',
       owner: v.owner,
@@ -216,6 +247,7 @@ function parseJournal(value: unknown): Journal | null {
       targetSha: v.targetSha,
       branch: v.branch,
       startedAt: v.startedAt,
+      ...(supersededUpdate === undefined ? {} : {supersededUpdate}),
     }
   }
 

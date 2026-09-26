@@ -7,7 +7,7 @@ import {join} from 'node:path'
 import process from 'node:process'
 
 import {describe, expect, it} from 'vitest'
-import {runAgentWalk, runWalkScriptForTesting} from './agent-walk.js'
+import {measureSealedTree, runAgentWalk, runWalkScriptForTesting} from './agent-walk.js'
 import {makeTempDir} from './update-fixtures/helpers.js'
 
 function opts(rootPath: string, overrides: Partial<Parameters<typeof runAgentWalk>[0]> = {}) {
@@ -165,4 +165,46 @@ describe('runAgentWalk \u2014 F2: traversal errors report completeness, never si
     const outcome = await runAgentWalk(opts(dir))
     expect(outcome.kind).toBe('failed')
   })
+})
+
+describe('measureSealedTree \u2014 F4: fd-scoped measurement of an agent-untraversable directory', () => {
+  const opts = (dirPath: string) => ({
+    dirPath,
+    maxEntries: 10_000,
+    deadlineMs: 5_000,
+    uid: process.getuid?.(),
+    gid: process.getgid?.(),
+    timeoutMs: 10_000,
+  })
+
+  it.skipIf(process.platform === 'linux')('reports unavailable on a platform without /proc/self/fd', async () => {
+    const dir = await makeTempDir('agent-walk-test-')
+    try {
+      const outcome = await measureSealedTree(opts(dir))
+      expect(outcome.kind).toBe('unavailable')
+    } finally {
+      await rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it.skipIf(process.platform !== 'linux')(
+    'measures a directory reachable ONLY via the inherited fd, never a pathname, on Linux',
+    async () => {
+      const parent = await makeTempDir('agent-walk-test-')
+      const sealed = join(parent, 'sealed')
+      try {
+        await mkdir(sealed)
+        await writeFile(join(sealed, 'a.txt'), 'hello')
+        await chmod(parent, 0o700) // ancestor unreadable by anyone else; the fd bypasses this entirely
+        const outcome = await measureSealedTree(opts(sealed))
+        expect(outcome.kind).toBe('ok')
+        if (outcome.kind !== 'ok') throw new Error('unreachable')
+        expect(outcome.totalBytes).toBeGreaterThan(0)
+        expect(outcome.complete).toBe(true)
+      } finally {
+        await chmod(parent, 0o700)
+        await rm(parent, {recursive: true, force: true})
+      }
+    },
+  )
 })

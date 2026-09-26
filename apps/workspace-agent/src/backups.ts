@@ -11,14 +11,46 @@
  */
 
 import type {AgentWalkRunner} from './agent-walk.js'
+import type {GitOutcome, GitRunnerFn} from './git-safety.js'
 import type {BackupEntry, DeleteBackupResult, ListBackupsResult} from './types.js'
-import {lstat, readdir, readFile, rm} from 'node:fs/promises'
+import {randomUUID} from 'node:crypto'
+import {lstat, open, readdir, readFile, rename, rm} from 'node:fs/promises'
 import {join} from 'node:path'
 
-import {runAgentWalk} from './agent-walk.js'
-import {JOURNAL_DIR_NAME, QUARANTINE_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {measureSealedTree, runAgentWalk} from './agent-walk.js'
+import {AGENT_GID, AGENT_UID, JOURNAL_DIR_NAME, QUARANTINE_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal} from './journal.js'
 import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
+import {createInvocationTracker, runTrackedInvocation} from './update.js'
+
+/** (F5) `listBackups` never calls git — this stub exists only to satisfy `createInvocationTracker`'s required `gitRunner` parameter and is never dispatched. */
+const neverCalledGitRunner: GitRunnerFn = async (): Promise<GitOutcome> => ({kind: 'timeout'})
+
+/**
+ * (F4/F5) Wraps a base `AgentWalkRunner` so a `termination-unconfirmed` or incomplete/failed
+ * PLAIN pathname walk falls back to `measureSealedTree` — F4's fd-scoped mechanism for measuring a
+ * tree whose ancestors are root-owned and block ordinary agent-uid traversal. `measureSealedTree`
+ * reporting `unavailable` (non-Linux) surfaces the ORIGINAL direct outcome unchanged, so a
+ * plain-walk-capable environment (e.g. this test suite's own temp directories, whose ancestors are
+ * NOT actually root-owned) is never worse off than before this wrapper existed.
+ */
+function withSealedFallback(baseWalkRunner: AgentWalkRunner): AgentWalkRunner {
+  return async options => {
+    const direct = await baseWalkRunner(options)
+    if (direct.kind === 'termination-unconfirmed') return direct
+    if (direct.kind === 'ok' && direct.complete) return direct
+    const sealed = await measureSealedTree({
+      dirPath: options.rootPath,
+      maxEntries: options.maxEntries,
+      deadlineMs: options.deadlineMs,
+      uid: options.uid,
+      gid: options.gid,
+      timeoutMs: options.timeoutMs,
+    })
+    if (sealed.kind === 'unavailable') return direct
+    return sealed
+  }
+}
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors update.ts/inspect.ts. */
 export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
@@ -74,6 +106,7 @@ export interface BackupsDeps {
   readonly reposRoot?: string
   /** (E4b) Injected agent-uid walk runner, used ONLY to measure a generation whose metadata is missing/malformed — defaults to the real subprocess-spawning `runAgentWalk`. */
   readonly walkRunner?: AgentWalkRunner
+  /** (F5) Defaults to `AGENT_UID`/`AGENT_GID` — NEVER root — same as every other agent-uid walk in this codebase. Tests pass `undefined` explicitly to run unprivileged locally. */
   readonly uid?: number
   readonly gid?: number
   readonly walkDeadlineMs?: number
@@ -122,8 +155,8 @@ function parseQuarantineMetadata(value: unknown): QuarantineMetadata | null {
   }
 }
 
-/** Reads and parses the metadata file inside a single generation directory. Never follows a symlink at that path. */
-async function readQuarantineMetadata(generationPath: string): Promise<QuarantineMetadataReadResult> {
+/** Reads and parses the metadata file inside a single generation directory. Never follows a symlink at that path. Exported (F7) so recover.ts's replay/reconciliation path can decide whether a generation's metadata still needs completing, without re-implementing this parse. */
+export async function readQuarantineMetadata(generationPath: string): Promise<QuarantineMetadataReadResult> {
   const filePath = join(generationPath, QUARANTINE_METADATA_FILE_NAME)
   let st
   try {
@@ -160,6 +193,34 @@ async function readQuarantineMetadata(generationPath: string): Promise<Quarantin
 /** `<reposRoot>/.workspace-agent/quarantine/<owner>__<repo>` — the same `<owner>__<repo>` pairing the fetch store and journal.ts use. */
 function quarantineRepoDirFor(reposRoot: string, owner: string, repo: string): string {
   return join(reposRoot, WORKSPACE_STATE_DIR_NAME, QUARANTINE_DIR_NAME, `${owner}__${repo}`)
+}
+
+/**
+ * Writes `metadata` to `<envelopePath>/metadata.json` via temp-file-then-`rename` (same atomicity
+ * as journal.ts). Exported (F7) so recover.ts's initial quarantine write AND its replay/
+ * reconciliation metadata-completion path share exactly one write implementation, rather than
+ * recover.ts re-implementing the temp-then-rename dance a second time.
+ */
+export async function writeQuarantineMetadata(
+  envelopePath: string,
+  metadata: QuarantineMetadata,
+): Promise<'ok' | 'failed'> {
+  const metadataPath = join(envelopePath, QUARANTINE_METADATA_FILE_NAME)
+  const tempPath = join(envelopePath, `.${QUARANTINE_METADATA_FILE_NAME}.tmp-${randomUUID()}`)
+  try {
+    const handle = await open(tempPath, 'wx', 0o600)
+    try {
+      await handle.writeFile(JSON.stringify(metadata))
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await rename(tempPath, metadataPath)
+    return 'ok'
+  } catch {
+    await rm(tempPath, {force: true}).catch(() => {})
+    return 'failed'
+  }
 }
 
 type DirCheck = 'ok' | 'absent' | 'failed'
@@ -226,12 +287,29 @@ export async function listBackups(owner: string, repo: string, deps: BackupsDeps
   const {
     reposRoot = WORKSPACE_REPOS_ROOT,
     walkRunner = runAgentWalk,
-    uid,
-    gid,
+    // (F5) Default to the agent identity, NEVER root. Checked with `'uid' in deps` rather than a
+    // plain destructuring default: a caller that explicitly passes `uid: undefined` (as recover.ts
+    // always does — forwarding its OWN already-resolved uid, whatever that resolves to in a given
+    // environment) must keep that explicit choice, distinct from a caller that omits the key
+    // entirely (a bare/standalone call, e.g. from server.ts's GET /backups route, or a test) and
+    // gets the safe AGENT_UID/AGENT_GID default — a plain `= AGENT_UID` default cannot tell those
+    // two cases apart, since both present as `deps.uid === undefined`.
+    uid = 'uid' in deps ? deps.uid : AGENT_UID,
+    gid = 'gid' in deps ? deps.gid : AGENT_GID,
     walkDeadlineMs = 10_000,
     walkMaxEntries = 200_000,
     walkTimeoutMs = 15_000,
   } = deps
+  // (F5) The fallback measurement below is routed through a tracker so an unconfirmed subprocess
+  // termination sets the repo hold (via `runTrackedInvocation`) exactly like every other agent-uid
+  // walk in this codebase — `listBackups` is read-only and holds no lock itself, but the HOLD it
+  // sets is repo-scoped and still protects a concurrent mutation from racing an uncertain walker.
+  // (F4) The wrapped runner tries a plain agent-uid pathname walk first (the envelope's ancestors
+  // ARE agent-traversable in some deployments/tests), falling back to the fd-scoped sealed-tree
+  // walker only when that's incomplete/failed — exactly the scoped-access mechanism F4 introduced,
+  // reused here rather than re-implemented.
+  const tracker = createInvocationTracker({gitRunner: neverCalledGitRunner, walkRunner: withSealedFallback(walkRunner)})
+  const repoKey = repoMutexKey(owner, repo)
   const quarantineRepoDir = quarantineRepoDirFor(reposRoot, owner, repo)
 
   const dirStatus = await checkQuarantineRepoDir(reposRoot, quarantineRepoDir)
@@ -272,16 +350,25 @@ export async function listBackups(owner: string, repo: string, deps: BackupsDeps
       continue
     }
 
-    // (E4b) Missing/malformed/incomplete-at-write-time metadata: try to measure the preserved
-    // `checkout/` directly, AS THE AGENT, rather than failing closed as unknown forever.
-    const measured = await walkRunner({
-      rootPath: join(generationPath, QUARANTINE_CHECKOUT_DIR_NAME),
-      maxEntries: walkMaxEntries,
-      deadlineMs: walkDeadlineMs,
-      uid,
-      gid,
-      timeoutMs: walkTimeoutMs,
-    })
+    // (E4b/F5) Missing/malformed/incomplete-at-write-time metadata: try to measure the preserved
+    // `checkout/` directly, AS THE AGENT (falling back to the fd-scoped sealed-tree walker when a
+    // plain pathname walk can't reach it — F4), rather than failing closed as unknown forever.
+    // Routed through `runTrackedInvocation` so an unconfirmed termination anywhere in THIS walk
+    // sets the repo hold, same as every other agent-uid walk in this codebase.
+    const measured = await runTrackedInvocation(
+      repoKey,
+      tracker,
+      async () =>
+        tracker.walkRunner({
+          rootPath: join(generationPath, QUARANTINE_CHECKOUT_DIR_NAME),
+          maxEntries: walkMaxEntries,
+          deadlineMs: walkDeadlineMs,
+          uid,
+          gid,
+          timeoutMs: walkTimeoutMs,
+        }),
+      () => ({kind: 'termination-unconfirmed'}) as const,
+    )
     const measuredOk = measured.kind === 'ok' && measured.complete
     const sizeBytes = measuredOk && measured.kind === 'ok' ? measured.totalBytes : 0
     if (measuredOk) totalBytes += sizeBytes

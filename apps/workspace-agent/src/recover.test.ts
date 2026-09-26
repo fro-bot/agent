@@ -6,6 +6,7 @@
 import type {GitRunnerFn} from './git-safety.js'
 import type {ExecuteRecoveryDeps} from './recover.js'
 
+import {execFileSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {existsSync, mkdirSync, statSync} from 'node:fs'
 import {lstat, mkdir, readdir, readFile, readlink, rename, rm, symlink, writeFile} from 'node:fs/promises'
@@ -320,6 +321,10 @@ describe('previewRecovery — journal-in-progress and maintenance-hold refusals'
         phase: 'applying',
         fromSha: '0'.repeat(40),
         toSha: '1'.repeat(40),
+        startedAt: expect.any(String) as string,
+        estimatedSizeBytes: expect.any(Number) as number,
+        entryCount: expect.any(Number) as number,
+        sizeMeasurementComplete: true,
         fingerprint: expect.any(String) as string,
       },
     })
@@ -511,6 +516,55 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
           },
         )
         expect(updateResult).toMatchObject({kind: 'ready', change: 'unchanged'})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+})
+
+describe('executeRecovery -- F8: genuine split-identity ownership (root only)', {timeout: 30_000}, () => {
+  it.skipIf(process.getuid?.() !== 0)(
+    'installs the checkout owned by the REAL agent uid/gid, distinct from the root service; the quarantine envelope and its metadata stay root-owned',
+    async () => {
+      // #given -- a clean checkout, with ancestor dirs made traversable by a uid/gid OTHER than
+      // root's own (0), so the agent identity below is genuinely a different, unprivileged user --
+      // not root pretending to be the agent (the bug F8 flags in the OLD `process.getuid?.()`-for-
+      // both-sides tests).
+      await setupCleanCheckout()
+      execFileSync('chmod', ['-R', 'a+rX', reposRoot])
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'ok') throw new Error('unreachable')
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when -- confirm runs with the REAL agent identity, not root's own uid/gid
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+          recoveryDeps(fixture, {options: {uid: AGENT_UID, gid: AGENT_GID, timeoutMs: 10_000}}),
+        )
+
+        // #then
+        expect(result.kind).toBe('ok')
+        if (result.kind !== 'ok') throw new Error('unreachable')
+
+        const installedSt = statSync(destPathFor())
+        expect(installedSt.uid).toBe(AGENT_UID)
+        expect(installedSt.gid).toBe(AGENT_GID)
+
+        const envelopePath = join(
+          reposRoot,
+          WORKSPACE_STATE_DIR_NAME,
+          'quarantine',
+          `${OWNER}__${REPO}`,
+          result.recoveryId,
+        )
+        const envelopeSt = statSync(envelopePath)
+        expect(envelopeSt.uid).toBe(0)
+        expect(envelopeSt.gid).toBe(0)
+        const metadataSt = statSync(join(envelopePath, 'metadata.json'))
+        expect(metadataSt.uid).toBe(0)
+        expect(metadataSt.gid).toBe(0)
       } finally {
         await fixture.close()
       }
@@ -1283,6 +1337,181 @@ describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each ph
   })
 })
 
+describe('reconcileRecoveryJournalsOnStartup — F7: completes missing metadata even when the rename already happened', () => {
+  it('a replay whose PRIOR attempt already renamed checkout/ but crashed before writing metadata.json still writes it', async () => {
+    // #given the rename half is already done (a prior replay attempt got this far and crashed) --
+    // `checkout/` is populated, but metadata.json was never written.
+    await setupCleanCheckout()
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-f7'
+    const recoveredSha = createStagingCheckout(stagingPathFor(recoveryId))
+    const envelopePath = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`, recoveryId)
+    await mkdir(join(envelopePath, 'checkout'), {recursive: true})
+    await rename(destPathFor(), join(envelopePath, 'checkout'))
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'quarantining',
+      recoveryId,
+      targetSha: recoveredSha,
+      branch: 'main',
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    // #then — metadata.json now exists and parses; the rename was NOT re-attempted (idempotent)
+    expect(existsSync(join(envelopePath, 'metadata.json'))).toBe(true)
+    const metadata = JSON.parse(await readFile(join(envelopePath, 'metadata.json'), 'utf8')) as {source: string}
+    expect(metadata.source).toBe('reconciliation')
+    expect(existsSync(join(envelopePath, 'checkout', '.git'))).toBe(true)
+    expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(recoveredSha)
+  })
+
+  it('a replay whose PRIOR attempt already wrote VALID metadata never overwrites it (source/provenance preserved)', async () => {
+    await setupCleanCheckout()
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-f7-valid'
+    const recoveredSha = createStagingCheckout(stagingPathFor(recoveryId))
+    const envelopePath = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`, recoveryId)
+    await mkdir(join(envelopePath, 'checkout'), {recursive: true})
+    await rename(destPathFor(), join(envelopePath, 'checkout'))
+    const validMetadata = {
+      recoveryId,
+      owner: OWNER,
+      repo: REPO,
+      createdAt: new Date().toISOString(),
+      sizeBytes: 123,
+      entryCount: 4,
+      sizeComplete: true,
+      source: 'recovery',
+      originalHeadSha: 'a'.repeat(40),
+      originalBranch: 'main',
+    }
+    await writeFile(join(envelopePath, 'metadata.json'), JSON.stringify(validMetadata))
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'quarantining',
+      recoveryId,
+      targetSha: recoveredSha,
+      branch: 'main',
+      startedAt: new Date().toISOString(),
+    })
+
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    const metadata = JSON.parse(await readFile(join(envelopePath, 'metadata.json'), 'utf8')) as {
+      source: string
+      originalHeadSha: string
+    }
+    expect(metadata.source).toBe('recovery')
+    expect(metadata.originalHeadSha).toBe('a'.repeat(40))
+  })
+})
+
+describe('executeRecovery — F3: a confirmed pre-quarantine failure restores the superseded update journal', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'a confirmed build failure restores the ORIGINAL update journal, and /update then refuses needs-recovery',
+    async () => {
+      await setupCleanCheckout()
+      const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+      const updateJournal = {
+        kind: 'update' as const,
+        owner: OWNER,
+        repo: REPO,
+        phase: 'applying' as const,
+        fromSha: '0'.repeat(40),
+        toSha: '1'.repeat(40),
+        startedAt: new Date().toISOString(),
+      }
+      await writeJournal(journalsDir, updateJournal)
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'recoverable-update') throw new Error('unreachable')
+
+      const fixture = await setupNetworkFixture()
+      try {
+        const packStreamRunner = async () =>
+          ({
+            kind: 'failed',
+            reason: 'writer-failed',
+            writer: {exitCode: 1, signal: null},
+            reader: {exitCode: null, signal: null},
+          }) as const
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.update.fingerprint},
+          recoveryDeps(fixture, {packStreamRunner}),
+        )
+
+        expect(result).toEqual({kind: 'failed', reason: 'build-failed'})
+        const journal = await readJournal(journalsDir, OWNER, REPO)
+        expect(journal).toEqual({ok: true, journal: updateJournal})
+
+        const host = new URL(fixture.remoteBaseUrl).host
+        const updateResult = await executeUpdate(
+          {owner: OWNER, repo: REPO, token: fixture.token},
+          {
+            reposRoot,
+            options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+            remoteBaseUrl: fixture.remoteBaseUrl,
+            caBundlePath: fixture.caBundlePath,
+            askpassWriter: async d => writeLoopbackAskpassHelper(d, host),
+            serviceHome: checkoutHome,
+          },
+        )
+        expect(updateResult).toEqual({kind: 'refused', reason: 'needs-recovery'})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it('a crash-then-reconcile at the building phase restores the superseded update journal', async () => {
+    await mkdir(join(reposRoot, OWNER), {recursive: true})
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const updateJournal = {
+      kind: 'update' as const,
+      owner: OWNER,
+      repo: REPO,
+      phase: 'applying' as const,
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    }
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'building',
+      recoveryId: 'gen-f3',
+      targetSha: '2'.repeat(40),
+      branch: 'main',
+      startedAt: new Date().toISOString(),
+      supersededUpdate: updateJournal,
+    })
+
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    const journal = await readJournal(journalsDir, OWNER, REPO)
+    expect(journal).toEqual({ok: true, journal: updateJournal})
+  })
+})
+
 describe('executeRecovery — E2: recovers an interrupted UPDATE journal', () => {
   it.skipIf(!OPENSSL_AVAILABLE)(
     'update stuck at applying \u2192 preview shows it recoverable \u2192 recover succeeds \u2192 a follow-up /update then returns unchanged',
@@ -1308,6 +1537,10 @@ describe('executeRecovery — E2: recovers an interrupted UPDATE journal', () =>
           phase: 'applying',
           fromSha: '0'.repeat(40),
           toSha: '1'.repeat(40),
+          startedAt: expect.any(String) as string,
+          estimatedSizeBytes: expect.any(Number) as number,
+          entryCount: expect.any(Number) as number,
+          sizeMeasurementComplete: true,
           fingerprint: expect.any(String) as string,
         },
       })

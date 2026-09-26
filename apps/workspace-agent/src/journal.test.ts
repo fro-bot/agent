@@ -405,3 +405,47 @@ describe('directory safety — symlinked parent is refused, never followed', () 
     await expect(readJournal(journalsDir, 'acme', 'widgets')).rejects.toThrow(JournalDirectoryError)
   })
 })
+
+describe('RecoveryJournal.supersededUpdate (F3) \u2014 strict round trip', () => {
+  it('round-trips a recovery journal carrying the update journal it superseded', async () => {
+    // #given
+    const dir = journalsDirFor(tempRoot)
+    const superseded = makeUpdateJournal('applying')
+    const journal: RecoveryJournal = {...makeRecoveryJournal('building'), supersededUpdate: superseded}
+
+    // #when
+    await writeJournal(dir, journal)
+    const result = await readJournal(dir, 'acme', 'widgets')
+
+    // #then
+    expect(result).toEqual({ok: true, journal})
+  })
+
+  it('a recovery journal with no supersededUpdate still round-trips (the field is optional)', async () => {
+    const dir = journalsDirFor(tempRoot)
+    const journal = makeRecoveryJournal('quarantining')
+    await writeJournal(dir, journal)
+    const result = await readJournal(dir, 'acme', 'widgets')
+    expect(result).toEqual({ok: true, journal})
+  })
+
+  it('rejects a supersededUpdate missing a required field as malformed, not absent', async () => {
+    const dir = journalsDirFor(tempRoot)
+    await mkdir(dir, {recursive: true})
+    const raw = {...makeRecoveryJournal('building'), supersededUpdate: {kind: 'update', owner: 'acme'}}
+    await writeFile(join(dir, 'acme__widgets.json'), JSON.stringify(raw))
+    const result = await readJournal(dir, 'acme', 'widgets')
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toBe('malformed')
+  })
+
+  it('rejects a supersededUpdate whose own kind is not "update"', async () => {
+    const dir = journalsDirFor(tempRoot)
+    await mkdir(dir, {recursive: true})
+    const raw = {...makeRecoveryJournal('building'), supersededUpdate: {...makeRecoveryJournal('building')}}
+    await writeFile(join(dir, 'acme__widgets.json'), JSON.stringify(raw))
+    const result = await readJournal(dir, 'acme', 'widgets')
+    expect(result.ok).toBe(false)
+  })
+})

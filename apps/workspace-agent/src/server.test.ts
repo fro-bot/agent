@@ -1652,7 +1652,16 @@ describe('POST /recover/preview — result → status mapping', () => {
   it('recoverable-update → 200', async () => {
     const result: PreviewRecoveryResult = {
       kind: 'recoverable-update',
-      update: {phase: 'applying', fromSha: 'a'.repeat(40), toSha: 'b'.repeat(40), fingerprint: 'xyz'},
+      update: {
+        phase: 'applying',
+        fromSha: 'a'.repeat(40),
+        toSha: 'b'.repeat(40),
+        startedAt: '2026-09-24T00:00:00.000Z',
+        estimatedSizeBytes: 1024,
+        entryCount: 5,
+        sizeMeasurementComplete: true,
+        fingerprint: 'xyz',
+      },
     }
     const app = appWithoutAuth({previewRecoveryExecutor: makePreviewRecoveryExecutor(result)})
 

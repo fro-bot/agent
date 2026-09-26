@@ -10,7 +10,13 @@ import {join} from 'node:path'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {deleteBackup, listBackups, QUARANTINE_METADATA_FILE_NAME} from './backups.js'
 import {writeJournal} from './journal.js'
-import {markRepoHeld, repoMutexKey, resetRepoHoldsForTesting, resetRepoLocksForTesting} from './repo-mutex.js'
+import {
+  markRepoHeld,
+  repoHoldReason,
+  repoMutexKey,
+  resetRepoHoldsForTesting,
+  resetRepoLocksForTesting,
+} from './repo-mutex.js'
 import {makeTempDir} from './update-fixtures/helpers.js'
 
 let reposRoot: string
@@ -137,8 +143,10 @@ describe('listBackups — malformed and non-generation entries', () => {
     // #given
     await writeGeneration('gen-nometa', undefined)
 
-    // #when
-    const result = await listBackups('acme', 'widgets', {reposRoot})
+    // #when — (F5) uid/gid explicitly undefined: this test's temp directory ancestors are NOT
+    // actually root-owned, so the fallback walk succeeds unprivileged, exactly like before F5
+    // introduced the AGENT_UID/AGENT_GID default for bare/standalone calls.
+    const result = await listBackups('acme', 'widgets', {reposRoot, uid: undefined, gid: undefined})
 
     // #then
     expect(result.kind).toBe('ok')
@@ -194,6 +202,38 @@ describe('listBackups — malformed and non-generation entries', () => {
     // #then
     expect(result).toEqual({kind: 'failed'})
     await rm(realDir, {recursive: true, force: true})
+  })
+})
+
+describe('listBackups — F5: fallback measurement is routed through a tracker', () => {
+  it('an unconfirmed subprocess termination during the fallback walk sets the repo hold', async () => {
+    // #given a generation with no metadata (forces the fallback measurement path), and a walkRunner
+    // stub that reports termination-unconfirmed instead of a real outcome
+    await writeGeneration('gen-nometa', undefined)
+    const walkRunner = async () => ({kind: 'termination-unconfirmed' as const})
+
+    // #when
+    const result = await listBackups('acme', 'widgets', {reposRoot, walkRunner, uid: undefined, gid: undefined})
+
+    // #then — the call still returns a normal (degraded) result, but the hold is now set
+    expect(result.kind).toBe('ok')
+    expect(repoHoldReason(repoMutexKey('acme', 'widgets'))).toBe('termination-unconfirmed')
+  })
+
+  it('defaults to AGENT_UID/AGENT_GID — never root — when uid/gid are omitted entirely', async () => {
+    await writeGeneration('gen-nometa', undefined)
+    let sawUid: number | undefined
+    let sawGid: number | undefined
+    const walkRunner = async (options: {readonly uid: number | undefined; readonly gid: number | undefined}) => {
+      sawUid = options.uid
+      sawGid = options.gid
+      return {kind: 'ok' as const, totalBytes: 0, entryCount: 0, complete: true}
+    }
+
+    await listBackups('acme', 'widgets', {reposRoot, walkRunner})
+
+    expect(sawUid).toBe(10_001)
+    expect(sawGid).toBe(10_001)
   })
 })
 

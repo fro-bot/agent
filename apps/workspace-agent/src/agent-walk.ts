@@ -127,6 +127,8 @@ async function spawnWalkProcess(
   script: string,
   scriptArgs: readonly string[],
   options: {readonly uid: number | undefined; readonly gid: number | undefined; readonly timeoutMs: number},
+  /** (F4) When set, inherited by the child as fd 3 — `measureSealedTree`'s scoped-access mechanism. Opened and closed by the CALLER; never held open by this function. */
+  extraFd?: number,
 ): Promise<SpawnScriptOutcome> {
   return new Promise(resolve => {
     let settled = false
@@ -147,6 +149,7 @@ async function spawnWalkProcess(
           env: buildWalkEnv(),
           encoding: 'utf8',
           maxBuffer: 8 * 1024 * 1024,
+          ...(extraFd === undefined ? {} : {stdio: ['ignore', 'pipe', 'pipe', extraFd]}),
         },
         (error, stdout) => {
           if (settled) return
@@ -209,4 +212,56 @@ export async function runWalkScriptForTesting(
   options: {readonly uid: number | undefined; readonly gid: number | undefined; readonly timeoutMs: number},
 ): Promise<SpawnScriptOutcome> {
   return spawnWalkProcess(script, [], options)
+}
+
+/**
+ * (Review round F, F4) Self-contained walk script for the SEALED-TREE (fd-scoped) mode: identical
+ * bounded-walk logic to `WALK_SCRIPT`, but the root to walk is always `/proc/self/fd/3` \u2014 the
+ * inherited directory descriptor \u2014 never a caller-supplied pathname. This is what makes the
+ * mechanism safe: the agent-uid child never receives (and could never construct) a PATH through
+ * the root-owned, mode-0700 quarantine envelope ancestors; it only receives an ALREADY-OPEN
+ * descriptor to the one directory root chose to hand it, opened by root before the child ever
+ * starts. Linux-only (procfs `/proc/self/fd`); `measureSealedTree` checks availability first.
+ */
+const WALK_SCRIPT_FD = WALK_SCRIPT.replace(
+  'const [rootPath, maxEntriesStr, deadlineMsStr] = process.argv.slice(1);',
+  "const [maxEntriesStr, deadlineMsStr] = process.argv.slice(1); const rootPath = '/proc/self/fd/3';",
+)
+
+/**
+ * (Review round F, F4) Measures an agent-UNTRAVERSABLE tree (a quarantine envelope's `checkout/`,
+ * whose ancestors are root-owned mode 0700) by having ROOT open the directory itself and hand the
+ * agent-uid child an ALREADY-OPEN descriptor to it \u2014 never by loosening the envelope's
+ * permissions, and never by walking it in-process as root (which would reintroduce the exact
+ * symlink-race concern `runAgentWalk` exists to close). The child accesses the descriptor via
+ * `/proc/self/fd/3` (Linux procfs) since Node has no public fd-relative `readdir`/`lstat` API; on a
+ * platform without `/proc/self/fd` (macOS dev machines), this returns `{kind:'unavailable'}` and
+ * the caller's measurement stays explicitly unknown \u2014 failing closed, never assuming zero bytes.
+ * REJECTED alternative: chmod'ing the envelope open \u2014 the review explicitly ruled this out (it
+ * would let the agent traverse OTHER generations' envelopes too, not just measure this one).
+ */
+export async function measureSealedTree(options: {
+  readonly dirPath: string
+  readonly maxEntries: number
+  readonly deadlineMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+  readonly timeoutMs: number
+}): Promise<AgentWalkOutcome | {readonly kind: 'unavailable'}> {
+  if (process.platform !== 'linux') return {kind: 'unavailable'}
+  const {open} = await import('node:fs/promises')
+  let handle: Awaited<ReturnType<typeof open>>
+  try {
+    handle = await open(options.dirPath, 'r')
+  } catch {
+    return {kind: 'failed'}
+  }
+  try {
+    const scriptArgs = [String(options.maxEntries), String(options.deadlineMs)]
+    const outcome = await spawnWalkProcess(WALK_SCRIPT_FD, scriptArgs, options, handle.fd)
+    if (outcome.kind !== 'ok') return outcome
+    return parseWalkOutput(outcome.stdout)
+  } finally {
+    await handle.close()
+  }
 }

@@ -374,11 +374,22 @@ export interface OpaqueRecoveryPreview {
 
 export type RecoveryPreview = SafeRecoveryPreview | OpaqueRecoveryPreview
 
-/** An interrupted UPDATE journal reported as RECOVERABLE via `/recover`, rather than a dead-end refusal. `fingerprint` digests the journal's own identity (phase + from/to SHAs), never a live git inspection. */
+/**
+ * An interrupted UPDATE journal reported as RECOVERABLE via `/recover`, rather than a dead-end
+ * refusal. (Review round F, F6) Carries a filesystem-only (no git) size/entry-count observation of
+ * the checkout at confirm time, so the projected quota and disk-headroom checks have real evidence
+ * instead of a fixed zero. `fingerprint` digests the journal's own identity (phase, from/to SHAs,
+ * AND `startedAt` — distinguishing one interrupted-update instance from a later one at the same
+ * phase/SHAs) together with the size observation, never a live git inspection.
+ */
 export interface RecoverableUpdatePreview {
   readonly phase: UpdateJournalPhase
   readonly fromSha: string
   readonly toSha: string
+  readonly startedAt: string
+  readonly estimatedSizeBytes: number
+  readonly entryCount: number
+  readonly sizeMeasurementComplete: boolean
   readonly fingerprint: string
 }
 

@@ -17,7 +17,7 @@ import type {AgentWalkRunner} from './agent-walk.js'
 import type {QuarantineMetadata, QuarantineSource} from './backups.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions} from './git-stream.js'
-import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase} from './journal.js'
+import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase, UpdateJournal} from './journal.js'
 import type {
   DirtyCounts,
   ExecuteRecoveryRequest,
@@ -28,13 +28,13 @@ import type {
 } from './types.js'
 import type {Deadline, InvocationTracker, RemoteFailureReason} from './update.js'
 import {createHash, randomUUID} from 'node:crypto'
-import {lstat, mkdir, mkdtemp, open, realpath, rename, rm, statfs} from 'node:fs/promises'
+import {lstat, mkdir, mkdtemp, realpath, rename, rm, statfs} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {dirname, join} from 'node:path'
 import {performance} from 'node:perf_hooks'
 import process from 'node:process'
-import {runAgentWalk} from './agent-walk.js'
-import {listBackups, QUARANTINE_CHECKOUT_DIR_NAME, QUARANTINE_METADATA_FILE_NAME} from './backups.js'
+import {measureSealedTree, runAgentWalk} from './agent-walk.js'
+import {listBackups, QUARANTINE_CHECKOUT_DIR_NAME, readQuarantineMetadata, writeQuarantineMetadata} from './backups.js'
 import {checkCheckoutLayout, checkTempIndexCleanliness, inventoryCheckoutConfig} from './checkout-profile.js'
 import {HANDOFF_DEADLINE_MS, MAX_HANDOFF_ENTRIES, writeAskpassHelper} from './clone.js'
 import {
@@ -281,6 +281,26 @@ async function computeRecoveryPreviewLocked(
     // (E2) An interrupted UPDATE journal is recoverable, never a dead end — a RECOVERY journal
     // in progress still refuses outright (startup reconciliation, not a fresh /recover, owns it).
     if (journal.kind === 'update') {
+      // (F6) The checkout at its canonical path is still agent-traversable and untouched at this
+      // point (no quarantine has happened yet) — a filesystem-only walk (no git) gives real
+      // size/entry evidence for the projected quota and disk-headroom checks at confirm time,
+      // instead of the fixed `estimatedSizeBytes: 0` that used to silently defeat them. Journal
+      // INSTANCE identity (`startedAt`) is folded into the fingerprint too, so a NEW interrupted
+      // update starting at the same phase/shas (vanishingly unlikely, but not impossible for a
+      // repeatedly-failing update) is never mistaken for the one the operator actually previewed.
+      const canonicalForWalk = await resolveCanonicalCheckout(reposRoot, owner, repo)
+      const walkRootPath = canonicalForWalk.kind === 'ok' ? canonicalForWalk.path : join(reposRoot, owner, repo)
+      const walk = await walkCheckoutSize({
+        walkRunner,
+        rootPath: walkRootPath,
+        maxEntries: walkMaxEntries,
+        deadlineMs: walkDeadlineMs,
+        uid,
+        gid,
+      })
+      const estimatedSizeBytes = walk.kind === 'ok' ? walk.totalBytes : 0
+      const entryCount = walk.kind === 'ok' ? walk.entryCount : 0
+      const sizeMeasurementComplete = walk.kind === 'ok' && walk.complete
       const updateFingerprint = computeFingerprint([
         'update-recovery',
         owner,
@@ -288,10 +308,22 @@ async function computeRecoveryPreviewLocked(
         journal.phase,
         journal.fromSha,
         journal.toSha,
+        journal.startedAt,
+        estimatedSizeBytes,
+        entryCount,
       ])
       return {
         kind: 'recoverable-update',
-        update: {phase: journal.phase, fromSha: journal.fromSha, toSha: journal.toSha, fingerprint: updateFingerprint},
+        update: {
+          phase: journal.phase,
+          fromSha: journal.fromSha,
+          toSha: journal.toSha,
+          startedAt: journal.startedAt,
+          estimatedSizeBytes,
+          entryCount,
+          sizeMeasurementComplete,
+          fingerprint: updateFingerprint,
+        },
       }
     }
     return {kind: 'refused', reason: 'journal-in-progress', phase: journal.phase}
@@ -631,22 +663,44 @@ async function quarantineExistingCheckout(params: {
   } catch {
     return 'failed'
   }
+
+  // (F4) Measure BEFORE the rename, at the canonical path, where the tree is still
+  // agent-traversable and the repo lock is held — the NORMAL path, needing no scoped-fd fallback.
+  let measured: WalkOrFailOutcome = {kind: 'failed'}
+  const originalStillAtCheckoutPath = await pathExists(checkoutPath)
+  if (originalStillAtCheckoutPath) {
+    measured = await walkCheckoutSize({
+      walkRunner,
+      rootPath: checkoutPath,
+      maxEntries: walkMaxEntries,
+      deadlineMs: walkDeadlineMs,
+      uid,
+      gid,
+    })
+  }
+
   if (!(await pathExists(envelopeCheckoutPath))) {
     try {
       await rename(checkoutPath, envelopeCheckoutPath)
     } catch {
       return 'failed'
     }
+  } else if (!originalStillAtCheckoutPath && !(measured.kind === 'ok' && measured.complete)) {
+    // (F4) Legacy/replay: `checkout/` was already renamed into the envelope by a PRIOR attempt,
+    // and there was nothing left at the canonical path to measure beforehand — the envelope's own
+    // ancestors are root-owned mode 0700, blocking a plain agent-uid pathname walk, so the fd-
+    // scoped sealed-tree walker is the only remaining option.
+    const sealed = await measureSealedTree({
+      dirPath: envelopeCheckoutPath,
+      maxEntries: walkMaxEntries,
+      deadlineMs: walkDeadlineMs,
+      uid,
+      gid,
+      timeoutMs: walkDeadlineMs + WALK_TIMEOUT_BUFFER_MS,
+    })
+    if (sealed.kind === 'ok') measured = sealed
   }
 
-  const measured = await walkCheckoutSize({
-    walkRunner,
-    rootPath: envelopeCheckoutPath,
-    maxEntries: walkMaxEntries,
-    deadlineMs: walkDeadlineMs,
-    uid,
-    gid,
-  })
   const fullMetadata: QuarantineMetadata = {
     recoveryId,
     owner,
@@ -659,23 +713,10 @@ async function quarantineExistingCheckout(params: {
     ...(originalHeadSha === undefined ? {} : {originalHeadSha}),
     ...(originalBranch === undefined ? {} : {originalBranch}),
   }
-  const metadataPath = join(envelopePath, QUARANTINE_METADATA_FILE_NAME)
-  const tempPath = join(envelopePath, `.${QUARANTINE_METADATA_FILE_NAME}.tmp-${randomUUID()}`)
-  try {
-    const handle = await open(tempPath, 'wx', 0o600)
-    try {
-      await handle.writeFile(JSON.stringify(fullMetadata))
-      await handle.sync()
-    } finally {
-      await handle.close()
-    }
-    await rename(tempPath, metadataPath)
-  } catch {
-    await rm(tempPath, {force: true}).catch(() => {})
-    return 'failed'
-  }
-  return 'ok'
+  return writeQuarantineMetadata(envelopePath, fullMetadata)
 }
+
+/** Verifies an installed checkout, AS THE AGENT IDENTITY (local profile): HEAD == `sha`, attached to `branch`, and clean against a fresh temp index built from `sha`. */
 
 /** Verifies an installed checkout, AS THE AGENT IDENTITY (local profile): HEAD == `sha`, attached to `branch`, and clean against a fresh temp index built from `sha`. */
 async function verifyInstalledCheckout(params: {
@@ -763,7 +804,10 @@ async function reconcileOneRecoveryJournal(params: {
     await writeJournal(journalsDir, {kind: 'recovery', owner, repo, phase, recoveryId, targetSha, branch, startedAt})
   }
 
-  // (E7) A `building` journal means nothing durable exists yet but staging — remove it and clear.
+  // (E7/F3) A `building` journal means nothing durable exists yet but staging — remove it. The
+  // journal is RESTORED to `journal.supersededUpdate` (never merely deleted) when this recovery had
+  // taken over an interrupted update, so the update journal — and the /update needs-recovery
+  // barrier it enforces — survives a crash exactly as it survives a confirmed in-process failure.
   // If staging removal fails, the journal MUST stay (never silently clear over an unremoved leak).
   if (journal.phase === 'building') {
     try {
@@ -771,12 +815,22 @@ async function reconcileOneRecoveryJournal(params: {
     } catch {
       return 'left-in-place'
     }
-    await removeJournal(journalsDir, owner, repo)
+    await rollbackBuildJournal(journalsDir, owner, repo, journal.supersededUpdate)
     return 'cleared'
   }
 
   if (await pathExists(stagingPath)) {
-    if (!(await pathExists(envelopeCheckoutPath)) && (await pathExists(checkoutPath))) {
+    const envelopeCheckoutExists = await pathExists(envelopeCheckoutPath)
+    // (F7) Complete the quarantine — rename AND/OR metadata — whenever either half is still
+    // missing, INDEPENDENTLY of whether a prior replay already finished the rename half. A rename
+    // already done but crashing before its metadata write must not be replayed forever as
+    // "nothing to do here": `readQuarantineMetadata` distinguishes genuinely absent/malformed
+    // metadata (completed here) from valid metadata (left untouched, never re-stamped with the
+    // generic `source: 'reconciliation'`/unknown provenance this call site would otherwise write).
+    const envelopeHasValidMetadata =
+      envelopeCheckoutExists &&
+      (await readQuarantineMetadata(envelopePathFor(reposRoot, owner, repo, recoveryId))).ok === true
+    if (!envelopeHasValidMetadata && ((await pathExists(checkoutPath)) || envelopeCheckoutExists)) {
       const result = await quarantineExistingCheckout({
         reposRoot,
         owner,
@@ -960,6 +1014,26 @@ async function checkRecoveryPreflight(params: {
 }
 
 /** Every dependency `runRecoveryMutation` needs, already resolved from `ExecuteRecoveryDeps` defaults by `executeRecovery`. */
+/**
+ * (Review round F, F3) Rolls back a pre-quarantine recovery failure's journal: RESTORES
+ * `supersededUpdate` (if this recovery took over an interrupted update) rather than deleting,
+ * since the update journal, and the `/update` `needs-recovery` barrier it enforces, must survive a
+ * confirmed build/handoff failure exactly as if the recovery attempt had never started. Removes
+ * the journal outright only when there was nothing to restore.
+ */
+async function rollbackBuildJournal(
+  journalsDir: string,
+  owner: string,
+  repo: string,
+  supersededUpdate: UpdateJournal | undefined,
+): Promise<void> {
+  if (supersededUpdate === undefined) {
+    await removeJournal(journalsDir, owner, repo)
+    return
+  }
+  await writeJournal(journalsDir, supersededUpdate)
+}
+
 interface RecoveryMutationContext {
   readonly owner: string
   readonly repo: string
@@ -1045,8 +1119,13 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     if (preview.preview.fingerprint !== fingerprint) return {kind: 'refused', reason: 'checkout-changed'}
     estimatedSizeBytes = preview.preview.estimatedSizeBytes
     retention = preview.preview.retention
-  } else if (preview.kind === 'recoverable-update' && preview.update.fingerprint !== fingerprint)
-    return {kind: 'refused', reason: 'checkout-changed'}
+  } else if (preview.kind === 'recoverable-update') {
+    // (F6) Same ordering rationale as the safe path above: completeness is checked BEFORE the
+    // fingerprint, which digests the walk's own totals.
+    if (!preview.update.sizeMeasurementComplete) return {kind: 'failed', reason: 'inspection-failed'}
+    if (preview.update.fingerprint !== fingerprint) return {kind: 'refused', reason: 'checkout-changed'}
+    estimatedSizeBytes = preview.update.estimatedSizeBytes
+  }
   if (preview.kind !== 'ok') {
     // (E4) A `listBackups` failure must never fail OPEN as "zero existing generations" — refuse.
     const fresh = await listBackups(owner, repo, {reposRoot, walkRunner, uid, gid})
@@ -1069,6 +1148,17 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     statfsFn: ctx.statfsFn,
   })
   if (preflight.kind !== 'ok') return preflight
+
+  // (F3) Re-reads the journal (still under this call's repo lock — unchanged since the preview
+  // above) to capture the FULL original update journal this recovery is about to supersede, so it
+  // can be RESTORED (never merely deleted) if this recovery fails or crashes before quarantine.
+  let supersededUpdate: UpdateJournal | undefined
+  if (preview.kind === 'recoverable-update') {
+    const priorJournal = await readJournal(journalsDir, owner, repo)
+    if (priorJournal.ok === true && priorJournal.journal.kind === 'update') {
+      supersededUpdate = priorJournal.journal
+    }
+  }
 
   // (Review round D, D5) The FIRST journal write is deferred until the recovery target (branch +
   // sha) is actually known — see below, right before staging begins — so `targetSha`/`branch` are
@@ -1116,6 +1206,7 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       targetSha: target.sha,
       branch: target.branch,
       startedAt: now().toISOString(),
+      ...(supersededUpdate === undefined ? {} : {supersededUpdate}),
     })
 
     // (E7) Created EXCLUSIVELY — never silently reused — so a leftover leaf from an earlier,
@@ -1141,12 +1232,14 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       timeoutMs: ctx.buildTimeoutMs,
     })
     if (built.kind === 'failed') {
-      // (E7) A CONFIRMED (not unconfirmed) pre-quarantine failure: nothing durable exists but
-      // staging, so remove it and clear the journal. If staging removal itself fails, the journal
-      // MUST stay — never clear over an unremoved leak.
+      // (E7/F3) A CONFIRMED (not unconfirmed) pre-quarantine failure: nothing durable exists but
+      // staging, so remove it. The journal is RESTORED to the superseded update journal (never
+      // merely deleted) when this recovery took over an interrupted update — F3: the evidence, and
+      // the /update needs-recovery barrier it enforces, must survive. If staging removal itself
+      // fails, the journal MUST stay exactly as this recovery left it — never touched.
       try {
         await rm(stagingPath, {recursive: true, force: true})
-        await removeJournal(journalsDir, owner, repo)
+        await rollbackBuildJournal(journalsDir, owner, repo, supersededUpdate)
       } catch {
         // journal stays in place
       }
@@ -1167,11 +1260,11 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   // never a tracked git/pack-stream call, but it is still logically part of "the build".
   tracker.setDeadline(undefined)
   if (handoff.ok !== true) {
-    // (E7) Handoff failure is always CONFIRMED (filesystem-only lstat/lchown, no subprocess) —
-    // clean up the same way a confirmed build failure does.
+    // (E7/F3) Handoff failure is always CONFIRMED (filesystem-only lstat/lchown, no subprocess) —
+    // clean up (and restore any superseded update journal) the same way a confirmed build failure does.
     try {
       await rm(stagingPath, {recursive: true, force: true})
-      await removeJournal(journalsDir, owner, repo)
+      await rollbackBuildJournal(journalsDir, owner, repo, supersededUpdate)
     } catch {
       // journal stays in place
     }
