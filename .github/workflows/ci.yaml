@@ -310,7 +310,7 @@ jobs:
             [ "${attempt}" -eq 3 ] && { echo "docker build failed after 3 attempts"; exit 1; }
             sleep $((attempt * 15))
           done
-      - name: Smoke-test gateway image (assert config load, not module crash)
+      - name: Smoke-test gateway image (assert structured startup failure, not module crash)
         run: |
           set +e
           output="$(timeout 60s docker run --rm fro-bot-gateway:smoke 2>&1)"
@@ -324,12 +324,12 @@ jobs:
             exit 1
           fi
           test "$status" -ne 0
-          echo "$output" | grep -q "Missing required secret: DISCORD_TOKEN"
+          echo "$output" | grep -q '"msg":"gateway startup failed"'
           if echo "$output" | grep -q "ERR_MODULE_NOT_FOUND"; then
             echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
             exit 1
           fi
-          echo "OK: gateway reached config loading (DISCORD_TOKEN check), no module-resolution crash"
+          echo "OK: gateway emitted the expected structured startup failure, no module-resolution crash"
       - name: Smoke-test gateway image — announce opt-out boots past config (issue # 738)
         run: |
           set +e
