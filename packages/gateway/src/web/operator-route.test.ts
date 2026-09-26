@@ -12,7 +12,7 @@
 
 import type {Context} from 'hono'
 import {Hono} from 'hono'
-import {describe, expect, it, vi} from 'vitest'
+import {beforeAll, describe, expect, it, vi} from 'vitest'
 import {makeDirectIngressPolicy} from './ingress/policy.js'
 import {
   assertAllPrivilegedRoutesWrapped,
@@ -504,9 +504,21 @@ describe('registerOperatorRoute — auto-guard wrapping', () => {
 // ---------------------------------------------------------------------------
 
 describe('buildOperatorApp — health route is explicitly public', () => {
-  it('health route is registered as a public route, not a privileged route', async () => {
+  // Cold-importing the real server module graph (server.js + auth/session.js)
+  // can exceed the default 5s test timeout under CPU contention. Load them
+  // once here, scoped to this describe, with a generous hook timeout — the
+  // module load is setup cost, not the behavior under test.
+  let buildOperatorApp: typeof import('./server.js').buildOperatorApp
+  let createInMemorySessionStore: typeof import('./auth/session.js').createInMemorySessionStore
+
+  beforeAll(async () => {
     // #given — import the real buildOperatorApp to verify the health route classification
-    const {buildOperatorApp} = await import('./server.js')
+    ;({buildOperatorApp} = await import('./server.js'))
+    ;({createInMemorySessionStore} = await import('./auth/session.js'))
+  }, 30_000)
+
+  it('health route is registered as a public route, not a privileged route', () => {
+    // #given
     const app = buildOperatorApp(
       {
         logger: {debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined},
@@ -525,11 +537,10 @@ describe('buildOperatorApp — health route is explicitly public', () => {
     expect(isPrivilegedRoute(app, 'GET', '/operator/health')).toBe(false)
   })
 
-  it('assertAllPrivilegedRoutesWrapped passes for the real buildOperatorApp', async () => {
+  it('assertAllPrivilegedRoutesWrapped passes for the real buildOperatorApp', () => {
     // #given — include the dispatch route's optional dependencies so the real
     // production registration path mounts it before the wrapping assertion.
-    const {buildOperatorApp} = await import('./server.js')
-    const sessionStore = (await import('./auth/session.js')).createInMemorySessionStore()
+    const sessionStore = createInMemorySessionStore()
     const logger = {debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined}
     const app = buildOperatorApp(
       {

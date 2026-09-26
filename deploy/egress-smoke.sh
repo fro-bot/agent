@@ -118,10 +118,26 @@ services:
       NO_PROXY: localhost,127.0.0.1,workspace
       # Dummy token keeps the workspace-agent supervisor alive (clone-only mode).
       WORKSPACE_OPENCODE_TOKEN: dummy-egress-smoke-token
-      # The entrypoint waits for the CA at this path (named volume mount below).
-      MITMPROXY_CA_PATH: /run/mitmproxy-certs/mitmproxy-ca-cert.pem
+      # No MITMPROXY_CA_PATH override: the CA volume below is mounted at the
+      # SAME path the entrypoint now defaults to (RUNTIME_DIR=/run/workspace-agent,
+      # see deploy/workspace-entrypoint.sh step 3), now that the tmpfs below
+      # provides that path — an explicit override would silently mask a
+      # regression in the default resolving correctly.
+    # Production security posture (deploy/compose.yaml "workspace" service,
+    # exact mirror) — an egress-containment smoke that runs the workspace with
+    # MORE privilege than production doesn't prove production's containment
+    # holds under the hardened posture. Also exercises the tmpfs-nesting
+    # question (a bind-mounted volume nested under a --tmpfs-declared
+    # directory) that deploy/README.md and the isolation harness both flag as
+    # needing a real-container confirmation.
+    user: '0:0'
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /run/workspace-agent:rw,nosuid,nodev,mode=0700,uid=0,gid=0
     volumes:
-      - mitmproxy-certs:/run/mitmproxy-certs:ro
+      - mitmproxy-certs:/run/workspace-agent/mitmproxy:ro
     networks:
       - sandbox-net
     healthcheck:

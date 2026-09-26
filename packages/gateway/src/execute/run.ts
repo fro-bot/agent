@@ -232,8 +232,12 @@ export function formatTimeoutDuration(ms: number): string {
  * the workspace-agent environment is broken (`git-not-available`), a local
  * filesystem/path problem (`permission-denied` — an `EACCES` creating the
  * workspace directory, NOT a GitHub access problem; `too-many-files`;
- * `path-escaped-workspace`), a resolution bug (`head-resolution-failed`), or
- * the gateway sent a malformed request (`invalid-owner`, `invalid-repo`,
+ * `path-escaped-workspace`), a resolution bug (`head-resolution-failed`), a
+ * DETERMINISTIC post-clone ownership-handoff failure (`checkout-handoff-failed`
+ * — the same staged tree fails the same way on every retry: a hardlink, a
+ * filesystem-boundary crossing, an unsupported node type, or the handoff's own
+ * deadline/entry cap; see `apps/workspace-agent/src/handoff.ts`), or the
+ * gateway sent a malformed request (`invalid-owner`, `invalid-repo`,
  * `invalid-token-shape`, `malformed-body`, `body-too-large` — a gateway bug,
  * also operator-side).
  *
@@ -249,6 +253,12 @@ export function formatTimeoutDuration(ms: number): string {
  * case; moving to `workspace-unavailable` would send everyone hitting the
  * common transient case on a false "go check the repo" chase. Do not move
  * `clone-failed` back into this set without a way to tell the two apart.
+ *
+ * Also deliberately EXCLUDES `clone-timeout` and `too-many-files`: both stay
+ * retryable (a `git clone` timeout or an EMFILE from git itself may not recur).
+ * `checkout-handoff-failed` exists precisely so a DETERMINISTIC handoff failure
+ * is never confused with either — do not fold it back into `clone-timeout` or
+ * `too-many-files`.
  */
 const PERMANENT_CLONE_ERROR_CODES: ReadonlySet<CloneErrorCode> = new Set<CloneErrorCode>([
   'invalid-owner',
@@ -261,6 +271,7 @@ const PERMANENT_CLONE_ERROR_CODES: ReadonlySet<CloneErrorCode> = new Set<CloneEr
   'too-many-files',
   'path-escaped-workspace',
   'head-resolution-failed',
+  'checkout-handoff-failed',
 ])
 
 /**
@@ -306,6 +317,13 @@ function classifyEnsureCloneFailure(failure: EnsureCloneFailure): RunCoreErrorKi
     failure.workspaceKind === 'clone-error' &&
     PERMANENT_CLONE_ERROR_CODES.has(failure.code)
   ) {
+    return 'workspace-unavailable'
+  }
+  // A 401 means the workspace control API rejected the gateway's own bearer
+  // (WORKSPACE_OPENCODE_TOKEN) -- a stale-or-mismatched secret between the gateway and workspace
+  // images (see the auth invariant in apps/workspace-agent/AGENTS.md), not a transient
+  // reachability blip. Every other HTTP status stays 'unreachable', matching prior behavior.
+  if (failure.kind === 'workspace-failure' && failure.workspaceKind === 'http-error' && failure.status === 401) {
     return 'workspace-unavailable'
   }
   return 'unreachable'

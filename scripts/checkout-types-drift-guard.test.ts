@@ -1,8 +1,8 @@
 /**
- * Cross-package type-mirror test: mutual (two-way) assignability of the checkout-provenance
- * types duplicated between `apps/workspace-agent/src/types.ts` (producer) and
+ * Cross-package type-mirror test: mutual (two-way) assignability of the checkout-provenance and
+ * clone-error-code types duplicated between `apps/workspace-agent/src/types.ts` (producer) and
  * `packages/gateway/src/workspace-api/types.ts` (consumer): `CheckoutObservation`,
- * `CheckoutHead`, `WorktreeState`, and `CheckoutOperation`.
+ * `CheckoutHead`, `WorktreeState`, `CheckoutOperation`, and `CloneErrorCode`.
  *
  * Stronger than the existing precedent, `packages/gateway/src/workspace-api/readyz-types.test.ts`:
  * that test compares the gateway `ReadyzResponse` against a HAND-MAINTAINED LOCAL COPY of the
@@ -29,12 +29,14 @@ import type {
   CheckoutHead as AgentCheckoutHead,
   CheckoutObservation as AgentCheckoutObservation,
   CheckoutOperation as AgentCheckoutOperation,
+  CloneErrorCode as AgentCloneErrorCode,
   WorktreeState as AgentWorktreeState,
 } from '../apps/workspace-agent/src/types.js'
 import type {
   CheckoutHead as GatewayCheckoutHead,
   CheckoutObservation as GatewayCheckoutObservation,
   CheckoutOperation as GatewayCheckoutOperation,
+  CloneErrorCode as GatewayCloneErrorCode,
   WorktreeState as GatewayWorktreeState,
 } from '../packages/gateway/src/workspace-api/types.js'
 
@@ -69,11 +71,23 @@ type OperationMirrored = AssertMutuallyAssignable<GatewayCheckoutOperation, Agen
 const assertOperationMirrored: OperationMirrored = true
 assertOperationMirrored satisfies true
 
+/**
+ * `CloneErrorCode` is the `/clone` wire-error union (`apps/workspace-agent/src/types.ts`,
+ * mirrored in `packages/gateway/src/workspace-api/types.ts`). A code added to one side but not
+ * the other silently breaks either the gateway's parser (`client.ts`'s `isCloneErrorCode`, whose
+ * own `CLONE_ERROR_CODES` set has to be updated by hand and is NOT caught by this guard) or the
+ * gateway's retry classification (`PERMANENT_CLONE_ERROR_CODES`, execute/run.ts) — this guard
+ * catches only the type-level half of that drift, at compile time.
+ */
+type CloneErrorCodeMirrored = AssertMutuallyAssignable<GatewayCloneErrorCode, AgentCloneErrorCode>
+const assertCloneErrorCodeMirrored: CloneErrorCodeMirrored = true
+assertCloneErrorCodeMirrored satisfies true
+
 // ---------------------------------------------------------------------------
 // Runtime test (required by Vitest; the real guard is the compile-time check above)
 // ---------------------------------------------------------------------------
 
-describe('checkout-provenance cross-package type-mirror (CheckoutObservation, CheckoutHead, WorktreeState, CheckoutOperation)', () => {
+describe('checkout-provenance cross-package type-mirror (CheckoutObservation, CheckoutHead, WorktreeState, CheckoutOperation, CloneErrorCode)', () => {
   it('gateway and workspace-agent types are mutually assignable (compile-time guard)', () => {
     // The real assertions are the compile-time checks above — if either package's type drifts
     // from the other (a field added/removed/retyped on one side but not the other), this file
@@ -94,5 +108,13 @@ describe('checkout-provenance cross-package type-mirror (CheckoutObservation, Ch
     // #then — structurally compatible with the workspace-agent producer shape
     const asAgent: AgentCheckoutObservation = observation
     expect(asAgent.operationInProgress).toBe('am')
+  })
+
+  it('every gateway CloneErrorCode value is also a valid workspace-agent CloneErrorCode value (compile-time guard)', () => {
+    // The real assertion is the compile-time check above (CloneErrorCodeMirrored). This runtime
+    // assertion documents intent and satisfies the test runner.
+    const code: GatewayCloneErrorCode = 'checkout-handoff-failed'
+    const asAgent: AgentCloneErrorCode = code
+    expect(asAgent).toBe('checkout-handoff-failed')
   })
 })
