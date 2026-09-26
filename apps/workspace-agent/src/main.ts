@@ -214,10 +214,14 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   // logged and left in place, never blocks startup, and never exits the process — the affected
   // repository's next /update simply refuses needs-recovery, the same safe fallback a per-request
   // reconciliation would produce anyway.
+  // (C5a) Keep the losing race timer's handle so a FAST, successful reconciliation can cancel it —
+  // otherwise it keeps firing on its own schedule and logs a spurious "did not finish within the
+  // deadline" long after startup already moved on.
+  let journalReconcileTimer: ReturnType<typeof setTimeout> | undefined
   await Promise.race([
     reconcileUpdateJournalsFn({reposRoot: WORKSPACE_REPOS_ROOT, logger: opencodeLogger}),
     new Promise<void>(resolve => {
-      setTimeout(() => {
+      journalReconcileTimer = setTimeout(() => {
         opencodeLogger.error(
           'workspace-agent: startup journal reconciliation did not finish within the deadline — continuing startup regardless',
           {timeoutMs: JOURNAL_RECONCILE_TIMEOUT_MS},
@@ -225,15 +229,19 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
         resolve()
       }, JOURNAL_RECONCILE_TIMEOUT_MS)
     }),
-  ]).catch((error: unknown) => {
-    // reconcileUpdateJournalsOnStartup itself never throws (it catches internally); this guards
-    // against a bug in an INJECTED fn (tests; a future refactor) doing the same, never blocking or
-    // failing startup because of it.
-    const message = error instanceof Error ? error.message : String(error)
-    opencodeLogger.error('workspace-agent: startup journal reconciliation threw unexpectedly — continuing startup', {
-      message,
+  ])
+    .catch((error: unknown) => {
+      // reconcileUpdateJournalsOnStartup itself never throws (it catches internally); this guards
+      // against a bug in an INJECTED fn (tests; a future refactor) doing the same, never blocking or
+      // failing startup because of it.
+      const message = error instanceof Error ? error.message : String(error)
+      opencodeLogger.error('workspace-agent: startup journal reconciliation threw unexpectedly — continuing startup', {
+        message,
+      })
     })
-  })
+    .finally(() => {
+      clearTimeout(journalReconcileTimer)
+    })
 
   // Egress-proxy / CA-bundle configuration for the /update network half, read ONCE here from the
   // same env vars clone.ts already trusts for proxy (config.ts's `readUpdateNetworkConfig`'s own

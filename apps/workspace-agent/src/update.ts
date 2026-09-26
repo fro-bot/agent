@@ -283,12 +283,21 @@ async function reconcileUpdateJournal(params: {
   readonly owner: string
   readonly repo: string
   readonly destPath: string
-  readonly gitRunner: GitRunnerFn
+  readonly tracker: InvocationTracker
   readonly timeoutMs: number
   readonly uid: number | undefined
   readonly gid: number | undefined
 }): Promise<JournalReconciliation> {
-  const {journalsDir, owner, repo, destPath, gitRunner, timeoutMs, uid, gid} = params
+  const {journalsDir, owner, repo, destPath, tracker, timeoutMs, uid, gid} = params
+  const gitRunner = tracker.gitRunner
+  // (C2) Gated: a journal from THIS reconciliation must never be cleared while a subprocess this
+  // tracker saw may still be live — the caller re-checks `tracker.sawUnconfirmed()` afterward and
+  // overrides this function's own return value when that happened, but the journal itself must
+  // never be removed here regardless.
+  const clearJournal = async (): Promise<void> => {
+    if (tracker.sawUnconfirmed()) return
+    await removeJournal(journalsDir, owner, repo)
+  }
 
   const read = await readJournal(journalsDir, owner, repo)
   if (read.ok === false) {
@@ -360,7 +369,7 @@ async function reconcileUpdateJournal(params: {
       }
     }
 
-    await removeJournal(journalsDir, owner, repo)
+    await clearJournal()
     return {
       kind: 'ready',
       result: {
@@ -382,7 +391,7 @@ async function reconcileUpdateJournal(params: {
 
   // journal.phase === 'fetched': checkout untouched at H (see the plan's reconciliation table) —
   // clear and start over.
-  await removeJournal(journalsDir, owner, repo)
+  await clearJournal()
   return {kind: 'continue'}
 }
 
@@ -459,18 +468,43 @@ export async function reconcileUpdateJournalsOnStartup(deps: ReconcileUpdateJour
 
     const {owner, repo, phase} = journal
     const destPath = join(reposRoot, owner, repo)
+    const repoKey = repoMutexKey(owner, repo)
     try {
-      await withRepoLock(repoMutexKey(owner, repo), async () => {
+      await withRepoLock(repoKey, async () => {
+        // (C5b) A maintenance hold set by an earlier operation means a subprocess from THAT
+        // operation may still be live — never touch this repository's journal while held; only a
+        // process restart clears a hold (repo-mutex.ts).
+        if (repoHoldReason(repoKey) !== undefined) {
+          logger.warn('update: startup reconciliation skipping a repository under maintenance hold', {
+            owner,
+            repo,
+            phase,
+          })
+          return
+        }
+
+        // (C2) One tracker for this repository's reconciliation — any unconfirmed termination it
+        // sees, from ANY git call `reconcileUpdateJournal` makes, wins over that call's own return
+        // value: the journal must stay in place and the repository must be held.
+        const tracker = createInvocationTracker({gitRunner})
         const outcome = await reconcileUpdateJournal({
           journalsDir,
           owner,
           repo,
           destPath,
-          gitRunner,
+          tracker,
           timeoutMs,
           uid,
           gid,
         })
+        if (tracker.sawUnconfirmed()) {
+          markRepoHeld(repoKey, 'termination-unconfirmed')
+          logger.warn(
+            "update: startup reconciliation's subprocess termination could not be confirmed — holding the repository and leaving its journal in place",
+            {owner, repo, phase},
+          )
+          return
+        }
         if (outcome.kind === 'continue' || outcome.kind === 'ready') {
           logger.info('update: startup reconciliation cleared a journal', {owner, repo, phase})
           return
@@ -524,6 +558,74 @@ function createDeadline(budgetMs: number, now: () => number): Deadline {
 }
 
 // ---------------------------------------------------------------------------
+// Invocation tracker (review round C, C2/C3) — wraps the injected git runner and pack-stream
+// runner for ONE `executeUpdate` invocation (or one journal's startup reconciliation), recording
+// centrally whether ANY dispatch through it reported `termination-unconfirmed` — regardless of
+// how the immediate caller classified that outcome. Also enforces an optional active-phase
+// `Deadline` (C3): every dispatch clamps its OWN requested `timeoutMs` to `remainingMs()` at
+// dispatch time, never trusting a snapshot a multi-call helper captured once and reused.
+// ---------------------------------------------------------------------------
+
+export interface InvocationTracker {
+  readonly gitRunner: GitRunnerFn
+  readonly packStreamRunner: (options: PackStreamOptions) => Promise<PackStreamOutcome>
+  /** True once ANY dispatch through this tracker reported `termination-unconfirmed`. Sticky. */
+  readonly sawUnconfirmed: () => boolean
+  /** Installs (or clears, via `undefined`) the active phase deadline every dispatch clamps to. */
+  readonly setDeadline: (deadline: Deadline | undefined) => void
+  /** Records that this invocation's journal has reached (or passed) the `applying` phase — the point of no return for `mutationStarted` classification ('possibly' vs `false`) on an unconfirmed termination. */
+  readonly markApplyingPhase: () => void
+  readonly isApplyingPhase: () => boolean
+}
+
+export function createInvocationTracker(params: {
+  readonly gitRunner: GitRunnerFn
+  readonly packStreamRunner?: (options: PackStreamOptions) => Promise<PackStreamOutcome>
+}): InvocationTracker {
+  const {gitRunner: baseGitRunner, packStreamRunner: basePackStreamRunner = runPackStream} = params
+  let unconfirmed = false
+  let applyingPhase = false
+  let activeDeadline: Deadline | undefined
+
+  // Fresh on EVERY dispatch — never a value a caller computed once and reused across several of
+  // its own internal calls (C3).
+  const clampTimeout = (requestedTimeoutMs: number): number | 'expired' => {
+    if (activeDeadline === undefined) return requestedTimeoutMs
+    if (activeDeadline.expired()) return 'expired'
+    return Math.min(requestedTimeoutMs, activeDeadline.remainingMs())
+  }
+
+  const gitRunner: GitRunnerFn = async (args, options) => {
+    const timeoutMs = clampTimeout(options.timeoutMs)
+    if (timeoutMs === 'expired') return {kind: 'timeout'}
+    const outcome = await baseGitRunner(args, {...options, timeoutMs})
+    if (outcome.kind === 'termination-unconfirmed') unconfirmed = true
+    return outcome
+  }
+
+  const packStreamRunner = async (options: PackStreamOptions): Promise<PackStreamOutcome> => {
+    const timeoutMs = clampTimeout(options.timeoutMs)
+    if (timeoutMs === 'expired') return {kind: 'timeout'}
+    const outcome = await basePackStreamRunner({...options, timeoutMs})
+    if (outcome.kind === 'termination-unconfirmed') unconfirmed = true
+    return outcome
+  }
+
+  return {
+    gitRunner,
+    packStreamRunner,
+    sawUnconfirmed: () => unconfirmed,
+    setDeadline: deadline => {
+      activeDeadline = deadline
+    },
+    markApplyingPhase: () => {
+      applyingPhase = true
+    },
+    isApplyingPhase: () => applyingPhase,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Network + apply half (slice 2b). Every admission check above already passed by the time this is
 // reached, so any checkout reaching this function is fully eligible. See the plan's Unit 4
 // approach and the "High-Level Technical Design" sequence diagram for the flow this implements —
@@ -547,7 +649,7 @@ interface NetworkAndApplyContext {
   readonly canonicalCheckoutPath: string
   readonly head: CheckoutHead
   readonly journalsDir: string
-  readonly gitRunner: GitRunnerFn
+  readonly tracker: InvocationTracker
   readonly remoteBaseUrl: string
   readonly caBundlePath: string | undefined
   readonly proxy: {readonly https: string; readonly noProxy?: string} | undefined
@@ -556,7 +658,6 @@ interface NetworkAndApplyContext {
   readonly networkBudgetMs: number
   readonly applyTimeoutMs: number
   readonly maxPackBytes: number
-  readonly packStreamRunner: (options: PackStreamOptions) => Promise<PackStreamOutcome>
   readonly timeoutMs: number
   readonly uid: number | undefined
   readonly gid: number | undefined
@@ -629,6 +730,25 @@ async function ensureBareFetchStore(params: {
   } catch {
     return 'failed'
   }
+
+  // (Review round C, C1) `git init --bare` creates ITS OWN target directory, when absent, with a
+  // permissive default mode under the PROCESS UMASK — confirmed 0755 under the common 022 umask,
+  // never the 0700 `checkProtectedFetchDir` requires. Left to git, every update after the first
+  // would find its own store too wide and refuse `fetch-failed` forever. Create the leaf
+  // EXCLUSIVELY here instead, with an explicit mode `mkdir(2)` applies directly — an ordinary
+  // umask only ever CLEARS bits, and 0700 carries none outside the owner triad, so this is
+  // reliably 0700 regardless of the process umask — before `git init --bare` ever touches it.
+  // EEXIST is re-validated through `checkProtectedFetchDir`, never chmod'ed: a preexisting store
+  // with wider bits is refused outright. Nothing has shipped with the old, git-created-mode
+  // store, so there is no wider-mode store in the wild that needs migrating.
+  try {
+    await mkdir(fetchStorePath, {mode: 0o700})
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return 'failed'
+    const recheck = await checkProtectedFetchDir(fetchStorePath)
+    if (recheck.kind !== 'ok') return 'failed'
+  }
+
   const outcome = await gitRunner(['init', '--quiet', '--bare', '--template=', fetchStorePath], {
     cwd: parent,
     env: buildNeutralGitEnv(),
@@ -1164,7 +1284,7 @@ async function runFastForward(params: {
   readonly fromSha: string
   readonly toSha: string
   readonly branch: string
-  readonly gitRunner: GitRunnerFn
+  readonly tracker: InvocationTracker
   /** (B2) One shared apply deadline — covers every call below, not a fresh full allowance per call. */
   readonly deadline: Deadline
   readonly uid: number | undefined
@@ -1180,17 +1300,19 @@ async function runFastForward(params: {
     fromSha,
     toSha,
     branch,
-    gitRunner,
+    tracker,
     deadline,
     uid,
     gid,
     now,
   } = params
+  const gitRunner = tracker.gitRunner
 
   // Pre-merge: the checkout is still UNCHANGED (the object import is additive-only) — any failure
-  // here clears the journal and reports mutationStarted:false, never `true`.
+  // here clears the journal and reports mutationStarted:false, never `true`. Gated: never clears
+  // while `tracker` has seen an unconfirmed termination anywhere in this invocation.
   const preMergeFailed = async (): Promise<UpdateFailed> => {
-    await removeJournal(journalsDir, owner, repo)
+    if (!tracker.sawUnconfirmed()) await removeJournal(journalsDir, owner, repo)
     return {kind: 'failed', reason: 'apply-failed', mutationStarted: false, permanent: false}
   }
 
@@ -1308,7 +1430,7 @@ async function runFastForward(params: {
     startedAt: appliedAt,
     appliedAt,
   })
-  await removeJournal(journalsDir, owner, repo)
+  if (!tracker.sawUnconfirmed()) await removeJournal(journalsDir, owner, repo)
 
   return {kind: 'ready', change: 'fast-forward', branch, sha: toSha, fromSha, checkedAt: appliedAt}
 }
@@ -1328,7 +1450,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
     canonicalCheckoutPath,
     head,
     journalsDir,
-    gitRunner,
+    tracker,
     remoteBaseUrl,
     caBundlePath,
     proxy,
@@ -1337,7 +1459,6 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
     networkBudgetMs,
     applyTimeoutMs,
     maxPackBytes,
-    packStreamRunner,
     timeoutMs,
     uid,
     gid,
@@ -1346,6 +1467,15 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
     monotonicNow,
     logger,
   } = context
+  // (C2/C3) Every git/pack-stream call below goes through the tracker, never the raw runner — so
+  // termination uncertainty anywhere is recorded centrally, and the active phase deadline
+  // (installed below) clamps every dispatch to its true remaining time.
+  const gitRunner = tracker.gitRunner
+  const packStreamRunner = tracker.packStreamRunner
+  const clearJournal = async (): Promise<void> => {
+    if (tracker.sawUnconfirmed()) return
+    await removeJournal(journalsDir, owner, repo)
+  }
 
   const fetchStorePath = fetchStorePathFor(reposRoot, owner, repo)
   const storeReady = await ensureBareFetchStore({fetchStorePath, gitRunner, timeoutMs})
@@ -1381,6 +1511,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
     // (B2) One network deadline covers the WHOLE ls-remote/fetch/re-observe/retry sequence — never
     // a fresh networkBudgetMs allowance per call.
     const networkDeadline = createDeadline(networkBudgetMs, monotonicNow)
+    tracker.setDeadline(networkDeadline)
     const observed = await observeAndFetch({
       profile: networkProfile,
       remoteUrl,
@@ -1411,7 +1542,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
     // this function: "once the journal records applying, the workspace runs the mutation to
     // completion or confirmed termination regardless of the disconnect").
     if (signal?.aborted === true) {
-      await removeJournal(journalsDir, owner, repo)
+      await clearJournal()
       return {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}
     }
 
@@ -1424,19 +1555,23 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       toSha: targetSha,
       startedAt: now().toISOString(),
     })
+    // (C2) The point of no return for `mutationStarted` classification on an unconfirmed
+    // termination: from here on it is reported as 'possibly', never `false`.
+    tracker.markApplyingPhase()
 
     // (B2) One apply deadline covers EVERYTHING from here through the end of runFastForward — the
     // pack import, ancestry classification, the obstruction preflight, every pre-merge
     // re-admission re-check, the merge itself, and post-merge verification — instead of each step
     // separately consuming a fresh full applyTimeoutMs allowance.
     const applyDeadline = createDeadline(applyTimeoutMs, monotonicNow)
+    tracker.setDeadline(applyDeadline)
 
     // H may be a LOCAL commit the remote has never seen (the "ahead" case) — pack the full closure
     // of T when the bare store doesn't already have H, never a delta built against an object that
     // isn't there.
     const hKnownToBare = await shaPresentInBare(fetchStorePath, fromSha, gitRunner, applyDeadline.remainingMs())
     if (applyDeadline.expired()) {
-      await removeJournal(journalsDir, owner, repo)
+      await clearJournal()
       return {kind: 'failed', reason: 'apply-failed', mutationStarted: false, permanent: false}
     }
     const imported = await importPackObjects({
@@ -1451,7 +1586,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       gid,
     })
     if (imported.kind === 'failed') {
-      if (imported.result.reason !== 'termination-unconfirmed') await removeJournal(journalsDir, owner, repo)
+      if (imported.result.reason !== 'termination-unconfirmed') await clearJournal()
       return imported.result
     }
 
@@ -1470,7 +1605,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       // A CONCLUSIVE exit before the merge has ever launched: the checkout is still unchanged
       // (the import above is additive-only) — clear the journal rather than forcing recovery for
       // what may be a transient read failure.
-      await removeJournal(journalsDir, owner, repo)
+      await clearJournal()
       return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
     }
     if (ancestry === 'equal') {
@@ -1488,18 +1623,46 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
         gid,
         now,
       })
-      await removeJournal(journalsDir, owner, repo)
       if (reverify !== 'ok') {
+        await clearJournal()
         return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
       }
+
+      // (Review round C, C4) Re-verifying branch/HEAD/operation state is not enough on its own to
+      // report `unchanged` ready — a dirty checkout must never be reported ready just because the
+      // remote tip matches H. Fresh cleanliness against T (== H here) closes the seam where the
+      // agent could have dirtied the tree during this entire network round-trip.
+      const cleanliness = await checkTempIndexCleanliness({
+        checkoutPath: canonicalCheckoutPath,
+        headSha: targetSha,
+        gitRunner,
+        timeoutMs: applyDeadline.remainingMs(),
+        uid,
+        gid,
+      })
+      if (cleanliness.kind === 'inspection-failed') {
+        await clearJournal()
+        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+      }
+      if (cleanliness.kind === 'dirty') {
+        // No merge ran — clear the journal exactly like any other pre-merge refusal.
+        await clearJournal()
+        return {
+          kind: 'refused',
+          reason: 'dirty',
+          changedPaths: cleanliness.changedPaths.slice(0, MAX_DIRTY_SAMPLE_SIZE),
+        }
+      }
+
+      await clearJournal()
       return {kind: 'ready', change: 'unchanged', branch, sha: fromSha, checkedAt: now().toISOString()}
     }
     if (ancestry === 'ahead') {
-      await removeJournal(journalsDir, owner, repo)
+      await clearJournal()
       return {kind: 'refused', reason: 'ahead'}
     }
     if (ancestry === 'diverged') {
-      await removeJournal(journalsDir, owner, repo)
+      await clearJournal()
       return {kind: 'refused', reason: 'diverged'}
     }
 
@@ -1514,13 +1677,13 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       gid,
     })
     if (preflight.kind === 'obstructed') {
-      await removeJournal(journalsDir, owner, repo)
+      await clearJournal()
       return {kind: 'refused', reason: 'obstructed', obstructions: preflight.obstructions}
     }
     if (preflight.kind === 'inspection-failed') {
       // Same rationale as the ancestry inspection-failed case above: conclusive, pre-merge, checkout
       // still unchanged — clear the journal.
-      await removeJournal(journalsDir, owner, repo)
+      await clearJournal()
       return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
     }
 
@@ -1533,13 +1696,17 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
       fromSha,
       toSha: targetSha,
       branch,
-      gitRunner,
+      tracker,
       deadline: applyDeadline,
       uid,
       gid,
       now,
     })
   } finally {
+    // (C3) Clear the active phase deadline before any further dispatch — the ref cleanup below
+    // uses its own flat `timeoutMs`, not the apply budget, and must never be refused outright just
+    // because the apply phase itself already ran out of time.
+    tracker.setDeadline(undefined)
     await rm(askpassDir, {recursive: true, force: true}).catch(() => {})
     // (B1) Only delete the registered refs once every fetch subprocess is CONFIRMED terminated —
     // never while a termination-unconfirmed fetch may still be writing one of them. The repository
@@ -1573,7 +1740,7 @@ async function runNetworkAndApply(context: NetworkAndApplyContext): Promise<Upda
  */
 export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerDeps = {}): Promise<UpdateResult> {
   const {
-    gitRunner = runGit,
+    gitRunner: injectedGitRunner = runGit,
     reposRoot = WORKSPACE_REPOS_ROOT,
     options = {},
     now = () => new Date(),
@@ -1585,7 +1752,7 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
     applyTimeoutMs = DEFAULT_APPLY_TIMEOUT_MS,
     maxPackBytes = DEFAULT_MAX_PACK_BYTES,
     serviceHome = DEFAULT_SERVICE_HOME,
-    packStreamRunner = runPackStream,
+    packStreamRunner: injectedPackStreamRunner = runPackStream,
     signal,
     monotonicNow = () => performance.now(),
     logger = {warn: () => {}},
@@ -1597,6 +1764,13 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
   const destPath = join(reposRoot, owner, repo)
 
   return withRepoLock(repoMutexKey(owner, repo), async (): Promise<UpdateResult> => {
+    // (C2) One tracker for this WHOLE invocation — admission through the network/apply half —
+    // wraps the injected runners so termination uncertainty anywhere is recorded in one place.
+    // `gitRunner`/`packStreamRunner` below are the TRACKED versions; every admission step and
+    // `runNetworkAndApply` use these, never the raw injected ones.
+    const tracker = createInvocationTracker({gitRunner: injectedGitRunner, packStreamRunner: injectedPackStreamRunner})
+    const gitRunner = tracker.gitRunner
+
     // Step 0: the sticky maintenance hold, checked before EVERYTHING else — even journal
     // reconciliation. A held repository means some earlier operation ended with an unconfirmed
     // subprocess termination; nothing below can be trusted until a process restart clears it.
@@ -1604,128 +1778,146 @@ export async function executeUpdate(request: UpdateRequest, deps: UpdateHandlerD
       return {kind: 'refused', reason: 'maintenance-hold'}
     }
 
-    // Step 1: reconcile this repository's journal before anything else, under the mutex, so it
-    // can never race a concurrent write of the same journal.
-    const reconciliation = await reconcileUpdateJournal({
-      journalsDir,
-      owner,
-      repo,
-      destPath,
-      gitRunner,
-      timeoutMs,
-      uid,
-      gid,
-    })
-    if (reconciliation.kind !== 'continue') return reconciliation.result
+    // (C2) Every step below (through the end of the network/apply half) is wrapped in one IIFE so
+    // EVERY exit — an early admission refusal/failure just as much as `runNetworkAndApply`'s own
+    // result — funnels through the SINGLE choke point below, which overrides based on `tracker`
+    // rather than on what any individual step concluded.
+    const admissionResult = await (async (): Promise<UpdateResult> => {
+      // Step 1: reconcile this repository's journal before anything else, under the mutex, so it
+      // can never race a concurrent write of the same journal.
+      const reconciliation = await reconcileUpdateJournal({
+        journalsDir,
+        owner,
+        repo,
+        destPath,
+        tracker,
+        timeoutMs,
+        uid,
+        gid,
+      })
+      if (reconciliation.kind !== 'continue') return reconciliation.result
 
-    // Step 2: canonical-path containment, exactly as inspect.ts — reused via `inspectCheckout`,
-    // which in the same call also supplies HEAD/branch state and in-progress-operation detection
-    // (step 4 below).
-    const inspected = await inspectCheckout(
-      {owner, repo},
-      {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
-    )
-    if (inspected.response.ok === false) {
-      const {error} = inspected.response
-      if (error === 'no-checkout') return {kind: 'no-checkout'}
-      if (error === 'checkout-substituted') return {kind: 'refused', reason: 'checkout-substituted'}
-      // 'inspection-failed' | 'inspection-timeout' — a local check couldn't determine an answer.
-      return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-    }
-    const observation = inspected.response.observation
+      // Step 2: canonical-path containment, exactly as inspect.ts — reused via `inspectCheckout`,
+      // which in the same call also supplies HEAD/branch state and in-progress-operation detection
+      // (step 4 below).
+      const inspected = await inspectCheckout(
+        {owner, repo},
+        {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
+      )
+      if (inspected.response.ok === false) {
+        const {error} = inspected.response
+        if (error === 'no-checkout') return {kind: 'no-checkout'}
+        if (error === 'checkout-substituted') return {kind: 'refused', reason: 'checkout-substituted'}
+        // 'inspection-failed' | 'inspection-timeout' — a local check couldn't determine an answer.
+        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+      }
+      const observation = inspected.response.observation
 
-    // Step 3: layout.
-    const layout = await checkCheckoutLayout({checkoutPath: destPath, timeoutMs, uid, gid})
-    if (layout.kind === 'refused') return {kind: 'refused', reason: 'unsupported-layout', layoutReason: layout.reason}
-    if (layout.kind === 'inspection-failed') {
-      return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-    }
+      // Step 3: layout.
+      const layout = await checkCheckoutLayout({checkoutPath: destPath, timeoutMs, uid, gid})
+      if (layout.kind === 'refused') return {kind: 'refused', reason: 'unsupported-layout', layoutReason: layout.reason}
+      if (layout.kind === 'inspection-failed') {
+        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+      }
 
-    // Step 4: initialized submodules. Deliberately BEFORE the config allowlist (step 5): `git
-    // submodule init`/`update --init` always writes `submodule.<name>.url`/`.active` into local
-    // config, which the allowlist below refuses regardless — checking submodules first reports
-    // the more specific, more actionable `submodule-initialized` reason instead of a generic
-    // `unsupported-config` for this common case (confirmed empirically: unsetting those two keys
-    // while leaving `.git/modules/<name>` in place makes `git submodule status` itself report the
-    // submodule as no longer initialized, so the two checks are inherently coupled — ordering is
-    // what decides which refusal reason a caller actually sees).
-    const submodules = await checkNoInitializedSubmodules({checkoutPath: destPath, gitRunner, timeoutMs, uid, gid})
-    if (submodules.kind === 'refused') {
-      return {kind: 'refused', reason: 'submodule-initialized', submodules: submodules.submodules}
-    }
-    if (submodules.kind === 'inspection-failed') {
-      return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-    }
+      // Step 4: initialized submodules. Deliberately BEFORE the config allowlist (step 5): `git
+      // submodule init`/`update --init` always writes `submodule.<name>.url`/`.active` into local
+      // config, which the allowlist below refuses regardless — checking submodules first reports
+      // the more specific, more actionable `submodule-initialized` reason instead of a generic
+      // `unsupported-config` for this common case (confirmed empirically: unsetting those two keys
+      // while leaving `.git/modules/<name>` in place makes `git submodule status` itself report the
+      // submodule as no longer initialized, so the two checks are inherently coupled — ordering is
+      // what decides which refusal reason a caller actually sees).
+      const submodules = await checkNoInitializedSubmodules({checkoutPath: destPath, gitRunner, timeoutMs, uid, gid})
+      if (submodules.kind === 'refused') {
+        return {kind: 'refused', reason: 'submodule-initialized', submodules: submodules.submodules}
+      }
+      if (submodules.kind === 'inspection-failed') {
+        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+      }
 
-    // Step 5: the closed config allowlist.
-    const configInventory = await inventoryCheckoutConfig({checkoutPath: destPath, gitRunner, timeoutMs, uid, gid})
-    if (configInventory.kind === 'refused') {
-      return {kind: 'refused', reason: 'unsupported-config', disallowedKeys: configInventory.disallowedKeys}
-    }
-    if (configInventory.kind === 'inspection-failed') {
-      return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-    }
+      // Step 5: the closed config allowlist.
+      const configInventory = await inventoryCheckoutConfig({checkoutPath: destPath, gitRunner, timeoutMs, uid, gid})
+      if (configInventory.kind === 'refused') {
+        return {kind: 'refused', reason: 'unsupported-config', disallowedKeys: configInventory.disallowedKeys}
+      }
+      if (configInventory.kind === 'inspection-failed') {
+        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+      }
 
-    // Step 6: in-progress merge/rebase/am/cherry-pick/revert/bisect, from step 2's observation.
-    if (observation.operationInProgress !== 'none') {
-      return {kind: 'refused', reason: 'operation-in-progress', operation: observation.operationInProgress}
-    }
+      // Step 6: in-progress merge/rebase/am/cherry-pick/revert/bisect, from step 2's observation.
+      if (observation.operationInProgress !== 'none') {
+        return {kind: 'refused', reason: 'operation-in-progress', operation: observation.operationInProgress}
+      }
 
-    // Step 7: temp-index cleanliness against HEAD — never the checkout's own (agent-writable)
-    // persisted index.
-    const cleanliness = await checkTempIndexCleanliness({
-      checkoutPath: destPath,
-      headSha: observation.head.sha,
-      gitRunner,
-      timeoutMs,
-      uid,
-      gid,
-    })
-    if (cleanliness.kind === 'dirty') {
-      return {kind: 'refused', reason: 'dirty', changedPaths: cleanliness.changedPaths.slice(0, MAX_DIRTY_SAMPLE_SIZE)}
-    }
-    if (cleanliness.kind === 'inspection-failed') {
-      return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
-    }
+      // Step 7: temp-index cleanliness against HEAD — never the checkout's own (agent-writable)
+      // persisted index.
+      const cleanliness = await checkTempIndexCleanliness({
+        checkoutPath: destPath,
+        headSha: observation.head.sha,
+        gitRunner,
+        timeoutMs,
+        uid,
+        gid,
+      })
+      if (cleanliness.kind === 'dirty') {
+        return {
+          kind: 'refused',
+          reason: 'dirty',
+          changedPaths: cleanliness.changedPaths.slice(0, MAX_DIRTY_SAMPLE_SIZE),
+        }
+      }
+      if (cleanliness.kind === 'inspection-failed') {
+        return {kind: 'failed', reason: 'inspection-failed', mutationStarted: false, permanent: false}
+      }
 
-    // Step 8: client abort, checked once, immediately before the network/apply half would begin.
-    if (signal?.aborted === true) {
-      return {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}
-    }
+      // Step 8: client abort, checked once, immediately before the network/apply half would begin.
+      if (signal?.aborted === true) {
+        return {kind: 'failed', reason: 'aborted', mutationStarted: false, permanent: false}
+      }
 
-    // Admission passed in full — bring the checkout up to date.
-    const result = await runNetworkAndApply({
-      owner,
-      repo,
-      token: request.token,
-      reposRoot,
-      canonicalCheckoutPath: destPath,
-      head: observation.head,
-      journalsDir,
-      gitRunner,
-      remoteBaseUrl,
-      caBundlePath,
-      proxy,
-      askpassWriter,
-      serviceHome,
-      networkBudgetMs,
-      applyTimeoutMs,
-      maxPackBytes,
-      packStreamRunner,
-      timeoutMs,
-      uid,
-      gid,
-      now,
-      signal,
-      monotonicNow,
-      logger,
-    })
+      // Admission passed in full — bring the checkout up to date.
+      return runNetworkAndApply({
+        owner,
+        repo,
+        token: request.token,
+        reposRoot,
+        canonicalCheckoutPath: destPath,
+        head: observation.head,
+        journalsDir,
+        tracker,
+        remoteBaseUrl,
+        caBundlePath,
+        proxy,
+        askpassWriter,
+        serviceHome,
+        networkBudgetMs,
+        applyTimeoutMs,
+        maxPackBytes,
+        timeoutMs,
+        uid,
+        gid,
+        now,
+        signal,
+        monotonicNow,
+        logger,
+      })
+    })()
 
-    // A single choke point for the maintenance hold: every termination-unconfirmed outcome
-    // `runNetworkAndApply` can produce, at any phase, flows back through here.
-    if (result.kind === 'failed' && result.reason === 'termination-unconfirmed') {
+    // (C2) Single choke point: ANY unconfirmed termination this tracker saw, at ANY phase of this
+    // invocation — admission, journal reconciliation, or the network/apply half — wins over
+    // whatever the naive result above says. `mutationStarted` is 'possibly' once the journal has
+    // reached `applying` (`runNetworkAndApply` marks that via `tracker.markApplyingPhase()`),
+    // `false` before it.
+    if (tracker.sawUnconfirmed()) {
       markRepoHeld(repoMutexKey(owner, repo), 'termination-unconfirmed')
+      return {
+        kind: 'failed',
+        reason: 'termination-unconfirmed',
+        mutationStarted: tracker.isApplyingPhase() ? 'possibly' : false,
+        permanent: false,
+      }
     }
-    return result
+    return admissionResult
   })
 }

@@ -15,7 +15,7 @@ import type {ProxyListeningRef, ServerDeps} from './server.js'
 import http from 'node:http'
 import {Hono} from 'hono'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {SERVER_LISTEN_TIMEOUT_MS, startWorkspaceAgent} from './main.js'
+import {JOURNAL_RECONCILE_TIMEOUT_MS, SERVER_LISTEN_TIMEOUT_MS, startWorkspaceAgent} from './main.js'
 
 // ── Fake helpers ──────────────────────────────────────────────────────────────
 
@@ -781,6 +781,37 @@ describe('startWorkspaceAgent', () => {
         expect(callLog).not.toContain('runSupervisedOpencode')
       })
     })
+  })
+})
+
+describe('startWorkspaceAgent — startup journal reconciliation race timer (C5a)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('clears the losing race timer after a FAST successful reconciliation — no spurious deadline log later', async () => {
+    // #given — reconciliation resolves immediately, well inside the deadline
+    const callLog: string[] = []
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+
+    // #when
+    await startWorkspaceAgent({
+      env: fakeEnv,
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+    })
+    await vi.advanceTimersByTimeAsync(JOURNAL_RECONCILE_TIMEOUT_MS)
+
+    // #then — the deadline-timer log must never fire once reconciliation already finished
+    expect(errorSpy.mock.calls.some(call => String(call[0]).includes('did not finish within the deadline'))).toBe(false)
   })
 })
 

@@ -11,7 +11,7 @@ import type {UpdateRequest} from './types.js'
 import type {LoopbackListener} from './update-fixtures/helpers.js'
 import type {JournalReconciliationLogger, UpdateHandlerDeps} from './update.js'
 
-import {mkdir, rename, rm, symlink, writeFile} from 'node:fs/promises'
+import {chmod, mkdir, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
@@ -21,7 +21,13 @@ import {runGit} from './git-safety.js'
 import {runPackStream} from './git-stream.js'
 import {JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal, writeJournal} from './journal.js'
-import {resetRepoHoldsForTesting, resetRepoLocksForTesting} from './repo-mutex.js'
+import {
+  markRepoHeld,
+  repoHoldReason,
+  repoMutexKey,
+  resetRepoHoldsForTesting,
+  resetRepoLocksForTesting,
+} from './repo-mutex.js'
 import {bareRepoPath, startGitHttpServer, writeLoopbackAskpassHelper} from './update-fixtures/git-http-server.js'
 import {
   commitFile,
@@ -35,7 +41,7 @@ import {
   sentinelPath,
   startLoopbackListener,
 } from './update-fixtures/helpers.js'
-import {executeUpdate, reconcileUpdateJournalsOnStartup} from './update.js'
+import {createInvocationTracker, executeUpdate, reconcileUpdateJournalsOnStartup} from './update.js'
 
 const OWNER = 'acme'
 const REPO = 'widgets'
@@ -139,6 +145,78 @@ async function setupEligibleCheckout(owner = OWNER, repo = REPO): Promise<{reado
     await rm(sourceHome, {recursive: true, force: true})
   }
 }
+
+describe('createInvocationTracker (review round C, C2)', () => {
+  it('sawUnconfirmed() is false until a git dispatch reports termination-unconfirmed, then stays true', async () => {
+    const outcomes: GitRunnerFn = async () => ({kind: 'ok', stdout: '', stderr: ''})
+    let callCount = 0
+    const gitRunner: GitRunnerFn = async (args, options) => {
+      callCount += 1
+      if (callCount === 2) return {kind: 'termination-unconfirmed'}
+      return outcomes(args, options)
+    }
+    const tracker = createInvocationTracker({gitRunner})
+
+    await tracker.gitRunner([], {cwd: '/', env: {}, timeoutMs: 1000})
+    expect(tracker.sawUnconfirmed()).toBe(false)
+
+    await tracker.gitRunner([], {cwd: '/', env: {}, timeoutMs: 1000})
+    expect(tracker.sawUnconfirmed()).toBe(true)
+
+    // #and — sticky: a later confirmed 'ok' never clears it.
+    await tracker.gitRunner([], {cwd: '/', env: {}, timeoutMs: 1000})
+    expect(tracker.sawUnconfirmed()).toBe(true)
+  })
+
+  it('sawUnconfirmed() also becomes true (and stays true) from a pack-stream dispatch', async () => {
+    const tracker = createInvocationTracker({
+      gitRunner: async () => ({kind: 'ok', stdout: '', stderr: ''}),
+      packStreamRunner: async () => ({kind: 'termination-unconfirmed'}),
+    })
+    const options = {
+      writer: {command: 'git', args: [], cwd: '/', env: {}},
+      reader: {command: 'git', args: [], cwd: '/', env: {}},
+      maxBytes: 1,
+      timeoutMs: 1000,
+    }
+
+    await tracker.packStreamRunner(options)
+    expect(tracker.sawUnconfirmed()).toBe(true)
+  })
+
+  it("(C3) clamps every dispatch to the ACTIVE deadline's true remaining time — a multi-call helper reusing one stale timeoutMs snapshot cannot exceed the aggregate budget, and nothing spawns once expired", async () => {
+    // #given a fake clock advanced by the fake runner itself (simulating each dispatch consuming
+    // real wall-clock time) and a 500ms budget
+    let now = 0
+    const dispatchedTimeouts: number[] = []
+    let dispatchCount = 0
+    const gitRunner: GitRunnerFn = async (_args, options) => {
+      dispatchCount += 1
+      dispatchedTimeouts.push(options.timeoutMs)
+      now += 300
+      return {kind: 'ok', stdout: '', stderr: ''}
+    }
+    const tracker = createInvocationTracker({gitRunner})
+    const deadlineAt = now + 500
+    tracker.setDeadline({
+      remainingMs: () => Math.max(0, deadlineAt - now),
+      expired: () => now >= deadlineAt,
+    })
+
+    // #when — a "multi-call helper" that captured ONE remaining-time snapshot up front and reuses
+    // it for every one of its own calls: the exact anti-pattern C3 fixes.
+    const staleTimeoutMs = 500
+    await tracker.gitRunner([], {cwd: '/', env: {}, timeoutMs: staleTimeoutMs})
+    await tracker.gitRunner([], {cwd: '/', env: {}, timeoutMs: staleTimeoutMs})
+    const third = await tracker.gitRunner([], {cwd: '/', env: {}, timeoutMs: staleTimeoutMs})
+
+    // #then — dispatch 1 clamps to the full 500ms remaining; dispatch 2 clamps BELOW the stale
+    // snapshot to the true 200ms remaining; dispatch 3 (600ms elapsed > 500ms budget) never spawns.
+    expect(dispatchedTimeouts).toEqual([500, 200])
+    expect(dispatchCount).toBe(2)
+    expect(third).toEqual({kind: 'timeout'})
+  })
+})
 
 describe('executeUpdate — journal reconciliation', () => {
   it('refuses needs-recovery when the journal is at phase "applying" — no network profile, no remote contact', async () => {
@@ -447,6 +525,52 @@ describe('executeUpdate — ensureBareFetchStore hardening (review round B, B6)'
     const result = await executeUpdate(req(), localDeps())
 
     expect(result).toEqual({kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false})
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — fetch store leaf mode (review round C, C1)', () => {
+  it('two consecutive successful /update runs under umask 022 — the store git init creates is never too wide for the second run', async () => {
+    const fixture = await setupNetworkFixture()
+    const priorUmask = process.umask(0o022)
+    try {
+      await cloneCheckoutAtHead(fixture)
+
+      // #when — first run creates the fetch store from scratch via `ensureBareFetchStore`
+      const first = await executeUpdate(req(), networkDeps(fixture))
+      // #then — must succeed, never fetch-failed from a too-wide store
+      expect(first.kind).toBe('ready')
+
+      // #when — second run reuses the SAME store `ensureBareFetchStore` just created
+      const second = await executeUpdate(req(), networkDeps(fixture))
+      // #then — the pre-fix bug: git init's own umask-masked leaf mode failed this admission
+      expect(second).toEqual({
+        kind: 'ready',
+        change: 'unchanged',
+        branch: 'main',
+        sha: fixture.headSha,
+        checkedAt: expect.any(String) as string,
+      })
+    } finally {
+      process.umask(priorUmask)
+      await fixture.close()
+    }
+  })
+
+  it("refuses fetch-failed against a preexisting fetch-store directory wider than 0700 — never chmod'ed", async () => {
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      const fetchStorePath = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'fetch', `${OWNER}__${REPO}.git`)
+      await mkdir(fetchStorePath, {recursive: true})
+      // Explicit chmod — umask-independent — guarantees the mode regardless of the test runner's own umask.
+      await chmod(fetchStorePath, 0o755)
+
+      const result = await executeUpdate(req(), networkDeps(fixture))
+
+      expect(result).toEqual({kind: 'failed', reason: 'fetch-failed', mutationStarted: false, permanent: false})
+    } finally {
+      await fixture.close()
+    }
   })
 })
 
@@ -793,6 +917,36 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — happy path (real network 
       // #and (B7) — HEAD genuinely never moved.
       const headSha = gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()
       expect(headSha).toBe(fixture.headSha)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('(review round C, C4) a tracked file changed during the fetch seam refuses dirty, not ready, for an unchanged (ancestry-equal) result', async () => {
+    // #given a checkout at the remote tip (ancestry will classify 'equal') where the SECOND
+    // no-`--branch` porcelain status call — the C4 cleanliness re-check inside the ancestry-equal
+    // branch, since the first is executeUpdate's own admission step 7 — is forged dirty, simulating
+    // the agent dirtying the tree during the network round-trip.
+    const fixture = await setupNetworkFixture()
+    try {
+      await cloneCheckoutAtHead(fixture)
+      let cleanlinessStatusCalls = 0
+      const forgingRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('status') && args.includes('--porcelain=v2') && !args.includes('--branch')) {
+          cleanlinessStatusCalls += 1
+          if (cleanlinessStatusCalls === 2) {
+            return {kind: 'ok', stdout: '1 .M N... 100644 100644 100644 aaa bbb file.txt\0', stderr: ''}
+          }
+        }
+        return runGit(args, options)
+      }
+
+      // #when
+      const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+      // #then — refused dirty, never ready; no merge ran, so the journal is cleared.
+      expect(result).toEqual({kind: 'refused', reason: 'dirty', changedPaths: ['file.txt']})
+      expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: false, reason: 'absent'})
     } finally {
       await fixture.close()
     }
@@ -1275,6 +1429,125 @@ describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — deadlines are shared, not
   })
 })
 
+describe('executeUpdate — invocation tracker choke point, admission phase (review round C, C2d)', () => {
+  it('an unconfirmed termination during admission (before any journal exists) places a maintenance hold', async () => {
+    await setupEligibleCheckout()
+    const forgingRunner: GitRunnerFn = async (args, options) => {
+      if (args.includes('read-tree')) return {kind: 'termination-unconfirmed'}
+      return runGit(args, options)
+    }
+
+    const result = await executeUpdate(req(), localDeps({gitRunner: forgingRunner}))
+
+    expect(result).toEqual({
+      kind: 'failed',
+      reason: 'termination-unconfirmed',
+      mutationStarted: false,
+      permanent: false,
+    })
+
+    const {runner, calls} = makeGitRunnerSpy()
+    const followUp = await executeUpdate(req(), localDeps({gitRunner: runner}))
+    expect(followUp).toEqual({kind: 'refused', reason: 'maintenance-hold'})
+    expect(calls).toEqual([])
+  })
+})
+
+describe.skipIf(!OPENSSL_AVAILABLE)(
+  'executeUpdate — invocation tracker choke point, apply phase (review round C, C2a/b/c)',
+  () => {
+    it('(C2a) merge-base unconfirmed after the pack import: hold set, journal stays applying, result termination-unconfirmed', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        fixture.pushCommit('b.txt', 'two', 'c2')
+        const forgingRunner: GitRunnerFn = async (args, options) => {
+          if (args.includes('merge-base') && args.includes('--is-ancestor')) return {kind: 'termination-unconfirmed'}
+          return runGit(args, options)
+        }
+
+        const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+        expect(result).toEqual({
+          kind: 'failed',
+          reason: 'termination-unconfirmed',
+          mutationStarted: 'possibly',
+          permanent: false,
+        })
+        const journal = await readJournal(journalsDirFor(), OWNER, REPO)
+        expect(journal.ok).toBe(true)
+        expect(journal.ok === true ? journal.journal.phase : undefined).toBe('applying')
+
+        const followUp = await executeUpdate(req(), networkDeps(fixture))
+        expect(followUp).toEqual({kind: 'refused', reason: 'maintenance-hold'})
+      } finally {
+        await fixture.close()
+      }
+    })
+
+    it('(C2b) the pre-merge cleanliness re-check unconfirmed: hold set, journal stays applying, result termination-unconfirmed', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        fixture.pushCommit('b.txt', 'two', 'c2')
+        // Two `read-tree` calls happen in a normal "behind" flow: admission step 7 (against H), then
+        // runFastForward's own pre-merge re-check (against H again) — forge the SECOND.
+        let readTreeCalls = 0
+        const forgingRunner: GitRunnerFn = async (args, options) => {
+          if (args.includes('read-tree')) {
+            readTreeCalls += 1
+            if (readTreeCalls === 2) return {kind: 'termination-unconfirmed'}
+          }
+          return runGit(args, options)
+        }
+
+        const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+        expect(result).toEqual({
+          kind: 'failed',
+          reason: 'termination-unconfirmed',
+          mutationStarted: 'possibly',
+          permanent: false,
+        })
+        const journal = await readJournal(journalsDirFor(), OWNER, REPO)
+        expect(journal.ok).toBe(true)
+        expect(journal.ok === true ? journal.journal.phase : undefined).toBe('applying')
+
+        const followUp = await executeUpdate(req(), networkDeps(fixture))
+        expect(followUp).toEqual({kind: 'refused', reason: 'maintenance-hold'})
+      } finally {
+        await fixture.close()
+      }
+    })
+
+    it('(C2c) ref-cleanup update-ref unconfirmed after an otherwise successful update: hold set, result not ready', async () => {
+      const fixture = await setupNetworkFixture()
+      try {
+        await cloneCheckoutAtHead(fixture)
+        fixture.pushCommit('b.txt', 'two', 'c2')
+        const forgingRunner: GitRunnerFn = async (args, options) => {
+          if (args.includes('update-ref') && args.includes('-d')) return {kind: 'termination-unconfirmed'}
+          return runGit(args, options)
+        }
+
+        const result = await executeUpdate(req(), networkDeps(fixture, {gitRunner: forgingRunner}))
+
+        expect(result).toEqual({
+          kind: 'failed',
+          reason: 'termination-unconfirmed',
+          mutationStarted: 'possibly',
+          permanent: false,
+        })
+
+        const followUp = await executeUpdate(req(), networkDeps(fixture))
+        expect(followUp).toEqual({kind: 'refused', reason: 'maintenance-hold'})
+      } finally {
+        await fixture.close()
+      }
+    })
+  },
+)
+
 describe.skipIf(!OPENSSL_AVAILABLE)('executeUpdate — hung apply via an injectable seam', () => {
   it('a pack-stream that reports termination-unconfirmed fails possibly, leaves the journal at applying, places a maintenance hold, and a follow-up /update refuses maintenance-hold with zero git calls', async () => {
     // #given a fake packStreamRunner standing in for a hung `pack-objects | index-pack` pipe \u2014
@@ -1505,5 +1778,60 @@ describe('reconcileUpdateJournalsOnStartup', () => {
     // #given \u2014 fresh reposRoot, no journals directory ever created
     // #when / #then
     await expect(reconcileUpdateJournalsOnStartup({reposRoot, logger: silentLogger()})).resolves.toBeUndefined()
+  })
+
+  it('(C5b) skips a repository already under a maintenance hold, leaving its journal untouched with zero git calls', async () => {
+    await setupEligibleCheckout()
+    const journal = {
+      kind: 'update' as const,
+      owner: OWNER,
+      repo: REPO,
+      phase: 'fetched' as const,
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    }
+    await writeJournal(journalsDirFor(), journal)
+    markRepoHeld(repoMutexKey(OWNER, REPO), 'termination-unconfirmed')
+    const {runner, calls} = makeGitRunnerSpy()
+
+    await reconcileUpdateJournalsOnStartup({
+      reposRoot,
+      gitRunner: runner,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: silentLogger(),
+    })
+
+    expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: true, journal})
+    expect(calls).toEqual([])
+  })
+
+  it('(C5b) an unconfirmed termination during reconciliation holds the repository and leaves its journal in place', async () => {
+    const {headSha} = await setupEligibleCheckout()
+    const journal = {
+      kind: 'update' as const,
+      owner: OWNER,
+      repo: REPO,
+      phase: 'applied' as const,
+      fromSha: '0'.repeat(40),
+      toSha: headSha,
+      startedAt: new Date().toISOString(),
+      appliedAt: new Date().toISOString(),
+    }
+    await writeJournal(journalsDirFor(), journal)
+    const forgingRunner: GitRunnerFn = async (args, options) => {
+      if (args.includes('rev-parse') && args.includes('--verify')) return {kind: 'termination-unconfirmed'}
+      return runGit(args, options)
+    }
+
+    await reconcileUpdateJournalsOnStartup({
+      reposRoot,
+      gitRunner: forgingRunner,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: silentLogger(),
+    })
+
+    expect(await readJournal(journalsDirFor(), OWNER, REPO)).toEqual({ok: true, journal})
+    expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
   })
 })
