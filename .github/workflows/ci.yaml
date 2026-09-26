@@ -417,6 +417,21 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    env:
+      # Every `docker run` that starts the workspace image below must run with
+      # the SAME security posture compose.yaml gives it in production (user,
+      # capabilities, no-new-privileges, and the protected tmpfs) — a smoke
+      # test that runs with more privilege than production doesn't prove
+      # production works. Mirrors deploy/compose.yaml's `workspace` service
+      # exactly: user: "0:0", cap_drop: [ALL],
+      # cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL],
+      # security_opt: [no-new-privileges:true], and the
+      # /run/workspace-agent tmpfs (0700, root-owned).
+      WORKSPACE_DOCKER_SECURITY_FLAGS: >-
+        --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE
+        --cap-add FOWNER --cap-add SETUID --cap-add SETGID --cap-add KILL
+        --security-opt no-new-privileges:true
+        --tmpfs /run/workspace-agent:rw,nosuid,nodev,mode=0700,uid=0,gid=0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Node.js and Bun
@@ -471,6 +486,7 @@ jobs:
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
             fro-bot-workspace:smoke)"
           cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
@@ -513,8 +529,8 @@ jobs:
           # No model/provider overlay → base config stands: Systematic plugin baked,
           # NO model field (deployer supplies it), and the overlay-absent log line.
           echo "$logs" | grep -q "provider-overlay=none"
-          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c '! grep -q "\"model\"" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c '! grep -q "\"model\"" /home/opencode/.config/opencode/opencode.json'
           # The image bakes the file-watcher opt-out. Nothing else asserts it, and dropping
           # the ENV costs performance with no other signal, so pin it here.
           docker exec "$cid" sh -c '[ "$OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER" = "true" ]'
@@ -534,7 +550,8 @@ jobs:
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
-            -v /tmp/auth.json:/run/secrets/workspace_opencode_auth:ro \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
+            -v /tmp/auth.json:/run/workspace-agent/secrets/workspace_opencode_auth:ro \
             fro-bot-workspace:smoke)"
           cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
@@ -548,7 +565,7 @@ jobs:
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with auth provisioned"; exit 1; }
           echo "$logs" | grep -q "auth: provisioned"
           # auth.json written with 0600 perms; content must NOT appear in logs.
-          docker exec "$cid" sh -c 'test "$(stat -c %a /root/.local/share/opencode/auth.json)" = "600"'
+          docker exec "$cid" sh -c 'test "$(stat -c %u:%a /home/opencode/.local/share/opencode/auth.json)" = "10001:600"'
           if echo "$logs" | grep -q "sk-dummy-not-real"; then
             echo "REGRESSION: auth secret leaked into logs"; exit 1
           fi
@@ -564,7 +581,8 @@ jobs:
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
-            -v /tmp/bad-auth.json:/run/secrets/workspace_opencode_auth:ro \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
+            -v /tmp/bad-auth.json:/run/workspace-agent/secrets/workspace_opencode_auth:ro \
             fro-bot-workspace:smoke 2>&1)"
           status=$?
           set -e
@@ -584,6 +602,7 @@ jobs:
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
             -e WORKSPACE_OPENCODE_MODEL='anthropic/claude-sonnet-4-6' \
             -e 'WORKSPACE_OPENCODE_CONFIG={"autoupdate":true,"plugin":[],"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}' \
             fro-bot-workspace:smoke)"
@@ -600,10 +619,10 @@ jobs:
           echo "$logs" | grep -q "provider-overlay=applied"
           # Effective config carries the overlaid model + provider baseURL, AND the
           # hostile overlay could NOT drop the plugin or re-enable autoupdate.
-          docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /home/opencode/.config/opencode/opencode.json'
           echo "OK: overlay applied; Systematic plugin preserved + autoupdate stays pinned despite hostile overlay"
       - name: Smoke-test config validation (malformed overlay → fail fast)
         run: |
@@ -613,13 +632,14 @@ jobs:
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
             -e 'WORKSPACE_OPENCODE_CONFIG={not valid json' \
             fro-bot-workspace:smoke 2>&1)"
           status=$?
           set -e
           echo "--- output ---"; echo "$output"
           [ "$status" -ne 0 ] || { echo "REGRESSION: malformed config overlay did not fail startup"; exit 1; }
-          echo "$output" | grep -q "opencode config overlay is invalid"
+          echo "$output" | grep -q "WORKSPACE_OPENCODE_CONFIG is not valid JSON"
           echo "OK: malformed config overlay rejected at startup"
       - name: Smoke-test combined auth + model + provider overlay
         run: |
@@ -629,9 +649,10 @@ jobs:
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
             -e WORKSPACE_OPENCODE_MODEL='anthropic/claude-sonnet-4-6' \
             -e 'WORKSPACE_OPENCODE_CONFIG={"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}' \
-            -v /tmp/auth.json:/run/secrets/workspace_opencode_auth:ro \
+            -v /tmp/auth.json:/run/workspace-agent/secrets/workspace_opencode_auth:ro \
             fro-bot-workspace:smoke)"
           cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
@@ -645,11 +666,11 @@ jobs:
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with combined auth+model+overlay"; exit 1; }
           echo "$logs" | grep -q "auth: provisioned"
           echo "$logs" | grep -q "provider-overlay=applied"
-          docker exec "$cid" sh -c 'test "$(stat -c %a /root/.local/share/opencode/auth.json)" = "600"'
-          docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'test "$(stat -c %u:%a /home/opencode/.local/share/opencode/auth.json)" = "10001:600"'
+          docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /home/opencode/.config/opencode/opencode.json'
           echo "OK: combined auth + model + provider overlay — all assertions passed"
       - name: Smoke-test model-only overlay
         run: |
@@ -658,6 +679,7 @@ jobs:
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
             -e WORKSPACE_OPENCODE_MODEL='anthropic/claude-sonnet-4-6' \
             fro-bot-workspace:smoke)"
           cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
@@ -671,9 +693,9 @@ jobs:
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with model-only overlay"; exit 1; }
           echo "$logs" | grep -q "provider-overlay=none"
-          docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c '! grep -q "\"provider\"" /root/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c '! grep -q "\"provider\"" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
           echo "OK: model-only overlay — model present, no provider key, plugin preserved"
       - name: Smoke-test empty auth file (whitespace → absent, clone-only boots)
         run: |
@@ -683,7 +705,8 @@ jobs:
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
-            -v /tmp/empty-auth.json:/run/secrets/workspace_opencode_auth:ro \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
+            -v /tmp/empty-auth.json:/run/workspace-agent/secrets/workspace_opencode_auth:ro \
             fro-bot-workspace:smoke)"
           cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
@@ -696,7 +719,7 @@ jobs:
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with whitespace-only auth"; exit 1; }
           echo "$logs" | grep -q "auth: absent"
-          docker exec "$cid" sh -c '! test -f /root/.local/share/opencode/auth.json'
+          docker exec "$cid" sh -c '! test -f /home/opencode/.local/share/opencode/auth.json'
           echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
       - name: Check harness release tag URL (positive checksum path test)
         run: |
@@ -768,6 +791,19 @@ jobs:
           # entrypoint; an arbitrary container would not and the HTTPS 200 case would
           # fail for the wrong reason (TLS error, not a routing failure).
           WORKSPACE_IMAGE=fro-bot-workspace:smoke bash deploy/egress-smoke.sh
+
+      - name: Isolation acceptance harness (uid isolation security properties)
+        timeout-minutes: 15
+        run: |
+          # Every security claim the workspace uid-isolation hardening makes
+          # (apps/workspace-agent/src/identity.ts, deploy/workspace.Dockerfile,
+          # deploy/compose.yaml, deploy/workspace-entrypoint.sh,
+          # deploy/scripts/*) is proven HERE, in a real container, by actually
+          # attempting each violation and asserting it fails — Docker is not
+          # available on dev machines, so this job is the only place these
+          # claims get proven. See deploy/tests/isolation-harness.sh for the
+          # full assertion list, positive controls, and migration fixture.
+          WORKSPACE_IMAGE=fro-bot-workspace:smoke bash deploy/tests/isolation-harness.sh
 
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}

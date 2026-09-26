@@ -438,7 +438,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       logger: addProjectLogger,
     })
     const dispatchWorkflow = createWorkflowDispatcher({appClient, logger})
-    const workspaceClient = createWorkspaceClient({baseUrl: config.workspaceAgentUrl})
+    const workspaceClient = createWorkspaceClient({
+      baseUrl: config.workspaceAgentUrl,
+      token: config.workspaceOpencodeToken,
+    })
 
     const commandDeps = {
       bindingsStore,

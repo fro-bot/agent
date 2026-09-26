@@ -283,8 +283,10 @@ describe('WorkspaceClient.readyz', () => {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeClient(overrides?: {baseUrl?: string; timeoutMs?: number; inspectTimeoutMs?: number}) {
-  return createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 1000, ...overrides})
+const TEST_TOKEN = 'test-workspace-opencode-token'
+
+function makeClient(overrides?: {baseUrl?: string; timeoutMs?: number; inspectTimeoutMs?: number; token?: string}) {
+  return createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 1000, token: TEST_TOKEN, ...overrides})
 }
 
 function makeRequest(overrides?: Partial<CloneRequest>): CloneRequest {
@@ -361,9 +363,35 @@ describe('createWorkspaceClient', () => {
         'http://workspace:9100/clone',
         expect.objectContaining({
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`},
         }),
       )
+      vi.unstubAllGlobals()
+    })
+
+    it('sends the exact control-API bearer on /clone and never on /readyz', async () => {
+      // #given
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({
+        ok: true,
+        json: async () => ({ok: true, path: '/workspace/repos/testowner/testrepo', commit: 'abc123'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      await client.clone(req)
+      const cloneHeaders = (fetchMock.mock.calls[0]?.[1] as {headers?: Record<string, string>} | undefined)?.headers
+
+      fetchMock.mockResolvedValueOnce({ok: true, status: 200, json: async () => ({ready: true, opencode: 'ready'})})
+      await client.readyz()
+      const readyzInit = fetchMock.mock.calls[1]?.[1] as {headers?: Record<string, string>} | undefined
+
+      // #then — clone carries the exact bearer; readyz carries no Authorization header at all
+      expect(cloneHeaders).toEqual({'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`})
+      expect(
+        readyzInit?.headers === undefined || Object.keys(readyzInit.headers).includes('Authorization') === false,
+      ).toBe(true)
       vi.unstubAllGlobals()
     })
   })
@@ -498,6 +526,7 @@ describe('createWorkspaceClient', () => {
       'permission-denied',
       'too-many-files',
       'path-escaped-workspace',
+      'checkout-handoff-failed',
     ]
 
     for (const code of errorCodes) {
@@ -549,6 +578,43 @@ describe('createWorkspaceClient', () => {
 
       // #then
       expect(result).toEqual(err({kind: 'http-error', status: 409}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error/401 on the real server 401 response ({ok:false, error:"unauthorized"})', async () => {
+      // #given — the actual wire shape the workspace agent sends when the gateway's bearer
+      // (WORKSPACE_OPENCODE_TOKEN) is rejected. 'unauthorized' is not a CLONE_ERROR_CODE, so
+      // without a status check this would already fall through to http-error — this test pins
+      // that behavior against the real body, not just an empty one.
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'unauthorized'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error/401 even when the 401 body is a well-formed clone-error envelope (regression guard)', async () => {
+      // #given — a 401 response whose body happens to parse as a valid CloneFailure (some real
+      // CLONE_ERROR_CODE). If a future code ever collided with what the server sends on 401,
+      // body-shape-based classification would silently reclassify this as 'clone-error' instead
+      // of the auth failure it actually is. The explicit status check must win regardless of
+      // body shape.
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'clone-failed'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
       vi.unstubAllGlobals()
     })
   })
@@ -873,7 +939,11 @@ describe('WorkspaceClient.inspect', () => {
       // #then
       expect(fetchMock).toHaveBeenCalledWith(
         'http://workspace:9100/inspect',
-        expect.objectContaining({method: 'POST', body: JSON.stringify(makeInspectRequest())}),
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify(makeInspectRequest()),
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`},
+        }),
       )
       vi.unstubAllGlobals()
     })
@@ -950,6 +1020,39 @@ describe('WorkspaceClient.inspect', () => {
       expect(result).toEqual(err({kind: 'http-error', status: 502}))
       vi.unstubAllGlobals()
     })
+
+    it('returns http-error/401 on the real server 401 response ({ok:false, error:"unauthorized"})', async () => {
+      // #given — the actual wire shape the workspace agent sends when the gateway's bearer
+      // (WORKSPACE_OPENCODE_TOKEN) is rejected. 'unauthorized' is not an InspectErrorCode, so
+      // without a status check this would already fall through to http-error — this test pins
+      // that behavior against the real body, not just an empty one.
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'unauthorized'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error/401 even when the 401 body is a well-formed inspect-error envelope (regression guard)', async () => {
+      // #given — a 401 response whose body happens to parse as a valid InspectFailure (some real
+      // InspectErrorCode). The explicit status check must classify this as the auth failure it
+      // actually is, regardless of body shape.
+      const client = makeClient()
+      const fetchMock = mockFetch({ok: false, status: 401, json: async () => ({ok: false, error: 'no-checkout'})})
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.inspect(makeInspectRequest())
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 401}))
+      vi.unstubAllGlobals()
+    })
   })
 
   describe('inspect timeout budget', () => {
@@ -975,7 +1078,7 @@ describe('WorkspaceClient.inspect', () => {
       // #given — only timeoutMs (clone budget) is overridden; inspectTimeoutMs is left at its
       // own default (25s) rather than inheriting the clone value.
       const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
-      const client = createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 300_000})
+      const client = createWorkspaceClient({baseUrl: 'http://workspace:9100', timeoutMs: 300_000, token: TEST_TOKEN})
       const fetchMock = mockFetch({ok: true, json: async () => ({ok: true, observation: VALID_OBSERVATION})})
       vi.stubGlobal('fetch', fetchMock)
 

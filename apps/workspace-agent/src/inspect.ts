@@ -24,6 +24,12 @@
  *    `inspection-failed`. A missed neutralization is worse than a missing observation.
  */
 
+// GIT_SAFETY_ARGS, safeDirectoryArgs, gitInvocation, buildInspectEnv, GitRunnerOptions, GitOutcome,
+// GitRunnerFn, and the confirmed-termination `runGit` runner all now live in git-safety.ts, shared
+// with clone.ts's `repo-exists` and post-rename race-check validation (and, for `runGit` itself,
+// with clone.ts's default `gitRunner`) — see that module for the full rationale. Imported below
+// under their original local names so nothing else in this file has to change.
+import type {GitOutcome, GitRunnerFn, GitRunnerOptions} from './git-safety.js'
 import type {
   CheckoutObservation,
   CheckoutOperation,
@@ -32,10 +38,11 @@ import type {
   InspectRequest,
   InspectSuccess,
 } from './types.js'
-import {execFile} from 'node:child_process'
 import {realpath, stat} from 'node:fs/promises'
 import {join} from 'node:path'
-import process from 'node:process'
+
+import {buildNeutralGitEnv as buildInspectEnv, gitInvocation, runGit} from './git-safety.js'
+import {AGENT_GID, AGENT_UID} from './identity.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors clone.ts. */
 export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
@@ -43,148 +50,8 @@ export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 /** Default inspection timeout in milliseconds. Local-only git calls; short by design. */
 export const DEFAULT_INSPECT_TIMEOUT_MS = 10_000
 
-/**
- * Bound on waiting for a confirmed reap after SIGKILL. Mirrors the reap-grace pattern used
- * elsewhere in this repo (src/services/setup/adapters.ts) for confirmed-termination semantics.
- */
-const GIT_KILL_REAP_GRACE_MS = 2_000
-
-/**
- * Bound on buffered stdout/stderr per git invocation. `execFile` buffers both streams in
- * memory and enforces this ceiling itself (Node's default is 1 MiB, too small for `git status
- * --porcelain=v2` on a large dirty tree — a single renamed/untracked file is a full porcelain
- * line, so tens of thousands of changed files can run into several MB of output). 64 MiB
- * comfortably covers even a six-figure changed-file count while still bounding memory use per
- * inspection call.
- */
-const GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024
-
-// ---------------------------------------------------------------------------
-// Git subprocess runner \u2014 confirmed-termination timeout, no credential env.
-// ---------------------------------------------------------------------------
-
-export interface GitRunnerOptions {
-  readonly cwd: string
-  readonly env: Record<string, string>
-  readonly timeoutMs: number
-}
-
-export type GitOutcome =
-  | {readonly kind: 'ok'; readonly stdout: string; readonly stderr: string}
-  | {readonly kind: 'failed'; readonly code: number | null; readonly stdout: string; readonly stderr: string}
-  | {readonly kind: 'timeout'}
-
-export type GitRunnerFn = (args: readonly string[], options: GitRunnerOptions) => Promise<GitOutcome>
-
-/**
- * Default git runner. Uses the callback form of `execFile` (never the promisified wrapper) so we
- * retain a handle to the underlying `ChildProcess` and can CONFIRM termination on timeout: on
- * timeout we SIGKILL the child and wait for `execFile`'s callback — which Node fires only after
- * the child's stdio streams have actually closed — before resolving the timeout outcome, rather
- * than resolving as soon as `kill()` is called. `maxBuffer` is set explicitly so a pathologically
- * large `git status` output fails cleanly (mapped to a `failed` outcome) instead of throwing past
- * the caller.
- */
-export const runGit: GitRunnerFn = async (args, options) =>
-  new Promise(resolve => {
-    let settled = false
-    let timedOut = false
-    let graceHandle: ReturnType<typeof setTimeout> | undefined
-    let timeoutHandle: ReturnType<typeof setTimeout>
-
-    const child = execFile(
-      'git',
-      args,
-      {cwd: options.cwd, env: options.env, maxBuffer: GIT_MAX_BUFFER_BYTES, encoding: 'utf8'},
-      (error, stdout, stderr) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timeoutHandle)
-        clearTimeout(graceHandle)
-        if (timedOut) {
-          resolve({kind: 'timeout'})
-          return
-        }
-        if (error === null) {
-          resolve({kind: 'ok', stdout, stderr})
-          return
-        }
-        // error.code is the numeric exit code for a normal non-zero exit, or a string (e.g.
-        // 'ENOENT', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') for spawn/stream failures — including
-        // maxBuffer overflow, which we want reported as a clean `failed` outcome, not a throw
-        // that escapes the caller.
-        const code = typeof error.code === 'number' ? error.code : null
-        resolve({kind: 'failed', code, stdout, stderr})
-      },
-    )
-
-    timeoutHandle = setTimeout(() => {
-      timedOut = true
-      child.kill('SIGKILL')
-      // Grace window in case SIGKILL doesn't reap promptly (unusual, but SIGKILL delivery is not
-      // instantaneous). If the child still hasn't closed after this, resolve anyway — the caller
-      // must never hang forever — but we have genuinely waited, not just fired-and-forgotten.
-      graceHandle = setTimeout(() => {
-        if (settled) return
-        settled = true
-        resolve({kind: 'timeout'})
-      }, GIT_KILL_REAP_GRACE_MS)
-    }, options.timeoutMs)
-  })
-
-/**
- * Global git safety flags applied to EVERY inspection invocation.
- *
- * - `--no-optional-locks`: makes `git status` skip the opportunistic write of the refreshed
- *   stat-cache back to `.git/index`. This is the specific mechanism that keeps `status` read-only
- *   \u2014 without it, `git status` silently rewrites the index on disk even though it reports no
- *   changes were made.
- * - `--no-pager`: git never spawns `core.pager` for our non-interactive output.
- * - `-c core.fsmonitor=false`: neutralizes an agent-writable `.git/config` that could otherwise
- *   configure `core.fsmonitor` to execute an arbitrary command on every `status` call.
- * - `-c core.hooksPath=/dev/null`: points hook lookup at a location that can never contain
- *   executable hook scripts, defense-in-depth against a config-injected hooks path.
- * - `-c core.pager=cat`: defense-in-depth alongside `--no-pager` (config could otherwise re-enable
- *   paging for a subcommand that ignores the global flag).
- * - `-c credential.helper=`: disables any operator-side credential helper; inspection never needs
- *   credentials and must never be handed any.
- *
- * `filter.<name>.clean`/`.smudge`/`.process` drivers are NOT in this fixed list because the set of
- * configured names isn't fixed \u2014 they're enumerated and neutralized per call via env overrides;
- * see enumerateFilterDrivers()/buildFilterNeutralizationEnv() below.
- */
-const GIT_SAFETY_ARGS: readonly string[] = [
-  '--no-optional-locks',
-  '--no-pager',
-  '-c',
-  'core.fsmonitor=false',
-  '-c',
-  'core.hooksPath=/dev/null',
-  '-c',
-  'core.pager=cat',
-  '-c',
-  'credential.helper=',
-]
-
-function gitInvocation(cwd: string, subArgs: readonly string[]): readonly string[] {
-  return ['-C', cwd, ...GIT_SAFETY_ARGS, ...subArgs]
-}
-
-/**
- * Minimal git subprocess environment. Deliberately does NOT include GITHUB_TOKEN, proxy
- * variables, or any credential material \u2014 inspection is local-only and needs no network access.
- */
-function buildInspectEnv(): Record<string, string> {
-  return {
-    GIT_TERMINAL_PROMPT: '0',
-    GIT_TRACE: '0',
-    GIT_TRACE_PACKET: '0',
-    GIT_TRACE_PERFORMANCE: '0',
-    GIT_CURL_VERBOSE: '0',
-    HOME: process.env.HOME ?? '/root',
-    PATH: process.env.PATH ?? '/usr/bin:/bin',
-  }
-}
+export type {GitOutcome, GitRunnerFn, GitRunnerOptions}
+export {runGit}
 
 // ---------------------------------------------------------------------------
 // Filter-driver enumeration and neutralization — closes the vector where `git status` runs
@@ -240,11 +107,15 @@ async function enumerateFilterDrivers(
   env: Record<string, string>,
   gitRunner: GitRunnerFn,
   timeoutMs: number,
+  uid: number | undefined,
+  gid: number | undefined,
 ): Promise<FilterEnumerationOutcome> {
-  const outcome = await gitRunner(gitInvocation(cwd, ['config', '-z', '--get-regexp', String.raw`^filter\.`]), {
+  const outcome = await gitRunner(gitInvocation(cwd, cwd, ['config', '-z', '--get-regexp', String.raw`^filter\.`]), {
     cwd,
     env,
     timeoutMs,
+    uid,
+    gid,
   })
   if (outcome.kind === 'ok') return {kind: 'ok', drivers: parseFilterDriverNames(outcome.stdout)}
   if (outcome.kind === 'failed' && outcome.code === 1 && outcome.stdout.length === 0) {
@@ -423,7 +294,19 @@ export interface InspectHandlerDeps {
   /** Workspace repos root. Defaults to WORKSPACE_REPOS_ROOT. */
   readonly reposRoot?: string
   /** Inspection options. */
-  readonly options?: {readonly timeoutMs?: number}
+  readonly options?: {
+    readonly timeoutMs?: number
+    /**
+     * Unprivileged uid every git invocation runs as. Defaults to AGENT_UID (identity.ts) —
+     * production wiring never needs to override this. Injectable ONLY so local tests (this
+     * machine is not root; switching to an arbitrary uid fails) can pass the CURRENT process's
+     * own uid instead — see inspect.test.ts for exactly how and why that doesn't weaken the
+     * code path under test.
+     */
+    readonly uid?: number
+    /** Unprivileged gid every git invocation runs as. Defaults to AGENT_GID (identity.ts). */
+    readonly gid?: number
+  }
   /** Injected clock for testability. Defaults to `() => new Date()`. */
   readonly clock?: () => Date
 }
@@ -456,7 +339,7 @@ export async function inspectCheckout(
   deps: InspectHandlerDeps = {},
 ): Promise<InspectHandlerResult> {
   const {gitRunner = runGit, reposRoot = WORKSPACE_REPOS_ROOT, options = {}, clock = () => new Date()} = deps
-  const {timeoutMs = DEFAULT_INSPECT_TIMEOUT_MS} = options
+  const {timeoutMs = DEFAULT_INSPECT_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const {owner, repo} = request
 
   // Resolve the repos root itself first, so the substitution check below compares against the
@@ -490,15 +373,20 @@ export async function inspectCheckout(
   const env = buildInspectEnv()
 
   const topOutcome = await gitRunner(
-    gitInvocation(canonicalResolved, ['rev-parse', '--show-toplevel', '--absolute-git-dir']),
+    gitInvocation(canonicalResolved, canonicalResolved, ['rev-parse', '--show-toplevel', '--absolute-git-dir']),
     {
       cwd: canonicalResolved,
       env,
       timeoutMs,
+      uid,
+      gid,
     },
   )
 
   if (topOutcome.kind === 'timeout') return failure('inspection-timeout', 504)
+  // Unconfirmed termination must never be reported as the clean, confirmed timeout above — it
+  // does not claim the process actually stopped (module header invariant #5).
+  if (topOutcome.kind === 'termination-unconfirmed') return failure('inspection-failed', 500)
   if (topOutcome.kind === 'failed') return failure('no-checkout', 404)
 
   const topLines = topOutcome.stdout.trim().split('\n')
@@ -526,7 +414,7 @@ export async function inspectCheckout(
   // Fail closed: enumerate every configured filter driver before `status` ever runs. If this
   // fails, times out, or returns something unparseable, `status` must never be invoked \u2014 an
   // inspection that might execute a planted command is worse than one reporting nothing.
-  const filterEnumeration = await enumerateFilterDrivers(canonicalResolved, env, gitRunner, timeoutMs)
+  const filterEnumeration = await enumerateFilterDrivers(canonicalResolved, env, gitRunner, timeoutMs, uid, gid)
   if (filterEnumeration.kind === 'failed') return failure('inspection-failed', 500)
 
   const statusEnv: Record<string, string> = {...env, ...buildFilterNeutralizationEnv(filterEnumeration.drivers)}
@@ -534,17 +422,25 @@ export async function inspectCheckout(
   // `--ignore-submodules=all`: a submodule has its own config/attributes, which the enumeration
   // above does not (and cannot, without recursing) cover, and `status.submoduleSummary` can spawn
   // additional work on top. This means the dirty counts below no longer reflect submodule
-  // changes \u2014 see the module header and the report for the trade-off.
+  // changes -- see the module header and the report for the trade-off.
   const statusOutcome = await gitRunner(
-    gitInvocation(canonicalResolved, ['status', '--porcelain=v2', '--branch', '--ignore-submodules=all']),
+    gitInvocation(canonicalResolved, canonicalResolved, [
+      'status',
+      '--porcelain=v2',
+      '--branch',
+      '--ignore-submodules=all',
+    ]),
     {
       cwd: canonicalResolved,
+      uid,
+      gid,
       env: statusEnv,
       timeoutMs,
     },
   )
 
   if (statusOutcome.kind === 'timeout') return failure('inspection-timeout', 504)
+  if (statusOutcome.kind === 'termination-unconfirmed') return failure('inspection-failed', 500)
   if (statusOutcome.kind === 'failed') return failure('inspection-failed', 500)
 
   const parsed = parsePorcelainV2(statusOutcome.stdout)

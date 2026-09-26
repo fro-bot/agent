@@ -16,6 +16,9 @@ import type {
   ReadyzResponse,
 } from './types.js'
 
+import {Buffer} from 'node:buffer'
+import {timingSafeEqual} from 'node:crypto'
+
 import {Hono} from 'hono'
 import {executeClone, scrubCredentials} from './clone.js'
 import {inspectCheckout} from './inspect.js'
@@ -23,6 +26,9 @@ import {sanitizeOwner, sanitizeRepo, validateTokenShape} from './sanitize.js'
 
 /** Maximum allowed request body size in bytes. */
 const MAX_BODY_BYTES = 4096
+
+/** Fixed 401 body for a missing/wrong-scheme/wrong control-API bearer. Never echoes the presented header. */
+const UNAUTHORIZED_BODY = {ok: false, error: 'unauthorized'} as const
 
 /** Simplified clone executor signature for dependency injection. */
 export type CloneExecutorFn = (request: CloneRequest, deps?: CloneHandlerDeps) => Promise<CloneHandlerResult>
@@ -67,16 +73,66 @@ export interface ServerDeps {
    * When absent, /readyz falls back to the opencode-only check (legacy/clone-only mode).
    */
   readonly proxyListening?: ProxyListeningRef
+  /**
+   * Required control-API auth mode — every caller must state it explicitly, so an
+   * unauthenticated control API can never be built by omission.
+   *
+   * `{kind: 'bearer', token}`: every route except `/healthz` and `/readyz` requires
+   * `Authorization: Bearer <token>`, checked before any body parsing, JSON parsing, or route
+   * logic — a missing, wrong-scheme, or wrong token gets a fixed 401 body. Comparison is
+   * constant-time (`timingSafeEqual`, length-guarded). The presented header value is never
+   * logged. `token` must be non-empty (whitespace-only is also rejected).
+   *
+   * `{kind: 'disabled-for-tests'}`: no auth middleware is installed. Test-only — production
+   * wiring in `main.ts` always passes the `bearer` variant, sourced from the
+   * `WORKSPACE_OPENCODE_TOKEN` secret.
+   */
+  readonly auth: {readonly kind: 'bearer'; readonly token: string} | {readonly kind: 'disabled-for-tests'}
 }
 
 /**
  * Create the Hono application.
  *
- * @param deps - Optional dependency overrides for testing.
+ * @param deps - Dependency overrides. `deps.auth` is required — every caller must state
+ *   whether the control API is protected (`bearer`) or intentionally open (`disabled-for-tests`).
  */
-export function createApp(deps: ServerDeps = {}): Hono {
-  const {cloneExecutor = executeClone, inspectExecutor = inspectCheckout, opencodeStatus, proxyListening} = deps
+export function createApp(deps: ServerDeps): Hono {
+  const {cloneExecutor = executeClone, inspectExecutor = inspectCheckout, opencodeStatus, proxyListening, auth} = deps
   const app = new Hono()
+
+  // Control-API bearer check — every route except /healthz and /readyz. Registered before any
+  // route so it runs (and can short-circuit with 401) before body parsing, JSON parsing, or
+  // owner/repo validation. Constant-time comparison; the presented header is never logged.
+  // See ServerDeps.auth above and the reuse rationale in opencode-proxy.ts.
+  if (auth.kind === 'bearer') {
+    const {token} = auth
+    // An empty expected token would authenticate `Authorization: Bearer ` with nothing after it.
+    if (token.trim() === '') {
+      throw new Error('createApp: control-API token must not be empty')
+    }
+    const expectedBuf = Buffer.from(token)
+    app.use('*', async (c, next) => {
+      if (c.req.path === '/healthz' || c.req.path === '/readyz') {
+        return next()
+      }
+
+      const authHeader = c.req.header('authorization')
+      let authorized = false
+      if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+        const presentedBuf = Buffer.from(authHeader.slice('Bearer '.length))
+        // Guard length before timingSafeEqual (requires same-length buffers).
+        if (presentedBuf.length === expectedBuf.length) {
+          authorized = timingSafeEqual(presentedBuf, expectedBuf)
+        }
+      }
+
+      if (authorized === false) {
+        return c.json(UNAUTHORIZED_BODY, 401)
+      }
+
+      return next()
+    })
+  }
 
   // GET /healthz — liveness probe (always 200; clone-only signal)
   app.get('/healthz', c => {

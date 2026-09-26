@@ -197,6 +197,33 @@ The `workspace-repos` named volume is created automatically by Docker Compose on
 
 Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. Empty files mean "secret not set", which is the same as the file being absent — the gateway treats both as opt-out.
 
+### Workspace uid isolation (one-time checkout ownership migration)
+
+The workspace container's OpenCode process — and every tool it spawns — now runs as a fixed unprivileged uid (`10001`, account `opencode`), not root. The workspace-agent **service** itself still starts as root (uid 0) with a reduced Linux capability set (see `compose.yaml`: `cap_drop: [ALL]`, `cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]`) so it can set up protected directories and drop OpenCode's own privilege before it ever touches a cloned repo.
+
+**What this means for an existing deployment:** repo checkouts cloned before this change are root-owned on the `workspace-repos` volume. On the first boot after upgrading, the entrypoint walks each `owner/repo` checkout and hands ownership to uid `10001` — filesystem-only (no `git` invocations), symlink-safe, and hardlink-safe (see `deploy/scripts/migrate-repo-ownership.mjs`). The parent directories (`/workspace/repos`, `/workspace/repos/<owner>`) and the migration's own state directory stay root-owned; only the checkout directories themselves move.
+
+- **Runs automatically at container start** — no manual step required. It is resumable and idempotent: each checkout is marked complete only after it fully migrates, so a restart mid-migration safely resumes rather than re-doing (or skipping) finished work.
+- **Precondition: only one workspace container may use the `workspace-repos` volume during the upgrade.** Two containers migrating the same volume concurrently is unsupported — stop any other workspace container attached to the volume before upgrading.
+- **How long it takes:** proportional to the number and size of existing checkouts. It is bounded by a deadline, default **5 minutes**, configurable via `WORKSPACE_MIGRATION_DEADLINE_MS` (milliseconds) in `deploy/.env`. If the deadline is hit, the container refuses to start rather than launching OpenCode against a partially-migrated, mixed-ownership tree — restart the container to resume from where it left off. The `workspace` healthcheck's `start_period` (360s) is sized to cover the default deadline plus boot overhead; raise both together if you widen the deadline for a very large `workspace-repos` volume.
+- **New deployments** have nothing to migrate — checkouts are created directly under the agent uid, and this step is a fast no-op.
+- **Migration failure:** the container refuses to start if any checkout can't be fully migrated (an owner directory that's a symlink, not a real directory, not root-owned, unreadable, or foreign-filesystem; or a nested mount inside a checkout). The log names every offending path and what to do about it. Fix each path, then restart — checkouts that already migrated cleanly keep their completion marker and are not redone.
+- **Rollback:** after migration every checkout is owned by uid `10001`; a previous image's workspace container runs `git` as root, and root refuses to operate on a repo it doesn't own (git calls this "dubious ownership" — verified against real git with `GIT_TEST_ASSUME_DIFFERENT_OWNER=1 git status`, which exits 128 with `fatal: detected dubious ownership in repository at ...`). Before rolling back, chown the `<owner>/<repo>` checkout trees back to root — **never** the `/workspace/repos` root, `/workspace/repos/<owner>` directories, or the `.workspace-agent` state dir:
+
+  ```sh
+  # Run against the workspace-repos volume, e.g. via a throwaway container with it mounted at /workspace/repos.
+  for owner in /workspace/repos/*/; do
+    [ "$(basename "$owner")" = ".workspace-agent" ] && continue
+    for repo in "$owner"*/; do
+      chown -hR 0:0 "$repo"  # -h: change symlinks themselves, never their targets
+    done
+  done
+  ```
+
+- **Leftover `.tmp-*` dirs:** partial clones from the pre-migration clone path are never migrated or deleted automatically — the migration only warns and names them in the log. They are safe to remove manually once you've confirmed they're not in use.
+
+**Where the secret mounts moved:** `workspace-opencode-token`, `workspace-opencode-auth`, and the mitmproxy CA volume are now mounted under a protected, root-only path inside the container (`/run/workspace-agent/secrets/…` and `/run/workspace-agent/mitmproxy`, a `tmpfs` reset on every container start) instead of the old top-level `/run/secrets/…` and `/run/mitmproxy-certs`, which any uid in the container could read. **The host-side secret files themselves are unchanged** — `deploy/secrets/workspace-opencode-token` and `deploy/secrets/workspace-opencode-auth` keep the same names and locations; only the in-container mount destination moved. No operator action is needed for this beyond pulling the updated image.
+
 ### Current optional secrets
 
 | Secret file | Purpose | When added |
@@ -417,6 +444,8 @@ The raw OpenCode SDK server binds to loopback (`127.0.0.1:54321`) only and is ne
 
 The workspace image builds the workspace agent and bakes the OpenCode CLI, so the container serves repo clones and hosts an OpenCode server. `deploy/secrets/workspace-opencode-token` is required (the bearer proxy and the gateway share it).
 
+The workspace control API (`/clone`, `/inspect` on :9100) now requires this same bearer, not just the :9200 OpenCode proxy — so the gateway and workspace images must always be upgraded and rolled back together. If the two images disagree on the token (e.g. a gateway rollback against a newer workspace image, or vice versa), every clone request gets rejected with HTTP 401 and surfaces to users as `workspace-unavailable`.
+
 #### Harness OpenCode binary
 
 The workspace runs the **harness build** of OpenCode — the patched binary published to [fro-bot/agent releases](https://github.com/fro-bot/agent/releases), not the stock `anomalyco/opencode` build. The harness binary carries session, plugin, and compaction fixes that apply to the mention-loop execution path.
@@ -525,7 +554,7 @@ The stack uses two named Docker volumes that survive container recreation and da
 | Volume | Mounted at | Contents |
 | --- | --- | --- |
 | `workspace-repos` | `/workspace/repos` (workspace service) | Cloned repository checkouts |
-| `mitmproxy-certs` | `/home/mitmproxy/.mitmproxy` (mitmproxy) and `/run/mitmproxy-certs` (workspace, gateway) | mitmproxy CA certificate |
+| `mitmproxy-certs` | `/home/mitmproxy/.mitmproxy` (mitmproxy), `/run/workspace-agent/mitmproxy` (workspace), `/etc/ssl/certs` (gateway) | mitmproxy CA certificate |
 
 **Safe operations** — these preserve both volumes:
 

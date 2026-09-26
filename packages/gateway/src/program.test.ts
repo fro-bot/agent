@@ -6,7 +6,7 @@ import type {CoordinationLogger} from './runtime-effect.js'
 
 import {GatewayIntentBits} from 'discord.js'
 import {Effect} from 'effect'
-import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest'
 import {makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
 import {parseTrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 
@@ -2019,69 +2019,78 @@ describe('launch route wiring — POST /operator/runs', () => {
       })
   }
 
-  it('registers POST /operator/runs when production deps are fed to buildOperatorApp', async () => {
-    // #given — capture the production-shaped operator deps from the program
-    const serverDeps = await captureOperatorServerDeps()
+  // Cold-importing the real server module graph can exceed the default 5s test
+  // timeout under load, so load it once here with its own hook timeout.
+  // buildOperatorApp has no module-level state, and vi.mock is hoisted, so one
+  // shared import still sees this file's mocks.
+  describe('buildOperatorApp registration — POST /operator/runs', () => {
+    let buildOperatorApp: typeof import('./web/server.js').buildOperatorApp
 
-    // #when — feed those deps to buildOperatorApp with matching githubOAuth config
-    // (production deps include githubOAuth, so config must also include it)
-    const {buildOperatorApp} = await import('./web/server.js')
-    const app = buildOperatorApp(serverDeps, {
-      bindHost: '127.0.0.1',
-      bindPort: 0,
-      publicOrigin: 'https://operator.example.com',
-      ingressPolicy: makeOperatorWebConfig().ingressPolicy,
-      githubOAuth: {
-        clientId: 'test-oauth-client-id',
-        clientSecret: 'test-oauth-client-secret',
+    beforeAll(async () => {
+      ;({buildOperatorApp} = await import('./web/server.js'))
+    }, 30_000)
+
+    it('registers POST /operator/runs when production deps are fed to buildOperatorApp', async () => {
+      // #given — capture the production-shaped operator deps from the program
+      const serverDeps = await captureOperatorServerDeps()
+
+      // #when — feed those deps to buildOperatorApp with matching githubOAuth config
+      // (production deps include githubOAuth, so config must also include it)
+      const app = buildOperatorApp(serverDeps, {
+        bindHost: '127.0.0.1',
+        bindPort: 0,
         publicOrigin: 'https://operator.example.com',
-        callbackPath: '/operator/auth/github/callback',
-        allowedReturnPaths: ['/operator'],
-        stateTtlMs: 600_000,
-        maxOutstandingAttemptsPerKey: 5,
-      },
+        ingressPolicy: makeOperatorWebConfig().ingressPolicy,
+        githubOAuth: {
+          clientId: 'test-oauth-client-id',
+          clientSecret: 'test-oauth-client-secret',
+          publicOrigin: 'https://operator.example.com',
+          callbackPath: '/operator/auth/github/callback',
+          allowedReturnPaths: ['/operator'],
+          stateTtlMs: 600_000,
+          maxOutstandingAttemptsPerKey: 5,
+        },
+      })
+
+      // #then — POST /operator/runs is present (the launch route is mounted)
+      expect(extractRoutes(app)).toContainEqual({method: 'POST', path: '/operator/runs'})
     })
 
-    // #then — POST /operator/runs is present (the launch route is mounted)
-    expect(extractRoutes(app)).toContainEqual({method: 'POST', path: '/operator/runs'})
-  })
+    it('omits POST /operator/runs when getBindingByRepo is dropped from production deps', async () => {
+      // #given — production deps with getBindingByRepo removed
+      // Drop githubOAuth from deps too so buildOperatorApp doesn't throw on partial OAuth config
+      const serverDeps = await captureOperatorServerDeps()
+      const depsWithoutGetBindingByRepo = {...serverDeps, getBindingByRepo: undefined, githubOAuth: undefined}
 
-  it('omits POST /operator/runs when getBindingByRepo is dropped from production deps', async () => {
-    // #given — production deps with getBindingByRepo removed
-    // Drop githubOAuth from deps too so buildOperatorApp doesn't throw on partial OAuth config
-    const serverDeps = await captureOperatorServerDeps()
-    const depsWithoutGetBindingByRepo = {...serverDeps, getBindingByRepo: undefined, githubOAuth: undefined}
+      // #when
+      const app = buildOperatorApp(depsWithoutGetBindingByRepo, {
+        bindHost: '127.0.0.1',
+        bindPort: 0,
+        publicOrigin: 'https://operator.example.com',
+        ingressPolicy: makeOperatorWebConfig().ingressPolicy,
+      })
 
-    // #when
-    const {buildOperatorApp} = await import('./web/server.js')
-    const app = buildOperatorApp(depsWithoutGetBindingByRepo, {
-      bindHost: '127.0.0.1',
-      bindPort: 0,
-      publicOrigin: 'https://operator.example.com',
-      ingressPolicy: makeOperatorWebConfig().ingressPolicy,
+      // #then — launch route is absent when getBindingByRepo is missing
+      expect(extractRoutes(app)).not.toContainEqual({method: 'POST', path: '/operator/runs'})
     })
 
-    // #then — launch route is absent when getBindingByRepo is missing
-    expect(extractRoutes(app)).not.toContainEqual({method: 'POST', path: '/operator/runs'})
-  })
+    it('omits POST /operator/runs when launchWorkDeps is dropped from production deps', async () => {
+      // #given — production deps with launchWorkDeps removed
+      // Drop githubOAuth from deps too so buildOperatorApp doesn't throw on partial OAuth config
+      const serverDeps = await captureOperatorServerDeps()
+      const depsWithoutLaunchWorkDeps = {...serverDeps, launchWorkDeps: undefined, githubOAuth: undefined}
 
-  it('omits POST /operator/runs when launchWorkDeps is dropped from production deps', async () => {
-    // #given — production deps with launchWorkDeps removed
-    // Drop githubOAuth from deps too so buildOperatorApp doesn't throw on partial OAuth config
-    const serverDeps = await captureOperatorServerDeps()
-    const depsWithoutLaunchWorkDeps = {...serverDeps, launchWorkDeps: undefined, githubOAuth: undefined}
+      // #when
+      const app = buildOperatorApp(depsWithoutLaunchWorkDeps, {
+        bindHost: '127.0.0.1',
+        bindPort: 0,
+        publicOrigin: 'https://operator.example.com',
+        ingressPolicy: makeOperatorWebConfig().ingressPolicy,
+      })
 
-    // #when
-    const {buildOperatorApp} = await import('./web/server.js')
-    const app = buildOperatorApp(depsWithoutLaunchWorkDeps, {
-      bindHost: '127.0.0.1',
-      bindPort: 0,
-      publicOrigin: 'https://operator.example.com',
-      ingressPolicy: makeOperatorWebConfig().ingressPolicy,
+      // #then — launch route is absent when launchWorkDeps is missing
+      expect(extractRoutes(app)).not.toContainEqual({method: 'POST', path: '/operator/runs'})
     })
-
-    // #then — launch route is absent when launchWorkDeps is missing
-    expect(extractRoutes(app)).not.toContainEqual({method: 'POST', path: '/operator/runs'})
   })
 
   it('discord mention path still receives RunMentionDeps with the same engine deps shape', async () => {

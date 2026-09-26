@@ -53,6 +53,17 @@ export type CloneErrorCode =
   | 'path-escaped-workspace'
   | 'head-resolution-failed'
   | 'overloaded'
+  /**
+   * The post-clone ownership handoff (handoff.ts) failed — a deterministic failure: the same
+   * staged tree fails the same way on every retry (a hardlink, a filesystem-boundary crossing,
+   * an unsupported node type, or the handoff's own deadline/entry cap). Never `clone-timeout`
+   * (reserved for `git clone` itself timing out) and never `too-many-files` (reserved for an
+   * EMFILE from git) — those are gateway-classified as transient/operator-environment issues,
+   * not "this repository can never be handed off". The specific reason
+   * (`'hardlink' | 'foreign-filesystem' | 'unsupported-entry' | 'deadline-exceeded' | 'max-entries'`,
+   * see handoff.ts `HandoffFailureReason`) is carried in `CloneFailure.code`.
+   */
+  | 'checkout-handoff-failed'
 
 /** POST /inspect request body. */
 export interface InspectRequest {

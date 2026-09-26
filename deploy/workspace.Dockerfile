@@ -121,14 +121,50 @@ WORKDIR /app
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
 ARG OPENCODE_VERSION=1.18.30+harness.7c479429
-ARG SYSTEMATIC_VERSION=3.20.0
+ARG SYSTEMATIC_VERSION=3.21.0
 
 # System packages:
 #   git            — clone.ts runs `git clone` via execFile
 #   ca-certificates — entrypoint runs update-ca-certificates to trust the mitmproxy CA
 #   libgcc/libstdc++/ripgrep — required by the opencode musl binary (matches OpenCode's own image)
 #   curl           — fetch the opencode binary at build time
-RUN apk add --no-cache git ca-certificates libgcc libstdc++ ripgrep curl
+#   setpriv        — drops privilege to the opencode agent uid for OpenCode's
+#                    own credential/config provisioning (see workspace-entrypoint.sh).
+#                    Alpine's setpriv ships as part of util-linux and supports
+#                    --reuid/--regid/--clear-groups directly, so no /etc/passwd
+#                    lookup is required for the numeric uid/gid switch and no
+#                    root supplementary group can survive the drop — see the
+#                    entrypoint for the full choice rationale (setpriv vs.
+#                    su-exec vs. runuser).
+RUN apk add --no-cache git ca-certificates libgcc libstdc++ ripgrep curl setpriv
+
+# ── Unprivileged OpenCode agent account ─────────────────────────────────────
+# The workspace-agent SERVICE stays uid 0 (reduced capabilities only — see
+# compose.yaml). OpenCode itself — and everything it spawns as tools — runs as
+# this fixed, shared, no-login uid/gid so a compromised OpenCode/tool process
+# cannot read the service's secrets or write the service's git config.
+# uid/gid 10001 and the account name are a contract shared with the workspace
+# agent's spawn code (apps/workspace-agent/src) — do not renumber casually.
+RUN addgroup -g 10001 opencode \
+    && adduser -D -H -u 10001 -G opencode -s /sbin/nologin -h /home/opencode opencode
+
+# Agent home + XDG roots, owned by the agent, mode 0700 (no other uid — not
+# even root's own reads via `docker exec` as a different user — can browse
+# into it). OpenCode's own writes here (auth.json, opencode.json, cache,
+# session state) happen as uid 10001 — see the entrypoint's provisioning step.
+RUN mkdir -p /home/opencode/.local/share /home/opencode/.config /home/opencode/.cache /home/opencode/.local/state \
+    && chown -R opencode:opencode /home/opencode \
+    && chmod 0700 /home/opencode /home/opencode/.local /home/opencode/.local/share /home/opencode/.config \
+        /home/opencode/.cache /home/opencode/.local/state
+
+# The service's OWN home (root's HOME) is deliberately NOT /root and NOT
+# /home/opencode — a distinct, root-only path so nothing the service itself
+# writes under $HOME (e.g. global git config) lands somewhere the agent uid
+# can read or tamper with, and vice versa.
+RUN mkdir -p /var/lib/workspace-agent/home \
+    && chown 0:0 /var/lib/workspace-agent/home \
+    && chmod 0700 /var/lib/workspace-agent/home
+ENV HOME=/var/lib/workspace-agent/home
 
 # Bake the OpenCode CLI from the fro-bot/agent harness release.
 #
@@ -206,9 +242,18 @@ ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
 # WORKSPACE_OPENCODE_CONFIG so a deployer selects the provider/baseURL (e.g.
 # cliproxyapi) and model, mirroring the action's `model` + `opencode-config`
 # inputs. Only the mention-loop agent uses the plugin; clone does not.
-RUN mkdir -p /root/.config/opencode \
+#
+# Baked to a trusted, root-owned, world-readable (not writable) path OUTSIDE
+# any per-uid home — NOT /root/.config, which is the service's own home and
+# not a path the agent-uid provisioning step should ever need write access
+# near. The entrypoint's agent-uid subprocess reads this file (world-readable
+# is sufficient — no write access is needed) and writes the merged result to
+# the agent's own $XDG_CONFIG_HOME.
+RUN mkdir -p /usr/local/share/fro-bot \
     && printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "autoupdate": false,\n  "plugin": ["@fro.bot/systematic@%s"]\n}\n' "${SYSTEMATIC_VERSION}" \
-      > /root/.config/opencode/opencode.json
+      > /usr/local/share/fro-bot/opencode.base.json \
+    && chown 0:0 /usr/local/share/fro-bot/opencode.base.json \
+    && chmod 0644 /usr/local/share/fro-bot/opencode.base.json
 
 # Production node_modules + bundled entrypoint (mirror gateway.Dockerfile layout).
 COPY --from=build /workspace/node_modules ./node_modules
@@ -216,15 +261,32 @@ COPY --from=build /workspace/apps/workspace-agent/package.json ./apps/workspace-
 COPY --from=build /workspace/apps/workspace-agent/dist/ ./apps/workspace-agent/dist/
 
 # Clone target root (clone.ts writes to /workspace/repos/{owner}/{repo}).
-RUN mkdir -p /workspace/repos
+# Root-owned, 0755, on purpose: only the per-repo checkout directories beneath
+# it are handed to the agent uid, and only by the entrypoint's one-time
+# migration for pre-existing volumes (deploy/scripts/migrate-repo-ownership.mjs)
+# or by the workspace-agent's own clone path — never this parent directory.
+RUN mkdir -p /workspace/repos \
+    && chown 0:0 /workspace/repos \
+    && chmod 0755 /workspace/repos
 
 # CA-trust entrypoint (trusts the mitmproxy CA before launching the supervisor).
 COPY deploy/workspace-entrypoint.sh /usr/local/bin/workspace-entrypoint.sh
 RUN chmod 755 /usr/local/bin/workspace-entrypoint.sh
 
-# Extracted validator/merger helpers (used by workspace-entrypoint.sh).
-COPY deploy/scripts/validate-auth.mjs deploy/scripts/merge-config.mjs /usr/local/lib/workspace-scripts/
+# Extracted validator/merger/provisioning helpers (used by
+# workspace-entrypoint.sh). Root-owned, not writable by the agent uid — these
+# run partly as root (validation, migration) and partly as the agent uid
+# (config/auth provisioning), but neither identity may ever modify them.
+COPY deploy/scripts/validate-auth.mjs deploy/scripts/merge-config.mjs \
+     deploy/scripts/ensure-protected-dir.mjs deploy/scripts/migrate-repo-ownership.mjs \
+     deploy/scripts/provision-agent-config.mjs /usr/local/lib/workspace-scripts/
 
 WORKDIR /app/apps/workspace-agent
+
+# Explicit and documented: the service itself always starts as root so it can
+# create/validate the protected directories, install the mitmproxy CA,
+# migrate legacy checkout ownership, and read root-only secret mounts. It
+# drops OpenCode itself to uid 10001 before exec — see workspace-entrypoint.sh.
+USER 0:0
 
 ENTRYPOINT ["/usr/local/bin/workspace-entrypoint.sh"]
