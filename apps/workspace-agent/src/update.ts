@@ -543,13 +543,13 @@ export async function reconcileUpdateJournalsOnStartup(deps: ReconcileUpdateJour
 // point of no return (e.g. a spawned fast-forward merge) — see runFastForward's own comment.
 // ---------------------------------------------------------------------------
 
-interface Deadline {
+export interface Deadline {
   /** Milliseconds remaining, floored at 0 — never negative. */
   readonly remainingMs: () => number
   readonly expired: () => boolean
 }
 
-function createDeadline(budgetMs: number, now: () => number): Deadline {
+export function createDeadline(budgetMs: number, now: () => number): Deadline {
   const deadlineAt = now() + budgetMs
   return {
     remainingMs: () => Math.max(0, deadlineAt - now()),
@@ -668,7 +668,7 @@ interface NetworkAndApplyContext {
 }
 
 /** `<reposRoot>/.workspace-agent/<FETCH_STORE_DIR_NAME>/<owner>__<repo>.git` — matches identity.ts's documented fetch-store naming (the same `<owner>__<repo>` pairing journal.ts uses), a single flat, root-owned directory rather than a per-owner tree needing its own symlink-safety chain. */
-function fetchStorePathFor(reposRoot: string, owner: string, repo: string): string {
+export function fetchStorePathFor(reposRoot: string, owner: string, repo: string): string {
   return join(reposRoot, WORKSPACE_STATE_DIR_NAME, FETCH_STORE_DIR_NAME, `${owner}__${repo}.git`)
 }
 
@@ -710,7 +710,7 @@ async function checkProtectedFetchDir(path: string): Promise<ProtectedDirCheck> 
  * malformed-content parsing journal.ts's checks exist for. `git init --template=` (empty) so a
  * freshly created store never gets git's own sample-hooks template copied into it.
  */
-async function ensureBareFetchStore(params: {
+export async function ensureBareFetchStore(params: {
   readonly fetchStorePath: string
   readonly gitRunner: GitRunnerFn
   readonly timeoutMs: number
@@ -824,12 +824,12 @@ function classifyRemoteFailure(
 // scope.
 // ---------------------------------------------------------------------------
 
-interface RemoteObservation {
+export interface RemoteObservation {
   readonly branch: string
   readonly sha: string
 }
 
-type ObserveOutcome =
+export type ObserveOutcome =
   | {readonly kind: 'ok'; readonly observation: RemoteObservation}
   | {readonly kind: 'failed'; readonly reason: RemoteFailureReason; readonly permanent: boolean}
   | {readonly kind: 'timeout'}
@@ -852,7 +852,7 @@ function classifyTimeoutOrAbort(signal: AbortSignal | undefined): 'aborted' | 't
 }
 
 /** Runs `ls-remote --symref <remoteUrl> HEAD` and parses the remote's default branch name and current tip SHA. */
-async function observeRemoteDefaultBranch(
+export async function observeRemoteDefaultBranch(
   profile: GitProfile,
   remoteUrl: string,
   gitRunner: GitRunnerFn,
@@ -879,7 +879,7 @@ async function observeRemoteDefaultBranch(
   return {kind: 'ok', observation: {branch: branchMatch[1], sha: shaMatch[1]}}
 }
 
-type FetchIntoRefOutcome =
+export type FetchIntoRefOutcome =
   | {readonly kind: 'ok'}
   | {readonly kind: 'failed'; readonly reason: RemoteFailureReason; readonly permanent: boolean}
   | {readonly kind: 'timeout'}
@@ -888,7 +888,7 @@ type FetchIntoRefOutcome =
   | {readonly kind: 'unconfirmed'}
 
 /** Runs `fetch <remoteUrl> <refspec>` — `refspec` may be `<branch>:<localRef>` (creates/updates `localRef`) or a bare SHA (fetches the object without creating a ref; requires the remote to allow SHA1-in-want, exactly as GitHub does). */
-async function fetchIntoRef(
+export async function fetchIntoRef(
   profile: GitProfile,
   remoteUrl: string,
   refspec: string,

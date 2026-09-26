@@ -4,17 +4,37 @@
  */
 
 import type {GitRunnerFn} from './git-safety.js'
+import type {ExecuteRecoveryDeps} from './recover.js'
 
-import {mkdir, rename, rm, symlink, writeFile} from 'node:fs/promises'
+import {existsSync, mkdirSync} from 'node:fs'
+import {mkdir, readFile, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {runGit} from './git-safety.js'
-import {writeJournal} from './journal.js'
-import {previewRecovery} from './recover.js'
-import {markRepoHeld, repoMutexKey, resetRepoHoldsForTesting, resetRepoLocksForTesting} from './repo-mutex.js'
-import {commitFile, gitSync, initRepo, isolatedGitEnv, makeTempDir} from './update-fixtures/helpers.js'
+import {JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {readJournal, writeJournal} from './journal.js'
+import {executeRecovery, previewRecovery, reconcileRecoveryJournalsOnStartup} from './recover.js'
+import {
+  markRepoHeld,
+  repoHoldReason,
+  repoMutexKey,
+  resetRepoHoldsForTesting,
+  resetRepoLocksForTesting,
+} from './repo-mutex.js'
+import {bareRepoPath, startGitHttpServer, writeLoopbackAskpassHelper} from './update-fixtures/git-http-server.js'
+import {
+  commitFile,
+  gitSync,
+  initRepo,
+  isolatedGitEnv,
+  makeTempDir,
+  opensslAvailable,
+} from './update-fixtures/helpers.js'
+import {executeUpdate} from './update.js'
+
+const OPENSSL_AVAILABLE = opensslAvailable()
 
 const OWNER = 'acme'
 const REPO = 'widgets'
@@ -69,6 +89,60 @@ function makeGitRunnerSpy(): {readonly runner: GitRunnerFn; readonly calls: (rea
     return runGit(args, options)
   }
   return {runner, calls}
+}
+
+interface NetworkFixture {
+  readonly remoteBaseUrl: string
+  readonly caBundlePath: string
+  readonly remoteRepoPath: string
+  readonly headSha: string
+  readonly token: string
+  readonly close: () => Promise<void>
+}
+
+/** A real HTTPS "remote" for executeRecovery's fetch phase — same fixture update.test.ts uses. */
+async function setupNetworkFixture(owner = OWNER, repo = REPO): Promise<NetworkFixture> {
+  const fixtureReposRoot = await makeTempDir('recover-net-repos-')
+  const workDir = await makeTempDir('recover-net-work-')
+  const workHome = await makeTempDir('recover-net-work-home-')
+  const token = 'test-token'
+
+  const remoteRepoPath = await bareRepoPath(fixtureReposRoot, owner, repo)
+  gitSync(fixtureReposRoot, ['init', '-q', '--bare', '-b', 'main', remoteRepoPath], isolatedGitEnv(workHome))
+  initRepo(workDir, isolatedGitEnv(workHome), 'main')
+  const headSha = commitFile(workDir, isolatedGitEnv(workHome), 'README.md', 'hello\n', 'initial commit')
+  gitSync(workDir, ['push', '-q', remoteRepoPath, 'main'], isolatedGitEnv(workHome))
+
+  const server = await startGitHttpServer({reposRoot: fixtureReposRoot})
+  return {
+    remoteBaseUrl: server.baseUrl,
+    caBundlePath: server.caBundlePath,
+    remoteRepoPath,
+    headSha,
+    token,
+    async close() {
+      await server.close()
+      await rm(fixtureReposRoot, {recursive: true, force: true})
+      await rm(workDir, {recursive: true, force: true})
+      await rm(workHome, {recursive: true, force: true})
+    },
+  }
+}
+
+function recoveryDeps(fixture: NetworkFixture, overrides: ExecuteRecoveryDeps = {}): ExecuteRecoveryDeps {
+  const host = new URL(fixture.remoteBaseUrl).host
+  return {
+    ...deps(),
+    remoteBaseUrl: fixture.remoteBaseUrl,
+    caBundlePath: fixture.caBundlePath,
+    askpassWriter: async dir => writeLoopbackAskpassHelper(dir, host),
+    serviceHome: checkoutHome,
+    ...overrides,
+  }
+}
+
+function recoverReq(fixture: NetworkFixture, owner = OWNER, repo = REPO) {
+  return {owner, repo, token: fixture.token, fingerprint: ''}
 }
 
 describe('previewRecovery — safe preview, clean and dirty checkouts', () => {
@@ -332,5 +406,527 @@ describe('previewRecovery — the filesystem size/entry-count walk is bounded, a
     } finally {
       await rm(outsideDir, {recursive: true, force: true})
     }
+  })
+})
+
+describe('executeRecovery — happy path (real remote, real git)', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'preserves a dirty checkout byte-for-byte in quarantine and installs a clean checkout a follow-up executeUpdate reports unchanged',
+    async () => {
+      // #given a dirty local checkout: untracked, ignored, and a local-only commit
+      await setupCleanCheckout()
+      const dest = destPathFor()
+      await writeFile(join(dest, '.gitignore'), 'ignored.txt\n')
+      gitSync(dest, ['add', '.gitignore'], isolatedGitEnv(checkoutHome))
+      gitSync(dest, ['commit', '-q', '-m', 'add gitignore'], isolatedGitEnv(checkoutHome))
+      await writeFile(join(dest, 'ignored.txt'), 'ignored content\n')
+      await writeFile(join(dest, 'untracked.txt'), 'untracked content\n')
+      const localSha = commitFile(dest, isolatedGitEnv(checkoutHome), 'local-only.txt', 'local', 'local-only commit')
+
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'ok' || !preview.preview.inspectionSafe) throw new Error('unreachable')
+      const fingerprint = preview.preview.fingerprint
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when
+        const result = await executeRecovery({...recoverReq(fixture), fingerprint}, recoveryDeps(fixture))
+
+        // #then
+        expect(result.kind).toBe('ok')
+        if (result.kind !== 'ok') throw new Error('unreachable')
+        expect(result.sha).toBe(fixture.headSha)
+        expect(result.branch).toBe('main')
+
+        // #and — quarantine preserved the original byte for byte, including .git
+        const quarantinePath = join(
+          reposRoot,
+          WORKSPACE_STATE_DIR_NAME,
+          'quarantine',
+          `${OWNER}__${REPO}`,
+          result.recoveryId,
+        )
+        expect(gitSync(quarantinePath, ['log', '-1', '--format=%H'], isolatedGitEnv(checkoutHome)).trim()).toBe(
+          localSha,
+        )
+        expect(await readFile(join(quarantinePath, 'untracked.txt'), 'utf8')).toBe('untracked content\n')
+        expect(await readFile(join(quarantinePath, 'ignored.txt'), 'utf8')).toBe('ignored content\n')
+
+        // #and — installed checkout is clean on the default branch, agent-owned
+        expect(gitSync(dest, ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(fixture.headSha)
+        expect(gitSync(dest, ['status', '--porcelain'], isolatedGitEnv(checkoutHome)).trim()).toBe('')
+        expect(gitSync(dest, ['symbolic-ref', '--short', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe('main')
+
+        // #and — a follow-up executeUpdate sees it as unchanged
+        const host = new URL(fixture.remoteBaseUrl).host
+        const updateResult = await executeUpdate(
+          {owner: OWNER, repo: REPO, token: fixture.token},
+          {
+            reposRoot,
+            options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+            remoteBaseUrl: fixture.remoteBaseUrl,
+            caBundlePath: fixture.caBundlePath,
+            askpassWriter: async d => writeLoopbackAskpassHelper(d, host),
+            serviceHome: checkoutHome,
+          },
+        )
+        expect(updateResult).toMatchObject({kind: 'ready', change: 'unchanged'})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+})
+
+describe('executeRecovery — opaque checkout (hostile config)', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)('recovers a hostile-config checkout without ever running git in it', async () => {
+    // #given a checkout with a planted filter driver — not on the closed config allowlist
+    await setupCleanCheckout()
+    gitSync(destPathFor(), ['config', 'filter.evil.clean', 'cat'], isolatedGitEnv(checkoutHome))
+    const preview = await previewRecovery(req(), deps())
+    if (preview.kind !== 'ok' || preview.preview.inspectionSafe) throw new Error('unreachable')
+    const {runner, calls} = makeGitRunnerSpy()
+
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+        recoveryDeps(fixture, {gitRunner: runner}),
+      )
+
+      // #then
+      expect(result.kind).toBe('ok')
+      // #and — every call BEFORE staging's `git init` (the first command that ever touches the
+      // fresh checkout, never the original) is limited to the admission re-check's own inert
+      // `git config --list` — no working-tree-reading command (`status`/`read-tree`/`checkout`)
+      // ever ran against the ORIGINAL hostile checkout.
+      const initIndex = calls.findIndex(args => args.includes('init'))
+      expect(initIndex).toBeGreaterThan(-1)
+      const beforeBuild = calls.slice(0, initIndex)
+      expect(
+        beforeBuild.some(args => args.includes('status') || args.includes('read-tree') || args.includes('checkout')),
+      ).toBe(false)
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe('executeRecovery — fingerprint mismatch refuses checkout-changed', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)('a new local commit landing after preview refuses and moves nothing', async () => {
+    // #given
+    await setupCleanCheckout()
+    const preview = await previewRecovery(req(), deps())
+    if (preview.kind !== 'ok') throw new Error('unreachable')
+    commitFile(destPathFor(), isolatedGitEnv(checkoutHome), 'b.txt', 'two', 'second commit')
+
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+        recoveryDeps(fixture),
+      )
+
+      // #then
+      expect(result).toEqual({kind: 'refused', reason: 'checkout-changed'})
+      expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).not.toBe(
+        fixture.headSha,
+      )
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'a tracked file touched after preview (no new commit) also refuses checkout-changed',
+    async () => {
+      // #given
+      await setupCleanCheckout()
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'ok') throw new Error('unreachable')
+      await writeFile(join(destPathFor(), 'README.md'), 'tampered\n')
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+          recoveryDeps(fixture),
+        )
+
+        // #then
+        expect(result).toEqual({kind: 'refused', reason: 'checkout-changed'})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+})
+
+/** Writes a fake, already-quarantined generation directly to disk (bypassing recovery) so quota tests can seed `listBackups` cheaply. */
+async function createFakeGeneration(owner: string, repo: string, id: string, sizeBytes: number): Promise<void> {
+  const dir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${owner}__${repo}`, id)
+  await mkdir(dir, {recursive: true})
+  await writeFile(
+    join(dir, 'metadata.json'),
+    JSON.stringify({recoveryId: id, owner, repo, createdAt: new Date().toISOString(), sizeBytes, entryCount: 1}),
+  )
+}
+
+describe('executeRecovery — quota and disk-space preflight refuse before building', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)('refuses quota-exceeded at 5 generations, moving nothing', async () => {
+    // #given
+    await setupCleanCheckout()
+    for (let i = 0; i < 5; i += 1) await createFakeGeneration(OWNER, REPO, `gen-${i}`, 1)
+    const preview = await previewRecovery(req(), deps())
+    if (preview.kind !== 'ok') throw new Error('unreachable')
+
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+        recoveryDeps(fixture),
+      )
+
+      // #then
+      expect(result).toMatchObject({kind: 'refused', reason: 'quota-exceeded'})
+      expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim().length).toBe(40)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('refuses insufficient-disk-space before building, via an injected statfs', async () => {
+    // #given
+    await setupCleanCheckout()
+    const preview = await previewRecovery(req(), deps())
+    if (preview.kind !== 'ok') throw new Error('unreachable')
+    const statfsFn = async () => ({bavail: 1, bsize: 1})
+
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+        recoveryDeps(fixture, {statfsFn}),
+      )
+
+      // #then
+      expect(result).toEqual({kind: 'refused', reason: 'insufficient-disk-space'})
+      expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim().length).toBe(40)
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe('executeRecovery — no checkout installs without quarantine', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)('installs a fresh checkout with no prior generation written', async () => {
+    // #given no checkout at all for this owner/repo
+    const preview = await previewRecovery(req(), deps())
+    expect(preview).toEqual({kind: 'no-checkout'})
+
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when
+      const result = await executeRecovery({...recoverReq(fixture), fingerprint: ''}, recoveryDeps(fixture))
+
+      // #then
+      expect(result.kind).toBe('ok')
+      if (result.kind !== 'ok') throw new Error('unreachable')
+      expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(fixture.headSha)
+      const backupsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`)
+      await expect(readFile(join(backupsDir, result.recoveryId, 'metadata.json'), 'utf8')).rejects.toThrow()
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe('executeRecovery — concurrency serializes with itself and with executeUpdate', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'a second concurrent recover, started with the same (now-stale) fingerprint, is fully serialized behind the first',
+    async () => {
+      // #given
+      await setupCleanCheckout()
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'ok') throw new Error('unreachable')
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when — both start in the same tick; the per-repo mutex must fully serialize them
+        const [first, second] = await Promise.all([
+          executeRecovery({...recoverReq(fixture), fingerprint: preview.preview.fingerprint}, recoveryDeps(fixture)),
+          executeRecovery({...recoverReq(fixture), fingerprint: preview.preview.fingerprint}, recoveryDeps(fixture)),
+        ])
+
+        // #then — one recovers; the other, running only AFTER the first fully finished, sees the
+        // ALREADY-RECOVERED checkout and refuses on its own now-stale fingerprint. Never both `ok`.
+        const kinds = [first.kind, second.kind].sort()
+        expect(kinds).toEqual(['ok', 'refused'])
+        const refused = first.kind === 'refused' ? first : second
+        expect(refused).toEqual({kind: 'refused', reason: 'checkout-changed'})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'recover and update on the same repo serialize — update sees the post-recovery state',
+    async () => {
+      // #given
+      await setupCleanCheckout()
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'ok') throw new Error('unreachable')
+      const fixture = await setupNetworkFixture()
+      const host = new URL(fixture.remoteBaseUrl).host
+      try {
+        // #when
+        const [recovered, updated] = await Promise.all([
+          executeRecovery({...recoverReq(fixture), fingerprint: preview.preview.fingerprint}, recoveryDeps(fixture)),
+          executeUpdate(
+            {owner: OWNER, repo: REPO, token: fixture.token},
+            {
+              reposRoot,
+              options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+              remoteBaseUrl: fixture.remoteBaseUrl,
+              caBundlePath: fixture.caBundlePath,
+              askpassWriter: async d => writeLoopbackAskpassHelper(d, host),
+              serviceHome: checkoutHome,
+            },
+          ),
+        ])
+
+        // #then — recovery wins the lock first (called first, synchronous acquire); update, having
+        // waited for the lock, runs against the recovered checkout and reports it unchanged.
+        expect(recovered.kind).toBe('ok')
+        expect(updated).toMatchObject({kind: 'ready', change: 'unchanged'})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+})
+
+/** A gitRunner whose Nth call follows `sequence` (clamped to the last entry once exhausted): 'unconfirmed' reports a termination-unconfirmed outcome, 'throw' raises a REAL exception (not a git outcome), 'real' delegates to actual git. */
+function makeSequencedGitRunner(sequence: readonly ('unconfirmed' | 'throw' | 'real')[]): {
+  readonly runner: GitRunnerFn
+  readonly reset: () => void
+} {
+  let index = 0
+  const runner: GitRunnerFn = async (args, options) => {
+    const step = sequence[Math.min(index, sequence.length - 1)]
+    index += 1
+    if (step === 'unconfirmed') return {kind: 'termination-unconfirmed'}
+    if (step === 'throw') throw new Error('simulated crash after uncertainty')
+    return runGit(args, options)
+  }
+  return {runner, reset: () => (index = 0)}
+}
+
+describe('executeRecovery — unconfirmed subprocess termination holds the repo and keeps the journal', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'an unconfirmed termination during the build phase fails termination-unconfirmed, sets the hold, and never clears the journal',
+    async () => {
+      // #given a clean checkout and a packStreamRunner whose only call reports uncertainty
+      await setupCleanCheckout()
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'ok') throw new Error('unreachable')
+      const packStreamRunner = async () => ({kind: 'termination-unconfirmed'}) as const
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+          recoveryDeps(fixture, {packStreamRunner}),
+        )
+
+        // #then
+        expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
+        expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+        const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+        const journal = await readJournal(journalsDir, OWNER, REPO)
+        expect(journal.ok).toBe(true)
+        if (!journal.ok) throw new Error('unreachable')
+        expect(journal.journal.phase).toBe('building')
+        // #and — the original checkout was never touched
+        if (!preview.preview.inspectionSafe) throw new Error('unreachable')
+        expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(
+          preview.preview.headSha,
+        )
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'uncertainty followed by a LATER rejection still resolves to termination-unconfirmed, never an unhandled throw',
+    async () => {
+      // #given the config-inventory call reports uncertainty (degrading to an opaque preview), and
+      // the very next git call (the bare fetch-store init) then throws a genuine exception
+      await setupCleanCheckout()
+      const {runner, reset} = makeSequencedGitRunner(['unconfirmed', 'throw'])
+      const preview = await previewRecovery(req(), deps({gitRunner: runner}))
+      if (preview.kind !== 'ok') throw new Error('unreachable')
+      reset()
+
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.preview.fingerprint},
+          recoveryDeps(fixture, {gitRunner: runner}),
+        )
+
+        // #then — the choke point runs in a `finally`, so it fires even though `runRecoveryMutation`
+        // THREW rather than returned.
+        expect(result).toEqual({kind: 'failed', reason: 'termination-unconfirmed'})
+        expect(repoHoldReason(repoMutexKey(OWNER, REPO))).toBe('termination-unconfirmed')
+        const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+        const journal = await readJournal(journalsDir, OWNER, REPO)
+        expect(journal.ok).toBe(true)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+})
+
+const noopLogger = {info: () => {}, warn: () => {}, error: () => {}}
+
+function stagingPathFor(recoveryId: string): string {
+  return join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'staging', `recover-${recoveryId}`)
+}
+
+/** A real, minimal git repo at `path` \u2014 stands in for a completed (or partial) staging build during crash-reconciliation tests. */
+function createStagingCheckout(path: string, branch = 'main'): string {
+  mkdirSync(path, {recursive: true})
+  initRepo(path, isolatedGitEnv(checkoutHome), branch)
+  return commitFile(path, isolatedGitEnv(checkoutHome), 'README.md', 'recovered\n', 'recovered commit')
+}
+
+describe('reconcileRecoveryJournalsOnStartup — crash reconciliation at each phase boundary', () => {
+  it('building: removes the partial staging dir and clears the journal; the original (if any) is untouched', async () => {
+    // #given
+    const {headSha} = await setupCleanCheckout()
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-building'
+    mkdirSync(stagingPathFor(recoveryId), {recursive: true})
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'building',
+      recoveryId,
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    // #then
+    const journal = await readJournal(journalsDir, OWNER, REPO)
+    expect(journal.ok).toBe(false)
+    expect(existsSync(stagingPathFor(recoveryId))).toBe(false)
+    expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(headSha)
+  })
+
+  it('quarantining: the original (still at the checkout path) is moved to quarantine, then staging installs and verifies', async () => {
+    // #given the original checkout is still at the canonical path, and a completed staging build
+    // already exists at the deterministic recovery path
+    await setupCleanCheckout()
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-quarantining'
+    const recoveredSha = createStagingCheckout(stagingPathFor(recoveryId))
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'quarantining',
+      recoveryId,
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    // #then — journal cleared, original preserved (metadataOk:false is acceptable — evidence was
+    // no longer available at reconciliation time), staging installed and verified
+    const journal = await readJournal(journalsDir, OWNER, REPO)
+    expect(journal.ok).toBe(false)
+    const quarantinePath = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`, recoveryId)
+    expect(existsSync(join(quarantinePath, '.git'))).toBe(true)
+    expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(recoveredSha)
+    expect(existsSync(stagingPathFor(recoveryId))).toBe(false)
+  })
+
+  it('installing: the checkout path is empty and staging is complete — staging is renamed into place and verified', async () => {
+    // #given no checkout at the canonical path (already quarantined in a real recovery), staging complete
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-installing'
+    const recoveredSha = createStagingCheckout(stagingPathFor(recoveryId))
+    await mkdir(join(reposRoot, OWNER), {recursive: true})
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'installing',
+      recoveryId,
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    // #then
+    const journal = await readJournal(journalsDir, OWNER, REPO)
+    expect(journal.ok).toBe(false)
+    expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(recoveredSha)
+    expect(existsSync(stagingPathFor(recoveryId))).toBe(false)
+  })
+
+  it('verifying: the fresh checkout is already installed — verified and the journal cleared', async () => {
+    // #given the fresh checkout is already fully installed at the canonical path
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    const recoveryId = 'gen-verifying'
+    await mkdir(join(reposRoot, OWNER), {recursive: true})
+    const recoveredSha = createStagingCheckout(destPathFor())
+    await writeJournal(journalsDir, {
+      kind: 'recovery',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'verifying',
+      recoveryId,
+      startedAt: new Date().toISOString(),
+    })
+
+    // #when
+    await reconcileRecoveryJournalsOnStartup({
+      reposRoot,
+      options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+      logger: noopLogger,
+    })
+
+    // #then
+    const journal = await readJournal(journalsDir, OWNER, REPO)
+    expect(journal.ok).toBe(false)
+    expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(recoveredSha)
   })
 })

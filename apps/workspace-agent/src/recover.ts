@@ -13,28 +13,56 @@
  * a pure filesystem walk) and no further git ever runs there.
  */
 
-import type {GitRunnerFn} from './git-safety.js'
-import type {RecoveryJournalPhase, UpdateJournalPhase} from './journal.js'
+import type {GitProfile, GitRunnerFn} from './git-safety.js'
+import type {PackStreamOptions} from './git-stream.js'
+import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase, UpdateJournalPhase} from './journal.js'
 import type {CheckoutOperation} from './types.js'
+import type {Deadline, InvocationTracker, RemoteFailureReason} from './update.js'
 
-import {createHash} from 'node:crypto'
-import {lstat, readdir, realpath} from 'node:fs/promises'
+import {createHash, randomUUID} from 'node:crypto'
+import {lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, statfs} from 'node:fs/promises'
+import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {performance} from 'node:perf_hooks'
+import process from 'node:process'
 
-import {listBackups} from './backups.js'
-import {checkCheckoutLayout, inventoryCheckoutConfig} from './checkout-profile.js'
+import {listBackups, QUARANTINE_METADATA_FILE_NAME, type QuarantineMetadata} from './backups.js'
+import {checkCheckoutLayout, checkTempIndexCleanliness, inventoryCheckoutConfig} from './checkout-profile.js'
+import {HANDOFF_DEADLINE_MS, MAX_HANDOFF_ENTRIES, writeAskpassHelper} from './clone.js'
 import {
   buildFilterNeutralizationEnv,
+  buildNetworkGitProfile,
   buildNeutralGitEnv,
   enumerateFilterDrivers,
   gitInvocation,
   runGit,
 } from './git-safety.js'
-import {AGENT_GID, AGENT_UID, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {runPackStream} from './git-stream.js'
+import {handOffToAgent} from './handoff.js'
+import {
+  AGENT_GID,
+  AGENT_UID,
+  CLONE_STAGING_DIR_NAME,
+  JOURNAL_DIR_NAME,
+  QUARANTINE_DIR_NAME,
+  WORKSPACE_STATE_DIR_NAME,
+} from './identity.js'
 import {inspectCheckout} from './inspect.js'
-import {readJournal} from './journal.js'
-import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
+import {listJournals, readJournal, removeJournal, writeJournal} from './journal.js'
+import {markRepoHeld, repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
+import {
+  createDeadline,
+  createInvocationTracker,
+  DEFAULT_APPLY_TIMEOUT_MS as DEFAULT_BUILD_TIMEOUT_MS,
+  DEFAULT_MAX_PACK_BYTES,
+  DEFAULT_NETWORK_BUDGET_MS,
+  DEFAULT_REMOTE_BASE_URL,
+  DEFAULT_SERVICE_HOME,
+  ensureBareFetchStore,
+  fetchIntoRef,
+  fetchStorePathFor,
+  observeRemoteDefaultBranch,
+} from './update.js'
 
 /** Root directory where repos are cloned inside the workspace container. Mirrors update.ts/inspect.ts. */
 export const WORKSPACE_REPOS_ROOT = '/workspace/repos'
@@ -120,6 +148,68 @@ export type PreviewRecoveryResult =
   | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
   | {readonly kind: 'failed'; readonly reason: 'inspection-failed'}
   | {readonly kind: 'ok'; readonly preview: RecoveryPreview}
+
+/** Default headroom multiplier for the free-space preflight — plan: "start at twice the estimated checkout size". */
+export const DEFAULT_DISK_HEADROOM_MULTIPLIER = 2
+
+/** Confirms a previously previewed recovery. See the module header and executeRecovery's own doc comment for the full admission-gated mutation model. */
+export interface ExecuteRecoveryRequest {
+  readonly owner: string
+  readonly repo: string
+  readonly token: string
+  /** The fingerprint the operator saw from `previewRecovery`; recomputed and compared under the mutex. */
+  readonly fingerprint: string
+}
+
+export type ExecuteRecoveryFailureReason =
+  | 'inspection-failed'
+  | 'fetch-failed'
+  | 'build-failed'
+  | 'quarantine-failed'
+  | 'install-failed'
+  | 'verification-failed'
+  | 'termination-unconfirmed'
+
+export type ExecuteRecoveryResult =
+  | {readonly kind: 'no-checkout'}
+  | {readonly kind: 'refused'; readonly reason: 'maintenance-hold'}
+  | {readonly kind: 'refused'; readonly reason: 'journal-in-progress'; readonly phase: JournalInProgressPhase}
+  | {readonly kind: 'refused'; readonly reason: 'checkout-changed'}
+  | {readonly kind: 'refused'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
+  | {readonly kind: 'refused'; readonly reason: 'insufficient-disk-space'}
+  | {readonly kind: 'failed'; readonly reason: ExecuteRecoveryFailureReason}
+  | {readonly kind: 'ok'; readonly recoveryId: string; readonly sha: string; readonly branch: string}
+
+export interface ExecuteRecoveryDeps {
+  readonly gitRunner?: GitRunnerFn
+  readonly packStreamRunner?: (options: PackStreamOptions) => ReturnType<typeof runPackStream>
+  readonly reposRoot?: string
+  readonly options?: {readonly timeoutMs?: number; readonly uid?: number; readonly gid?: number}
+  readonly now?: () => Date
+  readonly walkDeadlineMs?: number
+  readonly walkMaxEntries?: number
+  readonly monotonicNow?: () => number
+  readonly remoteBaseUrl?: string
+  readonly caBundlePath?: string
+  readonly proxy?: {readonly https: string; readonly noProxy?: string}
+  readonly askpassWriter?: (dir: string) => Promise<string>
+  readonly serviceHome?: string
+  readonly networkBudgetMs?: number
+  readonly buildTimeoutMs?: number
+  readonly maxPackBytes?: number
+  readonly diskHeadroomMultiplier?: number
+  readonly statfsFn?: RecoveryStatfsFn
+  readonly mkdtempFn?: (prefix: string) => Promise<string>
+  readonly recoveryIdFn?: () => string
+}
+
+/** Minimal free-space shape this module needs — avoids `fs.promises.statfs`'s bigint-overload union. */
+export type RecoveryStatfsFn = (path: string) => Promise<{readonly bavail: number; readonly bsize: number}>
+
+async function defaultStatfs(path: string): Promise<{readonly bavail: number; readonly bsize: number}> {
+  const stats = await statfs(path)
+  return {bavail: Number(stats.bavail), bsize: Number(stats.bsize)}
+}
 
 export interface PreviewRecoveryDeps {
   readonly gitRunner?: GitRunnerFn
@@ -292,6 +382,141 @@ async function countIgnoredEntries(
 }
 
 /**
+ * The body of `previewRecovery`, extracted so `executeRecovery` (slice 5b) can recompute the
+ * fingerprint under the mutex IT already holds, without previewRecovery's own `withRepoLock`
+ * re-entering the same non-reentrant per-repo lock (repo-mutex.ts's `withRepoLock` would deadlock
+ * on a second acquire of the same key from within the first). Must only ever be called from
+ * inside an existing `withRepoLock(repoMutexKey(owner, repo), ...)` for this exact repo.
+ */
+async function computeRecoveryPreviewLocked(
+  owner: string,
+  repo: string,
+  params: {
+    readonly gitRunner: GitRunnerFn
+    readonly reposRoot: string
+    readonly timeoutMs: number
+    readonly uid: number
+    readonly gid: number
+    readonly now: () => Date
+    readonly walkDeadlineMs: number
+    readonly walkMaxEntries: number
+    readonly monotonicNow: () => number
+  },
+): Promise<PreviewRecoveryResult> {
+  const {gitRunner, reposRoot, timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries, monotonicNow} = params
+
+  // Checked first, before even the journal — mirrors update.ts's own step 0.
+  if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
+    return {kind: 'refused', reason: 'maintenance-hold'}
+  }
+
+  const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+  const journalRead = await readJournal(journalsDir, owner, repo)
+  if (journalRead.ok === true) {
+    return {kind: 'refused', reason: 'journal-in-progress', phase: journalRead.journal.phase}
+  }
+  if (journalRead.ok === false && journalRead.reason === 'malformed') {
+    return {kind: 'refused', reason: 'journal-in-progress', phase: 'malformed'}
+  }
+
+  const canonical = await resolveCanonicalCheckout(reposRoot, owner, repo)
+  if (canonical.kind === 'no-checkout') return {kind: 'no-checkout'}
+  if (canonical.kind === 'checkout-substituted') return {kind: 'refused', reason: 'checkout-substituted'}
+  const canonicalPath = canonical.path
+
+  // Admission gate: layout is pure filesystem (no git at all); config inventory is one inert
+  // `git config --list` call — never a working-tree-reading command, so running it does not
+  // violate "no git in the checkout" for a hostile-config checkout the way `git status` would.
+  const layout = await checkCheckoutLayout({checkoutPath: canonicalPath, timeoutMs, uid, gid})
+  let inspectionSafe = layout.kind === 'ok'
+  if (inspectionSafe) {
+    const configInventory = await inventoryCheckoutConfig({checkoutPath: canonicalPath, gitRunner, timeoutMs, uid, gid})
+    inspectionSafe = configInventory.kind === 'allowed'
+  }
+
+  const walk = await walkCheckoutSize(canonicalPath, {
+    deadlineMs: walkDeadlineMs,
+    maxEntries: walkMaxEntries,
+    now: monotonicNow,
+  })
+
+  const retentionResult = await listBackups(owner, repo, {reposRoot})
+  if (retentionResult.kind !== 'ok') return {kind: 'failed', reason: 'inspection-failed'}
+  const retention: RetentionUsage = {
+    generationCount: retentionResult.backups.length,
+    totalBytes: retentionResult.totalBytes,
+    maxGenerations: RETENTION_MAX_GENERATIONS,
+    maxBytes: RETENTION_MAX_BYTES,
+  }
+
+  if (!inspectionSafe) {
+    const fingerprint = computeFingerprint([walk.totalBytes, walk.entryCount])
+    return {
+      kind: 'ok',
+      preview: {
+        inspectionSafe: false,
+        estimatedSizeBytes: walk.totalBytes,
+        entryCount: walk.entryCount,
+        retention,
+        fingerprint,
+      },
+    }
+  }
+
+  const inspected = await inspectCheckout(
+    {owner, repo},
+    {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
+  )
+  if (inspected.response.ok !== true) {
+    // Admission already passed (layout ok, config allowed) and the canonical path already
+    // resolved above, so a failure HERE is a genuine, not a hostile-config, inspection failure.
+    return {kind: 'failed', reason: 'inspection-failed'}
+  }
+  const observation = inspected.response.observation
+
+  const ignoredCount = await countIgnoredEntries(canonicalPath, gitRunner, timeoutMs, uid, gid)
+  if (ignoredCount === undefined) return {kind: 'failed', reason: 'inspection-failed'}
+
+  const headSha = observation.head.sha
+  const branch = observation.head.kind === 'attached' ? observation.head.branch : undefined
+  const dirty: DirtyCounts =
+    observation.worktree.kind === 'dirty'
+      ? {
+          staged: observation.worktree.staged,
+          unstaged: observation.worktree.unstaged,
+          untracked: observation.worktree.untracked,
+          conflicted: observation.worktree.conflicted,
+        }
+      : {staged: 0, unstaged: 0, untracked: 0, conflicted: 0}
+
+  const fingerprint = computeFingerprint([
+    headSha,
+    dirty.staged,
+    dirty.unstaged,
+    dirty.untracked,
+    dirty.conflicted,
+    walk.totalBytes,
+    walk.entryCount,
+  ])
+
+  return {
+    kind: 'ok',
+    preview: {
+      inspectionSafe: true,
+      headSha,
+      branch,
+      dirty,
+      operationInProgress: observation.operationInProgress,
+      ignoredCount,
+      estimatedSizeBytes: walk.totalBytes,
+      entryCount: walk.entryCount,
+      retention,
+      fingerprint,
+    },
+  }
+}
+
+/**
  * Reports what a `/recover` call would see for `request.owner`/`request.repo`, without mutating
  * anything. See the module header for the full admission-gated safety model.
  */
@@ -311,121 +536,775 @@ export async function previewRecovery(
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const {owner, repo} = request
 
-  return withRepoLock(repoMutexKey(owner, repo), async (): Promise<PreviewRecoveryResult> => {
-    // Checked first, before even the journal \u2014 mirrors update.ts's own step 0.
-    if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
-      return {kind: 'refused', reason: 'maintenance-hold'}
-    }
+  return withRepoLock(repoMutexKey(owner, repo), async () =>
+    computeRecoveryPreviewLocked(owner, repo, {
+      gitRunner,
+      reposRoot,
+      timeoutMs,
+      uid,
+      gid,
+      now,
+      walkDeadlineMs,
+      walkMaxEntries,
+      monotonicNow,
+    }),
+  )
+}
 
+// ---------------------------------------------------------------------------
+// Mutation core — Unit 5, slice 5b. Everything below runs only under withRepoLock, via
+// executeRecovery at the end of this module.
+// ---------------------------------------------------------------------------
+
+type FetchRecoveryTargetOutcome =
+  | {readonly kind: 'ok'; readonly branch: string; readonly sha: string}
+  | {readonly kind: 'failed'; readonly reason: RemoteFailureReason}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'unconfirmed'}
+
+/**
+ * Fetches the remote's CURRENT default branch and tip into the bare store, forcing the local ref
+ * (`+<branch>:refs/heads/<branch>`) so a rewritten remote history never leaves a stale non-fast-
+ * forward ref behind. Retries the fetch-then-observe pair once (two attempts) to detect a moved
+ * tip, mirroring update.ts's own `observeAndFetch` loop — recovery has no local H to compare
+ * against, so it always packs T's full closure and never refuses detached/non-default-branch.
+ */
+async function fetchRecoveryTarget(params: {
+  readonly profile: GitProfile
+  readonly remoteUrl: string
+  readonly gitRunner: GitRunnerFn
+  readonly deadline: Deadline
+}): Promise<FetchRecoveryTargetOutcome> {
+  const {profile, remoteUrl, gitRunner, deadline} = params
+  if (deadline.expired()) return {kind: 'timeout'}
+  const first = await observeRemoteDefaultBranch(profile, remoteUrl, gitRunner, deadline.remainingMs(), undefined)
+  if (first.kind === 'unconfirmed') return {kind: 'unconfirmed'}
+  if (first.kind === 'timeout' || first.kind === 'aborted') return {kind: 'timeout'}
+  if (first.kind === 'failed') return {kind: 'failed', reason: first.reason}
+
+  const branch = first.observation.branch
+  let previousSha = first.observation.sha
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (deadline.expired()) return {kind: 'timeout'}
+    const fetched = await fetchIntoRef(
+      profile,
+      remoteUrl,
+      `+${branch}:refs/heads/${branch}`,
+      gitRunner,
+      deadline.remainingMs(),
+      undefined,
+    )
+    if (fetched.kind === 'unconfirmed') return {kind: 'unconfirmed'}
+    if (fetched.kind === 'timeout' || fetched.kind === 'aborted') return {kind: 'timeout'}
+    if (fetched.kind === 'failed') return {kind: 'failed', reason: fetched.reason}
+
+    if (deadline.expired()) return {kind: 'timeout'}
+    const reobserved = await observeRemoteDefaultBranch(
+      profile,
+      remoteUrl,
+      gitRunner,
+      deadline.remainingMs(),
+      undefined,
+    )
+    if (reobserved.kind === 'unconfirmed') return {kind: 'unconfirmed'}
+    if (reobserved.kind === 'timeout' || reobserved.kind === 'aborted') return {kind: 'timeout'}
+    if (reobserved.kind === 'failed') return {kind: 'failed', reason: reobserved.reason}
+    if (reobserved.observation.sha === previousSha) return {kind: 'ok', branch, sha: reobserved.observation.sha}
+    previousSha = reobserved.observation.sha
+  }
+  return {kind: 'failed', reason: 'fetch-failed'}
+}
+
+type BuildStagingOutcome =
+  {readonly kind: 'ok'} | {readonly kind: 'termination-unconfirmed'} | {readonly kind: 'failed'}
+
+/**
+ * Builds a fresh checkout at `stagingPath` (already created, root-owned, empty) ENTIRELY as root:
+ * `git init` (empty template, no sample hooks), pack import from the bare store (both sides run
+ * as root — the staging tree is not agent-owned yet), `read-tree --reset -u` from `sha`, ref setup
+ * for `branch`, then the canonical origin config the closed allowlist (checkout-profile.ts)
+ * recognizes. Never touched by AGENT_UID until `handOffToAgent` runs on the caller side.
+ */
+async function buildStagingCheckout(params: {
+  readonly stagingPath: string
+  readonly bareRepoPath: string
+  readonly owner: string
+  readonly repo: string
+  readonly branch: string
+  readonly sha: string
+  readonly gitRunner: GitRunnerFn
+  readonly packStreamRunner: (options: PackStreamOptions) => ReturnType<typeof runPackStream>
+  readonly maxPackBytes: number
+  readonly timeoutMs: number
+}): Promise<BuildStagingOutcome> {
+  const {stagingPath, bareRepoPath, owner, repo, branch, sha, gitRunner, packStreamRunner, maxPackBytes, timeoutMs} =
+    params
+  const env = buildNeutralGitEnv()
+  const runLocal = async (args: readonly string[]) =>
+    gitRunner(gitInvocation(stagingPath, stagingPath, args), {cwd: stagingPath, env, timeoutMs})
+
+  const init = await gitRunner(['init', '--quiet', '--template=', stagingPath], {cwd: stagingPath, env, timeoutMs})
+  if (init.kind === 'termination-unconfirmed') return {kind: 'termination-unconfirmed'}
+  if (init.kind !== 'ok') return {kind: 'failed'}
+
+  const packed = await packStreamRunner({
+    writer: {
+      command: 'git',
+      args: ['--git-dir', bareRepoPath, 'pack-objects', '--quiet', '--revs', '--stdout'],
+      cwd: bareRepoPath,
+      env,
+      stdin: `${sha}\n`,
+    },
+    reader: {
+      command: 'git',
+      args: [...gitInvocation(stagingPath, stagingPath, ['index-pack', '--stdin', '--strict'])],
+      cwd: stagingPath,
+      env: {...env, GIT_ALLOW_PROTOCOL: ''},
+    },
+    maxBytes: maxPackBytes,
+    timeoutMs,
+  })
+  if (packed.kind === 'termination-unconfirmed') return {kind: 'termination-unconfirmed'}
+  if (packed.kind !== 'ok') return {kind: 'failed'}
+
+  const originUrl = `https://github.com/${owner}/${repo}.git`
+  const steps: readonly (readonly string[])[] = [
+    ['read-tree', '--reset', '-u', sha],
+    ['update-ref', `refs/heads/${branch}`, sha],
+    ['symbolic-ref', 'HEAD', `refs/heads/${branch}`],
+    ['config', 'remote.origin.url', originUrl],
+    ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*'],
+    ['config', `branch.${branch}.remote`, 'origin'],
+    ['config', `branch.${branch}.merge`, `refs/heads/${branch}`],
+  ]
+  for (const args of steps) {
+    const outcome = await runLocal(args)
+    if (outcome.kind === 'termination-unconfirmed') return {kind: 'termination-unconfirmed'}
+    if (outcome.kind !== 'ok') return {kind: 'failed'}
+  }
+  return {kind: 'ok'}
+}
+
+/**
+ * Preserves the existing checkout at `checkoutPath` by rename into
+ * `<quarantine>/<owner>__<repo>/<recoveryId>/`, then writes a root-owned metadata.json alongside
+ * it (temp-file-and-rename, mirrors journal.ts). The rename alone preserves the tree byte for
+ * byte — including `.git`, ignored files, and local refs — since nothing but a directory-entry
+ * move happens to the preserved content itself.
+ */
+async function quarantineExistingCheckout(params: {
+  readonly reposRoot: string
+  readonly owner: string
+  readonly repo: string
+  readonly recoveryId: string
+  readonly checkoutPath: string
+  /** Omitted during best-effort crash reconciliation, where the original preview evidence is no longer available — the rename alone still fully preserves the content; the generation is just listed with `metadataOk: false`. */
+  readonly metadata: Omit<QuarantineMetadata, 'recoveryId' | 'owner' | 'repo'> | undefined
+}): Promise<'ok' | 'failed'> {
+  const {reposRoot, owner, repo, recoveryId, checkoutPath, metadata} = params
+  const quarantineRepoDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, QUARANTINE_DIR_NAME, `${owner}__${repo}`)
+  try {
+    await mkdir(quarantineRepoDir, {recursive: true, mode: 0o700})
+  } catch {
+    return 'failed'
+  }
+  const generationPath = join(quarantineRepoDir, recoveryId)
+  try {
+    await rename(checkoutPath, generationPath)
+  } catch {
+    return 'failed'
+  }
+  if (metadata === undefined) return 'ok'
+  const fullMetadata: QuarantineMetadata = {recoveryId, owner, repo, ...metadata}
+  const metadataPath = join(generationPath, QUARANTINE_METADATA_FILE_NAME)
+  const tempPath = join(generationPath, `.${QUARANTINE_METADATA_FILE_NAME}.tmp-${randomUUID()}`)
+  try {
+    const handle = await open(tempPath, 'wx', 0o600)
+    try {
+      await handle.writeFile(JSON.stringify(fullMetadata))
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await rename(tempPath, metadataPath)
+  } catch {
+    await rm(tempPath, {force: true}).catch(() => {})
+    return 'failed'
+  }
+  return 'ok'
+}
+
+/** Verifies an installed checkout, AS THE AGENT IDENTITY (local profile): HEAD == `sha`, attached to `branch`, and clean against a fresh temp index built from `sha`. */
+async function verifyInstalledCheckout(params: {
+  readonly canonicalPath: string
+  readonly branch: string
+  readonly sha: string
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}): Promise<'ok' | 'failed'> {
+  const {canonicalPath, branch, sha, gitRunner, timeoutMs, uid, gid} = params
+  const env = buildNeutralGitEnv()
+  const headOutcome = await gitRunner(
+    gitInvocation(canonicalPath, canonicalPath, ['rev-parse', '--verify', 'HEAD^{commit}']),
+    {cwd: canonicalPath, env, timeoutMs, uid, gid},
+  )
+  if (headOutcome.kind !== 'ok' || headOutcome.stdout.trim() !== sha) return 'failed'
+
+  const branchOutcome = await gitRunner(
+    gitInvocation(canonicalPath, canonicalPath, ['symbolic-ref', '--short', 'HEAD']),
+    {cwd: canonicalPath, env, timeoutMs, uid, gid},
+  )
+  if (branchOutcome.kind !== 'ok' || branchOutcome.stdout.trim() !== branch) return 'failed'
+
+  const cleanliness = await checkTempIndexCleanliness({
+    checkoutPath: canonicalPath,
+    headSha: sha,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  return cleanliness.kind === 'clean' ? 'ok' : 'failed'
+}
+
+/** Self-consistency verification used ONLY by crash reconciliation, which has no stored target branch/sha to compare against (RecoveryJournal carries only owner/repo/phase/recoveryId/startedAt) — reads whatever HEAD currently is and confirms it resolves, is attached, and is clean against itself. */
+async function verifyInstalledCheckoutSelfConsistent(params: {
+  readonly canonicalPath: string
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}): Promise<'ok' | 'failed'> {
+  const {canonicalPath, gitRunner, timeoutMs, uid, gid} = params
+  const env = buildNeutralGitEnv()
+  const headOutcome = await gitRunner(
+    gitInvocation(canonicalPath, canonicalPath, ['rev-parse', '--verify', 'HEAD^{commit}']),
+    {cwd: canonicalPath, env, timeoutMs, uid, gid},
+  )
+  if (headOutcome.kind !== 'ok') return 'failed'
+  const sha = headOutcome.stdout.trim()
+
+  const branchOutcome = await gitRunner(
+    gitInvocation(canonicalPath, canonicalPath, ['symbolic-ref', '--short', 'HEAD']),
+    {cwd: canonicalPath, env, timeoutMs, uid, gid},
+  )
+  if (branchOutcome.kind !== 'ok') return 'failed'
+
+  const cleanliness = await checkTempIndexCleanliness({
+    checkoutPath: canonicalPath,
+    headSha: sha,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  return cleanliness.kind === 'clean' ? 'ok' : 'failed'
+}
+
+/** `<reposRoot>/.workspace-agent/staging/recover-<recoveryId>` — deterministic from `recoveryId` alone (never a random mkdtemp name) so crash reconciliation can find it without the journal carrying an extra field. */
+function stagingPathFor(reposRoot: string, recoveryId: string): string {
+  return join(reposRoot, WORKSPACE_STATE_DIR_NAME, CLONE_STAGING_DIR_NAME, `recover-${recoveryId}`)
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export type RecoveryReconciliationOutcome = 'cleared' | 'left-in-place'
+
+/**
+ * Applies the plan's recovery reconciliation table to one journal. At NO phase is the original
+ * deleted or the canonical path left empty: `building` only ever removes STAGING (the original,
+ * if any, was never touched by that phase); `quarantining`/`installing`/`verifying` all run their
+ * remaining steps in sequence (a crash at `quarantining` still needs the `installing` rename to
+ * happen, and a crash at `installing` still needs `verifying`'s check) rather than assuming the
+ * journal's recorded phase is the ONLY step left to do.
+ */
+async function reconcileOneRecoveryJournal(params: {
+  readonly journalsDir: string
+  readonly reposRoot: string
+  readonly journal: RecoveryJournal
+  readonly gitRunner: GitRunnerFn
+  readonly timeoutMs: number
+  readonly uid: number | undefined
+  readonly gid: number | undefined
+}): Promise<RecoveryReconciliationOutcome> {
+  const {journalsDir, reposRoot, journal, gitRunner, timeoutMs, uid, gid} = params
+  const {owner, repo, phase, recoveryId} = journal
+  const checkoutPath = join(reposRoot, owner, repo)
+  const stagingPath = stagingPathFor(reposRoot, recoveryId)
+
+  if (phase === 'building') {
+    await rm(stagingPath, {recursive: true, force: true}).catch(() => {})
+    await removeJournal(journalsDir, owner, repo)
+    return 'cleared'
+  }
+
+  if (phase === 'quarantining' && (await pathExists(checkoutPath))) {
+    const result = await quarantineExistingCheckout({
+      reposRoot,
+      owner,
+      repo,
+      recoveryId,
+      checkoutPath,
+      metadata: undefined,
+    })
+    if (result === 'failed') return 'left-in-place'
+  }
+
+  if ((phase === 'quarantining' || phase === 'installing') && !(await pathExists(checkoutPath))) {
+    try {
+      await rename(stagingPath, checkoutPath)
+    } catch {
+      return 'left-in-place'
+    }
+  }
+
+  const verified = await verifyInstalledCheckoutSelfConsistent({
+    canonicalPath: checkoutPath,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  if (verified !== 'ok') return 'left-in-place'
+  await removeJournal(journalsDir, owner, repo)
+  return 'cleared'
+}
+
+export interface ReconcileRecoveryJournalsOnStartupDeps {
+  readonly gitRunner?: GitRunnerFn
+  readonly reposRoot?: string
+  readonly options?: {readonly timeoutMs?: number; readonly uid?: number; readonly gid?: number}
+  readonly logger: {
+    readonly info: (msg: string, meta?: Record<string, unknown>) => void
+    readonly warn: (msg: string, meta?: Record<string, unknown>) => void
+    readonly error: (msg: string, meta?: Record<string, unknown>) => void
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Reconciles every OUTSTANDING recovery journal exactly once, at startup, before the server
+ * accepts requests — mirrors update.ts's own `reconcileUpdateJournalsOnStartup`, but is NOT called
+ * by it: the two run side by side from main.ts (slice 5c wires the call; this function exists so
+ * that wiring is a one-line addition). Never throws: a directory-level fault or an unexpected
+ * per-journal error is logged and the journal is left in place rather than blocking startup.
+ */
+export async function reconcileRecoveryJournalsOnStartup(deps: ReconcileRecoveryJournalsOnStartupDeps): Promise<void> {
+  const {reposRoot = WORKSPACE_REPOS_ROOT, gitRunner = runGit, options = {}, logger} = deps
+  const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
+  const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+
+  let entries: readonly JournalListEntry[]
+  try {
+    entries = await listJournals(journalsDir)
+  } catch (error) {
+    logger.error('recover: startup journal reconciliation could not list journals — leaving all as-is', {
+      error: errorMessage(error),
+    })
+    return
+  }
+
+  for (const entry of entries) {
+    if (entry.result.ok === false) continue
+    const journal = entry.result.journal
+    if (journal.kind !== 'recovery') continue
+    const {owner, repo, phase} = journal
+    const repoKey = repoMutexKey(owner, repo)
+    try {
+      await withRepoLock(repoKey, async () => {
+        if (repoHoldReason(repoKey) !== undefined) {
+          logger.warn('recover: startup reconciliation skipping a repository under maintenance hold', {
+            owner,
+            repo,
+            phase,
+          })
+          return
+        }
+        const tracker = createInvocationTracker({gitRunner})
+        const outcome = await reconcileOneRecoveryJournal({
+          journalsDir,
+          reposRoot,
+          journal,
+          gitRunner: tracker.gitRunner,
+          timeoutMs,
+          uid,
+          gid,
+        })
+        if (tracker.sawUnconfirmed()) {
+          markRepoHeld(repoKey, 'termination-unconfirmed')
+          logger.warn('recover: reconciliation subprocess termination could not be confirmed — holding repository', {
+            owner,
+            repo,
+            phase,
+          })
+          return
+        }
+        logger[outcome === 'cleared' ? 'info' : 'warn'](`recover: startup reconciliation ${outcome} a journal`, {
+          owner,
+          repo,
+          phase,
+        })
+      })
+    } catch (error) {
+      logger.error('recover: startup reconciliation failed unexpectedly for one journal — leaving it in place', {
+        owner,
+        repo,
+        phase,
+        error: errorMessage(error),
+      })
+    }
+  }
+}
+
+type PreflightOutcome =
+  | {readonly kind: 'ok'}
+  | {readonly kind: 'refused'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
+  | {readonly kind: 'refused'; readonly reason: 'insufficient-disk-space'}
+
+/** Quota (5 generations / 10 GiB) then free-space (`estimatedSizeBytes * diskHeadroomMultiplier`) — checked BEFORE anything is built or moved, per the plan's "refuses before building"/"refuses before any rename". */
+async function checkRecoveryPreflight(params: {
+  readonly reposRoot: string
+  readonly estimatedSizeBytes: number
+  readonly retention: RetentionUsage
+  readonly diskHeadroomMultiplier: number
+  readonly statfsFn: RecoveryStatfsFn
+}): Promise<PreflightOutcome> {
+  const {reposRoot, estimatedSizeBytes, retention, diskHeadroomMultiplier, statfsFn} = params
+  if (retention.generationCount >= retention.maxGenerations || retention.totalBytes >= retention.maxBytes) {
+    return {kind: 'refused', reason: 'quota-exceeded', usage: retention}
+  }
+  let stats: {readonly bavail: number; readonly bsize: number}
+  try {
+    stats = await statfsFn(reposRoot)
+  } catch {
+    return {kind: 'refused', reason: 'insufficient-disk-space'}
+  }
+  const availableBytes = stats.bavail * stats.bsize
+  if (availableBytes < estimatedSizeBytes * diskHeadroomMultiplier) {
+    return {kind: 'refused', reason: 'insufficient-disk-space'}
+  }
+  return {kind: 'ok'}
+}
+
+/** Every dependency `runRecoveryMutation` needs, already resolved from `ExecuteRecoveryDeps` defaults by `executeRecovery`. */
+interface RecoveryMutationContext {
+  readonly owner: string
+  readonly repo: string
+  readonly token: string
+  readonly fingerprint: string
+  readonly reposRoot: string
+  readonly journalsDir: string
+  readonly checkoutPath: string
+  readonly tracker: InvocationTracker
+  readonly timeoutMs: number
+  readonly uid: number
+  readonly gid: number
+  readonly now: () => Date
+  readonly walkDeadlineMs: number
+  readonly walkMaxEntries: number
+  readonly monotonicNow: () => number
+  readonly remoteBaseUrl: string
+  readonly caBundlePath: string | undefined
+  readonly proxy: {readonly https: string; readonly noProxy?: string} | undefined
+  readonly askpassWriter: (dir: string) => Promise<string>
+  readonly serviceHome: string
+  readonly networkBudgetMs: number
+  readonly buildTimeoutMs: number
+  readonly maxPackBytes: number
+  readonly diskHeadroomMultiplier: number
+  readonly statfsFn: RecoveryStatfsFn
+  readonly recoveryId: string
+}
+
+/**
+ * The full mutation sequence, run entirely under the caller's repo lock and tracker. Returns a
+ * best-effort result for the tracker/hold choke point in `executeRecovery` to override when an
+ * unconfirmed termination occurred anywhere in this call — this function itself never clears the
+ * journal except on a fully verified success.
+ */
+async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<ExecuteRecoveryResult> {
+  const {owner, repo, token, fingerprint, reposRoot, journalsDir, checkoutPath, tracker, recoveryId} = ctx
+  const {timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries, monotonicNow} = ctx
+  const gitRunner = tracker.gitRunner
+  const packStreamRunner = tracker.packStreamRunner
+
+  const preview = await computeRecoveryPreviewLocked(owner, repo, {
+    gitRunner,
+    reposRoot,
+    timeoutMs,
+    uid,
+    gid,
+    now,
+    walkDeadlineMs,
+    walkMaxEntries,
+    monotonicNow,
+  })
+  if (preview.kind === 'refused')
+    return {
+      kind: 'refused',
+      reason: preview.reason,
+      ...('phase' in preview ? {phase: preview.phase} : {}),
+    } as ExecuteRecoveryResult
+  if (preview.kind === 'failed') return {kind: 'failed', reason: 'inspection-failed'}
+
+  let estimatedSizeBytes = 0
+  let retention: RetentionUsage = {
+    generationCount: 0,
+    totalBytes: 0,
+    maxGenerations: RETENTION_MAX_GENERATIONS,
+    maxBytes: RETENTION_MAX_BYTES,
+  }
+  const hadExistingCheckout = preview.kind === 'ok'
+  if (preview.kind === 'ok') {
+    if (preview.preview.fingerprint !== fingerprint) return {kind: 'refused', reason: 'checkout-changed'}
+    estimatedSizeBytes = preview.preview.estimatedSizeBytes
+    retention = preview.preview.retention
+  } else {
+    const fresh = await listBackups(owner, repo, {reposRoot})
+    if (fresh.kind === 'ok') {
+      retention = {
+        generationCount: fresh.backups.length,
+        totalBytes: fresh.totalBytes,
+        maxGenerations: RETENTION_MAX_GENERATIONS,
+        maxBytes: RETENTION_MAX_BYTES,
+      }
+    }
+  }
+
+  const preflight = await checkRecoveryPreflight({
+    reposRoot,
+    estimatedSizeBytes,
+    retention,
+    diskHeadroomMultiplier: ctx.diskHeadroomMultiplier,
+    statfsFn: ctx.statfsFn,
+  })
+  if (preflight.kind !== 'ok') return preflight
+
+  await writeJournal(journalsDir, {
+    kind: 'recovery',
+    owner,
+    repo,
+    phase: 'building',
+    recoveryId,
+    startedAt: now().toISOString(),
+  })
+
+  const fetchStorePath = fetchStorePathFor(reposRoot, owner, repo)
+  const storeReady = await ensureBareFetchStore({fetchStorePath, gitRunner, timeoutMs})
+  if (storeReady !== 'ok') return {kind: 'failed', reason: 'fetch-failed'}
+
+  const askpassDir = await mkdtemp(join(tmpdir(), 'workspace-agent-recover-askpass-'))
+  const stagingPath = stagingPathFor(reposRoot, recoveryId)
+  let target: {readonly branch: string; readonly sha: string}
+  try {
+    const askpassPath = await ctx.askpassWriter(askpassDir)
+    const profile = buildNetworkGitProfile({
+      bareRepoPath: fetchStorePath,
+      serviceHome: ctx.serviceHome,
+      askpassPath,
+      token,
+      caBundlePath: ctx.caBundlePath,
+      proxy: ctx.proxy,
+      parentEnv: process.env,
+    })
+    const remoteUrl = `${ctx.remoteBaseUrl}/${owner}/${repo}.git`
+    const deadline = createDeadline(ctx.networkBudgetMs, monotonicNow)
+    tracker.setDeadline(deadline)
+    const fetched = await fetchRecoveryTarget({profile, remoteUrl, gitRunner, deadline})
+    tracker.setDeadline(undefined)
+    if (fetched.kind !== 'ok') return {kind: 'failed', reason: 'fetch-failed'}
+    target = fetched
+
+    await mkdir(stagingPath, {recursive: true, mode: 0o700})
+    tracker.markApplyingPhase()
+    const built = await buildStagingCheckout({
+      stagingPath,
+      bareRepoPath: fetchStorePath,
+      owner,
+      repo,
+      branch: target.branch,
+      sha: target.sha,
+      gitRunner,
+      packStreamRunner,
+      maxPackBytes: ctx.maxPackBytes,
+      timeoutMs: ctx.buildTimeoutMs,
+    })
+    if (built.kind !== 'ok') return {kind: 'failed', reason: 'build-failed'}
+  } finally {
+    await rm(askpassDir, {recursive: true, force: true}).catch(() => {})
+  }
+
+  const handoff = await handOffToAgent(stagingPath, {
+    uid,
+    gid,
+    deadlineMs: HANDOFF_DEADLINE_MS,
+    maxEntries: MAX_HANDOFF_ENTRIES,
+  })
+  if (handoff.ok !== true) return {kind: 'failed', reason: 'build-failed'}
+
+  await writeJournal(journalsDir, {
+    kind: 'recovery',
+    owner,
+    repo,
+    phase: 'quarantining',
+    recoveryId,
+    startedAt: now().toISOString(),
+  })
+  if (hadExistingCheckout && preview.kind === 'ok') {
+    const originalHeadSha = preview.preview.inspectionSafe ? preview.preview.headSha : undefined
+    const originalBranch = preview.preview.inspectionSafe ? preview.preview.branch : undefined
+    const quarantined = await quarantineExistingCheckout({
+      reposRoot,
+      owner,
+      repo,
+      recoveryId,
+      checkoutPath,
+      metadata: {
+        createdAt: now().toISOString(),
+        sizeBytes: estimatedSizeBytes,
+        entryCount: preview.preview.entryCount,
+        originalHeadSha,
+        originalBranch,
+      },
+    })
+    if (quarantined !== 'ok') return {kind: 'failed', reason: 'quarantine-failed'}
+  }
+
+  await writeJournal(journalsDir, {
+    kind: 'recovery',
+    owner,
+    repo,
+    phase: 'installing',
+    recoveryId,
+    startedAt: now().toISOString(),
+  })
+  try {
+    await mkdir(join(reposRoot, owner), {recursive: true, mode: 0o755})
+    await rename(stagingPath, checkoutPath)
+  } catch {
+    return {kind: 'failed', reason: 'install-failed'}
+  }
+
+  await writeJournal(journalsDir, {
+    kind: 'recovery',
+    owner,
+    repo,
+    phase: 'verifying',
+    recoveryId,
+    startedAt: now().toISOString(),
+  })
+  const verified = await verifyInstalledCheckout({
+    canonicalPath: checkoutPath,
+    branch: target.branch,
+    sha: target.sha,
+    gitRunner,
+    timeoutMs,
+    uid,
+    gid,
+  })
+  if (verified !== 'ok') return {kind: 'failed', reason: 'verification-failed'}
+
+  await removeJournal(journalsDir, owner, repo)
+  return {kind: 'ok', recoveryId, sha: target.sha, branch: target.branch}
+}
+
+/**
+ * Confirms and executes a previously previewed recovery: quarantines the existing checkout (if
+ * any) and installs a fresh one at the remote's current default branch tip. See the module header
+ * and the plan's Unit 5 for the full admission-gated mutation model. ONE `InvocationTracker` wraps
+ * every git/pack-stream call this invocation makes (including the fingerprint recompute) — an
+ * unconfirmed subprocess termination ANYWHERE holds the repository and leaves the journal in
+ * place, exactly like update.ts's `executeUpdate`. The hold check runs in a `finally` so it fires
+ * even if a later step throws, not only on an ordinary return (review round: "a return-only choke
+ * point misses exceptions").
+ */
+export async function executeRecovery(
+  request: ExecuteRecoveryRequest,
+  deps: ExecuteRecoveryDeps = {},
+): Promise<ExecuteRecoveryResult> {
+  const {
+    gitRunner: injectedGitRunner = runGit,
+    packStreamRunner: injectedPackStreamRunner = runPackStream,
+    reposRoot = WORKSPACE_REPOS_ROOT,
+    options = {},
+    now = () => new Date(),
+    walkDeadlineMs = DEFAULT_WALK_DEADLINE_MS,
+    walkMaxEntries = DEFAULT_WALK_MAX_ENTRIES,
+    monotonicNow = () => performance.now(),
+    remoteBaseUrl = DEFAULT_REMOTE_BASE_URL,
+    caBundlePath,
+    proxy,
+    askpassWriter = writeAskpassHelper,
+    serviceHome = DEFAULT_SERVICE_HOME,
+    networkBudgetMs = DEFAULT_NETWORK_BUDGET_MS,
+    buildTimeoutMs = DEFAULT_BUILD_TIMEOUT_MS,
+    maxPackBytes = DEFAULT_MAX_PACK_BYTES,
+    diskHeadroomMultiplier = DEFAULT_DISK_HEADROOM_MULTIPLIER,
+    statfsFn = defaultStatfs,
+    recoveryIdFn = randomUUID,
+  } = deps
+  const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
+  const {owner, repo} = request
+  const repoKey = repoMutexKey(owner, repo)
+
+  return withRepoLock(repoKey, async (): Promise<ExecuteRecoveryResult> => {
+    if (repoHoldReason(repoKey) !== undefined) return {kind: 'refused', reason: 'maintenance-hold'}
+
+    const tracker = createInvocationTracker({gitRunner: injectedGitRunner, packStreamRunner: injectedPackStreamRunner})
     const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
-    const journalRead = await readJournal(journalsDir, owner, repo)
-    if (journalRead.ok === true) {
-      return {kind: 'refused', reason: 'journal-in-progress', phase: journalRead.journal.phase}
-    }
-    if (journalRead.ok === false && journalRead.reason === 'malformed') {
-      return {kind: 'refused', reason: 'journal-in-progress', phase: 'malformed'}
-    }
+    const checkoutPath = join(reposRoot, owner, repo)
+    let outcome: ExecuteRecoveryResult | undefined
+    let caught: unknown
 
-    const canonical = await resolveCanonicalCheckout(reposRoot, owner, repo)
-    if (canonical.kind === 'no-checkout') return {kind: 'no-checkout'}
-    if (canonical.kind === 'checkout-substituted') return {kind: 'refused', reason: 'checkout-substituted'}
-    const canonicalPath = canonical.path
-
-    // Admission gate: layout is pure filesystem (no git at all); config inventory is one inert
-    // `git config --list` call \u2014 never a working-tree-reading command, so running it does not
-    // violate "no git in the checkout" for a hostile-config checkout the way `git status` would.
-    const layout = await checkCheckoutLayout({checkoutPath: canonicalPath, timeoutMs, uid, gid})
-    let inspectionSafe = layout.kind === 'ok'
-    if (inspectionSafe) {
-      const configInventory = await inventoryCheckoutConfig({
-        checkoutPath: canonicalPath,
-        gitRunner,
+    try {
+      outcome = await runRecoveryMutation({
+        owner,
+        repo,
+        token: request.token,
+        fingerprint: request.fingerprint,
+        reposRoot,
+        journalsDir,
+        checkoutPath,
+        tracker,
         timeoutMs,
         uid,
         gid,
+        now,
+        walkDeadlineMs,
+        walkMaxEntries,
+        monotonicNow,
+        remoteBaseUrl,
+        caBundlePath,
+        proxy,
+        askpassWriter,
+        serviceHome,
+        networkBudgetMs,
+        buildTimeoutMs,
+        maxPackBytes,
+        diskHeadroomMultiplier,
+        statfsFn,
+        recoveryId: recoveryIdFn(),
       })
-      inspectionSafe = configInventory.kind === 'allowed'
+    } catch (error) {
+      caught = error
+    } finally {
+      if (tracker.sawUnconfirmed()) markRepoHeld(repoKey, 'termination-unconfirmed')
     }
 
-    const walk = await walkCheckoutSize(canonicalPath, {
-      deadlineMs: walkDeadlineMs,
-      maxEntries: walkMaxEntries,
-      now: monotonicNow,
-    })
-
-    const retentionResult = await listBackups(owner, repo, {reposRoot})
-    if (retentionResult.kind !== 'ok') return {kind: 'failed', reason: 'inspection-failed'}
-    const retention: RetentionUsage = {
-      generationCount: retentionResult.backups.length,
-      totalBytes: retentionResult.totalBytes,
-      maxGenerations: RETENTION_MAX_GENERATIONS,
-      maxBytes: RETENTION_MAX_BYTES,
-    }
-
-    if (!inspectionSafe) {
-      const fingerprint = computeFingerprint([walk.totalBytes, walk.entryCount])
-      return {
-        kind: 'ok',
-        preview: {
-          inspectionSafe: false,
-          estimatedSizeBytes: walk.totalBytes,
-          entryCount: walk.entryCount,
-          retention,
-          fingerprint,
-        },
-      }
-    }
-
-    const inspected = await inspectCheckout(
-      {owner, repo},
-      {gitRunner, reposRoot, options: {timeoutMs, uid, gid}, clock: now},
-    )
-    if (inspected.response.ok !== true) {
-      // Admission already passed (layout ok, config allowed) and the canonical path already
-      // resolved above, so a failure HERE is a genuine, not a hostile-config, inspection failure.
-      return {kind: 'failed', reason: 'inspection-failed'}
-    }
-    const observation = inspected.response.observation
-
-    const ignoredCount = await countIgnoredEntries(canonicalPath, gitRunner, timeoutMs, uid, gid)
-    if (ignoredCount === undefined) return {kind: 'failed', reason: 'inspection-failed'}
-
-    const headSha = observation.head.sha
-    const branch = observation.head.kind === 'attached' ? observation.head.branch : undefined
-    const dirty: DirtyCounts =
-      observation.worktree.kind === 'dirty'
-        ? {
-            staged: observation.worktree.staged,
-            unstaged: observation.worktree.unstaged,
-            untracked: observation.worktree.untracked,
-            conflicted: observation.worktree.conflicted,
-          }
-        : {staged: 0, unstaged: 0, untracked: 0, conflicted: 0}
-
-    const fingerprint = computeFingerprint([
-      headSha,
-      dirty.staged,
-      dirty.unstaged,
-      dirty.untracked,
-      dirty.conflicted,
-      walk.totalBytes,
-      walk.entryCount,
-    ])
-
-    return {
-      kind: 'ok',
-      preview: {
-        inspectionSafe: true,
-        headSha,
-        branch,
-        dirty,
-        operationInProgress: observation.operationInProgress,
-        ignoredCount,
-        estimatedSizeBytes: walk.totalBytes,
-        entryCount: walk.entryCount,
-        retention,
-        fingerprint,
-      },
-    }
+    if (tracker.sawUnconfirmed()) return {kind: 'failed', reason: 'termination-unconfirmed'}
+    if (caught !== undefined) throw caught
+    return outcome as ExecuteRecoveryResult
   })
 }
