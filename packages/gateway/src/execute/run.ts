@@ -8,15 +8,15 @@ import type {SinkThread} from '../discord/streaming.js'
 import type {OperatorFailureKind} from '../operator-contract/run-status.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {
-  CheckoutObservation,
   CloneErrorCode,
-  InspectWorkspaceError,
   ReadyzResponse,
+  UpdateResult,
+  UpdateWorkspaceError,
   WorkspaceError,
 } from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
-import type {CheckoutProvenance} from './provenance.js'
+import type {CheckoutPreparation, CheckoutProvenance} from './provenance.js'
 import type {ChannelQueue} from './queue.js'
 import type {RunCoreErrorKind} from './run-core.js'
 import type {RunIndex} from './run-index.js'
@@ -37,17 +37,25 @@ import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createDiscordApprovalOnPending} from '../approvals/discord-transport.js'
 import {sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
+import {buildRecoverEntryButton} from '../discord/recover-checkout-button.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {abortRegistry} from './abort-registry.js'
 import {attachOpencode} from './opencode-attach.js'
+import {
+  CLIENT_TIMEOUT_REPLY,
+  formatPreparationFailedReply,
+  formatPreparationRefusedReply,
+  RECOVER_SUFFIX,
+} from './preparation-reply.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
 import {
-  classifyInspectResult,
   formatProvenanceForPrompt,
   formatProvenanceLine,
   formatSubstitutedCheckoutLine,
+  toCheckoutPreparation,
+  toRemoteFreshnessFromUpdateReady,
 } from './provenance.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 
@@ -139,19 +147,25 @@ export interface RunMentionDeps {
    */
   readonly ensureClone: (owner: string, repo: string) => Promise<Result<string, EnsureCloneFailure>>
   /**
-   * Report the state of the checkout `ensureClone` just ensured exists.
-   * Called immediately after a successful `ensureClone`, still under the repo
-   * lock. Read-only — never clones, fetches, or mutates the checkout.
-   * Injected so tests can stub it without a live workspace.
+   * Bring the checkout up to date via `/update`, or report why it can't be. Called immediately
+   * after `ensureClone`, still under the repo lock. Injected so tests can stub it without a live
+   * workspace.
    *
-   * The engine classifies the result via `classifyInspectResult`: a
-   * `checkout-substituted` failure fails the run (a tree that isn't the
-   * expected repository is a correctness failure); every other outcome
-   * (success or any other failure) becomes a `CheckoutProvenance` the run
-   * carries forward — to the agent prompt, to the human-facing reply, and
-   * onto the run's persisted state.
+   * `remainingBudgetMs` is the caller's own remaining budget — `client.update()` takes the lesser
+   * of that and its own 100-second ceiling.
+   *
+   * The engine classifies the result: `no-checkout` triggers `ensureClone` then a retry; `ready`
+   * becomes a `CheckoutProvenance` (`remote` from `toRemoteFreshnessFromUpdateReady`) persisted
+   * with `EXECUTING`; `refused`/`checkout-substituted` fails the run through the same path
+   * `classifyInspectResult`'s `checkout-substituted` used to; every other `refused`/`failed`
+   * terminalizes to FAILED with a `CheckoutPreparation` (`toCheckoutPreparation`) and the matching
+   * reply from `preparation-reply.ts`, before any OpenCode session is ever created.
    */
-  readonly inspect: (owner: string, repo: string) => Promise<Result<CheckoutObservation, InspectWorkspaceError>>
+  readonly update: (
+    owner: string,
+    repo: string,
+    options: {readonly remainingBudgetMs: number},
+  ) => Promise<Result<UpdateResult, UpdateWorkspaceError>>
   /**
    * Workspace readiness check. Called after ensure-clone, before execution.
    * Injected so tests can stub it without a live workspace.
@@ -299,7 +313,9 @@ const PERMANENT_CLONE_ERROR_CODES: ReadonlySet<CloneErrorCode> = new Set<CloneEr
  * comparison that returns the same answer on every retry and that
  * `ensure-clone.ts` already logs at error level as a security signal —
  * telling the user to retry would be both futile and understate what may be
- * a tamper signal. Everything else (network/timeout/http/parse, and the
+ * a tamper signal. `workspace-failure`/`clone-error`/`journal-in-progress` is also
+ * `workspace-unavailable`, classified separately from `PERMANENT_CLONE_ERROR_CODES` below — see
+ * the comment at that branch for why. Everything else (network/timeout/http/parse, and the
  * transient clone-error codes including `clone-failed`) stays `unreachable`,
  * matching prior behavior.
  */
@@ -316,6 +332,20 @@ function classifyEnsureCloneFailure(failure: EnsureCloneFailure): RunCoreErrorKi
     failure.kind === 'workspace-failure' &&
     failure.workspaceKind === 'clone-error' &&
     PERMANENT_CLONE_ERROR_CODES.has(failure.code)
+  ) {
+    return 'workspace-unavailable'
+  }
+  // `journal-in-progress` is deliberately NOT folded into PERMANENT_CLONE_ERROR_CODES above: an
+  // outstanding journal is not deterministic in the same sense as a hardlinked handoff failure —
+  // it clears once a later `/update` or `/fro-bot recover-checkout` resolves it. But neither of
+  // those exists yet, so today a plain retry hits the exact same refusal every time; until Unit 7
+  // wires preparation's own `/update`-based reconciliation into the run path (which will replace
+  // this whole mapping), 'workspace-unavailable' (no blind retry invited) is closer to the truth
+  // than 'unreachable'.
+  if (
+    failure.kind === 'workspace-failure' &&
+    failure.workspaceKind === 'clone-error' &&
+    failure.code === 'journal-in-progress'
   ) {
     return 'workspace-unavailable'
   }
@@ -650,7 +680,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     persona,
     logger,
   } = deps
-  const {approvalRegistry, approvalMode, ensureClone, readyz, inspect} = deps
+  const {approvalRegistry, approvalMode, ensureClone, readyz, update} = deps
 
   // ── All mutable state that the outer finally needs is declared here so the
   // finally block can always reference channelId regardless of where execution
@@ -916,59 +946,169 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       return provenanceLine === undefined ? text : `${text}\n\n${provenanceLine}`
     }
 
+    // ── Preparation early-termination ── refused/failed/client-timeout, all before EXECUTING ──────
+    // Never creates an OpenCode session, never builds or sends a prompt. Structurally mirrors the
+    // pre-ACK gates (readyz/threadFactory/lock): reply via `replySink.send` DIRECTLY, never through
+    // `statusSink.resolveToFailure` — that API takes text only and cannot carry the Recover button
+    // (`MessageContentOptions.components`), and no OpenCode output could exist yet to preserve.
+    async function terminatePreparationEarly(
+      replyText: string,
+      checkoutPreparation: CheckoutPreparation | undefined,
+    ): Promise<void> {
+      statusSink.setReaction('failed')
+
+      if (heartbeatStopped === false) {
+        const stopResult = await heartbeat.stop()
+        heartbeatStopped = true
+        if (stopResult.success === true) {
+          runEtag = stopResult.data.runEtag
+          lockEtag = stopResult.data.lockEtag
+        } else {
+          logger.warn(
+            {repo, runId, err: stopResult.error.message},
+            'run: heartbeat stop failed during preparation termination; using last known etags',
+          )
+        }
+      }
+
+      const failedResult = await transitionRun(
+        coordinationConfig,
+        identity,
+        repo,
+        runId,
+        'FAILED',
+        runEtag,
+        coordLogger,
+        checkoutPreparation === undefined ? undefined : {detailsPatch: {checkoutPreparation}},
+      )
+      if (failedResult.success === false) {
+        logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED (preparation) failed')
+      } else {
+        notifyObserverBestEffort(deps, failedResult.data.state)
+        // eslint-disable-next-line no-void
+        void deps.operatorPushDispatcher?.dispatchRunFailed(runId, 'workspace-unavailable')
+      }
+
+      // The button is attached whenever the reply ends with RECOVER_SUFFIX (every refusal except
+      // maintenance-hold, plus an apply-failed reply whose mutation may have started) - never for
+      // a client timeout or maintenance-hold, which point nowhere useful for the operator to click.
+      // Only the Discord transport gets it - a web launch has no button surface and persists
+      // `checkoutPreparation` alone (see `buildRecoverEntryButton`'s own doc comment).
+      const components =
+        request.surface === 'discord' && replyText.endsWith(RECOVER_SUFFIX)
+          ? [buildRecoverEntryButton({channelId})]
+          : undefined
+      await request.replySink
+        .send('thread', components === undefined ? {content: replyText} : {content: replyText, components})
+        .catch((error: unknown) => {
+          logger.warn(
+            {repo, runId, err: error instanceof Error ? error.message : String(error)},
+            'run: failed to send preparation-termination reply',
+          )
+        })
+    }
+
     try {
-      // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
-      // Rehydrates a missing checkout (e.g. after container recreation) before OpenCode can start.
-      // Runs here — after the repo lock is held and heartbeat renewal is running, before the
-      // EXECUTING transition — because it reads and can mutate the shared per-repo checkout at
+      // ── Checkout preparation: bring the checkout up to date via /update (Unit 7) ─────────────
+      // Replaces the old unconditional ensureClone → inspect sequence. Runs here — after the repo
+      // lock is held and heartbeat renewal is running, before the EXECUTING transition — because
+      // /update reads and can mutate the shared per-repo checkout at
       // `/workspace/repos/{owner}/{repo}`. Running it before the lock (as gates 1-3 do) would let
       // a second run on the same repo (a different channel, the operator web surface, or a GitHub
       // Action run) observe or mutate the tree concurrently with the lock holder.
       //
-      // A failure here is routed through the SAME post-lock failure path as any other execution
-      // failure below (see the `catch (execError)` block): throwing a `RunCoreError` lets the
-      // existing heartbeat-stop / FAILED-transition / flush / thread-reply machinery run unchanged,
-      // rather than duplicating that sequence with a bespoke clone-failure handler.
-      const ensureCloneResult = await ensureClone(binding.owner, binding.repo)
-      if (ensureCloneResult.success === false) {
-        logger.warn(
-          {
-            channelId,
-            owner: binding.owner,
-            repo: binding.repo,
-            failureKind: ensureCloneResult.error.kind,
-          },
-          'run: workspace clone unavailable — aborting',
-        )
-        const runCoreKind = classifyEnsureCloneFailure(ensureCloneResult.error)
-        throw new RunCoreError(runCoreKind, `ensureClone failed: ${ensureCloneResult.error.kind}`)
+      // The HTTP deadline passed to /update is the lesser of 100s and this run's own remaining
+      // wall-clock budget (plan Unit 7) — `client.update()` itself takes the min of the two, so
+      // this just supplies its half honestly rather than always handing over the full 100s.
+      const remainingUpdateBudgetMs = (): number => Math.max(0, runTimeoutMs - (Date.now() - runStartMs))
+
+      let updateResult = await update(binding.owner, binding.repo, {remainingBudgetMs: remainingUpdateBudgetMs()})
+      let bindingWithEnsuredPath = binding
+
+      if (updateResult.success === true && updateResult.data.kind === 'no-checkout') {
+        // Rehydrate a missing checkout (e.g. after container recreation), then retry /update
+        // against the freshly cloned tree — the one case that still needs ensureClone.
+        const ensureCloneResult = await ensureClone(binding.owner, binding.repo)
+        if (ensureCloneResult.success === false) {
+          logger.warn(
+            {
+              channelId,
+              owner: binding.owner,
+              repo: binding.repo,
+              failureKind: ensureCloneResult.error.kind,
+            },
+            'run: workspace clone unavailable — aborting',
+          )
+          const runCoreKind = classifyEnsureCloneFailure(ensureCloneResult.error)
+          throw new RunCoreError(runCoreKind, `ensureClone failed: ${ensureCloneResult.error.kind}`)
+        }
+        // Use the ensured (canonical) path from ensureClone, not the potentially stale
+        // workspacePath stored in the binding (e.g. after container recreation).
+        bindingWithEnsuredPath = {...binding, workspacePath: ensureCloneResult.data}
+        updateResult = await update(binding.owner, binding.repo, {remainingBudgetMs: remainingUpdateBudgetMs()})
       }
 
-      // Use the ensured (canonical) path from ensureClone, not the potentially stale
-      // workspacePath stored in the binding (e.g. after container recreation).
-      const bindingWithEnsuredPath = {...binding, workspacePath: ensureCloneResult.data}
+      if (updateResult.success === false) {
+        // A client-side timeout means neither side knows what happened — distinct "state unknown"
+        // reply, no `checkoutPreparation` (there is no workspace response to build one from).
+        if (updateResult.error.kind === 'timeout') {
+          return await terminatePreparationEarly(CLIENT_TIMEOUT_REPLY, undefined)
+        }
+        // Every other transport error reuses the existing clone-error classification conventions:
+        // a rejected control-API bearer (401) is operator-side (`workspace-unavailable`);
+        // everything else (network/other-HTTP/parse) stays `unreachable`, inviting a retry.
+        const runCoreKind =
+          updateResult.error.kind === 'http-error' && updateResult.error.status === 401
+            ? 'workspace-unavailable'
+            : 'unreachable'
+        throw new RunCoreError(runCoreKind, `update transport error: ${updateResult.error.kind}`)
+      }
 
-      // ── Checkout provenance — report what the checkout holds, still under the repo lock ──────
-      // Runs immediately after ensureClone, before the EXECUTING transition, so a
-      // `checkout-substituted` failure (a tree that isn't the expected repository — a
-      // correctness failure) fails the run through the SAME post-lock path as any other
-      // execution failure, before any agent session starts. Every other outcome (success or
-      // any other inspect failure) proceeds with a `CheckoutProvenance` the run carries
-      // forward: PR 1 never fails a run merely because inspection was unavailable.
-      const inspectResult = await inspect(binding.owner, binding.repo)
-      const inspectOutcome = classifyInspectResult(inspectResult)
-      if (inspectOutcome.decision === 'fail-run') {
+      const preparationResult = updateResult.data
+      if (preparationResult.kind === 'no-checkout') {
+        // A fresh clone reporting no-checkout again is a workspace bug, not a transient blip.
+        throw new RunCoreError('workspace-unavailable', 'update still reports no-checkout after ensureClone')
+      }
+
+      if (preparationResult.kind === 'refused' && preparationResult.reason === 'checkout-substituted') {
+        // Keep the existing checkout-substituted handling — /update refuses this exactly like
+        // inspect() used to fail it: a tree that isn't the expected repository is a correctness
+        // failure, routed through the SAME post-lock RunCoreError path as any other execution
+        // failure, before any agent session starts.
         logger.error(
           {channelId, owner: binding.owner, repo: binding.repo},
           'run: checkout-substituted — tree is not the expected repository, aborting',
         )
-        // Set the provenance line before throwing — this is the one failure reply
-        // where an operator most needs it (the run found a tree that shouldn't be
-        // there), and `withProvenanceLine` only appends when `provenanceLine` is set.
         provenanceLine = formatSubstitutedCheckoutLine(repo)
-        throw new RunCoreError('checkout-substituted', 'inspect failed: checkout-substituted')
+        throw new RunCoreError('checkout-substituted', 'update refused: checkout-substituted')
       }
-      provenance = inspectOutcome.provenance
+
+      if (preparationResult.kind === 'refused' || preparationResult.kind === 'failed') {
+        // Every other refusal/failure terminalizes to FAILED with a CheckoutPreparation record and
+        // the matching reply — never an OpenCode session, never a prompt.
+        const replyText =
+          preparationResult.kind === 'refused'
+            ? formatPreparationRefusedReply(preparationResult)
+            : formatPreparationFailedReply(preparationResult)
+        return await terminatePreparationEarly(replyText, toCheckoutPreparation(preparationResult))
+      }
+
+      // preparationResult.kind === 'ready' — synthesize the observation from UpdateReady rather
+      // than an extra inspect() round-trip: a `ready` outcome's own admission gates (checkout-
+      // profile.ts) already GUARANTEE clean, attached, no-operation-in-progress — those are exactly
+      // the refusal reasons (dirty/detached/operation-in-progress) that would have refused instead
+      // of reporting ready. Calling inspect() again would double the checkout-lock-holding time for
+      // evidence /update's own success already implies.
+      provenance = {
+        kind: 'observed',
+        observation: {
+          head: {kind: 'attached', branch: preparationResult.branch, sha: preparationResult.sha},
+          worktree: {kind: 'clean'},
+          operationInProgress: 'none',
+          observedAt: preparationResult.checkedAt,
+        },
+        remote: toRemoteFreshnessFromUpdateReady(preparationResult),
+      }
       provenanceLine = formatProvenanceLine(repo, provenance)
 
       // Persist the STARTING provenance atomically with the EXECUTING phase write —

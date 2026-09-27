@@ -310,7 +310,7 @@ jobs:
             [ "${attempt}" -eq 3 ] && { echo "docker build failed after 3 attempts"; exit 1; }
             sleep $((attempt * 15))
           done
-      - name: Smoke-test gateway image (assert config load, not module crash)
+      - name: Smoke-test gateway image (assert structured startup failure, not module crash)
         run: |
           set +e
           output="$(timeout 60s docker run --rm fro-bot-gateway:smoke 2>&1)"
@@ -324,59 +324,125 @@ jobs:
             exit 1
           fi
           test "$status" -ne 0
-          echo "$output" | grep -q "Missing required secret: DISCORD_TOKEN"
+          echo "$output" | grep -q '"msg":"gateway startup failed"'
           if echo "$output" | grep -q "ERR_MODULE_NOT_FOUND"; then
             echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
             exit 1
           fi
-          echo "OK: gateway reached config loading (DISCORD_TOKEN check), no module-resolution crash"
-      - name: Smoke-test gateway image — announce opt-out boots past config (issue # 738)
+          echo "OK: gateway emitted the expected structured startup failure, no module-resolution crash"
+      - name: Smoke-test gateway image — announce opt-out reaches post-config initialization (#738)
         run: |
-          set +e
-          output="$(timeout 60s docker run --rm \
-            -e DISCORD_TOKEN=fake-token \
-            -e DISCORD_APPLICATION_ID=000000000000000000 \
-            -e S3_BUCKET=fake-bucket \
-            -e S3_REGION=us-east-1 \
-            -e GITHUB_APP_ID=000000 \
-            -e GITHUB_APP_PRIVATE_KEY=fake-key \
-            -e WORKSPACE_OPENCODE_TOKEN=fake-ws-token \
-            fro-bot-gateway:smoke 2>&1)"
-          status=$?
-          set -e
-          echo "--- docker run output ---"
-          echo "$output"
-          echo "--- exit status: $status ---"
-          if [ "$status" -eq 124 ]; then
-            echo "REGRESSION: gateway image hung on boot (timed out)"
-            exit 1
-          fi
-          # #738: with all core secrets present but announce secrets absent, config load
-          # must NOT fail on the announce secrets — the gateway must get PAST config load.
-          if echo "$output" | grep -q "Missing required secret: GATEWAY_WEBHOOK_SECRET"; then
-            echo "REGRESSION (#738): announce secret still required at config load"
-            exit 1
-          fi
-          if echo "$output" | grep -q "Missing required secret: GATEWAY_PRESENCE_CHANNEL_ID"; then
-            echo "REGRESSION (#738): announce secret still required at config load"
-            exit 1
-          fi
-          # Broader check: no required secret failed at all (catches any other required-secret regression)
-          if echo "$output" | grep -q "Missing required secret"; then
-            echo "FAIL: a required secret was missing — did not reach past config load"
-            exit 1
-          fi
-          if echo "$output" | grep -q "ERR_MODULE_NOT_FOUND"; then
-            echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
-            exit 1
-          fi
-          # Positive proof: boot reached PAST config load — the provider self-test fires against
-          # the fake S3 and main.ts logs "gateway startup failed" then exits 1.
-          if ! echo "$output" | grep -q "gateway startup failed"; then
-            echo "FAIL: boot did not reach the expected post-config failure point (gateway startup failed not found)"
-            exit 1
-          fi
-          echo "OK: gateway booted PAST config load (announce disabled, #738 fixed) and reached the runtime self-test boundary"
+          set -euo pipefail
+          smoke_dir="$(mktemp -d)"
+          container_name=""
+          cleanup() {
+            if [ -n "$container_name" ]; then
+              docker rm -f "$container_name" >/dev/null 2>&1 || true
+            fi
+            rm -rf "$smoke_dir"
+          }
+          trap cleanup EXIT
+
+          post_config_predicate() {
+            status="$1"
+            output="$2"
+            flag_path="$3"
+            scenario="$4"
+
+            if [ "$status" -ne 1 ]; then
+              echo "ASSERTION REJECTED: expected gateway exit 1 in $scenario, got $status"
+              return 2
+            fi
+            if ! echo "$output" | grep -Fq '"msg":"gateway startup failed"'; then
+              echo "ASSERTION REJECTED: structured startup-failure message missing in $scenario"
+              return 2
+            fi
+            if echo "$output" | grep -Fq "ERR_MODULE_NOT_FOUND"; then
+              echo "ASSERTION REJECTED: module resolution failed (ERR_MODULE_NOT_FOUND) in $scenario"
+              return 2
+            fi
+            if [ -e "$flag_path" ]; then
+              echo "POST-CONFIG PREDICATE REJECTED: readiness sentinel remains in $scenario"
+              return 1
+            fi
+
+            echo "POST-CONFIG PREDICATE ACCEPTED: readiness sentinel cleared in $scenario"
+            return 0
+          }
+
+          run_gateway_smoke() {
+            scenario="$1"
+            expected_predicate="$2"
+            shift 2
+            flag_path="$smoke_dir/$scenario-ready"
+            container_name="gateway-smoke-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$-$scenario"
+
+            : > "$flag_path"
+            if [ ! -f "$flag_path" ] || [ -s "$flag_path" ]; then
+              echo "ASSERTION FAILURE: could not seed empty readiness sentinel for $scenario"
+              return 1
+            fi
+
+            set +e
+            output="$(timeout 60s docker run --rm --name "$container_name" \
+              --mount "type=bind,src=$smoke_dir,dst=/var/run/fro-bot" \
+              -e FRO_BOT_READY_FLAG_PATH="/var/run/fro-bot/$scenario-ready" \
+              -e DISCORD_APPLICATION_ID=000000000000000000 \
+              -e S3_BUCKET=fake-bucket \
+              -e S3_REGION=us-east-1 \
+              -e GITHUB_APP_ID=000000 \
+              -e GITHUB_APP_PRIVATE_KEY=fake-key \
+              -e WORKSPACE_OPENCODE_TOKEN=fake-ws-token \
+              "$@" \
+              fro-bot-gateway:smoke node dist/main.mjs 2>&1)"
+            status=$?
+            set -e
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            container_name=""
+
+            echo "--- $scenario output ---"
+            echo "$output"
+            echo "--- exit status: $status ---"
+            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+              echo "INFRASTRUCTURE FAILURE: gateway smoke timed out in $scenario"
+              return 2
+            fi
+            if [ "$status" -ge 125 ]; then
+              echo "INFRASTRUCTURE FAILURE: docker/exec failed in $scenario with status $status"
+              return 2
+            fi
+            if post_config_predicate "$status" "$output" "$flag_path" "$scenario"; then
+              predicate_status=0
+            else
+              predicate_status=$?
+            fi
+
+            if [ "$expected_predicate" = accept ]; then
+              if [ "$predicate_status" -ne 0 ]; then
+                echo "ASSERTION FAILURE: valid config did not satisfy the post-config predicate in $scenario"
+                return 1
+              fi
+              echo "OK: valid fake-core config passed the post-config initialization predicate"
+            elif [ "$expected_predicate" = reject ]; then
+              if [ "$predicate_status" -ne 1 ]; then
+                echo "ASSERTION FAILURE: negative control $scenario did not specifically fail the post-config sentinel check"
+                return 1
+              fi
+              echo "OK: negative control $scenario was rejected by the same post-config predicate"
+            else
+              echo "ASSERTION FAILURE: unknown predicate expectation $expected_predicate in $scenario"
+              return 1
+            fi
+          }
+
+          # #738: valid fake core config without announce secrets reaches program initialization.
+          # setupReadinessFlag clears the seeded stale sentinel before startup self-test exits 1.
+          run_gateway_smoke valid-core accept -e DISCORD_TOKEN=fake-token
+
+          # Negative controls: each config failure must occur before program initialization.
+          run_gateway_smoke invalid-log-level reject \
+            -e DISCORD_TOKEN=fake-token -e LOG_LEVEL=forced-config-failure
+          run_gateway_smoke missing-discord-token reject
       - name: Smoke-test gateway image — operator route registration (offline diagnostic)
         timeout-minutes: 8
         run: |
@@ -476,6 +542,24 @@ jobs:
             [ "${attempt}" -eq 3 ] && { echo "docker build failed after 3 attempts"; exit 1; }
             sleep $((attempt * 15))
           done
+      - name: Run workspace-agent tests inside the image (real Alpine git, Unit 2 fixtures)
+        run: |
+          # Builds the workspace-test target (forked before the runtime stage prunes
+          # dev deps — see deploy/workspace.Dockerfile) and runs the workspace-agent
+          # test suite inside it, so the adversarial real-git fixtures in
+          # apps/workspace-agent/src/update-fixtures/ exercise this image's own
+          # Alpine `apk` git rather than this runner's git. Same build context and
+          # retry pattern as the runtime image build above; `docker run` failing
+          # (non-zero exit from vitest) fails this step via the job's `set -e` default.
+          for attempt in 1 2 3; do
+            if docker build --target workspace-test -f deploy/workspace.Dockerfile -t fro-bot-workspace:test .; then
+              break
+            fi
+            echo "::warning::docker build (workspace-test) attempt ${attempt} failed"
+            [ "${attempt}" -eq 3 ] && { echo "docker build (workspace-test) failed after 3 attempts"; exit 1; }
+            sleep $((attempt * 15))
+          done
+          docker run --rm fro-bot-workspace:test
       - name: Smoke-test workspace image (clone API boots independently of OpenCode)
         run: |
           set -e

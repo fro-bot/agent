@@ -4,7 +4,7 @@ Small Hono HTTP service that runs **inside** the workspace container. The gatewa
 
 ## Purpose
 
-Exposes `POST /clone` (clones a GitHub repo into `/workspace/repos/{owner}/{repo}`) and `POST /inspect` (read-only observation of an existing checkout). The gateway sends `{owner, repo, token}` to `/clone` — the agent derives the path internally and never accepts a caller-provided path.
+Exposes `POST /clone` (clones a GitHub repo into `/workspace/repos/{owner}/{repo}`), `POST /inspect` (read-only observation of an existing checkout), `POST /update` (network-free admission, then a bare-repo fetch, a pack-stream import, and a journaled fast-forward of an existing checkout), `POST /recover/preview` and `POST /recover` (preserve-and-replace recovery into a quarantine backup), and `GET`/`DELETE /backups/:owner/:repo[/:id]` (list/delete quarantine generations). The gateway sends `{owner, repo, token}` to `/clone` and `/update` — the agent derives the path internally and never accepts a caller-provided path.
 
 ## Security invariants
 
@@ -21,7 +21,12 @@ Exposes `POST /clone` (clones a GitHub repo into `/workspace/repos/{owner}/{repo
 11. **Fresh clones stage before they publish.** A clone is written under the root-owned staging directory (`/workspace/repos/.workspace-agent/staging/`, created by the entrypoint; `clone.ts` creates `staging/` itself if missing, `0700`) — never beside the destination, and never under the agent-traversable owner directory. HEAD is resolved and validated there, **before** handoff, so the service never runs git in an agent-owned tree for a fresh clone. Publishing is a single `rename` into `/workspace/repos/{owner}/{repo}` (see `identity.ts` for the exact path constants).
 12. **Ownership handoff is filesystem calls only.** `handoff.ts` walks the staged tree with `lstat`/`lchown` — never `stat`, never `chown`, never git. It never follows a symlink (the link itself is `lchown`'d, its target never touched), never crosses a filesystem boundary (`st_dev` comparison), and fails the clone outright on a hardlinked file (`nlink > 1` has no legitimate reason to exist in a fresh HTTPS clone) rather than guessing. The walk is bounded by both a deadline and an entry cap.
 13. **Existing-checkout git runs as the agent, not the service.** Once a checkout is agent-owned, any git invocation against it (`repo-exists` idempotency check, post-rename race-check) runs as `AGENT_UID`/`AGENT_GID` with the same neutralized, credential-free invocation shape `/inspect` uses (`git-safety.ts`: sealed config, exact `safe.directory`, no credentials) — never as the root-owned service. The only git that ever runs as root with credentials is the clone itself, in root-owned staging.
-14. **Every control route requires the gateway's bearer, except `/healthz` and `/readyz`.** `/clone` and `/inspect` require `Authorization: Bearer <WORKSPACE_OPENCODE_TOKEN>` — the same root-only secret already used for the 9200 OpenCode proxy (`opencode-proxy.ts`), read once at startup and threaded into `createApp()` via the required `ServerDeps.auth` field (`server.ts`). `auth` is a discriminated union with no default: production must always pass `{kind: 'bearer', token}`; the `{kind: 'disabled-for-tests'}` variant exists solely so tests can opt out explicitly, and can never be reached by omission. The check runs before any body parsing, JSON parsing, or route logic; a missing, wrong-scheme, or wrong token gets a fixed 401 before anything else happens. Comparison is constant-time (`timingSafeEqual`, length-guarded first). Without this, uid 10001 (the unprivileged OpenCode agent, reachable over loopback on `:9100`) could call `/clone` or `/inspect` itself.
+14. **Every control route requires the gateway's bearer, except `/healthz` and `/readyz`.** `/clone`, `/inspect`, `/update`, `/recover/preview`, `/recover`, and `/backups/*` require `Authorization: Bearer <WORKSPACE_OPENCODE_TOKEN>` — the same root-only secret already used for the 9200 OpenCode proxy (`opencode-proxy.ts`), read once at startup and threaded into `createApp()` via the required `ServerDeps.auth` field (`server.ts`). `auth` is a discriminated union with no default: production must always pass `{kind: 'bearer', token}`; the `{kind: 'disabled-for-tests'}` variant exists solely so tests can opt out explicitly, and can never be reached by omission. The check runs before any body parsing, JSON parsing, or route logic; a missing, wrong-scheme, or wrong token gets a fixed 401 before anything else happens. Comparison is constant-time (`timingSafeEqual`, length-guarded first). Without this, uid 10001 (the unprivileged OpenCode agent, reachable over loopback on `:9100`) could call any of these routes itself.
+15. **One per-repo mutex, shared by every mutating route.** `repo-mutex.ts`'s `withRepoLock` serializes clone, update, recover, and backup delete against each other for the same `owner/repo`; different repositories never contend. Callers queue FIFO; a rejected operation still releases in `finally`.
+16. **A sticky maintenance hold clears only on restart.** When a subprocess's termination cannot be confirmed within its reap-grace window (SIGKILL sent, exit never observed), `markRepoHeld` (`repo-mutex.ts`) puts that repository on hold: every later mutating call refuses with `maintenance-hold`. Nothing but a workspace process restart clears it — not a timer, not a later successful operation — because a leaked subprocess's continued existence can only be ruled out by the container actually restarting.
+17. **Every update/recovery mutation is journaled before it mutates, root-owned, outside `.git/`.** `journal.ts` writes one file per repository under the state directory's `journals/` store, temp-file-and-rename. A read that finds a file it cannot parse reports `malformed`, never `absent` — callers must refuse to proceed rather than act as though nothing was in flight. `main.ts` reconciles every outstanding journal at service start; `/update` and `/recover` reconcile again at the top of each call, before anything else.
+18. **Git against an EXISTING checkout never runs as the root service, only as the agent uid.** The only git that ever runs as root with credentials is a fresh clone (in root-owned staging) or a fetch into the protected bare mirror; every git invocation against an agent-owned checkout — admission, fast-forward, the `/inspect` status call — runs as `AGENT_UID`/`AGENT_GID` through the sealed profiles in `git-safety.ts`.
+19. **A checkout or quarantine generation's size is measured without the service walking an agent-owned path directly.** `agent-walk.ts`'s `runAgentWalk` spawns the walk as the agent uid; when that is incomplete or fails, `measureSealedTree`/`measureSealedTreeFromFd` fall back to measuring the same tree through a root-opened file descriptor instead of a path lookup the agent could have manipulated between the open and the read.
 
 ## Port
 
@@ -35,6 +40,11 @@ Exposes `POST /clone` (clones a GitHub repo into `/workspace/repos/{owner}/{repo
 | GET | /readyz | none | Readiness probe — gates on OpenCode + proxy state |
 | POST | /clone | bearer | Clone a GitHub repo into the workspace |
 | POST | /inspect | bearer | Read-only observation of an existing checkout |
+| POST | /update | bearer | Admission, bare-repo fetch, pack-stream import, journaled fast-forward of an existing checkout |
+| POST | /recover/preview | bearer | Stateless preview of what `/recover` would see (fingerprint, no mutation) |
+| POST | /recover | bearer | Quarantine the existing checkout (if any) and install a fresh one at the remote's default-branch tip |
+| GET | /backups/:owner/:repo | bearer | List quarantine generations for a repository |
+| DELETE | /backups/:owner/:repo/:id | bearer | Delete one quarantine generation |
 
 Every route except `/healthz` and `/readyz` requires `Authorization: Bearer <WORKSPACE_OPENCODE_TOKEN>` — see security invariant 14 above. A missing, wrong-scheme, or wrong token returns `401 {"ok": false, "error": "unauthorized"}` before the route's own validation runs.
 
@@ -82,16 +92,43 @@ Error (400/404/409/500/504):
 {"ok": false, "error": "invalid-owner" | "invalid-repo" | "malformed-body" | "body-too-large" | "no-checkout" | "checkout-substituted" | "inspection-failed" | "inspection-timeout"}
 ```
 
+### POST /update
+
+Brings an existing, eligible checkout up to date with its remote default branch, or refuses/fails with a precise reason. Request body mirrors `/clone` (`owner`, `repo`, `token` — the network half needs the same credential). Returns the bare `UpdateResult` discriminated union directly (kind `ready` ​/ `no-checkout` / `refused` / `failed`), never a `{response, statusCode}` wrapper. A `ready` result carries checked remote evidence (branch, SHA, time observed); a `refused` reason of `maintenance-hold` means a prior operation's subprocess termination could not be confirmed — see invariant 16. Never scrubs credential patterns from the response: no `UpdateResult` variant can carry one.
+
+### POST /recover/preview
+
+Read-only, stateless preview of what `/recover` would see. Request body mirrors `/inspect` (`owner`, `repo` — no token; never touches the network). Returns a `PreviewRecoveryResult` carrying a `fingerprint` (a digest of HEAD SHA, dirty counts, and checkout size/entry count) that the caller must echo back to `/recover`.
+
+### POST /recover
+
+Confirms a previously previewed recovery: quarantines the existing checkout (if any) by `rename`, then installs a fresh default-branch checkout built entirely as root before handoff. Request body mirrors `/update` plus `fingerprint` from the preview; `/recover` recomputes the fingerprint under the repo mutex and refuses with `checkout-changed` if it differs from what the caller saw. Returns the bare `ExecuteRecoveryResult` union.
+
+### GET /backups/:owner/:repo, DELETE /backups/:owner/:repo/:id
+
+List or delete quarantine generations for a repository. `owner`/`repo` are path params, validated with the same sanitizers every other route uses; `:id` is validated as a simple path segment (no `..`, no path separator, not empty) before `deleteBackup` runs its own internal check — neither layer alone is trusted. No export and no bulk delete.
+
 ## Package layout
 
 ```
 src/
-├── main.ts         Entry point — starts server, installs SIGTERM handler
-├── server.ts       Hono app factory (exported for tests)
-├── server.test.ts  Server-level integration tests
-├── clone.ts        Core clone logic (execFile, GIT_ASKPASS, path confinement)
-├── clone.test.ts   Clone handler unit tests (mocked execFile)
-├── sanitize.ts     Input validation (sanitizeOwner, sanitizeRepo, validateTokenShape)
+├── main.ts             Entry point — starts server, installs SIGTERM handler, reconciles journals at startup
+├── server.ts           Hono app factory (exported for tests)
+├── server.test.ts      Server-level integration tests
+├── clone.ts            Core clone logic (execFile, GIT_ASKPASS, path confinement)
+├── clone.test.ts       Clone handler unit tests (mocked execFile)
+├── update.ts           /update: admission, remote observation, bare-repo fetch, pack-stream import, journaled fast-forward
+├── recover.ts          /recover/preview and /recover: fingerprint preview, quarantine-and-replace mutation
+├── backups.ts          /backups list/delete; the quarantine-generation metadata schema
+├── checkout-profile.ts Config inventory, layout, and temp-index cleanliness admission checks shared by update/recover
+├── git-safety.ts       Sealed, credential-free git invocation profiles for git against an EXISTING checkout
+├── git-stream.ts       pack-objects | index-pack streaming primitive (runPackStream)
+├── repo-mutex.ts       Per-repo operation mutex (withRepoLock) and the sticky maintenance hold (markRepoHeld)
+├── journal.ts          Root-owned update/recovery journal store, temp-file-and-rename
+├── agent-walk.ts       Agent-uid and sealed-fd checkout size/entry-count walkers
+├── identity.ts         uid/gid, home/XDG, and state-directory-name constants
+├── config.ts           Secret-file reads; egress-proxy and CA-bundle config for /update, read once at startup
+├── sanitize.ts         Input validation (sanitizeOwner, sanitizeRepo, validateTokenShape)
 ├── sanitize.test.ts Sanitization unit tests
 └── types.ts        Request/response types (shared contract with gateway workspace-api)
 ```
@@ -123,4 +160,4 @@ Steps (2) and (3) are implemented by two checked-in Node ESM helpers in `deploy/
 
 ## Idempotency
 
-If `/workspace/repos/{owner}/{repo}` already exists, `POST /clone` returns **409 repo-exists**. PR D (the gateway orchestration layer) is responsible for deciding whether to surface this as an error or treat it as a no-op. Automatic re-sync (`git fetch + reset`) is deferred to Unit 6.
+If `/workspace/repos/{owner}/{repo}` already exists, `POST /clone` returns **409 repo-exists**; the gateway orchestration layer decides whether to surface this as an error or treat it as a no-op. Automatic re-sync now exists as `POST /update` (admission-gated fast-forward, not an unconditional `git fetch + reset`) — the gateway calls it before every run, retrying through `ensureClone`/`POST /clone` only when `/update` reports `no-checkout`.

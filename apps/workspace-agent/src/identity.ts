@@ -66,6 +66,33 @@ export const WORKSPACE_STATE_DIR_NAME = '.workspace-agent'
 export const CLONE_STAGING_DIR_NAME = 'staging'
 
 /**
+ * Name of the protected bare-repo "fetch store" subdirectory under the state dir
+ * (`/workspace/repos/.workspace-agent/fetch`). Each repository's root-owned bare mirror lives at
+ * `<fetch dir>/<owner>__<repo>.git` (checkout-update-recovery plan, Key Technical Decisions:
+ * "Credentials only in a protected bare repository"). Created lazily on first update, root-owned,
+ * never agent-traversable — credentials only ever touch a fetch running against this tree.
+ */
+export const FETCH_STORE_DIR_NAME = 'fetch'
+
+/**
+ * Name of the journal-store subdirectory under the state dir
+ * (`/workspace/repos/.workspace-agent/journals`). Holds one journal file per repository with an
+ * in-flight update or recovery mutation (journal.ts), written temp-file-and-rename. Root-owned
+ * and never inside the checkout's own `.git/`, where the agent could forge one — see the plan's
+ * "Journals live under .workspace-agent/journals/" decision.
+ */
+export const JOURNAL_DIR_NAME = 'journals'
+
+/**
+ * Name of the recovery-quarantine subdirectory under the state dir
+ * (`/workspace/repos/.workspace-agent/quarantine`). A preserved checkout lands at
+ * `<quarantine dir>/<owner>__<repo>/<recovery-id>/` (checkout-update-recovery plan, Key Technical
+ * Decisions: "Recovery preserves the whole directory by rename"). Root-owned; only a completed
+ * recovery's `installing` phase ever moves content out of it into an agent-owned checkout path.
+ */
+export const QUARANTINE_DIR_NAME = 'quarantine'
+
+/**
  * Absolute path to the baked OpenCode executable inside the workspace image.
  * deploy/workspace.Dockerfile installs the release tarball via
  * `tar -xz -C /usr/local/bin -f "/tmp/${oc_asset}.tar.gz"`, so the binary always lands at

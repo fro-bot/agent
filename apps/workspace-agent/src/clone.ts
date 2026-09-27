@@ -49,7 +49,9 @@ import {promisify} from 'node:util'
 
 import {buildNeutralGitEnv, gitInvocation, runGit} from './git-safety.js'
 import {handOffToAgent} from './handoff.js'
-import {AGENT_GID, AGENT_UID, CLONE_STAGING_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {AGENT_GID, AGENT_UID, CLONE_STAGING_DIR_NAME, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
+import {readJournal} from './journal.js'
+import {repoHoldReason, repoMutexKey, withRepoLock} from './repo-mutex.js'
 
 const execFile = promisify(execFileCb)
 
@@ -178,27 +180,10 @@ process.on('exit', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Per-repo lock (serializes concurrent requests for the same owner/repo)
+// Per-repo lock (serializes concurrent requests for the same owner/repo) — shared with
+// update, recover, and backup delete via repo-mutex.ts (checkout-update-recovery plan, Key
+// Technical Decisions: "One per-repo operation mutex in the workspace").
 // ---------------------------------------------------------------------------
-
-const repoLocks = new Map<string, Promise<void>>()
-
-async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  while (repoLocks.has(key)) {
-    await repoLocks.get(key)
-  }
-  let release!: () => void
-  const lock = new Promise<void>(resolve => {
-    release = resolve
-  })
-  repoLocks.set(key, lock)
-  try {
-    return await fn()
-  } finally {
-    repoLocks.delete(key)
-    release()
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Global concurrency semaphore
@@ -294,7 +279,7 @@ export async function executeClone(request: CloneRequest, deps: CloneHandlerDeps
 
   // Global concurrency semaphore.
   const semaphoreResult = await withCloneSemaphore(maxConcurrent, maxQueueDepth, async () =>
-    withRepoLock(`${owner}/${repo}`, async () =>
+    withRepoLock(repoMutexKey(owner, repo), async () =>
       executeCloneInner(owner, repo, token, reposRoot, timeoutMs, execFileFn, mkdtempFn, gitRunner, {
         deadlineMs: handoffDeadlineMs,
         maxEntries: handoffMaxEntries,
@@ -462,6 +447,7 @@ async function executeCloneInner(
   // Root-owned staging directory, created by the entrypoint (deploy/scripts/ensure-protected-dir.mjs)
   // as 0:0 0700 — see identity.ts. On the same volume as destPath, so the publishing rename is atomic.
   const stagingRoot = join(reposRoot, WORKSPACE_STATE_DIR_NAME, CLONE_STAGING_DIR_NAME)
+  const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
 
   let askpassDir: string | null = null
   let stagingClonePath: string | null = null
@@ -471,6 +457,35 @@ async function executeCloneInner(
   const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
+    // Refuse outright if this repository is under a sticky maintenance hold (repo-mutex.ts) —
+    // before anything else, even the journal check below. A hold means some earlier operation
+    // (update.ts's `/update`, today) ended with an UNCONFIRMED subprocess termination: the service
+    // cannot rule out a leaked process still touching this repository's on-disk state, so a fresh
+    // clone must not risk racing it. Reuses `journal-in-progress`'s wire code and 409 status
+    // (rather than a new `CloneErrorCode`) because adding one would require a matching gateway
+    // mirror and drift-guard update (scripts/checkout-types-drift-guard.test.ts) that is out of
+    // scope here — see update.ts's `UpdateRefusalReason` "maintenance-hold" for the full
+    // rationale. Both codes mean the same thing to a caller: don't clone this repository right
+    // now, an earlier operation left it in an uncertain state.
+    if (repoHoldReason(repoMutexKey(owner, repo)) !== undefined) {
+      return {response: {ok: false, error: 'journal-in-progress'}, statusCode: 409}
+    }
+
+    // Refuse outright if an update or recovery journal is already outstanding for this repo —
+    // before touching anything else. A journal (found, or found but malformed — either is
+    // "outstanding", never treated the same as no journal at all, see journal.ts) means an
+    // interrupted mutation left state this clone must not silently clone over or race with; the
+    // checkout (if any) needs `/update` or `/fro-bot recover-checkout` to resolve it first, not a
+    // fresh clone. Checked under the repo mutex, so it can never race a concurrent write of the
+    // same journal.
+    const journalCheck = await readJournal(journalsDir, owner, repo)
+    if (journalCheck.ok === true || journalCheck.reason === 'malformed') {
+      return {
+        response: {ok: false, error: 'journal-in-progress'},
+        statusCode: 409,
+      }
+    }
+
     // Ensure the owner dir exists.
     await mkdir(join(reposRoot, owner), {recursive: true, mode: 0o755})
     // Idempotency: if the destination already exists, verify it is a usable git checkout —

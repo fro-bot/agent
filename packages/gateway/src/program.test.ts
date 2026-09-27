@@ -68,6 +68,21 @@ vi.mock('./discord/approvals.js', () => ({
   DENY_PREFIX: 'fb-deny:',
 }))
 
+// Stub recover-checkout / checkout-backup button routing so program.test.ts can assert wiring
+// (the right handler is called for the right customId prefix) without a live workspace/coordination stack.
+vi.mock('./discord/recover-checkout-button.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./discord/recover-checkout-button.js')>()
+  return {...actual, handleRecoverEntryButtonClick: vi.fn().mockResolvedValue(undefined)}
+})
+vi.mock('./discord/commands/recover-checkout.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./discord/commands/recover-checkout.js')>()
+  return {...actual, handleRecoverConfirmOrCancelClick: vi.fn().mockResolvedValue(undefined)}
+})
+vi.mock('./discord/commands/checkout-backup.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./discord/commands/checkout-backup.js')>()
+  return {...actual, handleBackupDeleteConfirmOrCancelClick: vi.fn().mockResolvedValue(undefined)}
+})
+
 // Stub ensureWorkspaceClone so program tests can assert wiring without live GitHub/workspace calls.
 vi.mock('./workspace-api/ensure-clone.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./workspace-api/ensure-clone.js')>()
@@ -915,6 +930,39 @@ describe('button interaction handler (approval flow)', () => {
     // #then — no auth check, no registry interaction, no reply
     expect(fakeRegistry.handleDecision).not.toHaveBeenCalled()
     expect(interaction.reply).not.toHaveBeenCalled()
+  })
+
+  it('recover-entry button customId routes to handleRecoverEntryButtonClick', async () => {
+    const {interactionHandler} = await runAndCaptureHandler()
+    const {handleRecoverEntryButtonClick} = await import('./discord/recover-checkout-button.js')
+    const interaction = makeFakeButtonInteraction({customId: 'fb-recover-entry:ch-test'})
+
+    await interactionHandler(interaction)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(handleRecoverEntryButtonClick).toHaveBeenCalledOnce()
+  })
+
+  it('recover-confirm and recover-cancel customIds route to handleRecoverConfirmOrCancelClick', async () => {
+    const {interactionHandler} = await runAndCaptureHandler()
+    const {handleRecoverConfirmOrCancelClick} = await import('./discord/commands/recover-checkout.js')
+
+    await interactionHandler(makeFakeButtonInteraction({customId: 'fb-recover-confirm:nonce-1'}))
+    await interactionHandler(makeFakeButtonInteraction({customId: 'fb-recover-cancel:nonce-1'}))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(handleRecoverConfirmOrCancelClick).toHaveBeenCalledTimes(2)
+  })
+
+  it('backup-delete-confirm and backup-delete-cancel customIds route to handleBackupDeleteConfirmOrCancelClick', async () => {
+    const {interactionHandler} = await runAndCaptureHandler()
+    const {handleBackupDeleteConfirmOrCancelClick} = await import('./discord/commands/checkout-backup.js')
+
+    await interactionHandler(makeFakeButtonInteraction({customId: 'fb-backup-delete-confirm:nonce-1'}))
+    await interactionHandler(makeFakeButtonInteraction({customId: 'fb-backup-delete-cancel:nonce-1'}))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(handleBackupDeleteConfirmOrCancelClick).toHaveBeenCalledTimes(2)
   })
 
   it('authorized approve click → handleDecision called with decision=once, ephemeral Approved.', async () => {

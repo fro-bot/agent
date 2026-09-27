@@ -359,7 +359,7 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF + repo write/admin | Submit a tool-approval decision (once/always/reject) |
 | `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run (repo-scoped read authz) |
 
-Operator contract: v1.5.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
+Operator contract: v1.8.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
 
 Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gateway restart clears all sessions (global logout).
 
@@ -494,6 +494,43 @@ WORKSPACE_EGRESS_HOSTS=cliproxy.fro.bot
 ```
 
 Leave both variables unset for a clone-only deployment: the workspace boots and serves `/clone`, but the mention loop has no model until they are configured.
+
+## Checkout Updates and Recovery
+
+Before every gateway run (Discord mention or web launch), the workspace brings the repository's checkout up to date with its remote default branch, or refuses the run and says why in the reply.
+
+### What preparation does on each run
+
+- Fetches only into a root-owned bare mirror; objects cross into the checkout as a binary pack stream, never by local fetch or alternates. Credentials never touch the agent-owned checkout.
+- Fast-forwards the checkout only when it is clean, on the default branch, and its git configuration passes a closed allowlist.
+- Already at the remote tip → reports unchanged, the same evidence path as a fast-forward.
+- Records what the run started from (branch, SHA, time observed) as checked remote evidence in the run's provenance line and prompt.
+
+### What a refusal means
+
+A refusal (dirty tree, detached HEAD, non-default branch, diverged history, unsupported git config or layout, a path obstruction, an initialized submodule, or a checkout mid-operation) stops the run before it starts. **Nothing is discarded.** The reply names `/fro-bot recover-checkout` and, on Discord, carries a one-click Recover button. A fetch or authentication failure fails the run closed too, classified permanent only on positive evidence (App access revoked) — a transient failure invites a retry on the next mention.
+
+### Recovery
+
+`/fro-bot recover-checkout`, or the Recover button on a refusal reply, previews the recovery, then — on confirmation within 60 seconds — preserves the entire checkout by same-volume rename into a quarantine backup and installs a fresh default-branch checkout. Both entry points require a fresh guild-level `ManageChannels` check, re-verified again at confirmation.
+
+### Backups
+
+`/fro-bot checkout-backup list` shows every preserved generation for the channel's bound repo (id, date, size, source branch/SHA). `/fro-bot checkout-backup delete <id>` removes one generation after a confirmation prompt — there is no export and no bulk delete.
+
+### Retention
+
+Each repository retains at most **5 generations** or **10 GiB** of preserved checkouts, whichever limit is hit first, with no automatic eviction. At the cap, recovery refuses before moving anything — delete an old backup first.
+
+### Maintenance hold
+
+If an update or recovery subprocess's termination cannot be confirmed, the workspace puts that repository on hold: every later mutating operation on it refuses until the workspace container restarts. There is no timer and no automatic clear — restart the `workspace` service.
+
+### Deploy coordination
+
+Operator contract **1.8.0** carries checked remote evidence on `checkoutProvenance` and a new optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.8.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
+
+The gateway and workspace images must roll together, for the same reason as the control-API bearer above: an older gateway does not send the bearer or request shapes a newer workspace expects, and vice versa.
 
 ## Tool approval prompts
 

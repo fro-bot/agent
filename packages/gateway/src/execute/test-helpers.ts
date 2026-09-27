@@ -455,6 +455,49 @@ export function makeInspectFn(result: 'observed' | 'unavailable' | 'checkout-sub
   return vi.fn().mockResolvedValue({success: false as const, error: {kind: 'network-error' as const}})
 }
 
+/**
+ * Mock for `RunMentionDeps.update` (Unit 7 — replaces the old `ensureClone`→`inspect` sequence).
+ * `'ready'` (the default) is the happy-path outcome that lets a run proceed to EXECUTING.
+ */
+export function makeUpdateFn(
+  result: 'ready' | 'no-checkout' | 'checkout-substituted' | 'dirty' | 'fetch-failed' | 'timeout' = 'ready',
+) {
+  if (result === 'ready') {
+    return vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {
+        kind: 'ready' as const,
+        change: 'unchanged' as const,
+        branch: 'main',
+        sha: 'a'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      },
+    })
+  }
+  if (result === 'no-checkout') {
+    return vi.fn().mockResolvedValue({success: true as const, data: {kind: 'no-checkout' as const}})
+  }
+  if (result === 'checkout-substituted') {
+    return vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {kind: 'refused' as const, reason: 'checkout-substituted' as const},
+    })
+  }
+  if (result === 'dirty') {
+    return vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {kind: 'refused' as const, reason: 'dirty' as const, changedPaths: ['a.txt']},
+    })
+  }
+  if (result === 'fetch-failed') {
+    return vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {kind: 'failed' as const, reason: 'fetch-failed' as const, mutationStarted: false, permanent: false},
+    })
+  }
+  return vi.fn().mockResolvedValue({success: false as const, error: {kind: 'timeout' as const}})
+}
+
 export function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
   return {
     coordinationConfig: {} as CoordinationConfig,
@@ -473,7 +516,7 @@ export function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDep
     statusMode: overrides.statusMode ?? 'live-status',
     ensureClone: overrides.ensureClone ?? makeEnsureCloneFn('success'),
     readyz: overrides.readyz ?? makeReadyzFn('ready'),
-    inspect: overrides.inspect ?? makeInspectFn('observed'),
+    update: overrides.update ?? makeUpdateFn('ready'),
     ...overrides,
   }
 }
