@@ -62,7 +62,8 @@ vi.mock('./program.js', () => ({
   makeDiscordClientFromConfig: vi.fn(),
   makeGatewayProgram: vi.fn(),
   makeLogger: vi.fn().mockReturnValue({
-    error: vi.fn(),
+    error: (context: Record<string, unknown>, msg: string) =>
+      console.error(JSON.stringify({level: 'error', ...context, msg})),
     info: vi.fn(),
     debug: vi.fn(),
     warn: vi.fn(),
@@ -490,6 +491,28 @@ describe('main-dispatch.ts argv dispatch', () => {
 
       // #and — process.exit was NOT called (gateway runs as a daemon)
       expect(exitSpy).not.toHaveBeenCalled()
+    } finally {
+      restore()
+    }
+  })
+
+  it('gateway startup failure does not log rejection details and exits nonzero', async () => {
+    // #given — the gateway Effect rejects with a fabricated credential-bearing error
+    const fabricatedSecret = 'FABRICATED_STARTUP_TOKEN_DO_NOT_LOG'
+    const {restore} = withArgv(['node', 'main.js'])
+    mockEffectRunPromise.mockRejectedValueOnce(new Error(`startup failed with token=${fabricatedSecret}`))
+
+    try {
+      // #when — call the real dispatcher and let its startup failure handler run
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — stderr retains fixed context but never includes rejection details
+      expect(consoleErrorSpy).toHaveBeenCalledExactlyOnceWith(
+        JSON.stringify({level: 'error', msg: 'gateway startup failed'}),
+      )
+      expect(consoleErrorSpy.mock.calls.flat().join(' ')).not.toContain(fabricatedSecret)
+      expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1)
     } finally {
       restore()
     }

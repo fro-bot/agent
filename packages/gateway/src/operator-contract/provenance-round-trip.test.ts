@@ -17,11 +17,11 @@
  * compatibility with it is exactly the seam this test exists to guard.
  */
 
-import type {CheckoutProvenance} from '../execute/provenance.js'
+import type {CheckoutPreparation, CheckoutProvenance, RemoteFreshness} from '../execute/provenance.js'
 import type {CheckoutObservation, CheckoutOperation} from '../workspace-api/types.js'
 import {describe, expect, it} from 'vitest'
 
-import {parseOperatorCheckoutProvenance} from './provenance.js'
+import {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
 
 /** Simulates the JSON round-trip `runState.details.checkoutProvenance` actually takes on disk. */
 function throughStorage(value: CheckoutProvenance): unknown {
@@ -171,5 +171,86 @@ describe('operator provenance round-trip: internal CheckoutProvenance → storag
       // #then — kind + remote survive; the DTO shape never had a `reason` field to preserve
       expect(parsed).toEqual({kind: 'unavailable', remote: {kind: 'not-checked'}})
     })
+  })
+
+  describe('observed — checked remote (1.8.0)', () => {
+    it('checked/unchanged survives the round trip', () => {
+      // #given
+      const remote: RemoteFreshness = {
+        kind: 'checked',
+        defaultBranch: 'main',
+        sha: 'a'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+        change: 'unchanged',
+      }
+      const internal: CheckoutProvenance = {
+        kind: 'observed',
+        observation: observationWith(ATTACHED_HEAD, CLEAN_WORKTREE, 'none'),
+        remote,
+      }
+
+      // #when
+      const parsed = parseOperatorCheckoutProvenance(throughStorage(internal))
+
+      // #then
+      expect(parsed).toEqual({kind: 'observed', observation: internal.observation, remote})
+    })
+
+    it('checked/fast-forward survives the round trip, including fromSha', () => {
+      // #given
+      const remote: RemoteFreshness = {
+        kind: 'checked',
+        defaultBranch: 'main',
+        sha: 'b'.repeat(40),
+        checkedAt: '2026-01-01T00:00:00.000Z',
+        change: 'fast-forward',
+        fromSha: 'a'.repeat(40),
+      }
+      const internal: CheckoutProvenance = {
+        kind: 'observed',
+        observation: observationWith(ATTACHED_HEAD, CLEAN_WORKTREE, 'none'),
+        remote,
+      }
+
+      // #when
+      const parsed = parseOperatorCheckoutProvenance(throughStorage(internal))
+
+      // #then
+      expect(parsed).toEqual({kind: 'observed', observation: internal.observation, remote})
+    })
+  })
+})
+
+/** Simulates the JSON round-trip `runState.details.checkoutPreparation` actually takes on disk. */
+function preparationThroughStorage(value: CheckoutPreparation): unknown {
+  return JSON.parse(JSON.stringify(value)) as unknown
+}
+
+describe('operator preparation round-trip: internal CheckoutPreparation → storage → OperatorCheckoutPreparation', () => {
+  it.each<[string, CheckoutPreparation]>([
+    ['needs-recovery', {outcome: 'refused', reason: 'needs-recovery'}],
+    ['checkout-substituted', {outcome: 'refused', reason: 'checkout-substituted'}],
+    ['unsupported-layout', {outcome: 'refused', reason: 'unsupported-layout', layoutReason: 'bare-repository'}],
+    ['unsupported-config', {outcome: 'refused', reason: 'unsupported-config', disallowedKeys: ['url.x.insteadOf']}],
+    ['operation-in-progress', {outcome: 'refused', reason: 'operation-in-progress', operation: 'rebase'}],
+    ['dirty', {outcome: 'refused', reason: 'dirty', changedPaths: ['a.txt', 'b.txt']}],
+    ['submodule-initialized', {outcome: 'refused', reason: 'submodule-initialized', submodules: ['libs/x']}],
+    ['detached', {outcome: 'refused', reason: 'detached'}],
+    ['non-default-branch', {outcome: 'refused', reason: 'non-default-branch', branch: 'feature/x'}],
+    ['diverged', {outcome: 'refused', reason: 'diverged'}],
+    ['ahead', {outcome: 'refused', reason: 'ahead'}],
+    ['obstructed', {outcome: 'refused', reason: 'obstructed', obstructions: [{path: 'a.txt', kind: 'exact-conflict'}]}],
+    ['maintenance-hold', {outcome: 'refused', reason: 'maintenance-hold'}],
+    ['failed', {outcome: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false}],
+    [
+      'failed with mutationStarted possibly',
+      {outcome: 'failed', reason: 'termination-unconfirmed', mutationStarted: 'possibly', permanent: false},
+    ],
+  ])('%s survives the round trip', (_label, internal) => {
+    // #when
+    const parsed = parseOperatorCheckoutPreparation(preparationThroughStorage(internal))
+
+    // #then
+    expect(parsed).toEqual(internal)
   })
 })

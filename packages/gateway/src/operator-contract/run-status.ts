@@ -30,16 +30,22 @@
 
 import type {RunPhase, RunState, Surface} from '@fro-bot/runtime'
 import type {RunCoreErrorKind} from '../execute/run-core.js'
-import type {OperatorCheckoutProvenance} from './provenance.js'
+import type {OperatorCheckoutPreparation, OperatorCheckoutProvenance} from './provenance.js'
 
-import {parseOperatorCheckoutProvenance} from './provenance.js'
+import {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
 
 export type {
   OperatorCheckoutHead,
   OperatorCheckoutObservation,
   OperatorCheckoutOperation,
+  OperatorCheckoutPreparation,
+  OperatorCheckoutPreparationFailed,
+  OperatorCheckoutPreparationRefused,
   OperatorCheckoutProvenance,
+  OperatorLayoutRefusalReason,
+  OperatorObstructionKind,
   OperatorRemoteFreshness,
+  OperatorUpdateFailureReason,
   OperatorWorktreeState,
 } from './provenance.js'
 export type {RunPhase, Surface} from '@fro-bot/runtime'
@@ -86,6 +92,16 @@ export interface OperatorRunStatus {
    * mid-run changes it; this describes the starting point only.
    */
   readonly checkoutProvenance?: OperatorCheckoutProvenance
+  /**
+   * What preparation reported when it refused or failed BEFORE the run reached EXECUTING (contract
+   * 1.8.0). Mutually exclusive with `checkoutProvenance` in practice — a run either reached
+   * EXECUTING (provenance, no preparation) or it didn't (preparation, no provenance) — but the two
+   * fields are independent, unrelated optionals on this type, not a discriminated pair; nothing
+   * here enforces that exclusivity structurally. Absent for a run that reached EXECUTING, one that
+   * predates this contract version, or a malformed stored value. Never a claim about a LATER retry
+   * of the same run — each run attempt is its own record.
+   */
+  readonly checkoutPreparation?: OperatorCheckoutPreparation
 }
 
 /**
@@ -263,6 +279,11 @@ export const toOperatorRunStatus = (
   // collapse to `undefined` — the same "no provenance recorded" state.
   const checkoutProvenance = parseOperatorCheckoutProvenance(runState.details.checkoutProvenance)
 
+  // checkoutPreparation (1.8.0): populated the same defensive way as checkoutProvenance — parsed
+  // (never cast) from untrusted `details`, absent for a pre-existing run, a run that reached
+  // EXECUTING, or a malformed stored value.
+  const checkoutPreparation = parseOperatorCheckoutPreparation(runState.details.checkoutPreparation)
+
   // #when projecting — map only operator-safe fields; internal fields are never read
   return {
     runId: runState.run_id,
@@ -276,5 +297,6 @@ export const toOperatorRunStatus = (
     stale,
     ...(failureKind === undefined ? {} : {failureKind}),
     ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
+    ...(checkoutPreparation === undefined ? {} : {checkoutPreparation}),
   }
 }
