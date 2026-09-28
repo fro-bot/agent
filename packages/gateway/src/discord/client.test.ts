@@ -21,9 +21,10 @@ import {validateTokenIsFake} from './test-token-guard.js'
  * `discord.js`) and compare directly.
  */
 function expectClientIntents(client: Client, expected: readonly GatewayIntentBits[]): void {
-  const expectedBitfield = new (
+  const IntentsBitFieldCtor = (
     client.options.intents as unknown as {constructor: new (bits: readonly GatewayIntentBits[]) => {bitfield: number}}
-  ).constructor(expected).bitfield
+  ).constructor
+  const expectedBitfield = new IntentsBitFieldCtor(expected).bitfield
   expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
 }
 
