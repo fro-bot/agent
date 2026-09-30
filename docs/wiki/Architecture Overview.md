@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-09-20"
-updated-by: "schedule-d7190410-35540552880"
+last-updated: "2026-09-27"
+updated-by: "e6efc1f1"
 sources:
   - src/main.ts
   - src/post.ts
@@ -41,10 +41,15 @@ sources:
   - apps/workspace-agent/src/main.ts
   - apps/workspace-agent/src/server.ts
   - apps/workspace-agent/src/opencode-server.ts
+  - apps/workspace-agent/src/update.ts
+  - apps/workspace-agent/src/recover.ts
+  - apps/workspace-agent/src/journal.ts
+  - apps/workspace-agent/src/handoff.ts
+  - packages/gateway/src/workspace-api/client.ts
   - AGENTS.md
   - action.yaml
   - bunfig.toml
-summary: "Monorepo structure, action + harness + gateway + workspace-agent packages, and module map"
+summary: "Monorepo structure, module map, and the boundary between gateway execution and workspace checkout management"
 ---
 
 # Architecture Overview
@@ -61,7 +66,7 @@ The project is organized as a Bun workspace monorepo with two workspace areas:
 | `@fro.bot/harness` | `packages/harness/` | Published, patched OpenCode binary built via LLM-merge integration. Acts as a drop-in replacement for the stock OpenCode CLI in the action setup. Ships as a main package plus per-platform binary packages (`@fro.bot/harness-linux-x64`, etc.). |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord gateway daemon. Listens for Discord mentions and slash commands, acquires the per-repo coordination lock, and dispatches agent runs via the runtime. Built with Effect for typed error handling and structured concurrency. |
 | Action root | `src/` + `apps/action/` | The GitHub Action itself. Contains the harness (orchestration phases), features (triggers, comments, reviews, observability), and service adapters (GitHub API, cache, setup). Imports `@fro-bot/runtime` for core logic. |
-| workspace-agent | `apps/workspace-agent/` | Sandboxed Hono HTTP service that runs inside the Docker Compose deploy stack alongside the gateway. Provides a `POST /clone` endpoint to checkout repositories in an isolated container (keeping git credentials off the gateway), and hosts a loopback-bound OpenCode server fronted by a bearer-token proxy for the gateway to attach to. Also exposes `GET /healthz` for Docker Compose health checks. |
+| workspace-agent | `apps/workspace-agent/` | Sandboxed Hono HTTP service alongside the gateway. It clones, inspects, updates, and recovers checkouts in the workspace container; hosts an unprivileged OpenCode process behind a bearer-token proxy; and exposes health/readiness probes. |
 
 The `apps/action/` directory holds the thinnest possible entry points — `main.ts` and `post.ts` — which simply re-export from `src/main.ts` and `src/post.ts`. The split exists to support multiple surfaces (the Discord gateway and workspace-agent are now live) that share the runtime package but have their own entry points.
 
@@ -105,7 +110,7 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 
 **Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention or a web launch. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits via a serial queue (`queue.ts`), and `recovery.ts` handles interrupted runs. An in-memory abort registry (`abort-registry.ts`) plus `cancel.ts` back operator-initiated cancellation: a run registered under its `runId` can be aborted mid-flight and settles as `CANCELLED` rather than `FAILED` (see [[Operator Web Control Surface]]). `run-core.ts` also counts inbound events so a stalled run can be distinguished from a lost-event timeout. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
 
-The gateway has no separate drain stage because it does not need one: `run-core.ts` does not return until the run's ownership ledger drains, so the heartbeat stop, terminal transition, and concurrency-slot handoff in `run.ts` all happen after owned background work has settled. `settle-owned-sessions.ts` is the termination barrier every post-ledger error passes through — it aborts unsettled sessions, confirms by reconciliation rather than trusting the abort response, and re-raises the original error marked *quarantined* when it cannot confirm. A quarantined failure holds the channel's slot for a bounded window instead of handing the workspace to the next queued run. `recovery.ts` reads persisted ownership back on restart and refuses to release a stale run's lock when the claim names work it cannot verify is finished. See [[Background Subagents and Ownership]].
+The gateway has no separate drain stage because it does not need one: `run-core.ts` does not return until the run's ownership ledger drains, so the heartbeat stop, terminal transition, and concurrency-slot handoff in `run.ts` all happen after owned background work has settled. `settle-owned-sessions.ts` is the termination barrier every post-ledger error passes through — it aborts unsettled sessions, confirms by reconciliation rather than trusting the abort response, and re-raises the original error marked _quarantined_ when it cannot confirm. A quarantined failure holds the channel's slot for a bounded window instead of handing the workspace to the next queued run. `recovery.ts` reads persisted ownership back on restart and refuses to release a stale run's lock when the claim names work it cannot verify is finished. See [[Background Subagents and Ownership]].
 
 **Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
 
@@ -113,7 +118,7 @@ The gateway has no separate drain stage because it does not need one: `run-core.
 
 **Web** (`web/`, `operator-contract/`) — The authenticated operator web control surface: a browser-facing Hono server that lets a signed-in human launch, observe, and approve tool use within agent runs over HTTP and Server-Sent Events. It owns GitHub OAuth, server-side sessions, a numeric-user-ID allowlist, per-repo authorization, CSRF protection, the SSE observation pipeline, and a web tool-approval flow that drives the same approval registry as Discord — all speaking a frozen operator contract. Routes are mounted through a dependency-gated registration seam whose inventory is verified by an offline smoke check, so a missing dependency surfaces as a build failure rather than a silently absent endpoint. This is a second entry point into the same execution engine the Discord mention handler uses. See [[Operator Web Control Surface]].
 
-**Workspace API** (`workspace-api/`) — Client for calling the workspace-agent's clone and OpenCode-proxy endpoints (`client.ts`, `types.ts`).
+**Workspace API** (`workspace-api/`) — Typed client for the workspace-agent's clone, inspect, update, recovery, backup, and readiness endpoints (`client.ts`, `types.ts`). Before a gateway run begins, checkout preparation calls update under the repository lock and only falls back to clone when no checkout exists. The workspace service owns the mutation, journal, and per-repository mutex; the gateway owns admission and the resulting run-state record (see [[Operator Web Control Surface]]).
 
 **Bindings** (`bindings/`) — Channel-to-repository binding store. Maps Discord channel IDs to the GitHub repository they operate on. Backed by S3 so bindings survive restarts.
 
@@ -125,7 +130,11 @@ The gateway runs as a Docker container alongside sidecars: the workspace-agent, 
 
 ### Workspace-Agent (`apps/workspace-agent/`)
 
-The workspace-agent is a sandboxed Hono HTTP service that runs as a sidecar to the gateway. It owns two responsibilities: cloning repositories into an isolated container (`POST /clone`, keeping git credentials off the gateway), and hosting a remote OpenCode server that the gateway attaches to for agent execution. The OpenCode server (`opencode-server.ts`) binds to loopback only; a bearer-token proxy (`opencode-proxy.ts`) is the sole externally-reachable surface, ensuring the raw OpenCode port is never exposed on the sandbox network. The gateway attaches to this remote server via `createRemoteOpenCodeHandle()` in the runtime package — a handle whose `close`/`shutdown` are no-ops because the gateway does not own the remote server.
+The control API (`server.ts`) clones repositories (`POST /clone`), inspects checkouts (`POST /inspect`), brings eligible default-branch checkouts forward (`POST /update`), previews and performs preserve-and-replace recovery, and lists or deletes retained backups. Control routes require the gateway's bearer; health and readiness do not. A per-repo mutex serializes mutations, and root-owned journals outside the checkout record update/recovery progress so interrupted work is reconciled before another mutation. Recovery moves the old tree into quarantine before publishing a fresh checkout rather than discarding it. These boundaries let the gateway coordinate runs without manipulating the checkout itself.
+
+The service retains root authority for protected staging, journal, and network fetch operations, but the OpenCode server and its tools run under a separate unprivileged identity. Fresh clones are staged in a root-owned directory and handed off through a symlink-safe filesystem walk; git operations against an existing agent-owned checkout run as that agent identity. See [[Setup and Configuration]] for the deployment boundary.
+
+The OpenCode server (`opencode-server.ts`) binds to loopback only; a bearer-token proxy (`opencode-proxy.ts`) is its externally reachable surface on the sandbox network. The gateway attaches through `createRemoteOpenCodeHandle()` in the runtime package — a handle whose `close`/`shutdown` are no-ops because the gateway does not own the remote server process.
 
 ### Runtime Package (`packages/runtime/`)
 

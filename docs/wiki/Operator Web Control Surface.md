@@ -1,10 +1,12 @@
 ---
 type: subsystem
-last-updated: "2026-09-20"
-updated-by: "schedule-d7190410-35540552880"
+last-updated: "2026-09-27"
+updated-by: "e6efc1f1"
 sources:
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/run-core.ts
+  - packages/gateway/src/execute/provenance.ts
+  - packages/gateway/src/execute/preparation-reply.ts
   - packages/gateway/src/execute/recovery.ts
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/web/operator-route.ts
@@ -51,14 +53,18 @@ sources:
   - packages/gateway/src/operator-contract/approval-frame.ts
   - packages/gateway/src/operator-contract/output.ts
   - packages/gateway/src/operator-contract/run-status.ts
+  - packages/gateway/src/operator-contract/provenance.ts
   - packages/gateway/src/operator-contract/run-summary.ts
   - packages/gateway/src/execute/cancel.ts
   - packages/gateway/src/execute/abort-registry.ts
+  - packages/gateway/src/workspace-api/client.ts
+  - apps/workspace-agent/src/update.ts
+  - apps/workspace-agent/src/recover.ts
   - packages/gateway/src/operator-contract/redaction.ts
   - packages/gateway/src/operator-contract/repo-summary.ts
   - packages/gateway/src/operator-contract/version.ts
   - docs/decisions/2026-06-19-s2-operator-auth-authority.md
-summary: "Authenticated browser surface that lets operators launch, dispatch, observe, and approve gateway agent runs over HTTP and SSE"
+summary: "Authenticated browser surface for gateway runs, including checkout provenance, preparation outcomes, and live observation"
 ---
 
 # Operator Web Control Surface
@@ -122,6 +128,14 @@ The browser guard validates Fetch Metadata headers and an HMAC-signed CSRF token
 
 ## Launching a Run
 
+### Checkout preparation and recovery
+
+Gateway runs prepare the persistent checkout before the `EXECUTING` transition, under the shared repository lock (`execute/run.ts`, `workspace-api/client.ts`). Preparation asks the workspace-agent to update first; only a `no-checkout` result leads to a fresh clone and another update. A ready result includes remote default-branch evidence and a starting checkout observation. The engine records this as checkout provenance on the run and adds a deterministic line to its human reply, rather than trusting model-generated claims about what commit it saw. An ineligible tree — dirty, detached, on another branch, diverged, or obstructed — ends the run before execution; an uncertain network or apply result is recorded as a failure, not silently treated as a clean checkout. See [[Architecture Overview]] for the workspace-side mutation boundary.
+
+The gateway's Discord recovery command and its Recover button preview a preserve-and-replace operation before confirmation. The workspace-agent checks that the checkout still matches the preview fingerprint, moves the existing tree into a quarantine backup, and publishes a fresh default-branch checkout. Per-repository mutexes and persisted journals prevent another mutation from racing the operation or treating an interrupted update as a clean starting state (`apps/workspace-agent/src/recover.ts`, `apps/workspace-agent/src/update.ts`). If a subprocess cannot be confirmed stopped, the workspace holds that repository against further mutation until restart. The gateway's run lock and the workspace mutex protect different boundaries: cross-surface execution and local checkout operations, respectively.
+
+### Browser launch
+
 `POST /operator/runs` (`web/operator/launch-route.ts`) is a fire-and-return endpoint: the operator submits a repository and a prompt, and the server responds `202` with a `runId` almost immediately, leaving the operator to observe progress over SSE. Before anything launches, the request passes an ordered gauntlet: the browser guard, an operator-keyed rate limit, OAuth-token resolution from the session, body validation, **server-owned binding resolution** (the client names a repo but the server resolves the actual binding — client-supplied paths or owners are ignored), a denylist check that runs _before_ the authorization call, the repo-authorization check, and finally a per-operator idempotency guard.
 
 The idempotency guard (`web/operator/idempotency.ts`) namespaces its key by the operator's numeric ID (`{githubUserId}:{clientKey}`), so one operator can never suppress another's launch. It uses a two-phase reserve-then-commit lifecycle: the key is reserved before `launchWork` is called and committed only on success, so a concurrent duplicate during the reservation window is recognized as in-flight rather than launching the work twice. On rejection the reservation is rolled back so no dead `runId` is echoed.
@@ -172,7 +186,7 @@ Fan-out is handled by an in-memory observation manager (`web/sse/manager.ts`). T
 
 ## The Operator Contract
 
-The types crossing this boundary are defined once, in `packages/gateway/src/operator-contract/`, and treated as a frozen surface. The contract version (`version.ts`, currently `1.8.0`) is pinned at build time and never negotiated over the wire — clients cannot ask for an older shape. The version follows a deliberate increment policy: a major bump for any breaking change (a removed, renamed, or narrowed field), a minor bump for additive changes (a new optional field or a new type such as the `RunSummary` and approval-frame shapes), and a patch bump for documentation only. The version is also emitted (emit-only, never read from the wire) on the public health-check body, so operators can probe the deployed contract version without authenticating; note that adding that health field was treated as non-structural and did _not_ itself bump the contract version, because the dashboard enforces a fail-closed drift gate on the SSE ready-frame version. Two normative obligations are encoded directly in the contract (`redaction.ts`):
+The types crossing this boundary are defined once, in `packages/gateway/src/operator-contract/`, and treated as a frozen surface. The contract version (`version.ts`, currently `1.8.0`) is pinned at build time and never negotiated over the wire — clients cannot ask for an older shape. The version follows a deliberate increment policy: a major bump for any breaking change (a removed, renamed, or narrowed field), a minor bump for additive changes (a new optional field or a new type such as the `RunSummary` and approval-frame shapes), and a patch bump for documentation only. The version is also emitted (emit-only, never read from the wire) on the public health-check body, so operators can probe the deployed contract version without authenticating; note that adding that health field was treated as non-structural and did _not_ itself bump the contract version, because the dashboard enforces a fail-closed drift gate on the SSE ready-frame version. Contract 1.8.0 additionally carries validated checkout provenance for executing runs and a separate, bounded preparation reason for runs refused or failed before execution (`operator-contract/provenance.ts`); absent or malformed stored records never turn into a claim of freshness. Two normative obligations are encoded directly in the contract (`redaction.ts`):
 
 - **Redaction obligation** — denylisted repositories must be excluded _before_ any per-repo query, not filtered at render time. Deny-key matching tolerates GitHub node-ID format skew by deriving the numeric database ID, and an entry with no usable deny key (or an unreadable denylist) must deny rather than leak. Redaction composes with repository authorization: authorization proves an operator _may_ see a repo, redaction proves the repo _is not hidden by policy_, and both must pass.
 - **Authorization obligation** — operator identity is always constructed server-side from the authenticated session and is never deserialized from a request payload, and approval/launch decisions must carry a transport-bound identity rather than a free-form caller string.
@@ -181,7 +195,7 @@ The projection helper (`sse/projection.ts`) enforces redaction structurally: it 
 
 The run-listing surface uses a deliberately leaner shape, `RunSummary` (`run-summary.ts`), which carries the `owner/repo` resolved from the binding rather than the internal entity reference. Both projections are pure and total: each returns nothing — rather than a partially-redacted record — whenever a repository is denylisted or a run's stored identity contradicts its binding, so callers skip the null and never render leaked or inconsistent data.
 
-When a run fails, both projections may carry a `failureKind` — a coarse, sanitized reason drawn from a small closed vocabulary (`OperatorFailureKind` in `run-status.ts`): the two timeout variants (`inactivity-timeout`, `max-duration-timeout`), `stream-ended`, `workspace-unreachable`, `session-error`, and an `unknown` fallback. The mapping from the engine's richer internal error kinds is an explicit allowlist, so any unrecognized or unmapped internal kind collapses to `unknown` rather than leaking implementation detail. A pre-acknowledgement startup failure surfaces as `workspace-unreachable`. The kind is persisted on the `FAILED` run-state transition and projected onto the operator surface, giving operators a stable, non-sensitive signal about _why_ a run ended without exposing stack traces or internal vocabulary.
+When a run fails, both projections may carry a `failureKind` — a coarse, sanitized reason drawn from a small closed vocabulary (`OperatorFailureKind` in `run-status.ts`): the two timeout variants (`inactivity-timeout`, `max-duration-timeout`), `stream-ended`, `workspace-unreachable`, `session-error`, `checkout-substituted`, `workspace-unavailable`, and an `unknown` fallback. The last two distinguish an untrustworthy checkout from unavailable workspace control; neither is falsely described as an ordinary transient OpenCode failure. The mapping from the engine's richer internal error kinds is an explicit allowlist, so any unrecognized or unmapped internal kind collapses to `unknown` rather than leaking implementation detail. A pre-acknowledgement startup failure surfaces as `workspace-unreachable`. The kind is persisted on the `FAILED` run-state transition and projected onto the operator surface, giving operators a stable, non-sensitive signal about _why_ a run ended without exposing stack traces or internal vocabulary.
 
 The engine's newer `drain-timeout` kind — a run whose deadline expired while it was still waiting for background subagent work to settle — is mapped onto the existing `max-duration-timeout` rather than given a vocabulary entry of its own. That is a judgment about what the operator surface is for: a run's deadline covers execution and drain together, so from an operator's point of view it is the same wall-clock story, and the distinction only matters to someone reading the engine's logs. The internal-to-operator mapping table is exhaustiveness-checked against the internal kind union, so a future kind added without a mapping decision fails the type check rather than silently collapsing to `unknown`.
 
