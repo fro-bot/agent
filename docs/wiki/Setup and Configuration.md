@@ -1,12 +1,14 @@
 ---
 type: subsystem
-last-updated: "2026-09-20"
-updated-by: "schedule-d7190410-35540552880"
+last-updated: "2026-09-27"
+updated-by: "e6efc1f1"
 sources:
   - src/harness/config/outputs.ts
   - packages/runtime/src/agent/attachment-dir.ts
   - deploy/scripts/merge-config.mjs
   - deploy/workspace.Dockerfile
+  - deploy/workspace-entrypoint.sh
+  - deploy/compose.yaml
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
   - src/services/setup/systematic-config.ts
@@ -104,19 +106,19 @@ These can be overridden per-run via action inputs (`opencode-version`, `omo-vers
 
 Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
 
-The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.29+harness.88b6b5fb`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.30+harness.7c479429`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.18.29`) published by the `anomalyco/opencode` project. A _harness_ version carries a `harness.<sha>` suffix (for example `1.18.29+harness.88b6b5fb`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The carry set spans provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, several memory-leak and stability patches, a bound on the plugin npm install, and OpenAI-family prompt-cache and version-gate corrections; as the base advances up the `1.18.x` line, superseded and low-value carries are retired so the set stays lean. The exact carry set is defined in the `integrationRefs` list of `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.18.30`) published by the `anomalyco/opencode` project. A _harness_ version carries a `harness.<sha>` suffix (for example `1.18.30+harness.7c479429`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The carry set spans provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, several memory-leak and stability patches, a bound on the plugin npm install, and OpenAI-family prompt-cache and version-gate corrections; as the base advances up the `1.18.x` line, superseded and low-value carries are retired so the set stays lean. The exact carry set is defined in the `integrationRefs` list of `packages/harness/harness.config.json`; the action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
 ### Two Spellings of the Same Build
 
 A harness build has one identity but two written forms, and understanding why they differ explains most of the surrounding machinery.
 
-The **build-metadata form** — `1.18.29+harness.88b6b5fb` — is what the binary self-reports and what the version pin in `packages/runtime/src/shared/constants.ts` records. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
+The **build-metadata form** — `1.18.30+harness.7c479429` — is what the binary self-reports and what the version pin in `packages/runtime/src/shared/constants.ts` records. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
 
-The **prerelease form** — `1.18.29-harness.88b6b5fb` — is the published GitHub release tag, the npm package version, and the tool-cache key.
+The **prerelease form** — `1.18.30-harness.7c479429` — is the published GitHub release tag, the npm package version, and the tool-cache key.
 
 The prerelease form is not cosmetic. Harness releases live in the same tag namespace as the action's own `v0.x` product releases, and that namespace has two adversarial readers. Semantic-release scans tags matching `^v(.+)` to compute the next product version, so harness tags dropped the `v` prefix in mid-2026 to stay invisible to it. But bare-semver tags with build metadata created a second problem: because SemVer strips build metadata for precedence, Renovate's `github-tags` datasource — which discovers candidates from git tags, not release objects — read `1.18.21+harness.22dee0ee` as a _stable_ `1.18.21` that outranked the real `v0.x` action line, quietly breaking grouped update branches in consuming repositories. Marking the GitHub release object as a prerelease does not help, because candidate discovery never looks at release objects.
 
@@ -132,7 +134,7 @@ Moving the tag to a genuine SemVer prerelease identifier fixes it at the level o
 
 - **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build metadata and would collapse a harness build onto a stock cache entry of the same base version. The prerelease form survives `semver.clean()` intact, so using it as the cache key guarantees a harness build and a stock build of the same base version never share a cache slot. Logs and the binary's own `--version` output keep the build-metadata form.
 
-If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`, currently `1.18.29`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
+If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`, currently `1.18.30`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
 
 Because the tag shape is now load-bearing for two external tools and is derived in more than one place — the release workflow, the npm version builder, and the setup module — the test suite carries drift guards that read the repository's source text and fail if one producer is changed without the others. These guards exist because an earlier mirrored copy of the harness-version predicate asserted the opposite of production behavior and still passed, testing its own copy rather than the module.
 
@@ -165,8 +167,8 @@ The CI config built by `buildCIConfig()` ensures OpenCode operates correctly in 
 - **Auto-update disabled** — Prevents OpenCode from trying to update itself mid-run.
 - **Systematic plugin injected** — Ensures `@fro.bot/systematic@{version}` is registered as an OpenCode plugin. The version is pinned to prevent drift.
 - **Permission defaults hardened** — The config bakes in deny rules so the run never stalls on an interactive permission prompt it cannot answer. The `doom_loop` native ask defaults to `deny`, secret-shaped file reads (`*.env`, `*.env.*`) are denied while `*.env.example` stays readable, and edits are scoped to the workspace and any designated external directory. These defaults pair with the runtime's ask-answering behavior described in [[Execution Lifecycle]]: an ask that still reaches the agent is denied and logged rather than left to block until the execution deadline.
-- **Subagent depth pinned to one** — Set unconditionally in every mode, overriding any operator value with a logged warning. This is the project's one deliberate exception to "an explicit operator value wins," and the reason is structural rather than stylistic: upstream cancellation walks only *running* jobs, so at depth greater than one a completed child linking the root to a still-running grandchild is never walked, and the grandchild can outlive a cancellation meant to stop it. Depth one makes that path unreachable instead of requiring the harness to build a session-tree traversal of its own. The workspace container applies the same pin through its own config merge (`deploy/scripts/merge-config.mjs`), so both surfaces agree.
-- **Attachment directory granted** — A permission entry admits reads and writes under this run attempt's attachment directory. It is applied at the *top-level global* permission key, not only on the `build` agent, because a dispatched subagent inherits its parent session's resolved rules and would otherwise be unable to reach materialized files; the `build` agent's own block re-asserts the same pattern, since its catch-all deny would shadow the global grant under upstream's flattened evaluation. The grant names the specific run-attempt directory rather than the shared parent segment — a wildcard compiles to a pattern that matches path separators, so a segment-wide grant would let a sibling run on a persistent or self-hosted runner read this run's attachments and plant symlinks there.
+- **Subagent depth pinned to one** — Set unconditionally in every mode, overriding any operator value with a logged warning. This is the project's one deliberate exception to "an explicit operator value wins," and the reason is structural rather than stylistic: upstream cancellation walks only _running_ jobs, so at depth greater than one a completed child linking the root to a still-running grandchild is never walked, and the grandchild can outlive a cancellation meant to stop it. Depth one makes that path unreachable instead of requiring the harness to build a session-tree traversal of its own. The workspace container applies the same pin through its own config merge (`deploy/scripts/merge-config.mjs`), so both surfaces agree.
+- **Attachment directory granted** — A permission entry admits reads and writes under this run attempt's attachment directory. It is applied at the _top-level global_ permission key, not only on the `build` agent, because a dispatched subagent inherits its parent session's resolved rules and would otherwise be unable to reach materialized files; the `build` agent's own block re-asserts the same pattern, since its catch-all deny would shadow the global grant under upstream's flattened evaluation. The grant names the specific run-attempt directory rather than the shared parent segment — a wildcard compiles to a pattern that matches path separators, so a segment-wide grant would let a sibling run on a persistent or self-hosted runner read this run's attachments and plant symlinks there.
 
 Two experimental OpenCode behaviors are set through the environment at server spawn (`packages/runtime/src/agent/server.ts`) rather than through config, because there is no config-file equivalent for either. Background subagent dispatch is enabled — the single switch that makes detached `task` dispatch reachable at all, and the reason the drain phase exists (see [[Background Subagents and Ownership]]). The file watcher is disabled, because nothing in this project consumes file-change events; both surfaces read only message and tool lifecycle events, so the watcher is pure overhead. The accepted tradeoff is that OpenCode caches the VCS branch and refreshes that cache from watcher events, so the cached branch can go stale after a checkout — more visible on the long-lived workspace container than in short-lived CI.
 
@@ -178,6 +180,12 @@ The final config is the result of merging:
 - In plugin-enabled mode: CI config (with `default_agent` pinned to `"orchestrator"` for OMO Slim, or left unpinned so oMo selects Sisyphus) + existing `opencode.json` (from the installer) + user-provided `opencode-config` input.
 
 User values win on conflicts. In default mode, `oh-my-openagent` and `oh-my-opencode-slim` plugin entries in user config are stripped with a warning.
+
+### Workspace identity and control API
+
+The deployed workspace splits authority between the service and the model-driven process. The workspace-agent retains the privileges needed for protected clone staging, journals, and network fetches; the OpenCode process and its tools run as an unprivileged account. On startup the entrypoint migrates existing root-owned checkouts through a symlink-aware filesystem handoff, while protected secrets and state remain under root-owned paths (`deploy/workspace-entrypoint.sh`, `deploy/compose.yaml`). Fresh clones are handed off before agent execution. This keeps the checkout writable by the agent without giving it ownership of the credential and maintenance directories.
+
+The same bearer used by the gateway to attach to the OpenCode proxy on port 9200 also protects the workspace control API on port 9100. Clone, inspect, update, recovery, and backup routes check it before parsing request bodies; only health and readiness are unauthenticated (`apps/workspace-agent/src/server.ts`). Without that boundary, an agent tool running inside the container could call the loopback control API to mutate its own checkout outside the gateway's admission path. [[Architecture Overview]] describes how the gateway and workspace divide checkout preparation.
 
 ## Tools Cache
 

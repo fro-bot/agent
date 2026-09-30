@@ -1,6 +1,17 @@
 ---
-type: index
-last-updated: "2026-09-20"
+type: architecture
+last-updated: "2026-09-27"
+updated-by: "e6efc1f1"
+sources:
+  - docs/wiki/Architecture Overview.md
+  - docs/wiki/Background Subagents and Ownership.md
+  - docs/wiki/Conventions and Patterns.md
+  - docs/wiki/Execution Lifecycle.md
+  - docs/wiki/Operator Web Control Surface.md
+  - docs/wiki/Prompt Architecture.md
+  - docs/wiki/Session Persistence.md
+  - docs/wiki/Setup and Configuration.md
+  - docs/wiki/Troubleshooting.md
 summary: "Navigable entry point for the Fro Bot Agent project wiki"
 ---
 
@@ -16,7 +27,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 | Page | Type | Summary |
 | --- | --- | --- |
-| [Architecture Overview](Architecture%20Overview.md) | architecture | Monorepo structure, action + harness + gateway + workspace-agent packages, and module map |
+| [Architecture Overview](Architecture%20Overview.md) | architecture | Monorepo structure, module map, and the boundary between gateway execution and workspace checkout management |
 | [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Phase-by-phase walkthrough of a single action run, from bootstrap through drain, review reconciliation, brokered push, and the final invocation outcome |
 
 ### Subsystems
@@ -27,7 +38,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | [Background Subagents and Ownership](Background%20Subagents%20and%20Ownership.md) | subsystem | How the harness tracks, drains, and settles background subagent work that outlives the turn that dispatched it |
 | [Prompt Architecture](Prompt%20Architecture.md) | subsystem | How the multi-section XML-tagged prompt is assembled and why each section exists |
 | [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Tool installation, configuration assembly, credential management, cache strategy, and oMo opt-in |
-| [Operator Web Control Surface](Operator%20Web%20Control%20Surface.md) | subsystem | Authenticated browser surface that lets operators launch, dispatch, observe, and approve gateway agent runs over HTTP and SSE |
+| [Operator Web Control Surface](Operator%20Web%20Control%20Surface.md) | subsystem | Authenticated browser surface for gateway runs, including checkout provenance, preparation outcomes, and live observation |
 
 ### Conventions
 
@@ -39,7 +50,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 | Page | Type | Summary |
 | --- | --- | --- |
-| [Troubleshooting](Troubleshooting.md) | guide | Diagnosing common Fro Bot Agent failures — no response, cache persistence, setup and install errors, timeouts, incomplete invocations, brokered push, and a known gateway test flake |
+| [Troubleshooting](Troubleshooting.md) | convention | Common failure symptoms and their causes across action execution, persistence, setup, and gateway runs |
 
 ## About This Wiki
 
