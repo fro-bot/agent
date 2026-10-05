@@ -5514,6 +5514,66 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# TEST 81 — Entrypoint edge cases: empty values clear the image ENTRYPOINT
+#           (bypass tini) and must be rejected; explicit null is a no-op and
+#           must pass. Exercised on both the docker-compose and raw-YAML paths.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 81: entrypoint \"\" / [] rejected, null accepted ---"
+
+for EP_CASE in 'reject|""' 'reject|[]' 'accept|null'; do
+  EP_EXPECT="${EP_CASE%%|*}"
+  EP_VALUE="${EP_CASE#*|}"
+  EP_COMPOSE="${TMPDIR_TEST}/compose-entrypoint-edge.yaml"
+  hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" \
+    | awk -v v="${EP_VALUE}" '{print} /^    image: ubuntu:22.04$/ {print "    entrypoint: " v}' > "${EP_COMPOSE}"
+  for EP_PATH_MODE in compose raw; do
+    if [[ "${EP_PATH_MODE}" == "raw" ]]; then
+      "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null || continue
+      EP_PATH="${NO_DOCKER_PATH}"
+    else
+      EP_PATH="${PATH}"
+    fi
+    EP_EXIT=0
+    EP_OUTPUT="$(PATH="${EP_PATH}" COMPOSE_FILE="${EP_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || EP_EXIT=$?
+    if [[ "${EP_EXPECT}" == "reject" ]]; then
+      if [[ "${EP_EXIT}" -ne 0 ]] && echo "${EP_OUTPUT}" | grep -q "overrides entrypoint"; then
+        pass "TEST 81: ${EP_PATH_MODE} path rejects entrypoint: ${EP_VALUE}"
+      else
+        fail "TEST 81: ${EP_PATH_MODE} path did NOT reject entrypoint: ${EP_VALUE} — exit ${EP_EXIT}, output: ${EP_OUTPUT}"
+      fi
+    elif [[ "${EP_EXIT}" -eq 0 ]]; then
+      pass "TEST 81: ${EP_PATH_MODE} path accepts entrypoint: ${EP_VALUE}"
+    else
+      fail "TEST 81: ${EP_PATH_MODE} path rejected entrypoint: ${EP_VALUE} — exit ${EP_EXIT}, output: ${EP_OUTPUT}"
+    fi
+  done
+done
+
+# ---------------------------------------------------------------------------
+# TEST 82 — SIGPIPE regression: log_contains must succeed under pipefail when
+#           the match is early and the haystack far exceeds the pipe buffer.
+#           (`printf | grep -q` returns 141 here — the false failure it fixes.)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 82: log_contains survives early match + >256 KiB under pipefail ---"
+
+# shellcheck source=deploy/tests/log-contains.sh
+source deploy/tests/log-contains.sh
+SIGPIPE_FILLER="$(head -c 300000 /dev/zero | tr '\0' 'x')"
+SIGPIPE_HAYSTACK="workspace-agent: shutdown clean"$'\n'"${SIGPIPE_FILLER}"
+if log_contains "${SIGPIPE_HAYSTACK}" "workspace-agent: shutdown clean"; then
+  pass "TEST 82: log_contains returns success for an early match in a large haystack"
+else
+  fail "TEST 82: log_contains failed for an early match in a large haystack (SIGPIPE regression)"
+fi
+if log_contains "${SIGPIPE_HAYSTACK}" "absent-needle"; then
+  fail "TEST 82: log_contains matched an absent needle"
+else
+  pass "TEST 82: log_contains returns failure for an absent needle"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

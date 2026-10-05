@@ -32,6 +32,9 @@
 
 set -euo pipefail
 
+# shellcheck source=deploy/tests/log-contains.sh
+source "$(dirname "${BASH_SOURCE[0]}")/log-contains.sh"
+
 IMAGE="${WORKSPACE_IMAGE:-fro-bot-workspace:smoke}"
 
 # ── bounded waits ────────────────────────────────────────────────────────────
@@ -440,7 +443,7 @@ set -e
 [ "$secret_env_status" -ne 0 ] || fail "denial: uid 10001 could read /proc/${SECRET_PID}/environ of a root process holding a secret"
 [ "$secret_mem_status" -ne 0 ] || fail "denial: uid 10001 could read /proc/${SECRET_PID}/mem of a root process holding a secret"
 [ "$secret_fd_status" -ne 0 ] || fail "denial: uid 10001 could list /proc/${SECRET_PID}/fd of a root process holding a secret"
-if printf '%s%s%s' "$secret_env_out" "$secret_mem_out" "$secret_fd_out" | grep -qF "$DUMMY_TOKEN"; then
+if log_contains "${secret_env_out}${secret_mem_out}${secret_fd_out}" "$DUMMY_TOKEN"; then
   fail "denial: the dummy GITHUB_TOKEN leaked into environ/mem/fd output despite the operations failing"
 fi
 pass "uid 10001 cannot read environ/mem/fd of a root process holding a secret, and the secret never leaks into output"
@@ -523,7 +526,7 @@ assert_cannot_bind() {
   out="$(run_exec "$cid" "$user" sh -c "timeout 2 nc -l -p ${port} 2>&1")"
   status=$?
   set -e
-  if ! printf '%s' "$out" | grep -q 'Address in use'; then
+  if ! grep -q 'Address in use' <<<"$out"; then
     fail "${property}: uid ${user} was not refused with EADDRINUSE on port ${port} (status=${status}) — it may have bound it, or failed for an unrelated reason — output: ${out}"
   fi
   log "  bind attempt on :${port} failed as expected (status=${status}): ${out}"
@@ -537,7 +540,7 @@ assert_can_bind() {
   status=$?
   set -e
   # 0: nc exited on its own; 124 (GNU) / 143 (busybox): timeout ended a listen.
-  if printf '%s' "$out" | grep -qi 'bind'; then
+  if grep -qi 'bind' <<<"$out"; then
     fail "${property} (positive control): uid ${user} could NOT bind port ${port} (status=${status}): ${out}"
   fi
   case "$status" in
@@ -598,8 +601,8 @@ run_exec "$MAIN_CID" "0:0" sh -c '
 # wget-availability fallback needed. curl -d auto-sets Content-Length, which
 # POST /inspect requires (server.ts rejects a missing content-length header).
 inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"acme\",\"repo\":\"widgets\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
-echo "$inspect_out" | grep -q '"ok":true' || fail "service behavior: POST /inspect against a root-owned checkout did not return ok:true — got: ${inspect_out}"
-echo "$inspect_out" | grep -qi 'dubious' && fail "service behavior: POST /inspect response mentions 'dubious' ownership — got: ${inspect_out}"
+grep -q '"ok":true' <<<"$inspect_out" || fail "service behavior: POST /inspect against a root-owned checkout did not return ok:true — got: ${inspect_out}"
+grep -qi 'dubious' <<<"$inspect_out" && fail "service behavior: POST /inspect response mentions 'dubious' ownership — got: ${inspect_out}"
 pass "POST /inspect succeeds against a checkout git does not own, with no dubious-ownership error"
 
 # Control-API bearer: uid 10001 (the unprivileged agent, reachable over loopback on :9100) must
@@ -650,9 +653,9 @@ oc_environ_status=$?
 set -e
 if [ "$oc_environ_status" -eq 0 ]; then
   oc_environ="$(printf '%s' "$oc_environ_raw" | tr '\0' '\n')"
-  echo "$oc_environ" | grep -qi 'bearer-token\|isolation-harness-dummy-bearer-token' && \
+  grep -qi 'bearer-token\|isolation-harness-dummy-bearer-token' <<<"$oc_environ" && \
     fail "service behavior: the bearer token appears in OpenCode's own /proc/${OC_PID}/environ"
-  echo "$oc_environ" | grep -qi 'WORKSPACE_OPENCODE_TOKEN' && \
+  grep -qi 'WORKSPACE_OPENCODE_TOKEN' <<<"$oc_environ" && \
     fail "service behavior: WORKSPACE_OPENCODE_TOKEN* is present in OpenCode's own environ (should be allowlisted out — see buildOpencodeEnv)"
   pass ":9200 bearer proxy reaches OpenCode; the bearer token is absent from OpenCode's own /proc/<pid>/environ (root COULD read it — CAP_SYS_PTRACE must be present after all, or the kernel's dumpable/same-userns rules allowed it — and it was clean)"
 else
@@ -702,7 +705,7 @@ CLONE_OWNER="octocat"
 CLONE_REPO="Hello-World"
 CLONE_TOKEN="ghs_isolationHarnessDummyCloneToken1234567890"  # ghs_ + 40 chars, well past validateTokenShape's >=20 minimum
 clone_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
-if ! echo "$clone_out" | grep -q '"ok":true'; then
+if ! grep -q '"ok":true' <<<"$clone_out"; then
   # /clone reports only a coarse error code. Reproduce the network half with
   # the same sealed git config, as root, so the log shows git's own reason.
   echo "--- diagnostic: git ls-remote as root with sealed config ---" >&2
@@ -712,7 +715,7 @@ if ! echo "$clone_out" | grep -q '"ok":true'; then
   echo "--- diagnostic: workspace logs (tail) ---" >&2
   docker logs --tail 40 "$MAIN_CID" >&2 2>&1 || true
 fi
-echo "$clone_out" | grep -q '"ok":true' || fail "clone: POST /clone ${CLONE_OWNER}/${CLONE_REPO} did not return ok:true — got: ${clone_out} (network-level failure? this container has no --network override, so it depends on the runner having outbound internet — see the block comment above before assuming a uid/ownership regression)"
+grep -q '"ok":true' <<<"$clone_out" || fail "clone: POST /clone ${CLONE_OWNER}/${CLONE_REPO} did not return ok:true — got: ${clone_out} (network-level failure? this container has no --network override, so it depends on the runner having outbound internet — see the block comment above before assuming a uid/ownership regression)"
 pass "POST /clone ${CLONE_OWNER}/${CLONE_REPO} succeeds over the harness's direct (unproxied) network path"
 
 clone_root_owner="$(run_exec "$MAIN_CID" "0:0" stat -c '%u:%g:%a' /workspace/repos)"
@@ -734,15 +737,15 @@ must_succeed "clone: uid 10001 can create/edit a file in the new checkout" "$MAI
 pass "clone: uid 10001 can create and edit a file inside the checkout /clone produced"
 
 clone_inspect_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\"}' http://127.0.0.1:9100/inspect" 2>&1 || true)"
-echo "$clone_inspect_out" | grep -q '"ok":true' || fail "clone: POST /inspect on the new checkout did not return ok:true — got: ${clone_inspect_out}"
+grep -q '"ok":true' <<<"$clone_inspect_out" || fail "clone: POST /inspect on the new checkout did not return ok:true — got: ${clone_inspect_out}"
 pass "clone: POST /inspect on the /clone-produced checkout succeeds"
 
 clone_repeat_out="$(run_exec "$MAIN_CID" "0:0" sh -c "curl -sS -o /tmp/clone-repeat-body.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer ${WORKSPACE_BEARER}' -d '{\"owner\":\"${CLONE_OWNER}\",\"repo\":\"${CLONE_REPO}\",\"token\":\"${CLONE_TOKEN}\"}' http://127.0.0.1:9100/clone" 2>&1 || true)"
 [ "$clone_repeat_out" = "409" ] || fail "clone: second POST /clone of the same repo returned HTTP ${clone_repeat_out}, expected 409 (repo-exists) — body: $(run_exec "$MAIN_CID" "0:0" cat /tmp/clone-repeat-body.json 2>&1 || true)"
 clone_repeat_body="$(run_exec "$MAIN_CID" "0:0" cat /tmp/clone-repeat-body.json 2>&1 || true)"
-echo "$clone_repeat_body" | grep -q 'repo-exists' || fail "clone: second /clone returned 409 but body does not say repo-exists: ${clone_repeat_body}"
+grep -q 'repo-exists' <<<"$clone_repeat_body" || fail "clone: second /clone returned 409 but body does not say repo-exists: ${clone_repeat_body}"
 clone_repeat_logs="$(docker logs "$MAIN_CID" 2>&1 || true)"
-echo "$clone_repeat_logs" | grep -qi 'dubious ownership' && fail "clone: 'dubious ownership' appeared in workspace logs after the repeat /clone's repo-exists validation ran git as 10001 against the checkout"
+grep -qi 'dubious ownership' <<<"$clone_repeat_logs" && fail "clone: 'dubious ownership' appeared in workspace logs after the repeat /clone's repo-exists validation ran git as 10001 against the checkout"
 pass "clone: a second /clone of the same repo returns 409 repo-exists, with no dubious-ownership error in the workspace logs"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -794,9 +797,9 @@ log "  migration summary for this boot: ${clone_restart_summary_line}"
 # /inspect dubious-ownership fixture), and migrating it on this boot is
 # correct. Only the /clone checkout must be skipped.
 clone_restart_key="${CLONE_OWNER}/${CLONE_REPO}"
-printf '%s\n' "$clone_restart_logs" | grep -qxF "migrate: ${clone_restart_key}: skipped (already agent-owned)" \
+grep -qxF "migrate: ${clone_restart_key}: skipped (already agent-owned)" <<<"$clone_restart_logs" \
   || fail "phase 4b-restart: this boot's migration did not report ${clone_restart_key} as skipped (already agent-owned) — got: ${clone_restart_logs}"
-if printf '%s\n' "$clone_restart_logs" | grep -qxF "migrate: ${clone_restart_key}: complete"; then
+if grep -qxF "migrate: ${clone_restart_key}: complete" <<<"$clone_restart_logs"; then
   fail "phase 4b-restart: this boot's migration WALKED ${clone_restart_key} (reported it complete) instead of skipping it"
 fi
 pass "phase 4b-restart: this boot's migration skipped the /clone checkout (${clone_restart_key}) as already agent-owned, without walking it"
@@ -1252,6 +1255,8 @@ fi
 # killChildGroup specifically).
 # ─────────────────────────────────────────────────────────────────────────────
 stop_started_at="$(date +%s)"
+# Scope the log read to this container lifetime (earlier restarts also log shutdowns).
+stop_since="$(docker inspect -f '{{.State.StartedAt}}' "$MAIN_CID")"
 docker stop --time "$SHUTDOWN_TIMEOUT_S" "$MAIN_CID" >/dev/null
 stop_elapsed_s=$(($(date +%s) - stop_started_at))
 if docker top "$MAIN_CID" >/dev/null 2>&1; then
@@ -1264,9 +1269,9 @@ container_state="$(docker inspect -f '{{.State.Status}}' "$MAIN_CID")"
 stop_exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$MAIN_CID")"
 [ "$stop_exit_code" = "0" ] || fail "shutdown: container exit code is ${stop_exit_code}, expected 0 (137 = SIGKILL fallback; SIGTERM did not reach the supervisor)"
 [ "$stop_elapsed_s" -lt "$SHUTDOWN_TIMEOUT_S" ] || fail "shutdown: docker stop took ${stop_elapsed_s}s, not under the ${SHUTDOWN_TIMEOUT_S}s timeout — exit was not SIGTERM-driven"
-stop_logs="$(docker logs "$MAIN_CID" 2>&1)"
-printf '%s\n' "$stop_logs" | grep -q 'workspace-agent: SIGTERM received, draining' || fail "shutdown: no SIGTERM drain line in 'docker logs' — the supervisor never saw SIGTERM"
-printf '%s\n' "$stop_logs" | grep -q 'workspace-agent: shutdown clean' || fail "shutdown: no 'shutdown clean' line in 'docker logs' — the drain did not complete"
+stop_logs="$(docker logs --since "$stop_since" "$MAIN_CID" 2>&1)"
+log_contains "$stop_logs" 'workspace-agent: SIGTERM received, draining' || fail "shutdown: no SIGTERM drain line in 'docker logs' — the supervisor never saw SIGTERM"
+log_contains "$stop_logs" 'workspace-agent: shutdown clean' || fail "shutdown: no 'shutdown clean' line in 'docker logs' — the drain did not complete"
 pass "shutdown: SIGTERM-driven graceful exit (exit 0, ${stop_elapsed_s}s < ${SHUTDOWN_TIMEOUT_S}s, drain + 'shutdown clean' logged); reaping itself was already proven directly in phase 4d"
 
 # restart container so we don't leak a stopped-but-not-removed container past
