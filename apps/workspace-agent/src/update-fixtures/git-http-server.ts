@@ -258,6 +258,13 @@ async function runGitHttpBackend(params: {
       finish()
     })
 
+    // http-backend may exit before it has consumed the whole request body (e.g. an auth/failure
+    // path that answers early). `pipe()` does not forward destination errors, so without a listener
+    // the resulting EPIPE on its stdin is an unhandled 'error' event. EPIPE is benign here (the CGI
+    // response is what the client asserts on); anything else tears the child down like a request error.
+    child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EPIPE') child.kill('SIGKILL')
+    })
     if (child.stdin !== null) req.pipe(child.stdin)
     req.on('error', () => {
       child.kill('SIGKILL')
