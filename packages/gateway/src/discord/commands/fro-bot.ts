@@ -310,7 +310,7 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
               yield* editInteraction(
                 ctx.interaction,
                 {
-                  content: `🔒 The lock for \`${repoSlug}\` has expired, but its workspace still shows running sessions — not released. Wait for them to finish, or stop the workspace container and retry.`,
+                  content: `🔒 The lock for \`${repoSlug}\` has expired, but its workspace still shows running sessions — not released. Wait for those sessions to finish or cancel them, then retry. If it stays busy, restart the workspace (this ends its sessions) and retry once it is back up.`,
                 },
                 ctx.log,
               )
@@ -321,7 +321,7 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
               yield* editInteraction(
                 ctx.interaction,
                 {
-                  content: `⚠️ The lock for \`${repoSlug}\` has expired, but its workspace activity could not be confirmed — not released. Check that the workspace is reachable and try again.`,
+                  content: `⚠️ The lock for \`${repoSlug}\` has expired, but its workspace activity could not be confirmed — not released. If the workspace is down, restart it and retry once its status endpoint is reachable again.`,
                 },
                 ctx.log,
               )

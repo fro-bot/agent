@@ -232,7 +232,7 @@ On graceful shutdown (SIGTERM), pending queued tasks are dropped: the handoff is
 
 The `/fro-bot clear-queue` subcommand drops all pending queued tasks for the invoking channel. It is authorization-gated with the same authority check as the mention path (trigger role or guild-level ManageChannels). The in-flight run (if any) is unaffected.
 
-The `/fro-bot force-release-lock` subcommand lets a ManageChannels operator clear a stuck per-repo coordination lock. It is corroborated: the lock is only deleted when the lease is expired AND the repo's OpenCode workspace status check (`execute/repo-quiescence.ts`) reports `clear`; `busy` or `unknown` refuses (`workspace-busy` / `workspace-unknown`). The run-state heartbeat is diagnostic only. An `IfMatch` conditional delete on the ETag observed before the check ensures a re-acquired lock is never deleted. Requires guild-level ManageChannels (trigger-role-only users are denied). Operator-facing; not a substitute for normal lock release.
+The `/fro-bot force-release-lock` subcommand lets a ManageChannels operator clear a stuck per-repo coordination lock. It is corroborated: the lock is only deleted when the lease is expired AND the repo's OpenCode workspace status check (`execute/repo-quiescence.ts`) reports `clear`; `busy` or `unknown` refuses (`workspace-busy` / `workspace-unknown`). Operator guidance for a refusal: wait for or cancel the repo's running sessions; if still busy, or the workspace is down, restart the workspace and retry once its status endpoint is reachable (a stopped container yields `unknown`, never `clear`). The run-state heartbeat is diagnostic only. An `IfMatch` conditional delete on the ETag observed before the check ensures a re-acquired lock is never deleted. Requires guild-level ManageChannels (trigger-role-only users are denied). Operator-facing; not a substitute for normal lock release.
 
 Releasing is always done in a `finally` block so crashes leave the system in a recoverable state.
 
@@ -241,7 +241,7 @@ Releasing is always done in a `finally` block so crashes leave the system in a r
 `execute/recovery.ts` (`recoverStaleRuns`) runs once after Discord login on every gateway startup. It scans all bound repos for runs left in `EXECUTING`, `PENDING`, or `ACKNOWLEDGED` by a prior crash. The repo lock is acquired before the `PENDING`→`ACKNOWLEDGED` transition and held across `ensureClone` (which can run for minutes), so a crash can strand the lock under any of the three phases, not just `EXECUTING`. For each stranded run it:
 
 1. Checks the repo's OpenCode workspace status. `busy` or `unknown` leaves the run and the lock untouched (blocked recovery, logged); persisted ownership is never consulted.
-2. When `clear`, transitions the run state to `FAILED` via a conditional-write against the current S3 object etag.
+2. When `clear`, re-reads the run and re-checks staleness on that fresh record (a heartbeat during the check means it is alive — skipped), then transitions it to `FAILED` via a conditional write against that read's etag.
 3. Posts a brief "previous task interrupted on restart" note to the original thread (best-effort; skipped if the transition failed or the thread is unreachable).
 
 Startup recovery never deletes the coordination lock; a leftover lease lapses by TTL and the next acquisition re-runs the workspace check before taking over.

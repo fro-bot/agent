@@ -899,9 +899,9 @@ describe('/fro-bot force-release-lock — outcome mapping', () => {
   })
 
   it.each([
-    ['workspace-busy', /still shows running sessions/i],
-    ['workspace-unknown', /could not be confirmed/i],
-  ] as const)('%s → named blocked reply, lock not released', async (outcome, pattern) => {
+    ['workspace-busy', /still shows running sessions/i, /wait for those sessions.*restart the workspace/i],
+    ['workspace-unknown', /could not be confirmed/i, /restart it and retry once its status endpoint is reachable/i],
+  ] as const)('%s → named blocked reply, lock not released', async (outcome, pattern, guidance) => {
     // #given
     const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
       outcome,
@@ -922,6 +922,8 @@ describe('/fro-bot force-release-lock — outcome mapping', () => {
     const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
     expect(replyArg.content).toMatch(pattern)
     expect(replyArg.content).toMatch(/not released/i)
+    expect(replyArg.content).toMatch(guidance)
+    expect(replyArg.content).not.toMatch(/stop the workspace container/i)
   })
 
   it('store failure after a clear confirmation (Effect failure) → never a released reply', async () => {

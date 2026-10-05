@@ -11,8 +11,10 @@
  *     gateway restart is not a workspace restart, and the server may still be
  *     running work this process no longer remembers. Persisted ownership is never
  *     consulted, so missing/malformed ownership cannot bypass the check.
- *  2. Only when the workspace is `clear`, transitions the run to FAILED with an
- *     ETag-conditional write (a lost race never overwrites newer state).
+ *  2. Only when the workspace is `clear`, re-reads the run, re-checks staleness on that
+ *     fresh record (a heartbeat during the check means it is alive — skipped), and
+ *     transitions it to FAILED with a write conditioned on that read's ETag (a lost race
+ *     never overwrites newer state).
  *  3. Posts a brief "previous task interrupted" note to the original thread
  *     (best-effort — skipped if the transition failed or the thread cannot be resolved).
  *
@@ -29,7 +31,7 @@ import type {BindingsStore} from '../bindings/store.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
-import {findStaleRuns, getRunKey, transitionRun} from '@fro-bot/runtime'
+import {findStaleRuns, getRunKey, isRunStale, parseRunState, transitionRun} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -70,29 +72,35 @@ function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context
 }
 
 /**
- * Resolve the current object-store etag for a given key.
+ * Read the run record fresh, returning its parsed state and the etag of THAT read.
  *
- * Returns `null` when the adapter does not expose `getObject`, the key does
- * not exist, or any other error occurs — all of which are logged.
+ * Returns `null` when the adapter lacks `getObject`, or the read/parse fails — all logged. The caller re-checks
+ * staleness on the returned state and conditions its write on the returned etag, so a heartbeat landing before this
+ * read is seen (not stale → skip) and one landing after it fails the CAS.
  */
-async function resolveEtag(
+async function readFreshRun(
   config: CoordinationConfig,
   key: string,
-  label: string,
   logger: GatewayLogger,
-): Promise<string | null> {
+): Promise<{readonly state: RunState; readonly etag: string} | null> {
   if (config.storeAdapter.getObject == null) {
-    logger.warn({key, label}, 'recovery: store adapter does not support getObject — cannot resolve etag')
+    logger.warn({key}, 'recovery: store adapter does not support getObject — cannot re-read run')
     return null
   }
 
   const result = await config.storeAdapter.getObject(key)
   if (result.success === false) {
-    logger.warn({key, label, err: result.error.message}, 'recovery: getObject failed — cannot resolve etag')
+    logger.warn({key, err: result.error.message}, 'recovery: getObject failed — cannot re-read run')
     return null
   }
 
-  return result.data.etag
+  const parsed = parseRunState(result.data.data)
+  if (parsed.success === false) {
+    logger.warn({key, err: parsed.error.message}, 'recovery: fresh run record malformed — skipping')
+    return null
+  }
+
+  return {state: parsed.data, etag: result.data.etag}
 }
 
 // ---------------------------------------------------------------------------
@@ -221,8 +229,18 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
     return
   }
 
-  const runEtag = await resolveEtag(coordinationConfig, runKeyResult.data, 'run', logger)
-  if (runEtag === null) return
+  // The workspace check can take seconds; the run may have heartbeated meanwhile. Re-evaluate the same staleness
+  // predicate on a fresh record and condition the write on that read's etag — never one fetched without looking.
+  const fresh = await readFreshRun(coordinationConfig, runKeyResult.data, logger)
+  if (fresh === null) return
+  if (isRunStale(coordinationConfig, fresh.state) === false) {
+    logger.info(
+      {runId: run.run_id, repo, phase: fresh.state.phase, lastHeartbeat: fresh.state.last_heartbeat},
+      'recovery: run no longer stale after workspace check — leaving it untouched',
+    )
+    return
+  }
+  const runEtag = fresh.etag
 
   const transitionResult = await transitionRun(
     coordinationConfig,

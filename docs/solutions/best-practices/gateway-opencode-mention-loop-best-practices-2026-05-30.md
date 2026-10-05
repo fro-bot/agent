@@ -133,6 +133,9 @@ check yields `workspace-unknown`/`workspace-busy` and deletes nothing; the delet
 conditional delete on the ETag observed **before** confirmation, so a renewal or replacement
 during the check yields `conflict`. Every post-attempt exit emits one `lock-takeover-outcome`
 audit event. This is snapshot corroboration, not fencing (see ARCHITECTURE.md, S3 lock section).
+Operator reply guidance must be achievable: a *stopped* workspace yields `unknown` (also a refusal), so never
+tell the operator to stop the container. Say to wait for or cancel the repo's sessions, or restart the workspace
+and retry once its status endpoint is reachable (the restart ends sessions, so the check reports `clear`).
 
 ### 4. Flush partial output on failure paths
 

@@ -279,6 +279,58 @@ describe('checkout preparation: clone-then-update lock discipline', () => {
   })
 })
 
+describe('checkout preparation: invalid owner/repo binding', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it.each([
+    ['owner with a path separator', {owner: '../evil'}],
+    ['repo with whitespace', {repo: 'wid get'}],
+  ])(
+    '%s → no /update, ensureClone or session; FAILED, heartbeat stopped, lock and slot released',
+    async (_label, overrides) => {
+      // #given — a binding canonicalWorkspaceTarget rejects, after the lock is held and the heartbeat started
+      const {runMention} = await import('./run.js')
+      const startFn = vi.fn()
+      const stopFn = vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          runEtag: 'run-etag-after-heartbeat',
+          lockEtag: 'lock-etag-after-heartbeat',
+          runState: buildMockRunState(),
+        },
+      })
+      setupHappyPath({start: startFn, stop: stopFn})
+      const update = vi.fn()
+      const ensureClone = vi.fn()
+      const deps = makeDeps({update, ensureClone})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, {...makeBinding(), ...overrides}, deps)
+
+      // #then — nothing touched the workspace or started a session
+      expect(update).not.toHaveBeenCalled()
+      expect(ensureClone).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      // #and — the run is failed as workspace-unavailable
+      const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+      expect(failedCall).toBeDefined()
+      expect((failedCall?.[7] as {detailsPatch?: {failureKind?: string}})?.detailsPatch?.failureKind).toBe(
+        'workspace-unavailable',
+      )
+      // #and — every claimed resource is released: heartbeat stopped, lock deleted with the fresh etag, slot freed
+      expect(startFn).toHaveBeenCalledOnce()
+      expect(stopFn).toHaveBeenCalledOnce()
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      expect((mockRuntime.releaseLock.mock.calls[0] as unknown[])[2]).toBe('lock-etag-after-heartbeat')
+      const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
+      expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    },
+  )
+})
+
 describe('checkout preparation: deadline propagation', () => {
   beforeEach(() => {
     vi.clearAllMocks()

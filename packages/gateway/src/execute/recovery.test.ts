@@ -9,7 +9,9 @@ import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {recoverStaleRuns} from './recovery.js'
 
-vi.mock('@fro-bot/runtime', () => ({
+vi.mock('@fro-bot/runtime', async importOriginal => ({
+  // Real parseRunState/isRunStale: recovery re-checks staleness on the freshly read record.
+  ...(await importOriginal<typeof runtimeModule>()),
   getRunKey: vi.fn(),
   findStaleRuns: vi.fn(),
   transitionRun: vi.fn(),
@@ -67,7 +69,7 @@ function makeBindingsStore(bindings = [{owner: OWNER, repo: REPO}]): BindingsSto
 function makeCoordinationConfig() {
   const conditionalDelete = vi.fn()
   const getObject = vi.fn().mockImplementation(async (key: string) => {
-    if (key === RUN_KEY) return {success: true, data: {data: '{}', etag: RUN_ETAG}}
+    if (key === RUN_KEY) return {success: true, data: {data: JSON.stringify(makeStaleRun()), etag: RUN_ETAG}}
     return {success: false, error: new Error('not found')}
   })
   const config: CoordinationConfig = {
@@ -246,7 +248,7 @@ describe('recoverStaleRuns', () => {
       const {config} = makeCoordinationConfig()
       vi.mocked(config.storeAdapter.getObject as NonNullable<typeof config.storeAdapter.getObject>).mockResolvedValue({
         success: true,
-        data: {data: '{}', etag: RUN_ETAG},
+        data: {data: JSON.stringify(makeStaleRun()), etag: RUN_ETAG},
       })
       mockTransitionRun
         .mockResolvedValueOnce({success: false, error: new Error('boom')})
@@ -348,7 +350,7 @@ describe('recoverStaleRuns', () => {
       const {config} = makeCoordinationConfig()
       vi.mocked(config.storeAdapter.getObject as NonNullable<typeof config.storeAdapter.getObject>).mockResolvedValue({
         success: true,
-        data: {data: '{}', etag: RUN_ETAG},
+        data: {data: JSON.stringify(makeStaleRun()), etag: RUN_ETAG},
       })
       const checker: Checker = vi.fn(async ({repo}) => (repo === REPO_SLUG ? BUSY : CLEAR))
       const {deps} = makeDeps(
