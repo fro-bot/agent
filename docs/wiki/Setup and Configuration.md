@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-09-27"
-updated-by: "e6efc1f1"
+last-updated: "2026-10-04"
+updated-by: "27d08f8201656db6da2c60758bd4a0579fa2f6bb"
 sources:
   - src/harness/config/outputs.ts
   - packages/runtime/src/agent/attachment-dir.ts
@@ -38,7 +38,7 @@ sources:
   - action.yaml
   - RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md
   - RFCs/RFC-019-S3-Storage-Backend.md
-summary: "Tool installation, configuration assembly, credential management, cache strategy, and oMo opt-in"
+summary: "Tool installation, configuration assembly, credentials, caching, and oMo/OMO Slim version gating"
 ---
 
 # Setup and Configuration
@@ -100,9 +100,12 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 | OpenCode CLI | `DEFAULT_OPENCODE_VERSION`   | The AI coding agent platform                     |
 | Bun          | `DEFAULT_BUN_VERSION`        | JavaScript runtime and workspace package manager |
 | oMo          | `DEFAULT_OMO_VERSION`        | Oh My OpenAgent workflow framework               |
+| OMO Slim     | `DEFAULT_OMO_SLIM_VERSION`   | Lightweight alternative orchestration plugin     |
 | Systematic   | `DEFAULT_SYSTEMATIC_VERSION` | OpenCode plugin for structured workflows         |
 
-These can be overridden per-run via action inputs (`opencode-version`, `omo-version`, `systematic-version`). Stock tool pins are updated via Renovate-managed PRs; the OpenCode harness default is advanced by the harness release sync PR after a harness build exists.
+These can be overridden per-run via action inputs (`opencode-version`, `omo-version`, `omo-slim-version`, `systematic-version`). Stock tool pins are updated via Renovate-managed PRs; the OpenCode harness default is advanced by the harness release sync PR after a harness build exists.
+
+The OMO Slim default is currently `2.2.25`, on the stable release line tracked in `packages/runtime/src/shared/constants.ts`. That pin is separate from the compatibility gate in `src/services/setup/ci-config.ts`: its verified-version list currently contains only `1.1.1`. When Slim mode is enabled, `src/services/setup/setup.ts` rejects an unverified version before installing Bun or the plugin, and configuration assembly independently checks the same list before selecting `orchestrator`. Thus enabling Slim with the current default fails setup; the version bump alone does not certify orchestrator registration. The default OpenCode-only mode does not enter this gate. This distinction helps explain setup failures discussed in [[Troubleshooting]].
 
 Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
 
@@ -130,7 +133,7 @@ Moving the tag to a genuine SemVer prerelease identifier fixes it at the level o
 
 - **Download source** — Harness versions are routed to the `fro-bot/agent` releases URL instead of the upstream `anomalyco/opencode` releases, with the tag derived through the prerelease conversion. Percent-encoding of `+` as `%2B` is retained for the migrated legacy tags, since GitHub stores tags URL-encoded and a raw `+` is misread as a space. Stock versions keep their conventional `v`-prefixed upstream URL.
 
-- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary; the stock fallback (`FALLBACK_VERSION`, currently `1.18.29`) is reached only on the `latest`-resolution path.
+- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary. Stock-version installation failures can retry the stock fallback (`FALLBACK_VERSION`, currently `1.18.30`); that version is also used when `latest` resolution fails.
 
 - **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build metadata and would collapse a harness build onto a stock cache entry of the same base version. The prerelease form survives `semver.clean()` intact, so using it as the cache key guarantees a harness build and a stock build of the same base version never share a cache slot. Logs and the binary's own `--version` output keep the build-metadata form.
 
