@@ -1,8 +1,15 @@
+import type {Reporter, TestModule, Vitest, VitestPluginContext} from 'vitest/node'
 import type {ReportedModule} from './vitest-incomplete-run-reporter.js'
 
-import {describe, expect, it} from 'vitest'
+import process from 'node:process'
+import {afterEach, describe, expect, it} from 'vitest'
 
-import {findIncompleteModules, formatIncompleteRunReport} from './vitest-incomplete-run-reporter.js'
+import {
+  createIncompleteRunReporter,
+  findIncompleteModules,
+  formatIncompleteRunReport,
+  incompleteRunReporterPlugin,
+} from './vitest-incomplete-run-reporter.js'
 
 function mod(path: string, state: ReportedModule['state'], tests: ReportedModule['tests'] = []): ReportedModule {
   return {path, state, tests}
@@ -144,5 +151,118 @@ describe('formatIncompleteRunReport', () => {
     expect(report).toContain('test-0')
     expect(report).not.toContain('test-119')
     expect(report).toContain('and 70 more')
+  })
+})
+
+/** Minimal structural stand-in for a Vitest `TestModule`; only the members the reporter reads. */
+function fakeModule(path: string, state: ReportedModule['state'], testStates: readonly string[]): TestModule {
+  const fake = {
+    relativeModuleId: path,
+    state: () => state,
+    children: {
+      allTests: () => testStates.map((name, index) => ({fullName: `${name}-${index}`, result: () => ({state: name})})),
+    },
+  }
+  return fake as unknown as TestModule
+}
+
+describe('createIncompleteRunReporter', () => {
+  const originalExitCode = process.exitCode
+  afterEach(() => {
+    process.exitCode = originalExitCode
+  })
+
+  it('writes the report and forces exit code 1 when a module did not finish', () => {
+    // #given a run that ended normally with a crashed module
+    const written: string[] = []
+    const reporter = createIncompleteRunReporter({write: text => written.push(text)})
+    process.exitCode = 0
+
+    // #when the run ends
+    reporter.onTestRunEnd?.([fakeModule('crash.test.ts', 'pending', ['pending'])], [], 'failed')
+
+    // #then the loss is reported and the exit code is forced
+    expect(written.join('')).toContain('crash.test.ts')
+    expect(process.exitCode).toBe(1)
+  })
+
+  it('writes nothing and leaves process.exitCode untouched for an interrupted run', () => {
+    // #given a cancelled run that legitimately left a module unfinished
+    const written: string[] = []
+    const reporter = createIncompleteRunReporter({write: text => written.push(text)})
+    process.exitCode = undefined
+
+    // #when the run ends with reason "interrupted"
+    reporter.onTestRunEnd?.([fakeModule('crash.test.ts', 'pending', ['pending'])], [], 'interrupted')
+
+    // #then no report is written and the exit code is not mutated
+    expect(written).toEqual([])
+    expect(process.exitCode).toBeUndefined()
+  })
+
+  it('writes nothing and leaves process.exitCode untouched when every module finished', () => {
+    // #given a clean run
+    const written: string[] = []
+    const reporter = createIncompleteRunReporter({write: text => written.push(text)})
+    process.exitCode = undefined
+
+    // #when the run ends
+    reporter.onTestRunEnd?.([fakeModule('ok.test.ts', 'passed', ['passed'])], [], 'passed')
+
+    // #then nothing happens
+    expect(written).toEqual([])
+    expect(process.exitCode).toBeUndefined()
+  })
+})
+
+function configure(plugin: ReturnType<typeof incompleteRunReporterPlugin>, vitest: Vitest): void {
+  const context = {vitest} as unknown as VitestPluginContext
+  plugin.configureVitest?.call({} as never, context)
+}
+
+function fakeVitest(reporters: Reporter[]): Vitest {
+  return {config: {reporters}} as unknown as Vitest
+}
+
+describe('incompleteRunReporterPlugin', () => {
+  it('appends to the already-resolved reporter list instead of replacing it', () => {
+    // #given a Vitest instance with a configured reporter
+    const existing: Reporter = {}
+    const reporters: Reporter[] = [existing]
+
+    // #when the plugin configures Vitest
+    configure(incompleteRunReporterPlugin(), fakeVitest(reporters))
+
+    // #then the existing reporter is preserved in order and the safety net is added after it
+    expect(reporters).toHaveLength(2)
+    expect(reporters[0]).toBe(existing)
+    expect(reporters[1]?.onTestRunEnd).toBeTypeOf('function')
+  })
+
+  it('registers once per Vitest instance when configureVitest runs for several projects', () => {
+    // #given one plugin instance configured once per project
+    const reporters: Reporter[] = []
+    const vitest = fakeVitest(reporters)
+    const plugin = incompleteRunReporterPlugin()
+
+    // #when the hook runs twice for the same Vitest instance
+    configure(plugin, vitest)
+    configure(plugin, vitest)
+
+    // #then only one reporter is registered
+    expect(reporters).toHaveLength(1)
+  })
+
+  it('registers once even when the plugin itself is added twice', () => {
+    // #given two plugin instances (e.g. a merged config listing the plugin again)
+    const reporters: Reporter[] = []
+    const vitest = fakeVitest(reporters)
+
+    // #when both configure the same Vitest instance
+    configure(incompleteRunReporterPlugin(), vitest)
+    configure(incompleteRunReporterPlugin(), vitest)
+
+    // #then the failure report would still be written once
+    expect(reporters).toHaveLength(1)
   })
 })

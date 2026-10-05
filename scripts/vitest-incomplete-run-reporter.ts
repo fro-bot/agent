@@ -96,6 +96,10 @@ export function createIncompleteRunReporter(options: IncompleteRunReporterOption
   }
 }
 
+// Module-level so the guard also holds when the plugin is instantiated twice (e.g. a package config that
+// merges the root config's plugins), not just when `configureVitest` runs once per project.
+const registered = new WeakSet<Vitest>()
+
 /**
  * Vite plugin that appends the reporter to Vitest's already-resolved reporter list.
  *
@@ -105,7 +109,6 @@ export function createIncompleteRunReporter(options: IncompleteRunReporterOption
  * every existing reporter and still applies to every suite that resolves the root config.
  */
 export function incompleteRunReporterPlugin(options: IncompleteRunReporterOptions = {}): Plugin {
-  const registered = new WeakSet<Vitest>()
   return {
     name: 'fro-bot:incomplete-run-reporter',
     configureVitest({vitest}) {

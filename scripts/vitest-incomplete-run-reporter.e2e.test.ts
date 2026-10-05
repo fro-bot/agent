@@ -45,8 +45,19 @@ describe('incomplete-run reporter (worker crash end-to-end)', () => {
     const {output} = runFixtureVitest([])
 
     // #then the healthy file (with skipped suite and todo) is not reported as lost work
-    const report = output.slice(output.indexOf('Vitest run incomplete'))
-    expect(report).not.toContain('healthy')
+    const reportStart = output.indexOf('Vitest run incomplete')
+    expect(reportStart).toBeGreaterThanOrEqual(0)
+    expect(output.slice(reportStart)).not.toContain('healthy')
+  })
+
+  it('passes with no incomplete-run report when only the healthy file is run', () => {
+    // #given a real run restricted to the healthy fixture (pass + skipped suite + todo)
+    // #when Vitest runs it with the reporter registered
+    const {status, output} = runFixtureVitest(['healthy.fixture.ts'])
+
+    // #then the run succeeds and the safety net stays silent
+    expect(status).toBe(0)
+    expect(output).not.toContain('Vitest run incomplete')
   })
 
   it('is additive: a --reporter override still gets the incomplete-run report', () => {
