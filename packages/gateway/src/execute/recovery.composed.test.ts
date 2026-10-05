@@ -74,7 +74,19 @@ function createRunStore(initial: RunState, afterRunRead: (readCount: number, hea
     conditionalDelete: vi.fn(async () => ok(undefined)),
   }
 
-  return {adapter, state: () => JSON.parse(current.data) as RunState, reads: () => reads}
+  /** Simulates another writer replacing the stored record with arbitrary bytes (bumps the etag like a real write). */
+  const overwrite = (data: string): void => {
+    version += 1
+    current = {data, etag: `etag-${version}`}
+  }
+
+  return {
+    adapter,
+    state: () => JSON.parse(current.data) as RunState,
+    raw: () => current.data,
+    reads: () => reads,
+    overwrite,
+  }
 }
 
 function makeConfig(adapter: ObjectStoreAdapter): CoordinationConfig {
@@ -93,7 +105,7 @@ function makeLogger(): GatewayLogger {
 }
 
 function makeRig(options: {
-  readonly onCheck?: (heartbeat: () => void) => void
+  readonly onCheck?: (heartbeat: () => void, overwrite: (data: string) => void) => void
   readonly afterRunRead?: (readCount: number, heartbeat: () => void) => void
 }) {
   let heartbeatFn: () => void = () => {}
@@ -110,7 +122,7 @@ function makeRig(options: {
   const logger = makeLogger()
   const checkRepoQuiescence = vi.fn(async () => {
     // The initial stale scan has already read the record by the time the check runs.
-    options.onCheck?.(heartbeatFn)
+    options.onCheck?.(heartbeatFn, store.overwrite)
     return CLEAR
   })
   const deps: RecoverStaleRunsDeps = {
@@ -173,4 +185,46 @@ describe('recoverStaleRuns — composed with the real run-state store', () => {
     expect(store.state().phase).toBe('EXECUTING')
     expect(thread.send).not.toHaveBeenCalled()
   })
+
+  it.each(['COMPLETED', 'CANCELLED'] as const)(
+    'a run that became %s during the workspace check is left untouched: no write, no note',
+    async terminalPhase => {
+      // #given — the run reaches a terminal phase while the (multi-second) confirmation is in flight
+      const terminalRecord = JSON.stringify({...makeStaleRun(), phase: terminalPhase})
+      const {deps, store, thread, logger} = makeRig({onCheck: (_heartbeat, overwrite) => overwrite(terminalRecord)})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — recovery re-read, saw a terminal record, and did not clobber it with FAILED
+      expect(store.adapter.conditionalPut).not.toHaveBeenCalled()
+      expect(store.raw()).toBe(terminalRecord)
+      expect(store.state().phase).toBe(terminalPhase)
+      expect(thread.send).not.toHaveBeenCalled()
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({runId: RUN_ID, phase: terminalPhase}),
+        expect.stringContaining('no longer stale'),
+      )
+    },
+  )
+
+  it.each([
+    ['invalid JSON', '{not json'],
+    ['a payload failing run-state validation', JSON.stringify({run_id: RUN_ID, phase: 'NOT_A_PHASE'})],
+  ])(
+    'a run record that became malformed (%s) during the workspace check is left untouched: no write, no note',
+    async (_label, malformed) => {
+      // #given — the record is corrupted while the workspace check is in flight
+      const {deps, store, thread, logger} = makeRig({onCheck: (_heartbeat, overwrite) => overwrite(malformed)})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — recovery refused to act on an unparseable record
+      expect(store.adapter.conditionalPut).not.toHaveBeenCalled()
+      expect(store.raw()).toBe(malformed)
+      expect(thread.send).not.toHaveBeenCalled()
+      expect(logger.warn).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('malformed'))
+    },
+  )
 })
