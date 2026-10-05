@@ -188,7 +188,7 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
 
         // Confirm — an abort call succeeding is a delivery receipt, not proof the child
         // actually stopped. Reuse the same reconciliation primitive the drain loop uses.
-        const adapter = createSdkLedgerReconcileAdapter(client)
+        const adapter = createSdkLedgerReconcileAdapter(client, directory)
         const reconcileResult = await reconcileLedgerOnce({
           ledger,
           adapter,

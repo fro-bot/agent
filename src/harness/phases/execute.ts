@@ -33,6 +33,7 @@ import {
 } from '@fro-bot/runtime'
 import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
 import {inspectResponseFile, resolveResponseSurface} from '../../features/agent/response-file.js'
+import {getGitHubWorkspace} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {buildSessionSearchQuery} from './session-prep.js'
@@ -170,6 +171,7 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     ledger: overflowedLedger,
     client: cacheRestore.serverHandle.client,
     parentSessionId: overflowedSessionId,
+    directory: getGitHubWorkspace(),
     deadlineMs: 0,
     logger: execLogger,
   })
@@ -528,6 +530,8 @@ export interface RunDrainOptions {
   readonly ledger?: OwnershipLedger
   readonly client: SessionClient | null
   readonly parentSessionId: string | null
+  /** Directory the session runs in (`getGitHubWorkspace()`, as in `executeOpenCode`); reconciliation is scoped to it. */
+  readonly directory: string
   /** Remaining budget for drain, already excluding the teardown reserve. */
   readonly deadlineMs: number
   readonly logger: Logger
@@ -638,6 +642,7 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
     ledger,
     client,
     parentSessionId,
+    directory,
     deadlineMs,
     logger,
     reconcileIntervalMs,
@@ -664,7 +669,7 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
     }
   }
 
-  const adapter = createSdkLedgerReconcileAdapter(client)
+  const adapter = createSdkLedgerReconcileAdapter(client, directory)
   const reconcileOptions: ReconcileLedgerOptions = {ledger, adapter, parentSessionId, logger}
 
   // Unconditional first pass, regardless of the ledger's current outstanding

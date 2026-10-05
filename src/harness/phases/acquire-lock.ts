@@ -236,13 +236,25 @@ function createLeaseController(
   }
 }
 
+/** Builds the Action's coordination holder id; keep in sync with `isActionHolderId`. */
+function buildActionHolderId(runId: string, runAttempt: number): string {
+  return `action:${runId}:${runAttempt}`
+}
+
+const ACTION_HOLDER_ID_PATTERN = /^action:[^:\s]+:\d+$/
+
+/** True only for ids produced by `buildActionHolderId`. */
+function isActionHolderId(holderId: string): boolean {
+  return ACTION_HOLDER_ID_PATTERN.test(holderId)
+}
+
 /**
  * Result of attempting to acquire the per-repo coordination lock.
  *
  * Discriminated union so callers exhaustively handle each outcome:
  * - `acquired`: lock held by this Action; cleanup must release using `lockEtag` (or, once
  *   `renewal` has ticked, `renewal.currentEtag()`) and must stop `renewal` before releasing.
- * - `held-by-other`: another surface (Discord gateway or another Action run) holds the lock; skip cleanly
+ * - `held-by-other`: the lock is held, an expired gateway lease was not corroborated, or a takeover lost a race; skip cleanly
  * - `s3-disabled`: object store is not configured; coordination is opt-in, so proceed without a lock
  * - `error`: lock acquisition failed for an unexpected reason; caller decides whether to fail or proceed
  */
@@ -290,7 +302,7 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
   }
 
   const adapter = createS3Adapter(storeConfig, logger)
-  const holderId = `action:${runId}:${runAttempt}`
+  const holderId = buildActionHolderId(runId, runAttempt)
   const config: CoordinationConfig = {
     storeAdapter: adapter,
     storeConfig,
@@ -299,7 +311,11 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
     staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
     pendingStaleThresholdMs: DEFAULT_PENDING_STALE_THRESHOLD_MS,
   }
-  const result = await acquireLock(config, repo, holderId, 'github', runId, logger)
+  // The Action never writes the shared workspace checkout, so a killed runner's expired lease must not wedge
+  // the repo: reclaim expired Action leases (surface + Action holder id) without corroboration. Anything else is skipped.
+  const result = await acquireLock(config, repo, holderId, 'github', runId, logger, {
+    reclaimableWithoutConfirmation: holder => holder.surface === 'github' && isActionHolderId(holder.holder_id),
+  })
 
   if (result.success === false) {
     logger.warning('Lock acquisition failed', {error: result.error.message, repo, holderId})
@@ -312,11 +328,22 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
     return {outcome: 'acquired', lockEtag: result.data.etag, renewal}
   }
 
-  logger.info('lock-held-by-other-surface', {
+  const heldBy = {
     repo,
     holderId,
     heldBy: result.data.holder?.holder_id ?? null,
     surface: result.data.holder?.surface ?? null,
-  })
+  }
+  switch (result.data.outcome) {
+    case 'expired-holder':
+      logger.info('Expired coordination lease held by a gateway surface; settlement unconfirmed; skipped', heldBy)
+      break
+    case 'conflict':
+      logger.info('Coordination lease changed during takeover; skipped', heldBy)
+      break
+    case 'active-holder':
+      logger.info('lock-held-by-other-surface', {...heldBy, reason: 'coordination lease held'})
+      break
+  }
   return {outcome: 'held-by-other', holder: result.data.holder}
 }

@@ -6,9 +6,12 @@
  */
 
 import type {
+  ConfirmExpiredHolder,
   CoordinationConfig,
   ForceReleaseStaleLockResult,
+  LockAcquisitionOptions,
   LockAcquisitionResult,
+  LockLogger,
   LockRecord,
   Logger,
   ObjectStoreAdapter,
@@ -36,7 +39,15 @@ import {
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
 
-export type {AwsCredentials, ObjectStoreConfig} from '@fro-bot/runtime'
+export type {
+  AwsCredentials,
+  ConfirmExpiredHolder,
+  LockAcquisitionOptions,
+  LockAcquisitionResult,
+  LockRecord,
+  ObjectStoreConfig,
+  RepoQuiescence,
+} from '@fro-bot/runtime'
 // Re-exported so non-run.ts callers (e.g. discord/ maintenance-run helpers) never import
 // @fro-bot/runtime directly for heartbeat lifecycle glue — this file stays the single seam.
 export {createHeartbeatController} from '@fro-bot/runtime'
@@ -54,16 +65,20 @@ export interface CoordinationLogger {
 // Lock operations
 // ---------------------------------------------------------------------------
 
+/** Lock operations also emit INFO audit events, so they need `info` alongside `debug`. */
+export type LockCoordinationLogger = LockLogger
+
 export const acquireLockEffect = (
   config: CoordinationConfig,
   repo: string,
   holderId: string,
   surface: Surface,
   runId: string,
-  logger: CoordinationLogger,
+  logger: LockCoordinationLogger,
+  options?: LockAcquisitionOptions,
 ): Effect.Effect<LockAcquisitionResult, Error> =>
   Effect.tryPromise({
-    try: async () => acquireLock(config, repo, holderId, surface, runId, logger),
+    try: async () => acquireLock(config, repo, holderId, surface, runId, logger, options),
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   }).pipe(Effect.flatMap(result => (result.success === true ? Effect.succeed(result.data) : Effect.fail(result.error))))
 
@@ -104,11 +119,11 @@ export const forceReleaseLockEffect = (
 export const forceReleaseStaleLockEffect = (
   config: CoordinationConfig,
   repo: string,
-  identity: string,
-  logger: CoordinationLogger,
+  logger: LockCoordinationLogger,
+  confirmExpiredHolder?: ConfirmExpiredHolder,
 ): Effect.Effect<ForceReleaseStaleLockResult, Error> =>
   Effect.tryPromise({
-    try: async () => forceReleaseStaleLock(config, repo, identity, logger),
+    try: async () => forceReleaseStaleLock(config, repo, logger, {confirmExpiredHolder}),
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   }).pipe(Effect.flatMap(result => (result.success === true ? Effect.succeed(result.data) : Effect.fail(result.error))))
 

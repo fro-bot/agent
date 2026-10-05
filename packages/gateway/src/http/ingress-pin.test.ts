@@ -256,6 +256,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     launchWorkDeps: {
       coordinationConfig: {} as import('../execute/run.js').RunMentionDeps['coordinationConfig'],
       identity: 'stub-identity',
+      checkRepoQuiescence: vi.fn(),
       concurrency: {tryAcquire: vi.fn(() => 'ok' as const), release: vi.fn(), activeCount: vi.fn(() => 0), max: 3},
       queue: {
         enqueue: vi.fn(() => 'queued' as const),

@@ -5,7 +5,7 @@ import type {CoordinationConfig, RunState} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {err, ok} from '../shared/types.js'
-import {createRun, findStaleRuns, parseRunState, patchRunDetails, transitionRun} from './run-state.js'
+import {createRun, findStaleRuns, isRunStale, parseRunState, patchRunDetails, transitionRun} from './run-state.js'
 
 function createLogger(): Logger {
   return {
@@ -1019,5 +1019,26 @@ describe('run-state coordination', () => {
       expect(result.success === false ? result.error.message : '').toContain('S3 unreachable')
       expect(storeAdapter.conditionalPut).not.toHaveBeenCalled()
     })
+  })
+})
+
+describe('isRunStale', () => {
+  const NOW = Date.parse('2026-04-24T18:15:00.000Z')
+  const config = createCoordinationConfig({} as Required<ObjectStoreAdapter>)
+  const ago = (ms: number): string => new Date(NOW - ms).toISOString()
+
+  it.each([
+    ['EXECUTING', 120_000, true],
+    ['EXECUTING', 30_000, false],
+    ['PENDING', 120_000, false],
+    ['ACKNOWLEDGED', 31 * 60_000, true],
+    ['COMPLETED', 24 * 60 * 60_000, false],
+    ['FAILED', 24 * 60 * 60_000, false],
+  ] as const)('%s with a heartbeat %i ms old → stale=%s', (phase, ageMs, expected) => {
+    // #given
+    const state = createRunState({phase, last_heartbeat: ago(ageMs)})
+
+    // #when / #then
+    expect(isRunStale(config, state, NOW)).toBe(expected)
   })
 })

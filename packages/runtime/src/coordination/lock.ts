@@ -1,11 +1,21 @@
 import type {ObjectStoreOperationError} from '../object-store/types.js'
 import type {Result} from '../shared/types.js'
-import type {CoordinationConfig, LockAcquisitionResult, LockRecord, RunState, Surface} from './types.js'
+import type {ConfirmationSource, TakeoverAuditContext} from './lock-audit.js'
+import type {
+  ConfirmExpiredHolder,
+  CoordinationConfig,
+  LockAcquisitionOptions,
+  LockAcquisitionResult,
+  LockLogger,
+  LockRecord,
+  RepoQuiescence,
+  Surface,
+} from './types.js'
 
 import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
 import {resolveConditionalDelete, resolveConditionalPut, resolveGetObject} from './adapter-guards.js'
-import {getRunKey, parseRunState} from './run-state.js'
+import {collectHolderEvidence, confirmWithDeadline, decisionForBlocked, emitTakeoverAudit} from './lock-audit.js'
 
 /** The identity segment used for all lock keys. Exported so consumers (e.g. recovery.ts) can import it instead of maintaining a local copy. */
 export const COORDINATION_IDENTITY = 'coordination'
@@ -103,15 +113,14 @@ export async function acquireLock(
   holderId: string,
   surface: Surface,
   runId: string,
-  logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  logger: LockLogger,
+  options: LockAcquisitionOptions = {},
 ): Promise<Result<LockAcquisitionResult, Error>> {
   const key = getLockKey(config, repo)
   if (key.success === false) {
     return err(key.error)
   }
 
-  const now = new Date().toISOString()
-  const lockRecord = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, now)
   const conditionalPut = resolveConditionalPut(config)
   if (conditionalPut.success === false) {
     return err(conditionalPut.error)
@@ -123,12 +132,13 @@ export async function acquireLock(
   }
 
   logger.debug('Attempting lock acquisition', {key: key.data, repo, runId, surface})
-  const acquired = await conditionalPut.data(key.data, JSON.stringify(lockRecord), {ifNoneMatch: '*'})
+  const created = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, new Date().toISOString())
+  const acquired = await conditionalPut.data(key.data, JSON.stringify(created), {ifNoneMatch: '*'})
   if (acquired.success === true) {
     if (typeof acquired.data.etag !== 'string' || acquired.data.etag.length === 0) {
       return err(new Error('Lock acquisition succeeded without a usable ETag'))
     }
-    return ok({acquired: true, etag: acquired.data.etag, holder: null})
+    return ok({acquired: true, outcome: 'acquired', etag: acquired.data.etag, holder: null})
   }
 
   if (isPreconditionFailed(acquired.error) === false) {
@@ -145,23 +155,67 @@ export async function acquireLock(
     return err(holder.error)
   }
 
-  if (isStale(holder.data, new Date(now)) === false) {
-    return ok({acquired: false, etag: null, holder: holder.data})
+  const observedAt = new Date()
+  if (isStale(holder.data, observedAt) === false) {
+    return ok({acquired: false, outcome: 'active-holder', etag: null, holder: holder.data})
   }
 
-  const takeover = await conditionalPut.data(key.data, JSON.stringify(lockRecord), {ifMatch: existing.data.etag})
+  // Expired lease: a clock fact, not proof the holder stopped writing. Replace it only with corroboration
+  // (or when the holder's surface is explicitly reclaimable); the ETag observed here is the only one ever used.
+  const observedEtag = existing.data.etag
+  const auditContext: TakeoverAuditContext = {
+    operation: 'acquire',
+    correlationId: crypto.randomUUID(),
+    repo,
+    holder: holder.data,
+    evidence: await collectHolderEvidence(config, repo, holder.data),
+    now: observedAt,
+    replacement: {holderId, runId, surface},
+  }
+  emitTakeoverAudit(logger, 'lock-takeover-attempt', auditContext, 'pending', null, null)
+
+  let source: ConfirmationSource
+  let quiescence: RepoQuiescence | null = null
+  if (options.reclaimableWithoutConfirmation?.(holder.data) === true) {
+    source = 'holder-surface-reclaimable'
+  } else if (options.confirmExpiredHolder === undefined) {
+    source = 'no-corroborator'
+    quiescence = {kind: 'unknown', source: 'unavailable', directory: null, reason: 'no-corroborator'}
+  } else {
+    quiescence = await confirmWithDeadline(options.confirmExpiredHolder, repo, holder.data)
+    source = quiescence.source
+  }
+
+  if (quiescence !== null && quiescence.kind !== 'clear') {
+    emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, decisionForBlocked(quiescence), source, quiescence)
+    return ok({
+      acquired: false,
+      outcome: 'expired-holder',
+      etag: null,
+      holder: holder.data,
+      confirmation: quiescence,
+    })
+  }
+
+  // Stamped after confirmation so the new lease's TTL does not include the confirmation wait.
+  const replacement = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, new Date().toISOString())
+  const takeover = await conditionalPut.data(key.data, JSON.stringify(replacement), {ifMatch: observedEtag})
   if (takeover.success === false) {
     if (isPreconditionFailed(takeover.error) === true) {
-      return ok({acquired: false, etag: null, holder: null})
+      emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'cas-conflict', source, quiescence)
+      return ok({acquired: false, outcome: 'conflict', etag: null, holder: null})
     }
 
+    emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'store-error', source, quiescence)
     return err(takeover.error)
   }
 
   if (typeof takeover.data.etag !== 'string' || takeover.data.etag.length === 0) {
+    emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'store-error', source, quiescence)
     return err(new Error('Lock acquisition succeeded without a usable ETag'))
   }
-  return ok({acquired: true, etag: takeover.data.etag, holder: null})
+  emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'taken-over', source, quiescence)
+  return ok({acquired: true, outcome: 'acquired', etag: takeover.data.etag, holder: null})
 }
 
 export async function releaseLock(
@@ -231,14 +285,17 @@ export async function forceReleaseLock(
 /**
  * Typed outcome of a `forceReleaseStaleLock` call.
  *
- * - `released`    — lock was proven dead (lease expired + run-state stale/absent) and deleted.
- * - `live-holder` — lock is held by a live run (lease fresh OR heartbeat fresh); no delete.
- * - `no-lock`     — no lock record exists for the repo; nothing to release.
- * - `conflict`    — both signals said dead but the lock object changed between read and delete
- *                   (IfMatch precondition failure); the new holder's lock was NOT deleted.
- * - `error`       — malformed/partial lock or run-state record; fail-closed, no delete.
+ * - `released`          — lease expired and the workspace was confirmed clear; lock deleted.
+ * - `live-holder`       — lease not expired; no delete.
+ * - `no-lock`           — no lock record exists for the repo; nothing to release.
+ * - `conflict`          — the lock object changed between read and delete (IfMatch precondition
+ *                         failure); the new holder's lock was NOT deleted.
+ * - `workspace-busy`    — OpenCode reports activity in the repo directory; no delete.
+ * - `workspace-unknown` — activity could not be determined (or no corroborator was supplied); no delete.
+ * - `error`             — malformed/unreadable lock record; fail-closed, no delete.
  */
-export type ForceReleaseStaleLockOutcome = 'released' | 'live-holder' | 'no-lock' | 'conflict' | 'error'
+export type ForceReleaseStaleLockOutcome =
+  'released' | 'live-holder' | 'no-lock' | 'conflict' | 'workspace-busy' | 'workspace-unknown' | 'error'
 
 export interface ForceReleaseStaleLockResult {
   readonly outcome: ForceReleaseStaleLockOutcome
@@ -248,18 +305,15 @@ export interface ForceReleaseStaleLockResult {
   readonly runId: string | null
   /** Age of the lock in milliseconds at the time of the check, if a lock record was read. */
   readonly lockAgeMs: number | null
-  /** Age of the last heartbeat in milliseconds at the time of the check, if run-state was read. */
+  /** Age of the old holder's last RunState heartbeat. Diagnostic only; null when RunState was unavailable. */
   readonly heartbeatAgeMs: number | null
 }
 
-/**
- * Internal helper: reads the current lock record and its S3 etag.
- *
- * Returns:
- * - `ok({record, etag})` — lock exists and is valid.
- * - `ok(null)`           — lock object does not exist (NoSuchKey / not-found).
- * - `err(error)`         — unexpected read or parse error (fail-closed).
- */
+export interface ForceReleaseStaleLockOptions {
+  readonly confirmExpiredHolder?: ConfirmExpiredHolder
+}
+
+/** Reads the current lock record and its ETag. `ok(null)` means the lock does not exist. */
 async function readLockRecord(
   config: CoordinationConfig,
   repo: string,
@@ -291,224 +345,115 @@ async function readLockRecord(
 }
 
 /**
- * Internal helper: reads the run-state record for a given `run_id`.
+ * Corroborated operator release of an expired per-repo coordination lock.
  *
- * Uses the run-owner `identity` (e.g. the gateway identity `'discord-gateway'`) as the identity
- * segment — distinct from the lock key's `COORDINATION_IDENTITY`. Run-state records are written
- * under the gateway identity; the lock key lives under `COORDINATION_IDENTITY`. These are two
- * separate key families and must not be conflated.
+ * Deletes the lock only when the lease has expired AND `confirmExpiredHolder` reports the repo
+ * workspace `clear`. The old holder's RunState is read for the audit trail only. The delete is
+ * `If-Match` on the ETag observed BEFORE confirmation, so a renewal or replacement during the
+ * confirmation wait yields `conflict` and the newer record survives.
  *
- * Returns:
- * - `ok(runState)` — run-state exists and is valid.
- * - `ok(null)`     — run-state object does not exist (NoSuchKey / not-found → genuinely absent → dead).
- * - `err(error)`   — transient/unknown read failure OR parse error on a present record (fail-closed).
- */
-async function readRunStateByRunId(
-  config: CoordinationConfig,
-  repo: string,
-  identity: string,
-  runId: string,
-): Promise<Result<RunState | null, Error>> {
-  const key = getRunKey(config, identity, repo, runId)
-  if (key.success === false) {
-    return err(key.error)
-  }
-
-  const getObject = resolveGetObject(config)
-  if (getObject.success === false) {
-    return err(getObject.error)
-  }
-
-  const fetched = await getObject.data(key.data)
-  if (fetched.success === false) {
-    if (isNotFound(fetched.error) === true) {
-      // Genuinely absent (NoSuchKey / not-found) → treat as dead, OK to proceed.
-      return ok(null)
-    }
-    // Transient or unknown read failure (network, 503, etc.) → fail-closed.
-    // Do NOT treat as absent: a live run's lock must not be deleted on a transient error.
-    return err(fetched.error)
-  }
-
-  const parsed = parseRunState(fetched.data.data)
-  if (parsed.success === false) {
-    // Present but malformed → fail-closed
-    return err(parsed.error)
-  }
-
-  return ok(parsed.data)
-}
-
-/**
- * Dead-run-verified force-release of a per-repo coordination lock.
- *
- * Releases the lock ONLY when BOTH signals confirm the owning run is dead:
- *   1. Lock lease expired (`acquired_at + ttl_seconds ≤ now`).
- *   2. Run-state heartbeat is stale (`last_heartbeat + staleThresholdMs ≤ now`) OR absent.
- *
- * An `IfMatch: etag` conditional delete guards the read→delete race: if the lock object
- * changed between read and delete (re-acquire/renewal), the delete fails and the outcome
- * is `conflict` — the new holder's lock is never deleted.
- *
- * `identity` is the run-owner identity (e.g. `'discord-gateway'`) used to build the
- * run-state key. This is distinct from the lock key's `COORDINATION_IDENTITY` — run-state
- * records are written under the gateway identity, not the coordination identity.
- *
- * Returns a `Result<ForceReleaseStaleLockResult, Error>`. The outer `Result` is `err` only
- * for unexpected infrastructure failures (key-build errors, missing adapter capabilities).
- * All semantic outcomes (`released`, `live-holder`, `no-lock`, `conflict`, `error`) are
- * returned as `ok(result)` with the appropriate `outcome` discriminant.
+ * The outer `Result` is `err` only for unexpected infrastructure failures; every semantic
+ * outcome is `ok(result)` with an `outcome` discriminant.
  */
 export async function forceReleaseStaleLock(
   config: CoordinationConfig,
   repo: string,
-  identity: string,
-  logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  logger: LockLogger,
+  options: ForceReleaseStaleLockOptions = {},
 ): Promise<Result<ForceReleaseStaleLockResult, Error>> {
   const now = new Date()
 
-  // Step 1: Read the current lock record + etag.
   const lockRead = await readLockRecord(config, repo)
   if (lockRead.success === false) {
     logger.debug('forceReleaseStaleLock: failed to read lock record', {error: lockRead.error.message, repo})
-    return ok({outcome: 'error', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null})
+    return ok({
+      outcome: 'error',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
   }
 
   if (lockRead.data === null) {
     logger.debug('forceReleaseStaleLock: no lock record found', {repo})
-    return ok({outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null})
+    return ok({
+      outcome: 'no-lock',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
   }
 
   const {record: lockRecord, etag: lockEtag} = lockRead.data
   const lockAgeMs = now.getTime() - new Date(lockRecord.acquired_at).getTime()
+  const base = {holderId: lockRecord.holder_id, runId: lockRecord.run_id, lockAgeMs}
 
-  // Step 2 — Signal 1 (lease): check if the lock lease has expired.
   if (isStale(lockRecord, now) === false) {
-    logger.debug('forceReleaseStaleLock: lock lease is still active', {
-      holderId: lockRecord.holder_id,
-      lockAgeMs,
-      repo,
-      runId: lockRecord.run_id,
-    })
+    logger.debug('forceReleaseStaleLock: lock lease is still active', {...base, repo})
+    return ok({outcome: 'live-holder', ...base, heartbeatAgeMs: null})
+  }
+
+  const evidence = await collectHolderEvidence(config, repo, lockRecord)
+  const heartbeatAgeMs = evidence.kind === 'known' ? now.getTime() - new Date(evidence.lastHeartbeat).getTime() : null
+  const auditContext: TakeoverAuditContext = {
+    operation: 'operator-release',
+    correlationId: crypto.randomUUID(),
+    repo,
+    holder: lockRecord,
+    evidence,
+    now,
+    replacement: null,
+  }
+  emitTakeoverAudit(logger, 'lock-takeover-attempt', auditContext, 'pending', null, null)
+
+  let source: ConfirmationSource = 'no-corroborator'
+  let quiescence: RepoQuiescence = {kind: 'unknown', source: 'unavailable', directory: null, reason: 'no-corroborator'}
+  if (options.confirmExpiredHolder !== undefined) {
+    quiescence = await confirmWithDeadline(options.confirmExpiredHolder, repo, lockRecord)
+    source = quiescence.source
+  }
+
+  if (quiescence.kind !== 'clear') {
+    emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, decisionForBlocked(quiescence), source, quiescence)
     return ok({
-      outcome: 'live-holder',
-      holderId: lockRecord.holder_id,
-      runId: lockRecord.run_id,
-      lockAgeMs,
-      heartbeatAgeMs: null,
+      outcome: quiescence.kind === 'busy' ? 'workspace-busy' : 'workspace-unknown',
+      ...base,
+      heartbeatAgeMs,
     })
   }
 
-  // Step 3 — Signal 2 (heartbeat): read the run-state for the lock's run_id.
-  // Use the run-owner identity (gateway identity), NOT COORDINATION_IDENTITY — run-state
-  // records are written under the gateway identity, not the coordination identity.
-  const runStateRead = await readRunStateByRunId(config, repo, identity, lockRecord.run_id)
-  if (runStateRead.success === false) {
-    // Malformed run-state record → fail-closed, no delete.
-    logger.debug('forceReleaseStaleLock: malformed run-state record', {
-      error: runStateRead.error.message,
-      repo,
-      runId: lockRecord.run_id,
-    })
-    return ok({
-      outcome: 'error',
-      holderId: lockRecord.holder_id,
-      runId: lockRecord.run_id,
-      lockAgeMs,
-      heartbeatAgeMs: null,
-    })
-  }
-
-  const runState = runStateRead.data
-  let heartbeatAgeMs: number | null = null
-
-  if (runState !== null) {
-    heartbeatAgeMs = now.getTime() - new Date(runState.last_heartbeat).getTime()
-    const heartbeatThreshold = config.staleThresholdMs
-
-    if (heartbeatAgeMs < heartbeatThreshold) {
-      // Run is alive — heartbeat is fresh. Refuse to delete.
-      logger.debug('forceReleaseStaleLock: run-state heartbeat is fresh, refusing to release', {
-        heartbeatAgeMs,
-        holderId: lockRecord.holder_id,
-        repo,
-        runId: lockRecord.run_id,
-      })
-      return ok({
-        outcome: 'live-holder',
-        holderId: lockRecord.holder_id,
-        runId: lockRecord.run_id,
-        lockAgeMs,
-        heartbeatAgeMs,
-      })
-    }
-  }
-
-  // Both signals say dead: lease expired AND (run-state absent OR heartbeat stale).
-  // Step 4: Perform the IfMatch conditional delete.
   const conditionalDelete = resolveConditionalDelete(config)
   if (conditionalDelete.success === false) {
+    emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'store-error', source, quiescence)
     return err(conditionalDelete.error)
   }
 
   const lockKey = getLockKey(config, repo)
   if (lockKey.success === false) {
+    emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'store-error', source, quiescence)
     return err(lockKey.error)
   }
-
-  logger.debug('forceReleaseStaleLock: both signals dead, attempting conditional delete', {
-    heartbeatAgeMs,
-    holderId: lockRecord.holder_id,
-    lockAgeMs,
-    repo,
-    runId: lockRecord.run_id,
-  })
 
   const deleted = await conditionalDelete.data(lockKey.data, {ifMatch: lockEtag})
   if (deleted.success === false) {
     if (isPreconditionFailed(deleted.error) === true) {
-      // Lock object changed between read and delete — new holder's lock is safe.
-      logger.debug('forceReleaseStaleLock: IfMatch precondition failed (lock re-acquired between read and delete)', {
-        repo,
-        runId: lockRecord.run_id,
-      })
-      return ok({
-        outcome: 'conflict',
-        holderId: lockRecord.holder_id,
-        runId: lockRecord.run_id,
-        lockAgeMs,
-        heartbeatAgeMs,
-      })
+      emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'cas-conflict', source, quiescence)
+      return ok({outcome: 'conflict', ...base, heartbeatAgeMs})
     }
     if (isNotFound(deleted.error) === true) {
-      // Lock object vanished between read and delete — nothing to release.
-      logger.debug('forceReleaseStaleLock: lock object not found during delete (vanished between read and delete)', {
+      emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'lock-vanished', source, quiescence)
+      logger.debug('forceReleaseStaleLock: lock object vanished between read and delete', {
         repo,
         runId: lockRecord.run_id,
       })
-      return ok({
-        outcome: 'no-lock',
-        holderId: lockRecord.holder_id,
-        runId: lockRecord.run_id,
-        lockAgeMs,
-        heartbeatAgeMs,
-      })
+      return ok({outcome: 'no-lock', ...base, heartbeatAgeMs})
     }
+    emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'store-error', source, quiescence)
     return err(deleted.error)
   }
 
-  logger.debug('forceReleaseStaleLock: lock released', {
-    heartbeatAgeMs,
-    holderId: lockRecord.holder_id,
-    lockAgeMs,
-    repo,
-    runId: lockRecord.run_id,
-  })
-  return ok({
-    outcome: 'released',
-    holderId: lockRecord.holder_id,
-    runId: lockRecord.run_id,
-    lockAgeMs,
-    heartbeatAgeMs,
-  })
+  emitTakeoverAudit(logger, 'lock-takeover-outcome', auditContext, 'taken-over', source, quiescence)
+  return ok({outcome: 'released', ...base, heartbeatAgeMs})
 }

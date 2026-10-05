@@ -284,11 +284,11 @@ describe('runMention', () => {
       expect(ensureClone).not.toHaveBeenCalled()
     })
 
-    it('runOpenCodeCore receives ensured path from ensureClone, not stale binding.workspacePath', async () => {
+    it('runOpenCodeCore receives the canonical owner/repo directory, not stale binding.workspacePath', async () => {
       // #given — binding has a stale workspacePath; ensureClone returns the canonical path
       const {runMention} = await import('./run.js')
       setupHappyPath()
-      const canonicalPath = '/workspace/canonical/acme/widget'
+      const canonicalPath = '/workspace/repos/acme/widget'
       const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: canonicalPath})
       const staleBinding = {...makeBinding(), workspacePath: '/old/stale/path'}
       const deps = makeDeps({ensureClone, update: makeUpdateNoCheckoutThenReadyFn()})
@@ -302,6 +302,61 @@ describe('runMention', () => {
       const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string}
       expect(coreParams.directory).toBe(canonicalPath)
       expect(coreParams.directory).not.toBe('/old/stale/path')
+    })
+
+    it('uses the canonical directory even when no ensureClone is needed (stale binding.workspacePath ignored)', async () => {
+      // #given — /update reports ready on the first call, so ensureClone never runs
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ensureClone = vi.fn()
+      const staleBinding = {...makeBinding(), workspacePath: '/old/stale/path'}
+      const deps = makeDeps({ensureClone})
+
+      // #when
+      await runMention(makeMessage(), staleBinding, deps)
+
+      // #then
+      expect(ensureClone).not.toHaveBeenCalled()
+      const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string}
+      expect(coreParams.directory).toBe('/workspace/repos/acme/widget')
+    })
+
+    it('fails the run (no session) when ensureClone returns a path other than the canonical directory', async () => {
+      // #given — ensureClone reports a divergent checkout; the agent must not run in a directory the
+      // quiescence check does not query
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: '/workspace/other/acme/widget'})
+      const update = makeUpdateNoCheckoutThenReadyFn()
+      const deps = makeDeps({ensureClone, update})
+
+      // #when
+      await runMention(makeMessage(), makeBinding(), deps)
+
+      // #then — no OpenCode session; the run is terminalized FAILED; the retry /update never happens
+      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(update).toHaveBeenCalledOnce()
+      expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)).toContain('FAILED')
+    })
+
+    it('lowercases a mixed-case binding owner/repo for /update, ensureClone, and the session directory', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: '/workspace/repos/acme/widget'})
+      const update = makeUpdateNoCheckoutThenReadyFn()
+      const mixedBinding = {...makeBinding(), owner: 'Acme', repo: 'Widget', workspacePath: '/old/stale/path'}
+      const deps = makeDeps({ensureClone, update})
+
+      // #when
+      await runMention(makeMessage(), mixedBinding, deps)
+
+      // #then
+      expect(update.mock.calls[0]?.[0]).toBe('acme')
+      expect(update.mock.calls[0]?.[1]).toBe('widget')
+      expect(ensureClone).toHaveBeenCalledWith('acme', 'widget')
+      const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string}
+      expect(coreParams.directory).toBe('/workspace/repos/acme/widget')
     })
   })
 
@@ -323,11 +378,14 @@ describe('runMention', () => {
       })
       mockRuntime.acquireLock.mockImplementation(async () => {
         callOrder.push('acquireLock')
-        return {success: true as const, data: {acquired: true as const, etag: 'lock-etag-v1', holder: null}}
+        return {
+          success: true as const,
+          data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
+        }
       })
       const ensureClone = vi.fn().mockImplementation(async () => {
         callOrder.push('ensureClone')
-        return {success: true as const, data: '/workspace/acme/widget'}
+        return {success: true as const, data: '/workspace/repos/acme/widget'}
       })
       let updateCalls = 0
       const update = vi.fn().mockImplementation(async () => {
@@ -361,7 +419,12 @@ describe('runMention', () => {
       setupHappyPath()
       mockRuntime.acquireLock.mockResolvedValue({
         success: true as const,
-        data: {acquired: false as const, etag: null, holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown},
+        data: {
+          acquired: false as const,
+          outcome: 'active-holder' as const,
+          etag: null,
+          holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown,
+        },
       } as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
       const ensureClone = makeEnsureCloneFn('success')
       const deps = makeDeps({ensureClone})
@@ -452,11 +515,14 @@ describe('runMention', () => {
       })
       mockRuntime.acquireLock.mockImplementation(async () => {
         callOrder.push('acquireLock')
-        return {success: true as const, data: {acquired: true as const, etag: 'lock-etag-v1', holder: null}}
+        return {
+          success: true as const,
+          data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
+        }
       })
       const ensureClone = vi.fn().mockImplementation(async () => {
         callOrder.push('ensureClone')
-        return {success: true as const, data: '/workspace/acme/widget'}
+        return {success: true as const, data: '/workspace/repos/acme/widget'}
       })
       let updateCalls = 0
       const update = vi.fn().mockImplementation(async () => {
@@ -609,7 +675,12 @@ describe('runMention', () => {
 
       mockRuntime.acquireLock.mockResolvedValue({
         success: true as const,
-        data: {acquired: false as const, etag: null, holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown},
+        data: {
+          acquired: false as const,
+          outcome: 'active-holder' as const,
+          etag: null,
+          holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown,
+        },
       } as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
 
       // #when
@@ -1048,7 +1119,7 @@ describe('launchWork admission', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.transitionRun
@@ -1418,7 +1489,12 @@ describe('early-abort gates terminalize to FAILED', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-4b'}})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: false as const, etag: null, holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown},
+      data: {
+        acquired: false as const,
+        outcome: 'active-holder' as const,
+        etag: null,
+        holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown,
+      },
     } as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
@@ -1452,6 +1528,47 @@ describe('early-abort gates terminalize to FAILED', () => {
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
+  it('gate 4b (expired lease not corroborated): hands the shared checker to acquireLock, terminalizes, never executes', async () => {
+    // #given — acquireLock reports an expired holder it could not confirm settled
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-4c'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {
+        acquired: false as const,
+        outcome: 'expired-holder' as const,
+        etag: null,
+        holder: {holder_id: 'other-gateway'} as never,
+        confirmation: {
+          kind: 'busy',
+          source: 'opencode-session-status',
+          directory: '/d',
+          checkedAt: 't',
+          sessionIds: ['s'],
+        },
+      },
+    } as unknown as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
+    })
+    const checkRepoQuiescence = vi.fn()
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({checkRepoQuiescence})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — checker passed through as the corroborator
+    expect(mockRuntime.acquireLock.mock.calls[0]?.[6]).toEqual({confirmExpiredHolder: checkRepoQuiescence})
+    // #and — distinct reply, holder not leaked, run terminalized, no execution
+    const sends = request._replySink._sends
+    expect(sends.some(s => s.content.includes('may still be running'))).toBe(true)
+    expect(sends.every(s => !s.content.includes('other-gateway'))).toBe(true)
+    expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)).toContain('FAILED')
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
   // ── Gate 5: ACK transition fail ────────────────────────────────────────────
 
   it('gate 5 (ACK transition fail): run terminalized to FAILED, lock released, same reply text', async () => {
@@ -1460,7 +1577,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-5'}})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     // First transitionRun call (ACKNOWLEDGED) fails; second (FAILED terminalization) succeeds
@@ -1550,7 +1667,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-throw-post-lock'}})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-throw', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-throw', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     // transitionRun THROWS on the ACKNOWLEDGED call (not returns {success:false})
@@ -1799,7 +1916,12 @@ describe('failureKind threading (early-abort gates)', () => {
 
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: false as const, etag: null, holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown},
+      data: {
+        acquired: false as const,
+        outcome: 'active-holder' as const,
+        etag: null,
+        holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown,
+      },
     } as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
 
     // #when

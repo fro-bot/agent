@@ -151,7 +151,7 @@ describe('checkout provenance', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag'}})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.transitionRun
@@ -202,7 +202,7 @@ describe('checkout provenance', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag'}})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.transitionRun
@@ -255,7 +255,7 @@ describe('checkout provenance', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.transitionRun
@@ -324,7 +324,7 @@ describe('checkout provenance', () => {
     let updateCallCount = 0
     const ensureClone = vi.fn().mockImplementation(async () => {
       callOrder.push('ensureClone')
-      return {success: true as const, data: '/workspace/acme/widget'}
+      return {success: true as const, data: '/workspace/repos/acme/widget'}
     })
     const update = vi.fn().mockImplementation(async () => {
       updateCallCount += 1
@@ -343,7 +343,10 @@ describe('checkout provenance', () => {
     })
     mockRuntime.acquireLock.mockImplementation(async () => {
       callOrder.push('acquireLock')
-      return {success: true as const, data: {acquired: true as const, etag: 'lock-etag-v1', holder: null}}
+      return {
+        success: true as const,
+        data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
+      }
     })
     mockRuntime.createHeartbeatController.mockReturnValue({
       start: vi.fn().mockImplementation(() => {
