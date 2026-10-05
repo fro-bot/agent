@@ -446,6 +446,7 @@ describe('run', () => {
     // to a hardcoded literal instead of derived from `computeDrainDeadlineMs`'s return, this
     // value would not appear and the assertion below would fail for the right reason.
     const derivedDeadlineMs = 741_213
+    vi.stubEnv('GITHUB_WORKSPACE', '/github/workspace')
 
     vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
     vi.mocked(runRouting).mockResolvedValue(createRouting())
@@ -541,8 +542,10 @@ describe('run', () => {
       expect.objectContaining({
         ledger: ledgerInstance,
         parentSessionId: 'ses_root',
+        directory: '/github/workspace',
       }),
     )
+    vi.unstubAllEnvs()
 
     // #then drain's deadline is derived through computeDrainDeadlineMs from the remaining
     // timeout budget, not a hardcoded value -- assert both that the deadline actually used

@@ -104,6 +104,31 @@ describe('settleOwnedSessions', () => {
     })
   })
 
+  describe('reconciliation is scoped to the run directory', () => {
+    it('does not confirm a still-live child settled: status/children are queried with the run directory', async () => {
+      // #given — a child whose abort did not take effect: `session.status` reports it busy ONLY
+      // for the directory it runs in, and returns an empty `{}` for any other directory.
+      const directory = '/workspace/repos/owner/repo'
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'background task')
+      const childrenSpy = vi.fn().mockResolvedValue({data: [{id: CHILD}], error: null})
+      const statusSpy = vi.fn().mockImplementation(async (args?: {query?: {directory?: string}}) => ({
+        data: args?.query?.directory === directory ? {[CHILD]: {type: 'busy'}} : {},
+        error: null,
+      }))
+      const client = makeClient({children: childrenSpy, status: statusSpy})
+
+      // #when
+      const result = await settleOwnedSessions({client, directory, rootSessionId: ROOT, ledger, logger: makeLogger()})
+
+      // #then — both reconciliation calls carried the directory, so the live child is not settled
+      expect(childrenSpy).toHaveBeenCalledWith({path: {id: ROOT}, query: {directory}})
+      expect(statusSpy).toHaveBeenCalledWith({query: {directory}})
+      expect(result.settled).toBe(false)
+      expect(ledger.snapshot().find(entry => entry.sessionId === CHILD)?.state).toBe('unknown')
+    })
+  })
+
   describe('happy settle — cancel then confirm', () => {
     it('cancels the root and every unsettled entry, confirms via reconciliation, and returns settled:true', async () => {
       // #given — one outstanding child; reconciliation reports it a child of root AND no
