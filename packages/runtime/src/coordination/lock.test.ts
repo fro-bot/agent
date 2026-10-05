@@ -1,6 +1,6 @@
 import type {ObjectStoreAdapter, ObjectStoreConfig} from '../object-store/types.js'
 import type {Logger} from '../shared/logger.js'
-import type {CoordinationConfig, LockRecord, RunState} from './types.js'
+import type {ConfirmExpiredHolder, CoordinationConfig, LockRecord, RepoQuiescence, RunState} from './types.js'
 
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
@@ -71,6 +71,23 @@ function createCoordinationConfig(storeAdapter: Required<ObjectStoreAdapter>): C
   }
 }
 
+const clearConfirmation: ConfirmExpiredHolder = async () => ({
+  kind: 'clear',
+  source: 'opencode-session-status',
+  directory: '/workspace/repos/owner/repo',
+  checkedAt: '2026-04-24T18:15:00.000Z',
+})
+
+function busyConfirmation(sessionIds: readonly string[]): RepoQuiescence {
+  return {
+    kind: 'busy',
+    source: 'opencode-session-status',
+    directory: '/workspace/repos/owner/repo',
+    checkedAt: '2026-04-24T18:15:00.000Z',
+    sessionIds,
+  }
+}
+
 describe('lock coordination', () => {
   beforeEach(() => {
     vi.useFakeTimers()
@@ -93,7 +110,7 @@ describe('lock coordination', () => {
     const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
 
     // #then
-    expect(result).toEqual(ok({acquired: false, etag: null, holder: existingLock}))
+    expect(result).toEqual(ok({acquired: false, outcome: 'active-holder', etag: null, holder: existingLock}))
   })
 
   it('rejects an existing lock with an unknown surface', async () => {
@@ -125,7 +142,7 @@ describe('lock coordination', () => {
     const result = await acquireLock(config, 'owner/repo', 'gateway-1', 'discord', 'run-1', logger)
 
     // #then
-    expect(result).toEqual(ok({acquired: true, etag: 'etag-1', holder: null}))
+    expect(result).toEqual(ok({acquired: true, outcome: 'acquired', etag: 'etag-1', holder: null}))
     expect(storeAdapter.conditionalPut).toHaveBeenCalledWith(
       'fro-bot-state/coordination/owner/repo/locks/repo.json',
       JSON.stringify(
@@ -155,7 +172,7 @@ describe('lock coordination', () => {
     const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
 
     // #then
-    expect(result).toEqual(ok({acquired: false, etag: null, holder: existingLock}))
+    expect(result).toEqual(ok({acquired: false, outcome: 'active-holder', etag: null, holder: existingLock}))
     expect(storeAdapter.getObject).toHaveBeenCalledWith('fro-bot-state/coordination/owner/repo/locks/repo.json')
   })
 
@@ -175,7 +192,7 @@ describe('lock coordination', () => {
     const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
 
     // #then
-    expect(result).toEqual(ok({acquired: false, etag: null, holder: existingLock}))
+    expect(result).toEqual(ok({acquired: false, outcome: 'active-holder', etag: null, holder: existingLock}))
   })
 
   it('takes over a stale lock using the stale etag', async () => {
@@ -193,10 +210,12 @@ describe('lock coordination', () => {
     const logger = createLogger()
 
     // #when
-    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
+    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger, {
+      confirmExpiredHolder: clearConfirmation,
+    })
 
     // #then
-    expect(result).toEqual(ok({acquired: true, etag: 'etag-new', holder: null}))
+    expect(result).toEqual(ok({acquired: true, outcome: 'acquired', etag: 'etag-new', holder: null}))
     expect(conditionalPut).toHaveBeenNthCalledWith(
       2,
       'fro-bot-state/coordination/owner/repo/locks/repo.json',
@@ -227,10 +246,12 @@ describe('lock coordination', () => {
     const logger = createLogger()
 
     // #when
-    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
+    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger, {
+      confirmExpiredHolder: clearConfirmation,
+    })
 
     // #then
-    expect(result).toEqual(ok({acquired: false, etag: null, holder: null}))
+    expect(result).toEqual(ok({acquired: false, outcome: 'conflict', etag: null, holder: null}))
   })
 
   it('treats a lock as stale at exactly the ttl boundary', async () => {
@@ -248,10 +269,12 @@ describe('lock coordination', () => {
     const logger = createLogger()
 
     // #when
-    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
+    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger, {
+      confirmExpiredHolder: clearConfirmation,
+    })
 
     // #then
-    expect(result).toEqual(ok({acquired: true, etag: 'etag-new', holder: null}))
+    expect(result).toEqual(ok({acquired: true, outcome: 'acquired', etag: 'etag-new', holder: null}))
   })
 
   it('releases a lock using the held etag', async () => {
@@ -495,7 +518,9 @@ describe('lock coordination', () => {
     const logger = createLogger()
 
     // #when
-    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
+    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger, {
+      confirmExpiredHolder: clearConfirmation,
+    })
 
     // #then — must NOT return acquired:true; must return err
     expect(result.success).toBe(false)
@@ -514,7 +539,7 @@ describe('lock coordination', () => {
     const result = await acquireLock(config, 'owner/repo', 'gateway-1', 'discord', 'run-1', logger)
 
     // #then
-    expect(result).toEqual(ok({acquired: true, etag: 'etag-valid', holder: null}))
+    expect(result).toEqual(ok({acquired: true, outcome: 'acquired', etag: 'etag-valid', holder: null}))
   })
 })
 
@@ -559,7 +584,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then
     expect(result.success).toBe(true)
@@ -584,7 +609,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then
     expect(result.success).toBe(true)
@@ -594,30 +619,99 @@ describe('forceReleaseStaleLock', () => {
     })
   })
 
-  it('refuses to delete when lease is expired BUT run-state heartbeat is fresh (P0 guard)', async () => {
-    // #given — lock lease expired, but run is still heartbeating (heartbeat 30s ago, threshold=60s → alive)
+  it('releases an expired lock even when the old run-state heartbeat is fresh (RunState is diagnostic only)', async () => {
+    // #given — lease expired, run-state heartbeat 30s ago, workspace clear
     const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
-    // 18:14:30 is 30 seconds before 18:15:00 — within the 60s staleThresholdMs → live
     const liveRunState = createRunState({last_heartbeat: '2026-04-24T18:14:30.000Z'})
     const getObject = vi
       .fn<Required<ObjectStoreAdapter>['getObject']>()
       .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
       .mockResolvedValueOnce(ok({data: JSON.stringify(liveRunState), etag: 'etag-run'}))
     const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
-    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
-    const config = createCoordinationConfig(storeAdapter)
-    const logger = createLogger()
+    const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', createLogger(), {
+      confirmExpiredHolder: clearConfirmation,
+    })
 
-    // #then — must refuse, no delete
-    expect(result.success).toBe(true)
-    expect(result.success === true ? result.data.outcome : null).toBe('live-holder')
-    expect(result.success === true ? result.data.holderId : null).toBe('holder-1')
-    expect(result.success === true ? result.data.runId : null).toBe('run-1')
-    // The core P0 guard: assert NO delete call was made
+    // #then
+    expect(result.success === true ? result.data.outcome : null).toBe('released')
+    expect(result.success === true ? result.data.heartbeatAgeMs : null).toBe(30_000)
+    expect(conditionalDelete).toHaveBeenCalledOnce()
+  })
+
+  it('blocks release with workspace-busy and never deletes when the workspace is busy', async () => {
+    // #given
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValue(err(new Error('NoSuchKey')))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', createLogger(), {
+      confirmExpiredHolder: async () => busyConfirmation(['ses_child']),
+    })
+
+    // #then
+    expect(result.success === true ? result.data.outcome : null).toBe('workspace-busy')
     expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('blocks release with workspace-unknown when the workspace check is unknown or missing', async () => {
+    // #given
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(err(new Error('NoSuchKey')))
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(err(new Error('NoSuchKey')))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
+
+    // #when
+    const unknown = await forceReleaseStaleLock(config, 'owner/repo', createLogger(), {
+      confirmExpiredHolder: async () => ({
+        kind: 'unknown',
+        source: 'opencode-session-status',
+        directory: '/workspace/repos/owner/repo',
+        reason: 'status-request-failed',
+      }),
+    })
+    const missing = await forceReleaseStaleLock(config, 'owner/repo', createLogger())
+
+    // #then
+    expect(unknown.success === true ? unknown.data.outcome : null).toBe('workspace-unknown')
+    expect(missing.success === true ? missing.data.outcome : null).toBe('workspace-unknown')
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('deletes with the ETag observed before confirmation; a replacement during confirmation yields conflict', async () => {
+    // #given — the lock is replaced while confirmation runs, so the delete precondition fails
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-before'}))
+      .mockResolvedValue(err(new Error('NoSuchKey')))
+    const conditionalDelete = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalDelete']>()
+      .mockResolvedValueOnce(err(new Error('precondition failed')))
+    const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', createLogger(), {
+      confirmExpiredHolder: clearConfirmation,
+    })
+
+    // #then
+    expect(result.success === true ? result.data.outcome : null).toBe('conflict')
+    expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith('fro-bot-state/coordination/owner/repo/locks/repo.json', {
+      ifMatch: 'etag-before',
+    })
   })
 
   it('returns live-holder when lease is NOT expired (no run-state read, no delete)', async () => {
@@ -632,7 +726,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — live-holder, no run-state read, no delete
     expect(result.success).toBe(true)
@@ -653,7 +747,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then
     expect(result.success).toBe(true)
@@ -677,7 +771,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — conflict, not an error; the new holder's lock is NOT deleted
     expect(result.success).toBe(true)
@@ -699,7 +793,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — fail closed, no delete
     expect(result.success).toBe(true)
@@ -707,48 +801,48 @@ describe('forceReleaseStaleLock', () => {
     expect(conditionalDelete).not.toHaveBeenCalled()
   })
 
-  it('returns error and does NOT delete when run-state record is malformed', async () => {
-    // #given — lock is stale, but run-state has invalid shape
+  it('releases and audits an explicit unknown when the run-state record is malformed', async () => {
+    // #given — lock is stale, run-state has invalid shape (diagnostic only)
     const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
     const getObject = vi
       .fn<Required<ObjectStoreAdapter>['getObject']>()
       .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
       .mockResolvedValueOnce(ok({data: JSON.stringify({run_id: 'run-1'}), etag: 'etag-run'}))
     const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
-    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
-    const config = createCoordinationConfig(storeAdapter)
+    const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
-    // #then — fail closed, no delete
-    expect(result.success).toBe(true)
-    expect(result.success === true ? result.data.outcome : null).toBe('error')
-    expect(conditionalDelete).not.toHaveBeenCalled()
+    // #then
+    expect(result.success === true ? result.data.outcome : null).toBe('released')
+    expect(logger.info).toHaveBeenCalledWith(
+      'lock-takeover-outcome',
+      expect.objectContaining({oldRunState: 'unknown: run-state-malformed', decision: 'taken-over'}),
+    )
   })
 
-  it('returns error and does NOT delete when run-state getObject returns a transient (non-not-found) error', async () => {
-    // #given — lock lease is expired; run-state read fails with a transient error (not NoSuchKey)
-    // This is the P0 fail-closed guard: a network/503 error must NOT be treated as "absent → dead".
+  it('releases and audits an explicit unknown when the run-state read fails transiently', async () => {
+    // #given — run-state read failure neither authorizes nor prevents the corroborated release
     const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
     const getObject = vi
       .fn<Required<ObjectStoreAdapter>['getObject']>()
       .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
       .mockResolvedValueOnce(err(new Error('connection reset')))
     const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
-    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
-    const config = createCoordinationConfig(storeAdapter)
+    const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
-    // #then — fail closed: transient error → outcome 'error', NO delete
-    expect(result.success).toBe(true)
-    expect(result.success === true ? result.data.outcome : null).toBe('error')
-    // The core P0 guard: conditionalDelete must NOT be called on a transient read failure
-    expect(conditionalDelete).not.toHaveBeenCalled()
+    // #then
+    expect(result.success === true ? result.data.outcome : null).toBe('released')
+    expect(logger.info).toHaveBeenCalledWith(
+      'lock-takeover-attempt',
+      expect.objectContaining({oldRunState: 'unknown: run-state-unavailable', decision: 'pending'}),
+    )
   })
 
   it('releases the lock when run-state is absent (NoSuchKey) — genuinely-absent path still works', async () => {
@@ -765,7 +859,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — NoSuchKey is genuinely absent → treated as dead → released
     expect(result.success).toBe(true)
@@ -792,7 +886,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — lock vanished between read and delete → no-lock (not an error)
     expect(result.success).toBe(true)
@@ -803,34 +897,86 @@ describe('forceReleaseStaleLock', () => {
     })
   })
 
-  it('run-state key uses the gateway identity segment, NOT the coordination identity (NBC-2 regression)', async () => {
-    // #given — lock is stale; run-state is absent (NoSuchKey) so we can assert the exact key used
-    // This test PINS the run-state key identity segment: it must contain /discord-gateway/ (the
-    // gateway identity passed in), NOT /coordination/ (the lock key's identity). This is the
-    // regression test for the P0 bug where readRunStateByRunId used COORDINATION_IDENTITY.
-    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-42'})
+  it('returns err and audits store-error when the confirmed delete fails with a non-precondition, non-not-found error', async () => {
+    // #given — workspace clear, delete fails with a transient store error
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValue(err(new Error('NoSuchKey')))
+    const conditionalDelete = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalDelete']>()
+      .mockResolvedValueOnce(err(new Error('S3 503 service unavailable')))
+    const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(logger.info).toHaveBeenLastCalledWith(
+      'lock-takeover-outcome',
+      expect.objectContaining({operation: 'operator-release', decision: 'store-error'}),
+    )
+  })
+
+  it.each([
+    ['clear + delete ok', 'taken-over', async () => ok(undefined), clearConfirmation],
+    ['precondition failure', 'cas-conflict', async () => err(new Error('precondition failed')), clearConfirmation],
+    ['vanished lock', 'lock-vanished', async () => err(new Error('NoSuchKey: object not found')), clearConfirmation],
+    ['store error', 'store-error', async () => err(new Error('S3 503')), clearConfirmation],
+    ['busy workspace', 'blocked-busy', async () => ok(undefined), async () => busyConfirmation(['ses_child'])],
+  ])(
+    'emits exactly one lock-takeover-outcome sharing the attempt correlation id (%s)',
+    async (_label, decision, del, confirm) => {
+      // #given
+      const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+      const getObject = vi
+        .fn<Required<ObjectStoreAdapter>['getObject']>()
+        .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+        .mockResolvedValue(err(new Error('NoSuchKey')))
+      const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(del)
+      const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
+      const logger = createLogger()
+
+      // #when
+      await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: confirm})
+
+      // #then
+      const calls = vi.mocked(logger.info).mock.calls
+      const attempts = calls.filter(call => call[0] === 'lock-takeover-attempt')
+      const outcomes = calls.filter(call => call[0] === 'lock-takeover-outcome')
+      expect(attempts).toHaveLength(1)
+      expect(outcomes).toHaveLength(1)
+      expect(outcomes[0]?.[1]).toMatchObject({
+        operation: 'operator-release',
+        decision,
+        correlationId: attempts[0]?.[1]?.correlationId,
+      })
+    },
+  )
+
+  it('reads the diagnostic run-state under the OLD holder identity, not the coordination identity', async () => {
+    // #given — lock holder_id is the run-owner identity
+    const staleLock = createLockRecord({
+      acquired_at: '2026-04-24T18:00:00.000Z',
+      run_id: 'run-42',
+      holder_id: 'discord-gateway',
+    })
     const getObject = vi
       .fn<Required<ObjectStoreAdapter>['getObject']>()
       .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
       .mockResolvedValueOnce(err(new Error('NoSuchKey: object not found')))
-    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
-    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
-    const config = createCoordinationConfig(storeAdapter)
-    const logger = createLogger()
+    const config = createCoordinationConfig(createStoreAdapter({getObject}))
 
-    // #when — pass 'discord-gateway' as the run-state owner identity
-    await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    // #when
+    await forceReleaseStaleLock(config, 'owner/repo', createLogger(), {confirmExpiredHolder: clearConfirmation})
 
-    // #then — the second getObject call (run-state read) must use the gateway identity segment
-    // Key shape: {prefix}/{identity}/{owner}/{repo}/runs/{runId}.json
-    const runStateCall = getObject.mock.calls[1]
-    expect(runStateCall).toBeDefined()
-    const runStateKey = runStateCall?.[0] as string
-    // Must contain the gateway identity segment
+    // #then
+    const runStateKey = getObject.mock.calls[1]?.[0] as string
     expect(runStateKey).toContain('/discord-gateway/')
-    // Must reference the correct run ID
     expect(runStateKey).toContain('/runs/run-42.json')
-    // Must NOT use the coordination identity (the lock key's identity)
     expect(runStateKey).not.toContain('/coordination/')
   })
 })
@@ -924,7 +1070,7 @@ describe('isNotFound (via forceReleaseStaleLock lock-read path)', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — 404 → not-found → no-lock (not error)
     expect(result.success).toBe(true)
@@ -942,7 +1088,7 @@ describe('isNotFound (via forceReleaseStaleLock lock-read path)', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — NoSuchKey errorCode → not-found → no-lock
     expect(result.success).toBe(true)
@@ -960,7 +1106,7 @@ describe('isNotFound (via forceReleaseStaleLock lock-read path)', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — NoSuchKey errorName → not-found → no-lock
     expect(result.success).toBe(true)
@@ -979,7 +1125,7 @@ describe('isNotFound (via forceReleaseStaleLock lock-read path)', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — 503 with "not found" in message → classified as error (not no-lock), no delete
     expect(result.success).toBe(true)
@@ -997,7 +1143,7 @@ describe('isNotFound (via forceReleaseStaleLock lock-read path)', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger, {confirmExpiredHolder: clearConfirmation})
 
     // #then — fallback regex matches → no-lock
     expect(result.success).toBe(true)

@@ -67,7 +67,7 @@ vi.mock('@fro-bot/runtime', () => ({
 
 const noop = () => {}
 const logger = {debug: noop, info: noop, warning: noop, error: noop}
-const coordLogger = {debug: noop}
+const coordLogger = {debug: noop, info: noop}
 
 // Minimal CoordinationConfig stub — only shape matters for mocked calls
 const config = {} as Parameters<typeof acquireLockEffect>[0]
@@ -109,7 +109,7 @@ describe('acquireLockEffect', () => {
   // #when Effect runs
   // #then resolves to data
   it('resolves to LockAcquisitionResult on success', async () => {
-    const data = {acquired: true as const, etag: 'abc', holder: null}
+    const data = {acquired: true as const, outcome: 'acquired' as const, etag: 'abc', holder: null}
     vi.mocked(acquireLock).mockResolvedValue(ok(data))
 
     const exit = await Effect.runPromiseExit(

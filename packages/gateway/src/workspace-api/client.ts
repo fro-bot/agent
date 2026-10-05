@@ -235,6 +235,38 @@ export function workspaceRepoPath(owner: string, repo: string): string {
   return `${EXPECTED_WORKSPACE_ROOT}/${owner}/${repo}`
 }
 
+// Letters, digits, `.`, `_`, `-` only (GitHub allows repos like `.github`); `.` and `..` rejected separately.
+const CANONICAL_SEGMENT = /^[a-z0-9._-]+$/
+
+export interface CanonicalWorkspaceTarget {
+  readonly owner: string
+  readonly repo: string
+  /** `/workspace/repos/{owner}/{repo}` — the checkout `/update` operates on and the only OpenCode `directory` for this repo. */
+  readonly directory: string
+}
+
+/**
+ * Single source of truth for where a repo's OpenCode sessions run. Lowercases and validates owner/repo once;
+ * returns `null` for anything that is not a plain `owner`/`repo` pair (never falls back to a root or cwd).
+ *
+ * Every OpenCode `directory` the gateway sends for a repo (session create, event subscribe, prompt, abort,
+ * permission reply) AND the repo-quiescence `session.status` query must come from here: `session.status`
+ * returns `{}` for any directory without sessions, so a check against a different directory than the run's
+ * would read as "quiescent". Never use the stored `binding.workspacePath` for this.
+ */
+export function canonicalWorkspaceTarget(owner: string, repo: string): CanonicalWorkspaceTarget | null {
+  const canonicalOwner = owner.toLowerCase()
+  const canonicalRepo = repo.toLowerCase()
+  if (CANONICAL_SEGMENT.test(canonicalOwner) === false || CANONICAL_SEGMENT.test(canonicalRepo) === false) return null
+  if (canonicalOwner === '.' || canonicalOwner === '..' || canonicalRepo === '.' || canonicalRepo === '..') return null
+  return {owner: canonicalOwner, repo: canonicalRepo, directory: workspaceRepoPath(canonicalOwner, canonicalRepo)}
+}
+
+/** `canonicalWorkspaceTarget(...)?.directory`, or `null` when owner/repo are invalid. */
+export function canonicalWorkspaceDirectory(owner: string, repo: string): string | null {
+  return canonicalWorkspaceTarget(owner, repo)?.directory ?? null
+}
+
 /**
  * Create a workspace-agent HTTP client.
  *

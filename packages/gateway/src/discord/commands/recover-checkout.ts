@@ -261,8 +261,21 @@ async function runRecoverCheckoutFlow(params: {
       repo: repoSlug,
       kind: 'recover-checkout',
       logger: deps.gatewayLogger,
+      checkRepoQuiescence: deps.checkRepoQuiescence,
     }),
   )
+  if (guardResult.outcome === 'blocked') {
+    const why =
+      guardResult.reason === 'workspace-busy'
+        ? 'its workspace still shows running sessions'
+        : 'its workspace activity could not be confirmed'
+    await editInteractionAsync(
+      interaction,
+      {content: `\`${repoSlug}\` has an expired lock but ${why}, so recovery was not started. Try again shortly.`},
+      log,
+    )
+    return
+  }
   if (guardResult.outcome === 'lock-held') {
     const holder = guardResult.holderId === null ? 'another operation' : `holder \`${guardResult.holderId}\``
     await editInteractionAsync(

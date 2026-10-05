@@ -13,6 +13,7 @@
  */
 
 import type {CoordinationConfig, RunState} from '@fro-bot/runtime'
+import type {RepoQuiescenceChecker} from '../execute/repo-quiescence.js'
 import type {GatewayLogger} from './client.js'
 
 import {Effect} from 'effect'
@@ -25,8 +26,11 @@ import {
 } from '../runtime-effect.js'
 
 /** Narrow logger adapter for runtime coordination calls \u2014 mirrors `execute/run.ts`'s `toCoordLogger`. */
-function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context?: Record<string, unknown>) => void} {
-  return {debug: (msg, ctx) => logger.debug(ctx ?? {}, msg)}
+function toCoordLogger(logger: GatewayLogger): {
+  debug: (message: string, context?: Record<string, unknown>) => void
+  info: (message: string, context?: Record<string, unknown>) => void
+} {
+  return {debug: (msg, ctx) => logger.debug(ctx ?? {}, msg), info: (msg, ctx) => logger.info(ctx ?? {}, msg)}
 }
 
 export interface MaintenanceRunHandle {
@@ -42,6 +46,8 @@ export interface MaintenanceRunHandle {
 export type AcquireMaintenanceRunResult =
   | {readonly outcome: 'acquired'; readonly handle: MaintenanceRunHandle}
   | {readonly outcome: 'lock-held'; readonly holderId: string | null}
+  /** An expired lease exists but the workspace is not confirmed clear; nothing was mutated. */
+  | {readonly outcome: 'blocked'; readonly reason: 'workspace-busy' | 'workspace-unknown'}
   | {readonly outcome: 'error'; readonly message: string}
 
 /**
@@ -54,19 +60,25 @@ export function acquireMaintenanceRun(opts: {
   readonly repo: string
   readonly kind: string
   readonly logger: GatewayLogger
+  /** Required: an expired lease is only taken over once the repo workspace is confirmed clear. */
+  readonly checkRepoQuiescence: RepoQuiescenceChecker
 }): Effect.Effect<AcquireMaintenanceRunResult> {
-  const {coordinationConfig, identity, repo, kind, logger} = opts
+  const {coordinationConfig, identity, repo, kind, logger, checkRepoQuiescence} = opts
   const coordLogger = toCoordLogger(logger)
   const runId = crypto.randomUUID()
 
   return Effect.gen(function* () {
-    const lockResult = yield* acquireLockEffect(coordinationConfig, repo, identity, 'discord', runId, coordLogger).pipe(
-      Effect.either,
-    )
+    const lockResult = yield* acquireLockEffect(coordinationConfig, repo, identity, 'discord', runId, coordLogger, {
+      confirmExpiredHolder: checkRepoQuiescence,
+    }).pipe(Effect.either)
     if (lockResult._tag === 'Left') {
       return {outcome: 'error' as const, message: lockResult.left.message}
     }
     if (lockResult.right.acquired === false) {
+      if (lockResult.right.outcome === 'expired-holder') {
+        const reason = lockResult.right.confirmation.kind === 'busy' ? 'workspace-busy' : 'workspace-unknown'
+        return {outcome: 'blocked' as const, reason}
+      }
       return {outcome: 'lock-held' as const, holderId: lockResult.right.holder?.holder_id ?? null}
     }
     const lockEtag = lockResult.right.etag

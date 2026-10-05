@@ -42,6 +42,7 @@ import {abortRegistry} from './execute/abort-registry.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
+import {createRepoQuiescenceChecker} from './execute/repo-quiescence.js'
 import {createRunIndex} from './execute/run-index.js'
 import {getInFlightRuns} from './execute/run.js'
 import {AppNotInstalledError, createAppClient, InsufficientPermissionsError} from './github/app-client.js'
@@ -446,6 +447,13 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       token: config.workspaceOpencodeToken,
     })
 
+    // One workspace quiescence checker shared by acquisition, maintenance, recovery and operator release.
+    const checkRepoQuiescence = createRepoQuiescenceChecker({
+      workspaceOpencodeUrl: config.workspaceOpencodeUrl,
+      workspaceOpencodeToken: config.workspaceOpencodeToken,
+      logger,
+    })
+
     const commandDeps = {
       bindingsStore,
       appClient,
@@ -459,9 +467,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // force-release-lock deps: pre-built coordination config + Effect-wrapped primitive
       // (injected so tests can mock without real S3 calls)
       coordinationConfig: makeCoordinationConfig(s3Adapter, config),
-      // identity is the run-state owner identity (gateway identity); forwarded to
-      // forceReleaseStaleLockEffect so it reads run-state under the correct key segment.
       identity: config.identity,
+      checkRepoQuiescence,
       forceReleaseStaleLock: forceReleaseStaleLockEffect,
       dispatchWorkflow,
     }
@@ -653,6 +660,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     const runEngineDeps: import('./execute/run.js').RunMentionDeps = {
       coordinationConfig: makeCoordinationConfig(s3Adapter, config),
       identity: config.identity,
+      checkRepoQuiescence,
       concurrency: concurrencyRegistry,
       queue: channelQueue,
       attachUrl: config.workspaceOpencodeUrl,
@@ -1016,6 +1024,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           coordinationConfig: makeCoordinationConfig(s3Adapter, config),
           identity: config.identity,
           bindingsStore,
+          checkRepoQuiescence,
           resolveThread: async (threadId: string): Promise<SinkThread | null> => {
             try {
               const channel = await client.channels.fetch(threadId)

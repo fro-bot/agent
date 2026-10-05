@@ -8,16 +8,17 @@
  * - `ping` — smoke-test; responds with ephemeral "pong"
  * - `add-project` — bind a GitHub repo to a Discord channel
  * - `clear-queue` — drop pending queued tasks for the invoking channel
- * - `force-release-lock` — dead-run-verified force-release of a stuck per-repo lock
+ * - `force-release-lock` — corroborated force-release of an expired per-repo lock
  * - `dispatch` — ask GitHub Actions to run the fixed repository workflow
  */
 
 import type {CoordinationConfig, ForceReleaseStaleLockResult} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
+import type {RepoQuiescenceChecker} from '../../execute/repo-quiescence.js'
 import type {RunTask} from '../../execute/run.js'
 import type {DispatchWorkflow} from '../../github/dispatch.js'
-import type {CoordinationLogger} from '../../runtime-effect.js'
+import type {ConfirmExpiredHolder, LockCoordinationLogger} from '../../runtime-effect.js'
 import type {GatewayLogger} from '../client.js'
 import type {AddProjectDeps} from './add-project.js'
 import type {SlashCommand} from './index.js'
@@ -44,7 +45,7 @@ import {createRecoverCheckoutCommand} from './recover-checkout.js'
  * Extends `AddProjectDeps` with the per-channel queue so the `clear-queue`
  * subcommand can drop pending tasks for the invoking channel, and with
  * coordination deps so the `force-release-lock` subcommand can call the
- * dead-run-verified force-release primitive.
+ * corroborated force-release primitive.
  */
 export interface FroBotDeps extends AddProjectDeps {
   /** Per-channel FIFO queue — the same instance used by the run path. */
@@ -65,20 +66,23 @@ export interface FroBotDeps extends AddProjectDeps {
   readonly coordinationConfig: CoordinationConfig
   /**
    * Run-state owner identity (the gateway identity, e.g. `'discord-gateway'`).
-   * Passed to `forceReleaseStaleLock` so it reads run-state under the correct
-   * identity segment — distinct from the lock key's `COORDINATION_IDENTITY`.
    */
   readonly identity: string
   /**
-   * Dead-run-verified force-release primitive (injected for testability).
+   * Workspace quiescence check shared by every lock-reclaiming path (acquisition, maintenance,
+   * recovery, operator release).
+   */
+  readonly checkRepoQuiescence: RepoQuiescenceChecker
+  /**
+   * Corroborated force-release primitive (injected for testability).
    * In production this is `forceReleaseStaleLockEffect` from `runtime-effect.ts`.
    * Tests inject a mock returning `Effect.succeed(result)` to avoid real S3 calls.
    */
   readonly forceReleaseStaleLock: (
     config: CoordinationConfig,
     repo: string,
-    identity: string,
-    logger: CoordinationLogger,
+    logger: LockCoordinationLogger,
+    confirmExpiredHolder?: ConfirmExpiredHolder,
   ) => Effect.Effect<ForceReleaseStaleLockResult, Error>
   /** GitHub Actions dispatch primitive, constructed once in program.ts. */
   readonly dispatchWorkflow: DispatchWorkflow
@@ -123,7 +127,7 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
       sub
         .setName('force-release-lock')
         .setDescription(
-          'Force-release a stuck per-repo coordination lock (dead-run-verified; requires ManageChannels)',
+          'Force-release an expired per-repo coordination lock (workspace-verified; requires ManageChannels)',
         ),
     )
     .addSubcommand(sub =>
@@ -237,18 +241,16 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
           const {owner, repo} = bindingResult.data
           const repoSlug = `${owner}/${repo}`
 
-          // Narrow logger adapter — runtime coordination functions take a narrow
-          // {debug} logger; adapt the gateway logger inline (same pattern as run.ts).
-          const coordLogger: CoordinationLogger = {
+          const coordLogger: LockCoordinationLogger = {
             debug: (msg: string, coordCtx?: Record<string, unknown>) => ctx.log.debug(coordCtx ?? {}, msg),
+            info: (msg: string, coordCtx?: Record<string, unknown>) => ctx.log.info(coordCtx ?? {}, msg),
           }
 
-          // Pass deps.identity (the gateway identity) so run-state is read under the correct key.
           const releaseResult = yield* deps.forceReleaseStaleLock(
             deps.coordinationConfig,
             repoSlug,
-            deps.identity,
             coordLogger,
+            deps.checkRepoQuiescence,
           )
 
           const {outcome, holderId, lockAgeMs, heartbeatAgeMs} = releaseResult
@@ -298,6 +300,28 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
                 ctx.interaction,
                 {
                   content: `⚠️ The lock for \`${repoSlug}\` changed just now (re-acquired between read and delete). Try again.`,
+                },
+                ctx.log,
+              )
+              break
+            }
+
+            case 'workspace-busy': {
+              yield* editInteraction(
+                ctx.interaction,
+                {
+                  content: `🔒 The lock for \`${repoSlug}\` has expired, but its workspace still shows running sessions — not released. Wait for those sessions to finish or cancel them, then retry. If it stays busy, restart the workspace (this ends its sessions) and retry once it is back up.`,
+                },
+                ctx.log,
+              )
+              break
+            }
+
+            case 'workspace-unknown': {
+              yield* editInteraction(
+                ctx.interaction,
+                {
+                  content: `⚠️ The lock for \`${repoSlug}\` has expired, but its workspace activity could not be confirmed — not released. If the workspace is down, restart it and retry once its status endpoint is reachable again.`,
                 },
                 ctx.log,
               )

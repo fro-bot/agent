@@ -119,6 +119,7 @@ function makeRunMentionDeps(): MentionDeps['run'] {
   return {
     coordinationConfig: {} as MentionDeps['run']['coordinationConfig'],
     identity: 'discord-gateway',
+    checkRepoQuiescence: vi.fn(),
     concurrency: {
       tryAcquire: vi.fn().mockReturnValue('ok'),
       release: vi.fn(),

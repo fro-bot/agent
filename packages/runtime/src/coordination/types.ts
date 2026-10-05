@@ -33,9 +33,63 @@ export interface LockRecord {
   readonly run_id: string
 }
 
+/**
+ * Snapshot of whether OpenCode is running anything in a repo's workspace directory.
+ * Only `clear` authorizes replacing an expired lease holder; `busy` and `unknown` both block.
+ */
+export type RepoQuiescence =
+  | {
+      readonly kind: 'clear'
+      readonly source: 'opencode-session-status'
+      readonly directory: string
+      readonly checkedAt: string
+    }
+  | {
+      readonly kind: 'busy'
+      readonly source: 'opencode-session-status'
+      readonly directory: string
+      readonly checkedAt: string
+      readonly sessionIds: readonly string[]
+    }
+  | {
+      readonly kind: 'unknown'
+      readonly source: 'opencode-session-status' | 'unavailable'
+      readonly directory: string | null
+      readonly reason: string
+    }
+
+/** A `RepoQuiescence` that did not authorize takeover. */
+export type BlockedRepoQuiescence = Exclude<RepoQuiescence, {readonly kind: 'clear'}>
+
+export type ConfirmExpiredHolder = (context: {
+  readonly repo: string
+  readonly holder: LockRecord
+  readonly signal: AbortSignal
+}) => Promise<RepoQuiescence>
+
+export interface LockAcquisitionOptions {
+  readonly confirmExpiredHolder?: ConfirmExpiredHolder
+  /** Holders whose expired leases may be reclaimed without corroboration (e.g. the Action's own surface). */
+  readonly reclaimableWithoutConfirmation?: (holder: LockRecord) => boolean
+}
+
+/** Logger for lock operations that emit audit events (`info`) alongside diagnostics (`debug`). */
+export interface LockLogger {
+  readonly debug: (message: string, context?: Record<string, unknown>) => void
+  readonly info: (message: string, context?: Record<string, unknown>) => void
+}
+
 export type LockAcquisitionResult =
-  | {readonly acquired: true; readonly etag: string; readonly holder: null}
-  | {readonly acquired: false; readonly etag: null; readonly holder: LockRecord | null}
+  | {readonly acquired: true; readonly outcome: 'acquired'; readonly etag: string; readonly holder: null}
+  | {readonly acquired: false; readonly outcome: 'active-holder'; readonly etag: null; readonly holder: LockRecord}
+  | {
+      readonly acquired: false
+      readonly outcome: 'expired-holder'
+      readonly etag: null
+      readonly holder: LockRecord
+      readonly confirmation: BlockedRepoQuiescence
+    }
+  | {readonly acquired: false; readonly outcome: 'conflict'; readonly etag: null; readonly holder: null}
 
 export interface CoordinationConfig {
   readonly storeAdapter: ObjectStoreAdapter

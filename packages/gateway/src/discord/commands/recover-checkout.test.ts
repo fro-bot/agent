@@ -60,6 +60,7 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
     gatewayLogger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     coordinationConfig: {} as CoordinationConfig,
     identity: 'discord-gateway',
+    checkRepoQuiescence: vi.fn(),
     forceReleaseStaleLock: vi.fn(),
     dispatchWorkflow: vi.fn<DispatchWorkflow>(),
     ...overrides,
@@ -125,6 +126,30 @@ describe('/fro-bot recover-checkout — authorization', () => {
     expect(editReply).toHaveBeenCalledWith(expect.objectContaining({content: expect.stringContaining('other-gw')}))
     expect(deps.workspaceClient.previewRecovery).not.toHaveBeenCalled()
   })
+
+  it.each([
+    ['workspace-busy', /still shows running sessions/],
+    ['workspace-unknown', /could not be confirmed/],
+  ] as const)(
+    '%s: named blocked reply, passes the shared checker, and never reaches the workspace recovery endpoints',
+    async (reason, pattern) => {
+      const guild = makeGuild(true)
+      const {interaction, editReply} = makeSlashInteraction(guild)
+      mockAcquireMaintenanceRun.mockReturnValue(Effect.succeed({outcome: 'blocked', reason}))
+      const deps = makeDeps()
+      const executor = createRecoverCheckoutCommand(deps)
+
+      await Effect.runPromise(executor(interaction as never))
+
+      expect(mockAcquireMaintenanceRun).toHaveBeenCalledWith(
+        expect.objectContaining({checkRepoQuiescence: deps.checkRepoQuiescence}),
+      )
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing
+      expect(editReply).toHaveBeenCalledWith(expect.objectContaining({content: expect.stringMatching(pattern)}))
+      expect(deps.workspaceClient.previewRecovery).not.toHaveBeenCalled()
+      expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
+    },
+  )
 
   it('registration: the real /fro-bot dispatch path exposes recover-checkout', async () => {
     const guild = makeGuild(true)

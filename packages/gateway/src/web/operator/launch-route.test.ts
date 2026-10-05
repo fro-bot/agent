@@ -131,6 +131,7 @@ function makeLaunchWorkDeps(): RunMentionDeps {
   return {
     coordinationConfig: {} as RunMentionDeps['coordinationConfig'],
     identity: 'gateway-identity',
+    checkRepoQuiescence: vi.fn(),
     concurrency: {
       tryAcquire: vi.fn(() => 'ok' as const),
       release: vi.fn(),
@@ -154,7 +155,7 @@ function makeLaunchWorkDeps(): RunMentionDeps {
     approvalRegistry: makeApprovalRegistry(),
     approvalMode: 'approval-required',
     statusMode: 'live-status',
-    ensureClone: vi.fn(async () => ({success: true as const, data: '/workspace/acme/widget'})),
+    ensureClone: vi.fn(async () => ({success: true as const, data: '/workspace/repos/acme/widget'})),
     readyz: vi.fn(async () => ({success: true as const, data: {ready: true as const, opencode: 'ready' as const}})),
     update: vi.fn(async () => ({
       success: true as const,

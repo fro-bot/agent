@@ -316,7 +316,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
 
       mockRuntime.acquireLock.mockResolvedValue({
         success: true as const,
-        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+        data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
       })
       mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
       mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -381,7 +381,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
 
       mockRuntime.acquireLock.mockResolvedValue({
         success: true as const,
-        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+        data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
       })
       mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
       mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
