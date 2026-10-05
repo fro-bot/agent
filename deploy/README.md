@@ -183,7 +183,7 @@ The gateway container is considered healthy only after three conditions are all 
 
 1. The Discord `clientReady` event has fired — the bot is fully connected and ready to receive events. At that point the process writes `/var/run/fro-bot/gateway-ready`.
 2. The daemon process (PID 1) is still alive (`kill -0 1`).
-3. mitmproxy is reachable via TCP (`nc -z mitmproxy 8080`) — makes mitmproxy loss visible: if mitmproxy crashes but leaves its CA cert file on disk, the gateway shows `unhealthy` in `docker ps` so the problem is immediately apparent.
+3. mitmproxy is reachable via TCP (`nc -z mitmproxy 8080`, using the busybox `nc` already in the base image — no extra package) — makes mitmproxy loss visible: if mitmproxy crashes but leaves its CA cert file on disk, the gateway shows `unhealthy` in `docker ps` so the problem is immediately apparent.
 
 The flag is cleared at process startup, so a stale `/var/run/fro-bot/gateway-ready` from a prior container run cannot mask a current-run failure. `docker compose up --wait` blocks until the gateway is genuinely connected to Discord before returning.
 
@@ -449,6 +449,10 @@ The workspace control API (`/clone`, `/inspect` on :9100) now requires this same
 #### Process supervision (tini as pid 1)
 
 The image's `ENTRYPOINT` runs `tini` as pid 1; the workspace-agent service is its only child. tini reaps orphaned tool processes (otherwise they pile up as zombies). Do **not** also set `init: true` / `--init` or override `entrypoint` in `compose.yaml` — `deploy/validate-stack.sh` rejects both, and `deploy/tests/isolation-harness.sh` asserts pid 1 is `tini`.
+
+#### Base image and apk pins
+
+Both images build on `node:<ver>-alpine3.24@sha256:…`, and the workspace runtime's `apk add` packages are pinned to exact Alpine 3.24 versions. Renovate bumps them in one grouped "Alpine packages" PR, using the `registryUrls` rule in `.github/renovate.json5`. The tag's Alpine suffix, that `registryUrls` branch, and the pins must all name the same Alpine minor — to move to a new minor, change them together in one deliberate PR.
 
 #### Harness OpenCode binary
 
