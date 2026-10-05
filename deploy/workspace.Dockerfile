@@ -19,7 +19,7 @@
 # ── Stage 1: build-deps (full workspace, dev deps, workspace-agent build) ──────
 # Forked into `workspace-test` below BEFORE dev dependencies are pruned, then
 # continued as `build` (prune to production) for the runtime stage to copy from.
-FROM node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS build-deps
+FROM node:24.21.0-alpine3.24@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS build-deps
 
 WORKDIR /workspace
 
@@ -115,7 +115,7 @@ FROM build-deps AS workspace-test
 # (generateSelfSignedCert in update-fixtures/helpers.ts). The runtime image has
 # no need for the openssl CLI (only its libs, transitively, for Node/OpenCode),
 # so this is confined to the test-only stage rather than added to runtime.
-RUN apk add --no-cache git git-daemon openssl
+RUN apk add --no-cache git=2.54.0-r0 git-daemon=2.54.0-r0 openssl
 
 CMD ["sh", "-c", "set -e; git --version; exec bun run --filter @fro-bot/workspace-agent test"]
 
@@ -139,7 +139,7 @@ RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
     && bun install --production --frozen-lockfile --ignore-scripts
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS runtime
+FROM node:24.21.0-alpine3.24@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS runtime
 
 WORKDIR /app
 
@@ -150,7 +150,9 @@ WORKDIR /app
 ARG OPENCODE_VERSION=1.18.30+harness.7c479429
 ARG SYSTEMATIC_VERSION=3.21.5
 
-# System packages:
+# System packages, pinned to exact Alpine 3.24 versions (the base tag's
+# `-alpine3.24` suffix and the apk registryUrls in .github/renovate.json5 name
+# the same branch — change them together). Renovate bumps the pins in one group.
 #   git            — clone.ts runs `git clone` via execFile
 #   ca-certificates — entrypoint runs update-ca-certificates to trust the mitmproxy CA
 #   libgcc/libstdc++/ripgrep — required by the opencode musl binary (matches OpenCode's own image)
@@ -165,7 +167,15 @@ ARG SYSTEMATIC_VERSION=3.21.5
 #                    su-exec vs. runuser).
 #   tini           — pid 1; reaps orphaned tool processes. Don't also enable
 #                    `--init`/`init: true` (validate-stack.sh rejects it).
-RUN apk add --no-cache git ca-certificates libgcc libstdc++ ripgrep curl setpriv tini \
+RUN apk add --no-cache \
+      git=2.54.0-r0 \
+      ca-certificates=20260909-r0 \
+      libgcc=15.2.0-r5 \
+      libstdc++=15.2.0-r5 \
+      ripgrep=15.1.0-r0 \
+      curl=8.22.0-r0 \
+      setpriv=2.42.3-r1 \
+      tini=0.19.0-r3 \
     && /sbin/tini --version
 
 # ── Unprivileged OpenCode agent account ─────────────────────────────────────

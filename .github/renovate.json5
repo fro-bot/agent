@@ -169,6 +169,17 @@
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
     {matchDatasources: ['docker'], semanticCommitType: 'build'},
     {
+      // The dockerfile manager extracts `apk add pkg=version` pins but skips them
+      // (unknown-registry) until told which Alpine repo to read. The branch here
+      // must match the `-alpine3.X` suffix on the node base tag in
+      // deploy/*.Dockerfile; moving the Alpine minor is one deliberate PR that
+      // changes the tag suffix, this URL, and the pins together.
+      matchDatasources: ['apk'],
+      registryUrls: ['https://dl-cdn.alpinelinux.org/alpine?branch=v3.24&components=main,community&arch=x86_64'],
+      groupName: 'Alpine packages',
+      semanticCommitType: 'build',
+    },
+    {
       // versioning: node + versionCompatibility split "24.16.0-alpine" into
       // version=24.16.0 / compatibility=-alpine so Renovate compares Node semver
       // and rebuilds the tag on upgrades. sourceUrl inlines release-note
