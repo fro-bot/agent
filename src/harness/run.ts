@@ -15,7 +15,7 @@ import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
-import {getGitHubRunAttempt} from '../shared/env.js'
+import {getGitHubRunAttempt, getGitHubWorkspace} from '../shared/env.js'
 import {createLogger} from '../shared/logger.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
@@ -220,6 +220,7 @@ export async function run(): Promise<number> {
       ledger: execution.ownershipLedger,
       client: cacheRestore.serverHandle.client,
       parentSessionId: execution.sessionId,
+      directory: getGitHubWorkspace(),
       deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
       logger: drainLogger,
     })

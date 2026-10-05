@@ -263,6 +263,7 @@ describe('executeOpenCode — ownership ledger threading (Unit 11)', () => {
       ledger,
       client: client as unknown as Parameters<typeof runDrain>[0]['client'],
       parentSessionId: 'ses_root',
+      directory: '/workspace',
       deadlineMs: 60_000,
       logger: mockLogger,
     })

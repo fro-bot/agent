@@ -80,7 +80,7 @@ Settlement also arrives through the stream. When a background dispatch finishes,
 
 The SSE stream has no replay. A reconnect, a discontinuity, or a silently dropped event can leave a tracked entry `outstanding` forever. `packages/runtime/src/agent/ledger-reconcile.ts` asks upstream directly instead of waiting.
 
-Reconciliation asks two questions and never conflates them: `children(parentSessionId)` is a bare parent-id lookup with no liveness filter (discovery), and `liveSessionIds()` is backed by session status, which only holds non-idle sessions (liveness). For each entry that is currently outstanding or unknown:
+Reconciliation asks two questions and never conflates them: `children(parentSessionId)` is a bare parent-id lookup with no liveness filter (discovery), and `liveSessionIds()` is backed by session status, which only holds non-idle sessions (liveness). Both are scoped to the run's directory: session status is per-directory and returns `{}` for a directory with no sessions. For each entry that is currently outstanding or unknown:
 
 | Observation | Result |
 | --- | --- |

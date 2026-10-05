@@ -583,7 +583,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           adoptedSessionId => ownershipCoordinator.addOwnedSession(adoptedSessionId),
         )
 
-  const reconcileAdapter = ledger === undefined ? undefined : createSdkLedgerReconcileAdapter(client)
+  const reconcileAdapter = ledger === undefined ? undefined : createSdkLedgerReconcileAdapter(client, directory)
   const runtimeLogger = ledger === undefined ? undefined : toRuntimeLogger(logger)
   const reconciler =
     ledger === undefined || reconcileAdapter === undefined || runtimeLogger === undefined

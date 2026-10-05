@@ -801,6 +801,47 @@ describe('runExecute overflow recovery — ownership ledger (Unit 11)', () => {
     expect(callOrder).toEqual(['abort:ses_child', 'archive:overflowed-session'])
   })
 
+  it('reconciles the overflowed session against the workspace directory execution ran in', async () => {
+    // #given an overflowed session with an outstanding child, and the Action's workspace directory
+    vi.stubEnv('GITHUB_WORKSPACE', '/github/workspace')
+    const status = vi.fn(async (_args: unknown) => ({data: {ses_child: {type: 'busy'}}}))
+    const children = vi.fn(async (_args: unknown) => ({data: [{id: 'ses_child'}]}))
+    const client = {session: {children, status, abort: async () => ({data: {}})}} as unknown as SessionClient
+    const cacheRestore = createCacheRestore()
+    const restoreWithClient: CacheRestorePhaseResult = {
+      ...cacheRestore,
+      serverHandle: {...cacheRestore.serverHandle, client},
+    }
+    mocks.archiveSession.mockResolvedValue(true)
+    vi.mocked(executeOpenCode).mockImplementationOnce(async (_prompt, _logger, _config, _handle, ledger) => {
+      ledger?.adopt('ses_child', 'background task')
+      return createAgentResult()
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({success: true, exitCode: 0, error: null, sessionId: 'recovered-session', llmError: null}),
+    )
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when overflow recovery drains the overflowed session before archiving it
+    try {
+      await runExecute(
+        createBootstrap(1_000),
+        createRouting(),
+        restoreWithClient,
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+      vi.unstubAllEnvs()
+    }
+
+    // #then reconciliation was scoped to that directory on both calls
+    expect(children).toHaveBeenCalledWith({path: {id: 'overflowed-session'}, query: {directory: '/github/workspace'}})
+    expect(status).toHaveBeenCalledWith({query: {directory: '/github/workspace'}})
+  })
+
   it('starts the recovery session with a fresh ledger rather than inheriting the exhausted one', async () => {
     // #given the overflowed session's ledger has outstanding work at the moment recovery begins
     const callOrder: string[] = []
@@ -991,6 +1032,28 @@ describe('runDrain', () => {
     logger = createMockLogger()
   })
 
+  it('scopes reconciliation to the supplied directory, so a child busy there is not settled early', async () => {
+    // #given `session.status` is scoped per directory: it reports the child busy only for the
+    // directory the session runs in and returns `{}` for any other
+    const directory = '/github/workspace'
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+    const children = vi.fn(async (_args: unknown) => ({data: [{id: 'ses_child'}]}))
+    const status = vi.fn(async (args?: {query?: {directory?: string}}) => ({
+      data: args?.query?.directory === directory ? {ses_child: {type: 'busy'}} : {},
+    }))
+    const client = {session: {children, status, abort: async () => ({data: {}})}} as unknown as SessionClient
+
+    // #when drain runs with no wait budget (first reconciliation pass, then cancellation)
+    const outcome = await runDrain({ledger, client, parentSessionId: 'ses_root', directory, deadlineMs: 0, logger})
+
+    // #then both upstream calls carried the directory and the busy child was never settled
+    expect(children).toHaveBeenCalledWith({path: {id: 'ses_root'}, query: {directory}})
+    expect(status).toHaveBeenCalledWith({query: {directory}})
+    expect(outcome.settledCount).toBe(0)
+    expect(ledger.snapshot().find(entry => entry.sessionId === 'ses_child')?.state).toBe('unknown')
+  })
+
   it('is a complete no-op when no ledger is supplied', async () => {
     // #given a run with no ownership ledger at all -- today's production shape
     const children = vi.fn(async () => ({data: []}))
@@ -1001,6 +1064,7 @@ describe('runDrain', () => {
       ledger: undefined,
       client,
       parentSessionId: 'ses_root',
+      directory: '/workspace',
       deadlineMs: 60_000,
       logger,
     })
@@ -1023,6 +1087,7 @@ describe('runDrain', () => {
       ledger,
       client,
       parentSessionId: 'ses_root',
+      directory: '/workspace',
       deadlineMs: 60_000,
       logger,
     })
@@ -1054,6 +1119,7 @@ describe('runDrain', () => {
         ledger,
         client,
         parentSessionId: 'ses_root',
+        directory: '/workspace',
         deadlineMs: 5_000,
         logger,
         reconcileIntervalMs: 20,
@@ -1093,6 +1159,7 @@ describe('runDrain', () => {
         ledger,
         client,
         parentSessionId: 'ses_root',
+        directory: '/workspace',
         deadlineMs: 5_000,
         logger,
         reconcileIntervalMs: 20,
@@ -1124,6 +1191,7 @@ describe('runDrain', () => {
       ledger,
       client,
       parentSessionId: 'ses_root',
+      directory: '/workspace',
       deadlineMs: 60_000,
       logger,
     })
@@ -1166,6 +1234,7 @@ describe('runDrain', () => {
         ledger,
         client,
         parentSessionId: 'ses_root',
+        directory: '/workspace',
         deadlineMs: 30,
         logger,
         reconcileIntervalMs: 10_000,
@@ -1203,6 +1272,7 @@ describe('runDrain', () => {
         ledger,
         client,
         parentSessionId: 'ses_root',
+        directory: '/workspace',
         deadlineMs: 30,
         logger,
         reconcileIntervalMs: 10_000,
@@ -1239,6 +1309,7 @@ describe('runDrain', () => {
         ledger,
         client,
         parentSessionId: 'ses_root',
+        directory: '/workspace',
         deadlineMs: 30,
         logger,
         reconcileIntervalMs: 10_000,
@@ -1282,6 +1353,7 @@ describe('runDrain', () => {
         ledger,
         client,
         parentSessionId: 'ses_root',
+        directory: '/workspace',
         deadlineMs: 30,
         logger,
         reconcileIntervalMs: 10_000,
@@ -1312,6 +1384,7 @@ describe('runDrain', () => {
       ledger,
       client: null,
       parentSessionId: null,
+      directory: '/workspace',
       deadlineMs: 60_000,
       logger,
     })
@@ -1354,6 +1427,7 @@ describe('runDrain', () => {
         ledger,
         client,
         parentSessionId: execution.sessionId,
+        directory: '/workspace',
         deadlineMs: 30,
         logger,
         reconcileIntervalMs: 10_000,
