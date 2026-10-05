@@ -1,6 +1,12 @@
 import {defineConfig} from 'vitest/config'
 
+import {incompleteRunReporterPlugin} from './scripts/vitest-incomplete-run-reporter.ts'
+
+// Package suites run `vitest` from their own directory and resolve this config by walking up, so the plugin
+// below applies to every suite `bun run test` runs. It fails the run when a worker crash left tests with no
+// result (see scripts/vitest-incomplete-run-reporter.ts).
 export default defineConfig({
+  plugins: [incompleteRunReporterPlugin()],
   test: {
     exclude: [
       '**/node_modules/**',
