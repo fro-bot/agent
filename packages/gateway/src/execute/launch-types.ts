@@ -599,7 +599,7 @@ export type PostReplyFactory = (
  *
  * - `approvalRegistry` — program-scoped registry; the trust anchor for
  *   fail-closed settlement. The transport calls `register()` here.
- * - `directory` — canonical workspace path from `ensureClone` (not the
+ * - `directory` — canonical workspace path (`canonicalWorkspaceTarget`; never the
  *   potentially stale `binding.workspacePath`). Use this for reply routing.
  * - `approvalDeadlineMs` — per-approval deadline aligned with the run budget.
  *   Pass to `registry.register({ deadlineMs })`.
@@ -617,7 +617,7 @@ export interface ApprovalTransportContext {
   /** Program-scoped approval registry. The transport calls `register()` here. */
   readonly approvalRegistry: ApprovalRegistry
   /**
-   * Canonical workspace directory from `ensureClone`.
+   * Canonical workspace directory (`canonicalWorkspaceTarget`) — the directory the run's sessions use.
    * Use for `registry.register({ directory })` and reply routing.
    */
   readonly directory: string

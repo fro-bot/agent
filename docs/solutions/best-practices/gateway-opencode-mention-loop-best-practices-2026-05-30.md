@@ -1,7 +1,7 @@
 ---
 title: Gateway OpenCode mention-loop best practices
 date: 2026-05-30
-last_updated: 2026-06-10
+last_updated: 2026-10-04
 category: best-practices
 module: gateway
 problem_type: best_practice
@@ -15,7 +15,7 @@ related_components:
 applies_when:
   - remote-attaching a gateway to a workspace-bound OpenCode server
   - forwarding authorization across both HTTP and SSE event streams
-  - recovering stale execution runs after a restart
+  - recovering stale execution runs after a restart (without deleting coordination locks)
   - streaming partial agent output during long-running sessions
   - enforcing single-run ownership and timeout cleanup
 tags:
@@ -101,50 +101,38 @@ if (presentedBuf.length === expectedBuf.length) authorized = timingSafeEqual(pre
 if (authorized === false) { res.writeHead(401, {'Content-Type': 'text/plain'}); res.end(UNAUTHORIZED_BODY); return }
 ```
 
-### 3. Gate stale-run lock release on `run_id` ownership
+### 3. Never delete a coordination lock from startup recovery; corroborate expired leases
 
 Startup recovery sweeps runs left in a non-terminal phase by a crash → transitions them
-`FAILED`. The sweep now covers `PENDING` and `ACKNOWLEDGED` (pre-execution admitted runs)
-in addition to `EXECUTING`, since admission writes a durable `PENDING` before execution; the
+`FAILED`. The sweep covers `PENDING` and `ACKNOWLEDGED` (pre-execution admitted runs) in
+addition to `EXECUTING`, since admission writes a durable `PENDING` before execution; the
 heartbeat-staleness window excludes a just-admitted run so it is never killed mid-admission.
-Only `EXECUTING` runs hold a repo lock, so lock release applies to that phase alone. When
-releasing, it must **verify the current lock record's `run_id` matches the
-stale run before releasing**. A stale run-state whose lease already expired may have had its
-lock re-acquired by a newer, live run; releasing blindly deletes the newer run's lock and
-permits concurrent execution against the same repo. This was a P0.
 
-The canonical recovery entry point is `recoverStaleRuns` (`packages/gateway/src/execute/recovery.ts`),
-which calls the internal `recoverOneRun` helper per stale run. Both `getLockKey` and `getRunKey`
-are the exported key builders from `packages/runtime/src/coordination/lock.ts` and
-`packages/runtime/src/coordination/run-state.ts` respectively — never construct these keys
-ad-hoc. See also: `docs/solutions/best-practices/centralize-s3-key-identity-construction-2026-06-09.md`.
+**Startup recovery never deletes a coordination lock.** An earlier design released the lock
+when its `run_id` matched the stale run. Ownership gating stopped one run deleting a newer
+run's lock (a P0), but a lapsed lease is still only a clock fact: the old run's OpenCode
+sessions (including child sessions) can keep writing the shared checkout. Recovery now leaves
+the lease to lapse by TTL; the next acquisition performs a guarded takeover. Before terminalizing
+any stale active run, recovery runs the shared repo-quiescence check
+(`packages/gateway/src/execute/repo-quiescence.ts`, OpenCode `session.status` scoped to the repo
+directory): `busy`/`unknown` leaves the run and lock untouched, `clear` allows the
+ETag-conditional `FAILED` transition. Persisted ownership is not consulted, so
+missing/malformed ownership cannot bypass the check.
 
-```ts
-// packages/gateway/src/execute/recovery.ts (inside recoverOneRun)
-// Key builders from @fro-bot/runtime — single source of truth for key shape:
-const runKeyResult = getRunKey(coordinationConfig, identity, repo, run.run_id)
-const lockKeyResult = getLockKey(coordinationConfig, repo)
+The canonical recovery entry point is `recoverStaleRuns` (`packages/gateway/src/execute/recovery.ts`).
+`getLockKey` and `getRunKey` are the exported key builders from
+`packages/runtime/src/coordination/lock.ts` and `packages/runtime/src/coordination/run-state.ts`
+— never construct these keys ad-hoc. See also:
+`docs/solutions/best-practices/centralize-s3-key-identity-construction-2026-06-09.md`.
 
-// Only release the lock when it belongs to this stale run:
-const lockFetch = await fetchLockRecord(coordinationConfig, lockKeyResult.data, logger)
-if (lockFetch !== null) {
-  if (lockFetch.runId === run.run_id) {
-    await releaseLock(coordinationConfig, repo, lockFetch.etag, coordLogger)
-  } else {
-    logger.warn(
-      {runId: run.run_id, repo, lockRunId: lockFetch.runId},
-      'recovery: lock.run_id does not match stale run — skipping release (lock belongs to a different run)',
-    )
-  }
-}
-```
-
-An unparseable/missing `run_id` resolves to `null` → skip the release (fail safe: never delete
-a lock you cannot prove belongs to the stale run).
-
-`forceReleaseStaleLock` (`packages/runtime/src/coordination/lock.ts`) is the dual-signal
-(lease-expired + heartbeat-stale) variant used outside the startup sweep; it also calls
-`getLockKey` internally and guards the read→delete race with an `IfMatch` conditional delete.
+`forceReleaseStaleLock` (`packages/runtime/src/coordination/lock.ts`) is the guarded operator
+release: it requires an **expired lease AND a `clear` workspace corroboration**
+(`confirmExpiredHolder`, i.e. `session.status`). The old holder's RunState/heartbeat is read for
+the audit trail only and neither authorizes nor blocks release. A missing, `busy`, or `unknown`
+check yields `workspace-unknown`/`workspace-busy` and deletes nothing; the delete is an `IfMatch`
+conditional delete on the ETag observed **before** confirmation, so a renewal or replacement
+during the check yields `conflict`. Every post-attempt exit emits one `lock-takeover-outcome`
+audit event. This is snapshot corroboration, not fencing (see ARCHITECTURE.md, S3 lock section).
 
 ### 4. Flush partial output on failure paths
 
@@ -208,8 +196,9 @@ unrelated errors whose payload happens to contain those tokens.
 - **Transport clarity** — knowing remote attach is just a `baseUrl` swap (with fetch-based SSE
   that honors headers) is what makes the bearer-proxy boundary viable instead of a rebuild.
 - **The proxy is the trust boundary** because the server has no auth of its own.
-- **Ownership-gated release** prevents one stale run from deleting a newer run's lock — a
-  silent concurrency-corruption P0 that no happy-path test catches.
+- **No lock deletion in recovery + corroborated takeover** prevents an expired-but-still-writing
+  holder from being displaced on a clock fact alone — a silent concurrency-corruption P0 that no
+  happy-path test catches.
 - **Failure-path flush** preserves the only useful output in exactly the cases users care about
   most (timeouts, mid-run failures).
 - **Dual-finally + AbortSignal.timeout** make hangs and throws non-catastrophic instead of
@@ -221,7 +210,7 @@ unrelated errors whose payload happens to contain those tokens.
 
 - Attaching OpenCode (or any SDK server) across containers/hosts over HTTP+SSE.
 - Fronting a no-auth local server with a bearer-token boundary.
-- Recovering stale leases/locks at startup where another holder may have taken over.
+- Recovering stale runs at startup where another holder may have taken over (never delete the lock; corroborate first).
 - Streaming output to a user-visible sink during long-running async work.
 - Any long-running orchestration with concurrency caps and a per-resource lock.
 - Consuming SSE where the terminal event (not EOF) defines success.
@@ -234,8 +223,8 @@ unrelated errors whose payload happens to contain those tokens.
 **Proxy security** — bind OpenCode to `127.0.0.1`; expose only the reverse proxy; verify the
 bearer with `timingSafeEqual`; reject with a fixed 401 body.
 
-**Recovery** — read the current lock record; release only when `lockFetch.runId === run.run_id`;
-skip on mismatch or unparseable record.
+**Recovery** — run the repo-quiescence check before terminalizing a stale run; `busy`/`unknown`
+leaves run and lock untouched; never delete the lock (it lapses by TTL, takeover is guarded).
 
 **Failure handling** — best-effort `sink.flush()` inside catch, then the coarse user reply;
 never let a flush failure hide the real error.

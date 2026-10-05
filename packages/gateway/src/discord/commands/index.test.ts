@@ -66,6 +66,7 @@ function makeMockDeps(): FroBotDeps {
       pendingStaleThresholdMs: 30 * 60_000,
     },
     identity: 'discord-gateway',
+    checkRepoQuiescence: vi.fn(),
     forceReleaseStaleLock: vi.fn().mockResolvedValue({
       success: true,
       data: {outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null},

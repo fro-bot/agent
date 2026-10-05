@@ -416,7 +416,7 @@ export function makeStatusControllerMock(
 
 export function makeEnsureCloneFn(result: 'success' | 'failure' = 'success') {
   return result === 'success'
-    ? vi.fn().mockResolvedValue({success: true as const, data: '/workspace/acme/widget'})
+    ? vi.fn().mockResolvedValue({success: true as const, data: '/workspace/repos/acme/widget'})
     : vi.fn().mockResolvedValue({
         success: false as const,
         error: {kind: 'workspace-failure' as const, workspaceKind: 'network-error' as const},
@@ -502,6 +502,7 @@ export function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDep
   return {
     coordinationConfig: {} as CoordinationConfig,
     identity: 'discord-gateway',
+    checkRepoQuiescence: overrides.checkRepoQuiescence ?? vi.fn(),
     concurrency: overrides.concurrency ?? makeDefaultConcurrency(),
     queue: overrides.queue ?? makeDefaultQueue(),
     attachUrl: 'http://workspace:9200',
@@ -548,7 +549,7 @@ export function setupHappyPath(heartbeatOverrides?: {
 }) {
   mockRuntime.acquireLock.mockResolvedValue({
     success: true as const,
-    data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
   })
   mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
   mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
