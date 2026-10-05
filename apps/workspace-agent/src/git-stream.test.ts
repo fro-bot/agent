@@ -132,3 +132,34 @@ describe('runPackStream — 50 MB stream integrity (no git involved)', () => {
     expect(writerHash).toBe(independent.digest('hex'))
   }, 30_000)
 })
+
+describe('runPackStream — writer stdin failure (EPIPE)', () => {
+  it('fails closed, with confirmed termination, when the writer closes stdin without reading a payload larger than the pipe buffer', async () => {
+    // #given a writer that closes its stdin and exits without reading a multi-MB revision list (far
+    // beyond the OS pipe buffer, so the parent's write to writer.stdin genuinely fails with EPIPE),
+    // and a reader that would otherwise sit for far longer than this test's budget
+    const hugeStdin = Buffer.alloc(16 * 1024 * 1024, 'a')
+
+    // #when runPackStream writes the payload (an unhandled stream 'error' here would crash the
+    // process, and Vitest reports any such escape as an unhandled error that fails the run)
+    const outcome = await runPackStream({
+      writer: {
+        command: 'sh',
+        args: ['-c', 'exec 0<&-; exit 1'],
+        cwd: scriptsDir,
+        env: SCRIPT_ENV_BASE,
+        stdin: hugeStdin,
+      },
+      reader: {command: 'sh', args: ['-c', 'sleep 30'], cwd: scriptsDir, env: SCRIPT_ENV_BASE},
+      maxBytes: 64 * 1024 * 1024,
+      timeoutMs: 10_000,
+    })
+
+    // #then the run is a confirmed failure attributed to the writer (never ok, never
+    // termination-unconfirmed), and the reader was terminated rather than left running
+    expect(outcome.kind).toBe('failed')
+    const failure = outcome.kind === 'failed' ? outcome : null
+    expect(failure?.reason).toBe('writer-failed')
+    expect(failure?.reader.signal).not.toBeNull()
+  }, 20_000)
+})
