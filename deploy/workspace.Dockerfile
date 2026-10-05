@@ -163,7 +163,10 @@ ARG SYSTEMATIC_VERSION=3.21.5
 #                    root supplementary group can survive the drop — see the
 #                    entrypoint for the full choice rationale (setpriv vs.
 #                    su-exec vs. runuser).
-RUN apk add --no-cache git ca-certificates libgcc libstdc++ ripgrep curl setpriv
+#   tini           — pid 1; reaps orphaned tool processes. Don't also enable
+#                    `--init`/`init: true` (validate-stack.sh rejects it).
+RUN apk add --no-cache git ca-certificates libgcc libstdc++ ripgrep curl setpriv tini \
+    && /sbin/tini --version
 
 # ── Unprivileged OpenCode agent account ─────────────────────────────────────
 # The workspace-agent SERVICE stays uid 0 (reduced capabilities only — see
@@ -316,4 +319,6 @@ WORKDIR /app/apps/workspace-agent
 # drops OpenCode itself to uid 10001 before exec — see workspace-entrypoint.sh.
 USER 0:0
 
-ENTRYPOINT ["/usr/local/bin/workspace-entrypoint.sh"]
+# tini is pid 1; the workspace-agent service is its only child (the entrypoint
+# execs node), so it is NOT pid 1. Don't override this entrypoint (bypasses tini).
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/workspace-entrypoint.sh"]

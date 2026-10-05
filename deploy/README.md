@@ -446,6 +446,10 @@ The workspace image builds the workspace agent and bakes the OpenCode CLI, so th
 
 The workspace control API (`/clone`, `/inspect` on :9100) now requires this same bearer, not just the :9200 OpenCode proxy — so the gateway and workspace images must always be upgraded and rolled back together. If the two images disagree on the token (e.g. a gateway rollback against a newer workspace image, or vice versa), every clone request gets rejected with HTTP 401 and surfaces to users as `workspace-unavailable`.
 
+#### Process supervision (tini as pid 1)
+
+The image's `ENTRYPOINT` runs `tini` as pid 1; the workspace-agent service is its only child. tini reaps orphaned tool processes (otherwise they pile up as zombies). Do **not** also set `init: true` / `--init` or override `entrypoint` in `compose.yaml` — `deploy/validate-stack.sh` rejects both, and `deploy/tests/isolation-harness.sh` asserts pid 1 is `tini`.
+
 #### Harness OpenCode binary
 
 The workspace runs the **harness build** of OpenCode — the patched binary published to [fro-bot/agent releases](https://github.com/fro-bot/agent/releases), not the stock `anomalyco/opencode` build. The harness binary carries session, plugin, and compaction fixes that apply to the mention-loop execution path.
