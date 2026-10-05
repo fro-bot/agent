@@ -255,11 +255,6 @@ export async function runPackStream(options: PackStreamOptions): Promise<PackStr
       return
     }
 
-    // The writer's own stdin is independent of the writer→reader pipe (that pipe is wired below,
-    // writer.stdout -> reader.stdin). `.end(undefined)` closes it immediately with zero bytes,
-    // matching the pre-`stdin`-field behaviour exactly.
-    writer.stdin?.end(options.writer.stdin)
-
     const runSettlement = async (trigger: SettlementTrigger): Promise<void> => {
       const [writerConfirmed, readerConfirmed] = await Promise.all([
         ensureConfirmedClose(writer, () => writerClose !== undefined),
@@ -295,6 +290,16 @@ export async function runPackStream(options: PackStreamOptions): Promise<PackStr
         beginSettlement('ok')
       }
     }
+
+    // A writer that exits before reading its input raises EPIPE here; unhandled, that crashes the service.
+    // It never got its full input, so fail through the normal settlement.
+    writer.stdin?.on('error', () => {
+      beginSettlement('writer-failed')
+    })
+    // The writer's own stdin is independent of the writer→reader pipe (that pipe is wired below,
+    // writer.stdout -> reader.stdin). `.end(undefined)` closes it immediately with zero bytes,
+    // matching the pre-`stdin`-field behaviour exactly.
+    writer.stdin?.end(options.writer.stdin)
 
     writer.on('error', () => {
       beginSettlement('spawn-failed')
