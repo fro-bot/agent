@@ -55,11 +55,20 @@ async function execGit(
   args: readonly string[],
   options: {env: Record<string, string>; cwd: string; stdin?: string},
 ): Promise<GitResult> {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const child = execFile('git', args, {cwd: options.cwd, env: options.env}, (error, stdout, stderr) => {
       const rawCode = error?.code
       const code = error === null ? 0 : typeof rawCode === 'number' ? rawCode : 1
       resolve({code, stdout, stderr})
+    })
+    // git may exit (or close stdin) before consuming what we write — most git commands here never
+    // read stdin at all. On a fast Linux runner that surfaces as an `EPIPE` 'error' event on
+    // `child.stdin`; with no listener Node throws it as an unhandled error and Vitest fails the
+    // whole run even though every test passed. EPIPE only means "the child didn't want our input":
+    // the exit code/stdout/stderr assertions still decide pass/fail. Any other stdin error is a
+    // real failure and is surfaced by rejecting.
+    child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EPIPE') reject(error)
     })
     child.stdin?.end(options.stdin ?? '')
   })
