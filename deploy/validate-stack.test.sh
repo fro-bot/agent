@@ -5396,6 +5396,124 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# TEST 76 — Negative: workspace `init: true` must be rejected (Invariant 8f).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 76: Invariant 8 rejects workspace init: true (double init) ---"
+
+INIT_TRUE_COMPOSE="${TMPDIR_TEST}/compose-init-true.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" \
+  | awk '{print} /^    image: ubuntu:22.04$/ {print "    init: true"}' > "${INIT_TRUE_COMPOSE}"
+
+INIT_TRUE_OUTPUT=""
+INIT_TRUE_EXIT=0
+INIT_TRUE_OUTPUT="$(COMPOSE_FILE="${INIT_TRUE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || INIT_TRUE_EXIT=$?
+
+if [[ "${INIT_TRUE_EXIT}" -ne 0 ]]; then
+  pass "TEST 76: validate-stack.sh exited non-zero for workspace init: true"
+else
+  fail "TEST 76: validate-stack.sh exited ZERO for workspace init: true — guard did NOT fire"
+fi
+if echo "${INIT_TRUE_OUTPUT}" | grep -q "init:"; then
+  pass "TEST 76: failure message names the init setting"
+else
+  fail "TEST 76: failure message does not mention 'init:' — output: ${INIT_TRUE_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 77 — Negative: workspace `entrypoint:` override must be rejected (Invariant 8g).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 77: Invariant 8 rejects a workspace entrypoint override (bypasses tini) ---"
+
+ENTRYPOINT_OVERRIDE_COMPOSE="${TMPDIR_TEST}/compose-entrypoint-override.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" \
+  | awk '{print} /^    image: ubuntu:22.04$/ {print "    entrypoint: [/usr/local/bin/workspace-entrypoint.sh]"}' > "${ENTRYPOINT_OVERRIDE_COMPOSE}"
+
+ENTRYPOINT_OVERRIDE_OUTPUT=""
+ENTRYPOINT_OVERRIDE_EXIT=0
+ENTRYPOINT_OVERRIDE_OUTPUT="$(COMPOSE_FILE="${ENTRYPOINT_OVERRIDE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || ENTRYPOINT_OVERRIDE_EXIT=$?
+
+if [[ "${ENTRYPOINT_OVERRIDE_EXIT}" -ne 0 ]]; then
+  pass "TEST 77: validate-stack.sh exited non-zero for a workspace entrypoint override"
+else
+  fail "TEST 77: validate-stack.sh exited ZERO for a workspace entrypoint override — guard did NOT fire"
+fi
+if echo "${ENTRYPOINT_OVERRIDE_OUTPUT}" | grep -q "entrypoint"; then
+  pass "TEST 77: failure message names the entrypoint override"
+else
+  fail "TEST 77: failure message does not mention 'entrypoint' — output: ${ENTRYPOINT_OVERRIDE_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 78 — Positive: an explicit `init: false` passes.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 78: Invariant 8 accepts workspace init: false ---"
+
+INIT_FALSE_COMPOSE="${TMPDIR_TEST}/compose-init-false.yaml"
+hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" \
+  | awk '{print} /^    image: ubuntu:22.04$/ {print "    init: false"}' > "${INIT_FALSE_COMPOSE}"
+
+INIT_FALSE_OUTPUT=""
+INIT_FALSE_EXIT=0
+INIT_FALSE_OUTPUT="$(COMPOSE_FILE="${INIT_FALSE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || INIT_FALSE_EXIT=$?
+
+if [[ "${INIT_FALSE_EXIT}" -eq 0 ]]; then
+  pass "TEST 78: workspace init: false passes Invariant 8"
+else
+  fail "TEST 78: workspace init: false was rejected — output: ${INIT_FALSE_OUTPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 79 — Negative: quoted/numeric truthy workspace `init` values rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 79: Invariant 8 rejects quoted/numeric truthy workspace init values ---"
+
+for INIT_VALUE in '"true"' '"1"' '"yes"' '"on"' '1'; do
+  INIT_TRUTHY_COMPOSE="${TMPDIR_TEST}/compose-init-truthy.yaml"
+  hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" \
+    | awk -v v="${INIT_VALUE}" '{print} /^    image: ubuntu:22.04$/ {print "    init: " v}' > "${INIT_TRUTHY_COMPOSE}"
+  INIT_TRUTHY_EXIT=0
+  INIT_TRUTHY_OUTPUT="$(COMPOSE_FILE="${INIT_TRUTHY_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || INIT_TRUTHY_EXIT=$?
+  if [[ "${INIT_TRUTHY_EXIT}" -ne 0 ]]; then
+    pass "TEST 79: validate-stack.sh exited non-zero for workspace init: ${INIT_VALUE}"
+  else
+    fail "TEST 79: validate-stack.sh exited ZERO for workspace init: ${INIT_VALUE} — guard did NOT fire"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# TEST 80 — Negative (raw-YAML path): interpolated workspace `init` /
+#           `entrypoint` must fail closed — the raw parse cannot resolve them.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 80: raw-YAML fallback fails closed on interpolated workspace init/entrypoint ---"
+
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  for INTERP_CASE in \
+    'init|${WORKSPACE_INIT:-true}' \
+    'entrypoint|${WORKSPACE_ENTRYPOINT:-/bin/sh}' \
+    'entrypoint|[$WORKSPACE_ENTRYPOINT, --flag]'; do
+    INTERP_KEY="${INTERP_CASE%%|*}"
+    INTERP_VALUE="${INTERP_CASE#*|}"
+    INTERP_COMPOSE="${TMPDIR_TEST}/compose-interp-${INTERP_KEY}.yaml"
+    hardened_workspace_compose "${USER_OK}" "${CAP_DROP_OK}" "${CAP_ADD_OK}" "${SECOPT_OK}" "${TOKEN_TARGET_OK}" "${CA_TARGET_OK}" \
+      | awk -v k="${INTERP_KEY}" -v v="${INTERP_VALUE}" '{print} /^    image: ubuntu:22.04$/ {print "    " k ": " v}' > "${INTERP_COMPOSE}"
+    INTERP_EXIT=0
+    INTERP_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${INTERP_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || INTERP_EXIT=$?
+    if [[ "${INTERP_EXIT}" -ne 0 ]] && echo "${INTERP_OUTPUT}" | grep -q "Compose interpolation"; then
+      pass "TEST 80: raw-YAML path rejects interpolated workspace ${INTERP_KEY}: ${INTERP_VALUE}"
+    else
+      fail "TEST 80: raw-YAML path did NOT fail closed on workspace ${INTERP_KEY}: ${INTERP_VALUE} — exit ${INTERP_EXIT}, output: ${INTERP_OUTPUT}"
+    fi
+  done
+else
+  echo "  SKIP: interpolation test: PyYAML not available — raw-YAML path required."
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

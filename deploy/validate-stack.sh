@@ -105,6 +105,8 @@ compose_files = [f for f in compose_file_env.split(path_sep) if f]
 # to the previous behaviour.
 f_args = sum([["-f", f] for f in compose_files], [])
 
+raw_yaml_fallback = False  # True when cfg is un-interpolated raw YAML
+
 try:
     result = subprocess.run(
         ["docker", "compose"] + f_args + ["config", "--format", "json"],
@@ -149,6 +151,7 @@ except (subprocess.CalledProcessError, OSError):
                 sys.exit(1)
             with open(compose_files[0]) as fh:
                 cfg = yaml.safe_load(fh)
+            raw_yaml_fallback = True
     except Exception as e2:
         print(f"ERROR: could not parse compose config: {e2}", file=sys.stderr)
         sys.exit(1)
@@ -964,6 +967,8 @@ if operator_bind_host and str(operator_bind_host).strip():
 #       banned-capability check patrols) and no fewer (a narrower set breaks
 #       the entrypoint's own directory/migration/privilege-drop steps).
 #   8d. workspace declares security_opt including no-new-privileges:true.
+#   8f. workspace does not set `init: true` (tini is baked into the image).
+#   8g. workspace does not override `entrypoint` (would bypass tini).
 #   8e. workspace's secret mounts (workspace_opencode_token,
 #       workspace_opencode_auth) and the mitmproxy CA volume all target paths
 #       under the protected /run/workspace-agent tree — not the old top-level
@@ -1022,6 +1027,32 @@ if "no-new-privileges:true" not in workspace_sec_opts:
         f"FAIL: workspace security_opt is {sorted(workspace_sec_opts)!r} — must include "
         "no-new-privileges:true. Without it, a setuid/setcap binary inside the container could "
         "re-acquire privileges the cap_drop above just removed."
+    )
+
+# 8f/8g: the image runs tini as pid 1; compose must not add a second init or
+# override the entrypoint (both break the harness's "pid 1 is tini" assertion).
+# Raw-YAML path can't resolve Compose interpolation; fail closed on these keys.
+if raw_yaml_fallback:
+    for _key in ("init", "entrypoint"):
+        _raw = workspace_svc.get(_key)
+        _parts = _raw if isinstance(_raw, list) else [_raw]
+        if any(isinstance(_p, str) and "$" in _p for _p in _parts):
+            failures.append(
+                f"FAIL: workspace.{_key} uses Compose interpolation ({_raw!r}) and docker compose is "
+                "unavailable — the raw-YAML fallback cannot resolve it. Install docker compose or "
+                "use a literal value."
+            )
+
+_init_value = workspace_svc.get("init")
+if _init_value is True or str(_init_value).strip().lower() in ("true", "1", "yes", "on"):
+    failures.append(
+        f"FAIL: workspace declares init: {_init_value!r} — the image already runs tini as pid 1; "
+        "a second init would stack in front of it. Remove workspace.init."
+    )
+if workspace_svc.get("entrypoint") is not None:
+    failures.append(
+        f"FAIL: workspace overrides entrypoint: {workspace_svc.get('entrypoint')!r} — this bypasses "
+        "the image's tini ENTRYPOINT (orphans would no longer be reaped). Remove workspace.entrypoint."
     )
 
 def _volume_target(v):

@@ -306,7 +306,8 @@ if [ "$auth_was_present" = false ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: hand off to the supervisor as PID 1 so its SIGTERM drain works.
+# Step 6: exec the supervisor as tini's direct child (tini is PID 1 — see
+# deploy/workspace.Dockerfile ENTRYPOINT), so tini forwards SIGTERM to it.
 # The supervisor itself stays uid 0 (compose.yaml user: "0:0") — it spawns
 # OpenCode as uid 10001 (apps/workspace-agent/src owns that spawn logic).
 # ---------------------------------------------------------------------------

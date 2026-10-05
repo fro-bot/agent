@@ -161,6 +161,33 @@ wait_for_healthz() {
   [ "$ok" = "true" ]
 }
 
+# tini is pid 1; the workspace-agent service is its only child. resolve_svc_pid
+# asserts that topology and sets SVC_PID — every "service" check must target
+# $SVC_PID, not /proc/1 (tini has the same uid/env, so it would pass wrongly).
+# Re-run it after `docker restart` (pids change).
+SVC_PID=""
+resolve_svc_pid() {
+  local init_comm children svc_cmdline
+  init_comm="$(run_exec "$MAIN_CID" "" cat /proc/1/comm | tr -d '[:space:]')" \
+    || fail "init: could not read /proc/1/comm"
+  [ "$init_comm" = "tini" ] \
+    || fail "init: pid 1 is '${init_comm}', expected 'tini' — the image must run tini as its ENTRYPOINT (deploy/workspace.Dockerfile)"
+
+  children="$(run_exec "$MAIN_CID" "" cat /proc/1/task/1/children | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')" \
+    || fail "init: could not read /proc/1/task/1/children (needs CONFIG_PROC_CHILDREN on the host kernel)"
+  case "$children" in
+    ''|*' '*) fail "init: expected tini (pid 1) to have exactly ONE child (the workspace-agent service), found: '${children}'" ;;
+  esac
+  SVC_PID="$children"
+
+  svc_cmdline="$(run_exec "$MAIN_CID" "" cat "/proc/${SVC_PID}/cmdline" | tr '\0' ' ' | sed 's/ $//')" \
+    || fail "init: could not read /proc/${SVC_PID}/cmdline"
+  case "$svc_cmdline" in
+    node\ */workspace-agent/dist/main.mjs) ;;
+    *) fail "init: tini's only child (pid ${SVC_PID}) is not the workspace-agent service — cmdline: '${svc_cmdline}'" ;;
+  esac
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 0: start the main long-lived container with production security
 # settings, a real volume at /workspace/repos, and the secret/CA mounts nested
@@ -219,14 +246,17 @@ pass "container boots healthy with production security settings"
 # ─────────────────────────────────────────────────────────────────────────────
 log "phase 1: identity"
 
-if ! svc_status="$(run_exec "$MAIN_CID" "" cat /proc/1/status)"; then
-  fail "identity: could not read /proc/1/status (workspace-agent service)"
+resolve_svc_pid
+pass "init: pid 1 is tini and its only child (pid ${SVC_PID}) is the workspace-agent service (node …/workspace-agent/dist/main.mjs)"
+
+if ! svc_status="$(run_exec "$MAIN_CID" "" cat "/proc/${SVC_PID}/status")"; then
+  fail "identity: could not read /proc/${SVC_PID}/status (workspace-agent service)"
 fi
 svc_uid_line="$(echo "$svc_status" | grep '^Uid:')"
 svc_gid_line="$(echo "$svc_status" | grep '^Gid:')"
-echo "$svc_uid_line" | awk '{print $2}' | grep -qx '0' || fail "identity: workspace-agent service (pid 1) real uid is not 0 (${svc_uid_line})"
-echo "$svc_gid_line" | awk '{print $2}' | grep -qx '0' || fail "identity: workspace-agent service (pid 1) real gid is not 0 (${svc_gid_line})"
-pass "workspace agent service (pid 1) runs as uid/gid 0:0"
+echo "$svc_uid_line" | awk '{print $2}' | grep -qx '0' || fail "identity: workspace-agent service (pid ${SVC_PID}) real uid is not 0 (${svc_uid_line})"
+echo "$svc_gid_line" | awk '{print $2}' | grep -qx '0' || fail "identity: workspace-agent service (pid ${SVC_PID}) real gid is not 0 (${svc_gid_line})"
+pass "workspace agent service (pid ${SVC_PID}) runs as uid/gid 0:0"
 
 # OpenCode's pid, found INSIDE the container's own pid namespace (pidof runs
 # via docker exec, so PIDs are already container-relative — no host/container
@@ -351,7 +381,7 @@ must_succeed "root can read the dummy secret-holder's environ (setup sanity chec
 # harness's WORKSPACE_SECURITY_ARGS mirroring it, deliberately omits). The
 # `docker exec` root process used by must_succeed/must_fail is NOT an
 # ancestor of any process already running inside the container (the
-# secret-holder, or pid 1 itself) — it is a sibling spawned fresh by the
+# secret-holder, or the service itself) — it is a sibling spawned fresh by the
 # Docker engine. So on this kernel, root asserting "I can open THIS
 # pre-existing process's /proc/<pid>/mem" is FALSE for a reason that has
 # nothing to do with the uid boundary under test, which is exactly the bug a
@@ -420,7 +450,7 @@ else
   log "  mem denial mechanism at ptrace_scope=${ptrace_scope}: BOTH the uid/capability check AND Yama's non-ancestor rule deny this to uid 10001. The mem denial alone does NOT isolate which one is doing the work here — see the environ denial just proven above (a PTRACE_MODE_READ check, which Yama never restricts), which proves the uid boundary independently of Yama"
 fi
 
-# ── workspace agent's own /proc/1/environ (holds WORKSPACE_OPENCODE_TOKEN_FILE
+# ── workspace agent's own /proc/$SVC_PID/environ (holds WORKSPACE_OPENCODE_TOKEN_FILE
 # and, via config.ts's file-read path, is where a plain (non-_FILE) secret
 # value would land if ever passed that way) ─────────────────────────────────
 # See the earlier NUL-stripping note (phase 2, secret-holder environ capture)
@@ -428,10 +458,10 @@ fi
 # passed through tr before docker exec's stdout is captured, instead of
 # letting bash's own command substitution see raw NUL bytes directly.
 # shellcheck disable=SC2016 # the $? / $st are for the INNER sh -c script, not this outer bash line
-must_succeed "root can read its own /proc/1/environ (setup sanity check)" "$MAIN_CID" "0:0" \
-  sh -c 'cat /proc/1/environ >/tmp/isolation-harness-pid1-environ-capture 2>&1; st=$?; tr "\0" "\n" </tmp/isolation-harness-pid1-environ-capture; rm -f /tmp/isolation-harness-pid1-environ-capture; exit $st'
-must_fail "cannot read the workspace agent's own /proc/1/environ" "$MAIN_CID" "$AGENT_USER" cat /proc/1/environ
-pass "uid 10001 cannot read the workspace agent service's own /proc/1/environ"
+must_succeed "root can read its own /proc/${SVC_PID}/environ (setup sanity check)" "$MAIN_CID" "0:0" \
+  sh -c 'cat "/proc/$1/environ" >/tmp/isolation-harness-svc-environ-capture 2>&1; st=$?; tr "\0" "\n" </tmp/isolation-harness-svc-environ-capture; rm -f /tmp/isolation-harness-svc-environ-capture; exit $st' sh "$SVC_PID"
+must_fail "cannot read the workspace agent's own /proc/${SVC_PID}/environ" "$MAIN_CID" "$AGENT_USER" cat "/proc/${SVC_PID}/environ"
+pass "uid 10001 cannot read the workspace agent service's own /proc/${SVC_PID}/environ"
 
 # ── ptrace attach / process_vm_readv proxy ──────────────────────────────────
 # The image ships neither gdb nor strace (deploy/workspace.Dockerfile's final
@@ -449,21 +479,22 @@ pass "uid 10001 cannot read the workspace agent service's own /proc/1/environ"
 # explicitly against the workspace agent's own pid so ptrace/process_vm_readv
 # denial is proven against BOTH a synthetic target and the real supervisor.
 #
-# There is deliberately NO "root opens /proc/1/mem" positive control here: a
-# docker-exec root process is not an ancestor of pid 1 either, so under Yama
+# There is deliberately NO "root opens /proc/$SVC_PID/mem" positive control here: a
+# docker-exec root process is not an ancestor of the service either, so under Yama
 # ptrace_scope >= 1 that assertion is FALSE on this runner's kernel — the
 # exact bug a prior revision of this harness hit. The child-based root and
 # uid-10001 positive controls earlier in phase 2 already established that dd
 # can open /proc/<pid>/mem at all under this kernel's Yama policy, against
 # targets each caller legitimately owns as an ancestor.
+# shellcheck disable=SC2016 # $1 is for the INNER sh -c script (the service pid passed as its argument)
 must_fail "ptrace/process_vm_readv-equivalent access to the service's own memory" "$MAIN_CID" "$AGENT_USER" \
-  sh -c 'dd if=/proc/1/mem of=/dev/null bs=1 count=0 2>&1'
+  sh -c 'dd if="/proc/$1/mem" of=/dev/null bs=1 count=0 2>&1' sh "$SVC_PID"
 if [ "$ptrace_scope" = "0" ]; then
-  log "  pid-1 mem denial mechanism at ptrace_scope=0: the uid/capability check alone (uid 10001 lacks CAP_SYS_PTRACE and does not match pid 1's uid)"
+  log "  service mem denial mechanism at ptrace_scope=0: the uid/capability check alone (uid 10001 lacks CAP_SYS_PTRACE and does not match the service's uid)"
 else
-  log "  pid-1 mem denial mechanism at ptrace_scope=${ptrace_scope}: BOTH Yama's non-ancestor rule (a docker-exec root process is not pid 1's ancestor either) AND the uid/capability check deny this to uid 10001 — this denial alone does NOT isolate the uid boundary at scope >= 1; the /proc/1/environ denial proven above (PTRACE_MODE_READ, unaffected by Yama) proves that independently"
+  log "  service mem denial mechanism at ptrace_scope=${ptrace_scope}: BOTH Yama's non-ancestor rule (a docker-exec root process is not the service's ancestor either) AND the uid/capability check deny this to uid 10001 — this denial alone does NOT isolate the uid boundary at scope >= 1; the /proc/${SVC_PID}/environ denial proven above (PTRACE_MODE_READ, unaffected by Yama) proves that independently"
 fi
-pass "uid 10001 cannot open /proc/1/mem for read (same kernel gate as ptrace(PTRACE_ATTACH)/process_vm_readv against the service; the environ denial above is the Yama-independent proof of the uid boundary)"
+pass "uid 10001 cannot open /proc/${SVC_PID}/mem for read (same kernel gate as ptrace(PTRACE_ATTACH)/process_vm_readv against the service; the environ denial above is the Yama-independent proof of the uid boundary)"
 
 # ── cannot replace the checkout directory itself (root-owned 0755 parent) ──
 run_exec "$MAIN_CID" "0:0" sh -c \
@@ -982,7 +1013,8 @@ pass "askpass prompt control B: a Password prompt built from the wrong embedded 
 # tree with a known pgid, prove (positive control) it is really running as
 # 10001, kill -TERM the negative pgid AS ROOT the same way killChildGroup
 # does, and prove every level — including the grandchild — is gone from
-# /proc while the container keeps running. A separate negative control
+# /proc while the container keeps running ("gone" = absent from /proc; a
+# lingering zombie fails, since tini must reap). A separate negative control
 # proves the direction is one-way: 10001 cannot signal the root service.
 #
 # Tool availability (checked at runtime, not assumed): deploy/workspace.Dockerfile's
@@ -1006,6 +1038,9 @@ pass "askpass prompt control B: a Password prompt built from the wrong embedded 
 # false pass from an unrelated "command not found" exit code.
 # ─────────────────────────────────────────────────────────────────────────────
 log "phase 4d: signals across uids (real process-group kill, verified via /proc)"
+
+# Re-resolve: the container was restarted in phase 4b-restart.
+resolve_svc_pid
 
 SIGNAL_CHECK_DIR="$(mktemp -d)"
 TMPDIRS+=("$SIGNAL_CHECK_DIR")
@@ -1100,12 +1135,15 @@ test_group_pgid="$(run_exec "$MAIN_CID" "0:0" /tmp/pgid-of.sh "$group_parent_pid
 log "  test tree pgid: ${test_group_pgid}"
 
 # Refuse to signal a group that is not exclusively the test tree's. Without
-# setsid, the tree could inherit a pgid shared with the root service (pid 1)
-# or its supervisor, and a root `kill -<pgid>` would take down the service
-# instead of proving anything. The group leader must be the tree's own parent.
-service_pgid="$(run_exec "$MAIN_CID" "0:0" /tmp/pgid-of.sh 1 | tr -d '[:space:]')"
+# setsid, the tree could inherit a pgid shared with the root service or tini
+# (pid 1), and a root `kill -<pgid>` would take it down instead of proving
+# anything. The group leader must be the tree's own parent.
+service_pgid="$(run_exec "$MAIN_CID" "0:0" /tmp/pgid-of.sh "$SVC_PID" | tr -d '[:space:]')"
+init_pgid="$(run_exec "$MAIN_CID" "0:0" /tmp/pgid-of.sh 1 | tr -d '[:space:]')"
 [ "$test_group_pgid" != "$service_pgid" ] \
-  || fail "signal handling: the test tree shares pgid ${test_group_pgid} with the root service (pid 1) — refusing to signal it"
+  || fail "signal handling: the test tree shares pgid ${test_group_pgid} with the root service (pid ${SVC_PID}) — refusing to signal it"
+[ "$test_group_pgid" != "$init_pgid" ] \
+  || fail "signal handling: the test tree shares pgid ${test_group_pgid} with tini (pid 1) — refusing to signal it"
 [ "$test_group_pgid" = "$group_parent_pid" ] \
   || fail "signal handling: the test tree's pgid (${test_group_pgid}) is not its own parent (${group_parent_pid}), so the group may contain other processes — refusing to signal it"
 
@@ -1137,62 +1175,51 @@ pass "signal handling positive control: all three test-tree pids (parent/child/g
 # busybox kill's own negative-number syntax. node is already in this image.
 run_exec "$MAIN_CID" "0:0" node -e 'process.kill(-Number(process.argv[1]), "SIGTERM")' "$test_group_pgid"
 
-# A process counts as terminated when its /proc entry is gone OR it is a
-# zombie (state Z): it has exited and only its exit status is left. The tree
-# is started detached, so once its parent dies the rest reparent to pid 1 —
-# node, which never waits on children it did not spawn — and linger as
-# zombies. That is about reaping, not about whether the signal was delivered,
-# which is the property under test. Each zombie is recorded, not hidden.
-pid_is_running() {
-  # true only if /proc/<pid> exists and its state is not Z
-  local st
-  # shellcheck disable=SC2016 # awk's own $2, not a bash expansion
-  st="$(run_exec "$MAIN_CID" "0:0" awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null || true)"
-  st="$(printf '%s' "$st" | tr -d '[:space:]')"
-  [ -n "$st" ] && [ "$st" != "Z" ]
+# Terminated = /proc entry gone (not merely state Z). The orphaned tree
+# reparents to tini, which reaps asynchronously, so poll within a bounded window.
+pid_exists() {
+  run_exec "$MAIN_CID" "0:0" test -e "/proc/$1"
 }
 signal_reaped=false
 for _ in $(seq 1 "$SIGNAL_WAIT_TIMEOUT_S"); do
-  if ! pid_is_running "$group_parent_pid" && ! pid_is_running "$group_child_pid" && ! pid_is_running "$group_grandchild_pid"; then
+  if ! pid_exists "$group_parent_pid" && ! pid_exists "$group_child_pid" && ! pid_exists "$group_grandchild_pid"; then
     signal_reaped=true
     break
   fi
   sleep 1
 done
-for pid_idx in 0 1 2; do
-  pid_val="${GROUP_TREE_PIDS[$pid_idx]}"
-  if run_exec "$MAIN_CID" "0:0" grep -q '^State:[[:space:]]*Z' "/proc/${pid_val}/status" 2>/dev/null; then
-    log "RECORD (not asserted) ${GROUP_TREE_PID_NAMES[$pid_idx]}(${pid_val}) exited but is an unreaped zombie — pid 1 is node, which does not reap orphans"
-  fi
-done
 if [ "$signal_reaped" != "true" ]; then
-  still_alive=""
+  still_present=""
   for pid_idx in 0 1 2; do
     pid_name="${GROUP_TREE_PID_NAMES[$pid_idx]}"
     pid_val="${GROUP_TREE_PIDS[$pid_idx]}"
-    pid_is_running "$pid_val" && still_alive="${still_alive} ${pid_name}(${pid_val})"
+    if pid_exists "$pid_val"; then
+      # shellcheck disable=SC2016 # awk's own $2, not a bash expansion
+      pid_state="$(run_exec "$MAIN_CID" "0:0" awk '/^State:/{print $2}' "/proc/${pid_val}/status" 2>/dev/null || true)"
+      still_present="${still_present} ${pid_name}(${pid_val}, state=${pid_state:-gone})"
+    fi
   done
-  fail "signal handling: 'kill -TERM -${test_group_pgid}' as root did not reap the uid-10001 test tree within ${SIGNAL_WAIT_TIMEOUT_S}s — still alive:${still_alive:- none? (race — re-check the poll logic)} — this directly exercises what killChildGroup depends on"
+  fail "signal handling: 'kill -TERM -${test_group_pgid}' as root left the test tree in /proc after ${SIGNAL_WAIT_TIMEOUT_S}s — still present:${still_present:- none? (race — re-check the poll logic)} (state=Z: not reaped, pid 1 must be tini; otherwise the signal was not delivered)"
 fi
 # docker top the CONTAINER (not /proc) as an independent cross-check that we
 # didn't just lose the pids to a container-wide teardown — the container is
 # still supposed to be fully up at this point.
 docker top "$MAIN_CID" >/dev/null 2>&1 || fail "signal handling: the container itself is no longer running — this check is only meaningful while it's up, not via container teardown"
-pass "signal handling: root, with only the production capabilities (CAP_KILL, no CAP_SYS_PTRACE), sent SIGTERM to the uid-10001 process group's negative pgid and reaped parent + child + GRANDCHILD, entirely inside a still-running container"
+pass "signal handling: root, with only the production capabilities (CAP_KILL, no CAP_SYS_PTRACE), sent SIGTERM to the uid-10001 process group's negative pgid; parent + child + GRANDCHILD were terminated and reaped (absent from /proc), entirely inside a still-running container"
 
 # Negative control: the direction is one-way. As uid 10001, signalling the
-# root service (pid 1) must fail with a permission error, and pid 1 must
-# still be alive and the container still healthy afterward.
+# root service (pid $SVC_PID, not pid 1) must fail with a permission error, and
+# the service must still be alive and the container still healthy afterward.
 #
-# `kill -TERM 1` (a single positive pid, no negative-pgid `--` marker) means
+# `kill -TERM <pid>` (a single positive pid, no negative-pgid `--` marker) means
 # exactly what it says under busybox's kill — this call is NOT affected by
 # the `--` incompatibility fixed above, confirmed by inspection of busybox's
 # kill applet (it only special-cases the leading `-` on NEGATIVE numbers /
 # signal names, never on a bare positive pid).
-must_fail "signal handling negative control: uid 10001 cannot kill -TERM the root service (pid 1)" "$MAIN_CID" "$AGENT_USER" kill -TERM 1
-must_succeed "signal handling negative control: pid 1 is still alive after the denied kill attempt" "$MAIN_CID" "0:0" test -d /proc/1
-wait_for_healthz "$MAIN_CID" 10 || fail "signal handling negative control: the container is no longer healthy after the denied 10001->root kill attempt (pid 1 should be completely unaffected)"
-pass "signal handling negative control: uid 10001 cannot signal the root service; pid 1 and the container's healthz remain unaffected"
+must_fail "signal handling negative control: uid 10001 cannot kill -TERM the root service (pid ${SVC_PID})" "$MAIN_CID" "$AGENT_USER" kill -TERM "$SVC_PID"
+must_succeed "signal handling negative control: the service (pid ${SVC_PID}) is still alive after the denied kill attempt" "$MAIN_CID" "0:0" test -d "/proc/${SVC_PID}"
+wait_for_healthz "$MAIN_CID" 10 || fail "signal handling negative control: the container is no longer healthy after the denied 10001->root kill attempt (the service should be completely unaffected)"
+pass "signal handling negative control: uid 10001 cannot signal the root service (pid ${SVC_PID}); it and the container's healthz remain unaffected"
 
 # OpenCode's own process group, read-only — never killed through this path.
 # Whether OpenCode is actually serving at this point in the harness: yes for
@@ -1224,13 +1251,23 @@ fi
 # reporting no processes is true by definition and proves nothing about
 # killChildGroup specifically).
 # ─────────────────────────────────────────────────────────────────────────────
+stop_started_at="$(date +%s)"
 docker stop --time "$SHUTDOWN_TIMEOUT_S" "$MAIN_CID" >/dev/null
+stop_elapsed_s=$(($(date +%s) - stop_started_at))
 if docker top "$MAIN_CID" >/dev/null 2>&1; then
   fail "shutdown: container is still running after 'docker stop --time ${SHUTDOWN_TIMEOUT_S}' — the supervisor did not exit cleanly within the timeout"
 fi
 container_state="$(docker inspect -f '{{.State.Status}}' "$MAIN_CID")"
 [ "$container_state" = "exited" ] || fail "shutdown: container state after stop is '${container_state}', expected 'exited'"
-pass "shutdown: the container stops cleanly within ${SHUTDOWN_TIMEOUT_S}s (reaping itself was already proven directly in phase 4d, not inferred from this)"
+# Graceful = SIGTERM drain, not the SIGKILL fallback: main.ts exits 0 after
+# "shutdown clean"; 137 means docker stop timed out and killed it.
+stop_exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$MAIN_CID")"
+[ "$stop_exit_code" = "0" ] || fail "shutdown: container exit code is ${stop_exit_code}, expected 0 (137 = SIGKILL fallback; SIGTERM did not reach the supervisor)"
+[ "$stop_elapsed_s" -lt "$SHUTDOWN_TIMEOUT_S" ] || fail "shutdown: docker stop took ${stop_elapsed_s}s, not under the ${SHUTDOWN_TIMEOUT_S}s timeout — exit was not SIGTERM-driven"
+stop_logs="$(docker logs "$MAIN_CID" 2>&1)"
+printf '%s\n' "$stop_logs" | grep -q 'workspace-agent: SIGTERM received, draining' || fail "shutdown: no SIGTERM drain line in 'docker logs' — the supervisor never saw SIGTERM"
+printf '%s\n' "$stop_logs" | grep -q 'workspace-agent: shutdown clean' || fail "shutdown: no 'shutdown clean' line in 'docker logs' — the drain did not complete"
+pass "shutdown: SIGTERM-driven graceful exit (exit 0, ${stop_elapsed_s}s < ${SHUTDOWN_TIMEOUT_S}s, drain + 'shutdown clean' logged); reaping itself was already proven directly in phase 4d"
 
 # restart container so we don't leak a stopped-but-not-removed container past
 # this phase's own trap accounting (cleanup() force-removes regardless, but
