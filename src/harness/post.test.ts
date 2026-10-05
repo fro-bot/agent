@@ -75,6 +75,28 @@ describe('post action', () => {
       expect(logger.info).toHaveBeenCalledWith('Skipping post-action: event was not processed', expect.any(Object))
     })
 
+    it.each(['true', 'false'])(
+      'never retries the save for a lock-less Action run (shouldSaveCache=%s, cacheSaved=declined-for-safety)',
+      async shouldSaveCache => {
+        // #given cleanup declined the save because this run did not acquire the Action lock
+        const core = await import('@actions/core')
+        vi.mocked(core.getState).mockImplementation((key: string) => {
+          if (key === 'shouldSaveCache') return shouldSaveCache
+          if (key === 'cacheSaved') return 'declined-for-safety'
+          return ''
+        })
+
+        const {runPost} = await import('./post.js')
+
+        // #when the post hook runs
+        await runPost({logger: createMockLogger()})
+
+        // #then it does not save
+        const {saveCache} = await import('../services/cache/index.js')
+        expect(saveCache).not.toHaveBeenCalled()
+      },
+    )
+
     it('should skip cache save when cache was already saved', async () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {

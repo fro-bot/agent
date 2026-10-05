@@ -64,6 +64,11 @@ vi.mock('./phases/cleanup.js', () => ({
   runCleanup: vi.fn().mockResolvedValue({quiescenceConfirmed: true, continuityUnverified: false}),
 }))
 
+vi.mock('./phases/coordination-decline.js', () => ({
+  clearBlockedLabel: vi.fn().mockResolvedValue(undefined),
+  runCoordinationDecline: vi.fn().mockResolvedValue(undefined),
+}))
+
 vi.mock('./phases/dedup.js', () => ({
   runDedup: vi.fn(),
   saveDedupMarker: vi.fn(),
@@ -72,6 +77,12 @@ vi.mock('./phases/dedup.js', () => ({
 vi.mock('./phases/acquire-lock.js', () => ({
   runAcquireLock: vi.fn(),
 }))
+
+// Lets one test drive the REAL runAcquireLock against a rejecting lock primitive.
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@fro-bot/runtime')>()
+  return {...original, acquireLock: vi.fn(), createS3Adapter: vi.fn(() => ({}))}
+})
 
 vi.mock('./phases/execute.js', () => ({
   computeDrainDeadlineMs: vi.fn(() => 60_000),
@@ -344,7 +355,15 @@ describe('run', () => {
     vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
     vi.mocked(runRouting).mockResolvedValue(createRouting())
     vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
-    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 'held-by-other', holder: null})
+    const holder = {
+      repo: 'owner/repo',
+      holder_id: 'action:999:1',
+      surface: 'github' as const,
+      acquired_at: '2026-10-05T00:00:00.000Z',
+      ttl_seconds: 900,
+      run_id: '999',
+    }
+    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 'held-by-other', holder, reason: 'active-holder'})
 
     // #when the run reaches the coordination-lock skip
     const exitCode = await run()
@@ -361,6 +380,91 @@ describe('run', () => {
     // dedup entity was already assigned before the lock check ran
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('skipped')
     expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    // #and the decline is made visible (summary + warning + label) with the lock outcome and holder,
+    // and the blocked label is never cleared on a skip
+    const {runCoordinationDecline, clearBlockedLabel} = await import('./phases/coordination-decline.js')
+    expect(vi.mocked(runCoordinationDecline)).toHaveBeenCalledWith(
+      expect.objectContaining({holder, reason: 'active-holder', responseMode: 'github'}),
+    )
+    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
+    // #and session persistence is blocked: cleanup is told to decline the save, and the post hook is disabled
+    const {runCleanup} = await import('./phases/cleanup.js')
+    expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(expect.objectContaining({skipSessionPersistence: true}))
+    const core = await import('@actions/core')
+    expect(vi.mocked(core.saveState)).toHaveBeenLastCalledWith('should-save-cache', 'false')
+  })
+
+  it('fails closed without acknowledging, restoring cache, or executing when S3 lock acquisition errors', async () => {
+    // #given S3 coordination is configured but acquisition returned an error (store/config/network)
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runRouting} = await import('./phases/routing.js')
+    const {runDedup, saveDedupMarker} = await import('./phases/dedup.js')
+    const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {runAcknowledge} = await import('./phases/acknowledge.js')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {runExecute} = await import('./phases/execute.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+    const {runCoordinationDecline, clearBlockedLabel} = await import('./phases/coordination-decline.js')
+    const core = await import('@actions/core')
+
+    vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
+    vi.mocked(runRouting).mockResolvedValue(createRouting())
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
+    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 'error', error: new Error('S3 unreachable')})
+
+    // #when the run reaches the lock phase
+    const exitCode = await run()
+
+    // #then it exits 1 with invocation-outcome=failed and an error annotation, and nothing runs after it
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(core.setFailed)).toHaveBeenCalledWith(expect.stringContaining('S3 unreachable'))
+    expectUnavailableOutputs()
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('failed')
+    expect(runAcknowledge).not.toHaveBeenCalled()
+    expect(runCacheRestore).not.toHaveBeenCalled()
+    expect(runExecute).not.toHaveBeenCalled()
+    expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    expect(vi.mocked(runCoordinationDecline)).not.toHaveBeenCalled()
+    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
+    // #and the fail-closed run must not persist session state either
+    const {runCleanup} = await import('./phases/cleanup.js')
+    expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(expect.objectContaining({skipSessionPersistence: true}))
+    expect(vi.mocked(core.saveState)).toHaveBeenLastCalledWith('should-save-cache', 'false')
+  })
+
+  it('fails closed when the lock primitive rejects (thrown, not returned, error)', async () => {
+    // #given S3 is configured and the lock primitive itself rejects, driven through the real runAcquireLock
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runRouting} = await import('./phases/routing.js')
+    const {runDedup} = await import('./phases/dedup.js')
+    const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+    const {acquireLock} = await import('@fro-bot/runtime')
+    const core = await import('@actions/core')
+    const actual = await vi.importActual<typeof import('./phases/acquire-lock.js')>('./phases/acquire-lock.js')
+
+    const bootstrap = createBootstrap()
+    vi.mocked(runBootstrap).mockResolvedValue({
+      ...bootstrap,
+      inputs: {...bootstrap.inputs, storeConfig: {enabled: true, bucket: 'b', region: 'us-east-1', prefix: 'p'}},
+    })
+    vi.mocked(runRouting).mockResolvedValue(createRouting())
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: null})
+    vi.mocked(runAcquireLock).mockImplementation(actual.runAcquireLock)
+    vi.mocked(acquireLock).mockRejectedValue(new Error('socket hang up'))
+
+    // #when the run reaches the lock phase
+    const exitCode = await run()
+
+    // #then the throw is treated like any other lock error: exit 1, failed, no persistence, nothing restored
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(core.setFailed)).toHaveBeenCalledWith(expect.stringContaining('socket hang up'))
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('failed')
+    expect(runCacheRestore).not.toHaveBeenCalled()
+    expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(expect.objectContaining({skipSessionPersistence: true}))
+    expect(vi.mocked(core.saveState)).toHaveBeenLastCalledWith('should-save-cache', 'false')
   })
 
   it('emits failed (not succeeded) when bootstrap fails, matching the returned exit code', async () => {
@@ -633,7 +737,9 @@ describe('run', () => {
     // #then the run still completes successfully, and cleanup is told explicitly that
     // there is no lease to renew or release -- it must not fail for want of one it never held
     expect(exitCode).toBe(0)
-    expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(expect.objectContaining({leaseRenewal: null}))
+    expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(
+      expect.objectContaining({leaseRenewal: null, skipSessionPersistence: false}),
+    )
   })
 })
 
@@ -739,6 +845,44 @@ async function mockHappyPathThrough(overrides?: {
 describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('clears the blocked label only after a succeeded invocation, and never on incomplete or failed', async () => {
+    const {clearBlockedLabel} = await import('./phases/coordination-decline.js')
+
+    // #given a clean, successful delivery
+    await mockHappyPathThrough()
+
+    // #when the run succeeds
+    expect(await run()).toBe(0)
+
+    // #then the label is cleared for the routed target after the final outcome is known, bounded by this run's start
+    expect(vi.mocked(clearBlockedLabel)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(clearBlockedLabel)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.any(Number),
+      expect.anything(),
+    )
+
+    // #given response-mode none, which promises no label changes
+    vi.mocked(clearBlockedLabel).mockClear()
+    await mockHappyPathThrough()
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const bootstrap = createBootstrap()
+    vi.mocked(runBootstrap).mockResolvedValue({...bootstrap, inputs: {...bootstrap.inputs, responseMode: 'none'}})
+    expect(await run()).toBe(0)
+    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
+
+    // #given an incomplete outcome (observation gap)
+    await mockHappyPathThrough({observationGap: true})
+    expect(await run()).toBe(1)
+    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
+
+    // #given a failed outcome (execution failure)
+    await mockHappyPathThrough({executionSuccess: false})
+    expect(await run()).toBe(1)
+    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
   })
 
   it('useful response + observation gap -> incomplete, no dedup marker, no success reaction', async () => {

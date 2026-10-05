@@ -55,8 +55,9 @@ site calls `buildObjectStoreKey(...)` directly.
 ```typescript
 // lock.ts — owns the lock key family
 export const COORDINATION_IDENTITY = 'coordination'
-export function getLockKey(config, repo): Result<string, Error> {
-  return buildObjectStoreKey(config.storeConfig, COORDINATION_IDENTITY, repo, 'locks', 'repo.json')
+export function getLockKey(config, repo, scope = 'repo'): Result<string, Error> {
+  // scope 'repo' → repo.json (gateway); scope 'action' → action.json (GitHub Action)
+  return buildObjectStoreKey(config.storeConfig, COORDINATION_IDENTITY, repo, 'locks', LOCK_OBJECT_NAMES[scope])
 }
 
 // run-state.ts — owns the run-state key family

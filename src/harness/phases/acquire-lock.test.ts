@@ -2,7 +2,7 @@ import type {LockAcquisitionResult, LockRecord, ObjectStoreConfig} from '@fro-bo
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {err, ok} from '../../shared/types.js'
-import {runAcquireLock} from './acquire-lock.js'
+import {parseActionHolderRunId, runAcquireLock} from './acquire-lock.js'
 
 const acquireLockMock = vi.hoisted(() => vi.fn())
 const createS3AdapterMock = vi.hoisted(() => vi.fn(() => ({})))
@@ -127,7 +127,7 @@ describe('runAcquireLock', () => {
       '99999',
       expect.any(Object),
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing
-      {reclaimableWithoutConfirmation: expect.any(Function)},
+      {scope: 'action', reclaimableWithoutConfirmation: expect.any(Function)},
     )
   })
 
@@ -162,6 +162,7 @@ describe('runAcquireLock', () => {
     'action:1234',
     'action:1234:x',
     'action::1',
+    'action:abc:1',
     'action:1:2:3',
     'discord-gateway',
   ])('does not treat a github-surface holder with non-Action id %j as reclaimable', async holderId => {
@@ -215,7 +216,76 @@ describe('runAcquireLock', () => {
 
     // #then
     expect(options.reclaimableWithoutConfirmation(holder)).toBe(false)
-    expect(result).toEqual({outcome: 'held-by-other', holder})
+    expect(result).toEqual({outcome: 'held-by-other', holder, reason: 'expired-holder'})
+  })
+
+  it('skips an expired github-surface lease with holder action:abc:1 as held-by-other, not reclaimed', async () => {
+    // #given a non-numeric run id in an otherwise Action-shaped holder id; acquireLock reports it uncorroborated
+    const holder = createLockRecord({surface: 'github', holder_id: 'action:abc:1'})
+    acquireLockMock.mockResolvedValue(
+      lockOk({
+        acquired: false,
+        outcome: 'expired-holder',
+        etag: null,
+        holder,
+        confirmation: {kind: 'unknown', source: 'unavailable', directory: null, reason: 'no-corroborator'},
+      }),
+    )
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '5678',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    const options = acquireLockMock.mock.calls[0]?.[6] as {
+      reclaimableWithoutConfirmation: (holder: LockRecord) => boolean
+    }
+
+    // #then the predicate refuses it and the run is skipped
+    expect(options.reclaimableWithoutConfirmation(holder)).toBe(false)
+    expect(result).toEqual({outcome: 'held-by-other', holder, reason: 'expired-holder'})
+  })
+
+  it('returns error when acquireLock rejects instead of returning a Result', async () => {
+    // #given the lock primitive throws (e.g. a network failure outside the Result channel)
+    const thrown = new Error('socket hang up')
+    acquireLockMock.mockRejectedValue(thrown)
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '5678',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+
+    // #then it is reported as an error outcome, not an unhandled rejection
+    expect(result).toEqual({outcome: 'error', error: thrown})
+  })
+
+  it('returns error when createS3Adapter throws', async () => {
+    // #given adapter construction fails (e.g. invalid S3 configuration)
+    createS3AdapterMock.mockImplementationOnce(() => {
+      throw new Error('bad endpoint')
+    })
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '5678',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(result.outcome).toBe('error')
+    expect(result.outcome === 'error' ? result.error.message : '').toBe('bad endpoint')
+    expect(acquireLockMock).not.toHaveBeenCalled()
   })
 
   it('skips an expired gateway-held lease as held-by-other with a distinct unconfirmed log', async () => {
@@ -242,7 +312,7 @@ describe('runAcquireLock', () => {
     })
 
     // #then
-    expect(result).toEqual({outcome: 'held-by-other', holder})
+    expect(result).toEqual({outcome: 'held-by-other', holder, reason: 'expired-holder'})
     expect(logger.info).toHaveBeenCalledWith(
       expect.stringContaining('settlement unconfirmed; skipped'),
       expect.objectContaining({surface: 'discord'}),
@@ -290,7 +360,7 @@ describe('runAcquireLock', () => {
     })
 
     // #then phase reports held-by-other with holder details
-    expect(result).toEqual({outcome: 'held-by-other', holder})
+    expect(result).toEqual({outcome: 'held-by-other', holder, reason: 'active-holder'})
   })
 
   it('returns held-by-other when another Action run holds the lock', async () => {
@@ -312,7 +382,7 @@ describe('runAcquireLock', () => {
     })
 
     // #then same skip path applies — no special handling for same-surface contention
-    expect(result).toEqual({outcome: 'held-by-other', holder})
+    expect(result).toEqual({outcome: 'held-by-other', holder, reason: 'active-holder'})
   })
 
   it('returns held-by-other with null holder when stale-takeover race lost', async () => {
@@ -330,7 +400,7 @@ describe('runAcquireLock', () => {
     })
 
     // #then phase reports held-by-other with no holder context
-    expect(result).toEqual({outcome: 'held-by-other', holder: null})
+    expect(result).toEqual({outcome: 'held-by-other', holder: null, reason: 'conflict'})
   })
 
   it('returns error when acquireLock fails (S3 unavailable)', async () => {
@@ -348,7 +418,7 @@ describe('runAcquireLock', () => {
       logger: createMockLogger(),
     })
 
-    // #then phase reports error with the underlying cause; caller decides fail vs proceed
+    // #then phase reports error with the underlying cause; the caller fails closed (S3 is configured)
     expect(result).toEqual({outcome: 'error', error: networkError})
   })
 
@@ -407,6 +477,26 @@ describe('runAcquireLock lease renewal (plan Unit 12)', () => {
     expect(renewLeaseMock).toHaveBeenCalledTimes(1)
     expect(result.renewal.hasFailed()).toBe(false)
     expect(result.renewal.currentEtag()).toBe('"etag-renewed"')
+
+    await result.renewal.stop()
+  })
+
+  it('renews on the Action lock key, not the gateway repo key', async () => {
+    // #given a lock acquired successfully
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1111',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    if (result.outcome !== 'acquired') throw new Error('expected acquired outcome')
+
+    // #when the renewal interval fires
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #then renewLease receives the Action scope as its trailing argument
+    expect(renewLeaseMock.mock.calls[0]?.[5]).toBe('action')
 
     await result.renewal.stop()
   })
@@ -598,5 +688,21 @@ describe('runAcquireLock lease renewal (plan Unit 12)', () => {
     expect(result.renewal.hasFailed()).toBe(true)
 
     await vi.advanceTimersByTimeAsync(5_000)
+  })
+})
+
+describe('parseActionHolderRunId', () => {
+  it.each([
+    ['action:1234:1', '1234'],
+    ['action:1234:12', '1234'],
+    ['action:abc:1', null],
+    ['action:1234', null],
+    ['gateway:instance-1:run-99', null],
+    ['action:1:2:3', null],
+  ])('maps %j to %j', (holderId, expected) => {
+    // #given a holder id read from S3 (untrusted)
+    // #when parsed
+    // #then only well-formed Action ids with a numeric run id yield a run id
+    expect(parseActionHolderRunId(holderId)).toBe(expected)
   })
 })

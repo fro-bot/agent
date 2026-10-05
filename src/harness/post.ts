@@ -117,7 +117,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
     // than cleanup had -- no OpenCodeServerHandle, no ownership ledger, no lease -- so it
     // cannot be more confident that persisting now is safe than the step that just declined.
     // A process-boundary argument does not rescue a blind retry here: a failed lease
-    // renewal means another surface (the Discord gateway, or a retried Action run) may hold
+    // renewal means another Action run (e.g. a retried run) may hold
     // the lock and be writing the same object-store prefix regardless of which process this
     // is, and unconfirmed quiescence means the OpenCode child's exit was never confirmed --
     // a runner does not guarantee orphaned children are reaped between steps, so "it must be
@@ -150,7 +150,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
       // happened yet" gap this retry can safely close. A process boundary proves there is
       // no live writer *in this run's own process tree*, which is enough to justify
       // retrying an ordinary not-persisted save. It proves nothing about a failed lease
-      // renewal (another surface entirely -- the Discord gateway, or a retried Action run --
+      // renewal (another Action run entirely -- e.g. a retried run --
       // may hold the lock and be writing the same object-store prefix right now, regardless
       // of which process this one is) or about unconfirmed quiescence (a runner does not
       // guarantee orphaned children are reaped between steps, so "the OpenCode child must be

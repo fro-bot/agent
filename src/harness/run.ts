@@ -3,6 +3,7 @@ import type {
   OutputModeMigrationState,
   OutputModeRequestState,
   OwnershipLedger,
+  ResponseMode,
 } from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
@@ -25,6 +26,7 @@ import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
+import {clearBlockedLabel, runCoordinationDecline} from './phases/coordination-decline.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
 import {computeDrainDeadlineMs, resolveRequestedOutputModeState, runDrain, runExecute} from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
@@ -48,12 +50,15 @@ export async function run(): Promise<number> {
   let runId = ''
   let sessionRetention: number | null = null
   let lockEtag: string | null = null
-  // Renews the coordination lock's lease across execution, drain, and persistence (plan
-  // Unit 12) -- null whenever this run holds no lock (S3 disabled, acquisition failed, or
-  // another surface already holds it). Held here, not inside acquire-lock.ts, because it
+  // Renews the Action coordination lock's lease across execution, drain, and persistence (plan
+  // Unit 12) -- null whenever this run holds no lock (S3 disabled, or another Action run
+  // already holds it). Held here, not inside acquire-lock.ts, because it
   // must outlive the acquire-lock phase call and reach runCleanup in the finally block
   // below, exactly like lockEtag already does.
   let leaseRenewal: LeaseController | null = null
+  // True when S3 coordination is configured but the Action lock was not acquired (contended, or the
+  // fail-closed lock error). Such a run must not persist session state (see CleanupPhaseOptions).
+  let skipSessionPersistence = false
   // Hoisted out of the try block (like lockEtag above) because runCleanup runs from the
   // outer finally block, where a `const` declared inside try is out of scope. Populated
   // right after runExecute returns; stays undefined only when execution never ran
@@ -62,6 +67,8 @@ export async function run(): Promise<number> {
   let ownershipLedger: OwnershipLedger | undefined
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
+  // Parsed `response-mode` input; `none` promises no label changes (see coordination-decline.ts).
+  let responseMode: ResponseMode = 'github'
   let storeConfig: ObjectStoreConfig = {
     enabled: false,
     bucket: '',
@@ -88,7 +95,8 @@ export async function run(): Promise<number> {
   // a `return` expression before running `finally`) -- so `finally` must read a fact set
   // BEFORE each return, not `exitCode` itself, to know whether that return was a genuine
   // failure, an intentional skip, or (the 'pending' default) a normal in-progress run.
-  // 'failed': bootstrap or cache-restore could not even start (`return 1`). 'skipped':
+  // 'failed': bootstrap, cache-restore, or Action lock acquisition (S3 configured, lock error)
+  // could not even start (`return 1`). 'skipped':
   // routing found no matching trigger, dedup suppressed a repeat, or the coordination lock
   // was contended (`return 0`, but nothing was attempted -- not the same as delivered).
   let deliveryOutcome: 'pending' | 'failed' | 'skipped' = 'pending'
@@ -128,6 +136,7 @@ export async function run(): Promise<number> {
     }
     detectedOpencodeVersion = bootstrap.opencodeResult.version
     storeConfig = bootstrap.inputs.storeConfig
+    responseMode = bootstrap.inputs.responseMode
     sessionRetention = bootstrap.inputs.sessionRetention
 
     const routing = await runRouting(bootstrap, startTime)
@@ -170,24 +179,39 @@ export async function run(): Promise<number> {
         leaseRenewal = lockResult.renewal
         break
       case 'held-by-other':
-        bootstrapLogger.info('Skipping run — coordination lock held, or expired gateway lease unconfirmed', {
+        bootstrapLogger.info('Skipping run — Action coordination lock held, or expired non-Action lease unconfirmed', {
           heldBy: lockResult.holder?.holder_id ?? null,
           surface: lockResult.holder?.surface ?? null,
         })
         deliveryOutcome = 'skipped'
         setUnavailableActionOutputs(Date.now() - startTime)
+        // Nothing below this decline may write session state: cleanup declines its save and the post hook skips.
+        skipSessionPersistence = true
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+        // Visibility only (summary, warning, label): never a comment or reaction. Best-effort, never throws.
+        await runCoordinationDecline({
+          githubClient: routing.githubClient,
+          triggerContext: routing.triggerResult.context,
+          holder: lockResult.holder,
+          reason: lockResult.reason,
+          responseMode,
+          logger: bootstrapLogger,
+        })
         return 0
+      case 'error': {
+        // S3 coordination is configured (the disabled case is its own outcome), so running unlocked
+        // could race another Action run's save of the shared session object. Fail closed.
+        deliveryOutcome = 'failed'
+        setUnavailableActionOutputs(Date.now() - startTime)
+        skipSessionPersistence = true
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+        core.setFailed(
+          `Could not acquire the Action coordination lock; refusing to run unlocked: ${lockResult.error.message}`,
+        )
+        return 1
+      }
       case 's3-disabled':
-      case 'error':
-        // S3 disabled: lock is opt-in, proceed without coordination.
-        // Error: lock acquisition failed (network, permissions, etc.) — log and proceed
-        // to preserve single-surface behavior. A leaked Action lease is reclaimed on a later
-        // acquisition once its TTL expires; an expired gateway lease is never reclaimed here.
-        if (lockResult.outcome === 'error') {
-          bootstrapLogger.warning('Coordination lock acquisition failed; proceeding without lock', {
-            error: lockResult.error.message,
-          })
-        }
+        // Coordination is opt-in: no object store configured, proceed without a lock.
         break
     }
 
@@ -335,6 +359,7 @@ export async function run(): Promise<number> {
       lockEtag,
       ownershipLedger,
       leaseRenewal,
+      skipSessionPersistence,
     })
 
     // FINAL assessment: the single call to this pure function, made only now that
@@ -410,6 +435,12 @@ export async function run(): Promise<number> {
     // added because `applyTerminalReaction` is not typed to accept a fourth outcome value.
     if (reactionCtx != null && githubClient != null && finalOutcome !== 'skipped') {
       await applyTerminalReaction(githubClient, reactionCtx, finalOutcome, bootstrapLogger)
+    }
+
+    // A target that was blocked earlier is unblocked once a later invocation for it succeeds. Only after the
+    // FINAL outcome is known, and never on skip/failure/incomplete.
+    if (finalOutcome === 'succeeded' && responseMode !== 'none' && githubClient != null && triggerContext != null) {
+      await clearBlockedLabel(githubClient, triggerContext, startTime, bootstrapLogger)
     }
 
     setInvocationOutcomeOutput(finalOutcome)

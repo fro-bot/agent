@@ -67,7 +67,16 @@ export type ConfirmExpiredHolder = (context: {
   readonly signal: AbortSignal
 }) => Promise<RepoQuiescence>
 
+/**
+ * Which per-repo lock object an operation targets.
+ * - `repo`: gateway runs exclude each other (shared checkout). The default.
+ * - `action`: GitHub Action runs exclude each other (shared S3 session object).
+ */
+export type LockScope = 'repo' | 'action'
+
 export interface LockAcquisitionOptions {
+  /** Lock object to acquire. Defaults to `repo`. */
+  readonly scope?: LockScope
   readonly confirmExpiredHolder?: ConfirmExpiredHolder
   /** Holders whose expired leases may be reclaimed without corroboration (e.g. the Action's own surface). */
   readonly reclaimableWithoutConfirmation?: (holder: LockRecord) => boolean
