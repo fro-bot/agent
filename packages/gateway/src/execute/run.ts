@@ -1187,11 +1187,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
       // ── Checkout provenance for the agent — engine-level insertion ─────────────────
       // Appended here, AFTER whichever prompt builder just ran (Discord's or a custom
-      // one), so no builder can leave it out. The agent needs to know what it's reading
-      // — especially when the tree is dirty, detached, or mid-operation — and that
-      // remote freshness was not checked.
-      const promptTextWithProvenance =
-        provenance === undefined ? promptText : `${promptText}\n\n${formatProvenanceForPrompt(provenance)}`
+      // one), so no builder can leave it out.
+      const promptTextWithProvenance = `${promptText}\n\n${formatProvenanceForPrompt(provenance)}`
 
       // ── Remaining budget — single origin for hard abort AND approval deadline ──
       //
