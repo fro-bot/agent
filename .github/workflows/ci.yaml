@@ -475,6 +475,64 @@ jobs:
             exit 1
           fi
           echo "OK: all operator routes registered in the shipped image"
+      - name: Smoke-test gateway image — TCP health probe (busybox nc -z)
+        run: |
+          set -euo pipefail
+          # The HEALTHCHECK's mitmproxy probe relies on the base image's busybox `nc -z`
+          # (no netcat package is installed): exit 0 on an open port, non-zero on a closed one.
+          healthcheck="$(docker inspect --format '{{json .Config.Healthcheck.Test}}' fro-bot-gateway:smoke)"
+          if ! echo "$healthcheck" | grep -Fq 'nc -z mitmproxy 8080'; then
+            echo "REGRESSION: image HEALTHCHECK no longer contains the 'nc -z mitmproxy 8080' probe this step asserts: $healthcheck"
+            exit 1
+          fi
+
+          suffix="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$"
+          network="gateway-nc-smoke-$suffix"
+          listener="gateway-nc-listener-$suffix"
+          cleanup() {
+            docker rm -f "$listener" >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker network create "$network" >/dev/null
+          # Accept-and-discard loop: each probe consumes one accept, then nc re-listens.
+          docker run -d --name "$listener" --network "$network" fro-bot-gateway:smoke \
+            sh -c 'while true; do nc -l -p 8080 </dev/null >/dev/null 2>&1; done' >/dev/null
+
+          probe() {
+            timeout 30s docker run --rm --network "$network" fro-bot-gateway:smoke nc -z "$listener" "$1"
+          }
+
+          # Open port: retry briefly, the listener may not be accepting yet.
+          open_ok=false
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if probe 8080; then
+              open_ok=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$open_ok" != true ]; then
+            echo "ASSERTION FAILURE: 'nc -z $listener 8080' did not exit 0 against a listening endpoint"
+            docker logs "$listener" 2>&1 || true
+            exit 1
+          fi
+          echo "OK: nc -z exits 0 against a listening endpoint"
+
+          # Closed port: busybox nc exits 1 on connection refused; anything else
+          # (e.g. docker/exec failure, timeout) must not pass as a closed-port result.
+          if probe 9999; then
+            echo "ASSERTION FAILURE: 'nc -z $listener 9999' exited 0 against a closed port"
+            exit 1
+          else
+            closed_status=$?
+          fi
+          if [ "$closed_status" -ne 1 ]; then
+            echo "ASSERTION FAILURE: closed-port probe exited $closed_status, expected 1 (connection refused)"
+            exit 1
+          fi
+          echo "OK: nc -z exits 1 against a closed port"
 
   workspace-smoke:
     if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}
