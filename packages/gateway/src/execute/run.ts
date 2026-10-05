@@ -18,6 +18,7 @@ import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
 import type {CheckoutPreparation, CheckoutProvenance} from './provenance.js'
 import type {ChannelQueue} from './queue.js'
+import type {RepoQuiescenceChecker} from './repo-quiescence.js'
 import type {RunCoreErrorKind} from './run-core.js'
 import type {RunIndex} from './run-index.js'
 
@@ -41,6 +42,7 @@ import {buildRecoverEntryButton} from '../discord/recover-checkout-button.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
+import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
 import {attachOpencode} from './opencode-attach.js'
 import {
@@ -66,6 +68,8 @@ import {RunCoreError, runOpenCodeCore} from './run-core.js'
 export interface RunMentionDeps {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
+  /** Corroborates an expired repo lease before it is replaced; required, so no path takes over on time alone. */
+  readonly checkRepoQuiescence: RepoQuiescenceChecker
   readonly concurrency: ConcurrencyRegistry
   /** Per-channel FIFO queue for pending tasks. */
   readonly queue: ChannelQueue<RunTask>
@@ -362,9 +366,11 @@ function classifyEnsureCloneFailure(failure: EnsureCloneFailure): RunCoreErrorKi
 /** Narrow logger adapter for runtime coordination functions. */
 export function toCoordLogger(logger: GatewayLogger): {
   debug: (message: string, context?: Record<string, unknown>) => void
+  info: (message: string, context?: Record<string, unknown>) => void
 } {
   return {
     debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
+    info: (msg, ctx) => logger.info(ctx ?? {}, msg),
   }
 }
 
@@ -534,15 +540,11 @@ function extractRunCoreKind(execError: unknown): string | undefined {
  * recovers unattended rather than needing an operator to notice and intervene.
  *
  * Only the concurrency slot is released deterministically at this boundary (see
- * `scheduleQuarantineRelease`). The repo lock is left to decay via its own
- * lease TTL (`CoordinationConfig.lockTtlSeconds`, 900 s / 15 min by default) —
- * once this window stops renewing it, `acquireLock`'s existing stale-lease
- * takeover (a plain TTL comparison already exercised by ordinary crash
- * recovery) reclaims it the next time the repo is mentioned, and
- * `force-release-lock` becomes usable for an operator once both its lease and
- * heartbeat signals go stale. Neither path requires this module to force a
- * delete it cannot itself verify is safe — that direct-release call is exactly
- * the race the termination barrier exists to prevent.
+ * `scheduleQuarantineRelease`). The repo lock is left to lapse via its own lease TTL
+ * (`CoordinationConfig.lockTtlSeconds`, 900 s / 15 min by default) once this window stops
+ * renewing it. An expired lease is NOT reclaimed on elapsed time alone: acquisition and the
+ * operator `force-release-lock` both require a clear OpenCode workspace status check first, so a
+ * quarantined run whose children are still busy keeps the repo blocked.
  */
 export const QUARANTINE_HOLD_WINDOW_MS = 5 * 60_000
 
@@ -565,19 +567,19 @@ interface ScheduleQuarantineReleaseOpts {
  * comments there) — the heartbeat keeps renewing the lock lease so the
  * reservation cannot silently lapse via TTL while settlement is unconfirmed.
  * Left unbounded that hold is permanent and unreachable: `force-release-lock`
- * requires BOTH an expired lease AND a stale/absent heartbeat, and a
- * still-renewing heartbeat means neither condition can ever become true.
+ * requires an expired lease, and a still-renewing heartbeat means that
+ * can never become true.
  *
  * This schedules the deferred other half. After `QUARANTINE_HOLD_WINDOW_MS`:
  *  1. Stops the heartbeat (best-effort) — the lease stops renewing and the
- *     run-state heartbeat goes stale, starting both signals `force-release-lock`
- *     checks toward becoming true.
+ *     run-state heartbeat goes stale, letting the lease expire so a corroborated
+ *     takeover or `force-release-lock` becomes possible.
  *  2. Releases the concurrency slot — via the same atomic hand-off-or-release
  *     logic the ordinary completion path uses, so a queued task is never made
  *     to wait out this window behind a run that already finished failing.
  *
  * Does NOT call `releaseLock`: see `QUARANTINE_HOLD_WINDOW_MS` for why the lock
- * itself is left to the existing TTL-takeover / force-release-lock paths
+ * itself is left to the corroborated takeover / force-release-lock paths
  * instead of an explicit delete this module cannot verify is safe.
  */
 function scheduleQuarantineRelease(opts: ScheduleQuarantineReleaseOpts): void {
@@ -803,7 +805,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
-    const lockResult = await acquireLock(coordinationConfig, repo, identity, request.surface, runId, coordLogger)
+    const lockResult = await acquireLock(coordinationConfig, repo, identity, request.surface, runId, coordLogger, {
+      confirmExpiredHolder: deps.checkRepoQuiescence,
+    })
 
     if (lockResult.success === false) {
       logger.error({repo, runId, err: lockResult.error.message}, 'run: lock acquisition error')
@@ -815,11 +819,17 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     if (lockResult.data.acquired === false) {
       // Lock held — terminal "waiting" reply; do NOT expose holder ID to Discord
-      logger.info({repo, runId, holder: lockResult.data.holder?.holder_id ?? 'unknown'}, 'run: lock held by another')
+      const blocked = lockResult.data.outcome === 'expired-holder'
+      logger.info(
+        {repo, runId, outcome: lockResult.data.outcome, holder: lockResult.data.holder?.holder_id ?? 'unknown'},
+        blocked ? 'run: expired lease not corroborated — not taking over' : 'run: lock held by another',
+      )
       // Gate 3 (lock not acquired) failure: terminalize the admitted run to FAILED before replying.
       await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('thread', {
-        content: 'Another task is already in progress for this repo. Try again when it completes.',
+        content: blocked
+          ? 'A previous task in this repo may still be running, so a new one was not started. Try again in a few minutes.'
+          : 'Another task is already in progress for this repo. Try again when it completes.',
       })
       return
     }
@@ -1022,13 +1032,25 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // this just supplies its half honestly rather than always handing over the full 100s.
       const remainingUpdateBudgetMs = (): number => Math.max(0, runTimeoutMs - (Date.now() - runStartMs))
 
-      let updateResult = await update(binding.owner, binding.repo, {remainingBudgetMs: remainingUpdateBudgetMs()})
-      let bindingWithEnsuredPath = binding
+      // Single source of truth for where this repo's sessions run: `/workspace/repos/{owner}/{repo}`,
+      // lowercased and validated once. The stored `binding.workspacePath` is NEVER used as an OpenCode
+      // directory — the repo-quiescence check queries this same directory, and `session.status` returns `{}`
+      // (indistinguishable from quiescent) for any directory without sessions.
+      const workspaceTarget = canonicalWorkspaceTarget(binding.owner, binding.repo)
+      if (workspaceTarget === null) {
+        logger.error({channelId, owner: binding.owner, repo: binding.repo}, 'run: invalid owner/repo — aborting')
+        throw new RunCoreError('workspace-unavailable', 'invalid owner/repo for workspace directory')
+      }
+      const sessionDirectory = workspaceTarget.directory
+
+      let updateResult = await update(workspaceTarget.owner, workspaceTarget.repo, {
+        remainingBudgetMs: remainingUpdateBudgetMs(),
+      })
 
       if (updateResult.success === true && updateResult.data.kind === 'no-checkout') {
         // Rehydrate a missing checkout (e.g. after container recreation), then retry /update
         // against the freshly cloned tree — the one case that still needs ensureClone.
-        const ensureCloneResult = await ensureClone(binding.owner, binding.repo)
+        const ensureCloneResult = await ensureClone(workspaceTarget.owner, workspaceTarget.repo)
         if (ensureCloneResult.success === false) {
           logger.warn(
             {
@@ -1042,10 +1064,18 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           const runCoreKind = classifyEnsureCloneFailure(ensureCloneResult.error)
           throw new RunCoreError(runCoreKind, `ensureClone failed: ${ensureCloneResult.error.kind}`)
         }
-        // Use the ensured (canonical) path from ensureClone, not the potentially stale
-        // workspacePath stored in the binding (e.g. after container recreation).
-        bindingWithEnsuredPath = {...binding, workspacePath: ensureCloneResult.data}
-        updateResult = await update(binding.owner, binding.repo, {remainingBudgetMs: remainingUpdateBudgetMs()})
+        // Fail closed if ensureClone reports any other path: the agent must run in the exact directory the
+        // quiescence check queries, so a divergent checkout is a workspace error, never silently adopted.
+        if (ensureCloneResult.data !== sessionDirectory) {
+          logger.error(
+            {channelId, owner: binding.owner, repo: binding.repo},
+            'run: ensureClone returned a non-canonical workspace path — aborting',
+          )
+          throw new RunCoreError('workspace-unavailable', 'ensureClone returned a non-canonical workspace path')
+        }
+        updateResult = await update(workspaceTarget.owner, workspaceTarget.repo, {
+          remainingBudgetMs: remainingUpdateBudgetMs(),
+        })
       }
 
       if (updateResult.success === false) {
@@ -1174,15 +1204,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         request.promptBuilder === undefined
           ? buildDiscordPrompt({
               messageText: request.promptText,
-              owner: bindingWithEnsuredPath.owner,
-              repo: bindingWithEnsuredPath.repo,
+              owner: binding.owner,
+              repo: binding.repo,
               botUserId,
               persona,
             })
           : request.promptBuilder({
               messageText: request.promptText,
-              owner: bindingWithEnsuredPath.owner,
-              repo: bindingWithEnsuredPath.repo,
+              owner: binding.owner,
+              repo: binding.repo,
             })
 
       // ── Checkout provenance for the agent — engine-level insertion ─────────────────
@@ -1252,7 +1282,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
               approvalRegistry,
               replySink,
               threadId,
-              directory: bindingWithEnsuredPath.workspacePath,
+              directory: sessionDirectory,
               approvalDeadlineMs,
               onDeadlineSettled: async () => {
                 // markVisibleOutputSent AFTER the send succeeds so flush() still
@@ -1270,7 +1300,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             })
           : request.createApprovalOnPending({
               approvalRegistry,
-              directory: bindingWithEnsuredPath.workspacePath,
+              directory: sessionDirectory,
               approvalDeadlineMs,
               runId,
               repo,
@@ -1307,7 +1337,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       try {
         await runOpenCodeCore({
           handle,
-          directory: bindingWithEnsuredPath.workspacePath,
+          directory: sessionDirectory,
           promptText: promptTextWithProvenance,
           sink: replySink,
           signal: effectiveSignal,
@@ -1436,7 +1466,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         statusSink.setReaction('failed')
 
         const quarantineFailureKind = extractRunCoreKind(execError)
-        const quarantineDetailsPatch: Record<string, unknown> = {quarantined: true}
+        const quarantineDetailsPatch: Record<string, unknown> = {
+          quarantined: true,
+          // Audit evidence for a later takeover decision; not consulted for any gating.
+          quarantineHoldUntil: new Date(Date.now() + QUARANTINE_HOLD_WINDOW_MS).toISOString(),
+        }
         if (quarantineFailureKind !== undefined) {
           quarantineDetailsPatch.failureKind = quarantineFailureKind
         }

@@ -390,13 +390,14 @@ describe('runMention', () => {
       expect(deadlineMs).toBeGreaterThan(0)
     })
 
-    it('onPending: posts approval embed+buttons to thread and calls approvalRegistry.register with ensured canonical path', async () => {
+    it('onPending: posts approval embed+buttons to thread and calls approvalRegistry.register with the canonical directory', async () => {
       // #given — binding has a stale workspacePath; ensureClone returns the canonical path.
-      // approvalRegistry.register must receive the canonical path, NOT the stale binding path.
+      // approvalRegistry.register must receive the canonical directory derived from owner/repo,
+      // NOT the stale binding path.
       const {runMention} = await import('./run.js')
       setupHappyPath()
 
-      const canonicalPath = '/workspace/canonical/acme/widget'
+      const canonicalPath = '/workspace/repos/acme/widget'
       const staleBinding = {...makeBinding(), workspacePath: '/old/stale/path'}
       const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: canonicalPath})
 
@@ -462,7 +463,7 @@ describe('runMention', () => {
         }),
       )
 
-      // #and — approvalRegistry.register called with the CANONICAL path from ensureClone,
+      // #and — approvalRegistry.register called with the CANONICAL directory (owner/repo-derived),
       // NOT the stale binding.workspacePath
       expect(approvalRegistry.register).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -595,7 +596,8 @@ describe('runMention', () => {
       const fakeApprovalMessage = {id: 'msg-approval-999', edit: vi.fn()}
       thread.send.mockResolvedValue(fakeApprovalMessage)
       const message = makeMessage(thread)
-      const binding = makeBinding() // workspacePath = '/workspace/acme/widget'
+      const binding = makeBinding() // stored workspacePath is irrelevant; the run uses the canonical directory
+      const canonicalDirectory = '/workspace/repos/acme/widget'
 
       let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
       mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
@@ -636,14 +638,14 @@ describe('runMention', () => {
       const capturedPostReply = registerCall.effects.postReply
 
       // #when — invoke the postReply closure
-      await capturedPostReply('req-seam-999', binding.workspacePath, 'once')
+      await capturedPostReply('req-seam-999', canonicalDirectory, 'once')
 
       // #then — SDK endpoint called with session + permissionID in path AND directory in query
       expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
           path: {id: fakeRequest.sessionID, permissionID: fakeRequest.requestID},
           body: {response: 'once'},
-          query: {directory: binding.workspacePath},
+          query: {directory: canonicalDirectory},
         }),
       )
     })
@@ -677,13 +679,13 @@ describe('runMention', () => {
       )
     })
 
-    it('createApprovalOnPending factory: ApprovalTransportContext.directory equals canonical ensureClone path and approvalDeadlineMs is positive', async () => {
-      // Regression guard: the factory must receive the canonical path from ensureClone,
-      // not the stale binding.workspacePath. This is the Fix 4 assertion.
+    it('createApprovalOnPending factory: ApprovalTransportContext.directory equals the canonical directory and approvalDeadlineMs is positive', async () => {
+      // Regression guard: the factory must receive the canonical owner/repo-derived directory,
+      // not the stale binding.workspacePath.
       const {launchWork} = await import('./run.js')
       setupHappyPath()
 
-      const CANONICAL_PATH = '/workspace/canonical/acme/widget'
+      const CANONICAL_PATH = '/workspace/repos/acme/widget'
       const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: CANONICAL_PATH})
       const staleBinding = {...makeBinding(), workspacePath: '/old/stale/path'}
 
@@ -749,7 +751,7 @@ describe('runMention', () => {
       expect(createApprovalOnPending).toHaveBeenCalledOnce()
       expect(capturedContext).toBeDefined()
 
-      // #and — directory is the canonical path from ensureClone, NOT the stale binding path
+      // #and — directory is the canonical owner/repo-derived path, NOT the stale binding path
       expect(capturedContext?.directory).toBe(CANONICAL_PATH)
       expect(capturedContext?.directory).not.toBe('/old/stale/path')
 
@@ -1598,9 +1600,8 @@ describe('approval transport selection', () => {
 
     // #then — context carries all engine-owned fields a web transport needs
     expect(capturedContext).toBeDefined()
-    // canonical directory (from ensureClone, not stale binding.workspacePath)
-    expect(typeof capturedContext?.directory).toBe('string')
-    expect(capturedContext?.directory.length).toBeGreaterThan(0)
+    // canonical directory (owner/repo-derived, not stale binding.workspacePath)
+    expect(capturedContext?.directory).toBe('/workspace/repos/acme/widget')
     // approval deadline (aligned with run budget)
     expect(
       capturedContext?.approvalDeadlineMs === undefined || typeof capturedContext?.approvalDeadlineMs === 'number',
@@ -1693,6 +1694,8 @@ describe('approval transport selection', () => {
       'web',
       expect.any(String),
       expect.anything(),
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing
+      expect.objectContaining({confirmExpiredHolder: expect.any(Function)}),
     )
   })
 })

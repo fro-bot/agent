@@ -58,6 +58,13 @@ afterEach(async () => {
   await rm(destHome, {recursive: true, force: true})
 })
 
+/** `stdin` 'error' handler for a spawned child: ignores EPIPE (child exited early), rejects on anything else. */
+function ignoreEpipeOrReject(reject: (reason: unknown) => void): (error: NodeJS.ErrnoException) => void {
+  return error => {
+    if (error.code !== 'EPIPE') reject(error)
+  }
+}
+
 /** Runs the exact `pack-objects --stdout | index-pack --stdin --strict` shape the plan specifies, with no shell involved (matching how Unit 3's real implementation must spawn both ends directly, never via `sh -c`). */
 async function runRawPackPipe(
   sourceSha: string,
@@ -73,7 +80,7 @@ async function runRawPackPipe(
           reject(writerError)
           return
         }
-        execFile(
+        const reader = execFile(
           'git',
           ['-C', destRepo, 'index-pack', '--stdin', '--strict'],
           {env, encoding: 'utf8'},
@@ -84,9 +91,14 @@ async function runRawPackPipe(
             }
             resolve({indexPackStdout: readerStdout, indexPackStderr: readerStderr})
           },
-        ).stdin?.end(writerStdout)
+        )
+        // index-pack may exit before consuming the whole pack (e.g. on a --strict rejection); that is
+        // an EPIPE on its stdin, not a test failure — its exit status still decides the outcome above.
+        reader.stdin?.on('error', ignoreEpipeOrReject(reject))
+        reader.stdin?.end(writerStdout)
       },
     )
+    writer.stdin?.on('error', ignoreEpipeOrReject(reject))
     writer.stdin?.write(`${sourceSha}\n`)
     writer.stdin?.end()
   })

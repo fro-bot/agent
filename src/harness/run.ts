@@ -15,7 +15,7 @@ import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
-import {getGitHubRunAttempt} from '../shared/env.js'
+import {getGitHubRunAttempt, getGitHubWorkspace} from '../shared/env.js'
 import {createLogger} from '../shared/logger.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
@@ -170,7 +170,7 @@ export async function run(): Promise<number> {
         leaseRenewal = lockResult.renewal
         break
       case 'held-by-other':
-        bootstrapLogger.info('Skipping run — coordination lock held by another surface', {
+        bootstrapLogger.info('Skipping run — coordination lock held, or expired gateway lease unconfirmed', {
           heldBy: lockResult.holder?.holder_id ?? null,
           surface: lockResult.holder?.surface ?? null,
         })
@@ -181,8 +181,8 @@ export async function run(): Promise<number> {
       case 'error':
         // S3 disabled: lock is opt-in, proceed without coordination.
         // Error: lock acquisition failed (network, permissions, etc.) — log and proceed
-        // to preserve single-surface behavior. The 15-minute TTL of any leaked lock from
-        // a prior crash recovers via stale-takeover on the next acquisition attempt.
+        // to preserve single-surface behavior. A leaked Action lease is reclaimed on a later
+        // acquisition once its TTL expires; an expired gateway lease is never reclaimed here.
         if (lockResult.outcome === 'error') {
           bootstrapLogger.warning('Coordination lock acquisition failed; proceeding without lock', {
             error: lockResult.error.message,
@@ -220,6 +220,7 @@ export async function run(): Promise<number> {
       ledger: execution.ownershipLedger,
       client: cacheRestore.serverHandle.client,
       parentSessionId: execution.sessionId,
+      directory: getGitHubWorkspace(),
       deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
       logger: drainLogger,
     })

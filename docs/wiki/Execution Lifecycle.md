@@ -110,9 +110,9 @@ The lock config carries two staleness thresholds. The ordinary stale threshold g
 The lock result is a discriminated union with four outcomes:
 
 - **`acquired`** — This run holds the lock. The returned `lockEtag` is carried through to the cleanup phase for release.
-- **`held-by-other`** — Another surface (or another Action run) already holds the lock. The current run exits cleanly with code 0.
+- **`held-by-other`** — The lock is held, or it has expired but was held by a gateway surface (an expired gateway lease is not reclaimed without a workspace check, which the Action cannot make). The current run exits cleanly with code 0. An expired lease held by another Action run is reclaimed.
 - **`s3-disabled`** — S3 is not configured. Coordination is opt-in, so the run proceeds without a lock.
-- **`error`** — Lock acquisition failed unexpectedly. The run proceeds without a lock to preserve single-surface behavior. The 15-minute TTL on any orphaned lock from a prior crash allows recovery via stale-takeover on the next attempt.
+- **`error`** — Lock acquisition failed unexpectedly. The run proceeds without a lock to preserve single-surface behavior. An orphaned Action lock lapses after the 15-minute TTL and is reclaimed on a later attempt.
 
 The shared coordination layer (`packages/runtime/src/coordination/types.ts`) also names a run's lifecycle phases as a closed union — `PENDING`, `ACKNOWLEDGED`, `EXECUTING`, and the three **terminal phases** `COMPLETED`, `FAILED`, and `CANCELLED` (the last modeled as a `TerminalPhase` type so that gateway cancellation and the operator cancel route agree on one closed set instead of hand-writing the same literals). The Action harness itself does not expose these phases directly, but they are the vocabulary the [[Operator Web Control Surface]] and Discord gateway use for the runs that share this same per-repo lock.
 

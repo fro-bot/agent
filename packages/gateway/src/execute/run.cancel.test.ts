@@ -48,7 +48,7 @@ describe('operator cancel — abort-registry integration', () => {
 
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -150,7 +150,7 @@ describe('operator cancel — abort-registry integration', () => {
 
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -217,7 +217,7 @@ describe('operator cancel — abort-registry integration', () => {
 
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -310,7 +310,7 @@ describe('operator cancel — abort-registry integration', () => {
 
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -370,7 +370,7 @@ describe('operator cancel — abort-registry integration', () => {
     const {launchWork} = await import('./run.js')
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -436,7 +436,7 @@ describe('operator cancel — abort-registry integration', () => {
 
       mockRuntime.acquireLock.mockResolvedValue({
         success: true as const,
-        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+        data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
       })
       mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
       mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -511,7 +511,7 @@ describe('operator cancel — abort-registry integration', () => {
 
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -585,7 +585,7 @@ describe('operator cancel — abort-registry integration', () => {
     const executingState = buildMockRunState({phase: 'EXECUTING', run_id: 'cancel-fallback-parsefail-run-id'})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -655,7 +655,7 @@ describe('operator cancel — abort-registry integration', () => {
     const executingState = buildMockRunState({phase: 'EXECUTING', run_id: 'cancel-fallback-noadapter-run-id'})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -1011,7 +1011,7 @@ describe('operator cancel — abort-registry integration', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
-      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
     })
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     // ACK transition 412s.

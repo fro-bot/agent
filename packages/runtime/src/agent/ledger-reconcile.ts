@@ -302,12 +302,16 @@ export function createLedgerReconciler(options: CreateLedgerReconcilerOptions): 
  * this shape returns `Result` instead of throwing, that wrap needs no special
  * casing beyond what every other `*Effect` wrapper already does. The Action
  * consumes it directly, since it has no equivalent Effect boundary.
+ *
+ * `directory` is required: `session.status` is scoped to one directory instance and
+ * returns `{}` for a directory with no sessions, so it must be the directory the
+ * reconciled sessions run in. It is sent on `children` too, for the same scoping.
  */
-export function createSdkLedgerReconcileAdapter(client: SessionClient): LedgerReconcileAdapter {
+export function createSdkLedgerReconcileAdapter(client: SessionClient, directory: string): LedgerReconcileAdapter {
   return {
     children: async (parentSessionId: string): Promise<Result<readonly LedgerReconcileChild[], Error>> => {
       try {
-        const response = await client.session.children({path: {id: parentSessionId}})
+        const response = await client.session.children({path: {id: parentSessionId}, query: {directory}})
         if (response.error != null || response.data == null) {
           return err(toError(response.error ?? 'session.children returned no data'))
         }
@@ -322,7 +326,7 @@ export function createSdkLedgerReconcileAdapter(client: SessionClient): LedgerRe
 
     liveSessionIds: async (): Promise<Result<ReadonlySet<string>, Error>> => {
       try {
-        const response = await client.session.status()
+        const response = await client.session.status({query: {directory}})
         if (response.error != null || response.data == null) {
           return err(toError(response.error ?? 'session.status returned no data'))
         }

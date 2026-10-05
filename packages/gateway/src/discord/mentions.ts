@@ -158,7 +158,8 @@ export function handleMention(message: Message, botUserId: string, deps: Mention
 
       // ── Steps 4–12: Execution lifecycle ─────────────────────────────────
       // runMention owns: concurrency gate → ensure-clone → readyz → lock → run-state → execution.
-      // Passing the raw binding; runMention will override workspacePath with the ensured path.
+      // Passing the raw binding; the engine derives the canonical session directory from owner/repo and never
+      // uses the stored workspacePath as an OpenCode directory.
       await runMention(message, binding, runDeps)
     },
     catch: (error: unknown) => (error instanceof Error ? error : new Error(String(error))),

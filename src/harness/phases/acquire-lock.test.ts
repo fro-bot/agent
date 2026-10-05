@@ -76,7 +76,7 @@ describe('runAcquireLock', () => {
   it('returns acquired with etag on happy-path lock acquisition', async () => {
     // #given object store enabled and acquireLock returns success
     const storeConfig = createStoreConfig()
-    acquireLockMock.mockResolvedValue(lockOk({acquired: true, etag: '"etag-abc"', holder: null}))
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag-abc"', holder: null}))
 
     // #when running acquire-lock phase
     const result = await runAcquireLock({
@@ -104,7 +104,7 @@ describe('runAcquireLock', () => {
   it('passes holderId in action:{runId}:{runAttempt} format to acquireLock', async () => {
     // #given object store enabled and acquireLock returns success
     const storeConfig = createStoreConfig()
-    acquireLockMock.mockResolvedValue(lockOk({acquired: true, etag: '"etag"', holder: null}))
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
 
     // #when running acquire-lock phase
     await runAcquireLock({
@@ -126,6 +126,148 @@ describe('runAcquireLock', () => {
       'github',
       '99999',
       expect.any(Object),
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing
+      {reclaimableWithoutConfirmation: expect.any(Function)},
+    )
+  })
+
+  it('only treats github-surface holders as reclaimable without corroboration', async () => {
+    // #given
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    if (result.outcome === 'acquired') await result.renewal.stop()
+
+    // #when
+    const options = acquireLockMock.mock.calls[0]?.[6] as {
+      reclaimableWithoutConfirmation: (holder: LockRecord) => boolean
+      confirmExpiredHolder?: unknown
+    }
+
+    // #then — Action leases reclaimable; every gateway surface is not; no corroborator supplied
+    const actionHolder = {surface: 'github', holder_id: 'action:1234:1'} as const
+    expect(options.reclaimableWithoutConfirmation(createLockRecord(actionHolder))).toBe(true)
+    expect(options.reclaimableWithoutConfirmation(createLockRecord({...actionHolder, surface: 'discord'}))).toBe(false)
+    expect(options.reclaimableWithoutConfirmation(createLockRecord({...actionHolder, surface: 'web'}))).toBe(false)
+    expect(options.confirmExpiredHolder).toBeUndefined()
+  })
+
+  it.each([
+    'gateway:instance-1:run-99',
+    'action:1234',
+    'action:1234:x',
+    'action::1',
+    'action:1:2:3',
+    'discord-gateway',
+  ])('does not treat a github-surface holder with non-Action id %j as reclaimable', async holderId => {
+    // #given
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    if (result.outcome === 'acquired') await result.renewal.stop()
+    const options = acquireLockMock.mock.calls[0]?.[6] as {
+      reclaimableWithoutConfirmation: (holder: LockRecord) => boolean
+    }
+
+    // #when
+    const reclaimable = options.reclaimableWithoutConfirmation(
+      createLockRecord({surface: 'github', holder_id: holderId}),
+    )
+
+    // #then
+    expect(reclaimable).toBe(false)
+  })
+
+  it('skips an expired github-surface lease with a non-Action holder id as held-by-other, not reclaimed', async () => {
+    // #given — acquireLock applies the predicate and, since it rejects, reports expired-holder
+    const holder = createLockRecord({surface: 'github', holder_id: 'gateway:instance-1:run-99'})
+    acquireLockMock.mockResolvedValue(
+      lockOk({
+        acquired: false,
+        outcome: 'expired-holder',
+        etag: null,
+        holder,
+        confirmation: {kind: 'unknown', source: 'unavailable', directory: null, reason: 'no-corroborator'},
+      }),
+    )
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '5678',
+      runAttempt: 1,
+      logger: createMockLogger(),
+    })
+    const options = acquireLockMock.mock.calls[0]?.[6] as {
+      reclaimableWithoutConfirmation: (holder: LockRecord) => boolean
+    }
+
+    // #then
+    expect(options.reclaimableWithoutConfirmation(holder)).toBe(false)
+    expect(result).toEqual({outcome: 'held-by-other', holder})
+  })
+
+  it('skips an expired gateway-held lease as held-by-other with a distinct unconfirmed log', async () => {
+    // #given acquireLock reports an expired gateway lease it could not corroborate
+    const holder = createLockRecord({surface: 'discord'})
+    acquireLockMock.mockResolvedValue(
+      lockOk({
+        acquired: false,
+        outcome: 'expired-holder',
+        etag: null,
+        holder,
+        confirmation: {kind: 'unknown', source: 'unavailable', directory: null, reason: 'no-corroborator'},
+      }),
+    )
+    const logger = createMockLogger()
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '5678',
+      runAttempt: 1,
+      logger,
+    })
+
+    // #then
+    expect(result).toEqual({outcome: 'held-by-other', holder})
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining('settlement unconfirmed; skipped'),
+      expect.objectContaining({surface: 'discord'}),
+    )
+  })
+
+  it('logs an active lease as a coordination lease held', async () => {
+    // #given
+    const holder = createLockRecord({surface: 'discord'})
+    acquireLockMock.mockResolvedValue(lockOk({acquired: false, outcome: 'active-holder', etag: null, holder}))
+    const logger = createMockLogger()
+
+    // #when
+    await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '5678',
+      runAttempt: 1,
+      logger,
+    })
+
+    // #then
+    expect(logger.info).toHaveBeenCalledWith(
+      'lock-held-by-other-surface',
+      expect.objectContaining({reason: 'coordination lease held'}),
     )
   })
 
@@ -136,7 +278,7 @@ describe('runAcquireLock', () => {
       holder_id: 'gateway:instance-1:run-99',
       surface: 'discord',
     })
-    acquireLockMock.mockResolvedValue(lockOk({acquired: false, etag: null, holder}))
+    acquireLockMock.mockResolvedValue(lockOk({acquired: false, outcome: 'active-holder', etag: null, holder}))
 
     // #when running acquire-lock phase
     const result = await runAcquireLock({
@@ -158,7 +300,7 @@ describe('runAcquireLock', () => {
       holder_id: 'action:1234:1',
       surface: 'github',
     })
-    acquireLockMock.mockResolvedValue(lockOk({acquired: false, etag: null, holder}))
+    acquireLockMock.mockResolvedValue(lockOk({acquired: false, outcome: 'active-holder', etag: null, holder}))
 
     // #when running acquire-lock phase from a different Action run
     const result = await runAcquireLock({
@@ -176,7 +318,7 @@ describe('runAcquireLock', () => {
   it('returns held-by-other with null holder when stale-takeover race lost', async () => {
     // #given the lock was stale but another caller won the takeover write
     const storeConfig = createStoreConfig()
-    acquireLockMock.mockResolvedValue(lockOk({acquired: false, etag: null, holder: null}))
+    acquireLockMock.mockResolvedValue(lockOk({acquired: false, outcome: 'conflict', etag: null, holder: null}))
 
     // #when running acquire-lock phase
     const result = await runAcquireLock({
@@ -237,7 +379,9 @@ describe('runAcquireLock lease renewal (plan Unit 12)', () => {
     vi.clearAllMocks()
     vi.useFakeTimers()
     renewLeaseMock.mockResolvedValue(ok({etag: '"etag-renewed"'}))
-    acquireLockMock.mockResolvedValue(lockOk({acquired: true, etag: '"etag-initial"', holder: null}))
+    acquireLockMock.mockResolvedValue(
+      lockOk({acquired: true, outcome: 'acquired', etag: '"etag-initial"', holder: null}),
+    )
   })
 
   afterEach(() => {

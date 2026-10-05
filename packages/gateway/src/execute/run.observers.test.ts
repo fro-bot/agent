@@ -47,7 +47,7 @@ describe('runMention', () => {
       mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
       mockRuntime.acquireLock.mockResolvedValue({
         success: true as const,
-        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+        data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
       })
       mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
       mockRuntime.transitionRun
@@ -92,7 +92,7 @@ describe('runMention', () => {
 
       mockRuntime.acquireLock.mockResolvedValue({
         success: true as const,
-        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+        data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
       })
       mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
       mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})

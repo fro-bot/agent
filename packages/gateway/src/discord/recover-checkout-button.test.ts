@@ -118,6 +118,7 @@ function makeDeps(): FroBotDeps {
     gatewayLogger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     coordinationConfig: {} as CoordinationConfig,
     identity: 'discord-gateway',
+    checkRepoQuiescence: vi.fn(),
     forceReleaseStaleLock: vi.fn(),
     dispatchWorkflow: vi.fn<DispatchWorkflow>(),
   }
