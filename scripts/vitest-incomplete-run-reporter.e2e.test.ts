@@ -60,6 +60,17 @@ describe('incomplete-run reporter (worker crash end-to-end)', () => {
     expect(output).not.toContain('Vitest run incomplete')
   })
 
+  it('passes with no report when a -t name filter excludes a runnable test in the same file', () => {
+    // #given the healthy file has two runnable passing tests and the filter selects only one of them
+    // #when Vitest runs it with a test-name filter (the crash fixtures are not targeted)
+    const {status, output} = runFixtureVitest(['healthy.fixture.ts', '-t', 'healthy-second-test'])
+
+    // #then filtered-out tests are skipped work, not lost work: exit 0 and no report
+    expect(status).toBe(0)
+    expect(output).toContain('1 passed')
+    expect(output).not.toContain('Vitest run incomplete')
+  })
+
   it('is additive: a --reporter override still gets the incomplete-run report', () => {
     // #given the user swaps the primary reporter on the command line
     // #when the crashing fixtures run
