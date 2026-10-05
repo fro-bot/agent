@@ -83,6 +83,7 @@ export default defineConfig(
           devDependencies: [
             '**/*.test.ts',
             '**/*.spec.ts',
+            '**/*.fixture.ts',
             '**/test-helpers.ts',
             '**/__fixtures__/**',
             '**/*.config.ts',
