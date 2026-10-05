@@ -36,7 +36,7 @@ fro-bot/agent/
 │   │       ├── discord/        # Discord client, mentions, commands, streaming
 │   │       ├── github/         # GitHub App client, Actions workflow-dispatch adapter
 │   │       ├── execute/        # run-core, queue, concurrency, recovery, checkout provenance
-│   │       ├── web/            # Operator HTTP routes, SSE, audit
+│   │       ├── web/            # Operator HTTP routes, auth, ingress trust, SSE, audit
 │   │       ├── workspace-api/  # Workspace API surface
 │   │       ├── approvals/      # Approval gate
 │   │       ├── operator-contract/ # Operator contract types
@@ -92,7 +92,7 @@ fro-bot/agent/
 - **`src/harness/`** — Entry points and phase orchestration; the only layer allowed to compose across all others.
 - **`apps/action/`** — Thin workspace package whose sole purpose is re-exporting `src/main.ts` and `src/post.ts`; its build produces the committed root `dist/`.
 - **`apps/workspace-agent/`** — Hono HTTP service that runs inside the workspace container (clone setup with staged root→agent ownership handoff, read-only `POST /inspect` checkout observation, `POST /update` checkout fast-forward, `POST /recover/preview`+`/recover` quarantine-and-replace, `GET`/`DELETE /backups` generations, bearer-gated control API, per-repo mutex and journal store, checkout-update git primitives, supervised unprivileged OpenCode); touch when adding workspace-side API endpoints. Serialize every mutating repo operation through `src/repo-mutex.ts` (also the sticky, restart-only maintenance hold) and record in-flight update/recovery state in `src/journal.ts`; real-git adversarial fixtures live in `src/update-fixtures/`. Import uid/gid/path constants from `src/identity.ts` (mirrored in `deploy/workspace.Dockerfile`) and run any git against an existing checkout through `src/git-safety.ts` as the agent uid — never as the root service. Checkout size/entry counts go through `src/agent-walk.ts`'s agent-uid or sealed-fd walker, never a root-owned path lookup. Checkout types in `src/types.ts` are mirrored in `packages/gateway/src/workspace-api/types.ts` and pinned by `scripts/checkout-types-drift-guard.test.ts` — change both sides together.
-- **`packages/gateway/`** — Discord-first daemon and operator web surface; the largest package, containing the mention loop, command handlers, approval gate, and redaction pipeline.
+- **`packages/gateway/`** — Discord-first daemon and operator web surface; the largest package, containing the mention loop, command handlers, approval gate, redaction pipeline, and the `web/ingress/` trusted-proxy client-address resolver that keys the unauthenticated operator-surface rate limits and OAuth bindings.
 - **`packages/harness/`** — Patched-OpenCode build and publish pipeline; touch when updating the bundled OpenCode binary.
 - **`packages/runtime/`** — Shared runtime primitives consumed by both `src/` and `packages/gateway/`; owns the authoritative version-pin constants.
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
@@ -159,6 +159,7 @@ Use this decision tree to find the right home for new code:
 
 - **New Action phase, trigger handler, comment handler, or reviewer** → `src/features/<capability>/` (e.g. `src/features/triggers/`, `src/features/comments/`); wire it into `src/harness/phases/` or `src/features/triggers/router.ts`.
 - **New Discord command** → `packages/gateway/src/discord/commands/`; register it in the commands index.
+- **New operator web route** → `packages/gateway/src/web/`; register through `registerOperatorRoute`/`registerPublicRoute` (`packages/gateway/src/web/operator-route.ts`) and derive any unauthenticated client key from `resolveClient` (`packages/gateway/src/web/ingress/resolve-client.ts`) — never read an address header directly and never fall back to a shared key.
 - **New bundled CLI tool or version-pinned binary** (Bun, oMo, OpenCode, Systematic) → add a versioned-tool entry in `src/services/setup/` following the existing adapter pattern; pin the version constant in `packages/runtime/src/shared/constants.ts`.
 - **New workspace API endpoint** → `apps/workspace-agent/src/`; add the route to the Hono server (`createApp` in `apps/workspace-agent/src/server.ts` — it inherits the bearer check unless it is a probe) and call it from `packages/gateway/src/workspace-api/client.ts` with the bearer header. A route that mutates a repository's checkout, bare mirror, or quarantine tree must run inside `withRepoLock` (`src/repo-mutex.ts`) and journal its in-flight phase (`src/journal.ts`) before mutating — see `apps/workspace-agent/AGENTS.md`.
 - **Shared primitive used by both Action and gateway** → `packages/runtime/src/`; export from its `index.ts`.
