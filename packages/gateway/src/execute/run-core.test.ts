@@ -3537,6 +3537,43 @@ describe('runOpenCodeCore', () => {
       await runPromise
     })
 
+    it('the periodic reconciler is scoped to the run directory: a child busy in that directory stays outstanding', async () => {
+      // #given — `session.status` is scoped per directory: it reports CHILD busy only for the
+      // directory the run's sessions live in, and `{}` (200) for any other.
+      vi.useFakeTimers()
+      const directory = '/repos/myrepo'
+      let childBusy = true
+      const coordinator = makeCoordinator()
+      const ownershipLedger = createOwnershipLedger()
+      const {stream, emitNext} = makeControlledStream()
+      const sessionChildren = vi.fn().mockResolvedValue({data: [{id: CHILD}], error: null})
+      const sessionStatus = vi.fn().mockImplementation(async (args?: {query?: {directory?: string}}) => ({
+        data: childBusy && args?.query?.directory === directory ? {[CHILD]: {type: 'busy'}} : {},
+        error: null,
+      }))
+      const handle = makeHandle({subscribe: async () => Promise.resolve({stream}), sessionChildren, sessionStatus})
+      const params = {...buildParams(handle, {directory}), coordinator, ownershipLedger}
+      const runPromise = runOpenCodeCore(params)
+
+      emitNext(backgroundTaskCompletedEvent(CHILD))
+      await vi.advanceTimersByTimeAsync(0)
+
+      // #when — the reconciler's interval fires while CHILD is still busy
+      await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
+
+      // #then — both upstream calls carried the run's directory, so CHILD is not settled early
+      expect(sessionChildren).toHaveBeenCalledWith({path: {id: 'sess-123'}, query: {directory}})
+      expect(sessionStatus).toHaveBeenCalledWith({query: {directory}})
+      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('outstanding')
+
+      // Cleanup: CHILD genuinely stops; the next pass settles it and root idle completes the run.
+      childBusy = false
+      await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
+      expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
+      emitNext(sessionIdleEvent('sess-123'))
+      await runPromise
+    })
+
     it("the Action's use of the reconciliation primitive is unaffected by the gateway's adoption callback (no coordinator exists there)", async () => {
       // #given — `reconcileLedgerOnce` invoked directly against a bare (unwrapped)
       // ownership ledger, exactly as `src/harness/phases/execute.ts` (the Action) does —

@@ -1,10 +1,16 @@
+import type {SessionClient} from '../session/backend.js'
 import type {Logger} from '../shared/logger.js'
 import type {LedgerReconcileAdapter} from './ledger-reconcile.js'
 
 import {err, ok} from '@bfra.me/es/result'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {createLedgerReconciler, DEFAULT_LEDGER_RECONCILE_INTERVAL_MS, reconcileLedgerOnce} from './ledger-reconcile.js'
+import {
+  createLedgerReconciler,
+  createSdkLedgerReconcileAdapter,
+  DEFAULT_LEDGER_RECONCILE_INTERVAL_MS,
+  reconcileLedgerOnce,
+} from './ledger-reconcile.js'
 import {createOwnershipLedger} from './ownership-ledger.js'
 
 const PARENT_SESSION_ID = 'parent-session'
@@ -25,6 +31,66 @@ function makeAdapter(overrides: Partial<LedgerReconcileAdapter> = {}): LedgerRec
     ...overrides,
   }
 }
+
+describe('createSdkLedgerReconcileAdapter', () => {
+  const WORKSPACE = '/workspace/repos/owner/repo'
+
+  // `session.status` is scoped per directory instance: it reports the child busy only for the
+  // directory it runs in and returns an empty 200 `{}` for any other (including no directory).
+  function makeScopedClient(childId: string) {
+    const childrenCalls: unknown[] = []
+    const statusCalls: unknown[] = []
+    const client = {
+      session: {
+        children: async (args: unknown) => {
+          childrenCalls.push(args)
+          return {data: [{id: childId}], error: undefined}
+        },
+        status: async (args?: {query?: {directory?: string}}) => {
+          statusCalls.push(args)
+          return {data: args?.query?.directory === WORKSPACE ? {[childId]: {type: 'busy'}} : {}, error: undefined}
+        },
+      },
+    } as unknown as SessionClient
+    return {client, childrenCalls, statusCalls}
+  }
+
+  it('keeps a busy child outstanding when scoped to the directory the session runs in', async () => {
+    // #given — a child that is busy only under the run's directory
+    const {client, childrenCalls, statusCalls} = makeScopedClient('child-1')
+    const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'background task')
+    const adapter = createSdkLedgerReconcileAdapter(client, WORKSPACE)
+
+    // #when
+    const result = await reconcileLedgerOnce({
+      ledger,
+      adapter,
+      parentSessionId: PARENT_SESSION_ID,
+      logger: makeLogger(),
+    })
+
+    // #then — the child is not settled, and both upstream calls carried the directory
+    expect(result.success).toBe(true)
+    expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'background task', state: 'outstanding'}])
+    expect(childrenCalls).toEqual([{path: {id: PARENT_SESSION_ID}, query: {directory: WORKSPACE}}])
+    expect(statusCalls).toEqual([{query: {directory: WORKSPACE}}])
+  })
+
+  it('settles the child when reconciled against a directory with no live sessions', async () => {
+    // #given — same client, but the adapter is scoped to a different directory
+    const {client} = makeScopedClient('child-1')
+    const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'background task')
+    const adapter = createSdkLedgerReconcileAdapter(client, '/some/other/dir')
+
+    // #when
+    await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
+
+    // #then — documents why the directory matters: an empty live set settles the child
+    expect(ledger.snapshot()[0]?.state).toBe('settled')
+  })
+})
 
 describe('reconcileLedgerOnce', () => {
   it('regression guard: a live foreground child of this parent, never tracked by the ledger, is NOT adopted', async () => {

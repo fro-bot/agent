@@ -68,6 +68,10 @@ export interface RecoverStaleRunsDeps {
    * This is how a startup reconciliation pass asks the server what is still
    * alive before trusting anything persisted about a stale EXECUTING run.
    *
+   * The adapter must be built for that repo's workspace directory
+   * (`createSdkLedgerReconcileAdapter(client, directory)`): session status is
+   * per-directory, so an adapter scoped elsewhere reports every child as gone.
+   *
    * Optional and omitted by callers that have not wired workspace-server
    * access into recovery yet. When omitted (or when it throws, or resolves to
    * `null`), any run with persisted ownership to reconcile is treated as
