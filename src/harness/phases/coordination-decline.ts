@@ -5,6 +5,7 @@ import type {Logger} from '../../shared/logger.js'
 import * as core from '@actions/core'
 import {addLabelsToIssue, ensureLabelExists} from '../../services/github/api.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {escapeSummaryText as cell} from '../../shared/summary-escape.js'
 import {parseActionHolderRunId} from './acquire-lock.js'
 
 export const BLOCKED_LABEL = 'agent: blocked' as const
@@ -29,15 +30,6 @@ function resolveLabelTarget(context: TriggerContext): number | null {
   const target = context.target
   if (target == null) return null
   return target.kind === 'issue' || target.kind === 'pr' ? target.number : null
-}
-
-function escapeHtml(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')
-}
-
-/** Escapes untrusted text for a job-summary table cell, which is emitted as raw HTML. */
-function cell(value: string): string {
-  return escapeHtml(value).replaceAll('|', '&#124;').replaceAll('`', '&#96;').replaceAll('\n', ' ')
 }
 
 function describeReason(reason: CoordinationDeclineReason, holder: LockRecord | null): string {

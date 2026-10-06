@@ -7,6 +7,7 @@ import type {
 import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
 import type {AttachmentResult} from '../features/attachments/index.js'
+import type {InvocationSkipDetail} from '../features/observability/index.js'
 import type {TriggerContext} from '../features/triggers/types.js'
 import type {DeduplicationEntity} from '../services/cache/dedup.js'
 import type {Octokit} from '../services/github/types.js'
@@ -97,6 +98,8 @@ export async function run(): Promise<number> {
   // routing found no matching trigger, dedup suppressed a repeat, or the coordination lock
   // was contended (`return 0`, but nothing was attempted -- not the same as delivered).
   let deliveryOutcome: 'pending' | 'failed' | 'skipped' = 'pending'
+  // Why routing declined the event; stays null for the dedup and lock-contention skips, which have no routing reason.
+  let skipDetail: InvocationSkipDetail | null = null
 
   const createUnavailableOutputModeMigration = (): OutputModeMigrationState => ({
     requested: requestedOutputModeState,
@@ -136,8 +139,9 @@ export async function run(): Promise<number> {
     sessionRetention = bootstrap.inputs.sessionRetention
 
     const routing = await runRouting(bootstrap, startTime)
-    if (routing == null) {
+    if ('skipped' in routing) {
       deliveryOutcome = 'skipped'
+      skipDetail = {reason: routing.skipReason, message: routing.skipMessage}
       setUnavailableActionOutputs(Date.now() - startTime)
       return 0
     }
@@ -434,7 +438,7 @@ export async function run(): Promise<number> {
     }
 
     setInvocationOutcomeOutput(finalOutcome)
-    await writeInvocationOutcomeSummary(finalOutcome, finalIncompleteReasons, bootstrapLogger)
+    await writeInvocationOutcomeSummary(finalOutcome, finalIncompleteReasons, bootstrapLogger, skipDetail ?? undefined)
   }
 
   return exitCode
