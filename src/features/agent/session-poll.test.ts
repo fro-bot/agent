@@ -25,7 +25,9 @@ import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {reduceAttemptOutcome} from './attempt-outcome.js'
+import {createExecutionDeadline} from './retry.js'
 import {
+  EXECUTE_LEDGER_RECONCILE_INTERVAL_MS,
   INITIAL_ACTIVITY_TIMEOUT_MS,
   pollForSessionCompletion,
   pollForSessionCompletionObservation,
@@ -3098,5 +3100,518 @@ describe('adopted background child through the SSE-to-poll path', () => {
     // #then completion is admitted and the barrier is resolved
     expect(observation.settlement.kind).toBe('completion-observed')
     expect(rootFreshness.pendingParentMessageId).toBeNull()
+  })
+})
+
+/**
+ * An adopted child whose injected notice never reached the SSE stream, while a stable final root
+ * reply answering the pending injected turn is already stored and the root is absent from the
+ * non-idle status map (upstream's idle representation).
+ */
+function missedNoticeScenario(options: {
+  readonly children: ReturnType<typeof vi.fn>
+  readonly liveStatuses?: Record<string, {type: string}>
+}) {
+  const ledger = createOwnershipLedger()
+  ledger.adopt('ses_child', 'background task')
+  const rootFreshness = createRootFreshnessTracker()
+  armRootFreshness(rootFreshness)
+  registerPendingRootUserMessage(rootFreshness, 'msg_injected')
+  const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+  const messages = vi.fn().mockResolvedValue({
+    data: [
+      {info: {id: 'msg_reply', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_injected'}},
+    ],
+  })
+  const status = vi.fn().mockResolvedValue({data: options.liveStatuses ?? {}})
+  const client = {session: {messages, status, children: options.children}} as unknown as MockClient
+  return {ledger, rootFreshness, activityTracker, client}
+}
+
+/**
+ * Starts the poll without awaiting it. A rejected poll is captured and rethrown from `result()`, so
+ * every assertion that reads the outcome fails if the poll itself threw.
+ */
+function startPoll(
+  scenario: ReturnType<typeof missedNoticeScenario>,
+  deadline: ReturnType<typeof createExecutionDeadline>,
+  logger: Logger,
+  signal: AbortSignal = new AbortController().signal,
+): {readonly result: () => AttemptObservation | null} {
+  let result: AttemptObservation | null = null
+  let failure: Error | null = null
+  pollForSessionCompletionObservation(
+    scenario.client,
+    'ses_123',
+    '/workspace',
+    AbortSignal.any([signal, deadline.signal]),
+    logger,
+    30_000,
+    scenario.activityTracker,
+    deadline,
+    scenario.ledger,
+  ).then(
+    observation => {
+      result = observation
+    },
+    (error: unknown) => {
+      failure = error instanceof Error ? error : new Error(String(error))
+    },
+  )
+  return {
+    result: () => {
+      if (failure != null) throw failure
+      return result
+    },
+  }
+}
+
+describe('execute-phase ledger reconciliation for a missed background-task completion notice', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('admits completion before the deadline once reconciliation finds the child no longer live under the parent', async () => {
+    // #given an adopted child, a dropped notice, and the child reported as a non-live child of the parent
+    const children = vi.fn().mockResolvedValue({data: [{id: 'ses_child'}]})
+    const scenario = missedNoticeScenario({children})
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when the poll runs past one reconcile interval, well inside the deadline
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 3_000)
+    deadline.dispose()
+
+    // #then the child is settled via the directory-scoped reconcile and completion was admitted
+    expect(poll.result()?.settlement.kind).toBe('completion-observed')
+    expect(children).toHaveBeenCalledWith({path: {id: 'ses_123'}, query: {directory: '/workspace'}})
+    expect(scenario.ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'settled'}])
+    expect(deadline.isExpired()).toBe(false)
+    expect(scenario.rootFreshness.pendingParentMessageId).toBeNull()
+  })
+
+  it('stays deferred while reconciliation reports the child still live, and rate-limits the passes', async () => {
+    // #given a child that is still live under the parent
+    const children = vi.fn().mockResolvedValue({data: [{id: 'ses_child'}]})
+    const scenario = missedNoticeScenario({children, liveStatuses: {ses_child: {type: 'busy'}}})
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when the poll runs for 35s (70 poll ticks)
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(35_000)
+
+    // #then completion is not admitted, the entry is still outstanding, and reconciliation ran once per interval
+    expect(poll.result()).toBeNull()
+    expect(scenario.ledger.outstanding()).toBe(1)
+    expect(children).toHaveBeenCalledTimes(3)
+    deadline.dispose()
+    await vi.advanceTimersByTimeAsync(0)
+  })
+
+  it('waits one interval before the first reconciliation so the SSE notice can settle the entry itself', async () => {
+    // #given an otherwise-qualified completion deferred only by the ledger
+    const children = vi.fn().mockResolvedValue({data: [{id: 'ses_child'}]})
+    const scenario = missedNoticeScenario({children})
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when less than one interval has elapsed
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS - 2_000)
+
+    // #then no reconciliation has run and completion is still deferred
+    expect(children).not.toHaveBeenCalled()
+    expect(poll.result()).toBeNull()
+    deadline.dispose()
+  })
+
+  it('leaves the entry unknown and completion deferred when the adapter throws', async () => {
+    // #given an adapter whose observation fails
+    const children = vi.fn().mockRejectedValue(new Error('boom'))
+    const scenario = missedNoticeScenario({children})
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when the poll runs past several reconcile intervals
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(35_000)
+
+    // #then the entry is unknown (never settled) and completion is not admitted
+    expect(children).toHaveBeenCalled()
+    expect(scenario.ledger.snapshot()[0]?.state).toBe('unknown')
+    expect(poll.result()).toBeNull()
+    deadline.dispose()
+  })
+
+  it('bounds a hanging adapter by the remaining execution deadline and never settles on it', async () => {
+    // #given an adapter that never answers and a deadline that expires 1s after the first reconcile starts
+    const children = vi.fn().mockReturnValue(new Promise(() => {}))
+    const scenario = missedNoticeScenario({children})
+    const deadline = createExecutionDeadline(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 2_000, mockLogger)
+
+    // #when the poll runs past the deadline
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 3_000)
+
+    // #then the wait ended at the deadline instead of hanging, and the entry was not settled
+    expect(children).toHaveBeenCalledTimes(1)
+    expect(poll.result()?.settlement.kind).toBe('deadline')
+    expect(scenario.ledger.outstanding()).toBe(1)
+  })
+
+  it('does not admit evidence gathered before a reconcile await that renewed root activity', async () => {
+    // #given a reconcile that settles the child but, while awaiting, root activity arrives: a new
+    // injected root user turn the stored reply does not answer
+    const scenarioRef: {current?: ReturnType<typeof missedNoticeScenario>} = {}
+    const children = vi.fn().mockImplementation(async () => {
+      if (scenarioRef.current != null) registerPendingRootUserMessage(scenarioRef.current.rootFreshness, 'msg_new')
+      return {data: [{id: 'ses_child'}]}
+    })
+    const scenario = missedNoticeScenario({children})
+    scenarioRef.current = scenario
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+    const controller = new AbortController()
+
+    // #when the poll runs well past the reconcile
+    const poll = startPoll(scenario, deadline, mockLogger, controller.signal)
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #then the child settled, but the stale reply is not admitted for the renewed generation
+    expect(scenario.ledger.outstanding()).toBe(0)
+    expect(scenario.rootFreshness.pendingParentMessageId).toBe('msg_new')
+    expect(poll.result()).toBeNull()
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(poll.result()?.settlement.kind).toBe('cancelled')
+    deadline.dispose()
+  })
+
+  it('defers when REST shows an injected root user turn whose SSE event was missed, until its own reply appears', async () => {
+    // #given a child adopted over SSE, with neither its completion notice nor the injected root user
+    // message delivered: no pending-parent barrier exists on the tracker
+    const ledger = createOwnershipLedger()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+    await processEventStream(
+      (async function* () {
+        yield {
+          type: 'message.part.updated',
+          properties: {
+            sessionID: 'ses_123',
+            part: {
+              type: 'tool',
+              tool: 'task',
+              state: {status: 'completed', title: 'do the thing', metadata: {background: true, jobId: 'ses_child'}},
+            },
+          },
+        } as unknown as Event
+      })(),
+      'ses_123',
+      new AbortController().signal,
+      mockLogger,
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+    expect(ledger.snapshot()).toHaveLength(1)
+    expect(ledger.isDrainComplete()).toBe(false)
+    expect(rootFreshness.pendingParentMessageId).toBeNull()
+
+    // #given REST holds only the original turn and its qualified reply, so completion defers on the
+    // ledger; the injected user turn (no reply yet) lands in REST while the reconcile awaits, and the
+    // reconcile finds the child a non-live child of the parent
+    const originalTurn = {info: {id: 'msg_user', role: 'user'}}
+    const oldReply = {
+      info: {id: 'msg_old_reply', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_user'},
+    }
+    const injectedTurn = {info: {id: 'msg_injected', role: 'user'}}
+    const messages = vi.fn().mockResolvedValue({data: [originalTurn, oldReply]})
+    const children = vi.fn().mockImplementation(async () => {
+      messages.mockResolvedValue({data: [originalTurn, oldReply, injectedTurn]})
+      return {data: [{id: 'ses_child'}]}
+    })
+    const status = vi.fn().mockResolvedValue({data: {}})
+    const client = {session: {messages, status, children}} as unknown as MockClient
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when reconciliation settles the child and polling continues
+    const poll = startPoll({client, activityTracker, ledger, rootFreshness}, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 10_000)
+    expect(children).toHaveBeenCalledTimes(1)
+
+    // #then the child is settled but the reply to the earlier turn is not admitted; the injected turn is pending
+    expect(ledger.isDrainComplete()).toBe(true)
+    expect(poll.result()).toBeNull()
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_injected')
+
+    // #when the reply to the injected turn appears
+    messages.mockResolvedValue({
+      data: [
+        originalTurn,
+        oldReply,
+        injectedTurn,
+        {
+          info: {
+            id: 'msg_new_reply',
+            role: 'assistant',
+            time: {completed: 3},
+            finish: 'stop',
+            parentID: 'msg_injected',
+          },
+        },
+      ],
+    })
+    await vi.advanceTimersByTimeAsync(3_000)
+    deadline.dispose()
+
+    // #then completion is admitted and the barrier is resolved
+    expect(poll.result()?.settlement.kind).toBe('completion-observed')
+    expect(rootFreshness.pendingParentMessageId).toBeNull()
+  })
+
+  it('does not mutate the ledger from a reconcile that finishes after its timeout, and does not admit completion from it', async () => {
+    // #given a children lookup that answers only after the reconcile's own bound has elapsed
+    let resolveChildren: ((value: unknown) => void) | undefined
+    const children = vi.fn().mockReturnValueOnce(
+      new Promise(resolve => {
+        resolveChildren = resolve
+      }),
+    )
+    const scenario = missedNoticeScenario({children})
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when the first pass starts, loses the race to its 5s bound, and only then resolves with the child
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 6_000)
+    expect(children).toHaveBeenCalledTimes(1)
+    resolveChildren?.({data: [{id: 'ses_child'}]})
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then the late result did not settle the live entry and completion was not admitted from it
+    expect(scenario.ledger.snapshot()).toEqual([
+      {sessionId: 'ses_child', label: 'background task', state: 'outstanding'},
+    ])
+    expect(poll.result()).toBeNull()
+    deadline.dispose()
+  })
+
+  it('does not downgrade the ledger from a reconcile that fails after its timeout', async () => {
+    // #given a children lookup that rejects only after the reconcile's own bound has elapsed
+    let rejectChildren: ((reason: Error) => void) | undefined
+    const children = vi.fn().mockReturnValueOnce(
+      new Promise((_, reject) => {
+        rejectChildren = reject
+      }),
+    )
+    const scenario = missedNoticeScenario({children})
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when the pass loses the race and then fails
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 6_000)
+    rejectChildren?.(new Error('late failure'))
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then the entry was not marked unknown by the late failure
+    expect(scenario.ledger.snapshot()[0]?.state).toBe('outstanding')
+    expect(poll.result()).toBeNull()
+    deadline.dispose()
+  })
+
+  it('does not mutate the ledger from a reconcile that finishes after the execution deadline capped it', async () => {
+    // #given a deadline that expires 2s into the first reconcile, and a children lookup answering after it
+    let resolveChildren: ((value: unknown) => void) | undefined
+    const children = vi.fn().mockReturnValueOnce(
+      new Promise(resolve => {
+        resolveChildren = resolve
+      }),
+    )
+    const scenario = missedNoticeScenario({children})
+    const deadline = createExecutionDeadline(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 2_000, mockLogger)
+
+    // #when the deadline ends the wait, and the late result then arrives
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 3_000)
+    expect(poll.result()?.settlement.kind).toBe('deadline')
+    resolveChildren?.({data: [{id: 'ses_child'}]})
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then the ledger is unchanged by the late result
+    expect(scenario.ledger.snapshot()).toEqual([
+      {sessionId: 'ses_child', label: 'background task', state: 'outstanding'},
+    ])
+    deadline.dispose()
+  })
+
+  it('does not admit a stale SSE idle candidate after a reconcile await during which an injected root user turn landed', async () => {
+    // #given an old root idle candidate (SSE) held back only by the ledger, with REST holding the
+    // original turn and its reply
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    markRootIdleCandidate(rootFreshness)
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+    const originalTurn = {info: {id: 'msg_user', role: 'user'}}
+    const oldReply = {
+      info: {id: 'msg_old_reply', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_user'},
+    }
+    const injectedTurn = {info: {id: 'msg_injected', role: 'user'}}
+    const messages = vi.fn().mockResolvedValue({data: [originalTurn, oldReply]})
+    // the injected turn (never delivered over SSE) lands in REST while the reconcile awaits, which settles the child
+    const children = vi.fn().mockImplementation(async () => {
+      messages.mockResolvedValue({data: [originalTurn, oldReply, injectedTurn]})
+      return {data: [{id: 'ses_child'}]}
+    })
+    const status = vi.fn().mockResolvedValue({data: {}})
+    const client = {session: {messages, status, children}} as unknown as MockClient
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when reconciliation settles the child and polling continues
+    const poll = startPoll({client, activityTracker, ledger, rootFreshness}, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 5_000)
+    expect(children).toHaveBeenCalledTimes(1)
+
+    // #then the child is settled, but completion stays deferred on the unanswered injected turn
+    expect(ledger.isDrainComplete()).toBe(true)
+    expect(poll.result()).toBeNull()
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_injected')
+
+    // #when the injected turn's reply appears
+    messages.mockResolvedValue({
+      data: [
+        originalTurn,
+        oldReply,
+        injectedTurn,
+        {
+          info: {
+            id: 'msg_new_reply',
+            role: 'assistant',
+            time: {completed: 3},
+            finish: 'stop',
+            parentID: 'msg_injected',
+          },
+        },
+      ],
+    })
+    await vi.advanceTimersByTimeAsync(3_000)
+    deadline.dispose()
+
+    // #then completion is admitted
+    expect(poll.result()?.settlement.kind).toBe('completion-observed')
+    expect(rootFreshness.pendingParentMessageId).toBeNull()
+  })
+
+  it('does not overwrite a live unknown with a staged settle when the entry changed during the pass', async () => {
+    // #given an outstanding child, and a reconcile that finds it non-live, while the live entry is
+    // marked unknown mid-pass (descendant session.error / SSE discontinuity)
+    const scenarioRef: {current?: ReturnType<typeof missedNoticeScenario>} = {}
+    const children = vi.fn().mockImplementationOnce(async () => {
+      scenarioRef.current?.ledger.markUnknown('ses_child')
+      return {data: [{id: 'ses_child'}]}
+    })
+    const scenario = missedNoticeScenario({children})
+    scenarioRef.current = scenario
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when the in-bound pass finishes and commits
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 3_000)
+    expect(children).toHaveBeenCalledTimes(1)
+
+    // #then the live unknown survives and completion stays deferred
+    expect(scenario.ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'unknown'}])
+    expect(poll.result()).toBeNull()
+    deadline.dispose()
+  })
+
+  it('does not admit REST idle for an old candidate while a missed injected turn has only an unfinished reply', async () => {
+    // #given an old idle candidate, a settled ledger, revalidation required, and REST holding an
+    // injected root user turn (never seen over SSE) whose reply is still unfinished; status reads idle
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'background task')
+    ledger.settle('ses_child')
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    markRootIdleCandidate(rootFreshness)
+    requireRootRevalidation(rootFreshness)
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+    const originalTurn = {info: {id: 'msg_user', role: 'user'}}
+    const oldReply = {
+      info: {id: 'msg_old_reply', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_user'},
+    }
+    const injectedTurn = {info: {id: 'msg_injected', role: 'user'}}
+    const unfinishedReply = {info: {id: 'msg_new_reply', role: 'assistant', parentID: 'msg_injected'}}
+    const messages = vi.fn().mockResolvedValue({data: [originalTurn, oldReply, injectedTurn, unfinishedReply]})
+    const status = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const client = {session: {messages, status, children: vi.fn()}} as unknown as MockClient
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when polled across several ticks
+    const poll = startPoll({client, activityTracker, ledger, rootFreshness}, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then completion is not admitted and the injected turn is the pending barrier
+    expect(poll.result()).toBeNull()
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_injected')
+
+    // #when the reply completes with a qualifying finish
+    messages.mockResolvedValue({
+      data: [
+        originalTurn,
+        oldReply,
+        injectedTurn,
+        {info: {...unfinishedReply.info, time: {completed: 4}, finish: 'stop'}},
+      ],
+    })
+    await vi.advanceTimersByTimeAsync(3_000)
+    deadline.dispose()
+
+    // #then completion is admitted and the barrier is resolved
+    expect(poll.result()?.settlement.kind).toBe('completion-observed')
+    expect(rootFreshness.pendingParentMessageId).toBeNull()
+  })
+
+  it('does not reconcile while the ledger has entries but no completion evidence is otherwise qualified', async () => {
+    // #given an outstanding entry and a root with no idle evidence and no stored reply
+    const children = vi.fn().mockResolvedValue({data: [{id: 'ses_child'}]})
+    const scenario = missedNoticeScenario({children})
+    scenario.client.session.messages = vi.fn().mockResolvedValue({data: []})
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when the poll runs well past several reconcile intervals
+    const poll = startPoll(scenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS * 3)
+
+    // #then the adapter is never called and the entry is untouched
+    expect(children).not.toHaveBeenCalled()
+    expect(scenario.ledger.outstanding()).toBe(1)
+    expect(poll.result()).toBeNull()
+    deadline.dispose()
+  })
+
+  it('never calls the adapter when the ledger is empty', async () => {
+    // #given an empty ledger and otherwise-qualified completion evidence
+    const children = vi.fn().mockResolvedValue({data: []})
+    const scenario = missedNoticeScenario({children})
+    scenario.ledger.settle('ses_child')
+    const emptyLedgerScenario = {...scenario, ledger: createOwnershipLedger()}
+    const deadline = createExecutionDeadline(120_000, mockLogger)
+
+    // #when polled
+    const poll = startPoll(emptyLedgerScenario, deadline, mockLogger)
+    await vi.advanceTimersByTimeAsync(EXECUTE_LEDGER_RECONCILE_INTERVAL_MS + 3_000)
+    deadline.dispose()
+
+    // #then completion is admitted without any reconciliation call
+    expect(poll.result()?.settlement.kind).toBe('completion-observed')
+    expect(children).not.toHaveBeenCalled()
   })
 })
