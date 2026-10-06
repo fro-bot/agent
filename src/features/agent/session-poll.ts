@@ -1,4 +1,4 @@
-import type {ClassificationPath, ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
+import type {ClassificationPath, ErrorInfo, OwnershipEntryState, OwnershipLedger, SessionClient} from '@fro-bot/runtime'
 import type {createOpencode} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 /**
@@ -17,8 +17,11 @@ import {
   createAgentError,
   createErrorInfo,
   createLLMFetchError,
+  createOwnershipLedger,
   createRetryableApiError,
+  createSdkLedgerReconcileAdapter,
   isLlmFetchError,
+  reconcileLedgerOnce,
 } from '@fro-bot/runtime'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
@@ -30,6 +33,8 @@ import {
   invalidateRootFreshness,
   mergeActivityError,
   normalizeSessionError,
+  registerPendingRootUserMessage,
+  requireRootRevalidation,
   resolvePendingRootUserMessage,
 } from './streaming.js'
 
@@ -37,6 +42,15 @@ const POLL_INTERVAL_MS = 500
 const POLL_REQUEST_TIMEOUT_MS = 5_000
 const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
 const ERROR_GRACE_CYCLES = 3
+/**
+ * Spacing between execute-phase ledger reconciliations, and the grace before the first one. 10s is
+ * 20 poll ticks: long enough that upstream's own injected completion notice (normally delivered
+ * over SSE within moments of the child ending) settles the entry first, so reconciliation only
+ * ever recovers a missed notice; short enough that a missed notice costs seconds, not the run's
+ * remaining execution budget. Each pass is two local server calls, so a genuinely live child costs
+ * one pair per interval.
+ */
+export const EXECUTE_LEDGER_RECONCILE_INTERVAL_MS = 10_000
 export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 
 /**
@@ -290,6 +304,110 @@ async function runPollRequest<T>(
   return deadline == null ? request() : deadline.run(request, label)
 }
 
+interface ExecuteLedgerReconciler {
+  /**
+   * Runs at most one bounded, rate-limited reconciliation pass and resolves `true` when a pass was
+   * started (whether or not it finished in time), `false` when nothing ran. Never rejects and never
+   * admits completion: the caller re-derives all completion evidence on its next iteration.
+   */
+  readonly reconcileIfDue: () => Promise<boolean>
+}
+
+interface StagedLedger {
+  readonly ledger: OwnershipLedger
+  /** Each entry's state when it was staged: the only state a staged transition may be applied over. */
+  readonly baselineStates: ReadonlyMap<string, OwnershipEntryState>
+}
+
+/**
+ * Copy of the tracked entries into a throwaway ledger, so a pass can run to completion without
+ * touching the live one. Entry states are replayed through the public API (`adopt`, then
+ * `markUnknown`/`settle`), which reproduces every reachable state.
+ */
+function stageLedger(ledger: OwnershipLedger): StagedLedger {
+  const staged = createOwnershipLedger()
+  const baselineStates = new Map<string, OwnershipEntryState>()
+  for (const entry of ledger.snapshot()) {
+    baselineStates.set(entry.sessionId, entry.state)
+    staged.adopt(entry.sessionId, entry.label)
+    if (entry.state === 'unknown') staged.markUnknown(entry.sessionId)
+    if (entry.state === 'settled') staged.settle(entry.sessionId)
+  }
+  return {ledger: staged, baselineStates}
+}
+
+/**
+ * Applies the staged pass's transitions to the live ledger, but only over an entry still in the
+ * state it was staged in. An entry that changed while the pass awaited (settled by a notice, marked
+ * `unknown` by a descendant error or an SSE discontinuity, or never staged) keeps its live value:
+ * the pass observed an older world, and a later fresh pass reconciles it.
+ */
+function commitStagedLedger(live: OwnershipLedger, staged: StagedLedger): void {
+  const liveStates = new Map(live.snapshot().map(entry => [entry.sessionId, entry.state] as const))
+  for (const entry of staged.ledger.snapshot()) {
+    const baseline = staged.baselineStates.get(entry.sessionId)
+    if (baseline === undefined || liveStates.get(entry.sessionId) !== baseline) continue
+    if (entry.state === 'settled') live.settle(entry.sessionId)
+    else if (entry.state === 'unknown') live.markUnknown(entry.sessionId)
+  }
+}
+
+/**
+ * Directory-scoped `reconcileLedgerOnce` for the execute-phase wait -- the same adapter and
+ * directory `runDrain` uses -- so a settlement notice the SSE stream missed cannot block completion
+ * until the deadline. The adapter has no abort signal, so each pass is raced against the poll
+ * request timeout capped by the remaining execution deadline. Observe-then-commit: the pass runs
+ * against a staged copy of the ledger and its transitions reach the live ledger only if it finished
+ * inside that bound, so a late pass can never mutate the ledger after the poller gave up on it. A
+ * timeout is no progress, never settlement. One pass at a time: a pass that outlives its bound keeps
+ * running against its staged copy and later ticks skip until it finishes.
+ */
+function createExecuteLedgerReconciler(options: {
+  readonly client: SessionClient
+  readonly directory: string
+  readonly sessionId: string
+  readonly ledger: OwnershipLedger
+  readonly logger: Logger
+  readonly signal: AbortSignal
+  readonly deadline?: ExecutionDeadline
+}): ExecuteLedgerReconciler {
+  const {client, directory, sessionId, ledger, logger, signal, deadline} = options
+  const adapter = createSdkLedgerReconcileAdapter(client, directory)
+  let nextDueAt: number | null = null
+  let passInFlight = false
+
+  return {
+    reconcileIfDue: async (): Promise<boolean> => {
+      if (passInFlight || ledger.snapshot().length === 0) return false
+      const now = Date.now()
+      if (nextDueAt == null) {
+        nextDueAt = now + EXECUTE_LEDGER_RECONCILE_INTERVAL_MS
+        return false
+      }
+      if (now < nextDueAt) return false
+      nextDueAt = now + EXECUTE_LEDGER_RECONCILE_INTERVAL_MS
+
+      passInFlight = true
+      const staged = stageLedger(ledger)
+      const pass = reconcileLedgerOnce({ledger: staged.ledger, adapter, parentSessionId: sessionId, logger}).finally(
+        () => {
+          passInFlight = false
+        },
+      )
+      try {
+        await runPollRequest(async () => pass, 'ledger reconciliation', signal, deadline)
+        commitStagedLedger(ledger, staged)
+      } catch (error) {
+        logger.debug('Ledger reconciliation did not finish within its bound; treating as no progress', {
+          sessionId,
+          error: toErrorMessage(error),
+        })
+      }
+      return true
+    },
+  }
+}
+
 /**
  * Classifies an assistant message's own `error` field through the same bounded provider/generic
  * precedence the SSE `session.error` branch uses (`streaming.ts`'s `mergeActivityError` callers) --
@@ -403,16 +521,41 @@ async function detectMessageActivity(
   const messages = Array.isArray(messagesResponse.data) ? messagesResponse.data : []
   let latestAssistantMessage: unknown = null
   let latestAssistantMessageInfo: unknown = null
+  // The REST list is the authority for the newest root user turn: an injected background-task
+  // completion turn whose SSE event was missed leaves no tracker barrier, but it is stored here.
+  let newestRootUserMessageId: string | null = null
+  // The first non-baseline user message is the submitted prompt, not an injected turn.
+  let submittedPromptMessageId: string | null = null
   for (const message of messages) {
     const info = getObjectProperty(message, 'info')
     const id = getStringProperty(info, 'id')
-    if (id == null || activityTracker.baselineMessageIds.has(id)) continue
+    if (id == null) continue
 
     const role = getStringProperty(info, 'role')
+    if (role === 'user') {
+      newestRootUserMessageId = id
+      if (submittedPromptMessageId == null && !activityTracker.baselineMessageIds.has(id)) submittedPromptMessageId = id
+    }
+    if (activityTracker.baselineMessageIds.has(id)) continue
     if (role !== 'assistant') continue
 
     latestAssistantMessage = message
     latestAssistantMessageInfo = info
+  }
+
+  // A newer injected root user turn is pending root work as soon as REST shows it, before any
+  // assistant-state early return below: an unfinished or errored reply must not leave a retained
+  // idle candidate for an earlier turn admissible. Idempotent by id; skipped when the tracker
+  // already knows the turn. The barrier clears only through the existing resolution path, when a
+  // qualified terminal reply to this turn is admitted.
+  if (
+    rootFreshness != null &&
+    newestRootUserMessageId != null &&
+    newestRootUserMessageId !== submittedPromptMessageId &&
+    !activityTracker.baselineMessageIds.has(newestRootUserMessageId) &&
+    rootFreshness.latestRootUserMessageId !== newestRootUserMessageId
+  ) {
+    registerPendingRootUserMessage(rootFreshness, newestRootUserMessageId)
   }
 
   if (latestAssistantMessageInfo == null) {
@@ -476,11 +619,23 @@ async function detectMessageActivity(
     return null
   }
 
+  const parentId = getStringProperty(latestAssistantMessageInfo, 'parentID')
+  // A candidate qualifies only if it answers the newest root user message in the REST list. A newer
+  // user turn the SSE stream never delivered is registered as the pending root turn (idempotent by
+  // id; skipped when the tracker already knows it, where the `latestRootUserMessageId` check below
+  // rejects) and completion defers until its own reply appears.
+  if (newestRootUserMessageId != null && parentId !== newestRootUserMessageId) {
+    if (rootFreshness != null && rootFreshness.latestRootUserMessageId !== newestRootUserMessageId) {
+      registerPendingRootUserMessage(rootFreshness, newestRootUserMessageId)
+    }
+    activityTracker.completedAssistantMessageId = undefined
+    return null
+  }
+
   // Answers the latest root user message, with no newer unanswered one: `latestRootUserMessageId`
   // is only positively known once a new root user turn has been observed (e.g. an injected
   // background-task-completion turn) -- null in the common single-turn case, where this check
   // degrades to a no-op and the pending-parent barrier below is the operative guard.
-  const parentId = getStringProperty(latestAssistantMessageInfo, 'parentID')
   if (rootFreshness != null) {
     if (rootFreshness.latestRootUserMessageId != null && parentId !== rootFreshness.latestRootUserMessageId) {
       activityTracker.completedAssistantMessageId = undefined
@@ -587,8 +742,22 @@ export async function pollForSessionCompletionObservation(
   const pollStart = Date.now()
   let errorGraceCycles = 0
   let firstSessionError: string | null = null
+  const ledgerReconciler =
+    ownershipLedger === undefined
+      ? null
+      : createExecuteLedgerReconciler({
+          client,
+          directory,
+          sessionId,
+          ledger: ownershipLedger,
+          logger,
+          signal,
+          deadline,
+        })
 
   while (!signal.aborted) {
+    // Set only where otherwise-qualified completion evidence is deferred solely by the ledger.
+    let ledgerDeferredCompletion = false
     const terminalProviderError = activityTracker?.terminalProviderError
     if (terminalProviderError != null) {
       // Preserved producer policy: an already-accepted provider error wins here even if the
@@ -655,6 +824,7 @@ export async function pollForSessionCompletionObservation(
         : hasFreshIdleCandidate(rootFreshness)
     if (hasIdleEvidence) {
       if (ledgerBlocksCompletion(ownershipLedger)) {
+        ledgerDeferredCompletion = true
         logger.debug('Session idle detected via event stream but owned work outstanding — deferring completion', {
           sessionId,
           outstanding: ownershipLedger?.outstanding(),
@@ -764,6 +934,7 @@ export async function pollForSessionCompletionObservation(
 
       if (messageCandidateQualifiesForAdmission && messageCandidate != null) {
         if (ledgerBlocksCompletion(ownershipLedger)) {
+          ledgerDeferredCompletion = true
           logger.debug(
             'Qualified completed-assistant message observed but owned work outstanding — deferring completion',
             {sessionId, outstanding: ownershipLedger?.outstanding()},
@@ -831,6 +1002,7 @@ export async function pollForSessionCompletionObservation(
               {sessionId},
             )
           } else if (ledgerBlocksCompletion(ownershipLedger)) {
+            ledgerDeferredCompletion = true
             logger.debug('Session idle detected via polling but owned work outstanding — deferring completion', {
               sessionId,
               outstanding: ownershipLedger?.outstanding(),
@@ -896,6 +1068,19 @@ export async function pollForSessionCompletionObservation(
     } catch (pollError) {
       logger.debug('Poll request failed', {error: toErrorMessage(pollError)})
     }
+
+    // Reconciliation awaits and may settle entries, but never admits completion here: the next
+    // iteration re-derives root freshness, status, and the pending-parent barrier from scratch,
+    // so evidence gathered before this await cannot authorize anything after it. SSE may have
+    // missed a root user turn that landed during the await, so the retained idle candidate also
+    // needs REST corroboration (messages' newest root user turn + status) before it can admit.
+    if (
+      ledgerDeferredCompletion &&
+      ledgerReconciler != null &&
+      (await ledgerReconciler.reconcileIfDue()) &&
+      activityTracker?.rootFreshness != null
+    )
+      requireRootRevalidation(activityTracker.rootFreshness)
   }
 
   // Loop exited because `signal` was already aborted at the top-of-loop check — same
