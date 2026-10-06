@@ -3,7 +3,7 @@ import type {TriggerContext} from '../../features/triggers/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import * as core from '@actions/core'
-import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssue} from '../../services/github/api.js'
+import {addLabelsToIssue, ensureLabelExists} from '../../services/github/api.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {parseActionHolderRunId} from './acquire-lock.js'
 
@@ -142,7 +142,7 @@ async function writeCoordinationSkipSummary(
       .addRaw(
         '\nNo agent execution occurred. This request was not automatically requeued.\n\n' +
           '**Recovery:** re-run this workflow, or mention the bot again after the other run finishes. ' +
-          'Editing the issue alone does not retrigger it.\n',
+          'Editing the issue alone does not retrigger it. Remove the `agent: blocked` label manually after re-triggering.\n',
       )
 
     await core.summary.write()
@@ -153,8 +153,8 @@ async function writeCoordinationSkipSummary(
 
 /**
  * Makes a coordination-contended skip visible without breaking the Response Protocol (no comment, no reaction):
- * a job-summary section, a warning annotation, and — for routed issue/PR targets — the `agent: blocked` label.
- * Every step is best-effort; this never throws.
+ * a job-summary section, a warning annotation, and — for routed issue/PR targets — the `agent: blocked` label,
+ * which stays until an operator removes it. Every step is best-effort; this never throws.
  */
 export async function runCoordinationDecline(options: CoordinationDeclineOptions): Promise<void> {
   const {githubClient, triggerContext, holder, reason, responseMode, logger} = options
@@ -171,82 +171,4 @@ export async function runCoordinationDecline(options: CoordinationDeclineOptions
 
   await writeCoordinationSkipSummary(triggerContext, holder, reasonText, labelStatus, logger)
   core.warning(`Fro Bot skipped this run: ${reasonText} No agent execution occurred; re-run the workflow to retry.`)
-}
-
-const EVENTS_PAGE_SIZE = 100
-const EVENTS_MAX_PAGES = 10
-
-/**
- * Time of the most recent `labeled`/`unlabeled` event for the blocked label, and which it was. Events arrive oldest
- * first and cannot be reordered, so every page is read (bounded); `null` when none exist or the bound is exceeded.
- */
-async function lastBlockedLabelEvent(
-  client: Octokit,
-  context: TriggerContext,
-  issueNumber: number,
-): Promise<{readonly event: 'labeled' | 'unlabeled'; readonly createdAtMs: number} | null> {
-  let last: {readonly event: 'labeled' | 'unlabeled'; readonly createdAtMs: number} | null = null
-  for (let page = 1; page <= EVENTS_MAX_PAGES; page++) {
-    const {data} = await client.rest.issues.listEvents({
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      issue_number: issueNumber,
-      per_page: EVENTS_PAGE_SIZE,
-      page,
-    })
-    for (const entry of data) {
-      if (entry.event !== 'labeled' && entry.event !== 'unlabeled') continue
-      if ('label' in entry === false || entry.label?.name !== BLOCKED_LABEL) continue
-      const createdAtMs = new Date(entry.created_at).getTime()
-      if (Number.isFinite(createdAtMs) && (last == null || createdAtMs >= last.createdAtMs)) {
-        last = {event: entry.event, createdAtMs}
-      }
-    }
-    if (data.length < EVENTS_PAGE_SIZE) return last
-  }
-  return null
-}
-
-/**
- * Removes the `agent: blocked` label from the invocation's issue/PR target after this run finished `succeeded`,
- * but only when the label was applied before this invocation started (`runStartMs`): a label applied during this
- * run belongs to a newer decline and must survive. Reads the event history only when the label is currently on the
- * issue (first 100 labels; beyond that it is treated as absent). Best-effort: any API error or an undeterminable history skips
- * the removal, is logged, and never fails the run.
- */
-export async function clearBlockedLabel(
-  githubClient: Octokit,
-  triggerContext: TriggerContext,
-  runStartMs: number,
-  logger: Logger,
-): Promise<void> {
-  const issueNumber = resolveLabelTarget(triggerContext)
-  if (issueNumber == null) return
-  try {
-    // One cheap call first: the common path (label absent) must not pay for the full event history.
-    const {data: labels} = await githubClient.rest.issues.listLabelsOnIssue({
-      owner: triggerContext.repo.owner,
-      repo: triggerContext.repo.repo,
-      issue_number: issueNumber,
-      per_page: 100,
-    })
-    if (labels.some(label => label.name === BLOCKED_LABEL) === false) {
-      logger.debug('Blocked label not present; nothing to clear', {issueNumber})
-      return
-    }
-    const last = await lastBlockedLabelEvent(githubClient, triggerContext, issueNumber)
-    if (last == null || last.event !== 'labeled' || last.createdAtMs >= runStartMs) {
-      logger.debug('Blocked label not eligible for removal', {issueNumber})
-      return
-    }
-    await removeLabelFromIssue(
-      githubClient,
-      `${triggerContext.repo.owner}/${triggerContext.repo.repo}`,
-      issueNumber,
-      BLOCKED_LABEL,
-      logger,
-    )
-  } catch (error) {
-    logger.warning('Failed to remove blocked label (non-fatal)', {error: toErrorMessage(error)})
-  }
 }

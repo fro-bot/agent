@@ -3,7 +3,6 @@ import type {
   OutputModeMigrationState,
   OutputModeRequestState,
   OwnershipLedger,
-  ResponseMode,
 } from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
@@ -26,7 +25,7 @@ import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
-import {clearBlockedLabel, runCoordinationDecline} from './phases/coordination-decline.js'
+import {runCoordinationDecline} from './phases/coordination-decline.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
 import {computeDrainDeadlineMs, resolveRequestedOutputModeState, runDrain, runExecute} from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
@@ -67,8 +66,6 @@ export async function run(): Promise<number> {
   let ownershipLedger: OwnershipLedger | undefined
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
-  // Parsed `response-mode` input; `none` promises no label changes (see coordination-decline.ts).
-  let responseMode: ResponseMode = 'github'
   let storeConfig: ObjectStoreConfig = {
     enabled: false,
     bucket: '',
@@ -136,7 +133,6 @@ export async function run(): Promise<number> {
     }
     detectedOpencodeVersion = bootstrap.opencodeResult.version
     storeConfig = bootstrap.inputs.storeConfig
-    responseMode = bootstrap.inputs.responseMode
     sessionRetention = bootstrap.inputs.sessionRetention
 
     const routing = await runRouting(bootstrap, startTime)
@@ -194,7 +190,7 @@ export async function run(): Promise<number> {
           triggerContext: routing.triggerResult.context,
           holder: lockResult.holder,
           reason: lockResult.reason,
-          responseMode,
+          responseMode: bootstrap.inputs.responseMode,
           logger: bootstrapLogger,
         })
         return 0
@@ -435,12 +431,6 @@ export async function run(): Promise<number> {
     // added because `applyTerminalReaction` is not typed to accept a fourth outcome value.
     if (reactionCtx != null && githubClient != null && finalOutcome !== 'skipped') {
       await applyTerminalReaction(githubClient, reactionCtx, finalOutcome, bootstrapLogger)
-    }
-
-    // A target that was blocked earlier is unblocked once a later invocation for it succeeds. Only after the
-    // FINAL outcome is known, and never on skip/failure/incomplete.
-    if (finalOutcome === 'succeeded' && responseMode !== 'none' && githubClient != null && triggerContext != null) {
-      await clearBlockedLabel(githubClient, triggerContext, startTime, bootstrapLogger)
     }
 
     setInvocationOutcomeOutput(finalOutcome)

@@ -3,13 +3,12 @@ import type {TriggerContext, TriggerTarget} from '../../features/triggers/types.
 import type {Octokit} from '../../services/github/types.js'
 import * as core from '@actions/core'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssue} from '../../services/github/api.js'
+import {addLabelsToIssue, ensureLabelExists} from '../../services/github/api.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   BLOCKED_LABEL,
   BLOCKED_LABEL_COLOR,
   BLOCKED_LABEL_DESCRIPTION,
-  clearBlockedLabel,
   runCoordinationDecline,
 } from './coordination-decline.js'
 
@@ -26,7 +25,6 @@ vi.mock('@actions/core', () => ({
 vi.mock('../../services/github/api.js', () => ({
   addLabelsToIssue: vi.fn().mockResolvedValue(true),
   ensureLabelExists: vi.fn().mockResolvedValue(true),
-  removeLabelFromIssue: vi.fn().mockResolvedValue(true),
 }))
 
 const client = {} as Octokit
@@ -118,6 +116,7 @@ describe('runCoordinationDecline', () => {
     expect(text).toContain('applied')
     expect(text).toContain('No agent execution occurred. This request was not automatically requeued.')
     expect(text).toContain('Editing the issue alone does not retrigger')
+    expect(text).toContain('Remove the `agent: blocked` label manually after re-triggering')
     expect(core.summary.write).toHaveBeenCalled()
 
     // #and a warning annotation carries the same reason
@@ -284,187 +283,5 @@ describe('runCoordinationDecline', () => {
     // #then the reason and holder surface are reported without a run link
     expect(summaryText()).toContain('expired coordination lease')
     expect(summaryText()).not.toContain('/actions/runs/')
-  })
-})
-
-function blockedEvent(event: 'labeled' | 'unlabeled', createdAt: string) {
-  return {event, created_at: createdAt, label: {name: BLOCKED_LABEL, color: BLOCKED_LABEL_COLOR}}
-}
-
-const blockedLabelPresent = () => vi.fn().mockResolvedValue({data: [{name: 'bug'}, {name: BLOCKED_LABEL}]})
-
-function createEventsClient(
-  listEvents: ReturnType<typeof vi.fn>,
-  listLabelsOnIssue: ReturnType<typeof vi.fn> = blockedLabelPresent(),
-): Octokit {
-  return {rest: {issues: {listEvents, listLabelsOnIssue}}} as unknown as Octokit
-}
-
-describe('clearBlockedLabel', () => {
-  const runStartMs = Date.parse('2026-10-05T12:00:00.000Z')
-  const before = '2026-10-05T11:00:00.000Z'
-  const after = '2026-10-05T12:30:00.000Z'
-
-  beforeEach(() => {
-    vi.clearAllMocks()
-  })
-
-  it('removes the label when it was applied before this invocation started', async () => {
-    // #given the most recent labeled event predates the run start
-    const listEvents = vi.fn().mockResolvedValue({data: [blockedEvent('labeled', before)]})
-
-    // #when clearing for a PR target
-    await clearBlockedLabel(
-      createEventsClient(listEvents),
-      createContext(target('pr', 12)),
-      runStartMs,
-      createMockLogger(),
-    )
-
-    // #then the blocked label is removed from that number
-    expect(removeLabelFromIssue).toHaveBeenCalledWith(
-      expect.anything(),
-      'fro-bot/agent',
-      12,
-      BLOCKED_LABEL,
-      expect.anything(),
-    )
-  })
-
-  it('makes no events call and no removal when the label is not on the issue', async () => {
-    // #given the label list does not include the blocked label (the common path)
-    const listEvents = vi.fn()
-    const listLabelsOnIssue = vi.fn().mockResolvedValue({data: [{name: 'bug'}]})
-
-    // #when clearing
-    await clearBlockedLabel(
-      createEventsClient(listEvents, listLabelsOnIssue),
-      createContext(target('issue')),
-      runStartMs,
-      createMockLogger(),
-    )
-
-    // #then only the one label call is made
-    expect(listLabelsOnIssue).toHaveBeenCalledTimes(1)
-    expect(listEvents).not.toHaveBeenCalled()
-    expect(removeLabelFromIssue).not.toHaveBeenCalled()
-  })
-
-  it('skips the events call without throwing when listing labels fails', async () => {
-    // #given the label list call rejects
-    const listEvents = vi.fn()
-    const listLabelsOnIssue = vi.fn().mockRejectedValue(new Error('rate limited'))
-    const logger = createMockLogger()
-
-    // #when / #then it resolves, warns, and does nothing else
-    await expect(
-      clearBlockedLabel(
-        createEventsClient(listEvents, listLabelsOnIssue),
-        createContext(target('issue')),
-        runStartMs,
-        logger,
-      ),
-    ).resolves.toBeUndefined()
-    expect(listEvents).not.toHaveBeenCalled()
-    expect(removeLabelFromIssue).not.toHaveBeenCalled()
-    expect(logger.warning).toHaveBeenCalled()
-  })
-
-  it('keeps the label when it was applied after this invocation started', async () => {
-    // #given a newer decline labeled the target while this run was executing
-    const listEvents = vi
-      .fn()
-      .mockResolvedValue({data: [blockedEvent('labeled', before), blockedEvent('labeled', after)]})
-
-    // #when clearing
-    await clearBlockedLabel(
-      createEventsClient(listEvents),
-      createContext(target('issue')),
-      runStartMs,
-      createMockLogger(),
-    )
-
-    // #then the newest labeled event wins and the label stays
-    expect(removeLabelFromIssue).not.toHaveBeenCalled()
-  })
-
-  it('does nothing when the label is absent, was already removed, or belongs to another label', async () => {
-    // #given no events, an unlabeled-last history, and events for a different label
-    const other = {event: 'labeled', created_at: before, label: {name: 'bug', color: 'ffffff'}}
-    for (const data of [[], [blockedEvent('labeled', before), blockedEvent('unlabeled', before)], [other]]) {
-      // #when clearing
-      await clearBlockedLabel(
-        createEventsClient(vi.fn().mockResolvedValue({data})),
-        createContext(target('issue')),
-        runStartMs,
-        createMockLogger(),
-      )
-    }
-
-    // #then nothing is removed
-    expect(removeLabelFromIssue).not.toHaveBeenCalled()
-  })
-
-  it('pages through the events to find the latest labeled event', async () => {
-    // #given 100 unrelated events on page 1 and the blocked label on page 2
-    const filler = Array.from({length: 100}, () => ({event: 'commented', created_at: before}))
-    const listEvents = vi
-      .fn()
-      .mockResolvedValueOnce({data: filler})
-      .mockResolvedValueOnce({data: [blockedEvent('labeled', before)]})
-
-    // #when clearing
-    await clearBlockedLabel(
-      createEventsClient(listEvents),
-      createContext(target('issue')),
-      runStartMs,
-      createMockLogger(),
-    )
-
-    // #then both pages were read and the label is removed
-    expect(listEvents).toHaveBeenCalledTimes(2)
-    expect(removeLabelFromIssue).toHaveBeenCalledTimes(1)
-  })
-
-  it('skips clearing without throwing when the events API fails', async () => {
-    // #given the events call rejects
-    const listEvents = vi.fn().mockRejectedValue(new Error('rate limited'))
-    const logger = createMockLogger()
-
-    // #when / #then it resolves, logs a warning, and removes nothing
-    await expect(
-      clearBlockedLabel(createEventsClient(listEvents), createContext(target('issue')), runStartMs, logger),
-    ).resolves.toBeUndefined()
-    expect(removeLabelFromIssue).not.toHaveBeenCalled()
-    expect(logger.warning).toHaveBeenCalled()
-  })
-
-  it('does nothing for targets that cannot carry the label', async () => {
-    // #given a client that must not be called
-    const listEvents = vi.fn()
-
-    // #when clearing for a manual target and for no target
-    await clearBlockedLabel(
-      createEventsClient(listEvents),
-      createContext(target('manual')),
-      runStartMs,
-      createMockLogger(),
-    )
-    await clearBlockedLabel(createEventsClient(listEvents), createContext(null), runStartMs, createMockLogger())
-
-    // #then no API call is made
-    expect(listEvents).not.toHaveBeenCalled()
-    expect(removeLabelFromIssue).not.toHaveBeenCalled()
-  })
-
-  it('swallows removal failures', async () => {
-    // #given the label is eligible but removal throws
-    const listEvents = vi.fn().mockResolvedValue({data: [blockedEvent('labeled', before)]})
-    vi.mocked(removeLabelFromIssue).mockRejectedValueOnce(new Error('nope'))
-
-    // #when / #then it does not throw
-    await expect(
-      clearBlockedLabel(createEventsClient(listEvents), createContext(target('issue')), runStartMs, createMockLogger()),
-    ).resolves.toBeUndefined()
   })
 })

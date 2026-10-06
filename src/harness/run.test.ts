@@ -65,7 +65,6 @@ vi.mock('./phases/cleanup.js', () => ({
 }))
 
 vi.mock('./phases/coordination-decline.js', () => ({
-  clearBlockedLabel: vi.fn().mockResolvedValue(undefined),
   runCoordinationDecline: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -380,13 +379,11 @@ describe('run', () => {
     // dedup entity was already assigned before the lock check ran
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('skipped')
     expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
-    // #and the decline is made visible (summary + warning + label) with the lock outcome and holder,
-    // and the blocked label is never cleared on a skip
-    const {runCoordinationDecline, clearBlockedLabel} = await import('./phases/coordination-decline.js')
+    // #and the decline is made visible (summary + warning + label) with the lock outcome and holder
+    const {runCoordinationDecline} = await import('./phases/coordination-decline.js')
     expect(vi.mocked(runCoordinationDecline)).toHaveBeenCalledWith(
       expect.objectContaining({holder, reason: 'active-holder', responseMode: 'github'}),
     )
-    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
     // #and session persistence is blocked: cleanup is told to decline the save, and the post hook is disabled
     const {runCleanup} = await import('./phases/cleanup.js')
     expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(expect.objectContaining({skipSessionPersistence: true}))
@@ -404,7 +401,7 @@ describe('run', () => {
     const {runCacheRestore} = await import('./phases/cache-restore.js')
     const {runExecute} = await import('./phases/execute.js')
     const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
-    const {runCoordinationDecline, clearBlockedLabel} = await import('./phases/coordination-decline.js')
+    const {runCoordinationDecline} = await import('./phases/coordination-decline.js')
     const core = await import('@actions/core')
 
     vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
@@ -425,11 +422,30 @@ describe('run', () => {
     expect(runExecute).not.toHaveBeenCalled()
     expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
     expect(vi.mocked(runCoordinationDecline)).not.toHaveBeenCalled()
-    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
     // #and the fail-closed run must not persist session state either
     const {runCleanup} = await import('./phases/cleanup.js')
     expect(vi.mocked(runCleanup)).toHaveBeenCalledWith(expect.objectContaining({skipSessionPersistence: true}))
     expect(vi.mocked(core.saveState)).toHaveBeenLastCalledWith('should-save-cache', 'false')
+  })
+
+  it('passes response-mode none to the coordination decline so it skips labeling', async () => {
+    // #given a contended lock under response-mode none
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runRouting} = await import('./phases/routing.js')
+    const {runDedup} = await import('./phases/dedup.js')
+    const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {runCoordinationDecline} = await import('./phases/coordination-decline.js')
+    const bootstrap = createBootstrap()
+    vi.mocked(runBootstrap).mockResolvedValue({...bootstrap, inputs: {...bootstrap.inputs, responseMode: 'none'}})
+    vi.mocked(runRouting).mockResolvedValue(createRouting())
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: null})
+    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 'held-by-other', holder: null, reason: 'conflict'})
+
+    // #when the run is declined
+    expect(await run()).toBe(0)
+
+    // #then the parsed response mode reaches the decline
+    expect(vi.mocked(runCoordinationDecline)).toHaveBeenCalledWith(expect.objectContaining({responseMode: 'none'}))
   })
 
   it('fails closed when the lock primitive rejects (thrown, not returned, error)', async () => {
@@ -845,44 +861,6 @@ async function mockHappyPathThrough(overrides?: {
 describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-  })
-
-  it('clears the blocked label only after a succeeded invocation, and never on incomplete or failed', async () => {
-    const {clearBlockedLabel} = await import('./phases/coordination-decline.js')
-
-    // #given a clean, successful delivery
-    await mockHappyPathThrough()
-
-    // #when the run succeeds
-    expect(await run()).toBe(0)
-
-    // #then the label is cleared for the routed target after the final outcome is known, bounded by this run's start
-    expect(vi.mocked(clearBlockedLabel)).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(clearBlockedLabel)).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.any(Number),
-      expect.anything(),
-    )
-
-    // #given response-mode none, which promises no label changes
-    vi.mocked(clearBlockedLabel).mockClear()
-    await mockHappyPathThrough()
-    const {runBootstrap} = await import('./phases/bootstrap.js')
-    const bootstrap = createBootstrap()
-    vi.mocked(runBootstrap).mockResolvedValue({...bootstrap, inputs: {...bootstrap.inputs, responseMode: 'none'}})
-    expect(await run()).toBe(0)
-    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
-
-    // #given an incomplete outcome (observation gap)
-    await mockHappyPathThrough({observationGap: true})
-    expect(await run()).toBe(1)
-    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
-
-    // #given a failed outcome (execution failure)
-    await mockHappyPathThrough({executionSuccess: false})
-    expect(await run()).toBe(1)
-    expect(vi.mocked(clearBlockedLabel)).not.toHaveBeenCalled()
   })
 
   it('useful response + observation gap -> incomplete, no dedup marker, no success reaction', async () => {
