@@ -276,6 +276,7 @@ describe('processEventStream — ownership ledger integration', () => {
     const ledger = createOwnershipLedger()
     ledger.adopt(CHILD_SESSION_ID, 'do the thing')
     const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
     const activityTracker: ActivityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
@@ -284,7 +285,14 @@ describe('processEventStream — ownership ledger integration', () => {
       rootFreshness,
     }
     const injected = injectedCompletionEvent(ROOT_SESSION_ID, CHILD_SESSION_ID, 'completed', 'msg_injected')
-    const eventStream = createMockEventStream([injected, injected])
+    // Resumed only after the consumer has fully handled the first event, so the revision read here is
+    // the one the first injected event produced.
+    let revisionAfterFirstEvent: number | null = null
+    const eventStream = (async function* () {
+      yield injected
+      revisionAfterFirstEvent = rootFreshness.revision
+      yield injected
+    })()
 
     // #when the stream is processed
     await processEventStream(
@@ -301,6 +309,10 @@ describe('processEventStream — ownership ledger integration', () => {
     // #then the child settled and the injected parent message is the pending barrier
     expect(ledger.outstanding()).toBe(0)
     expect(rootFreshness.pendingParentMessageId).toBe('msg_injected')
+
+    // #and the duplicate event for the same message id did not re-invalidate freshness
+    expect(revisionAfterFirstEvent).not.toBeNull()
+    expect(rootFreshness.revision).toBe(revisionAfterFirstEvent)
   })
 
   it("registers the pending parent barrier for an untracked child's injected completion without touching the ledger", async () => {
