@@ -5222,6 +5222,10 @@ egress_c_expect "mitmproxy upstream-connect error 502" fail 0 \
 egress_c_expect "TLS verification failure (curl exit 60)" fail 60 \
   "$(egress_c_curl_output '* SSL certificate problem: unable to get local issuer certificate' "${EGRESS_C_MITM}" 'HTTP/2 403 ' "${EGRESS_C_GH_ID}")"
 egress_c_expect "timeout (curl exit 28)" fail 28 ""
+# curl exit 0 and otherwise valid (mitmproxy issuer, status line, x-github-request-id) but no TLS
+# verification-success line: exercises the TLS check itself, which the exit-60 case short-circuits past.
+egress_c_expect "no TLS verification line (curl exit 0)" fail 0 \
+  "$(egress_c_curl_output '* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384' "${EGRESS_C_MITM}" 'HTTP/2 200 ' "${EGRESS_C_GH_ID}")"
 egress_c_expect "response not issued via mitmproxy CA" fail 0 \
   "$(egress_c_curl_output "${EGRESS_C_VERIFIED}" 'CN=GTS CA 1P5; O=Google Trust Services' 'HTTP/2 200 ' "${EGRESS_C_GH_ID}")"
 
