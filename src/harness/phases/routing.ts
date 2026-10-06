@@ -1,5 +1,5 @@
 import type {AgentContext} from '../../features/agent/types.js'
-import type {TriggerResultProcess} from '../../features/triggers/types.js'
+import type {SkipReason, TriggerResultProcess} from '../../features/triggers/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as core from '@actions/core'
@@ -17,10 +17,26 @@ export interface RoutingPhaseResult {
   readonly botLogin: string | null
 }
 
+/** Routing declined the event; carries the skip reason so the run can surface it outside the logs. */
+export interface RoutingPhaseSkip {
+  readonly skipped: true
+  readonly skipReason: SkipReason
+  readonly skipMessage: string
+}
+
+/** Visibility only: one workflow annotation, never a comment or reaction. Best-effort, never throws. */
+function emitSkipNotice(skipReason: SkipReason, skipMessage: string): void {
+  try {
+    core.notice(`Fro Bot skipped this event (${skipReason}): ${skipMessage}`, {title: 'Fro Bot skipped event'})
+  } catch {
+    // Annotation is best-effort; the reason is also logged and written to the job summary.
+  }
+}
+
 export async function runRouting(
   bootstrap: BootstrapPhaseResult,
   _startTime: number,
-): Promise<RoutingPhaseResult | null> {
+): Promise<RoutingPhaseResult | RoutingPhaseSkip> {
   const contextLogger = createLogger({phase: 'context'})
   const githubContext = parseGitHubContext(contextLogger)
   const githubClient = createClient({token: bootstrap.inputs.githubToken, logger: contextLogger})
@@ -55,7 +71,8 @@ export async function runRouting(
       reason: triggerResult.skipReason,
       message: triggerResult.skipMessage,
     })
-    return null
+    emitSkipNotice(triggerResult.skipReason, triggerResult.skipMessage)
+    return {skipped: true, skipReason: triggerResult.skipReason, skipMessage: triggerResult.skipMessage}
   }
 
   triggerLogger.info('Event routed for processing', {
