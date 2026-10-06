@@ -49,6 +49,7 @@ type ExpressionValue = boolean | string
 const WORKFLOW_PATH = process.env.FRO_BOT_WORKFLOW_TEST_PATH ?? '.github/workflows/fro-bot.yaml'
 const HARNESS_INTEGRATE_WORKFLOW_PATH = '.github/workflows/harness-integrate.yaml'
 const CI_WORKFLOW_PATH = '.github/workflows/ci.yaml'
+const EXAMPLE_WORKFLOW_PATH = 'docs/examples/fro-bot.yaml'
 const REPOSITORY = 'fro-bot/agent'
 const DIRECT_REF = 'refs/heads/main'
 const DIRECT_WORKFLOW_REF = `${REPOSITORY}/.github/workflows/fro-bot.yaml@${DIRECT_REF}`
@@ -81,6 +82,20 @@ function stepsFor(path: string, jobName: string): Record<string, unknown>[] {
   const job = rawJob(path, jobName)
   if (!Array.isArray(job.steps)) throw new TypeError(`${path} job ${jobName} steps are missing`)
   return job.steps.filter((step): step is Record<string, unknown> => step !== null && typeof step === 'object')
+}
+
+function normalizedSchedulePrompt(path: string): string {
+  const env = loadRawWorkflow(path).env as Record<string, unknown>
+  const prompt = env.SCHEDULE_PROMPT
+  if (typeof prompt !== 'string') throw new TypeError(`SCHEDULE_PROMPT is missing from ${path}`)
+  return prompt.replaceAll(/\s+/g, ' ').trim()
+}
+
+function lookupSection(prompt: string, start: string, end: string): string {
+  const from = prompt.indexOf(start)
+  const to = prompt.indexOf(end, from + start.length)
+  if (from === -1 || to === -1) throw new TypeError(`lookup section ${start} is missing`)
+  return prompt.slice(from, to)
 }
 
 function stepById(steps: readonly Record<string, unknown>[], id: string): Record<string, unknown> {
@@ -728,6 +743,175 @@ describe('CI workflow: Test GitHub Action checkout', () => {
   })
 })
 
+// The daily maintenance run publishes one report issue per UTC day. These tests pin the marker-based
+// lookup, same-day idempotency, previous-report closure, the one-time #252 migration, and the exact
+// issue-write scope so the run cannot drift back to a rolling issue or widen its mutations.
+describe('fro-bot workflow — per-day report issue prompt', () => {
+  const MARKER = '<!-- fro-bot-daily-report-v1 -->'
+
+  const normalizedPrompt = (): string => {
+    const workflow = parse(readFileSync(WORKFLOW_PATH, 'utf8')) as {readonly env: Record<string, unknown>}
+    const prompt = workflow.env.SCHEDULE_PROMPT
+    if (typeof prompt !== 'string') throw new TypeError('SCHEDULE_PROMPT is missing from the workflow env')
+    return prompt.replaceAll(/\s+/g, ' ').trim()
+  }
+
+  it('titles each report with its UTC date and identifies reports by marker, not title search alone', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then the title format and marker match the other fro-bot repos, and lookup is marker-based
+    expect(prompt).toContain('Daily Fro Bot Report — YYYY-MM-DD (UTC)')
+    expect(prompt).toContain(`The first line of every report body is this marker: ${MARKER}`)
+    expect(prompt).toContain('identify reports by the marker, never by a title search alone')
+  })
+
+  it('updates the same-day report instead of creating a duplicate', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then an existing report for today's exact title is rewritten, and a closed one stays closed
+    expect(prompt).toContain(
+      "If a report whose title is exactly today's title exists in lookup a or b, rewrite its body",
+    )
+    expect(prompt).toContain('Never create a second report for the same date. Do not reopen it if it is closed.')
+  })
+
+  it('closes every other open report with a link to the new one', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then superseded reports are found by marker and closed with a pointer to today's report
+    expect(prompt).toContain("close every other open report from lookup a (marker present, title not today's)")
+    expect(prompt).toContain('Superseded by <today')
+  })
+
+  it('closes the legacy rolling issue #252 explicitly, once, and never edits or reopens it', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then #252 carries no marker so its closure is spelled out and gated on its exact title and open state
+    expect(prompt).toContain('It carries no marker, so it is closed explicitly')
+    expect(prompt).toContain('If it is open and its title is exactly "Daily Maintenance Report"')
+    expect(prompt).toContain('If it is already closed, do nothing. Never edit or reopen #252.')
+  })
+
+  it('permits exactly the four report mutations and drops the rolling-issue rules', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then the write scope is enumerated, and the old rolling-issue and Historical Summary logic is gone
+    expect(prompt).toContain(
+      "The only issue mutations permitted by this section are: create today's report, edit today's report, close a superseded report, and close #252 once.",
+    )
+    expect(prompt).toContain('Do NOT label, assign, or reopen any report.')
+    expect(prompt).not.toContain('SINGLE rolling issue')
+    expect(prompt).not.toContain('Historical Summary')
+    expect(prompt).not.toContain('ONE issue only')
+  })
+})
+
+// Report discovery must be complete: an incomplete listing reads as "no report exists" and produces
+// duplicates. Both the repo workflow and the copy-paste example carry the same contract.
+describe.each([
+  ['fro-bot workflow', WORKFLOW_PATH],
+  ['example workflow', EXAMPLE_WORKFLOW_PATH],
+])('%s — report discovery contract', (_name, path) => {
+  const prompt = (): string => normalizedSchedulePrompt(path)
+
+  it('lists open issues only, paginated to completion', () => {
+    // #given the schedule prompt
+    const text = prompt()
+
+    // #then open reports come from a state=open paginated listing, not a bounded all-states list
+    expect(text).toContain("gh api --paginate 'repos/{owner}/{repo}/issues?state=open&per_page=100'")
+    expect(text).toContain('`--paginate` follows every page, so the open set is complete.')
+    expect(text).not.toContain('--limit 200')
+  })
+
+  it('excludes pull requests from the open-issue listing by their pull_request key', () => {
+    // #given lookup a, the REST issues endpoint that returns pull requests alongside issues
+    const lookupA = lookupSection(prompt(), 'a. Open reports', 'b. ')
+
+    // #then entries carrying a pull_request key are dropped before reports are matched
+    expect(lookupA).toContain('state=open')
+    expect(lookupA).toContain('drop entries with a `pull_request` key')
+  })
+
+  it('takes the star baseline from a state-independent lookup, not the open-only listing', () => {
+    // #given the schedule prompt and its three lookups
+    const text = prompt()
+    const lookupA = lookupSection(text, 'a. Open reports', 'b. ')
+    const lookupC = lookupSection(text, 'c. Previous report', '1. ')
+
+    // #then lookup c searches all states and keeps closed reports, so a same-day rerun keeps its baseline
+    expect(lookupC).toContain('gh issue list --state all')
+    expect(lookupC).not.toContain('state=open')
+    expect(lookupC).toContain('Closed reports count')
+    expect(lookupC).toContain('older than today')
+
+    // #then the previous report is defined by lookup c, never by lookup a
+    expect(text).toContain('The previous report comes from lookup c')
+    expect(text).not.toMatch(/previous report[^.]*lookup a/)
+    expect(lookupA).not.toContain('previous report')
+  })
+
+  it('never lets a failed baseline lookup block the report, and keeps superseding open-only', () => {
+    // #given the schedule prompt
+    const text = prompt()
+
+    // #then only lookups a and b gate mutations; lookup c failure drops the star flags only
+    expect(text).toContain('If lookup c fails, flag nothing and say so in Notes; it never blocks the report.')
+    expect(text).toContain('close every other open report from lookup a')
+  })
+
+  it("looks up today's report by exact title in any state and confirms the marker", () => {
+    // #given the schedule prompt
+    const text = prompt()
+
+    // #then the same-day lookup is an exact-title search across all states
+    expect(text).toContain(
+      `gh issue list --state all --search '"Daily Fro Bot Report — YYYY-MM-DD (UTC)" in:title' --json number,title,state,url,body`,
+    )
+    expect(text).toContain('then confirm the marker on its body')
+  })
+
+  it('aborts every mutation when a discovery call fails', () => {
+    // #given the schedule prompt
+    const text = prompt()
+
+    // #then a failed lookup blocks create, edit, and close, and missing results are never absence
+    expect(text).toContain('Run lookups a and b before any mutation')
+    expect(text).toContain(
+      'If lookup a or b fails (non-zero exit or unparseable output), do not create, edit, or close anything, #252 included, and report the failure.',
+    )
+    expect(text).toContain('A missing result is never evidence that no report exists.')
+  })
+})
+
+describe('example workflow — maintenance concurrency', () => {
+  it('serializes scheduled and manual runs in one non-cancelling group', () => {
+    // #given the example concurrency block
+    const concurrency = loadRawWorkflow(EXAMPLE_WORKFLOW_PATH).concurrency as {
+      readonly group: string
+      readonly 'cancel-in-progress': boolean
+    }
+    const group = concurrency.group.replaceAll(/\s+/g, ' ')
+
+    // #then schedule and workflow_dispatch map to a constant shared group, never to run_id
+    expect(group).toContain(
+      "(github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'maintenance' ||",
+    )
+    expect(group.indexOf("&& 'maintenance'")).toBeLessThan(group.indexOf('github.run_id'))
+    expect(concurrency['cancel-in-progress']).toBe(false)
+
+    // #then the other triggers keep their per-thread keys
+    expect(group).toContain('github.event.issue.number')
+    expect(group).toContain('github.event.pull_request.number')
+    expect(group).toContain('github.event.discussion.number')
+  })
+})
+
 // The #1598 runtime-verification sweep is a temporary addition to the daily maintenance prompt.
 // It grants the schedule run exactly one extra mutable issue and nothing else, so these tests pin
 // the bounds that keep it from becoming a general-purpose issue-editing licence.
@@ -767,10 +951,10 @@ describe('fro-bot workflow — #1598 runtime-verification sweep prompt', () => {
     // #then the carve-out is attached to the prohibition itself, not floating on a later sentence,
     // and it names exactly the two permitted mutations -- editing the region and closing the issue
     expect(prompt).toContain(
-      'Do NOT comment on or modify individual issues/PRs, except #1598 while it is open: the only permitted mutations there are editing the delimited region below and closing the issue.',
+      'Do NOT comment on or modify any other individual issue/PR, except #1598 while it is open: the only permitted mutations there are editing the delimited region below and closing the issue.',
     )
     expect(prompt).toContain('Do NOT label, comment on, or reopen #1598')
-    expect(prompt).toContain('Apart from the #1598 exception, this run must update ONE issue only.')
+    expect(prompt).toContain('Apart from the #1598 exception, this run must mutate no other issue.')
   })
 
   it('grants the daily run exactly one extra mutable issue and skips once it is closed', () => {
