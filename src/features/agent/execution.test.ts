@@ -95,8 +95,8 @@ function injectedCompletionEvent(rootSessionID: string, childSessionID: string):
       sessionID: rootSessionID,
       part: {
         type: 'text',
+        synthetic: true,
         text: `<task id="${childSessionID}" state="completed">\ndone\n</task>`,
-        time: {start: 1, end: 2},
       },
     },
   } as unknown as Event
