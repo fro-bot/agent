@@ -8,6 +8,7 @@ import type {
   LockAcquisitionResult,
   LockLogger,
   LockRecord,
+  LockScope,
   RepoQuiescence,
   Surface,
 } from './types.js'
@@ -20,9 +21,14 @@ import {collectHolderEvidence, confirmWithDeadline, decisionForBlocked, emitTake
 /** The identity segment used for all lock keys. Exported so consumers (e.g. recovery.ts) can import it instead of maintaining a local copy. */
 export const COORDINATION_IDENTITY = 'coordination'
 
-/** Build the S3 key for a repo's coordination lock. Exported so consumers share the single source of truth for the lock key shape. */
-export function getLockKey(config: CoordinationConfig, repo: string): Result<string, Error> {
-  const key = buildObjectStoreKey(config.storeConfig, COORDINATION_IDENTITY, repo, 'locks', 'repo.json')
+const LOCK_OBJECT_NAMES = {repo: 'repo.json', action: 'action.json'} as const satisfies Record<LockScope, string>
+
+/**
+ * Build the S3 key for a repo's coordination lock. Exported so consumers share the single source of truth for the lock key shape.
+ * `scope` defaults to `repo` (the gateway's shared-checkout lock); the Action uses `action` (shared session store).
+ */
+export function getLockKey(config: CoordinationConfig, repo: string, scope: LockScope = 'repo'): Result<string, Error> {
+  const key = buildObjectStoreKey(config.storeConfig, COORDINATION_IDENTITY, repo, 'locks', LOCK_OBJECT_NAMES[scope])
   if (key.success === false) {
     return err(key.error)
   }
@@ -116,7 +122,7 @@ export async function acquireLock(
   logger: LockLogger,
   options: LockAcquisitionOptions = {},
 ): Promise<Result<LockAcquisitionResult, Error>> {
-  const key = getLockKey(config, repo)
+  const key = getLockKey(config, repo, options.scope)
   if (key.success === false) {
     return err(key.error)
   }
@@ -132,20 +138,42 @@ export async function acquireLock(
   }
 
   logger.debug('Attempting lock acquisition', {key: key.data, repo, runId, surface})
-  const created = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, new Date().toISOString())
-  const acquired = await conditionalPut.data(key.data, JSON.stringify(created), {ifNoneMatch: '*'})
-  if (acquired.success === true) {
-    if (typeof acquired.data.etag !== 'string' || acquired.data.etag.length === 0) {
+  const createOnce = async () => {
+    const created = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, new Date().toISOString())
+    return conditionalPut.data(key.data, JSON.stringify(created), {ifNoneMatch: '*'})
+  }
+  const toAcquired = (etag: unknown): Result<LockAcquisitionResult, Error> => {
+    if (typeof etag !== 'string' || etag.length === 0) {
       return err(new Error('Lock acquisition succeeded without a usable ETag'))
     }
-    return ok({acquired: true, outcome: 'acquired', etag: acquired.data.etag, holder: null})
+    return ok({acquired: true, outcome: 'acquired', etag, holder: null})
+  }
+
+  const acquired = await createOnce()
+  if (acquired.success === true) {
+    return toAcquired(acquired.data.etag)
   }
 
   if (isPreconditionFailed(acquired.error) === false) {
     return err(acquired.error)
   }
 
-  const existing = await getObject.data(key.data)
+  let existing = await getObject.data(key.data)
+  if (existing.success === false && isNotFound(existing.error) === true) {
+    // The holder released between our failed create and the read: retry the create once. A second
+    // precondition failure with the lock still absent means we keep losing races; report `conflict`.
+    const retried = await createOnce()
+    if (retried.success === true) {
+      return toAcquired(retried.data.etag)
+    }
+    if (isPreconditionFailed(retried.error) === false) {
+      return err(retried.error)
+    }
+    existing = await getObject.data(key.data)
+    if (existing.success === false && isNotFound(existing.error) === true) {
+      return ok({acquired: false, outcome: 'conflict', etag: null, holder: null})
+    }
+  }
   if (existing.success === false) {
     return err(existing.error)
   }
@@ -223,8 +251,9 @@ export async function releaseLock(
   repo: string,
   etag: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  scope: LockScope = 'repo',
 ): Promise<Result<void, Error>> {
-  const key = getLockKey(config, repo)
+  const key = getLockKey(config, repo, scope)
   if (key.success === false) {
     return err(key.error)
   }
@@ -244,8 +273,9 @@ export async function renewLease(
   lockRecord: LockRecord,
   etag: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  scope: LockScope = 'repo',
 ): Promise<Result<{etag: string}, Error>> {
-  const key = getLockKey(config, repo)
+  const key = getLockKey(config, repo, scope)
   if (key.success === false) {
     return err(key.error)
   }

@@ -863,6 +863,46 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     expect(saveState).toHaveBeenCalledWith('cacheSaved', 'durable')
   })
 
+  it('declines session persistence for a run that did not acquire the Action lock, with S3 configured', async () => {
+    // #given S3 coordination is configured but this run never held the Action lock (contended or lock error)
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {releaseLock} = await import('@fro-bot/runtime')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs with persistence blocked
+    await runCleanup(
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'b', region: 'us-east-1', prefix: 'p'},
+        lockEtag: null,
+        leaseRenewal: null,
+        skipSessionPersistence: true,
+      }),
+    )
+
+    // #then neither backend is attempted, the decline is the existing 'declined-for-safety' value the post hook
+    // honors, the reason names the missing lock, and lock release stays a no-op
+    expect(saveCache).not.toHaveBeenCalled()
+    const core = await import('@actions/core')
+    expect(core.saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+    expect(core.setOutput).toHaveBeenCalledWith('cache-save-result', 'declined-for-safety')
+    expect(vi.mocked(core.summary.addRaw).mock.calls.flat().join(' ')).toContain(
+      'did not acquire the Action coordination lock',
+    )
+    expect(releaseLock).not.toHaveBeenCalled()
+  })
+
+  it('s3-disabled runs keep persisting normally when skipSessionPersistence is not set', async () => {
+    // #given no coordination (S3 disabled): the run has no lock to lack
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs without the flag
+    await runCleanup(baseOptions({skipSessionPersistence: false}))
+
+    // #then the save proceeds as before
+    expect(saveCache).toHaveBeenCalledTimes(1)
+  })
+
   it('surfaces a declined persistence as a visible, named reason in the job summary, not a silent skip', async () => {
     // #given the review finding this unit exists to fix: an unknown ledger entry must not
     // silently skip persistence
@@ -902,7 +942,13 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
 
     // #then release uses the renewed ETag, never the stale acquisition-time one
     expect(lease.stop).toHaveBeenCalledTimes(1)
-    expect(releaseLock).toHaveBeenCalledWith(expect.any(Object), 'owner/repo', '"etag-renewed"', expect.any(Object))
+    expect(releaseLock).toHaveBeenCalledWith(
+      expect.any(Object),
+      'owner/repo',
+      '"etag-renewed"',
+      expect.any(Object),
+      'action',
+    )
   })
 
   it('still reaches lock release after a hung renewal, and a failed conditional delete does not throw out of cleanup', async () => {
@@ -929,7 +975,13 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     // #then release is still attempted with the (stale) etag stop() settled on, and the
     // failed conditional delete is swallowed -- non-fatal, matching every other release failure
     expect(lease.stop).toHaveBeenCalledTimes(1)
-    expect(releaseLock).toHaveBeenCalledWith(expect.any(Object), 'owner/repo', '"etag-stale"', expect.any(Object))
+    expect(releaseLock).toHaveBeenCalledWith(
+      expect.any(Object),
+      'owner/repo',
+      '"etag-stale"',
+      expect.any(Object),
+      'action',
+    )
   })
 })
 

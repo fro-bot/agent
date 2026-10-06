@@ -92,14 +92,36 @@ function backgroundDispatchEvent(sessionID: string, jobId: string, label = 'back
   } as unknown as Event
 }
 
-function injectedCompletionEvent(rootSessionID: string, childSessionID: string, state: 'completed' | 'error'): Event {
+/** Upstream's injected completion: a whole, synthetic text part on a root user message, with no `time`. */
+function injectedCompletionEvent(
+  rootSessionID: string,
+  childSessionID: string,
+  state: 'completed' | 'error',
+  messageID?: string,
+): Event {
   return {
     type: 'message.part.updated',
     properties: {
       sessionID: rootSessionID,
       part: {
         type: 'text',
+        synthetic: true,
+        ...(messageID === undefined ? {} : {messageID, sessionID: rootSessionID}),
         text: `<task id="${childSessionID}" state="${state}">\n<task_result>\ndone\n</task_result>\n</task>`,
+      },
+    },
+  } as unknown as Event
+}
+
+/** An assistant text part (streamed: carries `time`, never `synthetic`) quoting completion markup. */
+function assistantQuotedCompletionEvent(rootSessionID: string, childSessionID: string): Event {
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID: rootSessionID,
+      part: {
+        type: 'text',
+        text: `<task id="${childSessionID}" state="completed">\nquoted\n</task>`,
         time: {start: 1, end: 2},
       },
     },
@@ -200,6 +222,137 @@ describe('processEventStream — ownership ledger integration', () => {
     // #then the entry settles
     expect(ledger.outstanding()).toBe(0)
     expect(ledger.snapshot()).toContainEqual({sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'settled'})
+  })
+
+  it('settles the ledger entry when an error-state completion turn is injected', async () => {
+    // #given a ledger with an outstanding child, and an injected error-state completion with no `time`
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const eventStream = createMockEventStream([injectedCompletionEvent(ROOT_SESSION_ID, CHILD_SESSION_ID, 'error')])
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the entry settles
+    expect(ledger.snapshot()).toContainEqual({sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'settled'})
+  })
+
+  it("does not settle from an assistant text part that quotes a tracked child's completion markup", async () => {
+    // #given a ledger with an outstanding child, and a non-synthetic assistant text part quoting its marker
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([assistantQuotedCompletionEvent(ROOT_SESSION_ID, CHILD_SESSION_ID)], () =>
+      abortController.abort(),
+    )
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      undefined,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the entry stays outstanding
+    expect(ledger.outstanding()).toBe(1)
+  })
+
+  it('registers the pending parent barrier for the injected message and is idempotent on a duplicate event', async () => {
+    // #given an adopted child, an armed root-freshness tracker, and the injected part delivered twice
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+      rootFreshness,
+    }
+    const injected = injectedCompletionEvent(ROOT_SESSION_ID, CHILD_SESSION_ID, 'completed', 'msg_injected')
+    // Resumed only after the consumer has fully handled the first event, so the revision read here is
+    // the one the first injected event produced.
+    let revisionAfterFirstEvent: number | null = null
+    const eventStream = (async function* () {
+      yield injected
+      revisionAfterFirstEvent = rootFreshness.revision
+      yield injected
+    })()
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the child settled and the injected parent message is the pending barrier
+    expect(ledger.outstanding()).toBe(0)
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_injected')
+
+    // #and the duplicate event for the same message id did not re-invalidate freshness
+    expect(revisionAfterFirstEvent).not.toBeNull()
+    expect(rootFreshness.revision).toBe(revisionAfterFirstEvent)
+  })
+
+  it("registers the pending parent barrier for an untracked child's injected completion without touching the ledger", async () => {
+    // #given a ledger tracking a different child, and an injected completion for a child that was never adopted
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_other', 'other task')
+    const ledgerBefore = ledger.snapshot()
+    consoleMocks.outputTextContent.mockClear()
+    const rootFreshness = createRootFreshnessTracker()
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+      rootFreshness,
+    }
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream(
+      [injectedCompletionEvent(ROOT_SESSION_ID, CHILD_SESSION_ID, 'completed', 'msg_injected')],
+      () => abortController.abort(),
+    )
+
+    // #when the stream is processed
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the injected root turn is a pending barrier, nothing is settled or adopted, and the
+    // recognized part is not rendered as agent text
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_injected')
+    expect(ledger.snapshot()).toEqual(ledgerBefore)
+    expect(ledger.isTracked(CHILD_SESSION_ID)).toBe(false)
+    expect(consoleMocks.outputTextContent).not.toHaveBeenCalled()
   })
 
   it('does not settle from a similar-looking text part on a descendant session (only the parent injects completion)', async () => {

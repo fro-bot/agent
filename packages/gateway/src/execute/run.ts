@@ -1024,8 +1024,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // lock is held and heartbeat renewal is running, before the EXECUTING transition — because
       // /update reads and can mutate the shared per-repo checkout at
       // `/workspace/repos/{owner}/{repo}`. Running it before the lock (as gates 1-3 do) would let
-      // a second run on the same repo (a different channel, the operator web surface, or a GitHub
-      // Action run) observe or mutate the tree concurrently with the lock holder.
+      // a second gateway run on the same repo (a different channel or the operator web surface)
+      // observe or mutate the tree concurrently with the lock holder. GitHub Action runs use a
+      // separate lock and never touch this checkout.
       //
       // The HTTP deadline passed to /update is the lesser of 100s and this run's own remaining
       // wall-clock budget (plan Unit 7) — `client.update()` itself takes the min of the two, so

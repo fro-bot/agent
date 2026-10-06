@@ -1,5 +1,5 @@
 import type {ErrorInfo} from '@fro-bot/runtime'
-import type {createOpencode} from '@opencode-ai/sdk'
+import type {createOpencode, Event} from '@opencode-ai/sdk'
 /**
  * Unit 9: gate every terminal path.
  *
@@ -36,6 +36,7 @@ import {
   createRootFreshnessTracker,
   invalidateRootFreshness,
   markRootIdleCandidate,
+  processEventStream,
   registerPendingRootUserMessage,
   requireRootRevalidation,
   resolvePendingRootUserMessage,
@@ -3004,5 +3005,98 @@ describe("Finding 3 — the candidate's own revision is re-checked at final admi
 
     // #then completion is admitted exactly as the non-racing case does
     expect(observation.settlement.kind).toBe('completion-observed')
+  })
+})
+
+describe('adopted background child through the SSE-to-poll path', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('admits completion after the upstream-shaped injected completion settles the child and its reply answers the injected turn', async () => {
+    // #given a child adopted from a completed background `task` part, then upstream's injected root
+    // completion: a whole synthetic text part on a root user message, with no `time`
+    vi.useFakeTimers()
+    const ledger = createOwnershipLedger()
+    const rootFreshness = createRootFreshnessTracker()
+    armRootFreshness(rootFreshness)
+    const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+    const events: readonly Event[] = [
+      {
+        type: 'message.part.updated',
+        properties: {
+          sessionID: 'ses_123',
+          part: {
+            type: 'tool',
+            tool: 'task',
+            state: {status: 'completed', title: 'do the thing', metadata: {background: true, jobId: 'ses_child'}},
+          },
+        },
+      },
+      {
+        type: 'message.part.updated',
+        properties: {
+          sessionID: 'ses_123',
+          part: {
+            id: 'prt_injected',
+            sessionID: 'ses_123',
+            messageID: 'msg_injected',
+            type: 'text',
+            synthetic: true,
+            text: '<task id="ses_child" state="completed">\n<task_result>\ndone\n</task_result>\n</task>',
+          },
+        },
+      },
+    ] as unknown as readonly Event[]
+
+    // #when the stream delivers both events
+    await processEventStream(
+      (async function* () {
+        for (const event of events) yield event
+      })(),
+      'ses_123',
+      new AbortController().signal,
+      mockLogger,
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the child is settled and the injected parent message is the pending barrier
+    expect(ledger.outstanding()).toBe(0)
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_injected')
+
+    // #when the qualified final assistant reply to the injected turn is stored and the root is idle
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {info: {id: 'msg_reply', role: 'assistant', time: {completed: 2}, finish: 'stop', parentID: 'msg_injected'}},
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+      undefined,
+      ledger,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then completion is admitted and the barrier is resolved
+    expect(observation.settlement.kind).toBe('completion-observed')
+    expect(rootFreshness.pendingParentMessageId).toBeNull()
   })
 })
