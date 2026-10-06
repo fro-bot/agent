@@ -173,7 +173,7 @@ A few inputs most workflows touch:
 | `prompt` | No | — | Custom prompt for the agent |
 | `output-mode` | No | `auto` | Requested delivery mode for `schedule`/`workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`) |
 | `session-retention` | No | `50` | Number of sessions to retain before pruning |
-| `s3-backup` | No | `false` | Enable S3 write-through backup |
+| `s3-backup` | No | `false` | Enable S3 write-through backup. Also enables Action coordination: a lock acquisition error fails the run (`invocation-outcome=failed`) instead of running unlocked |
 | `s3-bucket` | No | — | S3 bucket for backup (required if `s3-backup` is true) |
 | `aws-region` | No | — | AWS region for the S3 bucket (`auto` for R2) |
 | `s3-endpoint` | No | — | Custom S3-compatible endpoint URL (R2, B2, MinIO) |

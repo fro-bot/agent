@@ -64,7 +64,7 @@ The project is organized as a Bun workspace monorepo with two workspace areas:
 | --- | --- | --- |
 | `@fro-bot/runtime` | `packages/runtime/` | Shared runtime library: agent prompt, session management, object store, coordination primitives, and shared utilities. Consumed by both the Action and the Gateway. |
 | `@fro.bot/harness` | `packages/harness/` | Published, patched OpenCode binary built via LLM-merge integration. Acts as a drop-in replacement for the stock OpenCode CLI in the action setup. Ships as a main package plus per-platform binary packages (`@fro.bot/harness-linux-x64`, etc.). |
-| `@fro-bot/gateway` | `packages/gateway/` | Discord gateway daemon. Listens for Discord mentions and slash commands, acquires the per-repo coordination lock, and dispatches agent runs via the runtime. Built with Effect for typed error handling and structured concurrency. |
+| `@fro-bot/gateway` | `packages/gateway/` | Discord gateway daemon. Listens for Discord mentions and slash commands, acquires the per-repo gateway lock (`repo.json`), and dispatches agent runs via the runtime. Built with Effect for typed error handling and structured concurrency. |
 | Action root | `src/` + `apps/action/` | The GitHub Action itself. Contains the harness (orchestration phases), features (triggers, comments, reviews, observability), and service adapters (GitHub API, cache, setup). Imports `@fro-bot/runtime` for core logic. |
 | workspace-agent | `apps/workspace-agent/` | Sandboxed Hono HTTP service alongside the gateway. It clones, inspects, updates, and recovers checkouts in the workspace container; hosts an unprivileged OpenCode process behind a bearer-token proxy; and exposes health/readiness probes. |
 
@@ -87,7 +87,7 @@ All layers may also import from `@fro-bot/runtime`, which is treated as a peer d
 
 The action defines two Node 24 entry points in `action.yaml`:
 
-- **`dist/main.js`** — The primary execution path. Bootstraps the environment, routes the incoming GitHub event, acquires a coordination lock, acknowledges the request, runs the AI agent, finalizes results, and attempts a first cache save.
+- **`dist/main.js`** — The primary execution path. Bootstraps the environment, routes the incoming GitHub event, acquires the per-repo Action lock (`action.json`; fail-closed when S3 is configured), acknowledges the request, runs the AI agent, finalizes results, and attempts a first cache save.
 - **`dist/post.js`** — A post-action hook (RFC-017) that runs after the main step completes, even on failure or cancellation. Its sole job is a durable cache save so that session state survives even if the main step is killed mid-execution.
 
 Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `post.ts` delegates to `harness/post.ts`.
@@ -148,7 +148,7 @@ The runtime package exports five module groups:
 
 **Object Store** (`object-store/`) — S3-compatible persistence: adapter, key builder, content sync, and endpoint/key validation (see [[Session Persistence]]).
 
-**Coordination** (`coordination/`) — S3-backed distributed lock, heartbeat controller, and run-state primitives for cross-surface mutual exclusion (see [[Execution Lifecycle]]). Run state gained a details-patch primitive alongside the phase-transition helper, because the transition helper refuses a same-phase write and background ownership changes occur mid-execution, with no phase change to hang them on. It re-reads the record on every call rather than threading a caller-held etag — a caller's etag goes stale the moment the heartbeat's own read-modify-write commits — and treats a lost race as non-fatal, since the next ownership change retries with fresher data.
+**Coordination** (`coordination/`) — S3-backed distributed lock, heartbeat controller, and run-state primitives for per-surface mutual exclusion — gateway runs on `repo.json`, Action runs on `action.json` (see [[Execution Lifecycle]]). Run state gained a details-patch primitive alongside the phase-transition helper, because the transition helper refuses a same-phase write and background ownership changes occur mid-execution, with no phase change to hang them on. It re-reads the record on every call rather than threading a caller-held etag — a caller's etag goes stale the moment the heartbeat's own read-modify-write commits — and treats a lost race as non-fatal, since the next ownership change retries with fresher data.
 
 **Shared** (`shared/`) — Logger with credential redaction, Result types, constants, environment helpers, async utilities, and formatting.
 

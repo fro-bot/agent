@@ -29,7 +29,10 @@ inputs:
     required: false
     default: '50'
   s3-backup:
-    description: Enable S3 write-through backup
+    description: >-
+      Enable S3 write-through backup. Also enables Action coordination: runs for the same repository take a per-repo
+      lock, a contended run is skipped, and a lock acquisition error fails the run (invocation-outcome=failed)
+      instead of running unlocked.
     required: false
     default: 'false'
   s3-bucket:
