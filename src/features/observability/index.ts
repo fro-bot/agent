@@ -1,5 +1,7 @@
 export {writeInvocationOutcomeSummary, writeJobSummary} from './job-summary.js'
 
+export type {InvocationSkipDetail} from './job-summary.js'
+
 export {createMetricsCollector} from './metrics.js'
 
 export type {MetricsCollector} from './metrics.js'

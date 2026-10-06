@@ -4,6 +4,13 @@ last-updated: "2026-09-27"
 updated-by: "e6efc1f1"
 sources:
   - action.yaml
+  - src/harness/phases/routing.ts
+  - src/features/triggers/router.ts
+  - src/features/triggers/skip-conditions-pr.ts
+  - src/features/triggers/context-builders-pr-issues.ts
+  - src/services/github/api.ts
+  - src/features/reviews/review-guards.ts
+  - src/features/agent/response-post.ts
   - src/harness/outcome.ts
   - src/features/observability/job-summary.ts
   - docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md
@@ -32,7 +39,45 @@ If the agent does not react to a mention or event:
 - **Verify credentials** — the `OPENCODE_AUTH_JSON` secret must be well-formed JSON mapping provider IDs to credentials.
 - **Check the trigger condition** — for comment triggers, `@fro-bot` must appear in the comment body, and the workflow `if:` guard must match the event.
 - **Confirm mention identity** — `@fro-bot` mentions require a token whose login matches the mention. `GITHUB_TOKEN` posts as `@github-actions`, so a PAT or GitHub App token is required to answer `@fro-bot`.
-- **Review access control** — only `OWNER`, `MEMBER`, and `COLLABORATOR` authors are processed; bot accounts and fork pull requests are skipped by design.
+- **Review access control** — only `OWNER`, `MEMBER`, and `COLLABORATOR` authors are processed; bot accounts and fork pull requests are skipped by design. A skipped run names its reason in a `Fro Bot skipped this event (<reason>)` notice and in the job summary's Invocation Outcome section. For a pull request from an unauthorized or bot author, see [Review Access and the Review-Request Path](#review-access-and-the-review-request-path).
+
+## Review Access and the Review-Request Path
+
+A skipped run reports its reason in two places besides the log: a `core.notice` annotation (`Fro Bot skipped this event (<reason>): <message>`) and the **Skip reason** line under Invocation Outcome in the job summary. The skip posts no comment and no reaction.
+
+**Who is authorized.** `pull_request` events are processed only when the author association is `OWNER`, `MEMBER`, or `COLLABORATOR`. Anything else is skipped with `unauthorized_author`.
+
+**Bot authors.** For `opened`, `synchronize`, and `reopened`, a bot sender (a login ending in `[bot]`) is skipped with `self_comment`. That covers PRs opened by bot accounts, including a repository's own first-party GitHub App. The check reads the webhook _sender_, not the PR author field, so a bot that pushes to a human's PR is skipped too.
+
+**The review-request override.** `review_requested` and `ready_for_review` are the exception. For these two actions the action resolves the webhook sender's repository permission through the collaborator-permission API and maps it to an association: `admin` → `OWNER`, `maintain` → `MEMBER`, `write` or `triage` → `COLLABORATOR`. That value replaces the PR author's association before the authorization check, so an unauthorized PR author is admitted when the person who requested the review is authorized. The bot-sender skip does not apply to these two actions. A `read`/`none` permission or a failed lookup resolves to nothing, and the PR author's own association applies.
+
+The review must also be requested from the bot, or the event is skipped with `bot_not_requested`. For `review_requested` the requested reviewer must match the bot's login; for `ready_for_review` the bot must already be among the PR's requested reviewers. Matching is case-insensitive and ignores a trailing `[bot]`, so `fro-bot` and `fro-bot[bot]` are equivalent.
+
+**Recipe.** To have the bot review a PR from an author the guard skips, such as a first-party App:
+
+1. Add `review_requested` to `on.pull_request.types`.
+2. Request the review from the identity behind the action's `github-token`. If that token authenticates as something other than `fro-bot`, request that identity.
+3. Make the request with a human account's credentials that hold `write` or higher on the repository. The App's own token will not work: it is not a collaborator, so its permission resolves to nothing. `GITHUB_TOKEN` will not work either: events it creates do not start new workflow runs.
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, review_requested]
+```
+
+In the workflow that opens the PR, request the review as the human account:
+
+```yaml
+- run: gh pr edit "$PR_NUMBER" --add-reviewer fro-bot
+  env:
+    GH_TOKEN: ${{ secrets.MAINTAINER_PAT }} # a human account with write or admin on this repository
+    PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
+```
+
+**Limits.**
+
+- The review guard (`checkForkOrSelfGuard` in `src/features/reviews/review-guards.ts`) never posts `APPROVE` on a PR whose author matches the reviewing identity after lowercasing and stripping `[bot]`, and never on a fork PR. `REQUEST_CHANGES` is still posted. On a `pull_request` event an approving verdict that the guard refuses posts no review and the delivery fails as `review-guard-blocked`, so the override cannot produce an approval in that case.
+- A review request made by the App or by `GITHUB_TOKEN` does not admit the PR. The first resolves to no permission; the second starts no run.
 
 ## Cache Issues
 
