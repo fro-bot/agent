@@ -728,6 +728,72 @@ describe('CI workflow: Test GitHub Action checkout', () => {
   })
 })
 
+// The daily maintenance run publishes one report issue per UTC day. These tests pin the marker-based
+// lookup, same-day idempotency, previous-report closure, the one-time #252 migration, and the exact
+// issue-write scope so the run cannot drift back to a rolling issue or widen its mutations.
+describe('fro-bot workflow — per-day report issue prompt', () => {
+  const MARKER = '<!-- fro-bot-daily-report-v1 -->'
+
+  const normalizedPrompt = (): string => {
+    const workflow = parse(readFileSync(WORKFLOW_PATH, 'utf8')) as {readonly env: Record<string, unknown>}
+    const prompt = workflow.env.SCHEDULE_PROMPT
+    if (typeof prompt !== 'string') throw new TypeError('SCHEDULE_PROMPT is missing from the workflow env')
+    return prompt.replaceAll(/\s+/g, ' ').trim()
+  }
+
+  it('titles each report with its UTC date and identifies reports by marker, not title search alone', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then the title format and marker match the other fro-bot repos, and lookup is marker-based
+    expect(prompt).toContain('Daily Fro Bot Report — YYYY-MM-DD (UTC)')
+    expect(prompt).toContain(`The first line of every report body is this marker: ${MARKER}`)
+    expect(prompt).toContain('identify reports by the marker, never by a title search alone')
+  })
+
+  it('updates the same-day report instead of creating a duplicate', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then an existing report for today's exact title is rewritten, and a closed one stays closed
+    expect(prompt).toContain("If a report whose title is exactly today's title exists, rewrite its body")
+    expect(prompt).toContain('Never create a second report for the same date. Do not reopen it if it is closed.')
+  })
+
+  it('closes every other open report with a link to the new one', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then superseded reports are found by marker and closed with a pointer to today's report
+    expect(prompt).toContain("close every other open report (marker present, title not today's)")
+    expect(prompt).toContain('Superseded by <today')
+  })
+
+  it('closes the legacy rolling issue #252 explicitly, once, and never edits or reopens it', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then #252 carries no marker so its closure is spelled out and gated on its exact title and open state
+    expect(prompt).toContain('It carries no marker, so it is closed explicitly')
+    expect(prompt).toContain('If it is open and its title is exactly "Daily Maintenance Report"')
+    expect(prompt).toContain('If it is already closed, do nothing. Never edit or reopen #252.')
+  })
+
+  it('permits exactly the four report mutations and drops the rolling-issue rules', () => {
+    // #given the schedule prompt
+    const prompt = normalizedPrompt()
+
+    // #then the write scope is enumerated, and the old rolling-issue and Historical Summary logic is gone
+    expect(prompt).toContain(
+      "The only issue mutations permitted by this section are: create today's report, edit today's report, close a superseded report, and close #252 once.",
+    )
+    expect(prompt).toContain('Do NOT label, assign, or reopen any report.')
+    expect(prompt).not.toContain('SINGLE rolling issue')
+    expect(prompt).not.toContain('Historical Summary')
+    expect(prompt).not.toContain('ONE issue only')
+  })
+})
+
 // The #1598 runtime-verification sweep is a temporary addition to the daily maintenance prompt.
 // It grants the schedule run exactly one extra mutable issue and nothing else, so these tests pin
 // the bounds that keep it from becoming a general-purpose issue-editing licence.
@@ -767,10 +833,10 @@ describe('fro-bot workflow — #1598 runtime-verification sweep prompt', () => {
     // #then the carve-out is attached to the prohibition itself, not floating on a later sentence,
     // and it names exactly the two permitted mutations -- editing the region and closing the issue
     expect(prompt).toContain(
-      'Do NOT comment on or modify individual issues/PRs, except #1598 while it is open: the only permitted mutations there are editing the delimited region below and closing the issue.',
+      'Do NOT comment on or modify any other individual issue/PR, except #1598 while it is open: the only permitted mutations there are editing the delimited region below and closing the issue.',
     )
     expect(prompt).toContain('Do NOT label, comment on, or reopen #1598')
-    expect(prompt).toContain('Apart from the #1598 exception, this run must update ONE issue only.')
+    expect(prompt).toContain('Apart from the #1598 exception, this run must mutate no other issue.')
   })
 
   it('grants the daily run exactly one extra mutable issue and skips once it is closed', () => {

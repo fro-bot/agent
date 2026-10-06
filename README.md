@@ -123,7 +123,7 @@ Trusted same-repository, non-fork PR mentions on `issue_comment` from `OWNER`, `
 
 ### Scheduled maintenance
 
-Run the agent on a schedule to maintain a rolling report:
+Run the agent on a schedule to publish one report issue per day:
 
 ```yaml
 name: Daily Maintenance Report
@@ -144,9 +144,11 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           prompt: |
-            Perform daily repository maintenance and update a SINGLE rolling
-            issue titled "Daily Maintenance Report". Append a dated section with
-            summary metrics, stale issues and PRs, and recommended actions.
+            Perform daily repository maintenance. Create one issue titled
+            "Daily Maintenance Report — YYYY-MM-DD (UTC)" for today, or update
+            it if it already exists, with summary metrics, stale issues and PRs,
+            and recommended actions. Then close any older open report, with a
+            comment linking today's.
 ```
 
 ## Configuration

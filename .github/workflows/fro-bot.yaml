@@ -78,24 +78,44 @@ concurrency:
 
 env:
   SCHEDULE_PROMPT: |
-    Perform daily repository maintenance and update a SINGLE rolling issue titled
-    "Daily Maintenance Report" in this repository.
+    Perform daily repository maintenance and publish ONE report issue per UTC day
+    in this repository.
 
-    Search for an open issue with this exact title. If multiple matches exist,
-    use the most recently updated one. If no open issue exists, create it.
-    If the most recent matching issue is closed, reopen it instead of creating
-    a new one.
+    REPORT ISSUE
+    Get today's UTC date with `date -u +%Y-%m-%d`. Today's report title is exactly
+    (em dash, no other variation):
+      Daily Fro Bot Report — YYYY-MM-DD (UTC)
+    The first line of every report body is this marker:
+      <!-- fro-bot-daily-report-v1 -->
+    A report is an issue whose body contains the marker; identify reports by the
+    marker, never by a title search alone. List them with:
+      gh issue list --state all --limit 200 --json number,title,state,url,body
+    and filter the JSON locally for the marker.
+    1. If a report whose title is exactly today's title exists, rewrite its body
+       with `gh issue edit <number> --body-file`. Never create a second report
+       for the same date. Do not reopen it if it is closed.
+    2. Otherwise create today's report with `gh issue create --body-file`.
+    3. Then close every other open report (marker present, title not today's)
+       with `gh issue close <number> --comment "Superseded by <today's report URL>"`.
+       When the run ends exactly one report is open, unless a maintainer closed
+       today's.
 
-    Append a new dated section for each run using "## YYYY-MM-DD (UTC)".
-    To keep the issue bounded: after appending today's section, replace any
-    individual daily sections older than 14 days with a single
-    "## Historical Summary" section that lists only the count of prior runs
-    and any items that remained unresolved across those runs. If a Historical Summary already exists, update it in place — do not create a second one.
+    MIGRATION (one-time)
+    #252 "Daily Maintenance Report" was the former rolling report. It carries no
+    marker, so it is closed explicitly, after today's report exists: read it with
+    `gh issue view 252 --json title,state`. If it is open and its title is exactly
+    "Daily Maintenance Report", run
+    `gh issue close 252 --comment "Replaced by per-day reports: <today's report URL>"`.
+    If it is already closed, do nothing. Never edit or reopen #252.
 
     Include links only (no full content duplication). Keep it concise and actionable.
-    Flag items that appear in the stale list for the first time (not present in the previous dated section) with a ★ marker.
+    Flag items that appear in the stale list for the first time (not present in the
+    previous report) with a ★ marker. The previous report is the newest older
+    report by the marker; on the first run it is the newest dated section of #252.
+    If neither is readable, flag nothing and say so in Notes.
 
-    Sections (in order):
+    Report body, in order: the marker line, a `## Daily Fro Bot Report — YYYY-MM-DD (UTC)`
+    heading, then these sections as `###` headings:
     - Summary metrics (issues opened since last run, currently open PRs, stale
       issues/PRs count, main branch check status, security alerts)
 
@@ -116,11 +136,14 @@ env:
     - Recommended actions (bulleted checklist)
     - Notes (use "data unavailable" for any inaccessible data source)
 
-    Do NOT comment on or modify individual issues/PRs, except #1598 while it is
+    WRITE SCOPE
+    The only issue mutations permitted by this section are: create today's report,
+    edit today's report, close a superseded report, and close #252 once. Do NOT
+    comment on or modify any other individual issue/PR, except #1598 while it is
     open: the only permitted mutations there are editing the delimited region
     below and closing the issue. Do NOT label, comment on, or reopen #1598, and
-    do NOT apply labels or open PRs. Apart from the #1598 exception, this run
-    must update ONE issue only.
+    do NOT apply labels or open PRs. Do NOT label, assign, or reopen any report.
+    Apart from the #1598 exception, this run must mutate no other issue.
 
     == RUNTIME VERIFICATION SWEEP (fro-bot/agent#1598) ==
     While #1598 is open, it is the one additional issue this run may update.
