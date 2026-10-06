@@ -928,9 +928,10 @@ jobs:
           # Proves the workspace's only internet path is mitmproxy:
           #   (a) direct internet request (no proxy) → fails (sandbox-net is internal:true)
           #   (b) non-allowlisted host through mitmproxy → 403
-          #   (c) allowlisted host through mitmproxy → 200, AND mitmproxy logs the flow
+          #   (c) allowlisted host through mitmproxy → genuine upstream response (any
+          #       status; unauthenticated GitHub API may be rate-limited), AND mitmproxy logs the flow
           # The workspace image carries the mitmproxy CA trust + proxy env via its
-          # entrypoint; an arbitrary container would not and the HTTPS 200 case would
+          # entrypoint; an arbitrary container would not and the HTTPS allowlisted case would
           # fail for the wrong reason (TLS error, not a routing failure).
           WORKSPACE_IMAGE=fro-bot-workspace:smoke bash deploy/egress-smoke.sh
 

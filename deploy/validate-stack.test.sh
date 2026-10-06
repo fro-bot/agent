@@ -5165,6 +5165,67 @@ echo "    compose.yaml image : ${COMPOSE_MITM_IMAGE:-<not found>}"
 echo "    egress-smoke.sh    : $(grep 'image:.*mitmproxy' "${EGRESS_SMOKE_FILE}" | head -1 | sed 's/^[[:space:]]*//' || echo '<no mitmproxy image line>')"
 
 # ---------------------------------------------------------------------------
+# EGRESS-C — probe (c) of egress-smoke.sh must accept any genuine upstream
+# response (incl. a rate-limit 403/429) and reject everything that is not one.
+# Docker-free: feeds canned `curl -sv` output to upstream_response_verified.
+# Fixture shapes: GitHub's rate-limited 403 is captured from CI (issue #1633);
+# the block and error shapes follow deploy/mitmproxy/allowlist.py and
+# mitmproxy's own error response (no x-github-request-id).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- EGRESS-C: probe (c) upstream-response classification ---"
+# shellcheck source=deploy/tests/upstream-response.sh
+source deploy/tests/upstream-response.sh
+
+egress_c_curl_output() {
+  local tls_verdict="$1" issuer="$2" status_line="$3" extra_header="$4"
+  printf '%s\n' \
+    '< HTTP/1.1 200 Connection established' \
+    '* Server certificate:' \
+    "*   issuer: ${issuer}" \
+    "${tls_verdict}" \
+    "< ${status_line}" \
+    'content-type: application/json; charset=utf-8' \
+    "${extra_header}"
+}
+EGRESS_C_VERIFIED='* SSL certificate verified via OpenSSL.'
+EGRESS_C_MITM='CN=mitmproxy; O=mitmproxy'
+EGRESS_C_GH_ID='< x-github-request-id: 5C00:12486F:8797F:A2370:6AAECD51'
+
+egress_c_expect() {
+  local name="$1" want="$2" rc="$3" out="$4" got=fail
+  if upstream_response_verified "${rc}" "${out}"; then got=pass; fi
+  if [[ "${got}" == "${want}" ]]; then
+    pass "EGRESS-C: ${name} → ${want}"
+  else
+    fail "EGRESS-C: ${name} → expected ${want}, got ${got}"
+  fi
+}
+
+egress_c_expect "upstream 200 via mitmproxy" pass 0 \
+  "$(egress_c_curl_output "${EGRESS_C_VERIFIED}" "${EGRESS_C_MITM}" 'HTTP/2 200 ' "${EGRESS_C_GH_ID}")"
+egress_c_expect "upstream rate-limit 403 via mitmproxy (#1633)" pass 0 \
+  "$(egress_c_curl_output "${EGRESS_C_VERIFIED}" "${EGRESS_C_MITM}" 'HTTP/2 403 ' "${EGRESS_C_GH_ID}")"
+egress_c_expect "upstream 429 via mitmproxy" pass 0 \
+  "$(egress_c_curl_output "${EGRESS_C_VERIFIED}" "${EGRESS_C_MITM}" 'HTTP/2 429 ' "${EGRESS_C_GH_ID}")"
+egress_c_expect "older curl 'verify ok' wording" pass 0 \
+  "$(egress_c_curl_output '* SSL certificate verify ok.' "${EGRESS_C_MITM}" 'HTTP/2 403 ' "${EGRESS_C_GH_ID}")"
+
+# Allowlist block on CONNECT: mitmproxy 403s the tunnel, curl exits 56 and never reaches TLS.
+egress_c_expect "allowlist block (CONNECT refused, curl exit 56)" fail 56 \
+  "$(printf '%s\n' '< HTTP/1.1 403 Forbidden' 'Blocked by fro-bot egress allowlist: api.github.com')"
+# A block served inside the MITM TLS session (request hook): verified TLS + 403, but no GitHub header.
+egress_c_expect "mitmproxy-served 403 over verified TLS" fail 0 \
+  "$(egress_c_curl_output "${EGRESS_C_VERIFIED}" "${EGRESS_C_MITM}" 'HTTP/2 403 ' 'Blocked by fro-bot egress allowlist: api.github.com')"
+egress_c_expect "mitmproxy upstream-connect error 502" fail 0 \
+  "$(egress_c_curl_output "${EGRESS_C_VERIFIED}" "${EGRESS_C_MITM}" 'HTTP/1.1 502 Bad Gateway' 'Server: mitmproxy')"
+egress_c_expect "TLS verification failure (curl exit 60)" fail 60 \
+  "$(egress_c_curl_output '* SSL certificate problem: unable to get local issuer certificate' "${EGRESS_C_MITM}" 'HTTP/2 403 ' "${EGRESS_C_GH_ID}")"
+egress_c_expect "timeout (curl exit 28)" fail 28 ""
+egress_c_expect "response not issued via mitmproxy CA" fail 0 \
+  "$(egress_c_curl_output "${EGRESS_C_VERIFIED}" 'CN=GTS CA 1P5; O=Google Trust Services' 'HTTP/2 200 ' "${EGRESS_C_GH_ID}")"
+
+# ---------------------------------------------------------------------------
 # Shared fixture: a minimal but fully-hardened workspace service, used as the
 # baseline for TEST 69-75 (workspace uid-isolation Invariant 8). Each negative
 # test starts from this baseline and mutates exactly one hardening key.
