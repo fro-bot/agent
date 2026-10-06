@@ -125,6 +125,31 @@ describe("Npm.add", () => {
     expect(stderr, stdout).toBe("")
     expect(code).toBe(0)
   }, 30_000)
+
+  test("fails with InstallFailedError when the registry never responds within the timeout", async () => {
+    await using tmp = await tmpdir()
+    const server = Bun.serve({ port: 0, fetch: () => new Promise(() => {}) })
+    const spec = "never-resolves-package@1.0.0"
+    process.env.npm_config_registry = `http://127.0.0.1:${server.port}/`
+    process.env.OPENCODE_NPM_INSTALL_TIMEOUT = "1000"
+    try {
+      const error = await Effect.gen(function* () {
+        const npm = yield* Npm.Service
+        return yield* npm.add(spec)
+      }).pipe(
+        Effect.flip,
+        Effect.scoped,
+        Effect.provide(npmLayer(path.join(tmp.path, "cache"))),
+        Effect.runPromise,
+      )
+
+      expect(error).toBeInstanceOf(Npm.InstallFailedError)
+    } finally {
+      delete process.env.npm_config_registry
+      delete process.env.OPENCODE_NPM_INSTALL_TIMEOUT
+      server.stop()
+    }
+  })
 })
 
 describe("Npm.install", () => {
