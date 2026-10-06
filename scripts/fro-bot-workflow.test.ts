@@ -91,6 +91,13 @@ function normalizedSchedulePrompt(path: string): string {
   return prompt.replaceAll(/\s+/g, ' ').trim()
 }
 
+function lookupSection(prompt: string, start: string, end: string): string {
+  const from = prompt.indexOf(start)
+  const to = prompt.indexOf(end, from + start.length)
+  if (from === -1 || to === -1) throw new TypeError(`lookup section ${start} is missing`)
+  return prompt.slice(from, to)
+}
+
 function stepById(steps: readonly Record<string, unknown>[], id: string): Record<string, unknown> {
   const step = steps.find(value => value.id === id)
   if (step === undefined) throw new TypeError(`step ${id} is missing`)
@@ -765,7 +772,7 @@ describe('fro-bot workflow — per-day report issue prompt', () => {
 
     // #then an existing report for today's exact title is rewritten, and a closed one stays closed
     expect(prompt).toContain(
-      "If a report whose title is exactly today's title exists in either lookup, rewrite its body",
+      "If a report whose title is exactly today's title exists in lookup a or b, rewrite its body",
     )
     expect(prompt).toContain('Never create a second report for the same date. Do not reopen it if it is closed.')
   })
@@ -819,7 +826,43 @@ describe.each([
     // #then open reports come from a state=open paginated listing, not a bounded all-states list
     expect(text).toContain("gh api --paginate 'repos/{owner}/{repo}/issues?state=open&per_page=100'")
     expect(text).toContain('`--paginate` follows every page, so the open set is complete.')
-    expect(text).not.toContain('--state all --limit')
+    expect(text).not.toContain('--limit 200')
+  })
+
+  it('excludes pull requests from the open-issue listing by their pull_request key', () => {
+    // #given lookup a, the REST issues endpoint that returns pull requests alongside issues
+    const lookupA = lookupSection(prompt(), 'a. Open reports', 'b. ')
+
+    // #then entries carrying a pull_request key are dropped before reports are matched
+    expect(lookupA).toContain('state=open')
+    expect(lookupA).toContain('drop entries with a `pull_request` key')
+  })
+
+  it('takes the star baseline from a state-independent lookup, not the open-only listing', () => {
+    // #given the schedule prompt and its three lookups
+    const text = prompt()
+    const lookupA = lookupSection(text, 'a. Open reports', 'b. ')
+    const lookupC = lookupSection(text, 'c. Previous report', '1. ')
+
+    // #then lookup c searches all states and keeps closed reports, so a same-day rerun keeps its baseline
+    expect(lookupC).toContain('gh issue list --state all')
+    expect(lookupC).not.toContain('state=open')
+    expect(lookupC).toContain('Closed reports count')
+    expect(lookupC).toContain('older than today')
+
+    // #then the previous report is defined by lookup c, never by lookup a
+    expect(text).toContain('The previous report comes from lookup c')
+    expect(text).not.toMatch(/previous report[^.]*lookup a/)
+    expect(lookupA).not.toContain('previous report')
+  })
+
+  it('never lets a failed baseline lookup block the report, and keeps superseding open-only', () => {
+    // #given the schedule prompt
+    const text = prompt()
+
+    // #then only lookups a and b gate mutations; lookup c failure drops the star flags only
+    expect(text).toContain('If lookup c fails, flag nothing and say so in Notes; it never blocks the report.')
+    expect(text).toContain('close every other open report from lookup a')
   })
 
   it("looks up today's report by exact title in any state and confirms the marker", () => {
@@ -838,9 +881,9 @@ describe.each([
     const text = prompt()
 
     // #then a failed lookup blocks create, edit, and close, and missing results are never absence
-    expect(text).toContain('Run both lookups before any mutation')
+    expect(text).toContain('Run lookups a and b before any mutation')
     expect(text).toContain(
-      'If any lookup fails (non-zero exit or unparseable output), do not create, edit, or close anything, #252 included, and report the failure.',
+      'If lookup a or b fails (non-zero exit or unparseable output), do not create, edit, or close anything, #252 included, and report the failure.',
     )
     expect(text).toContain('A missing result is never evidence that no report exists.')
   })
