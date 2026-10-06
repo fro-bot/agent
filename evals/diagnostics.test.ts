@@ -100,26 +100,71 @@ describe('diagnostic persistence boundaries', {timeout: 30_000}, () => {
   })
 
   it('redacts an arbitrary response credential before truncation', () => {
-    // #given an arbitrary credential crossing the response diagnostic byte boundary
+    // #given a response whose credential starts 12 bytes before the head-retention boundary. If bounding ran
+    // before redaction, the cut would split the credential and leave its first 12 characters unmatched.
+    // Post-redaction the content still exceeds the cap, so truncation genuinely happens.
     const sourceDirectory = createTemporaryDirectory('fro-bot-response-boundary-')
     const credential = 'arbitrary-credential-shape-that-must-not-leak'
-    const rawResponse = `${'R'.repeat(65_536 - credential.length + 3)}${credential}response-tail`
+    const marker = '\n\n[response truncated at 65536 bytes]\n'
+    const retainedBytes = 65_536 - Buffer.byteLength(marker, 'utf8')
+    const rawResponse = `${'R'.repeat(retainedBytes - 12)}${credential}${'response-tail'.repeat(100)}`
 
-    // #when the response diagnostic is persisted and read back
+    // #when the response diagnostic is persisted
     const diagnosticsPath = persistResponseDiagnostics(sourceDirectory, 'response-boundary', rawResponse, [credential])
 
-    // #then no credential fragment survives while useful surrounding response content remains
+    // #then truncation happened, the redaction placeholder sits in the retained region, and no credential fragment survives
     expect(diagnosticsPath).not.toBeNull()
     if (diagnosticsPath == null) {
       throw new Error('Expected response diagnostics path')
     }
     const persisted = readPersistedFile(diagnosticsPath, 'response.md')
-    const readback = readCapturedDiagnostics(diagnosticsPath, [credential])
+    expect(persisted.endsWith(marker)).toBe(true)
+    expect(Buffer.byteLength(persisted, 'utf8')).toBeLessThanOrEqual(65_536)
+    expect(persisted).not.toContain('response-tail')
     expect(persisted).toContain('RRRR')
+    expect(persisted).toContain('[REDACTED]')
+    expect(persisted).not.toContain(credential)
     expect(persisted).not.toContain(credential.slice(0, 12))
     expect(persisted).not.toContain(credential.slice(-12))
-    expect(readback).not.toContain(credential.slice(0, 12))
-    expect(readback).not.toContain(credential.slice(-12))
+  })
+
+  it('redacts an arbitrary log credential before tail truncation', () => {
+    // #given two identical logs (so directory read order cannot matter) whose second visit is tail-truncated.
+    // The credential's last 33 characters sit inside the raw tail window: if bounding ran before redaction,
+    // the cut would split the credential and leave its last 12 characters unmatched.
+    const sourceDirectory = createTemporaryDirectory('fro-bot-log-tail-source-')
+    const outputDirectory = createTemporaryDirectory('fro-bot-log-tail-output-')
+    const credential = 'arbitrary-log-tail-credential-that-must-not-leak'
+    const redactedLogBytes = 40_000
+    const remainingBytes = 65_536 - redactedLogBytes
+    const truncationMarker = `\n\n[diagnostic truncated at ${remainingBytes} bytes]\n`
+    const retainedTailBytes = remainingBytes - Buffer.byteLength(truncationMarker, 'utf8')
+    const exposedCredentialChars = 33
+    const trailingBytes = retainedTailBytes - exposedCredentialChars
+    const leadingBytes = redactedLogBytes - '[REDACTED]'.length - trailingBytes
+    const logContent = `${'A'.repeat(leadingBytes)}${credential}${'T'.repeat(trailingBytes)}`
+    writeFileSync(path.join(sourceDirectory, 'a.log'), logContent, 'utf8')
+    writeFileSync(path.join(sourceDirectory, 'b.log'), logContent, 'utf8')
+
+    // #when the diagnostic directory is captured
+    const diagnosticsPath = captureDiagnostics(sourceDirectory, outputDirectory, 'log-tail-boundary', [credential])
+
+    // #then the second-visited log is tail-truncated, still carries the redaction placeholder, and leaks no fragment
+    expect(diagnosticsPath).not.toBeNull()
+    if (diagnosticsPath == null) {
+      throw new Error('Expected log tail diagnostics path')
+    }
+    expect(logContent.length).toBeGreaterThan(redactedLogBytes)
+    const persistedLogs = ['a.log', 'b.log'].map(fileName => readPersistedFile(diagnosticsPath, fileName))
+    const truncatedLog = persistedLogs.find(log => log.startsWith(truncationMarker))
+    expect(truncatedLog).toBeDefined()
+    expect(Buffer.byteLength(truncatedLog ?? '', 'utf8')).toBeLessThanOrEqual(remainingBytes)
+    expect(truncatedLog).toContain('[REDACTED]')
+    for (const log of persistedLogs) {
+      expect(log).not.toContain(credential)
+      expect(log).not.toContain(credential.slice(0, 12))
+      expect(log).not.toContain(credential.slice(-12))
+    }
   })
 
   it('omits an oversized log instead of persisting an unsafe partial slice', () => {
