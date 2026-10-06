@@ -869,10 +869,12 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Upgrade npm to a trusted-publishing-capable version
-        # Trusted publishing (OIDC) requires npm >= 11.5.0; Node 24 ships an older npm.
-        # Pinned to a reviewed version that supports trusted publishing.
-        run: npm install -g npm@12.1.0
+      - name: Check npm supports trusted publishing
+        # Trusted publishing (OIDC) requires npm >= 11.5.1, which Node 24.6+ bundles.
+        run: |
+          version="$(npm --version)"
+          node -e 'const [a, b, c] = process.argv[1].split(".").map(Number); process.exit(a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1))) ? 0 : 1)' "$version" \
+            || { echo "::error::npm ${version} is older than 11.5.1, which trusted publishing requires"; exit 1; }
 
       - name: Install harness dependencies
         run: bun install --frozen-lockfile
