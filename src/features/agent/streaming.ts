@@ -843,39 +843,33 @@ export async function processEventStream(
         const partType = getStringProperty(part, 'type')
         if (partType === 'text') {
           const text = getStringProperty(part, 'text')
-          if (text != null) lastText = text
-          const endTime = getNumberProperty(getObjectProperty(part, 'time'), 'end')
-          if (endTime != null) {
-            // Root-only, never ownership-widened: this checks whether the ROOT's own
-            // text part is the synthetic turn upstream injects into the parent
-            // session when a background dispatch finishes (see `tool/task.ts`'s
-            // `inject()`). A descendant emitting similar-looking text is not this
-            // signal — only the parent session ever receives the injected turn.
-            //
-            // Upstream persists the injected turn's USER message (via `inject()`'s own
-            // `ops.prompt()` call) before the runner ever produces a reply to it -- so this text
-            // part is the injected turn's own content arriving. Register it as pending root work
-            // (barrier) BEFORE settling the ledger entry: a background completion injects another
-            // parent turn, and clearing/ignoring that fact here is exactly the exposure this
-            // freshness protocol closes. Correlated by message id so a duplicate/retried event for
-            // the same injected turn does not create a second phantom pending turn.
-            if (ownershipLedger !== undefined && eventSessionID === sessionId && text != null) {
-              const completion = parseInjectedTaskCompletion(text)
-              if (completion !== null) {
-                if (activityTracker?.rootFreshness != null) {
-                  const messageId = getStringProperty(part, 'messageID')
-                  registerPendingRootUserMessage(activityTracker.rootFreshness, messageId)
-                }
-                ownershipLedger.settle(completion.childSessionId)
-                logger.info('Background task completion turn observed — settled ownership entry', {
-                  sessionId,
-                  childSessionId: completion.childSessionId,
-                  state: completion.state,
-                })
-              }
+          // Upstream injects a background-task completion as a whole synthetic text part (no `time`) on a
+          // root user message; assistant text never sets `synthetic`. The injected turn is pending root work
+          // whether or not the child was adopted, so the barrier is registered before settling a tracked child.
+          const completion =
+            eventSessionID === sessionId && text != null && getBooleanProperty(part, 'synthetic') === true
+              ? parseInjectedTaskCompletion(text)
+              : null
+          if (completion === null) {
+            if (text != null) lastText = text
+            const endTime = getNumberProperty(getObjectProperty(part, 'time'), 'end')
+            if (endTime != null) {
+              outputTextContent(lastText)
+              lastText = ''
             }
-            outputTextContent(lastText)
-            lastText = ''
+          } else {
+            if (activityTracker?.rootFreshness != null) {
+              const messageId = getStringProperty(part, 'messageID')
+              registerPendingRootUserMessage(activityTracker.rootFreshness, messageId)
+            }
+            if (ownershipLedger?.isTracked(completion.childSessionId) === true) {
+              ownershipLedger.settle(completion.childSessionId)
+              logger.info('Background task completion turn observed — settled ownership entry', {
+                sessionId,
+                childSessionId: completion.childSessionId,
+                state: completion.state,
+              })
+            }
           }
         } else if (partType === 'tool') {
           const toolState = getObjectProperty(part, 'state')

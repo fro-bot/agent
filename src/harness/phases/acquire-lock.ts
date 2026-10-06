@@ -1,4 +1,4 @@
-import type {CoordinationConfig, LockRecord, ObjectStoreConfig} from '@fro-bot/runtime'
+import type {CoordinationConfig, LockRecord, LockScope, ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import {
   acquireLock,
@@ -12,14 +12,22 @@ import {
 import {createLogger} from '../../shared/logger.js'
 
 /**
+ * The Action's lock object (`.../locks/action.json`), distinct from the gateway's `repo.json`.
+ * Action runs exclude each other because they share one S3 session object (`sessions/opencode.db`,
+ * uploaded unconditionally, last writer wins). The Action and the gateway share no disk or session
+ * database, so they do not exclude each other. Cleanup's release must use this same scope.
+ */
+export const ACTION_LOCK_SCOPE = 'action' as const satisfies LockScope
+
+/**
  * Controls periodic renewal of the coordination lock lease acquired by `runAcquireLock`.
  *
  * The lock's TTL (`DEFAULT_LOCK_TTL_SECONDS`, 15 minutes) was sized for the median Action
  * run and has no renewal in itself -- but drain (plan Unit 10) can extend a run's
  * protected interval well past that, and execution plus a slow cache checkpoint/upload add
  * more on top. Without renewal, a long-running invocation's lease can expire mid-run,
- * letting another surface (the Discord gateway, or a retried Action run) take the lock
- * while this run is still writing.
+ * letting another Action run take the lock while this run is still writing the shared
+ * session object.
  *
  * `hasFailed()` lets a caller check renewal health WITHOUT stopping the timer -- this
  * matters because the lease must keep renewing THROUGH the persistence step itself (the
@@ -173,7 +181,7 @@ function createLeaseController(
     }
 
     inFlight = withTimeout(
-      renewLease(config, repo, lockRecord, currentEtag, logger),
+      renewLease(config, repo, lockRecord, currentEtag, logger, ACTION_LOCK_SCOPE),
       RENEWAL_TIMEOUT_MS,
       `Lease renewal exceeded ${RENEWAL_TIMEOUT_MS}ms`,
     )
@@ -241,7 +249,7 @@ function buildActionHolderId(runId: string, runAttempt: number): string {
   return `action:${runId}:${runAttempt}`
 }
 
-const ACTION_HOLDER_ID_PATTERN = /^action:[^:\s]+:\d+$/
+const ACTION_HOLDER_ID_PATTERN = /^action:\d+:\d+$/
 
 /** True only for ids produced by `buildActionHolderId`. */
 function isActionHolderId(holderId: string): boolean {
@@ -249,18 +257,34 @@ function isActionHolderId(holderId: string): boolean {
 }
 
 /**
- * Result of attempting to acquire the per-repo coordination lock.
+ * Extracts the workflow run id from an Action holder id, or `null` for anything that is not a well-formed
+ * `action:{numeric runId}:{attempt}` id. The holder id comes from S3, so callers must not trust other shapes.
+ */
+export function parseActionHolderRunId(holderId: string): string | null {
+  if (isActionHolderId(holderId) === false) return null
+  const runId = holderId.split(':')[1]
+  return runId ?? null
+}
+
+/**
+ * Result of attempting to acquire the per-repo Action coordination lock.
  *
  * Discriminated union so callers exhaustively handle each outcome:
  * - `acquired`: lock held by this Action; cleanup must release using `lockEtag` (or, once
  *   `renewal` has ticked, `renewal.currentEtag()`) and must stop `renewal` before releasing.
- * - `held-by-other`: the lock is held, an expired gateway lease was not corroborated, or a takeover lost a race; skip cleanly
+ * - `held-by-other`: another Action holds the lock, an expired non-Action lease was not corroborated, or a takeover
+ *   lost a race; skip cleanly. `reason` carries the lock outcome so the caller can explain the decline.
  * - `s3-disabled`: object store is not configured; coordination is opt-in, so proceed without a lock
- * - `error`: lock acquisition failed for an unexpected reason; caller decides whether to fail or proceed
+ * - `error`: lock acquisition failed for an unexpected reason (store, config, network); S3 is configured here, so the
+ *   caller fails closed rather than running unlocked
  */
 export type AcquireLockResult =
   | {readonly outcome: 'acquired'; readonly lockEtag: string; readonly renewal: LeaseController}
-  | {readonly outcome: 'held-by-other'; readonly holder: LockRecord | null}
+  | {
+      readonly outcome: 'held-by-other'
+      readonly holder: LockRecord | null
+      readonly reason: 'active-holder' | 'expired-holder' | 'conflict'
+    }
   | {readonly outcome: 's3-disabled'}
   | {readonly outcome: 'error'; readonly error: Error}
 
@@ -273,8 +297,9 @@ export interface AcquireLockPhaseOptions {
 }
 
 /**
- * Acquires the per-repo coordination lock so the Action and the Discord gateway
- * cannot execute concurrently against the same repository.
+ * Acquires the per-repo Action coordination lock so two Action runs cannot execute concurrently
+ * against the same repository's shared S3 session object. The gateway holds a separate lock
+ * (`repo.json`) and does not exclude, or get excluded by, the Action.
  *
  * Design decisions (see `docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md`
  * and `docs/plans/2026-09-14-001-feat-background-subagent-ownership-plan.md` Unit 12):
@@ -285,7 +310,7 @@ export interface AcquireLockPhaseOptions {
  *   alone, sized for the median ~2-min Action run; drain (Unit 10) can push a run's
  *   protected interval well past that, so the lease must now renew across execution,
  *   drain, and persistence rather than relying on the TTL outliving the run.
- * - No `RunState` record — the lock alone provides cross-surface mutual exclusion;
+ * - No `RunState` record — the lock alone provides Action-vs-Action mutual exclusion;
  *   GitHub already tracks workflow run state, so duplicating it in S3 is unnecessary.
  *   `LeaseController` renews only the lock record (`renewLease`), never a `RunState` --
  *   it does not reuse `packages/runtime/src/coordination/heartbeat.ts`'s
@@ -301,21 +326,30 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
     return {outcome: 's3-disabled'}
   }
 
-  const adapter = createS3Adapter(storeConfig, logger)
   const holderId = buildActionHolderId(runId, runAttempt)
-  const config: CoordinationConfig = {
-    storeAdapter: adapter,
-    storeConfig,
-    lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
-    heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
-    staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
-    pendingStaleThresholdMs: DEFAULT_PENDING_STALE_THRESHOLD_MS,
+  let config: CoordinationConfig
+  let result: Awaited<ReturnType<typeof acquireLock>>
+  try {
+    config = {
+      storeAdapter: createS3Adapter(storeConfig, logger),
+      storeConfig,
+      lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
+      heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+      staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+      pendingStaleThresholdMs: DEFAULT_PENDING_STALE_THRESHOLD_MS,
+    }
+    // A killed runner's expired lease must not wedge the repo: reclaim expired Action leases (surface + Action holder
+    // id) without corroboration. Anything else on this key is skipped.
+    result = await acquireLock(config, repo, holderId, 'github', runId, logger, {
+      scope: ACTION_LOCK_SCOPE,
+      reclaimableWithoutConfirmation: holder => holder.surface === 'github' && isActionHolderId(holder.holder_id),
+    })
+  } catch (error_) {
+    // A thrown adapter/acquire error must reach run.ts's fail-closed `error` path, not escape as a generic crash.
+    const error = error_ instanceof Error ? error_ : new Error(String(error_))
+    logger.warning('Lock acquisition threw', {error: error.message, repo, holderId})
+    return {outcome: 'error', error}
   }
-  // The Action never writes the shared workspace checkout, so a killed runner's expired lease must not wedge
-  // the repo: reclaim expired Action leases (surface + Action holder id) without corroboration. Anything else is skipped.
-  const result = await acquireLock(config, repo, holderId, 'github', runId, logger, {
-    reclaimableWithoutConfirmation: holder => holder.surface === 'github' && isActionHolderId(holder.holder_id),
-  })
 
   if (result.success === false) {
     logger.warning('Lock acquisition failed', {error: result.error.message, repo, holderId})
@@ -336,7 +370,7 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
   }
   switch (result.data.outcome) {
     case 'expired-holder':
-      logger.info('Expired coordination lease held by a gateway surface; settlement unconfirmed; skipped', heldBy)
+      logger.info('Expired coordination lease held by a non-Action holder; settlement unconfirmed; skipped', heldBy)
       break
     case 'conflict':
       logger.info('Coordination lease changed during takeover; skipped', heldBy)
@@ -345,5 +379,5 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
       logger.info('lock-held-by-other-surface', {...heldBy, reason: 'coordination lease held'})
       break
   }
-  return {outcome: 'held-by-other', holder: result.data.holder}
+  return {outcome: 'held-by-other', holder: result.data.holder, reason: result.data.outcome}
 }

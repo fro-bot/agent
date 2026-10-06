@@ -44,6 +44,7 @@ import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
 import {setCacheSaveResultOutput} from '../config/outputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
+import {ACTION_LOCK_SCOPE} from './acquire-lock.js'
 
 export interface CleanupPhaseOptions {
   readonly bootstrapLogger: Logger
@@ -60,7 +61,7 @@ export interface CleanupPhaseOptions {
   readonly runId: string
   /**
    * Coordination lock ETag from `runAcquireLock`. When non-null, cleanup releases the lock
-   * after all S3 sync and cache save operations complete so the next surface waits for a
+   * after all S3 sync and cache save operations complete so the next Action run waits for a
    * coherent state. Null when the Action ran without a lock (S3 disabled or no lock acquired).
    * Superseded by `leaseRenewal.currentEtag()` once renewal has ticked at least once
    * successfully -- releasing with this stale value after a successful renewal would fail
@@ -80,6 +81,14 @@ export interface CleanupPhaseOptions {
    * want of a lease it never held (see origin: R22a).
    */
   readonly leaseRenewal?: LeaseController | null
+  /**
+   * `true` when S3 coordination is configured but this invocation did NOT acquire the Action lock
+   * (contended `held-by-other`, or the fail-closed lock `error`). The Action lock exists to protect the
+   * shared session store, so such a run must not persist session state to either backend. Reported as
+   * `ownership-declined` (`declined-for-safety`), which the post hook honors rather than retries.
+   * Absent/`false` for locked runs and for S3-disabled runs, which have no coordination to lack.
+   */
+  readonly skipSessionPersistence?: boolean
 }
 
 /**
@@ -123,6 +132,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     lockEtag,
     ownershipLedger,
     leaseRenewal,
+    skipSessionPersistence = false,
   } = options
 
   // Populated below (quiescence during the shutdown step; lease continuity at the very end,
@@ -339,9 +349,9 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     //      writing (unknown entries are not distinguishable from live writers -- see
     //      OwnershipLedger.isPersistenceSafe).
     //   2. Unconfirmed quiescence: the OpenCode server itself might still be writing.
-    //   3. Unverified lease continuity: this run can no longer be certain no other surface
-    //      (Discord gateway, or a retried Action run) has taken over the coordination lock
-    //      and is writing the same session state concurrently. Reads the LATCHED
+    //   3. Unverified lease continuity: this run can no longer be certain no other Action
+    //      run has taken over the Action coordination lock and is writing the same session
+    //      object concurrently. Reads the LATCHED
     //      `continuityUnverified()` (never cleared by a later successful renewal), not the
     //      unlatched `hasFailed()` (which a later success resets) -- a tick that failed
     //      earlier in this invocation and then recovered is still a coverage gap that
@@ -363,13 +373,14 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     const ownershipSafe = ownershipLedger === undefined || ownershipLedger.isPersistenceSafe()
     const continuityUnverifiedNow =
       leaseRenewal != null && (leaseRenewal.continuityUnverified?.() ?? leaseRenewal.hasFailed())
-    const declineReason =
-      ownershipSafe === false
+    const declineReason = skipSessionPersistence
+      ? 'this run did not acquire the Action coordination lock, so it must not write the shared session store'
+      : ownershipSafe === false
         ? 'background subagent work this run owns is still unresolved (the ownership ledger has entries that are outstanding or unknown), so persisting could race a live writer'
         : quiescenceConfirmed === false
           ? 'the OpenCode server did not confirm it had stopped writing before this point, so the checkpoint could not be trusted to see a quiet database'
           : continuityUnverifiedNow
-            ? 'the coordination lease could not verify uninterrupted coverage, so this run can no longer be certain another surface has not taken over and is writing the same session state'
+            ? 'the coordination lease could not verify uninterrupted coverage, so this run can no longer be certain another Action run has not taken over and is writing the same session state'
             : null
 
     let cacheSaveResult: CacheSaveResult
@@ -442,9 +453,8 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       effectiveLockEtag = leaseRenewal.currentEtag()
     }
 
-    // Always release the coordination lock — even if cleanup steps above failed —
-    // so the next surface (Action or Discord gateway) can proceed without waiting
-    // for the 15-minute TTL to expire.
+    // Always release the Action coordination lock — even if cleanup steps above failed —
+    // so the next Action run can proceed without waiting for the 15-minute TTL to expire.
     if (effectiveLockEtag != null && storeConfig.enabled === true) {
       const releaseLogger = createLogger({phase: 'lock-release'})
       try {
@@ -461,6 +471,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
           repo,
           effectiveLockEtag,
           releaseLogger,
+          ACTION_LOCK_SCOPE,
         )
         if (releaseResult.success === false) {
           releaseLogger.warning('Lock release failed (non-fatal)', {
