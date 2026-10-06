@@ -10,16 +10,18 @@
 #   (b) Request to a non-allowlisted host through mitmproxy → expect 403.
 #       Proves the allowlist enforcement is active.
 #
-#   (c) Request to an allowlisted host through mitmproxy → expect 200, AND
-#       mitmproxy must have logged the allowed flow. This is the routing proof:
-#       the request succeeds ONLY because it went through mitmproxy.
+#   (c) Request to an allowlisted host through mitmproxy → expect a genuine
+#       upstream response (any status) over TLS verified against the mitmproxy
+#       CA, AND mitmproxy must have logged the allowed flow. This is the routing
+#       proof: the response arrives ONLY because it went through mitmproxy.
 #
 # Negative-control teeth: if the allowlist is set to allow-all, probe (b)
 # returns non-403 and the smoke fails. If mitmproxy is removed from the stack,
 # probe (c) has no route and fails. Either mutation breaks the smoke.
 #
 # Allowlisted host (probe c): api.github.com — always in the static allowlist,
-#   reliable HTTPS endpoint, returns 200 on GET /zen.
+#   reliable HTTPS endpoint. The call is unauthenticated, so the shared runner IP
+#   can exhaust GitHub's 60/hr quota and yield 403/429; that still proves routing.
 # Blocked host (probe b):     example.com — not in the allowlist, stable,
 #   no DNS surprises.
 #
@@ -44,6 +46,8 @@ FAIL=0
 # bump to compose.yaml is immediately picked up here without a separate edit.
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=deploy/tests/upstream-response.sh
+source "${SCRIPT_DIR}/tests/upstream-response.sh"
 MITMPROXY_IMAGE="$(grep '^[[:space:]]*image: mitmproxy/mitmproxy:' "${SCRIPT_DIR}/compose.yaml" | head -1 | sed 's/.*image: //' | tr -d '[:space:]')"
 if [[ -z "${MITMPROXY_IMAGE}" ]]; then
   echo "ERROR: could not extract mitmproxy image from ${SCRIPT_DIR}/compose.yaml" >&2
@@ -251,21 +255,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Probe (c): allowlisted host through mitmproxy → expect 200 + log proof.
-# api.github.com is in the static allowlist. The request succeeds only because
-# it routes through mitmproxy (the workspace has no direct internet path).
+# Probe (c): allowlisted host through mitmproxy → expect a genuine upstream
+# response + log proof. api.github.com is in the static allowlist. The workspace
+# has no direct internet path, so a real GitHub response over TLS verified
+# against the mitmproxy CA proves the request routed through mitmproxy and
+# reached upstream. The status is NOT asserted: unauthenticated GitHub API
+# calls from a shared runner IP can return 403/429 (rate limit). A block cannot
+# pass: a refused CONNECT or TLS failure makes curl exit non-zero, and mitmproxy's
+# own responses (403 allowlist block, 502) lack GitHub's x-github-request-id —
+# see deploy/tests/upstream-response.sh.
 # We then assert mitmproxy logged the allowed flow — this is the routing proof.
 #
 # Retry policy: retry ONLY on transport errors (curl non-zero exit) or
-# transient server errors (5xx/429). A definitive but WRONG status (anything
-# other than 200) is NEVER retried: that is a real routing/allowlist failure
-# and must fail immediately to preserve the test's teeth.
+# transient 5xx/429 that did not come from upstream. A definitive response that
+# is not a verified upstream response is NEVER retried: that is a real
+# routing/allowlist failure and must fail immediately to preserve the test's teeth.
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- probe (c): allowlisted host (api.github.com) through mitmproxy → expect 200 + log ---"
+echo "--- probe (c): allowlisted host (api.github.com) through mitmproxy → expect upstream response + log ---"
 probe_c_exit=0
 probe_c_output=""
 probe_c_status=""
+probe_c_upstream=0
 for _attempt in 1 2 3; do
   probe_c_exit=0
   probe_c_output=""
@@ -274,24 +285,25 @@ for _attempt in 1 2 3; do
     sh -c 'curl -sv --max-time 30 https://api.github.com/zen 2>&1')" || probe_c_exit=$?
   # Extract the HTTP status code from curl verbose output (last "< HTTP/... NNN" line).
   probe_c_status="$(echo "${probe_c_output}" | grep -oE '< HTTP/[0-9.]+ [0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
-  if [ "${probe_c_status}" = "200" ]; then
-    break  # definitive correct result — stop retrying
+  if upstream_response_verified "${probe_c_exit}" "${probe_c_output}"; then
+    probe_c_upstream=1
+    break  # verified upstream response (any status) — stop retrying
   elif [ -n "${probe_c_status}" ] && [ "${probe_c_status}" != "429" ] && \
        ! echo "${probe_c_status}" | grep -qE '^5[0-9][0-9]$'; then
-    # Definitive WRONG status (3xx/4xx≠429): routing/allowlist failure — fail immediately, no retry.
+    # Definitive non-upstream response (e.g. 403 allowlist block): routing/allowlist failure — fail immediately, no retry.
     break
   fi
-  # Transport error (curl exit non-zero, no status) or 5xx/429 — transient; retry with backoff.
+  # Transport error (curl exit non-zero, no status) or non-upstream 5xx/429 — transient; retry with backoff.
   if [ "${_attempt}" -lt 3 ]; then
     echo "  probe (c) attempt ${_attempt} transient (exit=${probe_c_exit} status=${probe_c_status:-none}), retrying in 3s..."
     sleep 3
   fi
 done
 
-if [ "${probe_c_status}" = "200" ]; then
-  pass "probe (c): allowlisted host api.github.com returned 200"
+if [ "${probe_c_upstream}" -eq 1 ]; then
+  pass "probe (c): allowlisted host api.github.com returned a verified upstream response (status ${probe_c_status})"
 else
-  fail "probe (c): expected 200 from api.github.com via mitmproxy, got: exit=${probe_c_exit} status=${probe_c_status:-none} output=${probe_c_output}"
+  fail "probe (c): expected a verified upstream response from api.github.com via mitmproxy, got: exit=${probe_c_exit} status=${probe_c_status:-none} output=${probe_c_output}"
 fi
 
 # Assert mitmproxy logged the allowed flow — proves routing, not just isolation.

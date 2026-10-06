@@ -123,7 +123,7 @@ Trusted same-repository, non-fork PR mentions on `issue_comment` from `OWNER`, `
 
 ### Scheduled maintenance
 
-Run the agent on a schedule to maintain a rolling report:
+Run the agent on a schedule to publish one report issue per day:
 
 ```yaml
 name: Daily Maintenance Report
@@ -144,9 +144,18 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           prompt: |
-            Perform daily repository maintenance and update a SINGLE rolling
-            issue titled "Daily Maintenance Report". Append a dated section with
-            summary metrics, stale issues and PRs, and recommended actions.
+            Perform daily repository maintenance and publish one report issue
+            per UTC day, titled "Daily Fro Bot Report — YYYY-MM-DD (UTC)". The
+            first line of the body is the marker
+            `<!-- fro-bot-daily-report-v1 -->`; identify reports by that marker.
+            List open issues (`gh api --paginate
+            'repos/{owner}/{repo}/issues?state=open&per_page=100'`) and look up
+            today's report by exact title in any state. If either lookup fails,
+            change nothing and report the failure. Edit today's report if it
+            exists, otherwise create it, with summary metrics, stale issues and
+            PRs, and recommended actions. Then close every other open report
+            with a comment linking today's. Create, edit, and close reports
+            only; do not label, assign, reopen, or comment on anything else.
 ```
 
 ## Configuration

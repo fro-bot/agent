@@ -82,7 +82,7 @@
 #
 # ── SCHEDULE PROMPT ALTERNATIVES ───────────────────────────────────────
 # The SCHEDULE_PROMPT defined in the env section below uses a read-only
-# "Daily Maintenance Report" strategy: it observes and reports but never
+# "Daily Fro Bot Report" strategy: it observes and reports but never
 # modifies code. This is the safe default.
 #
 # If you want the agent to actively fix problems on each scheduled run,
@@ -91,8 +91,8 @@
 #
 # ┌─ Option A: Maintenance Report (default — read-only) ───────────────
 # │ The agent scans for stale issues/PRs, failing checks, and security
-# │ alerts, then updates a single rolling issue with findings.
-# │ It does NOT push commits, open PRs, or modify code.
+# │ alerts, then publishes one report issue per UTC day and closes the
+# │ previous day's. It does NOT push commits, open PRs, or modify code.
 # │ → Already set as SCHEDULE_PROMPT below. No changes needed.
 #
 # ┌─ Option B: Autohealing (active repair — high autonomy) ────────────────
@@ -101,9 +101,9 @@
 # │ It WILL push commits to PR branches and the default branch.
 # │ Use only when that level of autonomy is acceptable.
 # │
-# │ Unlike Option A (rolling issue), Option B creates a NEW dated issue
-# │ per run ("Daily Autohealing Report — YYYY-MM-DD") because each run
-# │ documents specific commits and PRs that were modified.
+# │ Option B creates a NEW dated issue per run ("Daily Autohealing
+# │ Report — YYYY-MM-DD") because each run documents specific commits
+# │ and PRs that were modified.
 # │
 # │ To enable: replace the SCHEDULE_PROMPT value in the env section
 # │ with the prompt below (uncomment and paste as a YAML block scalar).
@@ -280,8 +280,11 @@ permissions:
   contents: read
 
 concurrency:
+  # Scheduled and manual runs share one group so overlapping runs cannot both
+  # create today's report. Other triggers keep their per-thread groups.
   group: >-
     fro-bot-${{
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'maintenance' ||
       github.event.issue.number ||
       github.event.pull_request.number ||
       github.event.discussion.number ||
@@ -319,25 +322,46 @@ env:
     Do not omit any heading.
 
   SCHEDULE_PROMPT: |
-    Perform daily repository maintenance and update a SINGLE rolling issue titled
-    "Daily Maintenance Report" in this repository.
+    Perform daily repository maintenance and publish ONE report issue per UTC day
+    in this repository.
 
-    Search for an issue with this exact title. If multiple matches exist,
-    use the most recently updated one. If no open issue exists, create it.
-    If the most recent matching issue is closed, reopen it instead of creating
-    a new one.
-
-    Append a new dated section for each run using "## YYYY-MM-DD (UTC)".
-    To keep the issue bounded: after appending today's section, replace any
-    individual daily sections older than 14 days with a single
-    "## Historical Summary" section that lists only the count of prior runs
-    and any items that remained unresolved across those runs. If a Historical Summary already exists, update it in place — do not create a second one.
+    REPORT ISSUE
+    Get today's UTC date with `date -u +%Y-%m-%d`. Today's report title is exactly:
+      Daily Fro Bot Report — YYYY-MM-DD (UTC)
+    The first line of every report body is this marker:
+      <!-- fro-bot-daily-report-v1 -->
+    A report is an issue whose body contains the marker; identify reports by the
+    marker, never by a title search alone. Run lookups a and b before any mutation:
+    a. Open reports (pull requests excluded: drop entries with a `pull_request` key):
+         gh api --paginate 'repos/{owner}/{repo}/issues?state=open&per_page=100'
+       `--paginate` follows every page, so the open set is complete. Keep the
+       issues whose body contains the marker.
+    b. Today's report in any state, by exact title, then confirm the marker on its body:
+         gh issue list --state all --search '"Daily Fro Bot Report — YYYY-MM-DD (UTC)" in:title' --json number,title,state,url,body
+    If lookup a or b fails (non-zero exit or unparseable output), do not create, edit,
+    or close anything, #252 included, and report the failure. A missing result is
+    never evidence that no report exists.
+    c. Previous report for the ★ comparison, in any state:
+         gh issue list --state all --limit 30 --search '"Daily Fro Bot Report" in:title' --json number,title,state,body
+       Keep the issues whose body contains the marker and whose title date is older
+       than today's; the newest by title date is the previous report. Closed reports
+       count: today's first run closes yesterday's, and a same-day rerun still
+       compares against it. If lookup c fails, flag nothing and say so in Notes; it
+       never blocks the report.
+    1. If a report whose title is exactly today's title exists in lookup a or b,
+       rewrite its body with `gh issue edit <number> --body-file`. Never create a
+       second report for the same date. Do not reopen it if it is closed.
+    2. Otherwise create today's report with `gh issue create --body-file`.
+    3. Then close every other open report from lookup a (marker present, title not
+       today's) with `gh issue close <number> --comment "Superseded by <today's report URL>"`.
 
     Include links only (no full content duplication). Keep it concise and actionable.
     Flag items that appear in the stale list for the first time (not present in
-    the previous dated section) with a ★ marker.
+    the previous report) with a ★ marker. The previous report comes from lookup c.
+    If it is unreadable, flag nothing and say so in Notes.
 
-    Sections (in order):
+    Report body, in order: the marker line, a `## Daily Fro Bot Report — YYYY-MM-DD (UTC)`
+    heading, then these sections as `###` headings:
     - Summary metrics (issues opened since last run, currently open PRs, stale
       issues/PRs count, main branch check status, security alerts if accessible)
     - Stale issues (no activity >30 days; recommend next step)
@@ -346,8 +370,10 @@ env:
     - Recommended actions (bulleted checklist)
     - Notes (use "data unavailable" for any inaccessible data source)
 
-    Do NOT comment on or modify individual issues/PRs. Do NOT apply labels.
-    Do NOT open PRs. This run must update ONE issue only.
+    WRITE SCOPE
+    The only issue mutations permitted are: create today's report, edit today's
+    report, and close a superseded report. Do NOT comment on or modify any other
+    individual issue/PR. Do NOT apply labels or reopen issues. Do NOT open PRs.
 
 jobs:
   fro-bot:

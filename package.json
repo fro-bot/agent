@@ -60,6 +60,8 @@
     "nanoid": ">=3.3.18 <4.0.0",
     "picomatch": ">=4.0.4",
     "postcss": ">=8.5.23",
+    "postcss-selector-parser": ">=7.1.6 <8.0.0",
+    "source-map-js": ">=1.2.2 <2.0.0",
     "tar": ">=7.5.21",
     "undici": ">=8.10.2",
     "vite": "8.3.1",
@@ -76,7 +78,7 @@
     "@bfra.me/es": "0.1.0",
     "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.3.1",
-    "@opencode-ai/sdk": "1.18.30"
+    "@opencode-ai/sdk": "1.18.34"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.54.0",
