@@ -144,11 +144,18 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           prompt: |
-            Perform daily repository maintenance. Create one issue titled
-            "Daily Maintenance Report — YYYY-MM-DD (UTC)" for today, or update
-            it if it already exists, with summary metrics, stale issues and PRs,
-            and recommended actions. Then close any older open report, with a
-            comment linking today's.
+            Perform daily repository maintenance and publish one report issue
+            per UTC day, titled "Daily Fro Bot Report — YYYY-MM-DD (UTC)". The
+            first line of the body is the marker
+            `<!-- fro-bot-daily-report-v1 -->`; identify reports by that marker.
+            List open issues (`gh api --paginate
+            'repos/{owner}/{repo}/issues?state=open&per_page=100'`) and look up
+            today's report by exact title in any state. If either lookup fails,
+            change nothing and report the failure. Edit today's report if it
+            exists, otherwise create it, with summary metrics, stale issues and
+            PRs, and recommended actions. Then close every other open report
+            with a comment linking today's. Create, edit, and close reports
+            only; do not label, assign, reopen, or comment on anything else.
 ```
 
 ## Configuration

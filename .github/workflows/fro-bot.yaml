@@ -88,15 +88,22 @@ env:
     The first line of every report body is this marker:
       <!-- fro-bot-daily-report-v1 -->
     A report is an issue whose body contains the marker; identify reports by the
-    marker, never by a title search alone. List them with:
-      gh issue list --state all --limit 200 --json number,title,state,url,body
-    and filter the JSON locally for the marker.
-    1. If a report whose title is exactly today's title exists, rewrite its body
-       with `gh issue edit <number> --body-file`. Never create a second report
-       for the same date. Do not reopen it if it is closed.
+    marker, never by a title search alone. Run both lookups before any mutation:
+    a. Open reports (pull requests excluded: drop entries with a `pull_request` key):
+         gh api --paginate 'repos/{owner}/{repo}/issues?state=open&per_page=100'
+       `--paginate` follows every page, so the open set is complete. Keep the
+       issues whose body contains the marker.
+    b. Today's report in any state, by exact title, then confirm the marker on its body:
+         gh issue list --state all --search '"Daily Fro Bot Report — YYYY-MM-DD (UTC)" in:title' --json number,title,state,url,body
+    If any lookup fails (non-zero exit or unparseable output), do not create, edit,
+    or close anything, #252 included, and report the failure. A missing result is
+    never evidence that no report exists.
+    1. If a report whose title is exactly today's title exists in either lookup,
+       rewrite its body with `gh issue edit <number> --body-file`. Never create a
+       second report for the same date. Do not reopen it if it is closed.
     2. Otherwise create today's report with `gh issue create --body-file`.
-    3. Then close every other open report (marker present, title not today's)
-       with `gh issue close <number> --comment "Superseded by <today's report URL>"`.
+    3. Then close every other open report from lookup a (marker present, title not
+       today's) with `gh issue close <number> --comment "Superseded by <today's report URL>"`.
        When the run ends exactly one report is open, unless a maintainer closed
        today's.
 
@@ -111,7 +118,7 @@ env:
     Include links only (no full content duplication). Keep it concise and actionable.
     Flag items that appear in the stale list for the first time (not present in the
     previous report) with a ★ marker. The previous report is the newest older
-    report by the marker; on the first run it is the newest dated section of #252.
+    open report from lookup a; on the first run it is the newest dated section of #252.
     If neither is readable, flag nothing and say so in Notes.
 
     Report body, in order: the marker line, a `## Daily Fro Bot Report — YYYY-MM-DD (UTC)`
