@@ -5,7 +5,8 @@ import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createLogger} from '../../shared/logger.js'
-import {writeCacheSaveResultSummary, writeJobSummary} from './job-summary.js'
+import {SKIP_REASONS} from '../triggers/types.js'
+import {writeCacheSaveResultSummary, writeInvocationOutcomeSummary, writeJobSummary} from './job-summary.js'
 
 vi.mock('@actions/core', () => {
   const mockSummary = {
@@ -648,5 +649,98 @@ describe('writeCacheSaveResultSummary', () => {
     await expect(writeCacheSaveResultSummary(persistedResult, 'main', logger)).resolves.not.toThrow()
     expect(logger.warning).toHaveBeenCalledWith('Failed to write cache save result summary', {error: 'Write failed'})
     expect(core.warning).toHaveBeenCalledWith('Failed to write cache save result summary: Write failed')
+  })
+})
+
+function summaryText(): string {
+  return vi.mocked(core.summary).addRaw.mock.calls.flat().join('')
+}
+
+describe('writeInvocationOutcomeSummary (skipped)', () => {
+  const logger = createLogger({phase: 'test'})
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('writes the skip reason and message to the summary', async () => {
+    // #given a routing skip with a reason code and message
+    // #when
+    await writeInvocationOutcomeSummary('skipped', [], logger, {
+      reason: 'draft_pr',
+      message: 'Pull request is a draft',
+    })
+
+    // #then the specific reason is rendered, not just the generic skipped sentence
+    expect(summaryText()).toContain('**Skip reason:** <code>draft_pr</code> — Pull request is a draft')
+    expect(core.summary.write).toHaveBeenCalledTimes(1)
+  })
+
+  it('adds the review-request hint for unauthorized_author only', async () => {
+    // #given an unauthorized author skip
+    await writeInvocationOutcomeSummary('skipped', [], logger, {
+      reason: 'unauthorized_author',
+      message: "Author association 'CONTRIBUTOR' is not authorized",
+    })
+
+    // #then the hint points at the documented review-request path
+    expect(summaryText()).toContain('a maintainer can request a review from the bot')
+    expect(summaryText()).toContain('docs/wiki/Troubleshooting.md#review-access-and-the-review-request-path')
+
+    // #and other reasons carry no hint
+    vi.clearAllMocks()
+    await writeInvocationOutcomeSummary('skipped', [], logger, {reason: 'draft_pr', message: 'Pull request is a draft'})
+    expect(summaryText()).not.toContain('request a review')
+  })
+
+  it('escapes untrusted text in the reason message', async () => {
+    // #given a message embedding an attacker-chosen login with markup and table/code delimiters
+    await writeInvocationOutcomeSummary('skipped', [], logger, {
+      reason: 'self_comment',
+      message: 'Pull requests from bots (<img src=x onerror=alert(1)>|`evil`\n# pwn) are not processed',
+    })
+
+    // #then no raw markup, pipes, backticks, or newlines survive
+    const text = summaryText()
+    expect(text).not.toContain('<img')
+    expect(text).toContain('&lt;img src=x onerror=alert(1)&gt;&#124;&#96;evil&#96; # pwn')
+  })
+
+  it.each(SKIP_REASONS)('renders the %s reason code', async reason => {
+    // #given every reason code in the closed SkipReason union
+    // #when
+    await writeInvocationOutcomeSummary('skipped', [], logger, {reason, message: 'detail'})
+
+    // #then the code appears in the summary
+    expect(summaryText()).toContain(`<code>${reason}</code>`)
+  })
+
+  it('keeps the generic skipped text when no skip detail is supplied', async () => {
+    // #given a dedup or lock-contention skip, which has no routing reason
+    await writeInvocationOutcomeSummary('skipped', [], logger)
+
+    // #then
+    expect(summaryText()).toContain('This invocation intentionally attempted no delivery')
+    expect(summaryText()).not.toContain('Skip reason')
+  })
+
+  it('does not render skip detail for a non-skipped outcome', async () => {
+    // #given a stray skip detail on a succeeded outcome
+    await writeInvocationOutcomeSummary('succeeded', [], logger, {reason: 'draft_pr', message: 'x'})
+
+    // #then
+    expect(summaryText()).not.toContain('Skip reason')
+  })
+
+  it('does not fail the run when the summary write throws', async () => {
+    // #given the summary write rejects
+    vi.mocked(core.summary.write).mockRejectedValueOnce(new Error('Write failed'))
+
+    // #when / #then it resolves and warns instead of throwing
+    await expect(
+      writeInvocationOutcomeSummary('skipped', [], logger, {reason: 'draft_pr', message: 'x'}),
+    ).resolves.toBeUndefined()
+    expect(logger.warning).toHaveBeenCalledWith('Failed to write invocation outcome summary', {error: 'Write failed'})
+    expect(core.warning).toHaveBeenCalledWith('Failed to write invocation outcome summary: Write failed')
   })
 })

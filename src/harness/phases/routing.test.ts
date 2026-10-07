@@ -1,4 +1,5 @@
 import type {BootstrapPhaseResult} from './bootstrap.js'
+import * as core from '@actions/core'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {collectAgentContext} from '../../features/agent/index.js'
 import {routeEvent} from '../../features/triggers/index.js'
@@ -14,6 +15,7 @@ vi.mock('@actions/core', () => ({
   debug: vi.fn(),
   warning: vi.fn(),
   error: vi.fn(),
+  notice: vi.fn(),
 }))
 
 vi.mock('../../features/agent/index.js', () => ({
@@ -102,7 +104,11 @@ describe('runRouting', () => {
 
     const result = await runRouting(bootstrap, 100)
 
-    expect(result).toBeNull()
+    expect(result).toEqual({
+      skipped: true,
+      skipReason: 'unsupported_event',
+      skipMessage: 'Unsupported event',
+    })
     expect(vi.mocked(setActionOutputs)).not.toHaveBeenCalled()
     expect(vi.mocked(collectAgentContext)).not.toHaveBeenCalled()
     expect(vi.mocked(getRepositoryPermission)).not.toHaveBeenCalled()
@@ -176,7 +182,94 @@ describe('runRouting', () => {
       expect.anything(),
       expect.objectContaining({reviewSkipLabel: 'skip-agent-review'}),
     )
-    expect(result).toBeNull()
+    expect(result).toEqual({
+      skipped: true,
+      skipReason: 'review_skip_label',
+      skipMessage: "Pull request has the opt-out label 'skip-agent-review'",
+    })
     expect(vi.mocked(collectAgentContext)).not.toHaveBeenCalled()
+  })
+
+  it('emits exactly one notice carrying the skip reason and no other annotation', async () => {
+    // #given routing declines an unauthorized pull request author
+    const bootstrap = {
+      inputs: {githubToken: 'ghp_test123', prompt: 'test prompt'},
+      logger: createMockLogger(),
+      opencodeResult: {path: '/tmp/opencode', version: '1.0.0', didSetup: false},
+    } as BootstrapPhaseResult
+
+    vi.mocked(parseGitHubContext).mockReturnValue({
+      eventName: 'pull_request',
+      eventType: 'pull_request',
+      repo: {owner: 'fro-bot', repo: 'agent'},
+      ref: 'refs/heads/main',
+      sha: 'abc123',
+      runId: 123,
+      actor: 'contrib',
+      payload: {},
+      event: {type: 'pull_request', action: 'opened'} as never,
+    })
+    vi.mocked(createClient).mockReturnValue({} as never)
+    vi.mocked(getBotLogin).mockResolvedValue('fro-bot[bot]')
+    vi.mocked(routeEvent).mockReturnValue({
+      shouldProcess: false,
+      skipReason: 'unauthorized_author',
+      skipMessage: "Author association 'CONTRIBUTOR' is not authorized",
+      context: {} as never,
+    })
+
+    // #when routing runs
+    await runRouting(bootstrap, 100)
+
+    // #then a single notice names the reason, with no warning or error annotation
+    expect(vi.mocked(core.notice)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(core.notice)).toHaveBeenCalledWith(
+      "Fro Bot skipped this event (unauthorized_author): Author association 'CONTRIBUTOR' is not authorized",
+      expect.anything(),
+    )
+    expect(vi.mocked(core.warning)).not.toHaveBeenCalled()
+    expect(vi.mocked(core.error)).not.toHaveBeenCalled()
+  })
+
+  it('still returns the skip when the notice cannot be emitted', async () => {
+    // #given core.notice throws
+    const bootstrap = {
+      inputs: {githubToken: 'ghp_test123', prompt: 'test prompt'},
+      logger: createMockLogger(),
+      opencodeResult: {path: '/tmp/opencode', version: '1.0.0', didSetup: false},
+    } as BootstrapPhaseResult
+
+    vi.mocked(parseGitHubContext).mockReturnValue({
+      eventName: 'push',
+      eventType: 'unsupported',
+      repo: {owner: 'fro-bot', repo: 'agent'},
+      ref: 'refs/heads/main',
+      sha: 'abc123',
+      runId: 123,
+      actor: 'mrbrown',
+      payload: {},
+      event: {type: 'unsupported'},
+    })
+    vi.mocked(createClient).mockReturnValue({} as never)
+    vi.mocked(getBotLogin).mockResolvedValue('fro-bot[bot]')
+    vi.mocked(routeEvent).mockReturnValue({
+      shouldProcess: false,
+      skipReason: 'unsupported_event',
+      skipMessage: 'Unsupported event type: push',
+      context: {} as never,
+    })
+    vi.mocked(core.notice).mockImplementationOnce(() => {
+      throw new Error('annotation failed')
+    })
+
+    // #when routing runs
+    const result = await runRouting(bootstrap, 100)
+
+    // #then the skip is still reported to the caller
+    expect(result).toEqual({
+      skipped: true,
+      skipReason: 'unsupported_event',
+      skipMessage: 'Unsupported event type: push',
+    })
   })
 })

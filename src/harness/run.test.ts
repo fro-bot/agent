@@ -298,9 +298,14 @@ describe('run', () => {
     const {runRouting} = await import('./phases/routing.js')
     const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
     const {saveDedupMarker} = await import('./phases/dedup.js')
+    const {writeInvocationOutcomeSummary} = await import('../features/observability/index.js')
 
     vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
-    vi.mocked(runRouting).mockResolvedValue(null)
+    vi.mocked(runRouting).mockResolvedValue({
+      skipped: true,
+      skipReason: 'unauthorized_author',
+      skipMessage: "Author association 'CONTRIBUTOR' is not authorized",
+    })
 
     // #when the run reaches the pre-execute routing skip
     const exitCode = await run()
@@ -313,6 +318,11 @@ describe('run', () => {
     // 'incomplete' that would force the exit code to 1 for every routine skip
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('skipped')
     expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+    // #and the routing skip reason is carried into the outcome summary
+    expect(vi.mocked(writeInvocationOutcomeSummary)).toHaveBeenCalledWith('skipped', [], expect.anything(), {
+      reason: 'unauthorized_author',
+      message: "Author association 'CONTRIBUTOR' is not authorized",
+    })
   })
 
   it('emits the unavailable output contract when dedup suppresses execution', async () => {

@@ -1,10 +1,12 @@
 import type {OwnershipEntryState, OwnershipLedger, OwnershipLedgerEntry} from '@fro-bot/runtime'
 import type {CacheSaveOutcome, CacheSaveResult, CacheSaveStateValue} from '../../shared/cache-save-result.js'
 import type {Logger} from '../../shared/logger.js'
+import type {SkipReason} from '../triggers/types.js'
 import type {CommentSummaryOptions} from './types.js'
 import * as core from '@actions/core'
 import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {escapeSummaryText} from '../../shared/summary-escape.js'
 import {formatCacheStatus, formatDuration} from './run-summary.js'
 
 /**
@@ -207,6 +209,20 @@ const INVOCATION_OUTCOME_LABELS: Readonly<Record<'succeeded' | 'incomplete' | 'f
   skipped: '⏭️ skipped',
 }
 
+/** Why routing declined an event. `message` can embed untrusted text (author logins, association values). */
+export interface InvocationSkipDetail {
+  readonly reason: SkipReason
+  readonly message: string
+}
+
+const REVIEW_REQUEST_DOC_URL =
+  'https://github.com/fro-bot/agent/blob/main/docs/wiki/Troubleshooting.md#review-access-and-the-review-request-path'
+
+/** One-line remediation per skip reason; reasons without an entry need none. */
+const SKIP_REASON_HINTS: Readonly<Partial<Record<SkipReason, string>>> = {
+  unauthorized_author: `If this is a pull request, a maintainer can request a review from the bot to have it processed — see [Review access and the review-request path](${REVIEW_REQUEST_DOC_URL}).`,
+}
+
 /**
  * Writes a standalone job-summary row reporting this invocation's final, verified outcome
  * -- `succeeded`, `incomplete` (a useful result may exist, but this invocation could not
@@ -221,6 +237,7 @@ export async function writeInvocationOutcomeSummary(
   outcome: 'succeeded' | 'incomplete' | 'failed' | 'skipped',
   incompleteReasons: readonly string[],
   logger: Logger,
+  skip?: InvocationSkipDetail,
 ): Promise<void> {
   try {
     core.summary.addHeading('Invocation Outcome', 3).addTable([
@@ -242,10 +259,20 @@ export async function writeInvocationOutcomeSummary(
       core.summary.addRaw(
         '\nThis invocation intentionally attempted no delivery (no matching trigger, a deduplicated repeat, or coordination-lock contention).\n',
       )
+
+      if (skip !== undefined) {
+        core.summary.addRaw(
+          `\n**Skip reason:** <code>${escapeSummaryText(skip.reason)}</code> — ${escapeSummaryText(skip.message)}\n`,
+        )
+        const hint = SKIP_REASON_HINTS[skip.reason]
+        if (hint !== undefined) {
+          core.summary.addRaw(`\n${hint}\n`)
+        }
+      }
     }
 
     await core.summary.write()
-    logger.debug('Wrote invocation outcome summary', {outcome, incompleteReasons})
+    logger.debug('Wrote invocation outcome summary', {outcome, incompleteReasons, skipReason: skip?.reason})
   } catch (error) {
     const errorMsg = toErrorMessage(error)
     logger.warning('Failed to write invocation outcome summary', {error: errorMsg})
