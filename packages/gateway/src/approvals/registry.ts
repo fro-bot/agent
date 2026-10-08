@@ -40,7 +40,8 @@
  *   and immediately fail-closes instead of leaving the entry open with a dead timer.
  * - A **dispose** (run ended / gateway shutdown) always wins — it tears down
  *   regardless of state (render 'disposed' + delete + best-effort reject POST
- *   if not yet claimed).
+ *   if not yet claimed). A claimed entry is marked `disposed`: if its in-flight reply
+ *   then fails, one reject reply is sent (never a reopen); if it succeeds, nothing more.
  *
  * ### register-before-send
  *
@@ -449,7 +450,25 @@ export function createApprovalRegistry(deps: {
       case 'not-found':
         return 'not-found'
       case 'reply-failed':
+        // Teardown removed the entry while this reply was in flight, and the reply failed: nothing
+        // owns the permission any more, so it would stay pending in OpenCode. Deny it once.
+        if (entry.state === 'disposed') await rejectAfterDisposedReplyFailure(entry)
         return 'reply-failed'
+    }
+  }
+
+  async function rejectAfterDisposedReplyFailure(entry: ApprovalGateEntry): Promise<void> {
+    const {requestID} = entry
+    try {
+      const r = await entry.payload.effects.postReply(requestID, entry.payload.directory, 'reject')
+      if (!r.ok) {
+        logger.warn(
+          {requestID, error: r.error},
+          'ApprovalRegistry: deny after a failed reply on a disposed entry returned ok:false',
+        )
+      }
+    } catch (error) {
+      logger.warn({requestID, err: error}, 'ApprovalRegistry: deny after a failed reply on a disposed entry threw')
     }
   }
 
@@ -561,6 +580,11 @@ export function createApprovalRegistry(deps: {
     // The gate clears the deadline timer on any terminal path, runs the work below, then removes
     // the entry and emits the terminal notification.
     await gate.retire(entry, terminalOutcomeFor(reason), async () => {
+      // A claimed entry's reply may still be in flight. Mark the entry disposed so the gate never
+      // reopens it when that reply fails, and so `handleDecision` can deny the permission once the
+      // reply settles. A reply that already succeeded awaits its echo, which finds nothing to settle.
+      if (reason === 'disposed' && entry.state === 'claimed') entry.state = 'disposed'
+
       // For non-replied/non-cascade reasons on open entries: best-effort postReply.
       // Skip if already claimed/confirmed (postReply was or is being sent).
       if (reason !== 'replied' && reason !== 'cascade' && entry.state === 'open') {
