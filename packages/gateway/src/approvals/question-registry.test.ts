@@ -1076,3 +1076,135 @@ describe('log hygiene', () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// Run binding (web routes find and settle a run's questions on any surface)
+// ---------------------------------------------------------------------------
+
+describe('run-bound questions', () => {
+  it("describePendingForRun lists a run's open questions whatever their surface scope", () => {
+    // #given a thread-scoped and a web-scoped question for run_1, and one for run_2
+    const {questions} = setup()
+    questions.register(makeParams({requestID: 'que_a', questionScopeId: 'thread_1', runId: 'run_1'}))
+    questions.register(makeParams({requestID: 'que_b', questionScopeId: 'run_1', runId: 'run_1'}))
+    questions.register(makeParams({requestID: 'que_c', questionScopeId: 'run_2', runId: 'run_2'}))
+
+    // #when / #then
+    expect(
+      questions
+        .describePendingForRun('run_1')
+        .map(dto => dto.requestID)
+        .sort((a, b) => a.localeCompare(b)),
+    ).toEqual(['que_a', 'que_b'])
+    expect(questions.describePendingForRun('run_2').map(dto => dto.requestID)).toEqual(['que_c'])
+    expect(questions.describePendingForRun('run_unknown')).toEqual([])
+  })
+
+  it('a question registered without a run id is not listed for any run', () => {
+    // #given
+    const {questions} = setup()
+    questions.register(makeParams())
+
+    // #when / #then
+    expect(questions.describePendingForRun('thread_1')).toEqual([])
+  })
+
+  it('describePendingForRun omits a claimed question', async () => {
+    // #given a claimed (reply in flight) question
+    const {questions} = setup()
+    let release: () => void = () => undefined
+    const effects = makeEffects({
+      replyQuestion: vi.fn(
+        async () =>
+          new Promise<QuestionEffectResult>(resolve => {
+            release = () => resolve(OK)
+          }),
+      ),
+    })
+    questions.register(makeParams({effects, runId: 'run_1'}))
+    const pending = decideAnswer(questions, [['staging']], {actor: WEB_ACTOR})
+    await flush()
+
+    // #then only open questions are actionable
+    expect(questions.describePendingForRun('run_1')).toEqual([])
+    release()
+    await pending
+  })
+
+  it('decide with a run id settles only a request that belongs to that run', async () => {
+    // #given a question bound to run_1
+    const {questions} = setup()
+    const effects = makeEffects()
+    questions.register(makeParams({effects, runId: 'run_1'}))
+
+    // #when another run's id is asserted, by a web operator
+    const wrongRun = await questions.decide({
+      requestID: 'que_1',
+      scopeId: 'run_2',
+      runId: 'run_2',
+      decision: {kind: 'skip'},
+      actor: WEB_ACTOR,
+    })
+
+    // #then it is indistinguishable from an unknown id, and nothing was sent
+    expect(wrongRun).toEqual({kind: 'not-found'})
+    expect(effects.replyQuestion).not.toHaveBeenCalled()
+
+    // #when the right run is asserted
+    const rightRun = await questions.decide({
+      requestID: 'que_1',
+      scopeId: 'run_1',
+      runId: 'run_1',
+      decision: {kind: 'skip'},
+      actor: WEB_ACTOR,
+    })
+
+    // #then
+    expect(rightRun).toEqual({kind: 'ok'})
+    expect(effects.replyQuestion).toHaveBeenCalledOnce()
+  })
+
+  it('decide with a run id refuses a question that has no run binding', async () => {
+    // #given an unbound question
+    const {questions} = setup()
+    questions.register(makeParams())
+
+    // #when
+    const outcome = await questions.decide({
+      requestID: 'que_1',
+      scopeId: 'thread_1',
+      runId: 'run_1',
+      decision: {kind: 'skip'},
+      actor: WEB_ACTOR,
+    })
+
+    // #then
+    expect(outcome).toEqual({kind: 'not-found'})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Several surfaces render the settlement
+// ---------------------------------------------------------------------------
+
+describe('attachMessage accumulates renders', () => {
+  it('every attached render runs on settlement, and one failing render does not skip the others', async () => {
+    // #given two surfaces, the first of which throws
+    const logger = makeLogger()
+    const {questions} = setup(logger)
+    questions.register(makeParams())
+    const first = vi.fn().mockRejectedValue(new Error('first surface down'))
+    const second = makeRenderFn()
+    questions.attachMessage('que_1', first)
+    questions.attachMessage('que_1', second)
+
+    // #when the question settles
+    questions.confirmEcho({kind: 'rejected', requestID: 'que_1', sessionID: 'ses_1'})
+    await flush()
+
+    // #then both ran, and the failure was logged by the gate
+    expect(first).toHaveBeenCalledOnce()
+    expect(second).toHaveBeenCalledOnce()
+    expect(logger.error).toHaveBeenCalled()
+  })
+})

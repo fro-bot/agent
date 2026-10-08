@@ -64,6 +64,7 @@ import {createPushDispatcher} from './web/operator-push/dispatcher.js'
 import {createPushSender} from './web/operator-push/push-sender.js'
 import {createOperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import {shouldNotify} from './web/operator-push/trigger-policy.js'
+import {createWebQuestionOnRegistered} from './web/operator/web-question.js'
 import {createRunObservationManager} from './web/sse/manager.js'
 import {projectRunObservation} from './web/sse/projection.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
@@ -164,6 +165,12 @@ export interface BuildOperatorServerInputs {
    */
   readonly approvalRegistry?: NonNullable<OperatorServerDeps['approvalRegistry']>
   /**
+   * Question registry for the question routes.
+   * Optional — omit (or pass undefined) to simulate a missing dep in tests,
+   * which causes the question routes to be absent from app.routes.
+   */
+  readonly questionRegistry?: NonNullable<OperatorServerDeps['questionRegistry']>
+  /**
    * Cancel-run engine dependencies for the cancel route's `cancelRun` orchestrator call.
    * Optional — omit (or pass undefined) to simulate a missing dep in tests,
    * which causes POST /operator/runs/:runId/cancel to be absent from app.routes.
@@ -246,6 +253,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     runObservationManager,
     runIndex,
     approvalRegistry,
+    questionRegistry,
     cancelRunDeps,
     launchWorkDeps,
     dispatchWorkflow,
@@ -320,6 +328,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     runObservationManager,
     runIndex,
     approvalRegistry,
+    questionRegistry,
     cancelRunDeps,
     // operatorPushStore/operatorPushVapidKeyInfo: server.ts gates the
     // /operator/push/* routes on both being present. Threaded only when the
@@ -505,6 +514,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           bindingsLookup: bindingsStore,
           isRepoDenied: denylistCache.isRepoDenied,
           hasPendingForScope: scopeId => approvalRegistry.hasPendingForScope(scopeId),
+          hasPendingQuestionForScope: scopeId => questionRegistry.hasPendingForScope(scopeId),
         }),
       logger,
       setInterval: (cb, ms) => setInterval(cb, ms),
@@ -685,6 +695,13 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       approvalRegistry,
       questionRegistry,
       requestGate,
+      // Every run's registered questions are announced on the run's SSE stream (open and settle
+      // frames), whichever surface launched it: web operators may answer any run's question.
+      createQuestionOnRegistered: ({runId, repo}) =>
+        createWebQuestionOnRegistered({
+          observeQuestion: (observedRunId, data) => runObservationManager.observeQuestion(observedRunId, data),
+          logger,
+        })({questionRegistry, runId, repo}),
       approvalMode: config.approvalMode,
       statusMode: config.statusMode,
       // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
@@ -882,6 +899,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         runObservationManager,
         runIndex,
         approvalRegistry,
+        questionRegistry,
         cancelRunDeps: {
           coordinationConfig: makeCoordinationConfig(s3Adapter, config),
           identity: config.identity,

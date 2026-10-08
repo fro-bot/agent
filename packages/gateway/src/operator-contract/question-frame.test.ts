@@ -76,7 +76,7 @@ describe('question contract surface (1.9.0)', () => {
 
   it('models answer and skip as a discriminated request', () => {
     // #given the two decision bodies
-    const answer: QuestionDecisionRequest = {decision: 'answer', answers: [['A']]}
+    const answer: QuestionDecisionRequest = {decision: 'answer', answers: [{options: [0], text: 'extra'}]}
     const skip: QuestionDecisionRequest = {decision: 'skip'}
 
     // #when / #then they are distinguishable by `decision`

@@ -399,6 +399,19 @@ describe('runOperatorRouteSmoke — regression guard (non-vacuous)', () => {
     expect(exitCode).not.toBe(0)
   })
 
+  it('returns non-zero when question routes are absent (questionRegistryOverride: undefined)', async () => {
+    // #given — questionRegistry flows through buildOperatorServerInputs; passing
+    // questionRegistryOverride: undefined causes the helper to pass undefined to
+    // deps.questionRegistry, and server.ts gates the question routes on that dep being present.
+    // #when
+    const exitCode = await runOperatorRouteSmoke({
+      questionRegistryOverride: undefined,
+    })
+
+    // #then — non-zero exit (question routes absent from the inventory)
+    expect(exitCode).not.toBe(0)
+  })
+
   it('returns non-zero when GET /operator/runs is absent (runIndexOverride: undefined)', async () => {
     // #given — runIndex flows through buildOperatorServerInputs; passing
     // runIndexOverride: undefined causes the helper to pass undefined to

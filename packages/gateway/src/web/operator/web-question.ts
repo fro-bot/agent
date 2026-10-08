@@ -1,22 +1,25 @@
 /**
  * Web question transport.
  *
- * Registers each pending agent question in the question registry and fans out
- * an SSE `question` frame so a web operator can see and answer it. The question
- * analog of `web-approval.ts`; this module only exports a factory. Wiring it
- * into run transport selection belongs to the run-launch units.
+ * Announces each registered agent question on the run's SSE stream so a web
+ * operator can see and answer it, and clears the prompt when the question
+ * settles. The question analog of `web-approval.ts`.
  *
- * ### register-before-fan-out
+ * ### Where it plugs in
  *
- * The registry entry is registered BEFORE the SSE frame is emitted, so an
- * answer can settle even if the frame is dropped. The registry is the
- * authoritative fail-closed gate; the frame is advisory.
+ * The run's question coordinator registers the question with the request gate
+ * and then calls the hook this factory returns (`onRegistered`). That is the
+ * same register-before-fan-out order the approval transport has: the registry
+ * entry exists before any frame is emitted, so an answer can settle even if the
+ * frame is dropped. The transport serves every run, Discord-launched or
+ * web-launched: web operators may answer any run's question, so a Discord run's
+ * question must reach the run stream and the pending listing too.
  *
  * ### fail-soft observation
  *
- * `observeQuestion` throwing never escapes the pending hook: the failure is
- * logged with ids and an error name only, and swallowed. The registration
- * already happened and the deadline still skips the question.
+ * `observeQuestion` throwing never escapes the hook: the failure is logged with
+ * ids and an error name only, and swallowed. The registration already happened
+ * and the deadline still skips the question.
  *
  * ### untrusted text
  *
@@ -26,58 +29,47 @@
  * only, never text and never a raw error message.
  */
 
-import type {QuestionPromptInput, QuestionRegistry, QuestionSideEffects} from '../../approvals/question-registry.js'
+import type {QuestionInfo, QuestionRegistry} from '../../approvals/question-registry.js'
 import type {QuestionFrameData} from '../../operator-contract/question-frame.js'
 import type {OperatorLogger} from '../server.js'
 import {toQuestionRequestDetail} from '../../approvals/question-detail.js'
-import {normalizeQuestion} from '../../approvals/question-registry.js'
 
 // ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
 
-/** A pending question as the run's question parser reports it. */
+/** A question the registry now holds, with `multiple` / `custom` already normalized. */
 export interface WebQuestionRequest {
   readonly requestID: string
-  readonly sessionID: string
-  readonly questions: readonly QuestionPromptInput[]
+  readonly questions: readonly QuestionInfo[]
 }
 
-/**
- * Per-run context supplied by the run engine; the question analog of
- * `ApprovalTransportContext`. The engine owns the registry, the human-wait
- * deadline derived from the remaining run budget, and the reply/reject
- * effects.
- */
+/** Per-run context supplied by the run engine. */
 export interface WebQuestionTransportContext {
-  /** Program-scoped question registry. The transport calls `register()` and `attachMessage()` here. */
-  readonly questionRegistry: Pick<QuestionRegistry, 'register' | 'attachMessage'>
-  /** Stable UUID for this run; the registry scope for web runs and the SSE fan-out key. */
+  /** Program-scoped question registry; the transport attaches its settle render here. */
+  readonly questionRegistry: Pick<QuestionRegistry, 'attachMessage'>
+  /** Stable UUID for this run; the SSE fan-out key. */
   readonly runId: string
   /** `owner/repo` for logging and correlation. */
   readonly repo: string
-  /** Human-wait deadline in ms; must be positive (the registry refuses otherwise). */
-  readonly questionDeadlineMs: number
-  /** Reply/reject effects injected by the engine. */
-  readonly effects: QuestionSideEffects
 }
 
 export interface WebQuestionTransportDeps {
   /**
-   * Fan-out for question frames. Same shape as the per-run observer wired for
-   * approvals. Fail-soft: a throw is logged and swallowed.
+   * Fan-out for question frames, keyed by run id. Fail-soft: a throw is logged
+   * and swallowed.
    */
   readonly observeQuestion: (runId: string, data: QuestionFrameData) => void
   readonly logger: OperatorLogger
 }
 
-/** What the engine calls when a question is pending, mirroring the approval `onPending`. */
-export type WebQuestionOnPending = (request: WebQuestionRequest) => void
+/** Called by the question coordinator once the registry holds the question. Never throws. */
+export type WebQuestionOnRegistered = (request: WebQuestionRequest) => void
 
-export type WebQuestionOnPendingFactory = (context: WebQuestionTransportContext) => WebQuestionOnPending
+export type WebQuestionOnRegisteredFactory = (context: WebQuestionTransportContext) => WebQuestionOnRegistered
 
 // ---------------------------------------------------------------------------
-// createWebQuestionOnPending
+// createWebQuestionOnRegistered
 // ---------------------------------------------------------------------------
 
 function errorName(error: unknown): string {
@@ -87,60 +79,44 @@ function errorName(error: unknown): string {
 /**
  * Factory for the web question transport.
  *
- * Returns a function that, given the run context, returns an `onPending` hook:
+ * Returns a function that, given the run context, returns an `onRegistered`
+ * hook which:
  *
- * 1. Registers the request with `questionScopeId = ctx.runId`.
- * 2. Attaches a render function that emits the settle frame on every
+ * 1. Attaches a render function that emits the settle frame on every
  *    settlement path (answer, skip, deadline, echo, teardown).
- * 3. Emits the bounded open frame.
- *
- * A duplicate request id keeps the existing entry and emits nothing new. A
- * refused registration (no usable deadline) emits no frame: there is nothing
- * to answer, and the caller owns the skip-immediately path.
+ * 2. Emits the bounded open frame.
  */
-export function createWebQuestionOnPending(deps: WebQuestionTransportDeps): WebQuestionOnPendingFactory {
+export function createWebQuestionOnRegistered(deps: WebQuestionTransportDeps): WebQuestionOnRegisteredFactory {
   const {observeQuestion, logger} = deps
 
-  return (ctx: WebQuestionTransportContext): WebQuestionOnPending => {
+  return (ctx: WebQuestionTransportContext): WebQuestionOnRegistered => {
     return (request: WebQuestionRequest): void => {
-      const {requestID, sessionID, questions} = request
+      const {requestID, questions} = request
       const {runId} = ctx
-
-      // register-before-fan-out
-      const outcome = ctx.questionRegistry.register({
-        requestID,
-        sessionID,
-        questionScopeId: runId,
-        questions,
-        effects: ctx.effects,
-        deadlineMs: ctx.questionDeadlineMs,
-      })
-
-      if (outcome.kind !== 'registered') {
-        logger.debug({runId, requestID, reason: outcome.kind}, 'web-question: not registered — no frame emitted')
-        return
-      }
 
       // The settle render runs on every settlement path. Advisory: a throw is
       // logged and swallowed because the settlement already happened.
-      ctx.questionRegistry.attachMessage(requestID, async (): Promise<void> => {
-        try {
-          observeQuestion(runId, {requestID, runId, settled: true})
-        } catch (error: unknown) {
-          logger.warn(
-            {runId, requestID, errName: errorName(error)},
-            'web-question: settle-frame observer threw (fail-soft; settlement already applied)',
-          )
-        }
-      })
-
-      // Frame build and fan-out share one guard: neither may reject the pending hook.
       try {
-        observeQuestion(runId, {
-          ...toQuestionRequestDetail(requestID, questions.map(normalizeQuestion)),
-          runId,
-          settled: false,
+        ctx.questionRegistry.attachMessage(requestID, async (): Promise<void> => {
+          try {
+            observeQuestion(runId, {requestID, runId, settled: true})
+          } catch (error: unknown) {
+            logger.warn(
+              {runId, requestID, errName: errorName(error)},
+              'web-question: settle-frame observer threw (fail-soft; settlement already applied)',
+            )
+          }
         })
+      } catch (error: unknown) {
+        logger.warn(
+          {runId, requestID, errName: errorName(error)},
+          'web-question: attaching the settle render threw (fail-soft)',
+        )
+      }
+
+      // Frame build and fan-out share one guard: neither may reject the hook.
+      try {
+        observeQuestion(runId, {...toQuestionRequestDetail(requestID, questions), runId, settled: false})
       } catch (error: unknown) {
         logger.warn(
           {runId, repo: ctx.repo, requestID, errName: errorName(error)},

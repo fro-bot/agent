@@ -118,19 +118,33 @@ export type QuestionFrameData =
 export type PendingQuestionDTO = QuestionRequestDetail
 
 // ---------------------------------------------------------------------------
-// Decision request types
+// Decision request and response types
 // ---------------------------------------------------------------------------
 
 /**
- * Answer a pending question request: one array of strings per question, in
- * question order. Each string is either an option label or, when the question's
- * `custom` is true, free text (at most 4,000 characters). A question with
- * `multiple: false` accepts at most one string. Every string is untrusted plain
- * text.
+ * The operator's answer to one question: which options they chose and, when the
+ * question's `custom` is true, free text.
+ *
+ * Options are chosen by zero-based **index into that question's `options`**, never
+ * by label. The labels a consumer displays are bounded and control-stripped, so
+ * they can differ from the raw labels the agent sent; the gateway maps each index
+ * back to the raw label before replying. `options` holds at most one index unless
+ * the question's `multiple` is true. `text` is untrusted plain text, at most 4,000
+ * characters; an omitted or empty `text` means no free-text answer. A question with
+ * neither is left unanswered.
+ */
+export interface QuestionAnswerChoice {
+  readonly options?: readonly number[]
+  readonly text?: string
+}
+
+/**
+ * Answer a pending question request: one choice per question, in question order.
+ * The array length must equal the request's question count.
  */
 export interface QuestionAnswerRequest {
   readonly decision: 'answer'
-  readonly answers: readonly (readonly string[])[]
+  readonly answers: readonly QuestionAnswerChoice[]
 }
 
 /**
@@ -143,3 +157,35 @@ export interface QuestionSkipRequest {
 
 /** Body of an operator question decision: answer or skip. */
 export type QuestionDecisionRequest = QuestionAnswerRequest | QuestionSkipRequest
+
+/** Response body of `GET /operator/runs/:runId/questions`: the run's open question requests. */
+export interface PendingQuestionsResponse {
+  readonly requests: readonly PendingQuestionDTO[]
+}
+
+/**
+ * Why a decision was refused as malformed (HTTP 400). The request stays pending.
+ * `malformed` covers a body that is not an answer/skip shape, duplicate or non-integer
+ * option indices, and non-string text; the others mirror the gateway's answer validation.
+ */
+export type QuestionDecisionInvalidReason =
+  'malformed' | 'arity-mismatch' | 'unknown-option' | 'multiple-not-allowed' | 'empty-value' | 'text-too-long'
+
+/**
+ * Outcome of a question decision (HTTP 200 unless noted).
+ *
+ * - `claimed`         — accepted; the reply is on its way to the agent.
+ * - `already_claimed` — another decision for this request is in flight; nothing changed.
+ * - `already_settled` — the request is no longer pending (answered, skipped, expired, or
+ *                       never existed for this run). Repeating a submission lands here.
+ * - `failed_to_settle`— the reply to the agent failed; the request is pending again.
+ * - `invalid`         — HTTP 400; the body was refused, see `reason`. The request stays pending.
+ */
+export type QuestionDecisionResponse =
+  | {readonly state: 'claimed' | 'already_claimed' | 'already_settled' | 'failed_to_settle'}
+  | {
+      readonly state: 'invalid'
+      readonly reason: QuestionDecisionInvalidReason
+      /** The question the problem is in, or null when it concerns the whole request. */
+      readonly questionIndex: number | null
+    }

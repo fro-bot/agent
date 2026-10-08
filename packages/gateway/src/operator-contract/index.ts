@@ -47,8 +47,12 @@ export type {
 export {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
 export type {
   PendingQuestionDTO,
+  PendingQuestionsResponse,
+  QuestionAnswerChoice,
   QuestionAnswerRequest,
+  QuestionDecisionInvalidReason,
   QuestionDecisionRequest,
+  QuestionDecisionResponse,
   QuestionFrameData,
   QuestionOptionDetail,
   QuestionPromptDetail,

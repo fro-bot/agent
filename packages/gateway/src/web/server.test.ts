@@ -2036,6 +2036,13 @@ function makeStubApprovalRegistry(): NonNullable<OperatorServerDeps['approvalReg
   }
 }
 
+function makeStubQuestionRegistry(): NonNullable<OperatorServerDeps['questionRegistry']> {
+  return {
+    decide: async () => ({kind: 'not-found' as const}),
+    describePendingForRun: () => [],
+  }
+}
+
 /** Shared stub for cancelRunDeps — opaque sentinel for registration tests only. */
 function makeStubCancelRunDeps(): NonNullable<OperatorServerDeps['cancelRunDeps']> {
   // Registration only checks `deps.cancelRunDeps !== undefined`; the actual
@@ -2098,6 +2105,7 @@ function makeFullPrivilegedDeps(sessionStore: ReturnType<typeof createInMemorySe
     launchWorkDeps: makeStubLaunchWorkDeps(),
     dispatchWorkflow: async (owner: string, repo: string) => ({outcome: 'accepted' as const, owner, repo}),
     approvalRegistry: makeStubApprovalRegistry(),
+    questionRegistry: makeStubQuestionRegistry(),
     cancelRunDeps: makeStubCancelRunDeps(),
     operatorPushStore: makeStubOperatorPushStore(),
     operatorPushVapidKeyInfo: makeStubOperatorPushVapidKeyInfo(),
@@ -2140,6 +2148,53 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
 
     expect(routeSet).toEqual(expectedV15Routes)
     expect(routes).toHaveLength(expectedV15Routes.size)
+  })
+
+  it('dep-gated negative case: without the question registry only the question routes are absent', () => {
+    // #given — every privileged dep except the question registry
+    const sessionStore = createInMemorySessionStore()
+    const app = buildOperatorApp(
+      {...makeFullPrivilegedDeps(sessionStore), questionRegistry: undefined},
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when
+    const routeSet = new Set(extractRoutes(app).map(r => `${r.method}:${r.path}`))
+
+    // #then — exactly the two question routes are missing from the expected inventory
+    const missing = EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`).filter(key => !routeSet.has(key))
+    expect(missing.toSorted()).toEqual([
+      'GET:/operator/runs/:runId/questions',
+      'POST:/operator/runs/:runId/questions/:requestId/decision',
+    ])
+  })
+
+  it('question decision route: a body over 64 KiB is rejected before session or run lookup', async () => {
+    // #given — the full route set with spies on the session and run-index lookups
+    const sessionStore = createInMemorySessionStore()
+    const getSpy = vi.spyOn(sessionStore, 'get')
+    const getTokenSpy = vi.spyOn(sessionStore, 'getOperatorToken')
+    const lookup = vi.fn(async () => undefined)
+    const base = makeFullPrivilegedDeps(sessionStore)
+    const app = buildOperatorApp(
+      {...base, runIndex: {...makeStubRunIndex(), lookup}},
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when — an oversized body is posted to the question decision route
+    const res = await app.fetch(
+      new Request('http://localhost/operator/runs/run-1/questions/que_1/decision', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: Buffer.alloc(65 * 1024 + 1, 0x41),
+      }),
+    )
+
+    // #then — the global body limit answers 413 and nothing was looked up
+    expect(res.status).toBe(413)
+    expect(lookup).not.toHaveBeenCalled()
+    expect(getSpy).not.toHaveBeenCalled()
+    expect(getTokenSpy).not.toHaveBeenCalled()
   })
 
   it('dep-gated negative case: without run/approval deps, privileged run/approval routes do NOT register', () => {

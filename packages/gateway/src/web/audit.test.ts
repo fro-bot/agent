@@ -1495,3 +1495,77 @@ describe('emitAudit — sink failure resilience', () => {
     expect(() => emitAudit(event, logger)).not.toThrow()
   })
 })
+
+// ---------------------------------------------------------------------------
+// question.decision / question.rejected
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — question.decision', () => {
+  it('emits an info record carrying ids, family, and outcome', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'question.decision',
+      correlationId: 'question:42:run-1:que_1',
+      githubUserId: 42,
+      runId: 'run-1',
+      requestId: 'que_1',
+      family: 'question',
+      outcome: 'skipped',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.info)).toBe('audit: question.decision')
+    expect(firstCallCtx(logger.info)).toEqual(event)
+  })
+
+  it('redacts sensitive values planted in correlationId, runId, and requestId', () => {
+    for (const planted of [PLANTED_COOKIE, PLANTED_TOKEN, PLANTED_BEARER, PLANTED_SECRET, PLANTED_INTERNAL_URL]) {
+      const logger = makeLogger()
+      emitAudit(
+        {
+          kind: 'question.decision',
+          correlationId: planted,
+          githubUserId: 42,
+          runId: planted,
+          requestId: planted,
+          family: 'question',
+          outcome: 'answered',
+        },
+        logger,
+      )
+      assertNoSensitiveValues(logger)
+    }
+  })
+})
+
+describe('emitAudit — question.rejected', () => {
+  const base = {
+    kind: 'question.rejected' as const,
+    correlationId: 'question:42:run-1:que_1',
+    githubUserId: 42,
+    runId: 'run-1',
+    requestId: 'que_1',
+    family: 'question' as const,
+  }
+
+  it.each(['already_claimed', 'not_found'] as const)('logs %s at info (routine race or stale request)', reason => {
+    const logger = makeLogger()
+    emitAudit({...base, reason}, logger)
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.info)).toMatchObject({kind: 'question.rejected', reason})
+  })
+
+  it.each(['invalid', 'reply_failed'] as const)('logs %s at warn (actionable)', reason => {
+    const logger = makeLogger()
+    emitAudit({...base, reason}, logger)
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.warn)).toBe('audit: question.rejected')
+  })
+})

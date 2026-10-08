@@ -2065,6 +2065,75 @@ describe('launch route wiring — POST /operator/runs', () => {
     )
   })
 
+  it('wires the question registry into the operator server so the question routes mount', async () => {
+    // #given / #when
+    const serverDeps = await captureOperatorServerDeps()
+
+    // #then — the routes and the runs share one registry instance
+    expect(serverDeps.questionRegistry).toBeDefined()
+    expect(serverDeps.questionRegistry).toBe(serverDeps.launchWorkDeps?.questionRegistry)
+  })
+
+  it("announces every run's registered questions on its SSE stream, whichever surface launched it", async () => {
+    // #given the run deps' question hook and a subscriber on a Discord-launched run's stream
+    const serverDeps = await captureOperatorServerDeps()
+    const runDeps = serverDeps.launchWorkDeps
+    const manager = serverDeps.runObservationManager
+    if (
+      runDeps?.questionRegistry === undefined ||
+      runDeps.createQuestionOnRegistered === undefined ||
+      manager === undefined
+    ) {
+      throw new Error('expected the question wiring on the run deps')
+    }
+    const frames: import('./web/sse/manager.js').ObservationFrame[] = []
+    manager.subscribe('run-discord-1', {
+      onEvent: frame => {
+        frames.push(frame)
+      },
+      onClose: () => undefined,
+    })
+    const asked = {
+      requestID: 'que_p1',
+      sessionID: 'sess-1',
+      questions: [{question: 'Which?', header: 'H', options: [], multiple: false, custom: true}],
+    }
+    const effects = {
+      replyQuestion: vi.fn(async () => ({ok: true as const})),
+      rejectQuestion: vi.fn(async () => ({ok: true as const})),
+    }
+
+    // #when the coordinator registers a thread-scoped question, then announces it
+    runDeps.questionRegistry.register({
+      requestID: asked.requestID,
+      sessionID: asked.sessionID,
+      questionScopeId: 'thread-9',
+      runId: 'run-discord-1',
+      questions: asked.questions,
+      effects,
+      deadlineMs: 60_000,
+    })
+    runDeps.createQuestionOnRegistered({runId: 'run-discord-1', repo: 'acme/widget'})({
+      requestID: asked.requestID,
+      sessionID: asked.sessionID,
+      questions: asked.questions,
+    })
+    runDeps.questionRegistry.confirmEcho({
+      kind: 'replied',
+      requestID: asked.requestID,
+      sessionID: asked.sessionID,
+      answers: [[]],
+    })
+    await new Promise<void>(resolve => {
+      setTimeout(resolve, 0)
+    })
+
+    // #then the stream saw the open frame, then the settle frame
+    const questionFrames = frames.filter(frame => frame.type === 'question')
+    expect(questionFrames.map(frame => frame.data.settled)).toEqual([false, true])
+    expect(questionFrames[0]).toMatchObject({runId: 'run-discord-1', data: {requestID: 'que_p1'}})
+  })
+
   /**
    * Extract unique logical routes from a Hono app, excluding the catch-all
    * ALL /* middleware entry and deduplicating by method+path.

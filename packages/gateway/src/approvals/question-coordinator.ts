@@ -62,6 +62,16 @@ export type QuestionAskOutcome = 'registered' | 'duplicate' | 'skipped' | 'faile
 export interface QuestionCoordinator {
   /** Register (or immediately skip) an owned question. Never rejects. */
   readonly onAsked: (request: QuestionAskedRequest) => Promise<QuestionAskOutcome>
+  /**
+   * Reject an owned question whose payload could not be parsed but whose request id is readable.
+   * Without this the agent's `question` tool call blocks until the inactivity timeout; rejecting
+   * ends the turn instead. Never rejects; logs ids and a reason code only.
+   */
+  readonly onMalformed: (args: {
+    readonly requestID: string
+    readonly sessionID: string
+    readonly reason: QuestionParseFailure
+  }) => Promise<void>
   /** Forward OpenCode's authoritative echo to the registry. Never throws. */
   readonly onEcho: (echo: QuestionEcho) => void
   /** Reject every still-pending question this run registered (run teardown). Never rejects. */
@@ -74,8 +84,16 @@ export interface QuestionCoordinatorDeps {
   readonly effects: QuestionSideEffects
   /** Scope the registry binds each question to (thread id for Discord runs, run id for web runs). */
   readonly scopeId: string
+  /** The run these questions belong to; lets web routes find and settle them on any surface. */
+  readonly runId?: string
   /** Deadline for a question asked now, or `undefined` when the run has no budget for one. */
   readonly computeDeadlineMs: () => number | undefined
+  /**
+   * Called once per newly registered question, after the registry holds it (register-before-fan-out):
+   * transports attach their settled render and announce the question here. Fail-soft: a throw is
+   * logged by id and never changes the ask's outcome.
+   */
+  readonly onRegistered?: (request: QuestionAskedRequest) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +201,7 @@ export function parseQuestionEcho(
 // ---------------------------------------------------------------------------
 
 export function createQuestionCoordinator(deps: QuestionCoordinatorDeps): QuestionCoordinator {
-  const {logger, registry, effects, scopeId, computeDeadlineMs} = deps
+  const {logger, registry, effects, scopeId, runId, computeDeadlineMs, onRegistered} = deps
   /** Sessions this run registered questions for — the dispose set. */
   const registeredSessionIDs = new Set<string>()
 
@@ -199,6 +217,19 @@ export function createQuestionCoordinator(deps: QuestionCoordinatorDeps): Questi
       logger.warn(
         {requestID: request.requestID, sessionID: request.sessionID, reason},
         'question-coordinator: immediate skip reply failed — the question stays pending in OpenCode',
+      )
+    }
+  }
+
+  /** Hand a registered question to the transports. Never throws. */
+  function announce(request: QuestionAskedRequest): void {
+    if (onRegistered === undefined) return
+    try {
+      onRegistered(request)
+    } catch (error) {
+      logger.warn(
+        {requestID: request.requestID, errName: error instanceof Error ? error.name : typeof error},
+        'question-coordinator: onRegistered threw — question stays registered, deadline will skip it',
       )
     }
   }
@@ -220,6 +251,7 @@ export function createQuestionCoordinator(deps: QuestionCoordinatorDeps): Questi
         requestID,
         sessionID,
         questionScopeId: scopeId,
+        runId,
         questions: request.questions,
         effects,
         deadlineMs,
@@ -227,6 +259,7 @@ export function createQuestionCoordinator(deps: QuestionCoordinatorDeps): Questi
       switch (outcome.kind) {
         case 'registered':
           registeredSessionIDs.add(sessionID)
+          announce(request)
           return 'registered'
         case 'duplicate':
           return 'duplicate'
@@ -240,6 +273,32 @@ export function createQuestionCoordinator(deps: QuestionCoordinatorDeps): Questi
         'question-coordinator: onAsked threw',
       )
       return 'failed'
+    }
+  }
+
+  async function onMalformed(args: {
+    readonly requestID: string
+    readonly sessionID: string
+    readonly reason: QuestionParseFailure
+  }): Promise<void> {
+    const {requestID, sessionID, reason} = args
+    // The effect's own error text is not logged (see skipImmediately).
+    let outcome: 'reject-error' | 'reject-threw' | null
+    try {
+      outcome = (await effects.rejectQuestion(requestID)).ok ? null : 'reject-error'
+    } catch {
+      outcome = 'reject-threw'
+    }
+    if (outcome === null) {
+      logger.warn(
+        {requestID: safeLogId(requestID), sessionID: safeLogId(sessionID), reason},
+        'question-coordinator: malformed question rejected so the agent does not wait for the timeout',
+      )
+    } else {
+      logger.warn(
+        {requestID: safeLogId(requestID), sessionID: safeLogId(sessionID), reason, rejectOutcome: outcome},
+        'question-coordinator: malformed question could not be rejected — the agent waits for the timeout',
+      )
     }
   }
 
@@ -269,5 +328,5 @@ export function createQuestionCoordinator(deps: QuestionCoordinatorDeps): Questi
     )
   }
 
-  return {onAsked, onEcho, dispose}
+  return {onAsked, onMalformed, onEcho, dispose}
 }

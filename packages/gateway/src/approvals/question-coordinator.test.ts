@@ -341,3 +341,154 @@ describe('createQuestionCoordinator', () => {
     expect(effects.rejectQuestion).not.toHaveBeenCalled()
   })
 })
+
+describe('createQuestionCoordinator — announcement, run binding, malformed asks', () => {
+  function setupWith(
+    options: {
+      readonly onRegistered?: (request: QuestionAskedRequest) => void
+      readonly effects?: Partial<QuestionSideEffects>
+    } = {},
+  ) {
+    const logger = makeLogger()
+    const gate = createRequestGate({logger})
+    const registry = createQuestionRegistry({logger, gate})
+    const effects: QuestionSideEffects = {
+      replyQuestion: vi.fn().mockResolvedValue({ok: true}),
+      rejectQuestion: vi.fn().mockResolvedValue({ok: true}),
+      ...options.effects,
+    }
+    const coordinator = createQuestionCoordinator({
+      logger,
+      registry,
+      effects,
+      scopeId: 'thread-1',
+      runId: 'run-1',
+      computeDeadlineMs: () => 60_000,
+      ...(options.onRegistered === undefined ? {} : {onRegistered: options.onRegistered}),
+    })
+    return {logger, registry, effects, coordinator}
+  }
+
+  it('binds the question to the run id so web routes find it under a thread scope', async () => {
+    // #given a Discord-style thread scope and a run id
+    const {coordinator, registry} = setupWith()
+
+    // #when
+    await coordinator.onAsked(parsedRequest())
+
+    // #then it is listed by run id as well as by scope
+    expect(registry.describePendingForRun('run-1').map(dto => dto.requestID)).toEqual(['que_1'])
+    expect(registry.describePendingForScope('thread-1')).toHaveLength(1)
+  })
+
+  it('announces a newly registered question once, after the registry holds it', async () => {
+    // #given a hook that checks the registry at call time
+    const held: boolean[] = []
+    const holder: {registry?: ReturnType<typeof createQuestionRegistry>} = {}
+    const onRegistered = vi.fn((request: QuestionAskedRequest) => {
+      held.push(holder.registry?.has(request.requestID) === true)
+    })
+    const {coordinator, registry} = setupWith({onRegistered})
+    holder.registry = registry
+
+    // #when the question is asked twice
+    await coordinator.onAsked(parsedRequest())
+    await coordinator.onAsked(parsedRequest())
+
+    // #then the duplicate is not re-announced
+    expect(onRegistered).toHaveBeenCalledExactlyOnceWith(parsedRequest())
+    expect(held).toEqual([true])
+  })
+
+  it('does not announce a question skipped for lack of budget', async () => {
+    // #given
+    const onRegistered = vi.fn()
+    const logger = makeLogger()
+    const registry = createQuestionRegistry({logger, gate: createRequestGate({logger})})
+    const effects: QuestionSideEffects = {
+      replyQuestion: vi.fn().mockResolvedValue({ok: true}),
+      rejectQuestion: vi.fn().mockResolvedValue({ok: true}),
+    }
+    const coordinator = createQuestionCoordinator({
+      logger,
+      registry,
+      effects,
+      scopeId: 's',
+      computeDeadlineMs: () => undefined,
+      onRegistered,
+    })
+
+    // #when
+    const outcome = await coordinator.onAsked(parsedRequest())
+
+    // #then
+    expect(outcome).toBe('skipped')
+    expect(onRegistered).not.toHaveBeenCalled()
+  })
+
+  it('a throwing announcement keeps the question registered and logs the id and error name only', async () => {
+    // #given a hook that throws an error carrying secret text
+    const {coordinator, registry, logger} = setupWith({
+      onRegistered: () => {
+        throw new Error(SECRET)
+      },
+    })
+
+    // #when
+    const outcome = await coordinator.onAsked(parsedRequest())
+
+    // #then
+    expect(outcome).toBe('registered')
+    expect(registry.has('que_1')).toBe(true)
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({requestID: 'que_1', errName: 'Error'}),
+      expect.stringContaining('onRegistered threw'),
+    )
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(SECRET)
+  })
+
+  it('onMalformed rejects the request and logs ids and a reason code only', async () => {
+    // #given
+    const {coordinator, effects, logger} = setupWith()
+
+    // #when
+    await coordinator.onMalformed({requestID: 'que_bad', sessionID: 'ses_1', reason: 'invalid-question'})
+
+    // #then
+    expect(effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_bad')
+    expect(effects.replyQuestion).not.toHaveBeenCalled()
+    expect(logger.warn).toHaveBeenCalledWith(
+      {requestID: 'que_bad', sessionID: 'ses_1', reason: 'invalid-question'},
+      expect.stringContaining('rejected'),
+    )
+  })
+
+  it.each([
+    ['an ok:false result', {rejectQuestion: vi.fn().mockResolvedValue({ok: false, error: SECRET})}, 'reject-error'],
+    ['a thrown error', {rejectQuestion: vi.fn().mockRejectedValue(new Error(SECRET))}, 'reject-threw'],
+  ])('onMalformed survives %s without leaking its text', async (_label, effects, code) => {
+    // #given
+    const {coordinator, logger} = setupWith({effects})
+
+    // #when / #then it never rejects
+    await expect(
+      coordinator.onMalformed({requestID: 'que_bad', sessionID: 'ses_1', reason: 'invalid-questions'}),
+    ).resolves.toBeUndefined()
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({requestID: 'que_bad', rejectOutcome: code}),
+      expect.stringContaining('could not be rejected'),
+    )
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(SECRET)
+  })
+
+  it('onMalformed does not log an id that is not id-shaped', async () => {
+    // #given an id carrying free text
+    const {coordinator, logger} = setupWith()
+
+    // #when
+    await coordinator.onMalformed({requestID: `${SECRET} with spaces`, sessionID: 'ses_1', reason: 'invalid-question'})
+
+    // #then it was still addressed for rejection, but never logged
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(SECRET)
+  })
+})

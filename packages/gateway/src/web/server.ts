@@ -27,6 +27,7 @@
 
 import type {ServerType} from '@hono/node-server'
 import type {Context, Env} from 'hono'
+import type {QuestionRegistry} from '../approvals/question-registry.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {CancelRunDeps} from '../execute/cancel.js'
@@ -72,6 +73,8 @@ import {buildDispatchRoute} from './operator/dispatch-route.js'
 import {createIdempotencyGuard} from './operator/idempotency.js'
 import {buildLaunchRoute} from './operator/launch-route.js'
 import {buildPendingApprovalsRoute} from './operator/pending-approvals-route.js'
+import {buildPendingQuestionsRoute} from './operator/pending-questions-route.js'
+import {buildQuestionDecisionRoute} from './operator/question-decision-route.js'
 import {buildReposRoute} from './operator/repos-route.js'
 import {buildRunsRoute} from './operator/runs-route.js'
 import {
@@ -263,6 +266,15 @@ export interface OperatorServerDeps {
    * When absent, neither route is registered (opt-in).
    */
   readonly approvalRegistry?: Pick<ApprovalRegistry, 'handleDecision' | 'describePendingForScope'>
+  /**
+   * Question registry for the question routes. When present (alongside the browser guard,
+   * sessionStore, runIndex, denylistCache, bindingsLookup, allowlist, and auditLogger), the
+   * following routes are registered:
+   *   - POST /operator/runs/:runId/questions/:requestId/decision (write-gated; answer or skip)
+   *   - GET  /operator/runs/:runId/questions (read-gated, enumeration)
+   * When absent, neither route is registered (opt-in).
+   */
+  readonly questionRegistry?: Pick<QuestionRegistry, 'decide' | 'describePendingForRun'>
   /**
    * Cancel-run engine dependencies (queue, abort registry, approvals, Discord
    * client, coordination config/identity) for the cancel route's `cancelRun`
@@ -1114,6 +1126,65 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
       registry: deps.approvalRegistry,
+      logger: deps.logger,
+      now: clock,
+    })
+  }
+
+  // ── Question routes ────────────────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND the question
+  // registry, runIndex, denylistCache, bindingsLookup, allowlist, and auditLogger
+  // are provided.
+  //   POST /operator/runs/:runId/questions/:requestId/decision — privileged, write-level
+  //        repo authz, CSRF; body {decision:'answer', answers:[{options?, text?}]} | {decision:'skip'}.
+  //   GET  /operator/runs/:runId/questions — privileged, read-level repo authz.
+  //
+  // Gate ordering matches the approval routes: guard, session token, run lookup,
+  // denylist (before any authz call), authz, then body validation and the gate.
+  // The 64 KiB body limit is the global middleware above, ahead of both routes.
+  // Every failure before body validation returns the identical no-oracle
+  // notFoundResponse. Web operators may answer any run's question, including a
+  // Discord-launched run's: the run is resolved server-side from the run index and
+  // the gate refuses a request id that belongs to a different run.
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.bindingsLookup !== undefined &&
+    deps.runIndex !== undefined &&
+    deps.questionRegistry !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    const repoAuthzDeps = {
+      allowlist: deps.allowlist,
+      fetch: globalThis.fetch,
+      clock,
+      random: Math.random.bind(Math),
+      auditLogger: deps.auditLogger,
+      logger: deps.logger,
+      cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+    }
+    buildQuestionDecisionRoute(app, {
+      sessionStore: deps.sessionStore,
+      runIndex: deps.runIndex,
+      denylistCache: deps.denylistCache,
+      bindingsLookup: deps.bindingsLookup,
+      repoAuthzDeps,
+      registry: deps.questionRegistry,
+      auditLogger: deps.auditLogger,
+      logger: deps.logger,
+      now: clock,
+    })
+    buildPendingQuestionsRoute(app, {
+      sessionStore: deps.sessionStore,
+      runIndex: deps.runIndex,
+      denylistCache: deps.denylistCache,
+      bindingsLookup: deps.bindingsLookup,
+      repoAuthzDeps,
+      registry: deps.questionRegistry,
       logger: deps.logger,
       now: clock,
     })

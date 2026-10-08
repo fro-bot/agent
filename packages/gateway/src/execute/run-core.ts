@@ -1039,6 +1039,18 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
               {eventType, requestID: askedRequestID, sessionID: safeLogId(eventSessionID), reason: parsed.reason},
               'run-core: question.asked payload malformed — skipping',
             )
+            // The asking tool call is blocked on this request. When its id is readable, reject it
+            // (fire-and-continue) so the agent's turn ends now instead of at the inactivity timeout.
+            // A payload with no readable id cannot be addressed and stays warn-only.
+            const rawAskedRequestID = getStringProperty(eventPayload, 'id')
+            if (rawAskedRequestID !== null && rawAskedRequestID.length > 0 && eventSessionID !== null) {
+              // eslint-disable-next-line no-void
+              void questions.onMalformed({
+                requestID: rawAskedRequestID,
+                sessionID: eventSessionID,
+                reason: parsed.reason,
+              })
+            }
           } else {
             const req = parsed.value
             // Pauses typing and the inactivity timer until every outstanding human wait is released.

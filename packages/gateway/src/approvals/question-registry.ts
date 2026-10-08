@@ -99,6 +99,12 @@ export interface RegisterQuestionParams {
   readonly sessionID: string
   /** Transport-neutral scope: for a Discord-launched run, its thread id; for a web run, the run id. */
   readonly questionScopeId: string
+  /**
+   * The run that asked the question. Web routes find and settle a run's questions by this id, so
+   * they work the same for Discord-launched runs (whose scope is a thread id). A question
+   * registered without it is not reachable from web routes.
+   */
+  readonly runId?: string
   readonly questions: readonly QuestionPromptInput[]
   readonly effects: QuestionSideEffects
   /** Human-wait deadline in ms. Must be a positive finite number. */
@@ -156,7 +162,7 @@ export interface PendingQuestionDTO {
 export interface QuestionRegistry {
   /** Register a pending question BEFORE posting it to any surface. */
   readonly register: (params: RegisterQuestionParams) => QuestionRegisterOutcome
-  /** Attach the settled render once the prompt is posted. */
+  /** Add a settled render once a surface has posted the prompt. Renders accumulate; each runs on settlement. */
   readonly attachMessage: (requestID: string, renderFn: QuestionRenderFn) => void
   readonly has: (requestID: string) => boolean
   readonly pending: () => readonly string[]
@@ -164,10 +170,17 @@ export interface QuestionRegistry {
   readonly hasPendingForScope: (questionScopeId: string) => boolean
   /** Open (not claimed) questions for the scope. */
   readonly describePendingForScope: (questionScopeId: string) => readonly PendingQuestionDTO[]
-  /** Answer or skip: scope check, single-winner claim, validation, reply POST. */
+  /** Open (not claimed) questions the given run asked, whatever surface scope they are bound to. */
+  readonly describePendingForRun: (runId: string) => readonly PendingQuestionDTO[]
+  /**
+   * Answer or skip: scope check, single-winner claim, validation, reply POST.
+   * When `runId` is given, the request must belong to that run or the outcome is `not-found`
+   * (the same answer as for an unknown id, so a caller cannot probe other runs' requests).
+   */
   readonly decide: (args: {
     readonly requestID: string
     readonly scopeId: string
+    readonly runId?: string
     readonly decision: QuestionDecision
     readonly actor: GateActor
   }) => Promise<QuestionDecisionOutcome>
@@ -186,9 +199,11 @@ export interface QuestionRegistry {
 /** Question-specific data carried on a gate entry. */
 export interface QuestionPayload {
   readonly questions: readonly QuestionInfo[]
+  /** The asking run, or `null` when registered without one. */
+  readonly runId: string | null
   readonly effects: QuestionSideEffects
-  /** Set by attachMessage once the prompt is posted. */
-  renderFn: QuestionRenderFn | null
+  /** Settled renders added by attachMessage, one per surface that posted the prompt. */
+  readonly renderFns: QuestionRenderFn[]
 }
 
 /** Discord actors settle only from the entry's own thread; web operators are authorized by the route before the gate. */
@@ -293,12 +308,14 @@ export function createQuestionRegistry(deps: {
   }
 
   async function runRender(entry: QuestionGateEntry, settlement: QuestionSettlement): Promise<void> {
-    const {renderFn, questions} = entry.payload
-    if (renderFn === null) return
-    try {
-      await renderFn(questions, settlement)
-    } catch (error) {
-      gate.logRenderFailure(entry, settlement.reason, error)
+    const {renderFns, questions} = entry.payload
+    // Each surface renders independently: one failing render never skips the others.
+    for (const renderFn of renderFns) {
+      try {
+        await renderFn(questions, settlement)
+      } catch (error) {
+        gate.logRenderFailure(entry, settlement.reason, error)
+      }
     }
   }
 
@@ -329,7 +346,7 @@ export function createQuestionRegistry(deps: {
   // -------------------------------------------------------------------------
 
   function register(params: RegisterQuestionParams): QuestionRegisterOutcome {
-    const {requestID, sessionID, questionScopeId, questions, effects, deadlineMs, onDeadlineSettled} = params
+    const {requestID, sessionID, questionScopeId, runId, questions, effects, deadlineMs, onDeadlineSettled} = params
 
     if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
       logger.warn({requestID, sessionID, reason: 'deadline-required'}, 'QuestionRegistry: register refused')
@@ -350,7 +367,7 @@ export function createQuestionRegistry(deps: {
       requestID,
       sessionID,
       scopeId: questionScopeId,
-      payload: {questions: normalized, effects, renderFn: null},
+      payload: {questions: normalized, runId: runId ?? null, effects, renderFns: []},
       ops: {
         // Deadline expiry is a skip: an empty reply, never a reject.
         postDeadlineReply: async () =>
@@ -379,7 +396,7 @@ export function createQuestionRegistry(deps: {
       logger.warn({requestID}, 'QuestionRegistry: attachMessage — entry not found (already settled?)')
       return
     }
-    entry.payload.renderFn = renderFn
+    entry.payload.renderFns.push(renderFn)
   }
 
   function has(requestID: string): boolean {
@@ -401,6 +418,12 @@ export function createQuestionRegistry(deps: {
       .map(entry => ({requestID: entry.requestID, questions: entry.payload.questions}))
   }
 
+  function describePendingForRun(runId: string): readonly PendingQuestionDTO[] {
+    return questionEntries()
+      .filter(entry => entry.payload.runId === runId && entry.state === 'open')
+      .map(entry => ({requestID: entry.requestID, questions: entry.payload.questions}))
+  }
+
   // -------------------------------------------------------------------------
   // decide
   // -------------------------------------------------------------------------
@@ -408,13 +431,15 @@ export function createQuestionRegistry(deps: {
   async function decide(args: {
     readonly requestID: string
     readonly scopeId: string
+    readonly runId?: string
     readonly decision: QuestionDecision
     readonly actor: GateActor
   }): Promise<QuestionDecisionOutcome> {
-    const {requestID, scopeId, decision, actor} = args
+    const {requestID, scopeId, runId, decision, actor} = args
 
     const entry = getEntry(requestID)
     if (entry === undefined) return {kind: 'not-found'}
+    if (runId !== undefined && entry.payload.runId !== runId) return {kind: 'not-found'}
 
     const admitted = gate.admit(entry, {scopeId, actor}, questionScopePolicy)
     if (admitted === 'scope-mismatch') return {kind: 'scope-mismatch'}
@@ -489,6 +514,7 @@ export function createQuestionRegistry(deps: {
     pending,
     hasPendingForScope,
     describePendingForScope,
+    describePendingForRun,
     decide,
     confirmEcho,
     disposeRun: gate.disposeRun,

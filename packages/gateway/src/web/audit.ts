@@ -168,6 +168,31 @@ export interface ApprovalRejectedEvent {
   readonly reason: ApprovalRejectedReason
 }
 
+/** Reasons a question decision was refused. Reason codes only — never question or answer text. */
+export type QuestionRejectedReason = 'already_claimed' | 'not_found' | 'invalid' | 'reply_failed'
+
+/** Question decision accepted by the request gate. Carries ids and the outcome only. */
+export interface QuestionDecisionEvent {
+  readonly kind: 'question.decision'
+  readonly correlationId: string
+  readonly githubUserId: number
+  readonly runId: string
+  readonly requestId: string
+  readonly family: 'question'
+  readonly outcome: 'answered' | 'skipped'
+}
+
+/** Question decision refused by the request gate or by answer validation. Carries ids and a reason code only. */
+export interface QuestionRejectedEvent {
+  readonly kind: 'question.rejected'
+  readonly correlationId: string
+  readonly githubUserId: number
+  readonly runId: string
+  readonly requestId: string
+  readonly family: 'question'
+  readonly reason: QuestionRejectedReason
+}
+
 /**
  * Operator cancel request accepted and processed (regardless of outcome —
  * 'cancelled' or the idempotent 'already-terminal' hit). The resulting phase
@@ -262,7 +287,7 @@ export interface PushDispatchEvent {
   readonly kind: 'push.dispatch'
   /** The triggering run/approval id — same redaction class as requestId/runId. */
   readonly correlationId: string
-  readonly trigger: 'approval' | 'run_failed'
+  readonly trigger: 'approval' | 'question' | 'run_failed'
   readonly delivered: number
   readonly dead: number
   readonly failed: number
@@ -288,6 +313,8 @@ export type AuditEvent =
   | DispatchCompletedEvent
   | ApprovalDecisionEvent
   | ApprovalRejectedEvent
+  | QuestionDecisionEvent
+  | QuestionRejectedEvent
   | BindingReadEvent
   | BearerRejectedEvent
   | BrowserGuardRejectedEvent
@@ -357,7 +384,7 @@ function redactIfSensitive(value: string): string {
  * approvalRejectedLevel(), dispatchCompletedLevel(), and pushDisabledLevel().
  */
 const LOG_LEVEL: Record<
-  Exclude<AuditEvent['kind'], 'approval.rejected' | 'dispatch.completed' | 'push.disabled'>,
+  Exclude<AuditEvent['kind'], 'approval.rejected' | 'question.rejected' | 'dispatch.completed' | 'push.disabled'>,
   'info' | 'warn'
 > = {
   'auth.start': 'info',
@@ -369,6 +396,7 @@ const LOG_LEVEL: Record<
   'launch.accepted': 'info',
   'launch.rejected': 'warn',
   'approval.decision': 'info',
+  'question.decision': 'info',
   'binding.read': 'info',
   'bearer.rejected': 'warn',
   'browser.guard.rejected': 'warn',
@@ -399,6 +427,21 @@ function approvalRejectedLevel(reason: ApprovalRejectedReason): 'info' | 'warn' 
     case 'scope_mismatch':
     case 'unknown':
     case 'deadline_expired':
+      return 'warn'
+  }
+}
+
+/**
+ * Per-reason log level for 'question.rejected' events: a lost race or stale request is routine;
+ * a refused answer or a failed reply to the agent is actionable.
+ */
+function questionRejectedLevel(reason: QuestionRejectedReason): 'info' | 'warn' {
+  switch (reason) {
+    case 'already_claimed':
+    case 'not_found':
+      return 'info'
+    case 'invalid':
+    case 'reply_failed':
       return 'warn'
   }
 }
@@ -454,6 +497,11 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
     case 'approval.rejected':
       ctx.requestId = redactIfSensitive(event.requestId)
       break
+    case 'question.decision':
+    case 'question.rejected':
+      ctx.requestId = redactIfSensitive(event.requestId)
+      ctx.runId = redactIfSensitive(event.runId)
+      break
     case 'run.cancel.requested':
       ctx.runId = redactIfSensitive(event.runId)
       break
@@ -482,11 +530,13 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
     const level =
       event.kind === 'approval.rejected'
         ? approvalRejectedLevel(event.reason)
-        : event.kind === 'dispatch.completed'
-          ? dispatchCompletedLevel(event.outcome)
-          : event.kind === 'push.disabled'
-            ? pushDisabledLevel(event.reason)
-            : LOG_LEVEL[event.kind]
+        : event.kind === 'question.rejected'
+          ? questionRejectedLevel(event.reason)
+          : event.kind === 'dispatch.completed'
+            ? dispatchCompletedLevel(event.outcome)
+            : event.kind === 'push.disabled'
+              ? pushDisabledLevel(event.reason)
+              : LOG_LEVEL[event.kind]
     if (level === 'warn') {
       logger.warn(ctx, msg)
     } else {

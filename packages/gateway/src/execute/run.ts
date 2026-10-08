@@ -1,6 +1,7 @@
 import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 import type {PermissionRequest} from '../approvals/coordinator.js'
+import type {QuestionAskedRequest} from '../approvals/question-coordinator.js'
 import type {QuestionRegistry} from '../approvals/question-registry.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RequestGate} from '../approvals/request-gate.js'
@@ -115,6 +116,17 @@ export interface RunMentionDeps {
    */
   readonly requestGate?: Pick<RequestGate, 'onTerminal'>
   /**
+   * Builds the per-run hook that announces a newly registered question to operator surfaces (the
+   * web transport attaches its settle render and emits the SSE open frame). Called once per run
+   * with the run's identity; the returned hook runs after the registry holds the question, for
+   * Discord-launched and web-launched runs alike. Injected so the engine stays transport-neutral.
+   * Absent: questions are still registered and answerable, just not announced.
+   */
+  readonly createQuestionOnRegistered?: (context: {
+    readonly runId: string
+    readonly repo: string
+  }) => (request: QuestionAskedRequest) => void
+  /**
    * Gateway approval mode. Propagated from `GatewayConfig.approvalMode`.
    * Currently only `approval-required` is supported.
    * `autonomous-low-risk` is deferred (unsafe due to OpenCode last-match-wins evaluation).
@@ -202,6 +214,8 @@ export interface RunMentionDeps {
    */
   readonly operatorPushDispatcher?: {
     readonly dispatchApprovalPending: (approvalId: string) => Promise<void>
+    /** Optional so fakes that only exercise the approval and run-failed nudges stay valid. */
+    readonly dispatchQuestionPending?: (runId: string) => Promise<void>
     readonly dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
   }
 }
@@ -1356,6 +1370,14 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // canonical directory. The deadline is evaluated when a question is asked, from the budget
       // left then (not at run start), so a late question never outlives the hard abort. Scope
       // matches cancellation's: the Discord thread for Discord runs, the run id otherwise.
+      const announceQuestion = deps.createQuestionOnRegistered?.({runId, repo})
+      // Runs after the registry holds the question: surface announcement first, push last so a
+      // push failure can never preempt the surfaces. Neither can throw into the coordinator.
+      const buildQuestionOnRegistered = (): ((asked: QuestionAskedRequest) => void) => asked => {
+        announceQuestion?.(asked)
+        // Fire-and-forget; the dispatcher is fail-soft by contract, and a rejection is swallowed anyway.
+        deps.operatorPushDispatcher?.dispatchQuestionPending?.(runId)?.catch(() => undefined)
+      }
       const questionCoordinator =
         deps.questionRegistry === undefined
           ? undefined
@@ -1368,7 +1390,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
                 directory: sessionDirectory,
               }),
               scopeId: request.surface === 'discord' ? threadId : runId,
+              runId,
               computeDeadlineMs: () => computeApprovalDeadlineMs(Math.max(0, runTimeoutMs - (Date.now() - runStartMs))),
+              onRegistered: buildQuestionOnRegistered(),
             })
 
       try {

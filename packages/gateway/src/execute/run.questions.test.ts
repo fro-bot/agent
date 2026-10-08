@@ -33,9 +33,11 @@ vi.mock('@opencode-ai/sdk/v2/client', () => ({
 }))
 
 const ANY_SIGNAL: unknown = expect.any(AbortSignal)
+const ANY_STRING: unknown = expect.any(String)
 
 const CANONICAL_DIRECTORY = '/workspace/repos/acme/widget'
 const WIRE_RUN_ID = 'question-run-id-1'
+const SECRET_TEXT = 'S3CRET-HOOK-ERROR'
 
 function makeV2Client() {
   const reply = vi.fn().mockResolvedValue({data: true, error: undefined})
@@ -282,6 +284,124 @@ describe('run question wiring', () => {
     const phases = mockRuntime.transitionRun.mock.calls.map((call: unknown[]) => call[4] as string)
     expect(phases).toContain('CANCELLED')
     expect(phases).not.toContain('FAILED')
+  })
+
+  it('announces a registered question through the injected hook with the run identity, after registration', async () => {
+    // #given deps whose hook records whether the registry already held the question when it ran
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeV2Client()
+    const {deps, questionRegistry} = makeQuestionDeps()
+    const heldWhenAnnounced: boolean[] = []
+    const announce = vi.fn((request: {readonly requestID: string}) => {
+      heldWhenAnnounced.push(questionRegistry.has(request.requestID))
+    })
+    const createQuestionOnRegistered = vi.fn(() => announce)
+    await runMention(makeMessage(), makeBinding(), {...deps, createQuestionOnRegistered})
+
+    // #when the run's coordinator registers a question
+    await capturedQuestions().onAsked(ASKED)
+
+    // #then the hook was built once with the run's id and repo, and ran after registration
+    expect(createQuestionOnRegistered).toHaveBeenCalledExactlyOnceWith({runId: ANY_STRING, repo: 'acme/widget'})
+    expect(announce).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({requestID: 'que_1'}))
+    expect(heldWhenAnnounced).toEqual([true])
+
+    // #and the registry binds the question to that same run, so web routes can find it
+    const builtFor = createQuestionOnRegistered.mock.calls[0] as unknown as [{runId: string}]
+    expect(questionRegistry.describePendingForRun(builtFor[0].runId).map(dto => dto.requestID)).toEqual(['que_1'])
+  })
+
+  it('a throwing announce hook never changes the ask outcome; the question stays registered', async () => {
+    // #given a hook that throws
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeV2Client()
+    const {deps, questionRegistry, logger} = makeQuestionDeps()
+    const createQuestionOnRegistered = vi.fn(() => () => {
+      throw new Error(SECRET_TEXT)
+    })
+    await runMention(makeMessage(), makeBinding(), {...deps, createQuestionOnRegistered})
+
+    // #when
+    const outcome = await capturedQuestions().onAsked(ASKED)
+
+    // #then still registered, and the log carries no error text
+    expect(outcome).toBe('registered')
+    expect(questionRegistry.has('que_1')).toBe(true)
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(SECRET_TEXT)
+  })
+
+  it('nudges operators by push once per registered question with the run id only', async () => {
+    // #given a push dispatcher
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeV2Client()
+    const {deps} = makeQuestionDeps()
+    const dispatchQuestionPending = vi.fn().mockResolvedValue(undefined)
+    const operatorPushDispatcher = {
+      dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
+      dispatchQuestionPending,
+      dispatchRunFailed: vi.fn().mockResolvedValue(undefined),
+    }
+    await runMention(makeMessage(), makeBinding(), {...deps, operatorPushDispatcher})
+
+    // #when a question registers, then the same id is asked again
+    await capturedQuestions().onAsked(ASKED)
+    await capturedQuestions().onAsked(ASKED)
+
+    // #then one push, carrying only the run id — never the request id or any text
+    expect(dispatchQuestionPending).toHaveBeenCalledExactlyOnceWith(expect.any(String))
+    expect(JSON.stringify(dispatchQuestionPending.mock.calls)).not.toContain('Which environment?')
+    expect(JSON.stringify(dispatchQuestionPending.mock.calls)).not.toContain('que_1')
+    expect(operatorPushDispatcher.dispatchApprovalPending).not.toHaveBeenCalled()
+  })
+
+  it('a question skipped for lack of budget is neither announced nor pushed', async () => {
+    // #given a run with no budget for a deadline, a hook, and a push dispatcher
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeV2Client()
+    const {deps} = makeQuestionDeps()
+    const announce = vi.fn()
+    const dispatchQuestionPending = vi.fn().mockResolvedValue(undefined)
+    await runMention(makeMessage(), makeBinding(), {
+      ...deps,
+      runTimeoutMs: 60_000,
+      createQuestionOnRegistered: () => announce,
+      operatorPushDispatcher: {
+        dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
+        dispatchQuestionPending,
+        dispatchRunFailed: vi.fn().mockResolvedValue(undefined),
+      },
+    })
+
+    // #when
+    const outcome = await capturedQuestions().onAsked(ASKED)
+
+    // #then no human wait begins, so no announcement and no nudge
+    expect(outcome).toBe('skipped')
+    expect(announce).not.toHaveBeenCalled()
+    expect(dispatchQuestionPending).not.toHaveBeenCalled()
+  })
+
+  it('a rejecting push dispatcher never affects the ask', async () => {
+    // #given a dispatcher whose promise rejects
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeV2Client()
+    const {deps} = makeQuestionDeps()
+    await runMention(makeMessage(), makeBinding(), {
+      ...deps,
+      operatorPushDispatcher: {
+        dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
+        dispatchQuestionPending: vi.fn().mockRejectedValue(new Error('push boom')),
+        dispatchRunFailed: vi.fn().mockResolvedValue(undefined),
+      },
+    })
+
+    // #when / #then
+    await expect(capturedQuestions().onAsked(ASKED)).resolves.toBe('registered')
   })
 
   it('computes the question deadline from the budget left when the question is asked', async () => {

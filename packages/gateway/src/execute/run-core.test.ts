@@ -4240,6 +4240,74 @@ describe('runOpenCodeCore', () => {
       expectInactivityTimeout(run.outcome())
     })
 
+    it('malformed question.asked with a readable id is rejected so the agent does not wait for the timeout', async () => {
+      // #given a payload whose questions are unparseable (secret-shaped) but whose id and session parse
+      const run = startQuestionRun()
+
+      // #when it arrives
+      await run.emit({
+        type: 'question.asked',
+        properties: {id: 'que_bad', sessionID: 'sess-123', questions: [{question: SECRET, header: SECRET}]},
+      })
+
+      // #then the request is rejected through the question effects, and nothing is registered
+      expect(run.effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_bad')
+      expect(run.effects.replyQuestion).not.toHaveBeenCalled()
+      expect(run.registry.pending()).toEqual([])
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'que_bad', reason: 'invalid-question'}),
+        expect.stringContaining('rejected'),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it('malformed question.asked whose reject fails is warned with a reason code and never throws', async () => {
+      // #given the reject call fails
+      const run = startQuestionRun({effects: {rejectQuestion: vi.fn().mockRejectedValue(new Error(SECRET))}})
+
+      // #when a malformed ask with a readable id arrives
+      await run.emit({
+        type: 'question.asked',
+        properties: {id: 'que_bad', sessionID: 'sess-123', questions: 'not-an-array'},
+      })
+
+      // #then the failure is a reason code in a warning, with no error text
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'que_bad', rejectOutcome: 'reject-threw'}),
+        expect.stringContaining('could not be rejected'),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it('malformed question.asked with no parseable id is only warn-logged, never rejected', async () => {
+      // #given a payload with no id
+      const run = startQuestionRun()
+
+      // #when it arrives
+      await run.emit({type: 'question.asked', properties: {sessionID: 'sess-123', questions: []}})
+
+      // #then nothing can be addressed: warn only, no reject
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({reason: 'missing-request-id'}),
+        expect.stringContaining('malformed'),
+      )
+    })
+
+    it('malformed question.asked from an unowned session is never rejected', async () => {
+      // #given a malformed ask from a session this run does not own
+      const run = startQuestionRun()
+
+      // #when it arrives
+      await run.emit({
+        type: 'question.asked',
+        properties: {id: 'que_foreign', sessionID: FOREIGN, questions: 'not-an-array'},
+      })
+
+      // #then the run leaves another run's request alone
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+    })
+
     it('without a question handler an owned question.asked is warned and does not pause the watchdog', async () => {
       // #given
       const run = startQuestionRun({withQuestions: false})
@@ -4362,6 +4430,7 @@ describe('runOpenCodeCore', () => {
       const questions = {
         onAsked: vi.fn().mockResolvedValue('registered'),
         onEcho: vi.fn(),
+        onMalformed: vi.fn().mockResolvedValue(undefined),
         dispose: vi.fn().mockResolvedValue(undefined),
       }
       const {stream, emitNext} = makeControlledStream()

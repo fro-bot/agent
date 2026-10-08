@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest'
-import {buildApprovalPayload, buildFailedRunPayload} from './payload-builder.js'
+import {buildApprovalPayload, buildFailedRunPayload, buildQuestionPayload} from './payload-builder.js'
 
 const FORBIDDEN_SUBSTRINGS = [
   'repo',
@@ -41,6 +41,34 @@ describe('buildApprovalPayload', () => {
   // #then it never carries a forbidden field
   it('never carries forbidden fields', () => {
     assertNoForbiddenFields(buildApprovalPayload())
+  })
+})
+
+describe('buildQuestionPayload', () => {
+  // #given no input (the builder takes none by construction)
+  // #when the question payload is built
+  // #then it has the fixed question copy keys and route only
+  it('returns the fixed question-pending payload shape', () => {
+    expect(buildQuestionPayload()).toEqual({
+      title: 'operator.question_pending.title',
+      body: 'operator.question_pending.body',
+      data: {type: 'question', route: '/'},
+    })
+  })
+
+  // #given the question payload
+  // #when serialized
+  // #then it never carries a forbidden field
+  it('never carries forbidden fields', () => {
+    assertNoForbiddenFields(buildQuestionPayload())
+  })
+
+  // #given the builder's signature
+  // #when called with arbitrary arguments at runtime
+  // #then nothing leaks into the payload
+  it('ignores any argument: question content cannot reach the payload', () => {
+    const leaky = buildQuestionPayload as (...args: unknown[]) => unknown
+    expect(JSON.stringify(leaky('which environment?', {options: ['prod']}))).not.toContain('environment')
   })
 })
 
