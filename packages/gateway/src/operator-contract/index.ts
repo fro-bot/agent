@@ -45,6 +45,16 @@ export type {
   OperatorWorktreeState,
 } from './provenance.js'
 export {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
+export type {
+  PendingQuestionDTO,
+  QuestionAnswerRequest,
+  QuestionDecisionRequest,
+  QuestionFrameData,
+  QuestionOptionDetail,
+  QuestionPromptDetail,
+  QuestionRequestDetail,
+  QuestionSkipRequest,
+} from './question-frame.js'
 export {assertRedactionApplied, AUTHORIZATION_OBLIGATION, REDACTION_OBLIGATION} from './redaction.js'
 export type {RedactionContext} from './redaction.js'
 export type {RepoSummary} from './repo-summary.js'

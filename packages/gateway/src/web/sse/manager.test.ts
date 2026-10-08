@@ -16,12 +16,13 @@ import type {
   OperatorCheckoutPreparation,
   OperatorCheckoutProvenance,
   OperatorRunStatus,
+  QuestionFrameData,
 } from '../../operator-contract/index.js'
 import type {ObservationFrame, OutputFrame, RunObservationManager, RunObservationManagerDeps} from './manager.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {createRunObservationManager} from './manager.js'
+import {createRunObservationManager, MAX_OPEN_QUESTION_REPLAY_PER_RUN} from './manager.js'
 import {projectRunObservation} from './projection.js'
 
 // ---------------------------------------------------------------------------
@@ -174,6 +175,18 @@ function makeManager(
     ...overrides,
   })
   return {manager, timers}
+}
+
+function makeManagerWithLogger(
+  projectFn: ProjectFn,
+  overrides: Partial<RunObservationManagerDeps> = {},
+): {manager: RunObservationManager; logger: {warn: ReturnType<typeof vi.fn>}} {
+  const warn = vi.fn()
+  const {manager} = makeManager(projectFn, {
+    logger: {info: vi.fn(), warn, error: vi.fn(), debug: vi.fn()},
+    ...overrides,
+  })
+  return {manager, logger: {warn}}
 }
 
 // ---------------------------------------------------------------------------
@@ -1904,6 +1917,7 @@ describe('observer-only invariant — observeOutput extension', () => {
       'observe',
       'observeOutput',
       'observeApproval',
+      'observeQuestion',
       'subscribe',
       'abortSubscription',
       'shutdown',
@@ -2690,6 +2704,295 @@ describe('observeApproval — approval frame fan-out', () => {
 
     // #then run-B subscriber does NOT get run-A's approval frame
     expect(framesB.filter(f => f.type === 'approval')).toHaveLength(0)
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 21. observeQuestion — question frame fan-out, ordering, and reconnect replay
+// ===========================================================================
+
+function openQuestion(requestID: string, runId = 'run-001'): QuestionFrameData {
+  return {
+    requestID,
+    runId,
+    questions: [
+      {
+        header: 'Pick',
+        text: 'Which one?',
+        options: [{label: 'A', description: 'first'}],
+        multiple: false,
+        custom: true,
+      },
+    ],
+    settled: false,
+  }
+}
+
+describe('observeQuestion — question frame fan-out', () => {
+  it('fans an open question frame, then a settle frame, to live subscribers in order', async () => {
+    // #given a manager with a subscriber
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when a question opens and then settles
+    manager.observeQuestion('run-001', openQuestion('q-1'))
+    manager.observeQuestion('run-001', {requestID: 'q-1', runId: 'run-001', settled: true})
+    await drain()
+
+    // #then both frames arrive in order, carrying the bounded detail and the run id
+    const questionFrames = frames.filter(f => f.type === 'question')
+    expect(questionFrames).toHaveLength(2)
+    expect(questionFrames[0]).toMatchObject({
+      type: 'question',
+      runId: 'run-001',
+      data: {requestID: 'q-1', runId: 'run-001', settled: false, questions: [{header: 'Pick', custom: true}]},
+    })
+    expect(questionFrames[1]).toMatchObject({type: 'question', data: {requestID: 'q-1', settled: true}})
+
+    manager.shutdown()
+  })
+
+  it('routes by the run id argument, not by data.runId', async () => {
+    // #given subscribers for two runs
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    const a = collectFrames(manager, 'run-A')
+    const b = collectFrames(manager, 'run-B')
+    await drain()
+
+    // #when a frame whose data.runId disagrees is observed for run-A
+    manager.observeQuestion('run-A', openQuestion('q-x', 'run-B'))
+    await drain()
+
+    // #then run-A gets it with the routed run id, and run-B gets nothing
+    const aFrames = a.frames.filter(f => f.type === 'question')
+    expect(aFrames).toHaveLength(1)
+    expect(aFrames[0]).toMatchObject({runId: 'run-A', data: {runId: 'run-A'}})
+    expect(b.frames.filter(f => f.type === 'question')).toHaveLength(0)
+
+    manager.shutdown()
+  })
+
+  it('delivers the settle frame before the terminal status when the run completes in the same flush', async () => {
+    // #given a running run with a subscriber and an open question
+    let callCount = 0
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const {manager} = makeManager(async () => (callCount++ === 0 ? makeOperatorRunStatus() : terminalStatus))
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+    manager.observeQuestion('run-001', openQuestion('q-1'))
+
+    // #when the question settles and the run reaches terminal in the same flush
+    manager.observeQuestion('run-001', {requestID: 'q-1', runId: 'run-001', settled: true})
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then the settle frame precedes the terminal status frame, and the stream closes
+    const settleIdx = frames.findIndex(f => f.type === 'question' && f.data.settled)
+    const terminalIdx = frames.findIndex(f => f.type === 'status' && f.data.status === 'succeeded')
+    expect(settleIdx).toBeGreaterThanOrEqual(0)
+    expect(terminalIdx).toBeGreaterThan(settleIdx)
+    expect(closes).toContain('terminal')
+
+    manager.shutdown()
+  })
+
+  it('does not coalesce: question frame overflow drops the subscriber, not the frame', async () => {
+    // #given a cap sized for exactly one settle frame and a subscriber that never drains
+    const sample = {
+      type: 'question' as const,
+      runId: 'run-001',
+      data: {requestID: 'q-cap', runId: 'run-001', settled: true as const},
+    }
+    const {manager} = makeManager(async () => makeOperatorRunStatus({status: 'running'}), {
+      subscriberQueueCapBytes: JSON.stringify(sample).length + 10,
+    })
+    const closes: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: async () => new Promise<void>(() => {}),
+      onClose: reason => closes.push(reason),
+    })
+
+    // #when two question frames arrive while the first (reset) frame is in flight
+    manager.observeQuestion('run-001', {requestID: 'q-cap', runId: 'run-001', settled: true})
+    manager.observeQuestion('run-001', {requestID: 'q-cap', runId: 'run-001', settled: true})
+    await drain()
+
+    // #then the subscriber is dropped with overflow (non-coalescing path)
+    expect(closes).toContain('overflow')
+
+    manager.shutdown()
+  })
+
+  it('drops a question frame after terminal (out-of-order async guard)', async () => {
+    // #given a run that already reached terminal
+    const {manager} = makeManager(async () => makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'}))
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+    const before = frames.length
+
+    // #when a stale question frame arrives
+    manager.observeQuestion('run-001', openQuestion('q-stale'))
+    await drain()
+
+    // #then nothing new is delivered
+    expect(frames.filter(f => f.type === 'question')).toHaveLength(0)
+    expect(frames.length).toBe(before)
+
+    manager.shutdown()
+  })
+
+  it('observeQuestion after shutdown is a no-op', () => {
+    // #given a shut-down manager
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    manager.shutdown()
+
+    // #when / #then it does not throw
+    expect(() => manager.observeQuestion('run-001', openQuestion('q-noop'))).not.toThrow()
+  })
+
+  it('never delivers a too-large open frame, warns with ids only, and keeps subscribers', async () => {
+    // #given a small queue cap and a healthy subscriber
+    const {manager, logger} = makeManagerWithLogger(async () => makeOperatorRunStatus(), {
+      subscriberQueueCapBytes: 1000,
+    })
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+    const secret = 'S3CR3T-'.repeat(200)
+
+    // #when an open frame larger than half the cap is observed
+    manager.observeQuestion('run-001', {
+      requestID: 'q-big',
+      runId: 'run-001',
+      questions: [{header: 'h', text: secret, options: [], multiple: false, custom: true}],
+      settled: false,
+    })
+    await drain()
+
+    // #then it is not delivered, the subscriber survives, and the warning carries no text
+    expect(frames.filter(f => f.type === 'question')).toHaveLength(0)
+    expect(closes).toStrictEqual([])
+    const warnArgs = JSON.stringify(logger.warn.mock.calls)
+    expect(warnArgs).toContain('q-big')
+    expect(warnArgs).not.toContain('S3CR3T')
+
+    manager.shutdown()
+  })
+})
+
+describe('observeQuestion — reconnect reconciliation', () => {
+  it('replays a still-open question to a late subscriber, after the status snapshot', async () => {
+    // #given a running run with a pending question and no subscribers
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    manager.observeQuestion('run-001', openQuestion('q-open'))
+
+    // #when an operator reconnects
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then the status snapshot is followed by the open question frame
+    expect(frames.map(f => f.type)).toStrictEqual(['status', 'question'])
+    expect(frames[1]).toMatchObject({data: {requestID: 'q-open', settled: false}})
+
+    manager.shutdown()
+  })
+
+  it('does not replay a settled question', async () => {
+    // #given a question that opened and then settled while nobody was connected
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    manager.observeQuestion('run-001', openQuestion('q-done'))
+    manager.observeQuestion('run-001', {requestID: 'q-done', runId: 'run-001', settled: true})
+
+    // #when an operator reconnects
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then no question frame is replayed
+    expect(frames.filter(f => f.type === 'question')).toHaveLength(0)
+
+    manager.shutdown()
+  })
+
+  it('replays only the still-open question when one of two has settled', async () => {
+    // #given two pending questions, one of which settles
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    manager.observeQuestion('run-001', openQuestion('q-1'))
+    manager.observeQuestion('run-001', openQuestion('q-2'))
+    manager.observeQuestion('run-001', {requestID: 'q-1', runId: 'run-001', settled: true})
+
+    // #when an operator reconnects
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then only q-2 is replayed
+    const replayed = frames.filter(f => f.type === 'question')
+    expect(replayed).toHaveLength(1)
+    expect(replayed[0]).toMatchObject({data: {requestID: 'q-2'}})
+
+    manager.shutdown()
+  })
+
+  it('bounds the replay set per run, evicting the oldest open question', async () => {
+    // #given more open questions than the replay bound
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    const total = MAX_OPEN_QUESTION_REPLAY_PER_RUN + 3
+    for (let i = 0; i < total; i++) {
+      manager.observeQuestion('run-001', openQuestion(`q-${i}`))
+    }
+
+    // #when an operator reconnects
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then exactly the newest MAX are replayed, oldest first
+    const ids = frames.flatMap(f => (f.type === 'question' ? [f.data.requestID] : []))
+    expect(ids).toHaveLength(MAX_OPEN_QUESTION_REPLAY_PER_RUN)
+    expect(ids[0]).toBe('q-3')
+    expect(ids.at(-1)).toBe(`q-${total - 1}`)
+
+    manager.shutdown()
+  })
+
+  it('clears the replay set when the run reaches terminal', async () => {
+    // #given a pending question that never settled before the run completed
+    let callCount = 0
+    const {manager} = makeManager(async () =>
+      callCount++ === 0 ? makeOperatorRunStatus() : makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'}),
+    )
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    manager.observeQuestion('run-001', openQuestion('q-orphan'))
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+
+    // #when a late subscriber connects (terminal replay)
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then it sees the terminal status only, no question
+    expect(frames.filter(f => f.type === 'question')).toHaveLength(0)
+    expect(frames.some(f => f.type === 'status' && f.data.status === 'succeeded')).toBe(true)
+
+    manager.shutdown()
+  })
+
+  it('isolates the replay set per run', async () => {
+    // #given an open question on run-A only
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    manager.observeQuestion('run-A', openQuestion('q-a', 'run-A'))
+
+    // #when a subscriber connects to run-B
+    const {frames} = collectFrames(manager, 'run-B')
+    await drain()
+
+    // #then run-B sees no question
+    expect(frames.filter(f => f.type === 'question')).toHaveLength(0)
 
     manager.shutdown()
   })

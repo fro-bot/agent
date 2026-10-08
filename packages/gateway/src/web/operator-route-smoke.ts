@@ -96,6 +96,7 @@ function makeStubRunObservationManager() {
     observe: async () => undefined,
     observeOutput: () => undefined,
     observeApproval: () => undefined,
+    observeQuestion: () => undefined,
     subscribe: () => () => undefined,
     abortSubscription: () => undefined,
     shutdown: () => undefined,

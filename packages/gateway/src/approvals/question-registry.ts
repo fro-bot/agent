@@ -236,7 +236,8 @@ export function validateQuestionAnswers(
   return {kind: 'valid'}
 }
 
-function normalizeQuestion(input: QuestionPromptInput): QuestionInfo {
+/** Normalize an upstream question: `multiple` defaults to false, `custom` to true. Single owner of that rule. */
+export function normalizeQuestion(input: QuestionPromptInput): QuestionInfo {
   return {
     question: input.question,
     header: input.header,

@@ -15,7 +15,7 @@ import type {DenylistCache, RepoKey} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {RepoAuthzCache, RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {SessionStore} from '../auth/session.js'
-import type {RunObservationManager, SubscriberCallbacks} from './manager.js'
+import type {ObservationFrame, RunObservationManager, SubscriberCallbacks} from './manager.js'
 import type {RunStreamRouteDeps} from './run-stream-route.js'
 
 import {Hono} from 'hono'
@@ -154,6 +154,7 @@ function makeManager(overrides?: Partial<RunObservationManager>): RunObservation
     observe: vi.fn(async () => undefined),
     observeOutput: vi.fn(),
     observeApproval: vi.fn(),
+    observeQuestion: vi.fn(),
     subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
     abortSubscription: vi.fn(),
     shutdown: vi.fn(),
@@ -2420,5 +2421,84 @@ describe('writeFrame — approval frame serialization', () => {
     expect(parsed.requestID).toBe('req-abc')
     expect(parsed.settled).toBe(true)
     expect(parsed.runId).toBe('run-abc')
+  })
+})
+
+async function readQuestionEvent(frame: ObservationFrame): Promise<Record<string, unknown>> {
+  const manager = makeManager({
+    subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+      Promise.resolve(callbacks.onEvent(frame)).catch(() => {})
+      return () => undefined
+    }),
+  })
+  const app = buildTestApp(makeDeps({manager}))
+  const res = await fetchStream(app, 'run-abc')
+  expect(res.status).toBe(200)
+
+  const reader = res.body?.getReader()
+  if (reader === undefined) throw new Error('Expected a readable body')
+  const decoder = new TextDecoder()
+  let text = ''
+  for (let i = 0; i < 15; i++) {
+    const result = await reader.read()
+    if (result.done === true) break
+    text += decoder.decode(result.value as Uint8Array, {stream: true})
+    if (text.includes('event: question')) break
+  }
+  await reader.cancel()
+
+  expect(text).toContain('event: question')
+  const match = /event: question\ndata: (.+)\n/.exec(text)
+  const data = match?.[1]
+  if (data === undefined) throw new Error('Expected a question event payload')
+  return JSON.parse(data) as Record<string, unknown>
+}
+
+// ===========================================================================
+// writeFrame — question frame serialization
+// ===========================================================================
+
+describe('writeFrame — question frame serialization', () => {
+  it('serializes an open question frame as an SSE question event, carrying text verbatim', async () => {
+    // #given an open question frame whose text is an injection payload
+    const payload = '<img src=x onerror=alert(1)> and `backticks` and **bold**'
+    const parsed = await readQuestionEvent({
+      type: 'question',
+      runId: 'run-abc',
+      data: {
+        requestID: 'q-1',
+        runId: 'run-abc',
+        questions: [
+          {
+            header: 'Pick',
+            text: payload,
+            options: [{label: 'A', description: payload}],
+            multiple: false,
+            custom: true,
+          },
+        ],
+        settled: false,
+      },
+    })
+
+    // #then the payload is a plain string value, untouched
+    expect(parsed.requestID).toBe('q-1')
+    expect(parsed.runId).toBe('run-abc')
+    expect(parsed.settled).toBe(false)
+    const [question] = parsed.questions as {text: string; options: {description: string}[]}[]
+    expect(question?.text).toBe(payload)
+    expect(question?.options[0]?.description).toBe(payload)
+  })
+
+  it('serializes a settle frame as an SSE question event', async () => {
+    // #given a settle frame
+    const parsed = await readQuestionEvent({
+      type: 'question',
+      runId: 'run-abc',
+      data: {requestID: 'q-1', runId: 'run-abc', settled: true},
+    })
+
+    // #then only the id, run id, and settled flag are present
+    expect(parsed).toStrictEqual({requestID: 'q-1', runId: 'run-abc', settled: true})
   })
 })
