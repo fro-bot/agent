@@ -38,7 +38,7 @@ fro-bot/agent/
 │   │       ├── execute/        # run-core, queue, concurrency, recovery, checkout provenance
 │   │       ├── web/            # Operator HTTP routes, auth, ingress trust, SSE, audit
 │   │       ├── workspace-api/  # Workspace API surface
-│   │       ├── approvals/      # Approval gate
+│   │       ├── approvals/      # Approval and question gate
 │   │       ├── operator-contract/ # Operator contract types
 │   │       └── redaction/      # PII/secret redaction gate
 │   ├── harness/                # @fro.bot/harness — patched-OpenCode build + publish pipeline

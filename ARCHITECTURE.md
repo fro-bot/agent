@@ -63,6 +63,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | Initialize SDK server lifecycle; probes instance-scoped readiness before reporting success |
 | `createOwnershipLedger` | Function | `packages/runtime/src/agent/ownership-ledger.ts` | In-memory 3-state (outstanding/settled/unknown) ledger for background subagent executions, keyed by child session id |
 | `reconcileLedgerOnce` / `createLedgerReconciler` | Function | `packages/runtime/src/agent/ledger-reconcile.ts` | Settles tracked ledger entries whose settlement event the SSE stream never delivered, against `children()`/`liveSessionIds()` (both scoped to the run's directory); never adopts an untracked session |
+| `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | Narrow v2-SDK client over OpenCode's `question` reply/reject endpoints (the v1 client does not expose them); every call carries the workspace `directory` |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version |
 | `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build version (OpenCode base + carries) |
@@ -77,6 +78,14 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `buildOperatorApp` | Function | `packages/gateway/src/web/server.ts` | Operator Hono app factory |
 | `createWorkflowDispatcher` | Function | `packages/gateway/src/github/dispatch.ts` | `/fro-bot dispatch` GitHub Actions workflow-dispatch adapter (fire-and-forget; no queue, concurrency, or local run-state) |
 | `createDiscordApprovalOnPending` | Function | `packages/gateway/src/approvals/discord-transport.ts` | Discord approval transport; auto-denies on a terminal (channel/thread-gone) delivery failure |
+| `createRequestGate` | Function | `packages/gateway/src/approvals/request-gate.ts` | Shared lifecycle core for human-wait requests: the `open → claimed → confirmed` state machine, scope check, registry-owned deadline, echo settlement, run teardown, and one terminal notification per request. Backs both the approval and question registries |
+| `createQuestionRegistry` | Function | `packages/gateway/src/approvals/question-registry.ts` | Question family of the gate: `answer` / `skip` decisions, answer validation, empty-reply skip at the deadline, reject on teardown, pending queries by scope and by run |
+| `createQuestionCoordinator` | Function | `packages/gateway/src/approvals/question-coordinator.ts` | Per-run seam for `question.*` events: computes the deadline (or skips immediately), registers, announces through `onRegistered`, rejects malformed asks, and rejects still-pending questions at run end |
+| `createDiscordQuestionOnRegistered` | Function | `packages/gateway/src/approvals/discord-question-transport.ts` | Discord question transport: posts the single-question prompt (or the web-fallback notice) into the run thread and attaches the settled render; a delivery failure never settles the question |
+| `handleQuestionInteraction` | Function | `packages/gateway/src/discord/question-interactions.ts` | Option/Skip/text buttons, select menu, and answer modal: authorizes, maps option indices to raw labels, and decides through the gate with a Discord actor scoped to the thread |
+| `buildPendingQuestionsRoute` / `buildQuestionDecisionRoute` | Function | `packages/gateway/src/web/operator/{pending-questions-route,question-decision-route}.ts` | `GET /operator/runs/:runId/questions` (read-level reconciliation listing) and `POST /operator/runs/:runId/questions/:requestId/decision` (write-level answer or skip) |
+| `createWebQuestionOnRegistered` | Function | `packages/gateway/src/web/operator/web-question.ts` | Web question transport: emits the SSE open frame after registration and attaches the settle-frame render; fail-soft |
+| `createQuestionEffects` | Function | `packages/gateway/src/execute/question-client.ts` | Per-run `replyQuestion` / `rejectQuestion` effects over the v2 SDK client; failures collapse to reason codes, never SDK error text |
 | `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Startup sweep: terminalizes stale active runs only when the repo's OpenCode workspace is confirmed clear (busy/unknown leaves run and lock untouched); never deletes coordination locks |
 | `classifyInspectResult` | Function | `packages/gateway/src/execute/provenance.ts` | Classifies a workspace `inspect()` result into a run-blocking `checkout-substituted` failure or a `CheckoutProvenance` the run carries forward |
 | `parseOperatorCheckoutProvenance` | Function | `packages/gateway/src/operator-contract/provenance.ts` | Field-by-field validator projecting persisted `runState.details.checkoutProvenance` into the wire-decoupled operator DTO |
@@ -94,7 +103,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `runAgentWalk` / `measureSealedTree` | Function | `apps/workspace-agent/src/agent-walk.ts` | Agent-uid checkout size/entry-count walker; `measureSealedTree` measures a sealed tree through a root-opened fd when a plain agent-uid walk can't traverse it |
 | `readUpdateNetworkConfig` | Function | `apps/workspace-agent/src/config.ts` | Reads the egress-proxy and CA-bundle settings `/update`'s network half needs, once at startup |
 | `createRecoverCheckoutCommand` / `createCheckoutBackupCommand` | Function | `packages/gateway/src/discord/commands/{recover-checkout,checkout-backup}.ts` | `/fro-bot recover-checkout` and `/fro-bot checkout-backup list\|delete`; the Recover button on a refusal reply shares the same flow via `discord/recover-checkout-button.ts` |
-| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Build-time-pinned operator contract version (`1.8.0`) |
+| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Build-time-pinned operator contract version (`1.9.0`) |
 | `resolveClient` | Function | `packages/gateway/src/web/ingress/resolve-client.ts` | Trusted-proxy-aware client-address resolution for the unauthenticated operator-surface keys (health, OAuth start/callback, logout rate limits and the OAuth attempt cap and binding); returns an opaque `ResolvedClientAddress` or a closed `IngressRejection` — never a fallback key |
 | `parseCanonicalAddress` | Function | `packages/gateway/src/web/ingress/canonical-address.ts` | Single strict IPv4/IPv6 parser shared by socket, X-Forwarded-For, and configured-peer parsing |
 
@@ -254,9 +263,19 @@ Discord messageCreate event
               │     (a terminal Discord delivery failure — channel/thread gone —
               │      auto-denies on the server instead of hanging out the run budget)
               │
+              ├─→ agent question (`question` tool; root or adopted descendant)
+              │     question.asked → question registry, deadline computed from the budget left
+              │     (too little budget → skipped at once with an empty reply)
+              │     → web: SSE `question` frame; Discord: prompt in the thread (single-question
+              │       shapes) or a notice pointing at the operator web surface
+              │     → answer/skip from either surface, or the deadline skip (empty reply)
+              │     (pauses the inactivity watchdog while any approval or question is pending)
+              │
               └─→ completion
                     root session.idle with ledger entries still outstanding → drain
                       (periodic reconciliation until settled or the run deadline expires)
+                    root session.idle with a question still pending → drain holds
+                      until the question settles, or the run deadline expires
                     code-written "started from" provenance line appended to the final reply
                     run → COMPLETED; heartbeat stop; lock release
                     on failure → FAILED; coarse error reply to thread
@@ -388,6 +407,30 @@ Idle and terminal-signal evidence consumed by the execute-phase poll loop (`poll
 ### Approval Denial on Undeliverable Discord Notification
 
 `createDiscordApprovalOnPending` (`packages/gateway/src/approvals/discord-transport.ts`) posts a tool-approval embed with Approve/Deny buttons and waits for a human. If the bound thread was deleted, that post fails, nobody can answer it, and the run would otherwise wait out its full budget for a decision that can never arrive. `handleUndeliverable` reclassifies a TERMINAL Discord failure — `UnknownChannel` or `MissingAccess`, matched on `DiscordAPIError.code` (a stable numeric code), never on `error.message`, so a wording change upstream cannot silently reclassify a rate limit or a 5xx as fatal — into an immediate server-side denial via `approvalRegistry.applySettlement({decision: 'reject', reason: 'disposed'})`, rather than leaving the entry `open` for a POST that can never succeed. Retryable failures (rate limits, 5xx, network errors) are left alone; the entry stays open via `markMessagePostFailed` so a later settlement can still deliver once the transient condition clears. The denial is deliberately visible, not silent: it logs at `error` with the Discord code, and posts a best-effort thread note worded distinctly from a human "Deny" click or a deadline timeout — because this mechanism turns Discord notification availability into a denial control, and an operator diagnosing a run must be able to tell a delivery failure from a person saying no.
+
+### Agent Questions (Gateway)
+
+When an agent calls OpenCode's `question` tool, OpenCode emits `question.asked` and blocks the tool call until the request is replied to or rejected. The gateway treats the request as a second family of human wait, next to tool approvals. A `question.asked` from the root session or an adopted background child reaches operators; one from a session the run does not own is ignored.
+
+**One gate, two families.** `createRequestGate` (`approvals/request-gate.ts`) owns what must be identical for approvals and questions: the entry map, the `open → claimed → confirmed` state machine with a single-winner claim, the scope check, the registry-owned deadline timer and its claimed-vs-deadline handshake, authoritative echo settlement, run teardown, and exactly one terminal notification per request. `registry.ts` (approvals) and `question-registry.ts` (questions) each supply their own decision vocabulary and per-entry behavior on top. Nothing settles a request except through the gate. OpenCode's `question.replied` / `question.rejected` echo is authoritative; an echo for an entry nobody on the gateway claimed still settles it.
+
+**Skip is an empty reply; reject is for teardown.** A skip, and a deadline expiry, reply to OpenCode with an empty answer for every question. Upstream turns that into an "Unanswered" tool result and the agent continues. Rejecting would raise `Question.RejectedError`, which `processor.ts` treats as a blocked turn that ends the agent's turn. Reject is therefore used only on cancel and run teardown, where ending the turn is the intent. A malformed `question.asked` whose request id is readable is rejected immediately (`QuestionCoordinator.onMalformed`), so the agent does not block until the inactivity timeout; an unreadable one is only logged.
+
+**Mandatory deadline.** A question registers with a positive deadline or not at all. The coordinator derives it at ask time from the budget the run has left (`computeApprovalDeadlineMs`: at least 60 s, at most half the remaining budget, 30 s clear of the hard abort, capped at 13 minutes). When the run has 90 s or less left, the question is skipped immediately with an empty reply rather than registered, because an entry with no deadline would block the agent until the hard abort. The deadline is a skip, so an unanswered question never fails the run.
+
+**Human-wait gauge and drain.** `run-core.ts` keeps a gauge of request ids a human still has to settle, approvals and questions alike. The inactivity watchdog is paused while the gauge is non-empty and re-armed with a fresh window only when the last id is released. Release comes from OpenCode's echo and from the gate's per-request terminal notification (`requestGate.onTerminal`), which also fires for settlements that produce no echo: deadline skip, failed reply, teardown. Both directions are idempotent by request id, and a skipped-without-registering question releases its own wait. Outstanding question waits also hold the root-idle drain open (an approval does not: a root session that went idle with an approval pending has abandoned that tool call, and teardown rejects it).
+
+**Cross-surface answering.** Questions are bound to the run that asked them. A web operator with write access to the run's repository can answer or skip any run's question, including a Discord-launched run's; the web route authorizes the operator against the run's repository and the gate then accepts a web actor for any scope. A Discord actor can settle only a question from its own thread. Tool approvals keep their channel binding; only questions gain cross-surface answering. A request settles as a whole: one decision carries answers for every question in it.
+
+**Discord shapes and the web fallback.** The native Discord prompt covers a request with a single question: up to 20 options and not `multiple` render as buttons (5 per row), 21–25 options or `multiple` with up to 25 render as one string select, and a control row carries Skip plus "Answer with text…" when a custom answer is allowed (a modal with one 4,000-character input). Everything else — more than one question, more than 25 options, an option with no usable label, or a custom id over Discord's 100-character limit — gets a fixed-copy notice in the thread saying a question is waiting and can be answered on the operator web surface. The notice never carries question text, links the configured public operator origin when one exists, and posts no partial prompt. The entry stays answerable from the web and skips at its deadline as usual. Custom ids are `fb-q:<code>:<requestID>[:<optionIndex>]`; they carry no labels.
+
+**Delivery failure does not settle.** If the Discord post fails terminally (`UnknownChannel` or `MissingAccess`, matched on `DiscordAPIError.code`), the question is not rejected the way an undeliverable approval is: web operators can still answer it and the deadline still skips it. The failure is logged once with ids and the Discord code. Retryable failures are logged and left alone.
+
+**Untrusted text.** Every question and answer string is untrusted plain text. The gateway carries it verbatim apart from length bounding and control-character stripping at the operator-facing build site (`approvals/question-detail.ts`), and never pre-renders it as HTML or Markdown; consumers render it inertly. Discord renders it in embeds, bounded and escaped with `escapeMarkdown`, with `allowedMentions: {parse: []}` on every send and edit. Logs, audit events, errors, and push payloads carry request ids and reason codes only — never question or answer text, and never an effect's raw error string, because an SDK error body can echo the text.
+
+**Caps and index-based answers.** A free-text answer is capped at 4,000 characters and question routes accept a 64 KiB request body; both are enforced before any call to OpenCode, and a refused answer leaves the request pending. An operator names options by zero-based index into the question's `options`, never by label: the labels operators see are bounded and control-stripped and can differ from the raw labels the agent sent, so the gateway maps each index back to the raw label held in the registry before replying. Discord select values are indices for the same reason.
+
+**Restart limitation.** Pending questions are in memory only, like approvals. A gateway restart loses the pending entry and its deadline timer with the run, and startup stale-run recovery handles the run itself. A workspace restart loses OpenCode's pending question; the gateway's deadline still fires and its skip fails closed, and the terminal notification still releases the gauge.
 
 ### Checkout Provenance (Gateway + Workspace)
 
