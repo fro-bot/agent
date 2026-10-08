@@ -2736,6 +2736,216 @@ describe('runOpenCodeCore', () => {
         expect(vi.getTimerCount()).toBe(0)
       })
     })
+
+    // -------------------------------------------------------------------------
+    // Human-wait gauge — the watchdog stays paused until every outstanding
+    // approval has been released, not just the first one.
+    // -------------------------------------------------------------------------
+
+    describe('human-wait gauge', () => {
+      const WINDOW = 5_000
+
+      afterEach(() => {
+        vi.useRealTimers()
+      })
+
+      type Outcome = {readonly ok: true} | {readonly ok: false; readonly error: unknown}
+
+      /** Starts a run over a hand-fed event stream under fake timers. */
+      function startGaugeRun(): {
+        readonly emit: (event: object) => Promise<void>
+        readonly outcome: () => Outcome | undefined
+        readonly done: Promise<void>
+        readonly coordinator: ReturnType<typeof makeCoordinator>
+      } {
+        vi.useFakeTimers()
+        const queue: object[] = []
+        let wake: (() => void) | null = null
+
+        async function* stream(): AsyncGenerator<object> {
+          while (true) {
+            const next = queue.shift()
+            if (next === undefined) {
+              await new Promise<void>(resolve => {
+                wake = resolve
+              })
+            } else {
+              yield next
+            }
+          }
+        }
+
+        const coordinator = makeCoordinator()
+        const handle = makeHandle({subscribe: async () => Promise.resolve({stream: stream()})})
+        let settled: Outcome | undefined
+        const done = runOpenCodeCore({...buildParams(handle), coordinator, inactivityTimeoutMs: WINDOW}).then(
+          () => {
+            settled = {ok: true}
+          },
+          (error: unknown) => {
+            settled = {ok: false, error}
+          },
+        )
+
+        return {
+          emit: async event => {
+            queue.push(event)
+            if (wake !== null) {
+              const resume: () => void = wake
+              wake = null
+              resume()
+            }
+            // Let the loop consume the event before the caller advances the clock.
+            await vi.advanceTimersByTimeAsync(1)
+          },
+          outcome: () => settled,
+          done,
+          coordinator,
+        }
+      }
+
+      function expectInactivityTimeout(outcome: Outcome | undefined): void {
+        expect(outcome?.ok).toBe(false)
+        if (outcome?.ok === false) {
+          expect(outcome.error).toBeInstanceOf(RunCoreError)
+          expect((outcome.error as RunCoreError).kind).toBe('inactivity-timeout')
+        }
+      }
+
+      it('one approval asked then replied: paused while pending, then re-armed with a fresh window', async () => {
+        // #given — one approval pending for far longer than the window
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+        expect(run.outcome()).toBeUndefined()
+
+        // #when — the approval is replied
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+
+        // #then — the window restarts from the reply: not expired just before it, expired just after
+        await vi.advanceTimersByTimeAsync(WINDOW - 10)
+        expect(run.outcome()).toBeUndefined()
+        await vi.advanceTimersByTimeAsync(20)
+        await run.done
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('two approvals, first replied: watchdog stays paused; re-arms only after the second is replied', async () => {
+        // #given — two concurrent approvals
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+        await run.emit(permissionAskedEvent('req-b'))
+
+        // #when — the first is replied
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then — still paused: the second approval is outstanding
+        expect(run.outcome()).toBeUndefined()
+
+        // #when — the second is replied
+        await run.emit(permissionRepliedEvent('req-b', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW + 10)
+        await run.done
+
+        // #then — the watchdog is armed again and fires
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('replied event for an unknown request id leaves the count unchanged while another item is pending', async () => {
+        // #given — one approval pending
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+
+        // #when — an echo arrives for an id that was never asked
+        await run.emit(permissionRepliedEvent('req-ghost', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then — no re-arm: the real approval is still outstanding
+        expect(run.outcome()).toBeUndefined()
+
+        // #when — the real approval is replied
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW + 10)
+        await run.done
+
+        // #then
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('duplicate permission.asked for one id is counted once: a single reply re-arms', async () => {
+        // #given — the same approval id asked twice
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+        await run.emit(permissionAskedEvent('req-a'))
+
+        // #when — one reply
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW + 10)
+        await run.done
+
+        // #then — the duplicate did not leave a phantom pending item
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('repeated replied echo for the same id releases once: the other approval keeps the watchdog paused', async () => {
+        // #given — two approvals, the first replied twice (echo repeated)
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+        await run.emit(permissionAskedEvent('req-b'))
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+
+        // #when
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then — the repeat did not drive the count below the outstanding second item
+        expect(run.outcome()).toBeUndefined()
+
+        // #when — second approval replied, then the run finishes
+        await run.emit(permissionRepliedEvent('req-b', 'once'))
+        await run.emit(sessionIdleEvent('sess-123'))
+        await run.done
+
+        // #then
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('replied echo from a session the run does not own does not release a pending approval', async () => {
+        // #given — an owned approval pending
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+
+        // #when — a foreign session replies with the same request id
+        await run.emit(permissionRepliedEvent('req-a', 'once', 'sess-foreign'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then — ownership gating keeps the approval outstanding
+        expect(run.outcome()).toBeUndefined()
+        expect(run.coordinator.onPermissionReplied).not.toHaveBeenCalled()
+
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await run.emit(sessionIdleEvent('sess-123'))
+        await run.done
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('inactivity timeout does not fire during a single pending approval', async () => {
+        // #given — one approval pending across many windows
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+
+        // #when
+        await vi.advanceTimersByTimeAsync(WINDOW * 10)
+
+        // #then — the run is still alive and completes once the approval resolves
+        expect(run.outcome()).toBeUndefined()
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await run.emit(sessionIdleEvent('sess-123'))
+        await run.done
+        expect(run.outcome()).toEqual({ok: true})
+      })
+    })
   })
 
   // ---------------------------------------------------------------------------

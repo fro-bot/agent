@@ -724,6 +724,28 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     resetInactivity()
   }
 
+  // Human-wait gauge: the set of request ids a human still has to settle (today: approvals).
+  // The inactivity watchdog is paused while the set is non-empty and re-armed with a fresh
+  // window only when the last id is released. Keying by request id keeps both directions
+  // idempotent: a duplicate ask adds nothing, and a release for an unknown or already-released
+  // id changes nothing, so the count can never drift or go negative.
+  const outstandingHumanWaits = new Set<string>()
+
+  function holdHumanWait(requestId: string): void {
+    outstandingHumanWaits.add(requestId)
+    // Pause typing while waiting on a human: the run is blocked, not actively working.
+    onBusy?.(false)
+    clearInactivity()
+  }
+
+  function releaseHumanWait(requestId: string): void {
+    if (!outstandingHumanWaits.delete(requestId)) return
+    if (outstandingHumanWaits.size > 0) return
+    // Last outstanding item settled: the run is unblocked, so resume typing and re-arm.
+    onBusy?.(true)
+    markActivity()
+  }
+
   // Ownership check: true for the root session, or a descendant session this
   // run's ledger has adopted (surfaced through `coordinator.isOwned`). False
   // for a null session id (no session on the payload) and false for any
@@ -913,11 +935,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           if (req === null) {
             logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
           } else {
-            // Pause typing while waiting on a human approval — the run is blocked,
-            // not actively working. Typing would falsely imply active work.
-            onBusy?.(false)
-            // Pause the inactivity timer while waiting for human approval.
-            clearInactivity()
+            // Pauses typing and the inactivity timer until every outstanding approval is released.
+            holdHumanWait(req.requestID)
             // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
             // eslint-disable-next-line no-void
             void coordinator.onPermissionAsked(req)
@@ -933,9 +952,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           if (ev === null) {
             logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
           } else {
-            // Approval resolved — resume typing if the run continues.
-            onBusy?.(true)
-            markActivity() // Re-arm inactivity now that the run is unblocked.
+            // Resumes typing and re-arms inactivity only if no other human-wait item remains.
+            releaseHumanWait(ev.requestID)
             coordinator.onPermissionReplied(ev)
             logger.info(
               {requestID: ev.requestID, reply: ev.reply},
