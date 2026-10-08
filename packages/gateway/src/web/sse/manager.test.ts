@@ -12,12 +12,17 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorRunStatus} from '../../operator-contract/index.js'
+import type {
+  OperatorCheckoutPreparation,
+  OperatorCheckoutProvenance,
+  OperatorRunStatus,
+} from '../../operator-contract/index.js'
 import type {ObservationFrame, OutputFrame, RunObservationManager, RunObservationManagerDeps} from './manager.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createRunObservationManager} from './manager.js'
+import {projectRunObservation} from './projection.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -2685,6 +2690,52 @@ describe('observeApproval — approval frame fan-out', () => {
 
     // #then run-B subscriber does NOT get run-A's approval frame
     expect(framesB.filter(f => f.type === 'approval')).toHaveLength(0)
+
+    manager.shutdown()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Real projection wired into the manager: checkout fields reach the status frame
+// ---------------------------------------------------------------------------
+
+describe('status frame — checkout fields through the real projection', () => {
+  it('delivers checkoutProvenance and checkoutPreparation on the emitted status frame', async () => {
+    // #given a manager wired to the real projectRunObservation and a run carrying both fields
+    const provenance: OperatorCheckoutProvenance = {
+      kind: 'observed',
+      observation: {
+        head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
+        worktree: {kind: 'clean'},
+        operationInProgress: 'none',
+        observedAt: '2026-01-01T00:00:00.000Z',
+      },
+      remote: {kind: 'not-checked'},
+    }
+    const preparation: OperatorCheckoutPreparation = {outcome: 'refused', reason: 'dirty', changedPaths: ['a.ts']}
+    const runState = makeRunState({details: {checkoutProvenance: provenance, checkoutPreparation: preparation}})
+    const projectFn: ProjectFn = async state =>
+      projectRunObservation(state, {
+        nowMs: 1_000_000,
+        staleThresholdMs: 60_000,
+        bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
+        isRepoDenied: () => false,
+        hasPendingForScope: () => false,
+      })
+    const {manager} = makeManager(projectFn)
+    const {frames} = collectFrames(manager, 'run-001')
+
+    // #when the run is observed
+    await manager.observe(runState)
+    await drain()
+
+    // #then the emitted status frame carries both fields
+    const statusFrames = frames.filter(f => f.type === 'status')
+    expect(statusFrames).toHaveLength(1)
+    expect(statusFrames[0]).toMatchObject({
+      type: 'status',
+      data: {checkoutProvenance: provenance, checkoutPreparation: preparation},
+    })
 
     manager.shutdown()
   })

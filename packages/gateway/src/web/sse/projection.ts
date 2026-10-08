@@ -69,25 +69,42 @@ export async function projectRunObservation(
     return null
   }
 
+  // Copy only the contract fields from the deny-gated bridge result (base), never from runState —
+  // preserves the deny-gate (a denied repo's base is null before any field). Destructuring `base`
+  // exhaustively makes a new OperatorRunStatus field a type error below until it is copied here.
+  const {
+    runId,
+    entityRef,
+    surface,
+    phase,
+    status,
+    startedAt,
+    stale,
+    failureKind,
+    checkoutProvenance,
+    checkoutPreparation,
+    ...uncopied
+  } = base
+  uncopied satisfies Record<string, never>
+
   const scopeId = scopeIdFor(runState)
   // Only overlay waiting_for_approval when the run is actively running — a stale approval
   // entry must not override a terminal status (succeeded/failed/cancelled) that has already
   // been reached. The overlay is meaningless once the run has left the running state.
   const overlaidStatus =
-    base.status === 'running' && deps.hasPendingForScope(scopeId) === true ? 'waiting_for_approval' : base.status
+    status === 'running' && deps.hasPendingForScope(scopeId) === true ? 'waiting_for_approval' : status
 
-  // Copy only the contract fields; never spread runState or read its details.
   const result: OperatorRunStatus = {
-    runId: base.runId,
-    entityRef: base.entityRef,
-    surface: base.surface,
-    phase: base.phase,
+    runId,
+    entityRef,
+    surface,
+    phase,
     status: overlaidStatus,
-    startedAt: base.startedAt,
-    stale: base.stale,
-    // Copy from the deny-gated bridge result (base), never from runState —
-    // preserves the deny-gate (a denied repo's base is null before any field).
-    ...(base.failureKind === undefined ? {} : {failureKind: base.failureKind}),
+    startedAt,
+    stale,
+    ...(failureKind === undefined ? {} : {failureKind}),
+    ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
+    ...(checkoutPreparation === undefined ? {} : {checkoutPreparation}),
   }
 
   return result
