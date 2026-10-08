@@ -128,6 +128,21 @@ describe('GET pending questions', () => {
     expect(body.requests).toHaveLength(PENDING_QUESTIONS_MAX_RESULTS)
   })
 
+  it('a 200 response carrying question text is Cache-Control: no-store, private', async () => {
+    // #given a pending question with model-authored text
+    const registry = makeRegistry()
+    register(registry, 'que_1')
+
+    // #when listing
+    const res = await list(makeDeps(registry))
+
+    // #then the 200 body has the question text and may not be cached
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as PendingQuestionsResponse
+    expect(body.requests[0]?.questions[0]?.text).toBe('Which environment?')
+    expect(res.headers.get('Cache-Control')).toBe('no-store, private')
+  })
+
   it('denylisted repo → 404 before any authz call', async () => {
     // #given a denylisted repo
     const registry = makeRegistry()

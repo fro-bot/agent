@@ -142,6 +142,8 @@ export function buildPendingQuestionsRoute(app: Hono, deps: PendingQuestionsRout
     ).map(dto => toQuestionRequestDetail(dto.requestID, dto.questions))
 
     const body: PendingQuestionsResponse = {requests}
+    // Model-authored question text must never be cached by a browser or shared proxy.
+    c.header('Cache-Control', 'no-store, private')
     return c.json(body, 200)
   })
 }

@@ -148,7 +148,7 @@ Dashboard consumption of contract `1.9.0` (question frame, answer and skip UI, `
 
 - **Generalize the approval registry into one gate with two request families.** Settlement is the security-critical boundary; one claim machine, one scope check, one deadline owner, and one dispose path avoid two gates drifting. The core owns the lifecycle; each family supplies its decision vocabulary, validation, reply/reject calls, cascade policy, and render. Approvals keep their cascade; questions have none.
 - **Characterize approvals before generalizing.** The existing registry, coordinator, and approval-flow tests are the regression net; the refactor lands with every approval test passing unchanged before any question family code.
-- **Human-wait gauge replaces the boolean pause.** The run-core watchdog counts outstanding approvals and questions and re-arms only at zero. The current single pause lets the first settlement re-arm the watchdog while a second item still waits. The gate notifies run-core of every terminal transition (echo, deadline, skip, cancellation, teardown, and fail-closed POST failure) through one callback keyed by request id, and the gauge release is idempotent per request id, so a settlement with no echo cannot leave the watchdog paused or drain blocked.
+- **Human-wait gauge replaces the boolean pause.** The run-core watchdog counts outstanding approvals and questions and re-arms only at zero, and only outside drain (during drain the watchdog stays paused and the gauge never holds or completes it). The current single pause lets the first settlement re-arm the watchdog while a second item still waits. The gate notifies run-core of every terminal transition (echo, deadline, skip, cancellation, teardown, and fail-closed POST failure) through one callback keyed by request id, and the gauge release is idempotent per request id, so a settlement with no echo cannot leave the watchdog paused outside drain.
 - **Skip is an empty reply; reject is reserved for cancel and teardown.** Upstream treats `Question.RejectedError` as a blocked tool call that ends the agent's turn (`src/session/processor.ts` sets `blocked` from `shouldBreak`), so reject cannot satisfy "continue without an answer". Operator skip and deadline expiry reply with one empty answer per question, which the tool reports as "Unanswered" and the agent continues. Cancellation and teardown reject, because ending the turn is the intent there.
 - **Question effects are injected from a v2 client.** The gateway's OpenCode handle is the v1 client, and question reply and reject exist only on the v2 SDK. `replyQuestion` and `rejectQuestion` closures are built at the same construction site as the permission reply, from a v2 client sharing the base URL, bearer, and run directory, and check `response.error` explicitly. The gate and run-core never see SDK versions.
 - **`custom` defaults to allowed.** Upstream enables a custom answer unless `custom` is explicitly false, so the gateway normalizes it to `custom !== false` and emits normalized booleans in operator DTOs and frames.
@@ -187,7 +187,7 @@ Dashboard consumption of contract `1.9.0` (question frame, answer and skip UI, `
 - Exact module boundaries of the generalized core (one module with family adapters vs. a core module plus family modules), settled once the characterization tests pin current behavior.
 - Whether `PermissionCoordinator` is renamed or a small owned-session tracker is split out for shared use; decided by how much call-site churn each option causes.
 - Discord free-text interaction shape for multi-question requests within the 5-input modal limit; requests that cannot fit take the web fallback.
-- Whether the drain-complete check reads the gauge directly or the registry's pending count for the run.
+- Resolved: drain does not read the gauge or the registry at all. It depends on the ownership ledger alone (a pending question during root idle implies an owned background child, which the ledger already holds).
 
 ## High-Level Technical Design
 
@@ -320,7 +320,7 @@ sequenceDiagram
 
 - [ ] **Unit 3: Question event ingestion and lifecycle in the run**
 
-**Goal:** Route owned `question.*` events into the gate, count them in the human-wait gauge, and keep drain and teardown question-aware.
+**Goal:** Route owned `question.*` events into the gate, count them in the human-wait gauge, and keep run teardown question-aware (drain stays ledger-only).
 
 **Requirements:** R1, R3, R4, R5, R11
 
@@ -341,7 +341,7 @@ sequenceDiagram
 - `isOwnedSession` gates all three; an owned question increments the gauge and registers with a deadline from the remaining run budget, or is skipped immediately when the budget is below the deadline floor; echoes confirm through the gate; the gauge decrements on the gate's terminal notification, once per request id.
 - `run.ts` builds the injected `replyQuestion` / `rejectQuestion` effects from a v2 client with the run's base URL, bearer, and canonical directory, next to the permission reply wiring.
 - An unowned or malformed question is warn-logged with ids and reason codes.
-- Root-idle drain does not complete while the gauge is non-zero; run teardown disposes pending questions before the session is released.
+- Drain is unchanged and ledger-only: the gauge neither holds nor completes it, and a release during drain never re-arms the inactivity watchdog. Run teardown disposes pending questions before the session is released.
 
 **Patterns to follow:**
 
@@ -353,10 +353,11 @@ sequenceDiagram
 - Happy path: adopted child question → registered with the run's scope.
 - Edge case: question from a foreign session → ignored with a warning, watchdog unaffected.
 - Edge case: approval and question pending together → watchdog re-arms only after both settle.
-- Edge case: root idle while a child's question is pending → run stays in drain; settles after the question does.
+- Edge case: root idle with an owned child and a pending child question → run stays in drain on the ledger; answering the question neither completes the run nor re-arms inactivity; the run completes when the ledger settles.
+- Edge case: root idle with a question outstanding and an empty or settled ledger → the run completes on the ledger condition alone; teardown rejects the question.
 - Error path: malformed `question.asked` → warning, no registration, no crash.
 - Edge case: question asked with remaining budget below the deadline floor → skipped immediately with an empty-answer reply, no human wait, gauge returns to zero.
-- Error path: deadline skip POST fails with no echo → terminal notification still releases the gauge; watchdog re-arms and drain can complete.
+- Error path: deadline skip POST fails with no echo → terminal notification still releases the gauge; outside drain the watchdog re-arms, and during drain it stays paused.
 - Error path: question effects report `response.error` → handled in the gate, never thrown into the stream loop.
 - Integration: run cancelled with a question pending → question rejected through the gate, run reaches `CANCELLED`.
 - Integration: question never answered → skipped at deadline, the agent's tool result reads "Unanswered", and the run continues and completes.
@@ -536,7 +537,7 @@ sequenceDiagram
 
 - **Interaction graph:** run-core event loop, the generalized registry, web routes and SSE manager, Discord interactions in `program.ts`, cancellation, push dispatcher, startup wiring.
 - **Error propagation:** reply/reject failures stay inside the gate (claim released or fail-closed); transport failures never settle a question; the deadline is the backstop for every failure.
-- **State lifecycle risks:** the gauge is released by the gate's per-request terminal notification, so it cannot go negative, double-release, or leak on teardown or echo-less settlement; drain waits for pending questions; dispose clears both families.
+- **State lifecycle risks:** the gauge is released by the gate's per-request terminal notification, so it cannot go negative, double-release, or leak on teardown or echo-less settlement; drain is ledger-only and ignores pending questions; dispose clears both families.
 - **API surface parity:** web and Discord answer through the same gate; approvals keep their scope rule while questions gain web cross-surface answering.
 - **Integration coverage:** the #1736 reproduction end to end; approval-plus-question concurrency; cancel and deadline races.
 - **Unchanged invariants:** approval decisions, cascade, routes, frames, Discord buttons, and the `waiting_for_approval` status behave as before; redaction-before-query ordering on every new route.

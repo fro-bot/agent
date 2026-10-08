@@ -38,11 +38,10 @@ import {
 
 function makeDeps(
   registry: QuestionRegistry,
-  overrides?: Partial<QuestionDecisionRouteDeps>,
-): QuestionDecisionRouteDeps & {
-  readonly auditLogger: ReturnType<typeof makeAuditLogger>
-  readonly logger: ReturnType<typeof makeLogger>
-} {
+  overrides?: Partial<Omit<QuestionDecisionRouteDeps, 'auditLogger' | 'logger'>>,
+) {
+  const auditLogger = makeAuditLogger()
+  const logger = makeLogger()
   return {
     sessionStore: makeSessionStore(),
     runIndex: makeRunIndex(),
@@ -50,11 +49,11 @@ function makeDeps(
     bindingsLookup: makeBindingsLookup(),
     repoAuthzDeps: writeAuthz(),
     registry,
-    auditLogger: makeAuditLogger(),
-    logger: makeLogger(),
+    auditLogger,
+    logger,
     now: () => 0,
     ...overrides,
-  } as never
+  } satisfies QuestionDecisionRouteDeps
 }
 
 function app(deps: QuestionDecisionRouteDeps) {
@@ -279,6 +278,44 @@ describe('POST question decision — gates and no-oracle denials', () => {
     // #then
     expect(res.status).toBe(404)
     expect(await res.json()).toEqual(NO_ORACLE)
+  })
+
+  it('a session that vanishes after authz → the same 404, no reply or reject', async () => {
+    // #given a session store whose token resolves but whose session entry is gone
+    const registry = makeRegistry()
+    const effects = makeEffects()
+    register(registry, effects)
+    const sessionStore = {...makeSessionStore(), get: vi.fn((_sessionId: string, _nowMs: number) => undefined)}
+    const deps = makeDeps(registry, {sessionStore})
+
+    // #when
+    const res = await post(app(deps), 'que_1', {decision: 'skip'})
+
+    // #then it is indistinguishable from a run-index miss, and nothing was settled
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual(NO_ORACLE)
+    expect(sessionStore.get).toHaveBeenCalledOnce()
+    expect(effects.replyQuestion).not.toHaveBeenCalled()
+    expect(effects.rejectQuestion).not.toHaveBeenCalled()
+  })
+
+  it('a registry.decide that throws → the same 404, no reply or reject', async () => {
+    // #given a registry whose settlement path throws unexpectedly
+    const registry = makeRegistry()
+    const effects = makeEffects()
+    register(registry, effects)
+    const decide = vi.spyOn(registry, 'decide').mockRejectedValue(new Error('boom'))
+    const deps = makeDeps(registry)
+
+    // #when
+    const res = await post(app(deps), 'que_1', {decision: 'skip'})
+
+    // #then 404 (not a 500), identical to a run-index miss, and nothing was sent to OpenCode
+    expect(decide).toHaveBeenCalledOnce()
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual(NO_ORACLE)
+    expect(effects.replyQuestion).not.toHaveBeenCalled()
+    expect(effects.rejectQuestion).not.toHaveBeenCalled()
   })
 })
 

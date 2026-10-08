@@ -577,27 +577,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     onOwnershipChange?.({rootSessionId: sessionId, ownedSessionIds})
   }
 
-  // Human waits the run is still blocked on (see the gauge notes further down). Declared here
-  // so the drain check and the gauge functions share it.
-  const outstandingHumanWaits = new Map<string, HumanWaitKind>()
-
-  // Root-idle drain holds for question waits only. A question from owned work keeps the run
-  // alive until it settles. An approval does not hold drain: a root session that goes idle with
-  // an approval still pending has abandoned that tool call, and run teardown rejects it.
-  function hasOutstandingQuestionWaits(): boolean {
-    for (const kind of outstandingHumanWaits.values()) {
-      if (kind === 'question') return true
-    }
-    return false
-  }
-
-  // Reads the underlying ledger: the hook wrapper (defined later) delegates reads unchanged.
-  function ownedWorkSettled(): boolean {
-    return ownershipLedger === undefined || ownershipLedger.isDrainComplete()
-  }
-
+  // Drain depends on the ownership ledger alone. Human waits never hold or complete it: a root
+  // `question` tool call blocks inside the root runner, and a foreground child keeps the root
+  // blocked on its `task` tool, so root idle with a question pending can only mean an owned
+  // background child, which is already an outstanding ledger entry.
   function checkDrainComplete(): void {
-    if (draining === true && ownedWorkSettled() === true && hasOutstandingQuestionWaits() === false) {
+    if (ownershipLedger !== undefined && draining === true && ownershipLedger.isDrainComplete()) {
       drainDoneController.abort()
     }
   }
@@ -745,7 +730,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // than waiting for the next SSE event that may never arrive. Every existing
   // `combinedSignal.aborted` check below is unaffected — it still means
   // exactly "timeout/inactivity/cancel", never "drain finished".
-  const iterationSignal = AbortSignal.any([combinedSignal, drainDoneController.signal])
+  const iterationSignal =
+    ledger === undefined ? combinedSignal : AbortSignal.any([combinedSignal, drainDoneController.signal])
   const abortableStream = makeAbortableStream(eventStream, iterationSignal)
 
   // Observability counters (#1101): disambiguate a genuine workspace hang (zero events
@@ -763,12 +749,16 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     resetInactivity()
   }
 
-  // Human-wait gauge (`outstandingHumanWaits`, declared with the drain machinery above): the
-  // request ids a human still has to settle, approvals and questions alike. The inactivity
-  // watchdog is paused while the map is non-empty and re-armed with a fresh window only when the
-  // last id is released. Keying by request id keeps both directions idempotent: a duplicate ask
-  // adds nothing, and a release for an unknown or already-released id changes nothing, so the
-  // count can never drift or go negative.
+  // Human-wait gauge: the request ids a human still has to settle, approvals and questions alike.
+  // The inactivity watchdog is paused while the map is non-empty and, outside drain, re-armed with
+  // a fresh window only when the last id is released. Keying by request id keeps both directions
+  // idempotent: a duplicate ask adds nothing, and a release for an unknown or already-released id
+  // changes nothing, so the count can never drift or go negative.
+  //
+  // The gauge never influences drain. While `draining` the watchdog stays paused whatever is
+  // released: the run's hard deadline (or a cancel) is the only bound, as it is without human waits.
+  // Re-arming mid-drain would let a quiet but valid background child trip the inactivity timer,
+  // which the post-loop classification reports as `drain-timeout` and cancels owned work early.
   //
   // Releases come from three places, all through `releaseHumanWait`: OpenCode's echo, the request
   // gate's terminal notification (which also fires for settlements that produce no echo: deadline
@@ -777,6 +767,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Once the event loop has exited the run no longer owns the watchdog: late releases (an
   // asynchronous skip finishing after the run ended) must not re-arm a timer nobody disposes.
   let humanWaitsClosed = false
+
+  const outstandingHumanWaits = new Map<string, HumanWaitKind>()
 
   function holdHumanWait(requestId: string, kind: HumanWaitKind): void {
     outstandingHumanWaits.set(requestId, kind)
@@ -788,10 +780,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   function releaseHumanWait(requestId: string): void {
     if (humanWaitsClosed === true) return
     if (!outstandingHumanWaits.delete(requestId)) return
-    // A drain that was only waiting on this question can now complete.
-    checkDrainComplete()
+    // Drain is bounded by the ledger and the run deadline alone: stay paused and quiet.
+    if (draining === true) return
     if (outstandingHumanWaits.size > 0) return
-    // Last outstanding item settled: the run is unblocked, so resume typing and re-arm.
+    // Last outstanding item settled outside drain: the run is unblocked, so resume typing and re-arm.
     onBusy?.(true)
     markActivity()
   }
@@ -1096,11 +1088,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // Deliberately root-scoped, NOT an ownership check: a descendant's own
         // idle transition must never end the run while the root is still
         // working. Root idle is the signal to CONSIDER finishing; whether that
-        // is actually allowed is the ledger's call, and — for questions — the
-        // human-wait gauge's, below.
+        // is actually allowed is the ledger's call, below.
         const eventSessionID = getEventSessionID(rawEvent)
         if (eventSessionID === sessionId) {
-          if (ownedWorkSettled() === true && hasOutstandingQuestionWaits() === false) {
+          if (ledger === undefined || ledger.isDrainComplete()) {
             logger.info(
               {sessionId, totalEvents, activityEvents, lastEventType},
               'run-core: session.idle received — stream complete',
@@ -1111,21 +1102,15 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             return
           }
 
-          // Outstanding owned work or an unanswered question: enter (or remain in) drain
-          // rather than completing. The run stays alive — slot, lease, and approval routing
-          // all continue exactly as during execution — until the ledger settles and every
-          // question wait is released, or the run's own deadline (`combinedSignal`) expires.
+          // Outstanding owned work: enter (or remain in) drain rather than
+          // completing. The run stays alive — slot, lease, and approval routing
+          // all continue exactly as during execution — until the ledger settles
+          // or the run's own deadline (`combinedSignal`) expires.
           if (draining === false) {
             draining = true
             logger.info(
-              {
-                sessionId,
-                outstanding: ledger?.outstanding(),
-                questionWaits: hasOutstandingQuestionWaits(),
-                totalEvents,
-                activityEvents,
-              },
-              'run-core: root session idle with owned work or a question outstanding — draining',
+              {sessionId, outstanding: ledger.outstanding(), totalEvents, activityEvents},
+              'run-core: root session idle with owned work outstanding — draining',
             )
             onBusy?.(false)
             clearInactivity()
@@ -1135,7 +1120,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           // without waiting for the reconciler's interval. Fire-and-forget: its
           // mutations (via the wrapped ledger) trigger persistence and the
           // drain-complete check on their own once they land.
-          if (ledger !== undefined && reconcileAdapter !== undefined && runtimeLogger !== undefined) {
+          if (reconcileAdapter !== undefined && runtimeLogger !== undefined) {
             // eslint-disable-next-line no-void
             void reconcileLedgerOnce({
               ledger,

@@ -4022,6 +4022,8 @@ describe('runOpenCodeCore', () => {
         readonly withQuestions?: boolean
         readonly ownershipLedger?: ReturnType<typeof createOwnershipLedger>
         readonly sessionStatus?: () => Promise<unknown>
+        readonly sessionAbort?: () => Promise<unknown>
+        readonly onBusy?: (busy: boolean) => void
         readonly signal?: AbortSignal
       } = {},
     ) {
@@ -4048,6 +4050,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () => Promise.resolve({stream}),
         sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
         ...(options.sessionStatus === undefined ? {} : {sessionStatus: options.sessionStatus}),
+        ...(options.sessionAbort === undefined ? {} : {sessionAbort: options.sessionAbort}),
       })
 
       let settled: Outcome | undefined
@@ -4059,6 +4062,7 @@ describe('runOpenCodeCore', () => {
         onHumanWaitTerminal: gate.onTerminal,
         inactivityTimeoutMs: WINDOW,
         ...(options.ownershipLedger === undefined ? {} : {ownershipLedger: options.ownershipLedger}),
+        ...(options.onBusy === undefined ? {} : {onBusy: options.onBusy}),
         ...(options.signal === undefined ? {} : {signal: options.signal}),
       }).then(
         () => {
@@ -4073,6 +4077,7 @@ describe('runOpenCodeCore', () => {
         logger,
         gate,
         registry,
+        questions,
         effects,
         coordinator,
         done,
@@ -4103,6 +4108,23 @@ describe('runOpenCodeCore', () => {
       await vi.advanceTimersByTimeAsync(WINDOW - 10)
       expect(run.outcome()).toBeUndefined()
       await vi.advanceTimersByTimeAsync(20)
+      await run.done
+      expectInactivityTimeout(run.outcome())
+    })
+
+    it('a rejected echo releases the wait like a replied one: outside drain the watchdog re-arms', async () => {
+      // #given a root-session question holding the watchdog
+      const run = startQuestionRun()
+      await run.emit(questionAskedEvent('que_1'))
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(run.outcome()).toBeUndefined()
+
+      // #when OpenCode echoes a rejection
+      await run.emit(questionRejectedEvent('que_1'))
+
+      // #then the entry is gone and the quiet run now times out on a fresh window
+      expect(run.registry.has('que_1')).toBe(false)
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
       await run.done
       expectInactivityTimeout(run.outcome())
     })
@@ -4159,45 +4181,126 @@ describe('runOpenCodeCore', () => {
       expectInactivityTimeout(run.outcome())
     })
 
-    it('root idle while an owned question is pending: the run stays in drain and completes once it settles', async () => {
-      // #given a child session asked a question and the root goes idle
-      const run = startQuestionRun({extraOwned: [CHILD]})
+    it('#1736 drain: answering a question mid-drain neither completes the run, re-arms inactivity, nor cancels owned work', async () => {
+      // #given a live background child, a pending question from it, and the root gone idle (drain)
+      let childLive = true
+      const sessionAbort = vi.fn().mockResolvedValue({data: {}, error: null})
+      const onBusy = vi.fn()
+      const ownershipLedger = createOwnershipLedger()
+      const run = startQuestionRun({
+        extraOwned: [CHILD],
+        ownershipLedger,
+        sessionStatus: async () => ({data: childLive ? {[CHILD]: {}} : {}, error: null}),
+        sessionAbort,
+        onBusy,
+      })
+      await run.emit(backgroundTaskCompletedEvent(CHILD))
       await run.emit(questionAskedEvent('que_child', CHILD))
       await run.emit(sessionIdleEvent('sess-123'))
-      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(ownershipLedger.isDrainComplete()).toBe(false)
+      onBusy.mockClear()
 
-      // #then the run has not completed and the watchdog did not fire
-      expect(run.outcome()).toBeUndefined()
-
-      // #when the question settles
+      // #when the question is answered while draining
       await run.emit(questionRepliedEvent('que_child', CHILD))
+
+      // #then the run is still draining and inactivity was not re-armed (typing stays off too)
+      expect(run.outcome()).toBeUndefined()
+      expect(onBusy).not.toHaveBeenCalledWith(true)
+
+      // #and a quiet but valid child outlasts the inactivity window: no drain-timeout, no cancellation
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(run.outcome()).toBeUndefined()
+      expect(sessionAbort).not.toHaveBeenCalled()
+
+      // #when the child settles through the ledger
+      childLive = false
+      await run.emit(sessionIdleEvent('sess-123'))
       await run.done
 
-      // #then the drain completes
+      // #then the run completes normally, with the owned work settled rather than cancelled
       expect(run.outcome()).toEqual({ok: true})
+      expect(ownershipLedger.snapshot().find(entry => entry.sessionId === CHILD)?.state).toBe('settled')
+      expect(sessionAbort).not.toHaveBeenCalled()
     })
 
-    it('drain holds for a question even when the ownership ledger has already settled', async () => {
+    it('#1736 drain: a question released by a failed deadline skip mid-drain does not complete the drain either', async () => {
+      // #given a live child, its pending question with a short deadline whose skip reply fails, and drain
+      const replyQuestion = vi.fn().mockResolvedValue({ok: false, error: 'down'})
+      const sessionAbort = vi.fn().mockResolvedValue({data: {}, error: null})
+      const run = startQuestionRun({
+        deadlineMs: 1_000,
+        effects: {replyQuestion},
+        extraOwned: [CHILD],
+        ownershipLedger: createOwnershipLedger(),
+        sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}),
+        sessionAbort,
+      })
+      await run.emit(backgroundTaskCompletedEvent(CHILD))
+      await run.emit(questionAskedEvent('que_child', CHILD))
+      await run.emit(sessionIdleEvent('sess-123'))
+
+      // #when the deadline passes and the terminal notification releases the wait
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(replyQuestion).toHaveBeenCalledExactlyOnceWith('que_child', [[]])
+      expect(run.registry.has('que_child')).toBe(false)
+
+      // #then the watchdog stays paused and the run keeps draining on the ledger
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(run.outcome()).toBeUndefined()
+      expect(sessionAbort).not.toHaveBeenCalled()
+    })
+
+    it('#1736 drain: root idle with a question pending and an empty ledger completes on the ledger alone; teardown rejects the question', async () => {
+      // #given a question outstanding and nothing owned in the ledger
+      const run = startQuestionRun({ownershipLedger: createOwnershipLedger()})
+      await run.emit(questionAskedEvent('que_1'))
+      expect(run.registry.has('que_1')).toBe(true)
+
+      // #when the root goes idle
+      await run.emit(sessionIdleEvent('sess-123'))
+      await run.done
+
+      // #then the run completed without waiting on the question, which nothing has settled
+      expect(run.outcome()).toEqual({ok: true})
+      expect(run.registry.has('que_1')).toBe(true)
+      expect(run.effects.replyQuestion).not.toHaveBeenCalled()
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+
+      // #when run teardown disposes the question
+      await run.questions.dispose('run ended')
+
+      // #then it is rejected through the existing teardown path
+      expect(run.effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+      expect(run.registry.has('que_1')).toBe(false)
+    })
+
+    it('#1736 drain: root idle with a question pending and an already-settled ledger completes on the ledger alone; teardown rejects the question', async () => {
       // #given a background child that finishes (not live) while its question is still pending
       const ownershipLedger = createOwnershipLedger()
-      const run = startQuestionRun({ownershipLedger, sessionStatus: async () => ({data: {}, error: null})})
+      const run = startQuestionRun({
+        extraOwned: [CHILD],
+        ownershipLedger,
+        sessionStatus: async () => ({data: {}, error: null}),
+      })
       await run.emit(backgroundTaskCompletedEvent(CHILD))
       await run.emit(questionAskedEvent('que_child', CHILD))
 
       // #when the root goes idle and the reconcile pass settles the child
       await run.emit(sessionIdleEvent('sess-123'))
-      await vi.advanceTimersByTimeAsync(WINDOW * 4)
-
-      // #then the ledger is drained but the question keeps the run alive
-      expect(ownershipLedger.isDrainComplete()).toBe(true)
-      expect(run.outcome()).toBeUndefined()
-
-      // #when the question settles
-      await run.emit(questionRejectedEvent('que_child', CHILD))
       await run.done
 
-      // #then
+      // #then the ledger alone ended the drain; the question did not hold the run
+      expect(ownershipLedger.isDrainComplete()).toBe(true)
       expect(run.outcome()).toEqual({ok: true})
+      expect(run.registry.has('que_child')).toBe(true)
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+
+      // #when run teardown disposes the question
+      await run.questions.dispose('run ended')
+
+      // #then it is rejected through the existing teardown path
+      expect(run.effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_child')
+      expect(run.registry.has('que_child')).toBe(false)
     })
 
     it('a pending approval alone does not hold root-idle completion (existing behavior)', async () => {
@@ -4361,28 +4464,31 @@ describe('runOpenCodeCore', () => {
       await run.emit(questionAskedEvent('que_a'))
       await run.emit(questionAskedEvent('que_b'))
 
-      // #then the watchdog re-armed (nothing is held) and the run is not stuck in drain
+      // #then the watchdog re-armed (nothing is held)
       await vi.advanceTimersByTimeAsync(WINDOW + 10)
       await run.done
       expectInactivityTimeout(run.outcome())
       expect(loggedText(run.logger)).not.toContain(SECRET)
     })
 
-    it('deadline skip POST fails with no echo: the terminal notification releases the gauge, re-arms the watchdog and drain completes', async () => {
+    it('deadline skip POST fails with no echo: the terminal notification releases the gauge and re-arms the watchdog', async () => {
       // #given a registered question whose skip reply will fail, and no echo will ever arrive
       const replyQuestion = vi.fn().mockResolvedValue({ok: false, error: 'down'})
-      const run = startQuestionRun({deadlineMs: 1_000, effects: {replyQuestion}, extraOwned: [CHILD]})
-      await run.emit(questionAskedEvent('que_1', CHILD))
-      await run.emit(sessionIdleEvent('sess-123'))
+      const run = startQuestionRun({deadlineMs: 1_000, effects: {replyQuestion}})
+      await run.emit(questionAskedEvent('que_1'))
 
       // #when the deadline passes
       await vi.advanceTimersByTimeAsync(1_000)
 
-      // #then the skip was attempted, the entry left the gate, and the drain completed without any echo
+      // #then the skip was attempted and the entry left the gate
       expect(replyQuestion).toHaveBeenCalledExactlyOnceWith('que_1', [[]])
       expect(run.registry.has('que_1')).toBe(false)
+
+      // #and the watchdog was re-armed by the terminal notification alone: the quiet run times out
+      expect(run.outcome()).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
       await run.done
-      expect(run.outcome()).toEqual({ok: true})
+      expectInactivityTimeout(run.outcome())
     })
 
     it('deadline skip with a throwing reply effect: contained, the watchdog re-arms', async () => {
