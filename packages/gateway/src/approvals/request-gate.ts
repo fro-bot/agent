@@ -10,7 +10,7 @@
  * - the scope check, through a family-supplied {@link ScopePolicy};
  * - the registry-owned deadline timer and the claimed-vs-deadline handshake;
  * - authoritative echo settlement, including entries nobody on the gateway claimed;
- * - run teardown (`disposeRun` / `disposeAll`);
+ * - run teardown (`disposeFamilyRun` / `disposeFamilyAll` per family, `disposeAllAcrossFamilies` for shutdown);
  * - one terminal notification per request id.
  *
  * Each family supplies, per entry, a {@link GateEntryOps} bundle: the reply
@@ -32,7 +32,17 @@
  *   no-op, but `deadlineExpired` is set. If the claimant's reply then fails,
  *   the entry fail-closes with the deadline reply instead of re-opening with
  *   a dead timer.
- * - Teardown always wins, regardless of state.
+ * - Teardown always wins, regardless of state. A `claimed` entry torn down while the
+ *   claimant's reply is still in flight is marked `disposed`: the entry leaves the gate at
+ *   once, and a late failure of that reply never reopens, re-arms, or re-renders it (the
+ *   question family rejects the orphaned request instead).
+ *
+ * ### Lifecycle surface
+ *
+ * Families never sequence raw steps. Each operation that changes where an entry is in its
+ * lifecycle does its timer, map, and terminal-notification work together: `put`, `admit` →
+ * `submit`, `settleEcho`, `settleNow`, `retire`, and the family/all dispose calls. There is no
+ * way to clear a timer, remove an entry, or emit the terminal event on its own.
  *
  * ### Terminal notification
  *
@@ -72,7 +82,11 @@ export type GateActor = DiscordApprovalActor | WebOperatorActor
 
 export type RequestFamily = 'approval' | 'question'
 
-export type EntryState = 'open' | 'claimed' | 'confirmed'
+/**
+ * `disposed` is set only by a family's teardown on an entry whose claimant's reply is still in
+ * flight: the entry is leaving the gate, and the late reply must not reopen or re-arm it.
+ */
+export type EntryState = 'open' | 'claimed' | 'confirmed' | 'disposed'
 
 /** Result of a reply/reject call to OpenCode. */
 export interface ReplyResult {
@@ -89,7 +103,7 @@ export interface GateEntryOps {
   readonly postDeadlineReply: () => Promise<ReplyResult>
   /** Settled render for the deadline outcome. Best-effort: the family catches render failures. */
   readonly renderDeadline: () => Promise<void>
-  /** Family teardown for run end / shutdown. Must leave the gate through {@link RequestGate.remove} + {@link RequestGate.terminate}. */
+  /** Family teardown for run end / shutdown. Must leave the gate through {@link RequestGate.retire}. */
   readonly dispose: () => Promise<void>
   /** Invoked after the deadline wins on an `open` entry (best-effort). */
   readonly onDeadlineSettled: (() => void | Promise<void>) | undefined
@@ -133,8 +147,6 @@ export type ScopePolicy = (
   request: {readonly scopeId: string; readonly actor: GateActor},
 ) => boolean
 
-export type AdmitOutcome = 'admitted' | 'scope-mismatch' | 'already-claimed'
-
 /** How an entry left the gate. */
 export type TerminalOutcome = 'confirmed' | 'cascade' | 'deadline' | 'disposed' | 'fail-closed'
 
@@ -153,51 +165,93 @@ export type TerminalListener = (event: TerminalEvent) => void
 // Gate interface
 // ---------------------------------------------------------------------------
 
+/**
+ * What {@link Admission.submit} reports. `ok` and `reply-failed` describe the claimant's reply.
+ * `already-claimed` and `not-found` are refusals made before anything was claimed or sent: the
+ * entry was no longer open, or no longer the current entry for its request id.
+ */
+export type SubmitOutcome = 'ok' | 'reply-failed' | 'already-claimed' | 'not-found'
+
+/**
+ * Result of {@link RequestGate.admit}. `admitted` carries the only way to claim the entry, so a
+ * claim cannot happen without the scope and single-winner checks having passed first.
+ */
+export type Admission =
+  | {
+      readonly kind: 'admitted'
+      /**
+       * Claim the entry for the admitted actor (atomic `open → claimed`) and send the claimant's
+       * reply. Call synchronously after `admit`, once any family validation has passed; a
+       * validation failure simply never submits, leaving the entry open.
+       *
+       * One-shot, and re-checked at the moment it runs: a second call on the same admission, an
+       * entry that is no longer open, or an entry that is no longer the current one for its
+       * request id is refused (`already-claimed` / `not-found`) with nothing claimed and nothing
+       * sent. Otherwise: on success the entry stays `claimed` until the echo settles it; on
+       * failure the claim is released to `open`, or the entry fail-closes when the deadline
+       * already passed; a reply that fails after the entry was `disposed` never reopens, re-arms,
+       * or re-renders it.
+       */
+      readonly submit: (post: () => Promise<ReplyResult>) => Promise<SubmitOutcome>
+    }
+  | {readonly kind: 'scope-mismatch'}
+  | {readonly kind: 'already-claimed'}
+
+/**
+ * The lifecycle surface a family gets. Everything that must happen together happens inside one
+ * operation: arming or clearing the timer, removing the entry, and emitting the terminal
+ * notification are never separate calls.
+ */
 export interface RequestGate {
   /** Look up the live entry for a request id (any family). */
   readonly get: (requestID: string) => GateEntry | undefined
   /** Snapshot of all live entries. */
   readonly list: () => readonly GateEntry[]
-  /** Insert an entry and arm its deadline timer when `deadlineMs` is positive. */
-  readonly put: (entry: GateEntry, deadlineMs: number | undefined) => void
   /**
-   * Retire an entry that is being replaced by a new entry for the same request
-   * id: clears its timer and suppresses its terminal notification, because the
-   * request id remains pending under the replacement.
+   * Insert an entry and arm its deadline timer when `deadlineMs` is positive. When an entry for
+   * the same request id is already registered it is replaced and returned: its timer is cleared
+   * and its terminal notification suppressed, because the request id stays pending under the
+   * replacement (the replacement emits when it leaves).
    */
-  readonly detach: (entry: GateEntry) => void
-  readonly clearTimer: (entry: GateEntry) => void
-  /** Remove the entry from the map if it is still the registered one. */
-  readonly remove: (entry: GateEntry) => void
-  /** Emit the terminal notification for the entry, at most once. */
-  readonly terminate: (entry: GateEntry, outcome: TerminalOutcome) => void
+  readonly put: (entry: GateEntry, deadlineMs: number | undefined) => GateEntry | undefined
   /** Log a settled-render failure without raising it. Families call this from their render wrapper's catch. */
   readonly logRenderFailure: (entry: GateEntry, reason: string, error: unknown) => void
-  /** Scope + single-winner check. Does not change state. */
+  /** Scope + single-winner check. Does not change state; see {@link Admission}. */
   readonly admit: (
     entry: GateEntry,
     request: {readonly scopeId: string; readonly actor: GateActor},
     policy: ScopePolicy,
-  ) => AdmitOutcome
-  /** Atomic `open → claimed` transition. Call synchronously after {@link RequestGate.admit}. */
-  readonly claim: (entry: GateEntry, actor: GateActor) => void
+  ) => Admission
   /**
-   * Send the claimant's reply. On success the entry stays `claimed` until the
-   * echo settles it. On failure the claim is released to `open`, or the entry
-   * fail-closes when the deadline already passed.
-   */
-  readonly postClaimed: (entry: GateEntry, post: () => Promise<ReplyResult>) => Promise<'ok' | 'reply-failed'>
-  /**
-   * Authoritative echo settlement: clear the timer, remove the entry, start the
-   * settled render, emit the terminal notification. Resolves when the render finishes.
+   * Authoritative echo settlement: clear the timer, remove the entry, start the settled render,
+   * emit the terminal notification. Resolves when the render finishes. Ignores a `disposed`
+   * entry: it is already leaving through {@link RequestGate.retire}, which renders it once and
+   * emits its only terminal notification.
    */
   readonly settleEcho: (entry: GateEntry, render: () => Promise<void>) => Promise<void>
+  /**
+   * Leave the gate immediately: clear the timer, remove the entry, emit the terminal notification.
+   * For a settlement whose follow-up work (a best-effort reply, a render) happens after the
+   * request has stopped blocking its run.
+   */
+  readonly settleNow: (entry: GateEntry, outcome: TerminalOutcome) => void
+  /**
+   * Leave the gate after family work: clear the timer now, run `work` (reply, render), then
+   * remove the entry and emit the terminal notification. A no-op when the entry already left
+   * (settled or replaced). Leaving is not conditional on the work: if `work` rejects, the
+   * rejection is logged (request id and error name or object per the family, never text) and
+   * the entry still leaves, exactly once, so whatever waits on its terminal notification is
+   * released. A replacement registered under the same request id is never removed.
+   */
+  readonly retire: (entry: GateEntry, outcome: TerminalOutcome, work: () => Promise<void>) => Promise<void>
   /** True when an `open` or `claimed` entry of the family exists for the scope. */
   readonly hasPendingForScope: (family: RequestFamily, scopeId: string) => boolean
-  /** Fail-close every entry of the session, across families. */
-  readonly disposeRun: (sessionID: string, reason: string) => Promise<void>
-  /** Fail-close every entry, across families. */
-  readonly disposeAll: (reason: string) => Promise<void>
+  /** Fail-close the session's entries of one family. Each registry tears down only its own family with this. */
+  readonly disposeFamilyRun: (family: RequestFamily, sessionID: string, reason: string) => Promise<void>
+  /** Fail-close every entry of one family. */
+  readonly disposeFamilyAll: (family: RequestFamily, reason: string) => Promise<void>
+  /** Fail-close every entry of every family. For gateway shutdown, which has no per-run coordinators to ask. */
+  readonly disposeAllAcrossFamilies: (reason: string) => Promise<void>
   /** Subscribe to terminal notifications. Returns an unsubscribe function. */
   readonly onTerminal: (listener: TerminalListener) => () => void
 }
@@ -240,7 +294,14 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     }
   }
 
-  function put(entry: GateEntry, deadlineMs: number | undefined): void {
+  function put(entry: GateEntry, deadlineMs: number | undefined): GateEntry | undefined {
+    const replaced = entries.get(entry.requestID)
+    if (replaced !== undefined) {
+      // The old entry's timer must not settle the replacement, and the request id stays pending,
+      // so the replaced entry emits no terminal notification.
+      clearTimer(replaced)
+      replaced.terminalFired = true
+    }
     entries.set(entry.requestID, entry)
     if (deadlineMs !== undefined && deadlineMs > 0) {
       entry.timer = setTimeout(() => {
@@ -248,11 +309,7 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
       }, deadlineMs)
       entry.timer.unref?.()
     }
-  }
-
-  function detach(entry: GateEntry): void {
-    clearTimer(entry)
-    entry.terminalFired = true
+    return replaced
   }
 
   function remove(entry: GateEntry): void {
@@ -390,19 +447,33 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     entry: GateEntry,
     request: {readonly scopeId: string; readonly actor: GateActor},
     policy: ScopePolicy,
-  ): AdmitOutcome {
+  ): Admission {
     if (!policy(entry, request)) {
       logger.warn(
         {requestID: entry.requestID, expected: entry.scopeId, received: request.scopeId},
         `${label(entry)}: scope mismatch — ignoring decision`,
       )
-      return 'scope-mismatch'
+      return {kind: 'scope-mismatch'}
     }
-    // Single-winner gate: claimed or confirmed both block a second decision.
-    if (entry.state === 'claimed' || entry.state === 'confirmed') {
-      return 'already-claimed'
+    // Single-winner gate: anything but open (claimed, confirmed, disposed) blocks a second decision.
+    if (entry.state !== 'open') {
+      return {kind: 'already-claimed'}
     }
-    return 'admitted'
+    let submitted = false
+    return {
+      kind: 'admitted',
+      // Returns postClaimed's promise directly on the happy path: an async wrapper would add
+      // microtask ticks to the settlement chain, whose depth the registry tests pin.
+      // eslint-disable-next-line @typescript-eslint/promise-function-async
+      submit: post => {
+        if (submitted) return Promise.resolve<SubmitOutcome>('already-claimed')
+        submitted = true
+        if (entries.get(entry.requestID) !== entry) return Promise.resolve<SubmitOutcome>('not-found')
+        if (entry.state !== 'open') return Promise.resolve<SubmitOutcome>('already-claimed')
+        claim(entry, request.actor)
+        return postClaimed(entry, post)
+      },
+    }
   }
 
   function claim(entry: GateEntry, actor: GateActor): void {
@@ -411,6 +482,9 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
   }
 
   function releaseFailedClaim(entry: GateEntry): 'reply-failed' {
+    // A disposed entry already left the gate: never reopen, re-arm, or fail-close it. The family
+    // that disposed it decides what a failed reply means (a question rejects the request).
+    if (entry.state === 'disposed') return 'reply-failed'
     if (entry.deadlineExpired) {
       // The deadline fired while the claim was in flight: fail-close instead of
       // leaving the entry open with a dead timer.
@@ -449,6 +523,8 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
   }
 
   async function settleEcho(entry: GateEntry, run: () => Promise<void>): Promise<void> {
+    // A disposed entry is mid-teardown: `retire` owns its render and its single terminal event.
+    if (entry.state === 'disposed') return
     // The echo is authoritative: clear the deadline timer regardless of state.
     clearTimer(entry)
     remove(entry)
@@ -458,6 +534,31 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     })
     terminate(entry, 'confirmed')
     await rendered
+  }
+
+  function settleNow(entry: GateEntry, outcome: TerminalOutcome): void {
+    clearTimer(entry)
+    remove(entry)
+    terminate(entry, outcome)
+  }
+
+  async function retire(entry: GateEntry, outcome: TerminalOutcome, work: () => Promise<void>): Promise<void> {
+    if (entries.get(entry.requestID) !== entry) return // already settled or replaced
+    clearTimer(entry)
+    try {
+      await work()
+    } catch (error) {
+      logger.error(
+        {requestID: entry.requestID, ...errorFields(entry, error)},
+        `${label(entry)}: retire work threw — leaving the gate anyway`,
+      )
+    } finally {
+      // Leaving never depends on the work. `remove` only deletes the entry that is still current
+      // for its id (a replacement is never removed), and `terminate` fires at most once (a replaced
+      // or already-settled entry has its notification suppressed or spent).
+      remove(entry)
+      terminate(entry, outcome)
+    }
   }
 
   function hasPendingForScope(family: RequestFamily, scopeId: string): boolean {
@@ -473,7 +574,10 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     return false
   }
 
-  async function disposeEntries(snapshot: readonly GateEntry[], context: 'disposeRun' | 'disposeAll'): Promise<void> {
+  async function disposeEntries(
+    snapshot: readonly GateEntry[],
+    context: 'disposeFamilyRun' | 'disposeFamilyAll' | 'disposeAllAcrossFamilies',
+  ): Promise<void> {
     await Promise.all(
       snapshot.map(async entry => {
         try {
@@ -488,17 +592,27 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     )
   }
 
-  async function disposeRun(sessionID: string, reason: string): Promise<void> {
-    const snapshot = list().filter(entry => entry.sessionID === sessionID)
+  async function disposeFamilyRun(family: RequestFamily, sessionID: string, reason: string): Promise<void> {
+    const snapshot = list().filter(entry => entry.family === family && entry.sessionID === sessionID)
     if (snapshot.length > 0) {
-      logger.warn({sessionID, reason, count: snapshot.length}, 'RequestGate: disposeRun — fail-closing run entries')
+      logger.warn(
+        {sessionID, family, reason, count: snapshot.length},
+        'RequestGate: disposeFamilyRun — fail-closing run entries',
+      )
     }
-    await disposeEntries(snapshot, 'disposeRun')
+    await disposeEntries(snapshot, 'disposeFamilyRun')
   }
 
-  async function disposeAll(_reason: string): Promise<void> {
+  async function disposeFamilyAll(family: RequestFamily, _reason: string): Promise<void> {
     // Snapshot before iterating so removal during disposal is safe.
-    await disposeEntries(list(), 'disposeAll')
+    await disposeEntries(
+      list().filter(entry => entry.family === family),
+      'disposeFamilyAll',
+    )
+  }
+
+  async function disposeAllAcrossFamilies(_reason: string): Promise<void> {
+    await disposeEntries(list(), 'disposeAllAcrossFamilies')
   }
 
   function onTerminal(listener: TerminalListener): () => void {
@@ -512,18 +626,15 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     get,
     list,
     put,
-    detach,
-    clearTimer,
-    remove,
-    terminate,
     logRenderFailure,
     admit,
-    claim,
-    postClaimed,
     settleEcho,
+    settleNow,
+    retire,
     hasPendingForScope,
-    disposeRun,
-    disposeAll,
+    disposeFamilyRun,
+    disposeFamilyAll,
+    disposeAllAcrossFamilies,
     onTerminal,
   }
 }

@@ -37,7 +37,7 @@
 import type {Hono} from 'hono'
 import type {QuestionDecisionOutcome, QuestionRegistry} from '../../approvals/question-registry.js'
 import type {RunIndex} from '../../execute/run-index.js'
-import type {QuestionDecisionResponse} from '../../operator-contract/question-frame.js'
+import type {QuestionDecisionErrorResponse, QuestionDecisionResponse} from '../../operator-contract/question-frame.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger, QuestionRejectedReason} from '../audit.js'
@@ -65,7 +65,7 @@ export interface QuestionDecisionRouteDeps {
   readonly now: () => number
 }
 
-const BAD_REQUEST: QuestionDecisionResponse = {state: 'invalid', reason: 'malformed', questionIndex: null}
+const BAD_REQUEST: QuestionDecisionErrorResponse = {error: 'bad request', reason: 'malformed', questionIndex: null}
 
 /** Audit reason for a non-ok gate outcome. */
 function rejectedReason(outcome: Exclude<QuestionDecisionOutcome, {readonly kind: 'ok'}>): QuestionRejectedReason {
@@ -85,8 +85,9 @@ function rejectedReason(outcome: Exclude<QuestionDecisionOutcome, {readonly kind
 /**
  * Register POST /operator/runs/:runId/questions/:requestId/decision on the given Hono app.
  *
- * Response body: a `QuestionDecisionResponse`. HTTP 200 for every gate outcome
- * except `invalid`, which is HTTP 400.
+ * Response body: a `QuestionDecisionResponse` (HTTP 200) for every gate outcome except
+ * `invalid`, which is HTTP 400 with a `QuestionDecisionErrorResponse` (`{error: 'bad request',
+ * reason, questionIndex}`) in the operator error envelope.
  */
 export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRouteDeps): void {
   registerOperatorRoute(app, 'POST', '/operator/runs/:runId/questions/:requestId/decision', async c => {
@@ -197,8 +198,8 @@ export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRout
         const resolved = resolveQuestionAnswers(request.questions, parsed.value.answers)
         if (resolved.kind === 'invalid') {
           refuse('invalid')
-          const refusal: QuestionDecisionResponse = {
-            state: 'invalid',
+          const refusal: QuestionDecisionErrorResponse = {
+            error: 'bad request',
             reason: resolved.reason,
             questionIndex: resolved.questionIndex,
           }
@@ -227,8 +228,8 @@ export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRout
         }
         case 'invalid': {
           refuse('invalid')
-          const refusal: QuestionDecisionResponse = {
-            state: 'invalid',
+          const refusal: QuestionDecisionErrorResponse = {
+            error: 'bad request',
             reason: outcome.reason,
             questionIndex: outcome.questionIndex,
           }

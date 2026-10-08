@@ -27,6 +27,7 @@
  * - **A positive deadline is mandatory.** The caller decides what to do when
  *   the run has no budget left for one (skip immediately).
  * - **No cascade.**
+ * - **Teardown is question-only.** Approvals sharing the gate are torn down by the approval registry.
  *
  * ### Untrusted text
  *
@@ -40,6 +41,7 @@
 import type {GatewayLogger} from '../discord/client.js'
 import type {GateActor, QuestionGateEntry, ReplyResult, RequestGate, ScopePolicy} from './request-gate.js'
 
+import {MAX_OPTIONS_PER_QUESTION, MAX_QUESTIONS_PER_REQUEST} from './question-detail.js'
 import {createRequestGate} from './request-gate.js'
 
 // ---------------------------------------------------------------------------
@@ -117,7 +119,7 @@ export type QuestionRegisterOutcome =
   | {readonly kind: 'registered'}
   /** A request with this id is already pending; the existing entry and deadline are kept. */
   | {readonly kind: 'duplicate'}
-  | {readonly kind: 'refused'; readonly reason: 'deadline-required'}
+  | {readonly kind: 'refused'; readonly reason: 'deadline-required' | 'oversize'}
 
 export type QuestionDecision = {readonly kind: 'answer'; readonly answers: QuestionAnswers} | {readonly kind: 'skip'}
 
@@ -192,9 +194,9 @@ export interface QuestionRegistry {
   }) => Promise<QuestionDecisionOutcome>
   /** Authoritative settlement from `question.replied` / `question.rejected`. Works on `open` entries too. */
   readonly confirmEcho: (event: QuestionEcho) => void
-  /** Fail-close every entry of the session, across families. */
+  /** Fail-close the session's questions. Questions only: approvals sharing the gate are torn down by the approval registry. */
   readonly disposeRun: (sessionID: string, reason: string) => Promise<void>
-  /** Fail-close every entry, across families. */
+  /** Fail-close every question. Questions only. */
   readonly disposeAll: (reason: string) => Promise<void>
 }
 
@@ -294,7 +296,7 @@ function actorLogFields(actor: GateActor): {readonly actorKind: GateActor['kind'
 
 export function createQuestionRegistry(deps: {
   readonly logger: GatewayLogger
-  /** Shared gate. Pass the approval registry's gate so teardown and terminal events span both families. */
+  /** Shared gate. Pass the approval registry's gate so terminal events span both families. */
   readonly gate?: RequestGate
 }): QuestionRegistry {
   const {logger} = deps
@@ -325,26 +327,28 @@ export function createQuestionRegistry(deps: {
     }
   }
 
-  /** Teardown: reject an unclaimed question (ends the turn), render, remove. */
+  /** Teardown: reject an unclaimed question (ends the turn), render, then leave the gate. */
   async function disposeEntry(entry: QuestionGateEntry): Promise<void> {
     const {requestID} = entry
-    if (gate.get(requestID) !== entry) return // already settled
-    gate.clearTimer(entry)
+    await gate.retire(entry, 'disposed', async () => {
+      // A claimed entry's reply may still be in flight. Mark the entry disposed so the gate never
+      // reopens it when that reply fails, and so `decide` can reject the request once the reply
+      // settles (see `rejectAfterDisposedReplyFailure`). A reply that already succeeded awaits its
+      // echo, which finds nothing to settle: no reject.
+      if (entry.state === 'claimed') entry.state = 'disposed'
 
-    // Skip the reject when a claimant's reply is in flight: the claimant owns the outcome.
-    if (entry.state === 'open') {
-      entry.state = 'claimed'
-      const result = await callEffect(async () => entry.payload.effects.rejectQuestion(requestID))
-      if (!result.ok) {
-        logger.warn({requestID, reason: result.error}, 'QuestionRegistry: dispose reject failed — continuing')
+      if (entry.state === 'open') {
+        entry.state = 'claimed'
+        const result = await callEffect(async () => entry.payload.effects.rejectQuestion(requestID))
+        if (!result.ok) {
+          logger.warn({requestID, reason: result.error}, 'QuestionRegistry: dispose reject failed — continuing')
+        }
+        // An echo that landed while the reject was in flight already settled the entry.
+        if (gate.get(requestID) !== entry) return
       }
-      // An echo that landed while the reject was in flight already settled the entry.
-      if (gate.get(requestID) !== entry) return
-    }
 
-    await runRender(entry, {reason: 'disposed', actor: entry.actor})
-    gate.remove(entry)
-    gate.terminate(entry, 'disposed')
+      await runRender(entry, {reason: 'disposed', actor: entry.actor})
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -357,6 +361,18 @@ export function createQuestionRegistry(deps: {
     if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
       logger.warn({requestID, sessionID, reason: 'deadline-required'}, 'QuestionRegistry: register refused')
       return {kind: 'refused', reason: 'deadline-required'}
+    }
+
+    // Defense in depth: the coordinator's parser rejects these asks before they get here.
+    if (
+      questions.length > MAX_QUESTIONS_PER_REQUEST ||
+      questions.some(question => question.options.length > MAX_OPTIONS_PER_QUESTION)
+    ) {
+      logger.warn(
+        {requestID, sessionID, reason: 'oversize', questionCount: questions.length},
+        'QuestionRegistry: register refused',
+      )
+      return {kind: 'refused', reason: 'oversize'}
     }
 
     if (gate.get(requestID) !== undefined) {
@@ -453,9 +469,9 @@ export function createQuestionRegistry(deps: {
     if (entry === undefined) return {kind: 'not-found'}
     if (runId !== undefined && entry.payload.runId !== runId) return {kind: 'not-found'}
 
-    const admitted = gate.admit(entry, {scopeId, actor}, questionScopePolicy)
-    if (admitted === 'scope-mismatch') return {kind: 'scope-mismatch'}
-    if (admitted === 'already-claimed') return {kind: 'already-claimed'}
+    const admission = gate.admit(entry, {scopeId, actor}, questionScopePolicy)
+    if (admission.kind === 'scope-mismatch') return {kind: 'scope-mismatch'}
+    if (admission.kind === 'already-claimed') return {kind: 'already-claimed'}
 
     const {questions, effects} = entry.payload
     let answers: QuestionAnswers
@@ -474,11 +490,33 @@ export function createQuestionRegistry(deps: {
       answers = emptyAnswers(questions)
     }
 
-    gate.claim(entry, actor)
-    const outcome = await gate.postClaimed(entry, async () =>
+    const outcome = await admission.submit(async () =>
       callEffect(async () => effects.replyQuestion(requestID, answers)),
     )
-    return outcome === 'ok' ? {kind: 'ok'} : {kind: 'reply-failed'}
+    switch (outcome) {
+      case 'ok':
+        return {kind: 'ok'}
+      case 'already-claimed':
+        return {kind: 'already-claimed'}
+      case 'not-found':
+        return {kind: 'not-found'}
+      case 'reply-failed':
+        // Teardown removed the entry while this reply was in flight, and the reply failed: nothing
+        // owns the request any more, so it would stay pending in OpenCode. End it once.
+        if (entry.state === 'disposed') await rejectAfterDisposedReplyFailure(entry)
+        return {kind: 'reply-failed'}
+    }
+  }
+
+  async function rejectAfterDisposedReplyFailure(entry: QuestionGateEntry): Promise<void> {
+    const {requestID} = entry
+    const result = await callEffect(async () => entry.payload.effects.rejectQuestion(requestID))
+    if (!result.ok) {
+      logger.warn(
+        {requestID, reason: result.error},
+        'QuestionRegistry: reject after a failed reply on a disposed entry did not go through',
+      )
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -530,7 +568,7 @@ export function createQuestionRegistry(deps: {
     describeRequest,
     decide,
     confirmEcho,
-    disposeRun: gate.disposeRun,
-    disposeAll: gate.disposeAll,
+    disposeRun: async (sessionID, reason) => gate.disposeFamilyRun('question', sessionID, reason),
+    disposeAll: async reason => gate.disposeFamilyAll('question', reason),
   }
 }

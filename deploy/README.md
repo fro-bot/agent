@@ -358,7 +358,7 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (repo-scoped read authz, continuous) |
 | `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF + repo write/admin | Submit a tool-approval decision (once/always/reject) |
 | `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run (repo-scoped read authz) |
-| `POST` | `/operator/runs/:runId/questions/:requestId/decision` | Session + CSRF + repo write/admin | Answer or skip an agent question (`{decision: 'skip'}` or `{decision: 'answer', answers}`; options by index, free text up to 4,000 characters) |
+| `POST` | `/operator/runs/:runId/questions/:requestId/decision` | Session + CSRF + repo write/admin | Answer or skip an agent question (`{decision: 'skip'}` or `{decision: 'answer', answers}`; options by index, free text up to 4,000 characters; a refused body is `400 {error: 'bad request', reason, questionIndex}`) |
 | `GET` | `/operator/runs/:runId/questions` | Session | List pending agent-question requests for a run (repo-scoped read authz) |
 
 Operator contract: v1.9.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.

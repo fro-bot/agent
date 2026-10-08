@@ -50,6 +50,7 @@ export type {
   PendingQuestionsResponse,
   QuestionAnswerChoice,
   QuestionAnswerRequest,
+  QuestionDecisionErrorResponse,
   QuestionDecisionInvalidReason,
   QuestionDecisionRequest,
   QuestionDecisionResponse,

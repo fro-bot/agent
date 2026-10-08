@@ -18,6 +18,7 @@ import {createOwnershipLedger, DEFAULT_LEDGER_RECONCILE_INTERVAL_MS} from '@fro-
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
+import {MAX_OPTIONS_PER_QUESTION, MAX_QUESTIONS_PER_REQUEST} from '../approvals/question-detail.js'
 import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
 import {RunCoreError, runOpenCodeCore, wrapLedgerWithHooks} from './run-core.js'
@@ -4024,6 +4025,7 @@ describe('runOpenCodeCore', () => {
         readonly sessionStatus?: () => Promise<unknown>
         readonly sessionAbort?: () => Promise<unknown>
         readonly onBusy?: (busy: boolean) => void
+        readonly onRegistered?: () => void
         readonly signal?: AbortSignal
       } = {},
     ) {
@@ -4043,6 +4045,7 @@ describe('runOpenCodeCore', () => {
         effects,
         scopeId: SCOPE,
         computeDeadlineMs: () => (deadline === 'none' ? undefined : deadline),
+        ...(options.onRegistered === undefined ? {} : {onRegistered: options.onRegistered}),
       })
       const {stream, emitNext} = makeControlledStream()
       const coordinator = makeCoordinator(options.extraOwned)
@@ -4359,6 +4362,42 @@ describe('runOpenCodeCore', () => {
       expect(run.registry.pending()).toEqual([])
       expect(run.logger.warn).toHaveBeenCalledWith(
         expect.objectContaining({requestID: 'que_bad', reason: 'invalid-question'}),
+        expect.stringContaining('rejected'),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it.each([
+      ['more questions than the cap', MAX_QUESTIONS_PER_REQUEST + 1, 2],
+      ['more options than the cap', 1, MAX_OPTIONS_PER_QUESTION + 1],
+    ])('an ask with %s is rejected once and never stored or fanned out', async (_label, questionCount, optionCount) => {
+      // #given an oversize ask with secret-shaped text and a readable id
+      const onRegistered = vi.fn()
+      const run = startQuestionRun({onRegistered})
+      const oversizeQuestion = {
+        question: SECRET,
+        header: SECRET,
+        options: Array.from({length: optionCount}, (_, index) => ({label: `${SECRET}-${index}`, description: ''})),
+      }
+
+      // #when it arrives
+      await run.emit({
+        type: 'question.asked',
+        properties: {
+          id: 'que_big',
+          sessionID: 'sess-123',
+          questions: Array.from({length: questionCount}, () => oversizeQuestion),
+        },
+      })
+
+      // #then OpenCode is told to reject it, exactly once, and the gateway holds and announces nothing
+      expect(run.effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_big')
+      expect(run.effects.replyQuestion).not.toHaveBeenCalled()
+      expect(run.registry.pending()).toEqual([])
+      expect(run.registry.describePendingForScope(SCOPE)).toEqual([])
+      expect(onRegistered).not.toHaveBeenCalled()
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'que_big', reason: 'oversize'}),
         expect.stringContaining('rejected'),
       )
       expect(loggedText(run.logger)).not.toContain(SECRET)

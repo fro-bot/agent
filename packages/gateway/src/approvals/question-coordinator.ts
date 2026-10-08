@@ -31,6 +31,7 @@ import type {
   QuestionSideEffects,
 } from './question-registry.js'
 
+import {MAX_OPTIONS_PER_QUESTION, MAX_QUESTIONS_PER_REQUEST} from './question-detail.js'
 import {emptyAnswers} from './question-registry.js'
 
 // ---------------------------------------------------------------------------
@@ -45,7 +46,13 @@ export interface QuestionAskedRequest {
 }
 
 export type QuestionParseFailure =
-  'missing-request-id' | 'missing-session-id' | 'invalid-questions' | 'invalid-question' | 'invalid-option'
+  | 'missing-request-id'
+  | 'missing-session-id'
+  | 'invalid-questions'
+  | 'invalid-question'
+  | 'invalid-option'
+  // More questions in one request, or more options in one question, than the gateway accepts.
+  | 'oversize'
 
 export type QuestionParseResult<T> =
   {readonly kind: 'ok'; readonly value: T} | {readonly kind: 'malformed'; readonly reason: QuestionParseFailure}
@@ -134,6 +141,7 @@ function parseQuestion(raw: unknown): QuestionParseResult<QuestionInfo> {
   if (question === null) return {kind: 'malformed', reason: 'invalid-question'}
   const rawOptions = getOwn(raw, 'options')
   if (!Array.isArray(rawOptions)) return {kind: 'malformed', reason: 'invalid-question'}
+  if (rawOptions.length > MAX_OPTIONS_PER_QUESTION) return {kind: 'malformed', reason: 'oversize'}
   const options: QuestionOption[] = []
   for (const rawOption of rawOptions as unknown[]) {
     const option = parseOption(rawOption)
@@ -161,6 +169,7 @@ export function parseQuestionRequest(payload: unknown): QuestionParseResult<Ques
   if (sessionID === null) return {kind: 'malformed', reason: 'missing-session-id'}
   const rawQuestions = getOwn(payload, 'questions')
   if (!Array.isArray(rawQuestions)) return {kind: 'malformed', reason: 'invalid-questions'}
+  if (rawQuestions.length > MAX_QUESTIONS_PER_REQUEST) return {kind: 'malformed', reason: 'oversize'}
   const questions: QuestionInfo[] = []
   for (const rawQuestion of rawQuestions as unknown[]) {
     const parsed = parseQuestion(rawQuestion)

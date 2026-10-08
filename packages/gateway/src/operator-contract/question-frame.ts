@@ -172,20 +172,28 @@ export type QuestionDecisionInvalidReason =
   'malformed' | 'arity-mismatch' | 'unknown-option' | 'multiple-not-allowed' | 'empty-value' | 'text-too-long'
 
 /**
- * Outcome of a question decision (HTTP 200 unless noted).
+ * Outcome of an accepted question decision (HTTP 200).
  *
  * - `claimed`         — accepted; the reply is on its way to the agent.
  * - `already_claimed` — another decision for this request is in flight; nothing changed.
  * - `already_settled` — the request is no longer pending (answered, skipped, expired, or
  *                       never existed for this run). Repeating a submission lands here.
  * - `failed_to_settle`— the reply to the agent failed; the request is pending again.
- * - `invalid`         — HTTP 400; the body was refused, see `reason`. The request stays pending.
+ *
+ * A refused body is not a state: it is HTTP 400 with {@link QuestionDecisionErrorResponse}.
  */
-export type QuestionDecisionResponse =
-  | {readonly state: 'claimed' | 'already_claimed' | 'already_settled' | 'failed_to_settle'}
-  | {
-      readonly state: 'invalid'
-      readonly reason: QuestionDecisionInvalidReason
-      /** The question the problem is in, or null when it concerns the whole request. */
-      readonly questionIndex: number | null
-    }
+export interface QuestionDecisionResponse {
+  readonly state: 'claimed' | 'already_claimed' | 'already_settled' | 'failed_to_settle'
+}
+
+/**
+ * Body of the HTTP 400 for a refused question decision. Follows the operator error envelope
+ * (`{error: string}`, like the approval decision route's `{error: 'bad request'}`) and adds the
+ * refusal detail. The request stays pending.
+ */
+export interface QuestionDecisionErrorResponse {
+  readonly error: 'bad request'
+  readonly reason: QuestionDecisionInvalidReason
+  /** The question the problem is in, or null when it concerns the whole request. */
+  readonly questionIndex: number | null
+}

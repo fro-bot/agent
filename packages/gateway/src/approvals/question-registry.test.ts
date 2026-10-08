@@ -15,10 +15,12 @@ import type {
   QuestionSideEffects,
   RegisterQuestionParams,
 } from './question-registry.js'
+import type {ApprovalRegistry} from './registry.js'
 import type {GateActor, TerminalEvent} from './request-gate.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
+import {MAX_OPTIONS_PER_QUESTION, MAX_QUESTIONS_PER_REQUEST} from './question-detail.js'
 import {
   createQuestionRegistry,
   emptyAnswers,
@@ -380,6 +382,45 @@ describe('register', () => {
     expect(questions.has('que_1')).toBe(false)
   })
 
+  it('registers a request exactly at both count caps', () => {
+    // #given the largest accepted request
+    const {questions} = setup()
+    const options = Array.from({length: MAX_OPTIONS_PER_QUESTION}, (_, index) => ({
+      label: `o${index}`,
+      description: '',
+    }))
+    const wide: QuestionPromptInput = {question: 'Which?', header: 'H', options}
+
+    // #when
+    const outcome = questions.register(
+      makeParams({questions: Array.from({length: MAX_QUESTIONS_PER_REQUEST}, () => wide)}),
+    )
+
+    // #then
+    expect(outcome).toEqual({kind: 'registered'})
+    expect(questions.has('que_1')).toBe(true)
+  })
+
+  it.each([
+    ['one question over the cap', MAX_QUESTIONS_PER_REQUEST + 1, 2],
+    ['one option over the cap', 1, MAX_OPTIONS_PER_QUESTION + 1],
+  ])('refuses %s as oversize and stores nothing', (_label, questionCount, optionCount) => {
+    // #given an oversize request
+    const {questions, terminals} = setup()
+    const options = Array.from({length: optionCount}, (_, index) => ({label: `o${index}`, description: ''}))
+    const oversize: QuestionPromptInput = {question: 'Which?', header: 'H', options}
+
+    // #when
+    const outcome = questions.register(makeParams({questions: Array.from({length: questionCount}, () => oversize)}))
+
+    // #then it is refused and invisible everywhere
+    expect(outcome).toEqual({kind: 'refused', reason: 'oversize'})
+    expect(questions.has('que_1')).toBe(false)
+    expect(questions.pending()).toEqual([])
+    expect(questions.describePendingForScope('thread_1')).toEqual([])
+    expect(terminals).toEqual([])
+  })
+
   it('duplicate register for a pending id is a no-op: existing entry, flags and deadline are kept', async () => {
     // #given a question with a 1s deadline
     const {questions, terminals} = setup()
@@ -725,28 +766,43 @@ function makePermission(requestID: string, sessionID = 'ses_1'): PermissionReque
   return {requestID, sessionID, permission: 'bash', patterns: ['ls'], title: 'Run ls'}
 }
 
+function registerApproval(approvals: ApprovalRegistry, postReply = vi.fn().mockResolvedValue({ok: true})) {
+  approvals.register({
+    requestID: 'per_1',
+    sessionID: 'ses_1',
+    approvalScopeId: 'thread_1',
+    directory: '/ws',
+    request: makePermission('per_1'),
+    effects: {postReply},
+  })
+  return postReply
+}
+
+/** A reply POST the test settles by hand. */
+function deferredReply() {
+  let settle!: (result: QuestionEffectResult) => void
+  const promise = new Promise<QuestionEffectResult>(resolve => {
+    settle = resolve
+  })
+  return {promise, settle}
+}
+
 describe('disposeRun across families', () => {
-  it('fail-closes the approval, rejects the question, and emits a terminal event for each', async () => {
+  it('run teardown: each registry disposes its own family, so the approval is fail-closed and the question rejected, once each', async () => {
     // #given one approval and one question pending on the same session
     const {questions, approvals, terminals} = setup()
-    const postReply = vi.fn().mockResolvedValue({ok: true})
     const qEffects = makeEffects()
     const approvalRender = vi.fn().mockResolvedValue(undefined)
     const questionRender = makeRenderFn()
-    approvals.register({
-      requestID: 'per_1',
-      sessionID: 'ses_1',
-      approvalScopeId: 'thread_1',
-      directory: '/ws',
-      request: makePermission('per_1'),
-      effects: {postReply},
-    })
+    const postReply = registerApproval(approvals)
     approvals.attachMessage('per_1', approvalRender)
     questions.register(makeParams({effects: qEffects}))
     questions.attachMessage('que_1', questionRender)
 
-    // #when the run is torn down
+    // #when the run is torn down, approvals first and then questions (the order run.ts uses)
     await approvals.disposeRun('ses_1', 'run-ended')
+    expect(questions.pending()).toEqual(['que_1'])
+    await questions.disposeRun('ses_1', 'run-ended')
 
     // #then the approval fail-closes as before; the question is rejected (turn-ending), not skipped
     expect(postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/ws', 'reject')
@@ -756,30 +812,72 @@ describe('disposeRun across families', () => {
     expect(questionRender).toHaveBeenCalledExactlyOnceWith(expect.any(Array), {reason: 'disposed', actor: null})
     expect(approvals.pending()).toEqual([])
     expect(questions.pending()).toEqual([])
-    expect(terminals.map(event => `${event.family}:${event.outcome}`).sort((a, b) => a.localeCompare(b))).toEqual([
+    expect(terminals.map(event => `${event.family}:${event.outcome}`)).toEqual([
       'approval:disposed',
       'question:disposed',
     ])
   })
 
-  it('a question registry call disposes approvals of the same gate too', async () => {
-    // #given
+  it('the approval registry disposes only approvals; the question registry disposes only questions', async () => {
+    // #given one of each on the same session
     const {questions, approvals, terminals} = setup()
-    approvals.register({
-      requestID: 'per_1',
-      sessionID: 'ses_1',
-      approvalScopeId: 'thread_1',
-      directory: '/ws',
-      request: makePermission('per_1'),
-      effects: {postReply: vi.fn().mockResolvedValue({ok: true})},
-    })
-    questions.register(makeParams())
+    const qEffects = makeEffects()
+    registerApproval(approvals)
+    questions.register(makeParams({effects: qEffects}))
 
-    // #when
+    // #when only the approval registry tears the session down
+    await approvals.disposeRun('ses_1', 'run-ended')
+
+    // #then the question is untouched
+    expect(approvals.pending()).toEqual([])
+    expect(questions.pending()).toEqual(['que_1'])
+    expect(qEffects.rejectQuestion).not.toHaveBeenCalled()
+    expect(terminals.map(event => event.family)).toEqual(['approval'])
+
+    // #when the question registry then does the same
+    registerApproval(approvals)
     await questions.disposeRun('ses_1', 'run-ended')
 
-    // #then
-    expect(terminals).toHaveLength(2)
+    // #then the new approval is untouched
+    expect(questions.pending()).toEqual([])
+    expect(approvals.pending()).toEqual(['per_1'])
+    expect(terminals.map(event => event.family)).toEqual(['approval', 'question'])
+  })
+
+  it('the same holds for disposeAll on each registry', async () => {
+    // #given one of each
+    const {questions, approvals} = setup()
+    registerApproval(approvals)
+    questions.register(makeParams())
+
+    // #when / #then each registry's disposeAll leaves the other family alone
+    await approvals.disposeAll('shutdown')
+    expect(approvals.pending()).toEqual([])
+    expect(questions.pending()).toEqual(['que_1'])
+    await questions.disposeAll('shutdown')
+    expect(questions.pending()).toEqual([])
+  })
+
+  it('the gate-level cross-family dispose settles both families exactly once (gateway shutdown)', async () => {
+    // #given one approval and one question on different sessions
+    const {gate, questions, approvals, terminals} = setup()
+    const qEffects = makeEffects()
+    const postReply = registerApproval(approvals)
+    questions.register(makeParams({sessionID: 'ses_2', effects: qEffects}))
+
+    // #when shutdown disposes across families (twice: the second call finds nothing)
+    await gate.disposeAllAcrossFamilies('gateway shutdown')
+    await gate.disposeAllAcrossFamilies('gateway shutdown')
+
+    // #then both are settled exactly once
+    expect(postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/ws', 'reject')
+    expect(qEffects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+    expect(approvals.pending()).toEqual([])
+    expect(questions.pending()).toEqual([])
+    expect(terminals.map(event => `${event.family}:${event.outcome}`).sort((a, b) => a.localeCompare(b))).toEqual([
+      'approval:disposed',
+      'question:disposed',
+    ])
   })
 
   it('only the matching session is disposed', async () => {
@@ -809,6 +907,176 @@ describe('disposeRun across families', () => {
     expect(effects.rejectQuestion).not.toHaveBeenCalled()
     expect(questions.has('que_1')).toBe(false)
     expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+  })
+
+  describe('teardown while the claimant reply is still in flight', () => {
+    it('the reply fails after teardown: the request is rejected once, and the entry is never reopened or re-rendered', async () => {
+      // #given an answer whose reply POST is still in flight, on a question with a rendered prompt
+      const {questions, terminals} = setup()
+      const reply = deferredReply()
+      const effects = makeEffects({replyQuestion: vi.fn().mockReturnValue(reply.promise)})
+      const render = makeRenderFn()
+      questions.register(makeParams({effects}))
+      questions.attachMessage('que_1', render)
+      const decision = decideAnswer(questions, [['staging']])
+      await flush()
+      expect(effects.replyQuestion).toHaveBeenCalledOnce()
+
+      // #when the run is torn down mid-flight, and then the reply fails
+      await questions.disposeRun('ses_1', 'run-ended')
+      expect(effects.rejectQuestion).not.toHaveBeenCalled()
+      reply.settle({ok: false, error: 'down'})
+      const outcome = await decision
+
+      // #then the orphaned request is rejected exactly once and the claimant sees the failure
+      expect(outcome).toEqual({kind: 'reply-failed'})
+      expect(effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+      // #and the entry stayed gone: not pending, not actionable, rendered once, one terminal event
+      expect(questions.has('que_1')).toBe(false)
+      expect(questions.pending()).toEqual([])
+      expect(questions.hasPendingForScope('thread_1')).toBe(false)
+      expect(render).toHaveBeenCalledExactlyOnceWith(expect.any(Array), {reason: 'disposed', actor: THREAD_ACTOR})
+      expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+    })
+
+    it('the reply throws after teardown: the request is rejected once', async () => {
+      // #given
+      const {questions} = setup()
+      let fail!: (error: Error) => void
+      const effects = makeEffects({
+        replyQuestion: vi.fn().mockReturnValue(
+          new Promise<QuestionEffectResult>((_resolve, reject) => {
+            fail = reject
+          }),
+        ),
+      })
+      questions.register(makeParams({effects}))
+      const decision = decideAnswer(questions, [['staging']])
+      await flush()
+
+      // #when
+      await questions.disposeRun('ses_1', 'run-ended')
+      fail(new Error('boom'))
+      const outcome = await decision
+
+      // #then
+      expect(outcome).toEqual({kind: 'reply-failed'})
+      expect(effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+    })
+
+    it('the reply succeeds after teardown: nothing is rejected', async () => {
+      // #given
+      const {questions, terminals} = setup()
+      const reply = deferredReply()
+      const effects = makeEffects({replyQuestion: vi.fn().mockReturnValue(reply.promise)})
+      questions.register(makeParams({effects}))
+      const decision = decideAnswer(questions, [['staging']])
+      await flush()
+
+      // #when the run is torn down and then the reply lands
+      await questions.disposeRun('ses_1', 'run-ended')
+      reply.settle({ok: true})
+      const outcome = await decision
+
+      // #then OpenCode got the answer; no reject follows it
+      expect(outcome).toEqual({kind: 'ok'})
+      expect(effects.rejectQuestion).not.toHaveBeenCalled()
+      expect(questions.has('que_1')).toBe(false)
+      expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+    })
+
+    it('a second decision arriving while the claimed entry is being torn down is refused', async () => {
+      // #given a claimed entry whose settled render is slow, so teardown is mid-flight
+      const {questions} = setup()
+      const reply = deferredReply()
+      const effects = makeEffects({replyQuestion: vi.fn().mockReturnValue(reply.promise)})
+      let finishRender!: () => void
+      questions.register(makeParams({effects}))
+      questions.attachMessage(
+        'que_1',
+        vi.fn().mockReturnValue(
+          new Promise<void>(resolve => {
+            finishRender = resolve
+          }),
+        ),
+      )
+      const decision = decideAnswer(questions, [['staging']])
+      await flush()
+      const teardown = questions.disposeRun('ses_1', 'run-ended')
+      await flush()
+
+      // #when another operator decides during teardown
+      const second = await decideAnswer(questions, [['prod']])
+
+      // #then it loses the single-winner check and no second reply goes out
+      expect(second).toEqual({kind: 'already-claimed'})
+      expect(effects.replyQuestion).toHaveBeenCalledOnce()
+
+      finishRender()
+      await teardown
+      reply.settle({ok: true})
+      await decision
+    })
+  })
+
+  describe('teardown is terminal and final', () => {
+    it('a settled render whose failure log also throws still removes the question and emits one event', async () => {
+      // #given a question whose render rejects while the log sink throws on the failure record
+      const {questions, logger, terminals} = setup()
+      const unhandled = vi.fn()
+      process.on('unhandledRejection', unhandled)
+      const effects = makeEffects()
+      questions.register(makeParams({effects}))
+      questions.attachMessage('que_1', vi.fn().mockRejectedValue(new Error('SECRET-TEXT discord down')))
+      vi.mocked(logger.error).mockImplementationOnce(() => {
+        throw new Error('log sink down')
+      })
+
+      try {
+        // #when the run is torn down
+        await expect(questions.disposeRun('ses_1', 'run-ended')).resolves.toBeUndefined()
+        await flush()
+
+        // #then it is gone, rejected once, exactly one event fired, and nothing was left unhandled
+        expect(questions.has('que_1')).toBe(false)
+        expect(effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+        expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+        expect(unhandled).not.toHaveBeenCalled()
+        expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain('SECRET-TEXT')
+      } finally {
+        process.off('unhandledRejection', unhandled)
+      }
+    })
+
+    it('an echo landing while a claimed question is being torn down is ignored: one render, one terminal event', async () => {
+      // #given a claimed question (its reply landed, the echo is pending) whose settled render is held open
+      const {questions, terminals} = setup()
+      const effects = makeEffects()
+      let finishRender!: () => void
+      const render: QuestionRenderFn = vi.fn().mockReturnValue(
+        new Promise<void>(resolve => {
+          finishRender = resolve
+        }),
+      )
+      questions.register(makeParams({effects}))
+      questions.attachMessage('que_1', render)
+      expect(await decideAnswer(questions, [['staging']])).toEqual({kind: 'ok'})
+      const teardown = questions.disposeRun('ses_1', 'run-ended')
+      await flush()
+      expect(render).toHaveBeenCalledExactlyOnceWith(expect.any(Array), {reason: 'disposed', actor: THREAD_ACTOR})
+
+      // #when OpenCode's replied echo arrives mid-teardown, and then the render is released
+      questions.confirmEcho({kind: 'replied', requestID: 'que_1', sessionID: 'ses_1', answers: [['staging']]})
+      await flush()
+      expect(terminals).toEqual([])
+      finishRender()
+      await teardown
+
+      // #then there was no "replied" render and no confirmed event: teardown's single event is the only one
+      expect(render).toHaveBeenCalledOnce()
+      expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+      expect(questions.has('que_1')).toBe(false)
+    })
   })
 
   it('reject failure on teardown still removes the entry and emits one event', async () => {

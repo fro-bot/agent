@@ -1039,15 +1039,17 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // Shut down the run-observation manager — closes all SSE subscriptions and clears timers.
       runObservationManager.shutdown()
 
-      // Dispose pending approvals before draining runs — ensures pending permissions
-      // fail-closed so in-flight runs don't hang waiting for a button that will never come.
+      // Dispose pending approvals and questions before draining runs — ensures pending
+      // permissions and agent questions fail-close so in-flight runs don't hang waiting for a
+      // button or an answer that will never come. Shutdown has no per-run coordinator to ask, so
+      // it uses the gate's explicit cross-family dispose; each registry's own disposeAll tears
+      // down only its family.
       //
-      // NOTE: disposeAll is best-effort early fail-close, NOT a hard barrier. A run still
-      // draining SSE could call register() for a late approval after disposeAll clears the
-      // map; that late entry is fail-closed only by the run's own coordinator.dispose() in
-      // its finally block. The per-run coordinator.dispose() is the authoritative backstop
-      // for approvals registered after this global drain.
-      await approvalRegistry.disposeAll('gateway shutdown')
+      // NOTE: this is best-effort early fail-close, NOT a hard barrier. A run still draining SSE
+      // could register a late approval or question after this clears the map; that late entry is
+      // fail-closed only by the run's own coordinator.dispose() / questionCoordinator.dispose()
+      // in its finally block, the authoritative backstop for entries registered after this drain.
+      await requestGate.disposeAllAcrossFamilies('gateway shutdown')
 
       // Drain in-flight runs with a bounded timeout so a hung S3/network call
       // (e.g. in acquireLock/ensureClone/readyz) cannot stall shutdown forever.

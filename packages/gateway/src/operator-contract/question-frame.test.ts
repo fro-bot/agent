@@ -6,7 +6,9 @@
 import type {
   OperatorWebStatus,
   PendingQuestionDTO,
+  QuestionDecisionErrorResponse,
   QuestionDecisionRequest,
+  QuestionDecisionResponse,
   QuestionFrameData,
   QuestionRequestDetail,
 } from './index.js'
@@ -81,6 +83,20 @@ describe('question contract surface (1.9.0)', () => {
 
     // #when / #then they are distinguishable by `decision`
     expect([answer.decision, skip.decision]).toStrictEqual(['answer', 'skip'])
+  })
+
+  it('keeps a refused decision out of the 200 state set: the 400 body is the standard error envelope', () => {
+    // #given an accepted outcome and a refusal
+    const accepted: QuestionDecisionResponse = {state: 'already_settled'}
+    const refused: QuestionDecisionErrorResponse = {error: 'bad request', reason: 'unknown-option', questionIndex: 0}
+
+    // #when serialized as a consumer would receive them
+    const refusedBody = JSON.parse(JSON.stringify(refused)) as Record<string, unknown>
+
+    // #then the refusal carries `error` (like every operator error) and no `state`; the outcome carries only `state`
+    expect(refusedBody).toStrictEqual({error: 'bad request', reason: 'unknown-option', questionIndex: 0})
+    expect('state' in refusedBody).toBe(false)
+    expect(Object.keys(accepted)).toStrictEqual(['state'])
   })
 
   it('includes waiting_for_question in the operator web status set', () => {

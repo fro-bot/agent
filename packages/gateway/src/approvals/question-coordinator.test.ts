@@ -9,6 +9,7 @@ import type {QuestionSideEffects} from './question-registry.js'
 import {describe, expect, it, vi} from 'vitest'
 
 import {createQuestionCoordinator, parseQuestionEcho, parseQuestionRequest, safeLogId} from './question-coordinator.js'
+import {MAX_OPTIONS_PER_QUESTION, MAX_QUESTIONS_PER_REQUEST} from './question-detail.js'
 import {createQuestionRegistry} from './question-registry.js'
 import {createRequestGate} from './request-gate.js'
 
@@ -130,6 +131,50 @@ describe('parseQuestionRequest', () => {
     expect(parseQuestionRequest(askedPayload({questions: []}))).toEqual({
       kind: 'ok',
       value: {requestID: 'que_1', sessionID: 'ses_1', questions: []},
+    })
+  })
+
+  describe('count caps', () => {
+    const oneQuestion = (optionCount: number) => ({
+      question: 'Which?',
+      header: 'H',
+      options: Array.from({length: optionCount}, (_, index) => ({label: `opt-${index}`, description: ''})),
+    })
+
+    it('accepts exactly MAX_QUESTIONS_PER_REQUEST questions', () => {
+      // #given / #when a request at the question-count cap
+      const parsed = parseQuestionRequest(
+        askedPayload({questions: Array.from({length: MAX_QUESTIONS_PER_REQUEST}, () => oneQuestion(2))}),
+      )
+
+      // #then
+      expect(parsed.kind).toBe('ok')
+    })
+
+    it('rejects one question over the cap as oversize', () => {
+      // #given / #when
+      const parsed = parseQuestionRequest(
+        askedPayload({questions: Array.from({length: MAX_QUESTIONS_PER_REQUEST + 1}, () => oneQuestion(2))}),
+      )
+
+      // #then
+      expect(parsed).toEqual({kind: 'malformed', reason: 'oversize'})
+    })
+
+    it('accepts exactly MAX_OPTIONS_PER_QUESTION options', () => {
+      // #given / #when
+      const parsed = parseQuestionRequest(askedPayload({questions: [oneQuestion(MAX_OPTIONS_PER_QUESTION)]}))
+
+      // #then
+      expect(parsed.kind).toBe('ok')
+    })
+
+    it('rejects one option over the cap as oversize', () => {
+      // #given / #when
+      const parsed = parseQuestionRequest(askedPayload({questions: [oneQuestion(MAX_OPTIONS_PER_QUESTION + 1)]}))
+
+      // #then
+      expect(parsed).toEqual({kind: 'malformed', reason: 'oversize'})
     })
   })
 })

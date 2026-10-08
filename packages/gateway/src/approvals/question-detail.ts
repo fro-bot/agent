@@ -43,6 +43,12 @@ export const QUESTION_OPTION_LABEL_MAX_LENGTH = 256
 /** Descriptions are a sentence; 1,024 matches Discord's embed-field-value limit. */
 export const QUESTION_OPTION_DESCRIPTION_MAX_LENGTH = 1024
 
+/** The tool asks a handful of questions at once; upstream sets no limit, so the gateway does: more is rejected, not truncated. */
+export const MAX_QUESTIONS_PER_REQUEST = 8
+
+/** Option lists are short; 64 is far above anything a prompt UI can present. Upstream sets no limit. */
+export const MAX_OPTIONS_PER_QUESTION = 64
+
 // Characters removed outright: C0 minus tab/LF/CR, DEL, C1, bidi overrides/isolates.
 // eslint-disable-next-line no-control-regex
 const REMOVED_CONTROLS = /[\u0000-\u0008\v\f\u000E-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g
