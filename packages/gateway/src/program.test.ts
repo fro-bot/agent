@@ -7,6 +7,7 @@ import type {CoordinationLogger} from './runtime-effect.js'
 import {GatewayIntentBits} from 'discord.js'
 import {Effect} from 'effect'
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest'
+import {__resetShuttingDownForTests} from './shutdown.js'
 import {makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
 import {parseTrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 
@@ -2455,5 +2456,89 @@ describe('launch route wiring — POST /operator/runs', () => {
     expect(launchDeps.approvalRegistry).toBe(mentionRunDeps.approvalRegistry)
     expect(launchDeps.runIndex).toBe(mentionRunDeps.runIndex)
     expect(launchDeps.runObserver).toBe(mentionRunDeps.runObserver)
+  })
+
+  it('gateway shutdown disposes a pending approval and a pending question through the shared gate, once each', async () => {
+    // #given the real approval registry over the program's gate, plus one pending approval and one pending question
+    const {createApprovalRegistry} = await import('./approvals/registry.js')
+    const actualRegistry = await vi.importActual<typeof import('./approvals/registry.js')>('./approvals/registry.js')
+    vi.mocked(createApprovalRegistry).mockImplementationOnce(registryDeps =>
+      actualRegistry.createApprovalRegistry(registryDeps),
+    )
+    const fakeClient = {...makeFakeClient(), destroy: vi.fn().mockResolvedValue(undefined)}
+    // A server handle that acknowledges close, so shutdown can finish.
+    const closingHandle = {close: vi.fn((cb?: (err?: Error) => void) => cb?.())}
+    const startOperatorServer = vi.fn().mockReturnValue(closingHandle)
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+    const listenersBefore = process.listeners('SIGTERM')
+    await Effect.runPromise(
+      makeGatewayProgram(deps, makeFakeConfig({announce: undefined, operatorWeb: makeOperatorWebConfig()})),
+    )
+    const shutdownHandler = process.listeners('SIGTERM').find(listener => !listenersBefore.includes(listener))
+    if (shutdownHandler === undefined) throw new Error('the shutdown handler was not installed')
+    const [serverDeps] = startOperatorServer.mock.calls[0] as [import('./web/server.js').OperatorServerDeps]
+    const runDeps = serverDeps.launchWorkDeps
+    if (runDeps?.questionRegistry === undefined || runDeps.requestGate === undefined) {
+      throw new Error('the question registry and request gate were not wired')
+    }
+    const {approvalRegistry, questionRegistry, requestGate} = runDeps
+
+    const postReply = vi.fn().mockResolvedValue({ok: true})
+    const replyQuestion = vi.fn().mockResolvedValue({ok: true})
+    const rejectQuestion = vi.fn().mockResolvedValue({ok: true})
+    approvalRegistry.register({
+      requestID: 'per_1',
+      sessionID: 'ses_1',
+      approvalScopeId: 'thread_1',
+      directory: '/ws',
+      request: {requestID: 'per_1', sessionID: 'ses_1', permission: 'bash', patterns: ['ls'], title: 'Run ls'},
+      effects: {postReply},
+    })
+    questionRegistry.register({
+      requestID: 'que_1',
+      sessionID: 'ses_1',
+      questionScopeId: 'thread_1',
+      questions: [{question: 'Which?', header: 'H', options: [{label: 'a', description: ''}]}],
+      effects: {replyQuestion, rejectQuestion},
+      deadlineMs: 60_000,
+    })
+    const terminals: {family: string; outcome: string; requestID: string}[] = []
+    requestGate.onTerminal(event => {
+      terminals.push({family: event.family, outcome: event.outcome, requestID: event.requestID})
+    })
+    const exited = new Promise<number | string | null | undefined>(resolve => {
+      vi.spyOn(process, 'exit').mockImplementation((code?: number | string | null) => {
+        resolve(code)
+        return undefined as never
+      })
+    })
+
+    try {
+      // #when SIGTERM drives the installed shutdown handler
+      shutdownHandler('SIGTERM')
+      const exitCode = await exited
+
+      // #then shutdown completed cleanly and settled each family's entry exactly once
+      expect(exitCode).toBe(0)
+      expect(postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/ws', 'reject')
+      expect(rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+      expect(replyQuestion).not.toHaveBeenCalled()
+      expect(approvalRegistry.pending()).toEqual([])
+      expect(questionRegistry.pending()).toEqual([])
+      expect(terminals).toHaveLength(2)
+      expect(terminals).toContainEqual({family: 'approval', outcome: 'disposed', requestID: 'per_1'})
+      expect(terminals).toContainEqual({family: 'question', outcome: 'disposed', requestID: 'que_1'})
+    } finally {
+      // The shutdown flag is module-level state shared by every test in this worker.
+      __resetShuttingDownForTests()
+      vi.restoreAllMocks()
+    }
   })
 })
