@@ -12,6 +12,10 @@ import {parseTrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 
 // Spy on createDiscordClient so we can assert the intents wiring without
 // touching the network or requiring a real Discord token.
+const ANY_VALUE: unknown = expect.anything()
+const ANY_FUNCTION: unknown = expect.any(Function)
+const ANY_ARRAY: unknown = expect.any(Array)
+
 vi.mock('./discord/client.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./discord/client.js')>()
   return {
@@ -66,6 +70,12 @@ vi.mock('./discord/approvals.js', () => ({
   buildSettledEmbed: vi.fn().mockReturnValue({type: 'settled-embed'}),
   APPROVE_PREFIX: 'fb-approve:',
   DENY_PREFIX: 'fb-deny:',
+}))
+
+// Stub the agent-question interaction handler so program.test.ts can assert wiring (which custom ids route to
+// it, and with what deps) without a live registry; its behavior is covered in question-interactions.test.ts.
+vi.mock('./discord/question-interactions.js', () => ({
+  handleQuestionInteraction: vi.fn().mockResolvedValue(undefined),
 }))
 
 // Stub recover-checkout / checkout-backup button routing so program.test.ts can assert wiring
@@ -930,6 +940,79 @@ describe('button interaction handler (approval flow)', () => {
     // #then — no auth check, no registry interaction, no reply
     expect(fakeRegistry.handleDecision).not.toHaveBeenCalled()
     expect(interaction.reply).not.toHaveBeenCalled()
+  })
+
+  it('question custom ids route to handleQuestionInteraction with the question registry and the role gate', async () => {
+    // #given
+    const {interactionHandler} = await runAndCaptureHandler()
+    const {handleQuestionInteraction} = await import('./discord/question-interactions.js')
+    vi.mocked(handleQuestionInteraction).mockClear()
+    const {userIsAuthorized} = await import('./discord/mentions.js')
+    vi.mocked(userIsAuthorized).mockResolvedValueOnce(true)
+    const interaction = makeFakeButtonInteraction({customId: 'fb-q:k:que_1'})
+
+    // #when
+    await interactionHandler(interaction)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then the handler got the parsed id and the real deps, and the approval path was not touched
+    expect(handleQuestionInteraction).toHaveBeenCalledExactlyOnceWith(
+      interaction,
+      {action: 'skip', requestID: 'que_1'},
+      expect.objectContaining({questionRegistry: ANY_VALUE, isAuthorized: ANY_FUNCTION}),
+    )
+    const deps = vi.mocked(handleQuestionInteraction).mock.calls[0]?.[2]
+    const guild = {id: 'guild-1'} as unknown as import('discord.js').Guild
+    await deps?.isAuthorized(guild, 'user-1', {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()})
+    expect(userIsAuthorized).toHaveBeenLastCalledWith(guild, 'user-1', 'approver-role', expect.anything())
+    expect(interaction.deferReply).not.toHaveBeenCalled()
+  })
+
+  it('a non-question button is not routed to handleQuestionInteraction', async () => {
+    const {interactionHandler} = await runAndCaptureHandler()
+    const {handleQuestionInteraction} = await import('./discord/question-interactions.js')
+    vi.mocked(handleQuestionInteraction).mockClear()
+
+    await interactionHandler(makeFakeButtonInteraction({customId: 'fb-approve:req-abc'}))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(handleQuestionInteraction).not.toHaveBeenCalled()
+  })
+
+  it('a select menu and a modal submit with question custom ids are routed too', async () => {
+    const {interactionHandler} = await runAndCaptureHandler()
+    const {handleQuestionInteraction} = await import('./discord/question-interactions.js')
+    vi.mocked(handleQuestionInteraction).mockClear()
+
+    await interactionHandler({
+      isButton: () => false,
+      isStringSelectMenu: () => true,
+      isModalSubmit: () => false,
+      customId: 'fb-q:s:que_1',
+    })
+    await interactionHandler({
+      isButton: () => false,
+      isStringSelectMenu: () => false,
+      isModalSubmit: () => true,
+      customId: 'fb-q:m:que_1',
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(vi.mocked(handleQuestionInteraction).mock.calls.map(call => call[1])).toEqual([
+      {action: 'select', requestID: 'que_1'},
+      {action: 'modal', requestID: 'que_1'},
+    ])
+  })
+
+  it('an unexpected throw from the question handler is logged and never escapes', async () => {
+    const {interactionHandler} = await runAndCaptureHandler()
+    const {handleQuestionInteraction} = await import('./discord/question-interactions.js')
+    vi.mocked(handleQuestionInteraction).mockRejectedValueOnce(new Error('boom'))
+
+    await expect(
+      Promise.resolve(interactionHandler(makeFakeButtonInteraction({customId: 'fb-q:k:que_1'}))),
+    ).resolves.toBeUndefined()
+    await new Promise(resolve => setTimeout(resolve, 0))
   })
 
   it('recover-entry button customId routes to handleRecoverEntryButtonClick', async () => {
@@ -2113,7 +2196,12 @@ describe('launch route wiring — POST /operator/runs', () => {
       effects,
       deadlineMs: 60_000,
     })
-    runDeps.createQuestionOnRegistered({runId: 'run-discord-1', repo: 'acme/widget'})({
+    const send = vi.fn(async (_target: string, _options: unknown) => ({success: true as const, data: {edit: vi.fn()}}))
+    const replySink = {
+      send,
+      markVisibleOutputPending: () => () => undefined,
+    } as unknown as import('./execute/launch-types.js').ReplySink
+    runDeps.createQuestionOnRegistered({runId: 'run-discord-1', repo: 'acme/widget', surface: 'discord', replySink})({
       requestID: asked.requestID,
       sessionID: asked.sessionID,
       questions: asked.questions,
@@ -2132,6 +2220,63 @@ describe('launch route wiring — POST /operator/runs', () => {
     const questionFrames = frames.filter(frame => frame.type === 'question')
     expect(questionFrames.map(frame => frame.data.settled)).toEqual([false, true])
     expect(questionFrames[0]).toMatchObject({runId: 'run-discord-1', data: {requestID: 'que_p1'}})
+
+    // #and the Discord-launched run also got the prompt in its thread
+    expect(send).toHaveBeenCalledExactlyOnceWith('thread', expect.objectContaining({embeds: ANY_ARRAY}))
+  })
+
+  it('a web-launched run gets the SSE frames but no Discord post', async () => {
+    // #given
+    const serverDeps = await captureOperatorServerDeps()
+    const runDeps = serverDeps.launchWorkDeps
+    const manager = serverDeps.runObservationManager
+    if (
+      runDeps?.questionRegistry === undefined ||
+      runDeps.createQuestionOnRegistered === undefined ||
+      manager === undefined
+    ) {
+      throw new Error('expected the question wiring on the run deps')
+    }
+    const frames: import('./web/sse/manager.js').ObservationFrame[] = []
+    manager.subscribe('run-web-1', {
+      onEvent: frame => {
+        frames.push(frame)
+      },
+      onClose: () => undefined,
+    })
+    const questions = [{question: 'Which?', header: 'H', options: [], multiple: false, custom: true}]
+    const send = vi.fn(async () => ({success: true as const, data: {edit: vi.fn()}}))
+    const replySink = {
+      send,
+      markVisibleOutputPending: () => () => undefined,
+    } as unknown as import('./execute/launch-types.js').ReplySink
+    runDeps.questionRegistry.register({
+      requestID: 'que_w1',
+      sessionID: 'sess-1',
+      questionScopeId: 'run-web-1',
+      runId: 'run-web-1',
+      questions,
+      effects: {
+        replyQuestion: vi.fn(async () => ({ok: true as const})),
+        rejectQuestion: vi.fn(async () => ({ok: true as const})),
+      },
+      deadlineMs: 60_000,
+    })
+
+    // #when announced for a web-surface run
+    runDeps.createQuestionOnRegistered({runId: 'run-web-1', repo: 'acme/widget', surface: 'web', replySink})({
+      requestID: 'que_w1',
+      sessionID: 'sess-1',
+      questions,
+    })
+
+    await new Promise<void>(resolve => {
+      setTimeout(resolve, 0)
+    })
+
+    // #then the SSE open frame is emitted and nothing is posted to Discord
+    expect(frames.filter(frame => frame.type === 'question')).toHaveLength(1)
+    expect(send).not.toHaveBeenCalled()
   })
 
   /**

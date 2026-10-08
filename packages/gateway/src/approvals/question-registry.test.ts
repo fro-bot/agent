@@ -1208,3 +1208,69 @@ describe('attachMessage accumulates renders', () => {
     expect(logger.error).toHaveBeenCalled()
   })
 })
+
+// ---------------------------------------------------------------------------
+// describeRequest (transport-side index → label mapping)
+// ---------------------------------------------------------------------------
+
+describe('describeRequest', () => {
+  it('returns the open request with raw questions whatever its scope or run', () => {
+    // #given
+    const {questions} = setup()
+    questions.register(makeParams({runId: 'run_1'}))
+
+    // #when / #then
+    expect(questions.describeRequest('que_1')).toEqual({
+      requestID: 'que_1',
+      questions: [expect.objectContaining({question: 'Which environment?', multiple: false, custom: true})],
+    })
+    expect(questions.describeRequest('que_unknown')).toBeUndefined()
+  })
+
+  it('omits a claimed or settled request', async () => {
+    // #given a claimed request
+    const {questions} = setup()
+    let release: () => void = () => undefined
+    const effects = makeEffects({
+      replyQuestion: vi.fn(
+        async () =>
+          new Promise<QuestionEffectResult>(resolve => {
+            release = () => resolve(OK)
+          }),
+      ),
+    })
+    questions.register(makeParams({effects}))
+    const pending = decideAnswer(questions, [['staging']])
+    await flush()
+
+    // #then mid-decision it is not describable; after the echo it is gone
+    expect(questions.describeRequest('que_1')).toBeUndefined()
+    release()
+    await pending
+    questions.confirmEcho({kind: 'replied', requestID: 'que_1', sessionID: 'ses_1', answers: [['staging']]})
+    await flush()
+    expect(questions.describeRequest('que_1')).toBeUndefined()
+  })
+
+  it('does not return an approval entry', () => {
+    const {questions, approvals} = setup()
+    approvals.register({
+      requestID: 'per_1',
+      sessionID: 'ses_1',
+      approvalScopeId: 'thread_1',
+      directory: '/w',
+      request: {
+        requestID: 'per_1',
+        sessionID: 'ses_1',
+        permission: 'bash',
+        patterns: [],
+        title: 't',
+      },
+      effects: {postReply: vi.fn(async () => ({ok: true}))},
+      deadlineMs: 60_000,
+      onDeadlineSettled: undefined,
+    })
+
+    expect(questions.describeRequest('per_1')).toBeUndefined()
+  })
+})

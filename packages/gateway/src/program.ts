@@ -27,6 +27,7 @@ import {
   redactSensitiveFields,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
+import {composeQuestionHooks, createDiscordQuestionOnRegistered} from './approvals/discord-question-transport.js'
 import {createQuestionRegistry} from './approvals/question-registry.js'
 import {createApprovalRegistry} from './approvals/registry.js'
 import {createRequestGate} from './approvals/request-gate.js'
@@ -39,6 +40,8 @@ import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './disc
 import {handleRecoverConfirmOrCancelClick} from './discord/commands/recover-checkout.js'
 import {editInteractionAsync} from './discord/io.js'
 import {handleMention, userIsAuthorized} from './discord/mentions.js'
+import {handleQuestionInteraction} from './discord/question-interactions.js'
+import {parseQuestionCustomId} from './discord/questions.js'
 import {handleRecoverEntryButtonClick, parseRecoverEntryCustomId} from './discord/recover-checkout-button.js'
 import {abortRegistry} from './execute/abort-registry.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
@@ -589,6 +592,23 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         }
       }
 
+      // ── Agent-question interactions: option / skip / text buttons, select menu, answer modal ──
+      if (interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit()) {
+        const questionParsed = parseQuestionCustomId(interaction.customId)
+        if (questionParsed !== null) {
+          // eslint-disable-next-line no-void
+          void handleQuestionInteraction(interaction, questionParsed, {
+            questionRegistry,
+            isAuthorized: async (guild, userId, authLogger) =>
+              userIsAuthorized(guild, userId, config.triggerRoleId, authLogger),
+            logger: withLogContext(logger, {interaction: 'question'}),
+          }).catch((error: unknown) => {
+            logger.error({err: String(error)}, 'interaction: unexpected error handling question interaction')
+          })
+          return
+        }
+      }
+
       // ── Button interactions: approval flow ────────────────────────
       if (interaction.isButton()) {
         const parsed = parseApprovalCustomId(interaction.customId)
@@ -697,11 +717,25 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       requestGate,
       // Every run's registered questions are announced on the run's SSE stream (open and settle
       // frames), whichever surface launched it: web operators may answer any run's question.
-      createQuestionOnRegistered: ({runId, repo}) =>
-        createWebQuestionOnRegistered({
-          observeQuestion: (observedRunId, data) => runObservationManager.observeQuestion(observedRunId, data),
+      createQuestionOnRegistered: ({runId, repo, surface, replySink}) =>
+        composeQuestionHooks(
+          [
+            createWebQuestionOnRegistered({
+              observeQuestion: (observedRunId, data) => runObservationManager.observeQuestion(observedRunId, data),
+              logger,
+            })({questionRegistry, runId, repo}),
+            // Discord-launched runs also post the prompt into their thread. Web-launched runs have no
+            // Discord thread, so they get no Discord post.
+            surface === 'discord'
+              ? createDiscordQuestionOnRegistered({
+                  questionRegistry,
+                  operatorOrigin: config.operatorWeb?.publicOrigin,
+                  logger,
+                })({replySink, runId})
+              : undefined,
+          ],
           logger,
-        })({questionRegistry, runId, repo}),
+        ),
       approvalMode: config.approvalMode,
       statusMode: config.statusMode,
       // Workspace readiness gate — uses the same :9100 base as the clone endpoint.

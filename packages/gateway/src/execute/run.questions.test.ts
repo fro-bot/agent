@@ -34,6 +34,8 @@ vi.mock('@opencode-ai/sdk/v2/client', () => ({
 
 const ANY_SIGNAL: unknown = expect.any(AbortSignal)
 const ANY_STRING: unknown = expect.any(String)
+const ANY_FUNCTION: unknown = expect.any(Function)
+const ANY_SINK: unknown = expect.objectContaining({send: ANY_FUNCTION})
 
 const CANONICAL_DIRECTORY = '/workspace/repos/acme/widget'
 const WIRE_RUN_ID = 'question-run-id-1'
@@ -303,7 +305,14 @@ describe('run question wiring', () => {
     await capturedQuestions().onAsked(ASKED)
 
     // #then the hook was built once with the run's id and repo, and ran after registration
-    expect(createQuestionOnRegistered).toHaveBeenCalledExactlyOnceWith({runId: ANY_STRING, repo: 'acme/widget'})
+    expect(createQuestionOnRegistered).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        runId: ANY_STRING,
+        repo: 'acme/widget',
+        surface: 'discord',
+        replySink: ANY_SINK,
+      }),
+    )
     expect(announce).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({requestID: 'que_1'}))
     expect(heldWhenAnnounced).toEqual([true])
 

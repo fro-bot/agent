@@ -170,6 +170,12 @@ export interface QuestionRegistry {
   readonly hasPendingForScope: (questionScopeId: string) => boolean
   /** Open (not claimed) questions for the scope. */
   readonly describePendingForScope: (questionScopeId: string) => readonly PendingQuestionDTO[]
+  /**
+   * The open (not claimed) request with this id, whatever its scope or run, or `undefined`.
+   * Lets a transport map an operator's option indices back to the raw labels before it calls
+   * `decide`, which stays the only place scope is enforced.
+   */
+  readonly describeRequest: (requestID: string) => PendingQuestionDTO | undefined
   /** Open (not claimed) questions the given run asked, whatever surface scope they are bound to. */
   readonly describePendingForRun: (runId: string) => readonly PendingQuestionDTO[]
   /**
@@ -418,6 +424,12 @@ export function createQuestionRegistry(deps: {
       .map(entry => ({requestID: entry.requestID, questions: entry.payload.questions}))
   }
 
+  function describeRequest(requestID: string): PendingQuestionDTO | undefined {
+    const entry = getEntry(requestID)
+    if (entry === undefined || entry.state !== 'open') return undefined
+    return {requestID: entry.requestID, questions: entry.payload.questions}
+  }
+
   function describePendingForRun(runId: string): readonly PendingQuestionDTO[] {
     return questionEntries()
       .filter(entry => entry.payload.runId === runId && entry.state === 'open')
@@ -515,6 +527,7 @@ export function createQuestionRegistry(deps: {
     hasPendingForScope,
     describePendingForScope,
     describePendingForRun,
+    describeRequest,
     decide,
     confirmEcho,
     disposeRun: gate.disposeRun,

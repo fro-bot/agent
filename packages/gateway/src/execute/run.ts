@@ -70,6 +70,18 @@ import {RunCoreError, runOpenCodeCore} from './run-core.js'
 // Public interfaces
 // ---------------------------------------------------------------------------
 
+/**
+ * What a question transport needs to know about the run it announces for. `surface` tells a
+ * transport whether the run was launched from Discord (its thread is where operators are) or from
+ * the web; `replySink` is the run's sink, whose `'thread'` target is that Discord thread.
+ */
+export interface QuestionTransportContext {
+  readonly runId: string
+  readonly repo: string
+  readonly surface: LaunchWorkRequest['surface']
+  readonly replySink: ReplySink
+}
+
 export interface RunMentionDeps {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
@@ -122,10 +134,7 @@ export interface RunMentionDeps {
    * Discord-launched and web-launched runs alike. Injected so the engine stays transport-neutral.
    * Absent: questions are still registered and answerable, just not announced.
    */
-  readonly createQuestionOnRegistered?: (context: {
-    readonly runId: string
-    readonly repo: string
-  }) => (request: QuestionAskedRequest) => void
+  readonly createQuestionOnRegistered?: (context: QuestionTransportContext) => (request: QuestionAskedRequest) => void
   /**
    * Gateway approval mode. Propagated from `GatewayConfig.approvalMode`.
    * Currently only `approval-required` is supported.
@@ -1370,7 +1379,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // canonical directory. The deadline is evaluated when a question is asked, from the budget
       // left then (not at run start), so a late question never outlives the hard abort. Scope
       // matches cancellation's: the Discord thread for Discord runs, the run id otherwise.
-      const announceQuestion = deps.createQuestionOnRegistered?.({runId, repo})
+      const announceQuestion = deps.createQuestionOnRegistered?.({runId, repo, surface: request.surface, replySink})
       // Runs after the registry holds the question: surface announcement first, push last so a
       // push failure can never preempt the surfaces. Neither can throw into the coordinator.
       const buildQuestionOnRegistered = (): ((asked: QuestionAskedRequest) => void) => asked => {
