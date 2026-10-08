@@ -2049,6 +2049,22 @@ describe('launch route wiring — POST /operator/runs', () => {
     expect(typeof serverDeps.launchWorkDeps).toBe('object')
   })
 
+  it('threads one shared request gate and the question registry into the run deps', async () => {
+    // #given / #when
+    const serverDeps = await captureOperatorServerDeps()
+    const {createApprovalRegistry} = await import('./approvals/registry.js')
+
+    // #then — runs (Discord and web share launchWorkDeps) receive the question registry and the gate
+    const runDeps = serverDeps.launchWorkDeps
+    expect(runDeps?.questionRegistry).toBeDefined()
+    expect(runDeps?.requestGate).toBeDefined()
+
+    // #and — the approval registry was built over that same gate, so teardown and terminal events span both families
+    expect(vi.mocked(createApprovalRegistry)).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({gate: runDeps?.requestGate}),
+    )
+  })
+
   /**
    * Extract unique logical routes from a Hono app, excluding the catch-all
    * ALL /* middleware entry and deduplicating by method+path.

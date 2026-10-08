@@ -28,6 +28,8 @@ import type {
   Logger as RuntimeLogger,
 } from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
+import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
+import type {TerminalListener} from '../approvals/request-gate.js'
 import type {GatewayLogger} from '../discord/client.js'
 
 import {
@@ -37,12 +39,16 @@ import {
   reconcileLedgerOnce,
 } from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
+import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
 import {formatToolPart} from './format-part.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 
 // ---------------------------------------------------------------------------
 // Typed error
 // ---------------------------------------------------------------------------
+
+/** Which kind of request a human wait is held for. */
+type HumanWaitKind = 'approval' | 'question'
 
 /** Discriminant for `RunCoreError` — `run.ts` maps these to coarse Discord replies. */
 export type RunCoreErrorKind =
@@ -149,6 +155,19 @@ export interface RunCoreParams {
    * supported mode). Fail-closed: if absent, `runOpenCodeCore` throws before session creation.
    */
   readonly coordinator?: PermissionCoordinator
+  /**
+   * Question coordinator. When absent, `question.*` events are not handled: an owned
+   * `question.asked` is warn-logged and does not pause the inactivity watchdog.
+   */
+  readonly questions?: QuestionCoordinator
+  /**
+   * Subscription to the request gate's terminal notifications (`RequestGate.onTerminal`).
+   * `runOpenCodeCore` subscribes once for the run and releases the matching human wait on
+   * every terminal event, so a settlement that produces no OpenCode echo (deadline skip,
+   * failed reply, teardown) still re-arms the watchdog and unblocks drain. Unsubscribed
+   * when the event loop exits. No-op when absent.
+   */
+  readonly onHumanWaitTerminal?: (listener: TerminalListener) => () => void
   /**
    * Optional hook called with each essential tool-action summary string as it is appended.
    * Receives the same summary string that `appendToolSummary` computes — no recomputation.
@@ -434,6 +453,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     signal,
     logger,
     coordinator,
+    questions,
+    onHumanWaitTerminal,
     approvalMode,
     onActivity,
     onBusy,
@@ -556,8 +577,27 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     onOwnershipChange?.({rootSessionId: sessionId, ownedSessionIds})
   }
 
+  // Human waits the run is still blocked on (see the gauge notes further down). Declared here
+  // so the drain check and the gauge functions share it.
+  const outstandingHumanWaits = new Map<string, HumanWaitKind>()
+
+  // Root-idle drain holds for question waits only. A question from owned work keeps the run
+  // alive until it settles. An approval does not hold drain: a root session that goes idle with
+  // an approval still pending has abandoned that tool call, and run teardown rejects it.
+  function hasOutstandingQuestionWaits(): boolean {
+    for (const kind of outstandingHumanWaits.values()) {
+      if (kind === 'question') return true
+    }
+    return false
+  }
+
+  // Reads the underlying ledger: the hook wrapper (defined later) delegates reads unchanged.
+  function ownedWorkSettled(): boolean {
+    return ownershipLedger === undefined || ownershipLedger.isDrainComplete()
+  }
+
   function checkDrainComplete(): void {
-    if (ownershipLedger !== undefined && draining === true && ownershipLedger.isDrainComplete()) {
+    if (draining === true && ownedWorkSettled() === true && hasOutstandingQuestionWaits() === false) {
       drainDoneController.abort()
     }
   }
@@ -705,8 +745,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // than waiting for the next SSE event that may never arrive. Every existing
   // `combinedSignal.aborted` check below is unaffected — it still means
   // exactly "timeout/inactivity/cancel", never "drain finished".
-  const iterationSignal =
-    ledger === undefined ? combinedSignal : AbortSignal.any([combinedSignal, drainDoneController.signal])
+  const iterationSignal = AbortSignal.any([combinedSignal, drainDoneController.signal])
   const abortableStream = makeAbortableStream(eventStream, iterationSignal)
 
   // Observability counters (#1101): disambiguate a genuine workspace hang (zero events
@@ -724,27 +763,44 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     resetInactivity()
   }
 
-  // Human-wait gauge: the set of request ids a human still has to settle (today: approvals).
-  // The inactivity watchdog is paused while the set is non-empty and re-armed with a fresh
-  // window only when the last id is released. Keying by request id keeps both directions
-  // idempotent: a duplicate ask adds nothing, and a release for an unknown or already-released
-  // id changes nothing, so the count can never drift or go negative.
-  const outstandingHumanWaits = new Set<string>()
+  // Human-wait gauge (`outstandingHumanWaits`, declared with the drain machinery above): the
+  // request ids a human still has to settle, approvals and questions alike. The inactivity
+  // watchdog is paused while the map is non-empty and re-armed with a fresh window only when the
+  // last id is released. Keying by request id keeps both directions idempotent: a duplicate ask
+  // adds nothing, and a release for an unknown or already-released id changes nothing, so the
+  // count can never drift or go negative.
+  //
+  // Releases come from three places, all through `releaseHumanWait`: OpenCode's echo, the request
+  // gate's terminal notification (which also fires for settlements that produce no echo: deadline
+  // skip, failed reply, teardown), and a question that was skipped without being registered.
+  //
+  // Once the event loop has exited the run no longer owns the watchdog: late releases (an
+  // asynchronous skip finishing after the run ended) must not re-arm a timer nobody disposes.
+  let humanWaitsClosed = false
 
-  function holdHumanWait(requestId: string): void {
-    outstandingHumanWaits.add(requestId)
+  function holdHumanWait(requestId: string, kind: HumanWaitKind): void {
+    outstandingHumanWaits.set(requestId, kind)
     // Pause typing while waiting on a human: the run is blocked, not actively working.
     onBusy?.(false)
     clearInactivity()
   }
 
   function releaseHumanWait(requestId: string): void {
+    if (humanWaitsClosed === true) return
     if (!outstandingHumanWaits.delete(requestId)) return
+    // A drain that was only waiting on this question can now complete.
+    checkDrainComplete()
     if (outstandingHumanWaits.size > 0) return
     // Last outstanding item settled: the run is unblocked, so resume typing and re-arm.
     onBusy?.(true)
     markActivity()
   }
+
+  // Terminal notifications from the request gate release the wait for any settlement path.
+  // Subscribed here (before the loop) and unsubscribed in the loop's finally.
+  const unsubscribeHumanWaitTerminal = onHumanWaitTerminal?.(event => {
+    releaseHumanWait(event.requestID)
+  })
 
   // Ownership check: true for the root session, or a descendant session this
   // run's ledger has adopted (surfaced through `coordinator.isOwned`). False
@@ -936,7 +992,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
           } else {
             // Pauses typing and the inactivity timer until every outstanding approval is released.
-            holdHumanWait(req.requestID)
+            holdHumanWait(req.requestID, 'approval')
             // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
             // eslint-disable-next-line no-void
             void coordinator.onPermissionAsked(req)
@@ -961,14 +1017,78 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             )
           }
         }
+      } else if (eventType === 'question.asked') {
+        const eventSessionID = getEventSessionID(rawEvent)
+        const askedRequestID = safeLogId(getStringProperty(eventPayload, 'id'))
+        if (isOwnedSession(eventSessionID) === false) {
+          // A question from a session this run does not own must not reach this run's operators.
+          // Logged because the asking session is blocked on it: ids and a reason code only.
+          logger.warn(
+            {eventType, requestID: askedRequestID, sessionID: safeLogId(eventSessionID), reason: 'unowned-session'},
+            'run-core: question.asked from a session this run does not own — ignoring',
+          )
+        } else if (questions === undefined) {
+          logger.warn(
+            {eventType, requestID: askedRequestID, sessionID: safeLogId(eventSessionID), reason: 'no-question-handler'},
+            'run-core: question.asked but no question handler is configured — ignoring',
+          )
+        } else {
+          const parsed = parseQuestionRequest(eventPayload)
+          if (parsed.kind === 'malformed') {
+            logger.warn(
+              {eventType, requestID: askedRequestID, sessionID: safeLogId(eventSessionID), reason: parsed.reason},
+              'run-core: question.asked payload malformed — skipping',
+            )
+          } else {
+            const req = parsed.value
+            // Pauses typing and the inactivity timer until every outstanding human wait is released.
+            holdHumanWait(req.requestID, 'question')
+            // Fire-and-continue: do NOT await — awaiting would starve the SSE drain. A question the
+            // coordinator did not hand to the gate (skipped for lack of budget, or a failed
+            // registration) will never produce a terminal event, so release its wait here.
+            questions
+              .onAsked(req)
+              .then(outcome => {
+                if (outcome === 'skipped' || outcome === 'failed') releaseHumanWait(req.requestID)
+              })
+              .catch(() => {
+                releaseHumanWait(req.requestID)
+              })
+            logger.info(
+              {requestID: req.requestID, sessionID: req.sessionID},
+              'run-core: question.asked forwarded to question handler',
+            )
+          }
+        }
+      } else if (eventType === 'question.replied' || eventType === 'question.rejected') {
+        // Authoritative settlement from OpenCode — works whether or not the gateway claimed the request.
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (isOwnedSession(eventSessionID) && questions !== undefined) {
+          const parsed = parseQuestionEcho(eventType, eventPayload)
+          if (parsed.kind === 'malformed') {
+            logger.warn(
+              {eventType, sessionID: safeLogId(eventSessionID), reason: parsed.reason},
+              'run-core: question echo payload malformed — skipping',
+            )
+          } else {
+            questions.onEcho(parsed.value)
+            // The echo is proof OpenCode is unblocked, so release even if the gate had no entry for it.
+            releaseHumanWait(parsed.value.requestID)
+            logger.info(
+              {requestID: parsed.value.requestID, echo: parsed.value.kind},
+              'run-core: question echo forwarded to question handler',
+            )
+          }
+        }
       } else if (eventType === 'session.idle') {
         // Deliberately root-scoped, NOT an ownership check: a descendant's own
         // idle transition must never end the run while the root is still
         // working. Root idle is the signal to CONSIDER finishing; whether that
-        // is actually allowed is the ledger's call, below.
+        // is actually allowed is the ledger's call, and — for questions — the
+        // human-wait gauge's, below.
         const eventSessionID = getEventSessionID(rawEvent)
         if (eventSessionID === sessionId) {
-          if (ledger === undefined || ledger.isDrainComplete()) {
+          if (ownedWorkSettled() === true && hasOutstandingQuestionWaits() === false) {
             logger.info(
               {sessionId, totalEvents, activityEvents, lastEventType},
               'run-core: session.idle received — stream complete',
@@ -979,15 +1099,21 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             return
           }
 
-          // Outstanding owned work: enter (or remain in) drain rather than
-          // completing. The run stays alive — slot, lease, and approval routing
-          // all continue exactly as during execution — until the ledger settles
-          // or the run's own deadline (`combinedSignal`) expires.
+          // Outstanding owned work or an unanswered question: enter (or remain in) drain
+          // rather than completing. The run stays alive — slot, lease, and approval routing
+          // all continue exactly as during execution — until the ledger settles and every
+          // question wait is released, or the run's own deadline (`combinedSignal`) expires.
           if (draining === false) {
             draining = true
             logger.info(
-              {sessionId, outstanding: ledger.outstanding(), totalEvents, activityEvents},
-              'run-core: root session idle with owned work outstanding — draining',
+              {
+                sessionId,
+                outstanding: ledger?.outstanding(),
+                questionWaits: hasOutstandingQuestionWaits(),
+                totalEvents,
+                activityEvents,
+              },
+              'run-core: root session idle with owned work or a question outstanding — draining',
             )
             onBusy?.(false)
             clearInactivity()
@@ -997,7 +1123,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           // without waiting for the reconciler's interval. Fire-and-forget: its
           // mutations (via the wrapped ledger) trigger persistence and the
           // drain-complete check on their own once they land.
-          if (reconcileAdapter !== undefined && runtimeLogger !== undefined) {
+          if (ledger !== undefined && reconcileAdapter !== undefined && runtimeLogger !== undefined) {
             // eslint-disable-next-line no-void
             void reconcileLedgerOnce({
               ledger,
@@ -1033,6 +1159,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // kept as defensive double-clears — pause()/dispose() on an already-cleared timer is a no-op.
     inactivityTimer.dispose()
     reconciler?.dispose()
+    // The watchdog is gone: stop reacting to gate notifications and late releases.
+    humanWaitsClosed = true
+    unsubscribeHumanWaitTerminal?.()
   }
 
   // Drain completed successfully: the ledger reported drain-complete and

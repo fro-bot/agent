@@ -42,6 +42,8 @@ export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.
 export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
 export {createRemoteOpenCodeHandle} from './remote-client.js'
+export {createRemoteQuestionClient} from './remote-question-client.js'
+export type {RemoteQuestionClient, RemoteQuestionResponse} from './remote-question-client.js'
 export {resolveResponseDelivery} from './response-delivery.js'
 export type {CredentialDisposition, ResponseDelivery, ResponseDeliveryDecision} from './response-delivery.js'
 export {

@@ -27,7 +27,9 @@ import {
   redactSensitiveFields,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
+import {createQuestionRegistry} from './approvals/question-registry.js'
 import {createApprovalRegistry} from './approvals/registry.js'
+import {createRequestGate} from './approvals/request-gate.js'
 import {createBindingsStore} from './bindings/store.js'
 import {parseApprovalCustomId} from './discord/approvals.js'
 import {createCancelNoticeDispatcher} from './discord/cancel-notice.js'
@@ -475,8 +477,14 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
 
     const registry = getCommandRegistry(commandDeps)
 
+    // Program-scoped request gate: one settlement lifecycle for both request families. The
+    // approval and question registries share it, so run teardown, shutdown drain, and the
+    // terminal notification each run subscribes to span approvals and questions alike.
+    const requestGate = createRequestGate({logger})
     // Program-scoped approval registry — shared between the button handler and shutdown drain.
-    const approvalRegistry = createApprovalRegistry({logger})
+    const approvalRegistry = createApprovalRegistry({logger, gate: requestGate})
+    // Program-scoped question registry — agent questions awaiting an operator's answer.
+    const questionRegistry = createQuestionRegistry({logger, gate: requestGate})
 
     // Run-observation manager: projects run states and fans them to SSE subscribers.
     // It is fed by the run lifecycle hook and holds a latest-status cache per active run.
@@ -675,6 +683,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       persona: config.persona,
       logger,
       approvalRegistry,
+      questionRegistry,
+      requestGate,
       approvalMode: config.approvalMode,
       statusMode: config.statusMode,
       // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
