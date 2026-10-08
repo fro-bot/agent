@@ -16,7 +16,12 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorRunStatus, OperatorWebStatus} from '../../operator-contract/index.js'
+import type {
+  OperatorCheckoutPreparation,
+  OperatorCheckoutProvenance,
+  OperatorRunStatus,
+  OperatorWebStatus,
+} from '../../operator-contract/index.js'
 import type {ProjectRunObservationDeps} from './projection.js'
 
 import {describe, expect, it} from 'vitest'
@@ -403,5 +408,135 @@ describe('projectRunObservation — closed DTO safety', () => {
     expect(result?.status).toBe('succeeded')
     expect(result?.startedAt).toBe('2024-06-01T12:00:00.000Z')
     expect(result?.stale).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Checkout fields (contract 1.8.0): carried from the deny-gated bridge result
+// ---------------------------------------------------------------------------
+
+describe('projectRunObservation — checkout fields', () => {
+  const PROVENANCE: OperatorCheckoutProvenance = {
+    kind: 'observed',
+    observation: {
+      head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
+      worktree: {kind: 'clean'},
+      operationInProgress: 'none',
+      observedAt: '2026-01-01T00:00:00.000Z',
+    },
+    remote: {kind: 'not-checked'},
+  }
+  const PREPARATION: OperatorCheckoutPreparation = {
+    outcome: 'refused',
+    reason: 'dirty',
+    changedPaths: ['src/index.ts'],
+  }
+
+  it('carries checkoutProvenance through from the bridge result when present', async () => {
+    // #given an EXECUTING base status carrying checkout provenance
+    const baseStatus = makeBaseStatus({checkoutProvenance: PROVENANCE})
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState(), makeDeps(baseStatus))
+
+    // #then the provenance is copied through unchanged
+    expect(result?.checkoutProvenance).toEqual(PROVENANCE)
+  })
+
+  it('carries checkoutPreparation through from the bridge result when present', async () => {
+    // #given a FAILED base status carrying a preparation refusal
+    const baseStatus = makeBaseStatus({phase: 'FAILED', status: 'failed', checkoutPreparation: PREPARATION})
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState({phase: 'FAILED'}), makeDeps(baseStatus))
+
+    // #then the preparation is copied through unchanged
+    expect(result?.checkoutPreparation).toEqual(PREPARATION)
+  })
+
+  it('omits both checkout keys when the bridge result lacks them', async () => {
+    // #given a base status recorded before the checkout fields existed
+    const baseStatus = makeBaseStatus()
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState(), makeDeps(baseStatus))
+
+    // #then neither key is present (not an undefined-valued key)
+    expect(result).not.toBeNull()
+    expect(Object.prototype.hasOwnProperty.call(result as object, 'checkoutProvenance')).toBe(false)
+    expect(Object.prototype.hasOwnProperty.call(result as object, 'checkoutPreparation')).toBe(false)
+  })
+
+  it('keeps the checkout fields through the waiting_for_approval overlay', async () => {
+    // #given a running base status with provenance and a pending approval for the run
+    const baseStatus = makeBaseStatus({checkoutProvenance: PROVENANCE})
+    const deps = makeDeps(baseStatus, () => true)
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState(), deps)
+
+    // #then the status is overlaid and the provenance is preserved
+    expect(result?.status).toBe('waiting_for_approval')
+    expect(result?.checkoutProvenance).toEqual(PROVENANCE)
+  })
+
+  it('surfaces the fields end to end through the real redaction bridge', async () => {
+    // #given a non-denied run whose stored details carry both checkout fields
+    const runState = makeRunState({
+      details: {checkoutProvenance: PROVENANCE, checkoutPreparation: PREPARATION},
+    })
+    const deps: ProjectRunObservationDeps = {
+      ...makeDeps(null),
+      bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
+      _projectRunStatus: undefined,
+    }
+
+    // #when projecting through the real bridge
+    const result = await projectRunObservation(runState, deps)
+
+    // #then both fields reach the projected status
+    expect(result?.checkoutProvenance).toEqual(PROVENANCE)
+    expect(result?.checkoutPreparation).toEqual(PREPARATION)
+  })
+
+  it('gives a denied run no checkout fields — the deny gate wins', async () => {
+    // #given a run carrying both checkout fields whose repo is denied
+    const runState = makeRunState({
+      details: {checkoutProvenance: PROVENANCE, checkoutPreparation: PREPARATION},
+    })
+    const deps: ProjectRunObservationDeps = {
+      ...makeDeps(null),
+      bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
+      isRepoDenied: () => true,
+      _projectRunStatus: undefined,
+    }
+
+    // #when projecting through the real bridge
+    const result = await projectRunObservation(runState, deps)
+
+    // #then nothing is surfaced at all
+    expect(result).toBeNull()
+  })
+
+  it('copies every OperatorRunStatus field — a fully populated status round-trips unchanged', async () => {
+    // #given a status with every contract field set; Required<> makes a new field a type error here
+    const full: Required<OperatorRunStatus> = {
+      runId: 'run-001',
+      entityRef: 'acme/widget#1',
+      surface: 'github',
+      phase: 'FAILED',
+      status: 'failed',
+      startedAt: '2024-01-01T00:00:00.000Z',
+      stale: false,
+      failureKind: 'inactivity-timeout',
+      checkoutProvenance: PROVENANCE,
+      checkoutPreparation: PREPARATION,
+    }
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState({phase: 'FAILED'}), makeDeps(full))
+
+    // #then no field is dropped
+    expect(result).toEqual(full)
   })
 })
