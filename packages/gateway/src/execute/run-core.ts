@@ -348,14 +348,6 @@ export function wrapLedgerWithHooks(
       onAdopted(sessionId)
       onChange()
     },
-    reopen: sessionId => {
-      const before = snapshotStates(ledger)
-      ledger.reopen(sessionId)
-      const after = snapshotStates(ledger)
-      if (statesEqual(before, after)) return
-      // Already registered with the coordinator when first adopted; only persistence needs to hear about it.
-      onChange()
-    },
     settle: sessionId => {
       const before = snapshotStates(ledger)
       ledger.settle(sessionId)
@@ -377,31 +369,6 @@ export function wrapLedgerWithHooks(
     snapshot: () => ledger.snapshot(),
     isTracked: sessionId => ledger.isTracked(sessionId),
   }
-}
-
-function getNumberProperty(value: unknown, property: string): number | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'number' ? descriptor.value : null
-}
-
-/**
- * When the dispatching tool call started (`state.time.start`, stamped when the call turned `running`, before the
- * tool executes — `session/processor.ts` tool-call handling). The child's prompt for the dispatch is created inside
- * `execute`, so every child segment of this dispatch is created at or after it.
- */
-function dispatchStartedAt(toolState: unknown): number | null {
-  return getNumberProperty(getObjectProperty(toolState, 'time'), 'start')
-}
-
-function dispatchIdentity(part: unknown): string | null {
-  return getStringProperty(part, 'id') ?? getStringProperty(part, 'callID')
-}
-
-/** `tool/task.ts` renders `<summary>Background task updated</summary>` when it extended a running job. */
-function isExtensionOfRunningJob(toolState: unknown): boolean {
-  const output = getStringProperty(toolState, 'output')
-  return output !== null && output.includes('<summary>Background task updated</summary>')
 }
 
 function getSessionID(value: unknown): string | null {
@@ -895,57 +862,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     return eventSessionID !== null && ownershipCoordinator.isOwned(eventSessionID)
   }
 
-  // ── Background dispatches that reuse a child session ─────────────────────────────────────────────────────────
-  // Upstream's `task` tool accepts an existing `task_id`: the child session is resumed and the job id is that
-  // session id (`tool/task.ts`: `sessions.get(task_id)`, `background.start({id: nextSession.id})`). Two cases:
-  // - the earlier job is still RUNNING: `background.extend` chains onto it, the tool part says "Background task
-  //   updated", and no second notice will ever be injected (`notify` only runs on the `start` path);
-  // - the earlier job already finished: `background.start` creates a NEW job under the same id, the tool part
-  //   says "Background task started", and that job injects its own notice.
-  // The ledger is keyed by child session id and `adopt` is idempotent, so without this a second dispatch added
-  // no outstanding entry, and the first dispatch's notice satisfied the fence for it too. Each dispatch is
-  // identified by its own tool part, so a duplicated or replayed completion event is not a second dispatch.
-  const seenDispatchIdentities = new Set<string>()
-
-  // A child first seen through an EXTENSION ("Background task updated") belongs to a job started outside this run
-  // (e.g. an earlier turn): `background.extend` chained onto it and never calls `notify`, so this run's dispatch
-  // owes no notice of its own. It is still adopted (settlement tracking) and its identity remembered.
-  function observeFirstDispatch(part: unknown, toolState: unknown, jobId: string, extension: boolean): void {
-    const identity = dispatchIdentity(part)
-    if (identity !== null) seenDispatchIdentities.add(identity)
-    drainCompletion?.noteDispatch(
-      jobId,
-      extension ? 'adopted-extension' : 'adopted',
-      dispatchStartedAt(toolState),
-      getStringProperty(part, 'messageID'),
-    )
-  }
-
-  function observeReusedDispatch(part: unknown, toolState: unknown, jobId: string, extension: boolean): void {
-    if (ledger === undefined) return
-    const identity = dispatchIdentity(part)
-    // Without the dispatch's own identity a duplicate cannot be told from a new dispatch: keep the old,
-    // idempotent behaviour rather than reopening on every replay.
-    if (identity === null || seenDispatchIdentities.has(identity)) return
-    seenDispatchIdentities.add(identity)
-    // Register the dispatch BEFORE reopening: the reopen can request a validation. An extension is not a job (no
-    // notice) but does add a user prompt to the child, so the gate must know the child's segments are not all jobs.
-    drainCompletion?.noteDispatch(
-      jobId,
-      extension ? 'extension' : 'reused',
-      dispatchStartedAt(toolState),
-      getStringProperty(part, 'messageID'),
-    )
-    // A settled entry whose job is in fact running (or restarted) is outstanding again. `unknown` is left alone.
-    ledger.reopen(jobId)
-    logger.info(
-      {sessionId, jobId, extension},
-      extension
-        ? 'run-core: background task extended a running job — reopened a prematurely settled entry'
-        : 'run-core: background dispatch reused a child session — a new notice is now expected',
-    )
-  }
-
   // Feeds the drain-completion gate. ROOT session only — a descendant's activity never changes root
   // lifecycle state. Invalidating: a new root user message (an injected notice included), a root busy/retry
   // status, and root assistant/text/tool activity. A notice also registers its injected user message before
@@ -1084,14 +1000,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                 const isBackground = getBooleanProperty(stateMetadata, 'background')
                 if (jobId !== null && isBackground === true) {
                   const label = stateTitle ?? 'background task'
-                  const wasTracked = ledger.isTracked(jobId)
                   ledger.adopt(jobId, label)
-                  const extension = isExtensionOfRunningJob(toolState)
-                  if (wasTracked) {
-                    observeReusedDispatch(part, toolState, jobId, extension)
-                  } else {
-                    observeFirstDispatch(part, toolState, jobId, extension)
-                  }
                   logger.info(
                     {sessionId, jobId, label},
                     'run-core: background dispatch observed -- adopted into ownership ledger',

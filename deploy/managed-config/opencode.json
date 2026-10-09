@@ -1,0 +1,4 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["file:///usr/local/lib/fro-bot/plugins/no-task-reuse.mjs"]
+}
