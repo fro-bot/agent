@@ -43,11 +43,21 @@ export interface OwnershipLedger {
    *
    * Idempotent: adopting the same `sessionId` more than once counts as a
    * single entry and does not overwrite an entry already in progress or
-   * resolved. Upstream can notify once for several dispatches against the
+   * resolved (a new dispatch onto a settled session goes through `reopen`). Upstream can notify once for several dispatches against the
    * same session (e.g. an extension), so a second `adopt` call must not
    * double-count or reset an entry's state.
    */
   readonly adopt: (sessionId: string, label: string) => void
+  /**
+   * Reopen a SETTLED entry as `outstanding`: a genuinely new dispatch resumed a child session this ledger already
+   * saw finish (upstream lets a `task` call pass an existing `task_id`; the job id is the session id).
+   *
+   * Deliberately separate from `adopt`, which stays idempotent so a duplicated or retried notification for the
+   * same dispatch can never undo a settlement. The caller decides what counts as a new dispatch (it needs the
+   * dispatch's own identity); this only performs the transition. A no-op for an untracked id and for an entry
+   * that is `outstanding` or `unknown` — `unknown` is never changed here, it keeps blocking.
+   */
+  readonly reopen: (sessionId: string) => void
   /**
    * Mark the entry for `sessionId` as settled (confirmed finished).
    *
@@ -142,6 +152,13 @@ export function createOwnershipLedger(): OwnershipLedger {
     adopt: (sessionId: string, label: string): void => {
       if (entries.has(sessionId) === true) return
       entries.set(sessionId, {label, state: 'outstanding'})
+    },
+
+    reopen: (sessionId: string): void => {
+      const entry = entries.get(sessionId)
+      if (entry === undefined) return
+      if (entry.state !== 'settled') return
+      entries.set(sessionId, {label: entry.label, state: 'outstanding'})
     },
 
     settle: (sessionId: string): void => {

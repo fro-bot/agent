@@ -173,4 +173,53 @@ describe('createOwnershipLedger', () => {
     expect(ledger.isDrainComplete()).toBe(true)
     expect(ledger.isPersistenceSafe()).toBe(true)
   })
+
+  describe('reopen — a genuinely new dispatch onto a settled session', () => {
+    it('reopens a settled entry as outstanding, keeping its label', () => {
+      // #given a settled entry
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.settle('session-1')
+      expect(ledger.isDrainComplete()).toBe(true)
+
+      // #when a new dispatch reopens it
+      ledger.reopen('session-1')
+
+      // #then it is outstanding again and blocks drain
+      expect(ledger.snapshot()).toEqual([{sessionId: 'session-1', label: 'reviewer-subagent', state: 'outstanding'}])
+      expect(ledger.isDrainComplete()).toBe(false)
+    })
+
+    it('adopt still never reopens a settled entry (a replayed notification must not undo a settlement)', () => {
+      // #given a settled entry
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.settle('session-1')
+
+      // #when the same session is adopted again
+      ledger.adopt('session-1', 'reviewer-subagent')
+
+      // #then it stays settled
+      expect(ledger.snapshot()[0]?.state).toBe('settled')
+    })
+
+    it('never touches an unknown entry, an outstanding entry, or a session that was never adopted', () => {
+      // #given one entry in each non-settled state
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-outstanding', 'a')
+      ledger.adopt('session-unknown', 'b')
+      ledger.markUnknown('session-unknown')
+
+      // #when reopen is called on each, and on a stranger
+      ledger.reopen('session-outstanding')
+      ledger.reopen('session-unknown')
+      ledger.reopen('session-never-adopted')
+
+      // #then nothing changed and nothing was created
+      expect(ledger.snapshot()).toEqual([
+        {sessionId: 'session-outstanding', label: 'a', state: 'outstanding'},
+        {sessionId: 'session-unknown', label: 'b', state: 'unknown'},
+      ])
+    })
+  })
 })

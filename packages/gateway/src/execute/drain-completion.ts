@@ -96,11 +96,13 @@ type BoundedResult<T> = {readonly ok: true; readonly value: T} | {readonly ok: f
 interface RestMessageFacts {
   readonly userMessageIds: readonly string[]
   readonly latestUserMessageId: string | null
-  /** Children named by a synthetic notice part on any persisted user message. */
-  readonly noticeChildren: ReadonlySet<string>
+  /** Every synthetic notice part on a persisted user message: the child it names and its `messageID:partID` key. */
+  readonly notices: readonly {readonly childSessionId: string; readonly key: string}[]
   /** Ids of the persisted user messages that carry a synthetic notice part. */
   readonly noticeMessageIds: ReadonlySet<string>
   readonly latestAssistant: {readonly info: unknown; readonly parts: unknown} | null
+  /** How many dispatches (user-prompt segments) of this session ended with an aborted assistant message. */
+  readonly cancelledDispatchCount: number
   /** Every persisted assistant message, in order, with the user message it answers. */
   readonly assistantMessages: readonly {readonly parentId: string | null; readonly parts: unknown}[]
 }
@@ -108,9 +110,14 @@ interface RestMessageFacts {
 function readMessages(data: unknown): RestMessageFacts | null {
   if (!Array.isArray(data)) return null
   const userMessageIds: string[] = []
-  const noticeChildren = new Set<string>()
+  const notices: {readonly childSessionId: string; readonly key: string}[] = []
   const noticeMessageIds = new Set<string>()
   const assistantMessages: {readonly parentId: string | null; readonly parts: unknown}[] = []
+  // A child session is resumed by sending it a new user prompt, so each dispatch is one run of messages starting at a
+  // user prompt. A cancelled dispatch is a segment whose LAST assistant message ended aborted; an aborted message
+  // that a later message in the same segment followed is not a cancellation.
+  const segmentCancelled: boolean[] = []
+  let segmentOpen = false
   let latestAssistant: {readonly info: unknown; readonly parts: unknown} | null = null
   for (const message of data as readonly unknown[]) {
     const info = getObjectProperty(message, 'info')
@@ -119,12 +126,18 @@ function readMessages(data: unknown): RestMessageFacts | null {
     const role = getStringProperty(info, 'role')
     if (role === 'user') {
       userMessageIds.push(id)
+      segmentCancelled.push(false)
+      segmentOpen = true
       const parts = getObjectProperty(message, 'parts')
       if (Array.isArray(parts)) {
-        for (const part of parts as readonly unknown[]) {
+        for (const [index, part] of (parts as readonly unknown[]).entries()) {
           const notice = parseSyntheticNoticePart(part)
           if (notice !== null) {
-            noticeChildren.add(notice.childSessionId)
+            // Same key shape as the stream's (`messageID:partID`), so one notice seen both ways counts once.
+            notices.push({
+              childSessionId: notice.childSessionId,
+              key: `${id}:${getStringProperty(part, 'id') ?? `index-${index}`}`,
+            })
             noticeMessageIds.add(id)
           }
         }
@@ -132,16 +145,23 @@ function readMessages(data: unknown): RestMessageFacts | null {
     } else if (role === 'assistant') {
       const parts = getObjectProperty(message, 'parts')
       latestAssistant = {info, parts}
+      if (!segmentOpen) {
+        segmentCancelled.push(false)
+        segmentOpen = true
+      }
+      segmentCancelled[segmentCancelled.length - 1] =
+        getStringProperty(getObjectProperty(info, 'error'), 'name') === ABORTED_ERROR_NAME
       assistantMessages.push({parentId: getStringProperty(info, 'parentID'), parts})
     }
   }
   return {
     userMessageIds,
     latestUserMessageId: userMessageIds.at(-1) ?? null,
-    noticeChildren,
+    notices,
     noticeMessageIds,
     latestAssistant,
     assistantMessages,
+    cancelledDispatchCount: segmentCancelled.filter(Boolean).length,
   }
 }
 
@@ -176,12 +196,6 @@ function isQualifiedTerminalReply(
     if (hasBlockingTool) return false
   }
   return true
-}
-
-/** Whether the last assistant message of a child session ended aborted — upstream injects nothing for it. */
-function endedAborted(facts: RestMessageFacts): boolean {
-  if (facts.latestAssistant === null) return false
-  return getStringProperty(getObjectProperty(facts.latestAssistant.info, 'error'), 'name') === ABORTED_ERROR_NAME
 }
 
 /**
@@ -244,6 +258,14 @@ export interface DrainCompletion {
    * changes nothing. Registers the injected user message BEFORE any validation can run.
    */
   readonly noteNotice: (notice: TaskNotice, messageId: string | null, partId: string | null) => void
+  /**
+   * A NEW background dispatch reused a child session this gate already tracks (upstream resumes the session and
+   * the job id is the session id). Each such dispatch is a separate upstream job and injects its own notice, so
+   * the fence now needs one more notice (or cancel) for that child. The caller dedupes by the dispatch's own tool
+   * part identity and must not call this for an extension of a still-running job (upstream injects nothing extra
+   * for those). Call BEFORE anything that can request validation.
+   */
+  readonly noteDispatch: (childSessionId: string) => void
   /** Root idle stamps the current revision. */
   readonly noteRootIdle: () => void
   /** The run entered drain: validation passes may now run, retried on the interval. */
@@ -284,9 +306,29 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
   let latestStreamUserMessageId: string | null = null
   const seenUserMessageIds = new Set<string>()
   const seenNoticeKeys = new Set<string>()
-  const noticedChildren = new Set<string>()
   const streamNoticeMessageIds = new Set<string>()
-  const cancelExempt = new Set<string>()
+  // The fence is per DISPATCH, not per child session: a reused session injects one notice per upstream job.
+  // Distinct notice parts seen for each child (stream and REST share the `messageID:partID` key), the number of
+  // upstream jobs started on it (1 unless `noteDispatch` says otherwise), and how many of its dispatches
+  // REST showed cancelled (dispatches ending in an aborted assistant message; upstream injects no notice for a cancelled job).
+  // Counting rather than "a notice after the latest adoption" because a fast child's notice can precede the
+  // dispatch's own tool-completion event, which would make an ordering rule reject valid evidence.
+  const noticeKeysByChild = new Map<string, Set<string>>()
+  const dispatchesByChild = new Map<string, number>()
+  const cancelledByChild = new Map<string, number>()
+
+  function recordNoticeKey(childSessionId: string, key: string): void {
+    const keys = noticeKeysByChild.get(childSessionId) ?? new Set<string>()
+    keys.add(key)
+    noticeKeysByChild.set(childSessionId, keys)
+  }
+
+  /** Whether `childSessionId` still lacks a notice (or cancel evidence) for one of its dispatches. */
+  function lacksEvidence(childSessionId: string): boolean {
+    const required = dispatchesByChild.get(childSessionId) ?? 1
+    const noticed = noticeKeysByChild.get(childSessionId)?.size ?? 0
+    return noticed + (cancelledByChild.get(childSessionId) ?? 0) < required
+  }
 
   function invalidate(): void {
     revision += 1
@@ -323,8 +365,13 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     if (messageId === null) invalidate()
     else if (seenUserMessageIds.has(messageId)) invalidate()
     else registerUserMessage(messageId)
-    noticedChildren.add(notice.childSessionId)
+    recordNoticeKey(notice.childSessionId, key)
     requestValidation()
+  }
+
+  function noteDispatch(childSessionId: string): void {
+    if (closed) return
+    dispatchesByChild.set(childSessionId, (dispatchesByChild.get(childSessionId) ?? 1) + 1)
   }
 
   function noteRootIdle(): void {
@@ -396,7 +443,7 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     const unconfirmed = ledger
       .snapshot()
       .map(entry => entry.sessionId)
-      .filter(id => !noticedChildren.has(id) && !cancelExempt.has(id))
+      .filter(lacksEvidence)
 
     const [live, rootFacts, childFacts] = await Promise.all([
       rootIsLive(),
@@ -407,12 +454,13 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
 
     // A persisted notice the stream never delivered still counts toward the fence.
     if (rootFacts !== null) {
-      for (const child of rootFacts.noticeChildren) noticedChildren.add(child)
+      for (const notice of rootFacts.notices) recordNoticeKey(notice.childSessionId, notice.key)
     }
-    // Cancel exemption: positive REST evidence only. Missing or failed evidence is NOT exempt.
+    // Cancel exemption: positive REST evidence only (one per dispatch of the child that ended aborted). Missing or failed evidence is NOT exempt, and an earlier dispatch's cancellation can cover only
+    // that dispatch: a later one still needs its own notice or its own aborted message.
     for (const {id, facts} of childFacts) {
-      if (noticedChildren.has(id)) continue
-      if (facts !== null && endedAborted(facts)) cancelExempt.add(id)
+      if (facts === null || !lacksEvidence(id)) continue
+      cancelledByChild.set(id, Math.max(cancelledByChild.get(id) ?? 0, facts.cancelledDispatchCount))
     }
 
     if (live === null) return reject('root-liveness-unavailable')
@@ -434,7 +482,7 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     const unfenced = ledger
       .snapshot()
       .map(entry => entry.sessionId)
-      .filter(id => !noticedChildren.has(id) && !cancelExempt.has(id))
+      .filter(lacksEvidence)
     if (unfenced.length > 0) return reject('notice-not-observed', {children: unfenced})
 
     // Delivery fence: the reply the user will read must already be in the sink. Ids only in the log, never text.
@@ -487,5 +535,14 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     retryTimer = undefined
   }
 
-  return {noteRootActivity, noteRootUserMessage, noteNotice, noteRootIdle, beginDrain, requestValidation, dispose}
+  return {
+    noteRootActivity,
+    noteRootUserMessage,
+    noteNotice,
+    noteDispatch,
+    noteRootIdle,
+    beginDrain,
+    requestValidation,
+    dispose,
+  }
 }

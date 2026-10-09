@@ -348,6 +348,14 @@ export function wrapLedgerWithHooks(
       onAdopted(sessionId)
       onChange()
     },
+    reopen: sessionId => {
+      const before = snapshotStates(ledger)
+      ledger.reopen(sessionId)
+      const after = snapshotStates(ledger)
+      if (statesEqual(before, after)) return
+      // Already registered with the coordinator when first adopted; only persistence needs to hear about it.
+      onChange()
+    },
     settle: sessionId => {
       const before = snapshotStates(ledger)
       ledger.settle(sessionId)
@@ -369,6 +377,16 @@ export function wrapLedgerWithHooks(
     snapshot: () => ledger.snapshot(),
     isTracked: sessionId => ledger.isTracked(sessionId),
   }
+}
+
+function dispatchIdentity(part: unknown): string | null {
+  return getStringProperty(part, 'id') ?? getStringProperty(part, 'callID')
+}
+
+/** `tool/task.ts` renders `<summary>Background task updated</summary>` when it extended a running job. */
+function isExtensionOfRunningJob(toolState: unknown): boolean {
+  const output = getStringProperty(toolState, 'output')
+  return output !== null && output.includes('<summary>Background task updated</summary>')
 }
 
 function getSessionID(value: unknown): string | null {
@@ -862,6 +880,43 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     return eventSessionID !== null && ownershipCoordinator.isOwned(eventSessionID)
   }
 
+  // ── Background dispatches that reuse a child session ─────────────────────────────────────────────────────────
+  // Upstream's `task` tool accepts an existing `task_id`: the child session is resumed and the job id is that
+  // session id (`tool/task.ts`: `sessions.get(task_id)`, `background.start({id: nextSession.id})`). Two cases:
+  // - the earlier job is still RUNNING: `background.extend` chains onto it, the tool part says "Background task
+  //   updated", and no second notice will ever be injected (`notify` only runs on the `start` path);
+  // - the earlier job already finished: `background.start` creates a NEW job under the same id, the tool part
+  //   says "Background task started", and that job injects its own notice.
+  // The ledger is keyed by child session id and `adopt` is idempotent, so without this a second dispatch added
+  // no outstanding entry, and the first dispatch's notice satisfied the fence for it too. Each dispatch is
+  // identified by its own tool part, so a duplicated or replayed completion event is not a second dispatch.
+  const seenDispatchIdentities = new Set<string>()
+
+  function rememberDispatchIdentity(part: unknown): void {
+    const identity = dispatchIdentity(part)
+    if (identity !== null) seenDispatchIdentities.add(identity)
+  }
+
+  function observeReusedDispatch(part: unknown, toolState: unknown, jobId: string): void {
+    if (ledger === undefined) return
+    const identity = dispatchIdentity(part)
+    // Without the dispatch's own identity a duplicate cannot be told from a new dispatch: keep the old,
+    // idempotent behaviour rather than reopening on every replay.
+    if (identity === null || seenDispatchIdentities.has(identity)) return
+    seenDispatchIdentities.add(identity)
+    const extension = isExtensionOfRunningJob(toolState)
+    // Register the extra expected notice BEFORE reopening: the reopen can request a validation.
+    if (!extension) drainCompletion?.noteDispatch(jobId)
+    // A settled entry whose job is in fact running (or restarted) is outstanding again. `unknown` is left alone.
+    ledger.reopen(jobId)
+    logger.info(
+      {sessionId, jobId, extension},
+      extension
+        ? 'run-core: background task extended a running job — reopened a prematurely settled entry'
+        : 'run-core: background dispatch reused a child session — a new notice is now expected',
+    )
+  }
+
   // Feeds the drain-completion gate. ROOT session only — a descendant's activity never changes root
   // lifecycle state. Invalidating: a new root user message (an injected notice included), a root busy/retry
   // status, and root assistant/text/tool activity. A notice also registers its injected user message before
@@ -1000,7 +1055,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                 const isBackground = getBooleanProperty(stateMetadata, 'background')
                 if (jobId !== null && isBackground === true) {
                   const label = stateTitle ?? 'background task'
+                  const wasTracked = ledger.isTracked(jobId)
                   ledger.adopt(jobId, label)
+                  if (wasTracked) {
+                    observeReusedDispatch(part, toolState, jobId)
+                  } else {
+                    rememberDispatchIdentity(part)
+                  }
                   logger.info(
                     {sessionId, jobId, label},
                     'run-core: background dispatch observed -- adopted into ownership ledger',

@@ -28,7 +28,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
 import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
-import {RunCoreError, runOpenCodeCore} from './run-core.js'
+import {RunCoreError, runOpenCodeCore, wrapLedgerWithHooks} from './run-core.js'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -2017,5 +2017,300 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         expectKind(run.outcome(), 'drain-timeout')
       },
     )
+  })
+
+  describe('21. a background task that reuses a settled child session is a NEW dispatch (#1753)', () => {
+    // Upstream (tool/task.ts @ v1.18.34): `task_id` resumes the session (`sessions.get`, :136-138); the job id is the
+    // session id; `background.extend` (:267) only succeeds while the job is RUNNING (core background-job.ts:264)
+    // and renders "Background task updated" with no new notify; otherwise `background.start` (:284) creates a NEW
+    // job under the same id (core :213-214 refuses only a running one), notifies (:317) and renders "started".
+
+    /** A completed background `task` tool part, with the part identity that tells one dispatch from a replay. */
+    const taskPart = (jobId: string, partID: string, kind: 'started' | 'updated' = 'started'): object => ({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: ROOT,
+        part: {
+          id: partID,
+          type: 'tool',
+          tool: 'task',
+          sessionID: ROOT,
+          state: {
+            status: 'completed',
+            title: 'background task',
+            output: `<task id="${jobId}" state="running">\n<summary>Background task ${kind}</summary>\n</task>`,
+            metadata: {background: true, jobId},
+          },
+        },
+      },
+    })
+
+    /** The notice for dispatch `n`, with the same message/part ids the persisted copy carries. */
+    const noticeN = (n: number, childId = CHILD): object =>
+      noticeEvent(childId, {messageID: `msg-n${n}`, partID: `msg-n${n}-part-0`})
+
+    /** Persisted root turns: the prompt answered, then `n` injected notices for CHILD, each answered. */
+    const turnsWithNotices = (n: number): readonly object[] => [
+      PROMPT,
+      FIRST_REPLY,
+      ...Array.from({length: n}, (_, index) => [
+        userMessage(`msg-n${index + 1}`, [{id: CHILD}]),
+        assistantReply(`msg-reply-${index + 2}`, `msg-n${index + 1}`),
+      ]).flat(),
+    ]
+
+    const stateOf = (run: Run, id: string) =>
+      run.ownershipLedger?.snapshot().find(entry => entry.sessionId === id)?.state
+
+    /** Dispatch 1, the root idle that begins the drain, and the child finishing: the ledger settles, no notice yet. */
+    async function firstDispatchSettled(options: RunOptions = {}) {
+      const run = startRun({deadlineMs: 120_000, live: [CHILD], ...options})
+      await run.emit(taskPart(CHILD, 'tool-1'))
+      await run.emit(idleEvent())
+      run.live.delete(CHILD)
+      await run.emit(idleEvent())
+      expect(stateOf(run, CHILD)).toBe('settled')
+      return run
+    }
+
+    it('1. the second dispatch keeps the run open until its own notice and the parent reply to it are seen', async () => {
+      // #given dispatch 1 finished, its notice was injected, and the parent is working on that follow-up
+      const run = await firstDispatchSettled()
+      run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+      await run.emit(noticeN(1))
+      await run.emit(statusEvent('busy'))
+
+      // #when the parent dispatches the same task_id again, and the child is running again
+      run.live.add(CHILD)
+      await run.emit(taskPart(CHILD, 'tool-2'))
+
+      // #then the entry is outstanding again, and the first dispatch's notice does not satisfy the run
+      expect(stateOf(run, CHILD)).toBe('outstanding')
+      await run.emit(idleEvent())
+      await run.advance(5_000)
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the second dispatch finishes and the ledger settles, but its notice has not been injected yet
+      run.live.delete(CHILD)
+      await run.emit(idleEvent())
+      await run.advance(5_000)
+      expect(stateOf(run, CHILD)).toBe('settled')
+
+      // #then the stale first notice must not stand in for it
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the second notice is injected, the parent answers it, and goes idle
+      run.fixture.root = async () => ({data: [...turnsWithNotices(2)], error: null})
+      await run.emit(noticeN(2))
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then the run completes
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it("1b. the second dispatch's notice is not enough until the parent has answered it", async () => {
+      // #given both dispatches settled with both notices seen, but REST shows the second notice unanswered
+      const run = await firstDispatchSettled()
+      run.fixture.root = async () => ({
+        data: [...turnsWithNotices(1), userMessage('msg-n2', [{id: CHILD}])],
+        error: null,
+      })
+      await run.emit(noticeN(1))
+      run.live.add(CHILD)
+      await run.emit(taskPart(CHILD, 'tool-2'))
+      run.live.delete(CHILD)
+      await run.emit(idleEvent())
+      await run.emit(noticeN(2))
+      await run.emit(idleEvent())
+
+      // #when time passes
+      await run.advance(5_000)
+
+      // #then the latest root user message has no reply: held
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the parent answers it
+      run.fixture.root = async () => ({data: [...turnsWithNotices(2)], error: null})
+      await run.advance(1_000)
+      await run.done
+
+      // #then it completes
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('2. a replayed event for the same dispatch is not a second dispatch', async () => {
+      // #given dispatch 1 and 2 (both with their own tool part ids), each event also delivered a second time
+      const run = await firstDispatchSettled()
+      run.fixture.root = async () => ({data: [...turnsWithNotices(2)], error: null})
+      await run.emit(taskPart(CHILD, 'tool-1'))
+      await run.emit(noticeN(1))
+      run.live.add(CHILD)
+      await run.emit(taskPart(CHILD, 'tool-2'))
+      await run.emit(taskPart(CHILD, 'tool-2'))
+      run.live.delete(CHILD)
+      await run.emit(idleEvent())
+
+      // #when the second dispatch's notice arrives (twice), then a late replay of its tool event after it settled
+      await run.emit(noticeN(2))
+      await run.emit(noticeN(2))
+      await run.emit(taskPart(CHILD, 'tool-2'))
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then two dispatches needed two notices — not three — and the replay did not reopen the settled entry
+      expect(run.outcome()).toEqual({ok: true})
+      expect(stateOf(run, CHILD)).toBe('settled')
+    })
+
+    it('3. cancel evidence from the first dispatch does not exempt the second', async () => {
+      // #given dispatch 1 was cancelled (REST shows an aborted child message) and dispatch 2 reused the session
+      const run = startRun({deadlineMs: 60_000, live: [CHILD]})
+      run.fixture.child = async id => ({data: id === CHILD ? [abortedAssistant] : [], error: null})
+      await run.emit(taskPart(CHILD, 'tool-1'))
+      await run.emit(taskPart(CHILD, 'tool-2'))
+      await run.emit(idleEvent())
+
+      // #when the child stops and the ledger settles, with the root's prompt answered and no notice for either
+      run.live.delete(CHILD)
+      await run.emit(idleEvent())
+      await run.advance(5_000)
+
+      // #then the one aborted message covers one dispatch, not both: held
+      expect(stateOf(run, CHILD)).toBe('settled')
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the second dispatch is cancelled too (a second aborted message)
+      const childPrompt = (id: string) => ({info: {id, role: 'user', sessionID: CHILD}, parts: []})
+      run.fixture.child = async id =>
+        id === CHILD
+          ? {
+              data: [
+                childPrompt('c-u1'),
+                abortedAssistant,
+                childPrompt('c-u2'),
+                {...abortedAssistant, info: {...abortedAssistant.info, id: 'c-a2'}},
+              ],
+              error: null,
+            }
+          : {data: [], error: null}
+      await run.advance(1_000)
+      await run.done
+
+      // #then each dispatch had its own evidence, and the run completes
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('4. reconciliation does not settle the reopened entry while the second dispatch is live', async () => {
+      // #given dispatch 1 settled, then a second dispatch reopened the entry and the child is running
+      const run = await firstDispatchSettled()
+      run.live.add(CHILD)
+      await run.emit(taskPart(CHILD, 'tool-2'))
+      expect(stateOf(run, CHILD)).toBe('outstanding')
+
+      // #when the reconciler ticks and the root goes idle (both consult the live set)
+      await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+      await run.emit(idleEvent())
+
+      // #then it stays outstanding and the run stays open
+      expect(stateOf(run, CHILD)).toBe('outstanding')
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the child actually stops
+      run.live.delete(CHILD)
+      await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+
+      // #then the next pass settles it
+      expect(stateOf(run, CHILD)).toBe('settled')
+    })
+
+    it('5. extending a still-running job injects no second notice, so it requires none', async () => {
+      // #given one dispatch whose job the parent then extended while it was running ("Background task updated")
+      const run = startRun({deadlineMs: 60_000, live: [CHILD]})
+      run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+      await run.emit(taskPart(CHILD, 'tool-1'))
+      await run.emit(taskPart(CHILD, 'tool-2', 'updated'))
+      await run.emit(idleEvent())
+
+      // #when the job finishes and its single notice is injected
+      run.live.delete(CHILD)
+      await run.emit(noticeN(1))
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then one notice is enough
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('5b. a run whose background dispatches never reuse a session behaves as before', async () => {
+      // #given two different children, one notice each
+      const run = startRun({deadlineMs: 60_000})
+      run.fixture.root = async () => ({
+        data: [
+          PROMPT,
+          FIRST_REPLY,
+          userMessage('msg-n1', [{id: CHILD}]),
+          userMessage('msg-n2', [{id: CHILD2}]),
+          assistantReply('msg-reply-2', 'msg-n2'),
+        ],
+        error: null,
+      })
+      await run.emit(taskPart(CHILD, 'tool-1'))
+      await run.emit(taskPart(CHILD2, 'tool-2'))
+      await run.emit(noticeEvent(CHILD, {messageID: 'msg-n1', partID: 'msg-n1-part-0'}))
+      await run.emit(noticeEvent(CHILD2, {messageID: 'msg-n2', partID: 'msg-n2-part-0'}))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then it completes
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('6. a second notice the stream missed but REST persisted still counts', async () => {
+      // #given both dispatches settled; only the first notice arrived over the stream
+      const run = await firstDispatchSettled()
+      run.fixture.root = async () => ({data: [...turnsWithNotices(2)], error: null})
+      await run.emit(noticeN(1))
+      run.live.add(CHILD)
+      await run.emit(taskPart(CHILD, 'tool-2'))
+      run.live.delete(CHILD)
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then REST's persisted second notice satisfied the fence
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('7. a dispatch without a tool part identity keeps the old idempotent adoption (never reopens)', async () => {
+      // #given dispatch 1 settled, then a completion event with no part id or callID names the same child
+      const run = await firstDispatchSettled()
+      await run.emit(dispatchEvent(CHILD))
+
+      // #then it cannot be told from a replay, so the settled entry stays settled
+      expect(stateOf(run, CHILD)).toBe('settled')
+    })
+
+    it('8. reopening an entry reports a change, so persistence hears about it; no-ops stay silent', () => {
+      // #given a wrapped ledger with one settled entry
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'background task')
+      ledger.settle(CHILD)
+      const onChange = vi.fn()
+      const onAdopted = vi.fn()
+      const wrapped = wrapLedgerWithHooks(ledger, onChange, onAdopted)
+
+      // #when it is reopened, then reopened again
+      wrapped.reopen(CHILD)
+      wrapped.reopen(CHILD)
+
+      // #then persistence was told once; the session was already registered with the coordinator
+      expect(onChange).toHaveBeenCalledTimes(1)
+      expect(onAdopted).not.toHaveBeenCalled()
+      expect(ledger.snapshot()[0]?.state).toBe('outstanding')
+    })
   })
 })
