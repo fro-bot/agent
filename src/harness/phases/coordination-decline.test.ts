@@ -3,7 +3,7 @@ import type {TriggerContext, TriggerTarget} from '../../features/triggers/types.
 import type {Octokit} from '../../services/github/types.js'
 import * as core from '@actions/core'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {addLabelsToIssue, ensureLabelExists} from '../../services/github/api.js'
+import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssue} from '../../services/github/api.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   BLOCKED_LABEL,
@@ -25,6 +25,7 @@ vi.mock('@actions/core', () => ({
 vi.mock('../../services/github/api.js', () => ({
   addLabelsToIssue: vi.fn().mockResolvedValue(true),
   ensureLabelExists: vi.fn().mockResolvedValue(true),
+  removeLabelFromIssue: vi.fn().mockResolvedValue(true),
 }))
 
 const client = {} as Octokit
@@ -116,11 +117,48 @@ describe('runCoordinationDecline', () => {
     expect(text).toContain('applied')
     expect(text).toContain('No agent execution occurred. This request was not automatically requeued.')
     expect(text).toContain('Editing the issue alone does not retrigger')
-    expect(text).toContain('Remove the `agent: blocked` label manually after re-triggering')
+    expect(text).toContain('removed automatically when a later run for this item succeeds')
+    expect(text).toContain('remove it manually if needed')
+    expect(text).not.toContain('manually after re-triggering')
     expect(core.summary.write).toHaveBeenCalled()
 
     // #and a warning annotation carries the same reason
     expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Another Fro Bot Action run is active'))
+  })
+
+  it('re-stamps the label: removes it before adding it so every skip emits a fresh labeled event', async () => {
+    // #given an issue target (the label may already be present from an earlier skip)
+    // #when the decline runs
+    await runCoordinationDecline({
+      githubClient: client,
+      triggerContext: createContext(target('issue')),
+      holder: createHolder(),
+      reason: 'active-holder',
+      responseMode: 'github',
+      logger: createMockLogger(),
+    })
+
+    // #then the label is removed, then added back -- in that order
+    expect(removeLabelFromIssue).toHaveBeenCalledWith(client, 'fro-bot/agent', 7, BLOCKED_LABEL, expect.anything())
+    const removeOrder = vi.mocked(removeLabelFromIssue).mock.invocationCallOrder[0]
+    const addOrder = vi.mocked(addLabelsToIssue).mock.invocationCallOrder[0]
+    expect(removeOrder).toBeLessThan(addOrder as number)
+  })
+
+  it('does not touch the label (remove or add) under response-mode none or for non-issue targets', async () => {
+    // #when response-mode is none
+    await runCoordinationDecline({
+      githubClient: client,
+      triggerContext: createContext(target('issue')),
+      holder: createHolder(),
+      reason: 'active-holder',
+      responseMode: 'none',
+      logger: createMockLogger(),
+    })
+
+    // #then neither remove nor add is called
+    expect(removeLabelFromIssue).not.toHaveBeenCalled()
+    expect(addLabelsToIssue).not.toHaveBeenCalled()
   })
 
   it('labels pull request targets', async () => {

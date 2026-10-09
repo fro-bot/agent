@@ -3,7 +3,7 @@ import type {TriggerContext} from '../../features/triggers/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import * as core from '@actions/core'
-import {addLabelsToIssue, ensureLabelExists} from '../../services/github/api.js'
+import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssue} from '../../services/github/api.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {escapeSummaryText as cell} from '../../shared/summary-escape.js'
 import {parseActionHolderRunId} from './acquire-lock.js'
@@ -97,6 +97,10 @@ async function applyBlockedLabel(
       logger,
     )
     if (exists === false) return false
+    // Re-stamp: adding a label that is already present creates no new `labeled` event, so a later successful run
+    // could not tell this skip from an older one. Remove first (a 404 for an absent label is tolerated by
+    // `removeLabelFromIssue`; any other remove failure is logged there and we still add so the label is visible).
+    await removeLabelFromIssue(client, repoString, issueNumber, BLOCKED_LABEL, logger)
     return await addLabelsToIssue(client, repoString, issueNumber, [BLOCKED_LABEL], logger)
   } catch (error) {
     logger.warning('Failed to apply blocked label (non-fatal)', {error: toErrorMessage(error)})
@@ -134,7 +138,8 @@ async function writeCoordinationSkipSummary(
       .addRaw(
         '\nNo agent execution occurred. This request was not automatically requeued.\n\n' +
           '**Recovery:** re-run this workflow, or mention the bot again after the other run finishes. ' +
-          'Editing the issue alone does not retrigger it. Remove the `agent: blocked` label manually after re-triggering.\n',
+          'Editing the issue alone does not retrigger it. The `agent: blocked` label is removed automatically when a ' +
+          'later run for this item succeeds; remove it manually if needed.\n',
       )
 
     await core.summary.write()
@@ -146,7 +151,8 @@ async function writeCoordinationSkipSummary(
 /**
  * Makes a coordination-contended skip visible without breaking the Response Protocol (no comment, no reaction):
  * a job-summary section, a warning annotation, and — for routed issue/PR targets — the `agent: blocked` label,
- * which stays until an operator removes it. Every step is best-effort; this never throws.
+ * re-stamped (removed, then added) so every skip emits a fresh `labeled` event. A later successful run for the same
+ * item clears it (`coordination-clear.ts`). Every step is best-effort; this never throws.
  */
 export async function runCoordinationDecline(options: CoordinationDeclineOptions): Promise<void> {
   const {githubClient, triggerContext, holder, reason, responseMode, logger} = options

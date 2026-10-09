@@ -13,6 +13,8 @@ export interface MockOctokitOverrides {
   readonly deleteReaction?: Mock | void
   readonly addLabels?: Mock | void
   readonly removeLabel?: Mock | void
+  readonly listLabelsOnIssue?: Mock | unknown[]
+  readonly listEvents?: Mock | unknown[]
   readonly getContent?: Mock | unknown
   readonly createBlob?: Mock | {sha: string}
   readonly createTree?: Mock | {sha: string}
@@ -134,6 +136,14 @@ export function createMockOctokit(overrides: MockOctokitOverrides = {}): Octokit
           typeof overrides.removeLabel === 'function'
             ? overrides.removeLabel
             : vi.fn().mockResolvedValue({data: overrides.removeLabel ?? undefined}),
+        listLabelsOnIssue:
+          typeof overrides.listLabelsOnIssue === 'function'
+            ? overrides.listLabelsOnIssue
+            : vi.fn().mockResolvedValue({data: overrides.listLabelsOnIssue ?? []}),
+        listEvents:
+          typeof overrides.listEvents === 'function'
+            ? overrides.listEvents
+            : vi.fn().mockResolvedValue({data: overrides.listEvents ?? [], headers: {}}),
         createLabel:
           typeof overrides.createLabel === 'function'
             ? overrides.createLabel

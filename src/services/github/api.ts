@@ -217,6 +217,108 @@ export async function removeLabelFromIssue(
 }
 
 /**
+ * List the label names currently on an issue or PR (one call, up to GitHub's 100-label-per-item cap).
+ * Returns `null` on any API failure so callers can tell "unreadable" apart from "no labels".
+ */
+export async function listLabelsOnIssue(
+  client: Octokit,
+  repoString: string,
+  issueNumber: number,
+  logger: Logger,
+): Promise<readonly string[] | null> {
+  try {
+    const {owner, repo} = parseRepoString(repoString)
+    const {data} = await client.rest.issues.listLabelsOnIssue({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: 100,
+    })
+    return data.map(label => label.name)
+  } catch (error) {
+    logger.warning('Failed to list labels on issue', {issueNumber, error: toErrorMessage(error)})
+    return null
+  }
+}
+
+const EVENTS_PAGE_SIZE = 100
+// The last page can hold only unrelated events; look back at most this many pages (including the last) before giving up.
+const MAX_EVENT_PAGES_SCANNED = 3
+
+/** Page number of the `rel="last"` entry in a GitHub `Link` header, or `null` when there is no further paging. */
+function parseLastPage(linkHeader: string | number | undefined): number | null {
+  if (typeof linkHeader !== 'string') return null
+  for (const part of linkHeader.split(',')) {
+    if (part.includes('rel="last"') === false) continue
+    const match = /[?&]page=(\d+)/.exec(part)
+    if (match?.[1] != null) return Number(match[1])
+  }
+  return null
+}
+
+interface IssueEventLike {
+  readonly event: string
+  readonly created_at: string
+  readonly label?: {readonly name: string}
+}
+
+/**
+ * Epoch ms of the most recent `labeled` event for each of `labels` on an issue or PR, found in ONE pass over the
+ * (chronologically ordered) issue events: the LAST page first (learned from the `Link` header on page 1), then a
+ * bounded look-back toward page 1 until every requested label has been seen. Page 1 is reused, never refetched, so
+ * a single-page item costs one call. The returned map is keyed by the label strings passed in and omits labels with
+ * no `labeled` event within the scanned pages. Returns `null` on any API failure so "unreadable" is distinguishable
+ * from "not found".
+ */
+export async function getLatestLabeledEventTimes(
+  client: Octokit,
+  repoString: string,
+  issueNumber: number,
+  labels: readonly string[],
+  logger: Logger,
+): Promise<ReadonlyMap<string, number> | null> {
+  try {
+    const {owner, repo} = parseRepoString(repoString)
+    const fetchPage = async (page: number) =>
+      client.rest.issues.listEvents({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        per_page: EVENTS_PAGE_SIZE,
+        page,
+      })
+
+    const wanted = new Map(labels.map(label => [label.toLowerCase(), label]))
+    const found = new Map<string, number>()
+    const first = await fetchPage(1)
+    const lastPage = parseLastPage(first.headers.link) ?? 1
+    let page = lastPage
+    let response = lastPage === 1 ? first : await fetchPage(lastPage)
+    for (let scanned = 0; scanned < MAX_EVENT_PAGES_SCANNED; scanned++) {
+      // Pages are scanned newest-first, so a label already found came from a later page and is never overwritten.
+      const pageLatest = new Map<string, number>()
+      for (const event of response.data as readonly IssueEventLike[]) {
+        const label = event.event === 'labeled' ? wanted.get(event.label?.name.toLowerCase() ?? '') : undefined
+        if (label == null) continue
+        const at = Date.parse(event.created_at)
+        if (Number.isNaN(at)) continue
+        if (at > (pageLatest.get(label) ?? Number.NEGATIVE_INFINITY)) pageLatest.set(label, at)
+      }
+      for (const [label, at] of pageLatest) {
+        if (found.has(label) === false) found.set(label, at)
+      }
+      if (found.size === wanted.size || page <= 1 || scanned + 1 >= MAX_EVENT_PAGES_SCANNED) break
+      page -= 1
+      response = page === 1 ? first : await fetchPage(page)
+    }
+    return found
+  } catch (error) {
+    logger.warning('Failed to read issue events', {issueNumber, labels, error: toErrorMessage(error)})
+    return null
+  }
+}
+
+/**
  * Get the default branch of a repository.
  */
 export async function getDefaultBranch(client: Octokit, repoString: string, logger: Logger): Promise<string> {

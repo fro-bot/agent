@@ -8,9 +8,11 @@ import {
   deleteCommentReaction,
   ensureLabelExists,
   getDefaultBranch,
+  getLatestLabeledEventTimes,
   getRepositoryPermission,
   getUserByUsername,
   listCommentReactions,
+  listLabelsOnIssue,
   parseRepoString,
   removeLabelFromIssue,
 } from './api.js'
@@ -506,6 +508,102 @@ describe('getUserByUsername', () => {
     const result = await getUserByUsername(mockClient, 'unknown', mockLogger)
 
     // #then
+    expect(result).toBeNull()
+  })
+})
+
+describe('listLabelsOnIssue', () => {
+  it('returns the label names', async () => {
+    // #given an issue with two labels
+    const client = createMockOctokit({listLabelsOnIssue: [{name: 'bug'}, {name: 'agent: blocked'}]})
+
+    // #when listing
+    const result = await listLabelsOnIssue(client, 'owner/repo', 42, createMockLogger())
+
+    // #then names come back from a single call
+    expect(result).toEqual(['bug', 'agent: blocked'])
+    expect(client.rest.issues.listLabelsOnIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns null (not an empty list) when the call fails', async () => {
+    // #given the API fails
+    const client = createMockOctokit({listLabelsOnIssue: vi.fn().mockRejectedValue(new Error('boom'))})
+    const logger = createMockLogger()
+
+    // #when listing
+    const result = await listLabelsOnIssue(client, 'owner/repo', 42, logger)
+
+    // #then failure is distinguishable from "no labels" and is logged
+    expect(result).toBeNull()
+    expect(logger.warning).toHaveBeenCalled()
+  })
+})
+
+describe('getLatestLabeledEventTimes', () => {
+  const lastLink = (page: number) => ({
+    link: `<https://api.github.com/x?per_page=100&page=2>; rel="next", <https://api.github.com/x?per_page=100&page=${page}>; rel="last"`,
+  })
+  const labeled = (createdAt: string, name: string) => ({event: 'labeled', created_at: createdAt, label: {name}})
+  const other = {event: 'commented', created_at: '2026-10-09T12:00:00Z'}
+  const wanted = ['agent: blocked', 'agent: working']
+
+  it('reads only page 1 when there is no Link header, returning both labels', async () => {
+    // #given a single page carrying both labels
+    const listEvents = vi.fn().mockResolvedValue({
+      data: [labeled('2026-10-09T10:00:00Z', 'agent: blocked'), labeled('2026-10-09T11:00:00Z', 'agent: working')],
+      headers: {},
+    })
+    const client = createMockOctokit({listEvents})
+
+    // #when reading the latest labeled times
+    const result = await getLatestLabeledEventTimes(client, 'owner/repo', 1, wanted, createMockLogger())
+
+    // #then one call, both times
+    expect(listEvents).toHaveBeenCalledTimes(1)
+    expect(result?.get('agent: blocked')).toBe(Date.parse('2026-10-09T10:00:00Z'))
+    expect(result?.get('agent: working')).toBe(Date.parse('2026-10-09T11:00:00Z'))
+  })
+
+  it('scans back from the last page until both labels are found, once per page', async () => {
+    // #given the last page (3) has only other events, page 2 has the working label, page 1 has the blocked one
+    const pages: Record<number, unknown[]> = {
+      1: [labeled('2026-10-09T09:00:00Z', 'agent: blocked')],
+      2: [labeled('2026-10-09T10:00:00Z', 'agent: working')],
+      3: [other],
+    }
+    const listEvents = vi
+      .fn()
+      .mockImplementation(async ({page}: {page: number}) => ({data: pages[page], headers: lastLink(3)}))
+    const client = createMockOctokit({listEvents})
+
+    // #when reading
+    const result = await getLatestLabeledEventTimes(client, 'owner/repo', 1, wanted, createMockLogger())
+
+    // #then both are found, page 1 is fetched exactly once, and no page repeats
+    expect(result?.get('agent: working')).toBe(Date.parse('2026-10-09T10:00:00Z'))
+    expect(result?.get('agent: blocked')).toBe(Date.parse('2026-10-09T09:00:00Z'))
+    expect(listEvents.mock.calls.map(call => (call[0] as {page: number}).page)).toEqual([1, 3, 2])
+  })
+
+  it('omits labels with no labeled event instead of failing', async () => {
+    // #given a page with no matching events
+    const client = createMockOctokit({listEvents: vi.fn().mockResolvedValue({data: [other], headers: {}})})
+
+    // #when reading
+    const result = await getLatestLabeledEventTimes(client, 'owner/repo', 1, wanted, createMockLogger())
+
+    // #then an empty map (not null) is returned
+    expect(result?.size).toBe(0)
+  })
+
+  it('returns null when events cannot be read', async () => {
+    // #given a failing events API
+    const client = createMockOctokit({listEvents: vi.fn().mockRejectedValue(new Error('500'))})
+
+    // #when reading
+    const result = await getLatestLabeledEventTimes(client, 'owner/repo', 1, wanted, createMockLogger())
+
+    // #then null
     expect(result).toBeNull()
   })
 })
