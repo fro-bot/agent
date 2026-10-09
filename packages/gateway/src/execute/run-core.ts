@@ -28,7 +28,10 @@ import type {
   Logger as RuntimeLogger,
 } from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
+import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
+import type {TerminalListener} from '../approvals/request-gate.js'
 import type {GatewayLogger} from '../discord/client.js'
+import type {DrainCompletion} from './drain-completion.js'
 
 import {
   createInactivityTimer,
@@ -37,12 +40,18 @@ import {
   reconcileLedgerOnce,
 } from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
+import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
+import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
+import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 
 // ---------------------------------------------------------------------------
 // Typed error
 // ---------------------------------------------------------------------------
+
+/** Which kind of request a human wait is held for. */
+type HumanWaitKind = 'approval' | 'question'
 
 /** Discriminant for `RunCoreError` — `run.ts` maps these to coarse Discord replies. */
 export type RunCoreErrorKind =
@@ -150,6 +159,19 @@ export interface RunCoreParams {
    */
   readonly coordinator?: PermissionCoordinator
   /**
+   * Question coordinator. When absent, `question.*` events are not handled: an owned
+   * `question.asked` is warn-logged and does not pause the inactivity watchdog.
+   */
+  readonly questions?: QuestionCoordinator
+  /**
+   * Subscription to the request gate's terminal notifications (`RequestGate.onTerminal`).
+   * `runOpenCodeCore` subscribes once for the run and releases the matching human wait on
+   * every terminal event, so a settlement that produces no OpenCode echo (deadline skip,
+   * failed reply, teardown) still re-arms the watchdog and unblocks drain. Unsubscribed
+   * when the event loop exits. No-op when absent.
+   */
+  readonly onHumanWaitTerminal?: (listener: TerminalListener) => () => void
+  /**
    * Optional hook called with each essential tool-action summary string as it is appended.
    * Receives the same summary string that `appendToolSummary` computes — no recomputation.
    * Used by `run.ts` to drive the status controller's `noteActivity`.
@@ -183,13 +205,17 @@ export interface RunCoreParams {
    *   `state.metadata.background === true` — the observable signal that a
    *   background dispatch was made (see `tool/task.ts` upstream).
    * - Treats the root session's `session.idle` as a DRAIN signal rather than
-   *   completion when the ledger has outstanding entries: the run keeps
-   *   consuming the event stream (routing descendant approvals/activity as
-   *   normal) and periodically reconciling (via `createLedgerReconciler`)
-   *   until every entry settles or the run's own deadline (`signal`) expires.
-   *   Only once the ledger reports drain-complete does `runOpenCodeCore`
-   *   return — so a caller awaiting this call already waits out the full
-   *   drain, and no separate drain stage is needed in `run.ts`.
+   *   completion once any dispatch was adopted: the run keeps consuming the
+   *   event stream (routing descendant approvals/activity as normal) and
+   *   periodically reconciling (via `createLedgerReconciler`) until the
+   *   drain-completion gate (`drain-completion.ts`) admits success or the
+   *   run's own deadline (`signal`) expires. A settled ledger alone is not
+   *   enough: upstream marks a child non-live BEFORE it injects the parent's
+   *   follow-up turn, so the gate also needs each child's completion notice
+   *   (or REST cancel evidence), current root idle, and REST corroboration.
+   *   `runOpenCodeCore` returns only then — so a caller awaiting this call
+   *   already waits out the full drain, and no separate drain stage is
+   *   needed in `run.ts`. A run that never adopted a dispatch is unaffected.
    * - On deadline expiry while draining, cancels every still-outstanding
    *   entry individually (`session.abort`) and throws `RunCoreError` with
    *   kind `'drain-timeout'` instead of waiting indefinitely.
@@ -434,6 +460,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     signal,
     logger,
     coordinator,
+    questions,
+    onHumanWaitTerminal,
     approvalMode,
     onActivity,
     onBusy,
@@ -478,12 +506,24 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // preserve the exact prior timing (no timer running during session.create/subscribe).
   inactivityTimer.pause()
 
+  // Watchdog pause state, consulted by `resetInactivity`. `draining` becomes true the first time the root
+  // goes idle with owned work outstanding (see 1c); `outstandingHumanWaits` is the request ids a human
+  // still has to settle (see the human-wait gauge below).
+  let draining = false
+  const outstandingHumanWaits = new Map<string, HumanWaitKind>()
+
   function clearInactivity(): void {
     inactivityTimer.pause()
   }
 
+  // The single re-arm path. The watchdog stays paused while a human is being waited on or while the
+  // run drains owned background work: activity (text, tool completions, owned children, parallel tools)
+  // then must not re-arm it, or a quiet human wait / drain would trip `inactivity-timeout` before the
+  // question deadline or the run's own deadline. Releasing the last human wait outside drain is the one
+  // path that re-arms, and it does so after the wait is deleted, so the guard sees an empty gauge.
   function resetInactivity(): void {
     if (!inactivityArmed) return
+    if (draining === true || outstandingHumanWaits.size > 0) return
     inactivityTimer.reset()
   }
 
@@ -544,8 +584,26 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // (never a failure) that unblocks the abortable stream once the ledger
   // reports drain-complete, without conflating that with `combinedSignal`
   // (whose abort always means timeout/inactivity/cancel).
-  let draining = false
+  // (`draining` itself is declared with the inactivity timer above: the watchdog consults it.)
   const drainDoneController = new AbortController()
+
+  // A ledger mutation only asks the drain-completion gate to validate; it never completes the drain
+  // itself. A settled ledger means every child is non-live, which upstream does BEFORE it injects the
+  // parent's follow-up turn (see `drain-completion.ts`), so the ledger alone is not completion. Human
+  // waits take no part either: a root `question` tool call blocks inside the root runner, and a
+  // foreground child keeps the root blocked on its `task` tool, so root idle with a question pending can
+  // only mean an owned background child, which is already a ledger entry.
+  // Assigned once the reconcile adapter exists (below); stays undefined for a run with no ledger.
+  let drainCompletion: DrainCompletion | undefined
+
+  // What the stream actually delivered to the sink. The drain-completion gate's delivery fence consults it: the
+  // sink is append-only, so completion waits for the follow-up reply to be delivered rather than repairing it.
+  const replyDelivery = createReplyDeliveryTracker()
+
+  // Only ROOT text counts: the fence is about the parent's follow-up reply, not a descendant's output.
+  function recordDelivered(eventSessionID: string | null, partId: string | null, text: string): void {
+    if (drainCompletion !== undefined && eventSessionID === sessionId) replyDelivery.recordDelta(partId, text)
+  }
 
   function persistOwnership(): void {
     if (ownershipLedger === undefined) return
@@ -556,12 +614,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     onOwnershipChange?.({rootSessionId: sessionId, ownedSessionIds})
   }
 
-  function checkDrainComplete(): void {
-    if (ownershipLedger !== undefined && draining === true && ownershipLedger.isDrainComplete()) {
-      drainDoneController.abort()
-    }
-  }
-
   const ledger: OwnershipLedger | undefined =
     ownershipLedger === undefined
       ? undefined
@@ -569,7 +621,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           ownershipLedger,
           () => {
             persistOwnership()
-            checkDrainComplete()
+            drainCompletion?.requestValidation()
           },
           // A directly-observed dispatch (the task-tool-completion path below) must become
           // visible to event routing (`coordinator.isOwned`) the moment it is adopted —
@@ -595,6 +647,21 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           logger: runtimeLogger,
         })
 
+  if (ledger !== undefined && reconcileAdapter !== undefined) {
+    drainCompletion = createDrainCompletion({
+      client,
+      directory,
+      rootSessionId: sessionId,
+      ledger,
+      adapter: reconcileAdapter,
+      signal: combinedSignal,
+      logger,
+      isReplyDelivered: parts => replyDelivery.covers(parts),
+      // The only path that completes a drain: an admitted validation unblocks the stream.
+      onAdmitted: () => drainDoneController.abort(),
+    })
+  }
+
   // ── 1d. Termination barrier ─────────────────────────────────────────────────
   // Every RunCoreError thrown from this point on (session create/ledger creation
   // already happened above — a throw before this point has no owned work to settle)
@@ -606,8 +673,17 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // still alive and writing. If settlement cannot be confirmed within its bound, the
   // SAME kind and message re-throw with `quarantined: true` (never a different kind —
   // quarantine is additional evidence, not a replacement explanation).
+  //
+  // Follow-up window: a run that adopted background work keeps draining after its children settle, because
+  // upstream then injects a follow-up turn on the ROOT, which may be writing to the checkout again. A failure
+  // there (cancel, deadline, a dropped stream) must not take the settled-ledger fast path: the root is aborted
+  // and confirmed quiescent first (`confirmRootQuiescent`), inside the same teardown budget, and an unconfirmed
+  // root is quarantined exactly like an unconfirmed child. Runs that never adopted background work are never
+  // `draining`, so they keep the original fast path.
   async function throwWithBarrier(kind: RunCoreErrorKind, message: string): Promise<never> {
-    if (ledger === undefined || ledger.isDrainComplete() === true) {
+    const rootFollowUpOpen =
+      drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false
+    if (ledger === undefined || (ledger.isDrainComplete() === true && rootFollowUpOpen === false)) {
       throw new RunCoreError(kind, message)
     }
     const settlement = await settleOwnedSessions({
@@ -616,6 +692,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       rootSessionId: sessionId,
       ledger,
       logger,
+      ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
     })
     if (settlement.settled === true) {
       throw new RunCoreError(kind, message)
@@ -695,6 +772,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // the only way to distinguish them from text deltas.
   const reasoningPartIds = new Set<string>()
 
+  // Part IDs of synthetic background-task notices. A notice is the harness talking to the parent agent,
+  // never reply text: nothing carrying one of these ids may reach the sink.
+  const noticePartIds = new Set<string>()
+
   // Wrap the raw event stream in an abort-aware iterator so we do not block
   // indefinitely waiting for the next event when the signal fires mid-stream.
   // The inner generator races each `next()` call against the abort signal so
@@ -724,6 +805,49 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     resetInactivity()
   }
 
+  // Human-wait gauge: the request ids a human still has to settle, approvals and questions alike.
+  // The inactivity watchdog is paused while the map is non-empty and, outside drain, re-armed with
+  // a fresh window only when the last id is released. Keying by request id keeps both directions
+  // idempotent: a duplicate ask adds nothing, and a release for an unknown or already-released id
+  // changes nothing, so the count can never drift or go negative.
+  //
+  // The gauge never influences drain. While `draining` the watchdog stays paused whatever is
+  // released: the run's hard deadline (or a cancel) is the only bound, as it is without human waits.
+  // Re-arming mid-drain would let a quiet but valid background child trip the inactivity timer,
+  // which the post-loop classification reports as `drain-timeout` and cancels owned work early.
+  //
+  // Releases come from three places, all through `releaseHumanWait`: OpenCode's echo, the request
+  // gate's terminal notification (which also fires for settlements that produce no echo: deadline
+  // skip, failed reply, teardown), and a question that was skipped without being registered.
+  //
+  // Once the event loop has exited the run no longer owns the watchdog: late releases (an
+  // asynchronous skip finishing after the run ended) must not re-arm a timer nobody disposes.
+  let humanWaitsClosed = false
+
+  function holdHumanWait(requestId: string, kind: HumanWaitKind): void {
+    outstandingHumanWaits.set(requestId, kind)
+    // Pause typing while waiting on a human: the run is blocked, not actively working.
+    onBusy?.(false)
+    clearInactivity()
+  }
+
+  function releaseHumanWait(requestId: string): void {
+    if (humanWaitsClosed === true) return
+    if (!outstandingHumanWaits.delete(requestId)) return
+    // Drain is bounded by the ledger and the run deadline alone: stay paused and quiet.
+    if (draining === true) return
+    if (outstandingHumanWaits.size > 0) return
+    // Last outstanding item settled outside drain: the run is unblocked, so resume typing and re-arm.
+    onBusy?.(true)
+    markActivity()
+  }
+
+  // Terminal notifications from the request gate release the wait for any settlement path.
+  // Subscribed here (before the loop) and unsubscribed in the loop's finally.
+  const unsubscribeHumanWaitTerminal = onHumanWaitTerminal?.(event => {
+    releaseHumanWait(event.requestID)
+  })
+
   // Ownership check: true for the root session, or a descendant session this
   // run's ledger has adopted (surfaced through `coordinator.isOwned`). False
   // for a null session id (no session on the payload) and false for any
@@ -736,6 +860,44 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // binding is needed at all).
   function isOwnedSession(eventSessionID: string | null): boolean {
     return eventSessionID !== null && ownershipCoordinator.isOwned(eventSessionID)
+  }
+
+  // Feeds the drain-completion gate. ROOT session only — a descendant's activity never changes root
+  // lifecycle state. Invalidating: a new root user message (an injected notice included), a root busy/retry
+  // status, and root assistant/text/tool activity. A notice also registers its injected user message before
+  // anything can test completion. No-op for a run with no ledger.
+  function observeRootForDrain(rawEvent: unknown, eventType: string | null, eventPayload: unknown): void {
+    if (drainCompletion === undefined) return
+    if (eventType === 'message.part.updated') {
+      const part = getObjectProperty(eventPayload, 'part')
+      if ((getSessionID(eventPayload) ?? getSessionID(part)) !== sessionId) return
+      const notice = parseSyntheticNoticePart(part)
+      if (notice === null) {
+        drainCompletion.noteRootActivity()
+        return
+      }
+      const partId = getStringProperty(part, 'id')
+      if (partId !== null) noticePartIds.add(partId)
+      drainCompletion.noteNotice(notice, getStringProperty(part, 'messageID'), partId)
+    } else if (eventType === 'message.updated') {
+      const info = getObjectProperty(eventPayload, 'info')
+      if ((getSessionID(eventPayload) ?? getSessionID(info)) !== sessionId) return
+      const role = getStringProperty(info, 'role')
+      const messageId = getStringProperty(info, 'id')
+      if (role === 'user' && messageId !== null) drainCompletion.noteRootUserMessage(messageId)
+      else if (role === 'assistant') drainCompletion.noteRootActivity()
+    } else if (eventType === 'session.status') {
+      if (getEventSessionID(rawEvent) !== sessionId) return
+      const statusType = getStringProperty(getObjectProperty(eventPayload, 'status'), 'type')
+      if (statusType === 'busy' || statusType === 'retry') drainCompletion.noteRootActivity()
+    } else if (
+      (eventType === 'message.part.delta' ||
+        eventType === 'session.next.text.delta' ||
+        eventType === 'session.next.tool.called' ||
+        eventType === 'session.next.tool.success') &&
+      getEventSessionID(rawEvent) === sessionId
+    )
+      drainCompletion.noteRootActivity()
   }
 
   try {
@@ -754,6 +916,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       totalEvents += 1
       lastEventType = eventType ?? undefined
 
+      // Root-only freshness bookkeeping for the drain-completion gate. Observation only: it never alters
+      // the routing below, so a run that adopted nothing sees no behavioural difference.
+      observeRootForDrain(rawEvent, eventType, eventPayload)
+
       if (eventType === 'message.part.delta') {
         // New SDK shape: streaming text delta events.
         // delta may be {type:'text', text:string} or a plain string when field === 'text'.
@@ -761,17 +927,19 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         const eventSessionID = getEventSessionID(rawEvent)
         if (isOwnedSession(eventSessionID)) {
           const deltaPartId = getStringProperty(eventPayload, 'partID')
-          if (deltaPartId !== null && reasoningPartIds.has(deltaPartId)) {
-            // This delta belongs to a reasoning part — suppress it entirely.
+          if (deltaPartId !== null && (reasoningPartIds.has(deltaPartId) || noticePartIds.has(deltaPartId))) {
+            // This delta belongs to a reasoning part or a synthetic background-task notice — suppress it entirely.
           } else {
             const delta = getObjectProperty(eventPayload, 'delta')
             const deltaType = getStringProperty(delta, 'type')
             const deltaText = getStringProperty(delta, 'text')
             if (deltaType === 'text' && deltaText != null) {
               sink.append(deltaText)
+              recordDelivered(eventSessionID, deltaPartId, deltaText)
               markActivity()
             } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
               sink.append(delta)
+              recordDelivered(eventSessionID, deltaPartId, delta)
               markActivity()
             }
           }
@@ -785,6 +953,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
           if (deltaText != null) {
             sink.append(deltaText)
+            recordDelivered(eventSessionID, null, deltaText)
             markActivity()
           }
         }
@@ -913,11 +1082,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           if (req === null) {
             logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
           } else {
-            // Pause typing while waiting on a human approval — the run is blocked,
-            // not actively working. Typing would falsely imply active work.
-            onBusy?.(false)
-            // Pause the inactivity timer while waiting for human approval.
-            clearInactivity()
+            // Pauses typing and the inactivity timer until every outstanding approval is released.
+            holdHumanWait(req.requestID, 'approval')
             // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
             // eslint-disable-next-line no-void
             void coordinator.onPermissionAsked(req)
@@ -933,13 +1099,87 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           if (ev === null) {
             logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
           } else {
-            // Approval resolved — resume typing if the run continues.
-            onBusy?.(true)
-            markActivity() // Re-arm inactivity now that the run is unblocked.
+            // Resumes typing and re-arms inactivity only if no other human-wait item remains.
+            releaseHumanWait(ev.requestID)
             coordinator.onPermissionReplied(ev)
             logger.info(
               {requestID: ev.requestID, reply: ev.reply},
               'run-core: permission.replied forwarded to coordinator',
+            )
+          }
+        }
+      } else if (eventType === 'question.asked') {
+        const eventSessionID = getEventSessionID(rawEvent)
+        const askedRequestID = safeLogId(getStringProperty(eventPayload, 'id'))
+        if (isOwnedSession(eventSessionID) === false) {
+          // A question from a session this run does not own must not reach this run's operators.
+          // Logged because the asking session is blocked on it: ids and a reason code only.
+          logger.warn(
+            {eventType, requestID: askedRequestID, sessionID: safeLogId(eventSessionID), reason: 'unowned-session'},
+            'run-core: question.asked from a session this run does not own — ignoring',
+          )
+        } else if (questions === undefined) {
+          logger.warn(
+            {eventType, requestID: askedRequestID, sessionID: safeLogId(eventSessionID), reason: 'no-question-handler'},
+            'run-core: question.asked but no question handler is configured — ignoring',
+          )
+        } else {
+          const parsed = parseQuestionRequest(eventPayload)
+          if (parsed.kind === 'malformed') {
+            logger.warn(
+              {eventType, requestID: askedRequestID, sessionID: safeLogId(eventSessionID), reason: parsed.reason},
+              'run-core: question.asked payload malformed — skipping',
+            )
+            // The asking tool call is blocked on this request. When its id is readable, reject it
+            // (fire-and-continue) so the agent's turn ends now instead of at the inactivity timeout.
+            // A payload with no readable id cannot be addressed and stays warn-only.
+            const rawAskedRequestID = getStringProperty(eventPayload, 'id')
+            if (rawAskedRequestID !== null && rawAskedRequestID.length > 0 && eventSessionID !== null) {
+              // eslint-disable-next-line no-void
+              void questions.onMalformed({
+                requestID: rawAskedRequestID,
+                sessionID: eventSessionID,
+                reason: parsed.reason,
+              })
+            }
+          } else {
+            const req = parsed.value
+            // Pauses typing and the inactivity timer until every outstanding human wait is released.
+            holdHumanWait(req.requestID, 'question')
+            // Fire-and-continue: do NOT await — awaiting would starve the SSE drain. A question the
+            // coordinator did not hand to the gate (skipped for lack of budget, or a failed
+            // registration) will never produce a terminal event, so release its wait here.
+            questions
+              .onAsked(req)
+              .then(outcome => {
+                if (outcome === 'skipped' || outcome === 'failed') releaseHumanWait(req.requestID)
+              })
+              .catch(() => {
+                releaseHumanWait(req.requestID)
+              })
+            logger.info(
+              {requestID: req.requestID, sessionID: req.sessionID},
+              'run-core: question.asked forwarded to question handler',
+            )
+          }
+        }
+      } else if (eventType === 'question.replied' || eventType === 'question.rejected') {
+        // Authoritative settlement from OpenCode — works whether or not the gateway claimed the request.
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (isOwnedSession(eventSessionID) && questions !== undefined) {
+          const parsed = parseQuestionEcho(eventType, eventPayload)
+          if (parsed.kind === 'malformed') {
+            logger.warn(
+              {eventType, sessionID: safeLogId(eventSessionID), reason: parsed.reason},
+              'run-core: question echo payload malformed — skipping',
+            )
+          } else {
+            questions.onEcho(parsed.value)
+            // The echo is proof OpenCode is unblocked, so release even if the gate had no entry for it.
+            releaseHumanWait(parsed.value.requestID)
+            logger.info(
+              {requestID: parsed.value.requestID, echo: parsed.value.kind},
+              'run-core: question echo forwarded to question handler',
             )
           }
         }
@@ -950,7 +1190,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // is actually allowed is the ledger's call, below.
         const eventSessionID = getEventSessionID(rawEvent)
         if (eventSessionID === sessionId) {
-          if (ledger === undefined || ledger.isDrainComplete()) {
+          // Background-only gate: a run that never adopted a dispatch (no ledger, or an empty one) completes
+          // on root idle exactly as it always has. Once ANY dispatch was adopted, a settled ledger is not
+          // enough — see the drain-completion gate below.
+          if (ledger === undefined || drainCompletion === undefined || ledger.snapshot().length === 0) {
             logger.info(
               {sessionId, totalEvents, activityEvents, lastEventType},
               'run-core: session.idle received — stream complete',
@@ -961,25 +1204,33 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             return
           }
 
-          // Outstanding owned work: enter (or remain in) drain rather than
-          // completing. The run stays alive — slot, lease, and approval routing
-          // all continue exactly as during execution — until the ledger settles
-          // or the run's own deadline (`combinedSignal`) expires.
+          // A background dispatch was adopted: enter (or remain in) drain rather than completing. The run
+          // stays alive — slot, lease, and approval routing all continue exactly as during execution — until
+          // the drain-completion gate admits success or the run's own deadline (`combinedSignal`) expires.
+          // The gate needs the ledger settled AND each child's completion notice (or cancel evidence) AND
+          // root freshness; a settled ledger alone can precede the parent's injected follow-up turn.
+          const ledgerSettled = ledger.isDrainComplete()
           if (draining === false) {
             draining = true
             logger.info(
               {sessionId, outstanding: ledger.outstanding(), totalEvents, activityEvents},
-              'run-core: root session idle with owned work outstanding — draining',
+              ledgerSettled
+                ? 'run-core: root session idle with background work settled — awaiting completion notice and root freshness'
+                : 'run-core: root session idle with owned work outstanding — draining',
             )
             onBusy?.(false)
             clearInactivity()
+            drainCompletion.beginDrain()
           }
+
+          // Root idle is evidence only for the generation it arrives in: stamp the current revision.
+          drainCompletion.noteRootIdle()
 
           // Immediate reconcile pass so already-finished background work settles
           // without waiting for the reconciler's interval. Fire-and-forget: its
-          // mutations (via the wrapped ledger) trigger persistence and the
-          // drain-complete check on their own once they land.
-          if (reconcileAdapter !== undefined && runtimeLogger !== undefined) {
+          // mutations (via the wrapped ledger) trigger persistence and a validation
+          // request on their own once they land.
+          if (ledgerSettled === false && reconcileAdapter !== undefined && runtimeLogger !== undefined) {
             // eslint-disable-next-line no-void
             void reconcileLedgerOnce({
               ledger,
@@ -990,6 +1241,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
               // reconcileLedgerOnce never rejects; this satisfies no-floating-promises.
             })
           }
+
+          // Validate against REST now that this generation has idle evidence. Coalesced: at most one in flight.
+          drainCompletion.requestValidation()
         }
       } else if (eventType === 'session.error') {
         const eventSessionID = getEventSessionID(rawEvent)
@@ -1015,6 +1269,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // kept as defensive double-clears — pause()/dispose() on an already-cleared timer is a no-op.
     inactivityTimer.dispose()
     reconciler?.dispose()
+    // No validation result may admit success once the loop has exited, and its retry timer must not leak.
+    drainCompletion?.dispose()
+    // The watchdog is gone: stop reacting to gate notifications and late releases.
+    humanWaitsClosed = true
+    unsubscribeHumanWaitTerminal?.()
   }
 
   // Drain completed successfully: the ledger reported drain-complete and

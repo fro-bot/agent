@@ -55,6 +55,8 @@ export const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readon
   {method: 'GET', path: '/operator/runs/:runId/stream'},
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
   {method: 'GET', path: '/operator/runs/:runId/approvals'},
+  {method: 'POST', path: '/operator/runs/:runId/questions/:requestId/decision'},
+  {method: 'GET', path: '/operator/runs/:runId/questions'},
   {method: 'POST', path: '/operator/runs/:runId/cancel'},
   {method: 'GET', path: '/operator/push/vapid-key'},
   {method: 'POST', path: '/operator/push/subscriptions'},
@@ -96,6 +98,7 @@ function makeStubRunObservationManager() {
     observe: async () => undefined,
     observeOutput: () => undefined,
     observeApproval: () => undefined,
+    observeQuestion: () => undefined,
     subscribe: () => () => undefined,
     abortSubscription: () => undefined,
     shutdown: () => undefined,
@@ -114,6 +117,14 @@ function makeStubApprovalRegistry() {
   return {
     handleDecision: async () => 'not-found' as const,
     describePendingForScope: () => [],
+  }
+}
+
+function makeStubQuestionRegistry() {
+  return {
+    decide: async () => ({kind: 'not-found' as const}),
+    describePendingForRun: () => [],
+    isClaimed: () => false,
   }
 }
 
@@ -187,6 +198,13 @@ export interface OperatorRouteSmokeOptions {
    * undefined here flows through the helper and causes the approval routes to be absent.
    */
   readonly approvalRegistryOverride?: Parameters<typeof buildOperatorServerInputs>[0]['approvalRegistry']
+  /**
+   * Override the questionRegistry passed to buildOperatorServerInputs.
+   * Pass undefined to simulate a missing question registry (question routes absent).
+   * Because questionRegistry is optional in BuildOperatorServerInputs, passing
+   * undefined here flows through the helper and causes the question routes to be absent.
+   */
+  readonly questionRegistryOverride?: Parameters<typeof buildOperatorServerInputs>[0]['questionRegistry']
   /**
    * Override the runIndex passed to buildOperatorServerInputs.
    * Pass undefined to simulate a missing run index (GET /operator/runs absent).
@@ -290,6 +308,13 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
   const hasApprovalRegistryOverride = options !== undefined && 'approvalRegistryOverride' in options
   const approvalRegistry = hasApprovalRegistryOverride ? options.approvalRegistryOverride : makeStubApprovalRegistry()
 
+  // Resolve questionRegistry — use the override if provided, else the default stub.
+  // When the override is explicitly undefined, the question routes will not register
+  // because buildOperatorServerInputs passes it through to deps.questionRegistry,
+  // and server.ts gates the question routes on that dep being present.
+  const hasQuestionRegistryOverride = options !== undefined && 'questionRegistryOverride' in options
+  const questionRegistry = hasQuestionRegistryOverride ? options.questionRegistryOverride : makeStubQuestionRegistry()
+
   // Resolve runIndex — use the override if provided, else the default stub.
   // When the override is explicitly undefined, GET /operator/runs will not register
   // because buildOperatorServerInputs passes it through to deps.runIndex,
@@ -331,6 +356,9 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     // sees the same value as production. When undefined (regression test), the
     // helper passes undefined to deps.approvalRegistry and the approval routes are absent.
     approvalRegistry,
+    // questionRegistry flows through the helper like approvalRegistry. When undefined (regression
+    // test), the helper passes undefined to deps.questionRegistry and the question routes are absent.
+    questionRegistry,
     // cancelRunDeps flows through the helper so the route gate in server.ts
     // sees the same value as production. When undefined (regression test), the
     // helper passes undefined to deps.cancelRunDeps and the cancel route is absent.

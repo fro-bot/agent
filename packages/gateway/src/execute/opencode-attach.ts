@@ -13,6 +13,7 @@
 import type {OpenCodeServerHandle} from '@fro-bot/runtime'
 
 import {createRemoteOpenCodeHandle} from '@fro-bot/runtime'
+import {workspaceAuthHeaders} from './workspace-auth.js'
 
 /**
  * Build an `OpenCodeServerHandle` attached to a remote workspace OpenCode
@@ -27,5 +28,5 @@ import {createRemoteOpenCodeHandle} from '@fro-bot/runtime'
  */
 export function attachOpencode(baseURL: string, token: string): OpenCodeServerHandle {
   // Authorization header injected here — never passed through to a logger.
-  return createRemoteOpenCodeHandle(baseURL, {Authorization: `Bearer ${token}`})
+  return createRemoteOpenCodeHandle(baseURL, workspaceAuthHeaders(token))
 }

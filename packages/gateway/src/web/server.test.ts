@@ -16,9 +16,12 @@
  */
 
 import type {AddressInfo} from 'node:net'
+import type {RunState} from '@fro-bot/runtime'
 import type {ServerType} from '@hono/node-server'
 
+import type {OperatorRunStatus} from '../operator-contract/index.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
+import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps} from './auth/session.js'
 import type {ResolvedClientAddress} from './ingress/resolve-client.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './server.js'
@@ -39,6 +42,7 @@ import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {EXPECTED_OPERATOR_ROUTES} from './operator-route-smoke.js'
 import {isPrivilegedRoute, isPublicCrossSiteRoute, isPublicRoute} from './operator-route.js'
 import {buildOperatorApp, createOperatorServer} from './server.js'
+import {createRunObservationManager} from './sse/manager.js'
 
 /**
  * Build a stub ResolvedClientAddress for test getSourceKey stubs. The branded
@@ -1943,6 +1947,7 @@ describe('buildOperatorApp — optional streaming deps accepted without error', 
       observe: async () => undefined,
       observeOutput: () => undefined,
       observeApproval: () => undefined,
+      observeQuestion: () => undefined,
       subscribe: () => () => undefined,
       abortSubscription: () => undefined,
       shutdown: () => undefined,
@@ -2011,6 +2016,7 @@ function makeStubRunObservationManager(): NonNullable<OperatorServerDeps['runObs
     observe: async () => undefined,
     observeOutput: () => undefined,
     observeApproval: () => undefined,
+    observeQuestion: () => undefined,
     subscribe: () => () => undefined,
     abortSubscription: () => undefined,
     shutdown: () => undefined,
@@ -2031,6 +2037,14 @@ function makeStubApprovalRegistry(): NonNullable<OperatorServerDeps['approvalReg
   return {
     handleDecision: async () => 'not-found' as const,
     describePendingForScope: () => [],
+  }
+}
+
+function makeStubQuestionRegistry(): NonNullable<OperatorServerDeps['questionRegistry']> {
+  return {
+    decide: async () => ({kind: 'not-found' as const}),
+    describePendingForRun: () => [],
+    isClaimed: () => false,
   }
 }
 
@@ -2096,6 +2110,7 @@ function makeFullPrivilegedDeps(sessionStore: ReturnType<typeof createInMemorySe
     launchWorkDeps: makeStubLaunchWorkDeps(),
     dispatchWorkflow: async (owner: string, repo: string) => ({outcome: 'accepted' as const, owner, repo}),
     approvalRegistry: makeStubApprovalRegistry(),
+    questionRegistry: makeStubQuestionRegistry(),
     cancelRunDeps: makeStubCancelRunDeps(),
     operatorPushStore: makeStubOperatorPushStore(),
     operatorPushVapidKeyInfo: makeStubOperatorPushVapidKeyInfo(),
@@ -2140,6 +2155,53 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(routes).toHaveLength(expectedV15Routes.size)
   })
 
+  it('dep-gated negative case: without the question registry only the question routes are absent', () => {
+    // #given — every privileged dep except the question registry
+    const sessionStore = createInMemorySessionStore()
+    const app = buildOperatorApp(
+      {...makeFullPrivilegedDeps(sessionStore), questionRegistry: undefined},
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when
+    const routeSet = new Set(extractRoutes(app).map(r => `${r.method}:${r.path}`))
+
+    // #then — exactly the two question routes are missing from the expected inventory
+    const missing = EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`).filter(key => !routeSet.has(key))
+    expect(missing.toSorted()).toEqual([
+      'GET:/operator/runs/:runId/questions',
+      'POST:/operator/runs/:runId/questions/:requestId/decision',
+    ])
+  })
+
+  it('question decision route: a body over 64 KiB is rejected before session or run lookup', async () => {
+    // #given — the full route set with spies on the session and run-index lookups
+    const sessionStore = createInMemorySessionStore()
+    const getSpy = vi.spyOn(sessionStore, 'get')
+    const getTokenSpy = vi.spyOn(sessionStore, 'getOperatorToken')
+    const lookup = vi.fn(async () => undefined)
+    const base = makeFullPrivilegedDeps(sessionStore)
+    const app = buildOperatorApp(
+      {...base, runIndex: {...makeStubRunIndex(), lookup}},
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when — an oversized body is posted to the question decision route
+    const res = await app.fetch(
+      new Request('http://localhost/operator/runs/run-1/questions/que_1/decision', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: Buffer.alloc(65 * 1024 + 1, 0x41),
+      }),
+    )
+
+    // #then — the global body limit answers 413 and nothing was looked up
+    expect(res.status).toBe(413)
+    expect(lookup).not.toHaveBeenCalled()
+    expect(getSpy).not.toHaveBeenCalled()
+    expect(getTokenSpy).not.toHaveBeenCalled()
+  })
+
   it('dep-gated negative case: without run/approval deps, privileged run/approval routes do NOT register', () => {
     // #given — only OAuth + session/browser-guard deps (no launchWorkDeps, runIndex,
     // denylistCache, bindingsLookup, runObservationManager, approvalRegistry)
@@ -2182,4 +2244,175 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(routePaths).toContain('GET:/operator/session/csrf')
     expect(routePaths).toContain('GET:/operator/session')
   })
+})
+
+// ---------------------------------------------------------------------------
+// #1639 — production wiring: RunIndex.readRun reaches the run-stream route
+// ---------------------------------------------------------------------------
+
+interface SseChunk {
+  readonly done: boolean
+  readonly value?: Uint8Array
+}
+
+/** Reads an SSE body, resolving `done: true` only if the server ends the stream within `idleMs`. */
+function openStream(res: Response) {
+  const reader = res.body?.getReader()
+  if (reader === undefined) throw new Error('expected a readable SSE body')
+  const decoder = new TextDecoder()
+  let pending: Promise<SseChunk> | undefined
+  return {
+    async readToEnd(idleMs: number): Promise<{text: string; done: boolean}> {
+      let text = ''
+      for (let i = 0; i < 50; i++) {
+        pending ??= reader.read() as Promise<SseChunk>
+        const result = await Promise.race([
+          pending,
+          new Promise<'idle'>(resolve => setTimeout(() => resolve('idle'), idleMs)),
+        ])
+        if (result === 'idle') return {text, done: false}
+        pending = undefined
+        if (result.done === true) return {text, done: true}
+        text += decoder.decode(result.value, {stream: true})
+      }
+      return {text, done: false}
+    },
+    async cancel(): Promise<void> {
+      await reader.cancel().catch(() => undefined)
+    },
+  }
+}
+
+const eventNames = (text: string): string[] =>
+  [...text.matchAll(/^event: (\w+)$/gm)].map(m => m[1]).filter((n): n is string => n !== undefined)
+
+describe('buildOperatorApp — run stream resolves an evicted terminal run from persisted state (#1639)', () => {
+  const RUN_ID = 'run-evicted'
+  const LIVE_RUN_ID = 'run-live'
+  const REPO = 'acme/widget'
+  const BOUNDED_MS = 2_000
+
+  function makePersistedRunState(runId: string, phase: RunState['phase']): RunState {
+    return {
+      run_id: runId,
+      surface: 'github',
+      thread_id: 'thread-001',
+      entity_ref: `${REPO}#1`,
+      phase,
+      started_at: '2024-01-01T00:00:00.000Z',
+      last_heartbeat: '2024-01-01T00:00:00.000Z',
+      holder_id: 'holder-001',
+      details: {},
+    }
+  }
+
+  const authorizedRepoAuthzCache = (): RepoAuthzCache => ({
+    get: () => ({authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}),
+    set: () => undefined,
+    getInFlight: () => undefined,
+    setInFlight: () => undefined,
+    deleteInFlight: () => undefined,
+    tokenIdentityFor: () => 'stub-token-id',
+  })
+
+  it(
+    'emits ready, reset, terminal status then closes and releases the slot via the real server wiring',
+    {timeout: 10_000},
+    async () => {
+      // #given the real operator app with an authorized operator session on a non-denied repo
+      const sessionStore = createInMemorySessionStore()
+      const now = Date.now()
+      const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, 'operator-oauth-token', now)
+      if (sessionId === undefined) throw new Error('expected session to be created')
+      const guard = makeStubBrowserGuardDeps(sessionStore)
+
+      // #given a persisted terminal RunState for RUN_ID (and a still-running one for LIVE_RUN_ID)
+      const readRun = vi.fn(async (_repo: string, runId: string) =>
+        makePersistedRunState(runId, runId === RUN_ID ? 'COMPLETED' : 'EXECUTING'),
+      )
+      const runIndex = {
+        register: () => undefined,
+        lookup: async () => ({repo: REPO, surface: 'github' as const}),
+        listRunsForRepo: async () => [],
+        readRun,
+      }
+
+      // #given an SSE manager with NO replay entry for either run (the cache-miss / restart case)
+      const manager = createRunObservationManager({
+        projectRunObservation: async (runState): Promise<OperatorRunStatus | null> => ({
+          runId: runState.run_id,
+          entityRef: runState.entity_ref,
+          surface: runState.surface,
+          phase: runState.phase,
+          status: runState.phase === 'COMPLETED' ? 'succeeded' : 'running',
+          startedAt: runState.started_at,
+          stale: false,
+        }),
+        logger: makeLogger(),
+        setInterval: globalThis.setInterval.bind(globalThis),
+        clearInterval: globalThis.clearInterval.bind(globalThis),
+        setTimeout: globalThis.setTimeout.bind(globalThis),
+        clearTimeout: globalThis.clearTimeout.bind(globalThis),
+        now: () => Date.now(),
+      })
+
+      const app = buildOperatorApp(
+        makeStubDeps({
+          ...guard,
+          sessionDeps: makeStubSessionDeps({clock: () => now}),
+          denylistCache: makeStubDenylistCache(),
+          bindingsLookup: {
+            getBindingByRepo: async () => ({success: true, data: {databaseId: 42, nodeId: 'node-id-1'}}),
+          },
+          runObservationManager: manager,
+          runIndex,
+          repoAuthzCache: authorizedRepoAuthzCache(),
+          rateLimiter: {allow: () => true},
+        }),
+        makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+      )
+      const open = async (runId: string): Promise<Response> =>
+        app.fetch(
+          new Request(`http://127.0.0.1/operator/runs/${runId}/stream`, {
+            headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`, origin: 'https://operator.example.com'},
+          }),
+        )
+      const live: ReturnType<typeof openStream>[] = []
+
+      try {
+        // #given four live streams holding slots (default per-operator cap is 5)
+        for (let i = 0; i < 4; i++) {
+          const res = await open(LIVE_RUN_ID)
+          expect(res.status).toBe(200)
+          const stream = openStream(res)
+          live.push(stream)
+          expect(eventNames((await stream.readToEnd(150)).text)).toEqual(['ready', 'reset'])
+        }
+
+        // #when the operator opens the stream for the evicted terminal run
+        const res = await open(RUN_ID)
+        expect(res.status).toBe(200)
+        const {text, done} = await openStream(res).readToEnd(BOUNDED_MS)
+
+        // #then ready, then reset, then the terminal status — in that order
+        expect(eventNames(text)).toEqual(['ready', 'reset', 'status'])
+        expect(text).toContain('"status":"succeeded"')
+        // #then the persisted state was read for the server-resolved repo (proves server.ts passes readRun through)
+        expect(readRun).toHaveBeenCalledWith(REPO, RUN_ID)
+        // #then the stream closed on its own
+        expect(done).toBe(true)
+
+        // #then its slot was released: a fifth live stream is admitted, and only a sixth is refused
+        const fifth = await open(LIVE_RUN_ID)
+        expect(fifth.status).toBe(200)
+        live.push(openStream(fifth))
+        const sixth = await open(LIVE_RUN_ID)
+        expect(sixth.status).toBe(429)
+        await sixth.body?.cancel()
+      } finally {
+        await Promise.all(live.map(async stream => stream.cancel()))
+        manager.shutdown()
+      }
+    },
+  )
 })

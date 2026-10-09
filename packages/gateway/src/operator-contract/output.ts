@@ -8,8 +8,15 @@
  *   Clients accumulate these to build the in-progress answer.
  * - **Terminal frame** (`final: true`): replaces the accumulated live text with
  *   the authoritative complete answer. Guaranteed to arrive before the terminal
- *   status frame. A run with no output still produces a terminal frame (empty
+ *   status frame for a run observed live (or replayed from the terminal replay
+ *   cache). A run with no output still produces a terminal frame (empty
  *   `text`) so the client can distinguish "no output" from "missing output".
+ *   Exception: when the replay entry is gone (aged out, or lost to a gateway
+ *   restart) the stream emits `reset` (`no-snapshot`) and then, if the run's
+ *   persisted state is terminal, only the terminal status frame. Persisted
+ *   state carries no output text, so NO terminal output frame is sent in that
+ *   case — its absence means "output no longer available", not "no output".
+ *   Clients must drive completion off the terminal status frame.
  *
  * `seq` is monotonic per run (starts at 0, increments by 1 per frame). Clients
  * can detect gaps caused by coalescing via `droppedCount`.

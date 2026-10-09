@@ -56,6 +56,7 @@ function makeStubRunObservationManager() {
     observe: async () => undefined,
     observeOutput: () => undefined,
     observeApproval: () => undefined,
+    observeQuestion: () => undefined,
     subscribe: () => () => undefined,
     abortSubscription: () => undefined,
     shutdown: () => undefined,
@@ -395,6 +396,19 @@ describe('runOperatorRouteSmoke — regression guard (non-vacuous)', () => {
     })
 
     // #then — non-zero exit (approval routes absent)
+    expect(exitCode).not.toBe(0)
+  })
+
+  it('returns non-zero when question routes are absent (questionRegistryOverride: undefined)', async () => {
+    // #given — questionRegistry flows through buildOperatorServerInputs; passing
+    // questionRegistryOverride: undefined causes the helper to pass undefined to
+    // deps.questionRegistry, and server.ts gates the question routes on that dep being present.
+    // #when
+    const exitCode = await runOperatorRouteSmoke({
+      questionRegistryOverride: undefined,
+    })
+
+    // #then — non-zero exit (question routes absent from the inventory)
     expect(exitCode).not.toBe(0)
   })
 

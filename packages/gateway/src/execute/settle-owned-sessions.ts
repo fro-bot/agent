@@ -45,6 +45,13 @@
  * `ledger.isDrainComplete()` to decide whether the causal error escapes
  * plain or `quarantined`.
  *
+ * Follow-up window (`confirmRootQuiescent`): a run that adopted background work stays alive after its
+ * children settle, because upstream then injects a follow-up turn on the ROOT and the root may be writing to
+ * the checkout again. A failure in that window (cancel, deadline) cannot take the settled-ledger fast path:
+ * the root is aborted, then confirmed quiescent — absent from the directory-scoped live set — by bounded
+ * polling inside the same teardown budget. A root that cannot be confirmed quiescent in time is reported
+ * `settled: false`, which `throwWithBarrier` turns into the existing quarantine.
+ *
  * This module deliberately does NOT decide what `run.ts` does with a
  * quarantine outcome — it only reports whether settlement was confirmed. The
  * decision to hold the lock, keep the heartbeat renewing it, and refuse
@@ -64,6 +71,9 @@ import {createSdkLedgerReconcileAdapter, reconcileLedgerOnce} from '@fro-bot/run
  */
 export const DEFAULT_SETTLE_TIMEOUT_MS = 15_000
 
+/** Cadence of the root-quiescence confirmation poll (inside `DEFAULT_SETTLE_TIMEOUT_MS`). */
+export const ROOT_QUIESCENCE_POLL_INTERVAL_MS = 500
+
 export interface SettleOwnedSessionsParams {
   /** SDK client for the workspace OpenCode server this run is attached to. */
   readonly client: SessionClient
@@ -76,6 +86,14 @@ export interface SettleOwnedSessionsParams {
   readonly logger: GatewayLogger
   /** Overrides `DEFAULT_SETTLE_TIMEOUT_MS` — for tests only. */
   readonly timeoutMs?: number
+  /**
+   * The root may be executing an injected follow-up turn (the run is in the drain's follow-up window and was not
+   * admitted). Disables the settled-ledger fast path and adds root quiescence to what must be confirmed. Omitted
+   * for every other failure path, which therefore behaves exactly as before.
+   */
+  readonly confirmRootQuiescent?: boolean
+  /** Overrides `ROOT_QUIESCENCE_POLL_INTERVAL_MS` — for tests only. */
+  readonly rootPollIntervalMs?: number
 }
 
 export type SettleOwnedSessionsResult = {readonly settled: true} | {readonly settled: false; readonly reason: string}
@@ -149,17 +167,30 @@ async function withBound<T>(ms: number, work: () => Promise<T>, onTimeout: () =>
  * unnecessary abort call.
  */
 export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Promise<SettleOwnedSessionsResult> {
-  const {client, directory, rootSessionId, ledger, logger, timeoutMs = DEFAULT_SETTLE_TIMEOUT_MS} = params
+  const {
+    client,
+    directory,
+    rootSessionId,
+    ledger,
+    logger,
+    timeoutMs = DEFAULT_SETTLE_TIMEOUT_MS,
+    confirmRootQuiescent = false,
+    rootPollIntervalMs = ROOT_QUIESCENCE_POLL_INTERVAL_MS,
+  } = params
 
-  if (ledger.isDrainComplete() === true) {
+  if (ledger.isDrainComplete() === true && confirmRootQuiescent === false) {
     return {settled: true}
   }
 
   const unsettled = ledger.snapshot().filter(entry => entry.state !== 'settled')
   logger.warn(
-    {rootSessionId, unsettled: unsettled.map(entry => entry.sessionId)},
-    'settle-owned-sessions: run failed with owned work still outstanding — cancelling before releasing resources',
+    {rootSessionId, unsettled: unsettled.map(entry => entry.sessionId), confirmRootQuiescent},
+    confirmRootQuiescent
+      ? 'settle-owned-sessions: run failed while the root may be running a follow-up turn — aborting the root and confirming it stopped before releasing resources'
+      : 'settle-owned-sessions: run failed with owned work still outstanding — cancelling before releasing resources',
   )
+  let finished = false
+  const isFinished = (): boolean => finished
 
   return withBound(
     timeoutMs,
@@ -189,21 +220,43 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         // Confirm — an abort call succeeding is a delivery receipt, not proof the child
         // actually stopped. Reuse the same reconciliation primitive the drain loop uses.
         const adapter = createSdkLedgerReconcileAdapter(client, directory)
-        const reconcileResult = await reconcileLedgerOnce({
-          ledger,
-          adapter,
-          parentSessionId: rootSessionId,
-          logger: toRuntimeLogger(logger),
-        })
-        if (reconcileResult.success === false) {
-          logger.warn(
-            {rootSessionId, detail: reconcileResult.error.message},
-            'settle-owned-sessions: reconciliation call failed while confirming settlement',
-          )
+        if (unsettled.length > 0) {
+          const reconcileResult = await reconcileLedgerOnce({
+            ledger,
+            adapter,
+            parentSessionId: rootSessionId,
+            logger: toRuntimeLogger(logger),
+          })
+          if (reconcileResult.success === false) {
+            logger.warn(
+              {rootSessionId, detail: reconcileResult.error.message},
+              'settle-owned-sessions: reconciliation call failed while confirming settlement',
+            )
+          }
         }
 
-        if (ledger.isDrainComplete() === true) {
-          logger.info({rootSessionId}, 'settle-owned-sessions: owned work confirmed settled')
+        // The root's own follow-up turn: confirmed only by the directory-scoped live set no longer holding it.
+        // The abort call is a delivery receipt here too. Poll inside the same teardown budget; the outer bound
+        // turns a root that never quiesces (or a lookup that hangs) into the same quarantine decision.
+        let rootQuiescent = confirmRootQuiescent === false
+        while (!rootQuiescent && !isFinished() && !teardownSignal.aborted) {
+          const live = await adapter.liveSessionIds(teardownSignal)
+          if (live.success === true && !live.data.has(rootSessionId)) {
+            rootQuiescent = true
+          } else if (!isFinished()) {
+            await new Promise<void>(resolve => {
+              setTimeout(resolve, rootPollIntervalMs)
+            })
+          }
+        }
+
+        if (ledger.isDrainComplete() === true && rootQuiescent) {
+          logger.info(
+            {rootSessionId, confirmRootQuiescent},
+            confirmRootQuiescent
+              ? 'settle-owned-sessions: owned work settled and the root confirmed quiescent'
+              : 'settle-owned-sessions: owned work confirmed settled',
+          )
           return {settled: true}
         }
 
@@ -217,9 +270,19 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         }
         const stillUnresolvedIds = stillUnresolved.map(entry => entry.sessionId)
         logger.error(
-          {rootSessionId, stillUnresolvedIds},
+          {rootSessionId, stillUnresolvedIds, rootQuiescent},
           'settle-owned-sessions: owned work could not be confirmed settled',
         )
+        if (!rootQuiescent) {
+          return {
+            settled: false,
+            reason: `root session not confirmed quiescent after abort${
+              stillUnresolvedIds.length > 0
+                ? `; owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`
+                : ''
+            }`,
+          }
+        }
         return {settled: false, reason: `owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`}
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -228,9 +291,12 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
           'settle-owned-sessions: unexpected error during settle attempt — quarantining rather than letting it escape',
         )
         return {settled: false, reason: `settle attempt threw unexpectedly: ${message}`}
+      } finally {
+        finished = true
       }
     },
     () => {
+      finished = true
       logger.error(
         {rootSessionId, timeoutMs},
         'settle-owned-sessions: settle attempt exceeded its bound — quarantining rather than hanging',

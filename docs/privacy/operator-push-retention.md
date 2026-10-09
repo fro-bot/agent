@@ -2,7 +2,7 @@
 
 This document describes the data the gateway's operator push notification surface stores, what it puts in a notification payload, how long it keeps records, and how an operator's data can be exported or deleted.
 
-Push notifications are an optional, opt-in convenience for operators using the browser-based control surface. They exist to nudge an operator that a run needs attention (a pending approval or a failed run) when they are not already watching the dashboard. They are never the system of record — the dashboard's live status stream and Discord remain the authoritative, detailed channels.
+Push notifications are an optional, opt-in convenience for operators using the browser-based control surface. They exist to nudge an operator that a run needs attention (a pending approval, a pending agent question, or a failed run) when they are not already watching the dashboard. They are never the system of record — the dashboard's live status stream and Discord remain the authoritative, detailed channels.
 
 ## What is stored
 
@@ -19,7 +19,7 @@ When an operator opts in, the browser creates a [W3C Push API](https://www.w3.or
 
 ## What a notification contains
 
-Every push notification uses fixed, neutral copy: a short message indicating something needs attention, a link that opens the operator dashboard, and — for failures — a label drawn from a small, pre-defined, allowlisted set of failure categories (for example, a timeout or a workspace error). The payload never includes the run's repository, prompt, or any of its output. An operator who wants details opens the dashboard, authenticates, and sees them there under the normal authorization rules — the push payload itself carries none of it.
+Every push notification uses fixed, neutral copy: a short message indicating something needs attention, a link that opens the operator dashboard, and — for failures — a label drawn from a small, pre-defined, allowlisted set of failure categories (for example, a timeout or a workspace error). The payload never includes the run's repository, prompt, or any of its output, and a question notification never includes the question or its options. An operator who wants details opens the dashboard, authenticates, and sees them there under the normal authorization rules — the push payload itself carries none of it.
 
 ## Retention
 

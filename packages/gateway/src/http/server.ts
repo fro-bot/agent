@@ -19,7 +19,6 @@ import type {RateLimiter} from './rate-limit.js'
 import type {ReplayCache} from './replay-cache.js'
 import {Buffer} from 'node:buffer'
 import {serve} from '@hono/node-server'
-import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
 import {bodyLimit} from 'hono/body-limit'
 import {ANNOUNCE_MAX_BODY_BYTES, handleAnnounce} from './announce-handler.js'
@@ -104,19 +103,15 @@ export function buildAnnounceApp(deps: AnnounceServerDeps, config: AnnounceServe
       const arrayBuffer = await c.req.arrayBuffer()
       const rawBody = Buffer.from(arrayBuffer)
 
-      // Derive rate-limit key from the actual TCP socket remote address.
-      // X-Forwarded-For is intentionally NOT used — it is caller-spoofable.
-      // Behind the ingress this keys on the proxy's connection, which is the
-      // correct trust boundary for v1.
-      const connInfo = getConnInfo(c)
-      const sourceKey = connInfo.remote.address ?? undefined
-
+      // No socket/XFF-derived key is computed here: the handler authenticates first and then
+      // rate-limits on one fixed producer key. Coarse flood protection for unauthenticated
+      // traffic belongs at ingress/transport; this listener has its own trust boundary
+      // (it does not inherit the operator-surface ingress policy).
       const result: AnnounceHandlerResult = await handleAnnounce(
         rawBody,
         {
           get: (name: string) => c.req.header(name) ?? null,
         },
-        sourceKey,
         {
           client: deps.client,
           logger: deps.logger,

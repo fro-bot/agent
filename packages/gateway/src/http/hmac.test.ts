@@ -8,9 +8,15 @@
 import {Buffer} from 'node:buffer'
 import {createHmac} from 'node:crypto'
 
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 
 import {checkTimestamp, REPLAY_WINDOW_MS, verifyHmac} from './hmac.js'
+
+// Pass-through spy on createHmac so tests can assert whether hashing happened at all.
+vi.mock('node:crypto', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:crypto')>()
+  return {...actual, createHmac: vi.fn(actual.createHmac)}
+})
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -29,6 +35,38 @@ const BODY = Buffer.from(JSON.stringify({v: 1, event_type: 'survey_completed', f
 // ---------------------------------------------------------------------------
 
 describe('verifyHmac', () => {
+  describe('malformed signature (rejected before hashing)', () => {
+    const validSig = makeSignature(SECRET, TIMESTAMP, BODY)
+
+    it.each([
+      ['empty', ''],
+      ['too short', validSig.slice(0, 62)],
+      ['too long', `${validSig}00`],
+      ['odd length', validSig.slice(0, 63)],
+      ['non-hex chars', `${validSig.slice(0, 62)}zz`],
+      ['prefixed', `sha256=${validSig}`],
+      ['surrounding whitespace', ` ${validSig} `],
+    ])('rejects a %s signature without computing the HMAC', (_label, signature) => {
+      // #given
+      vi.mocked(createHmac).mockClear()
+
+      // #when
+      const result = verifyHmac(SECRET, BODY, TIMESTAMP, signature)
+
+      // #then
+      expect(result).toEqual({ok: false, reason: 'hmac_invalid'})
+      expect(createHmac).not.toHaveBeenCalled()
+    })
+
+    it('accepts an upper-case hex rendering of a valid signature (hex is case-insensitive)', () => {
+      // #given / #when
+      const result = verifyHmac(SECRET, BODY, TIMESTAMP, validSig.toUpperCase())
+
+      // #then
+      expect(result).toEqual({ok: true})
+    })
+  })
+
   describe('happy path', () => {
     it('returns ok:true for correct secret + signature over timestamp.body', () => {
       // #given

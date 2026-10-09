@@ -39,7 +39,7 @@ import type {CoordinationConfig, RunState, Surface} from '@fro-bot/runtime'
 
 import type {BindingsStore} from '../bindings/store.js'
 import type {GatewayLogger} from '../discord/client.js'
-import {getRunPrefix, parseRunState} from '@fro-bot/runtime'
+import {getRunKey, getRunPrefix, parseRunState} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -92,6 +92,21 @@ export interface RunIndex {
    * not a runId resolution. A failing key is skipped (not fatal).
    */
   listRunsForRepo: (repo: string, limit?: number) => Promise<readonly RunState[]>
+
+  /**
+   * Read the durable run-state for one run in a known repo (`owner/repo`).
+   *
+   * A single targeted object read (`getRunKey` → `getObject` → `parseRunState`), not a
+   * repo scan — safe on the SSE subscribe path. The persisted RunState is the authority
+   * for whether a run is terminal when the in-memory observation caches have no entry
+   * (evicted terminal replay entry, or a gateway restart).
+   *
+   * Does NOT touch the accelerator or negative cache and performs NO authorization: the
+   * caller must have resolved `repo` server-side and passed the redaction and authz gates
+   * first. Returns `undefined` on any key/read/parse failure or when the stored run id
+   * does not match (never throws).
+   */
+  readRun: (repo: string, runId: string) => Promise<RunState | undefined>
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +447,59 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
   }
 
   // ---------------------------------------------------------------------------
+  // readRun
+  // ---------------------------------------------------------------------------
+
+  async function readRun(repo: string, runId: string): Promise<RunState | undefined> {
+    // Injectable override takes precedence (used in tests; production uses the store adapter).
+    if (deps.findRunsForRepo !== undefined) {
+      try {
+        const runs = await deps.findRunsForRepo(repo)
+        return runs.find(r => r.run_id === runId)
+      } catch (error: unknown) {
+        logger.warn(
+          {repo, runId, err: error instanceof Error ? error.message : String(error)},
+          'run-index: findRunsForRepo threw in readRun — returning undefined',
+        )
+        return undefined
+      }
+    }
+
+    const keyResult = getRunKey(coordinationConfig, identity, repo, runId)
+    if (keyResult.success === false) {
+      logger.warn({repo, runId, err: keyResult.error.message}, 'run-index: getRunKey failed in readRun')
+      return undefined
+    }
+
+    const getObject = coordinationConfig.storeAdapter.getObject
+    if (getObject == null) {
+      logger.warn({repo, runId}, 'run-index: store adapter does not support getObject in readRun')
+      return undefined
+    }
+
+    try {
+      const fetched = await getObject.call(coordinationConfig.storeAdapter, keyResult.data)
+      if (fetched.success === false) {
+        logger.debug({repo, runId, err: fetched.error.message}, 'run-index: getObject failed in readRun')
+        return undefined
+      }
+      const parsed = parseRunState(fetched.data.data)
+      if (parsed.success === false) {
+        logger.warn({repo, runId, err: parsed.error.message}, 'run-index: parseRunState failed in readRun')
+        return undefined
+      }
+      // Defense in depth: never hand back a state for a different run than the one asked for.
+      return parsed.data.run_id === runId ? parsed.data : undefined
+    } catch (error: unknown) {
+      logger.warn(
+        {repo, runId, err: error instanceof Error ? error.message : String(error)},
+        'run-index: readRun threw — returning undefined',
+      )
+      return undefined
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // listRunsForRepo
   // ---------------------------------------------------------------------------
 
@@ -521,5 +589,5 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
     return fetchRunsForKeys(listed.data, getObject)
   }
 
-  return {register, lookup, listRunsForRepo}
+  return {register, lookup, listRunsForRepo, readRun}
 }

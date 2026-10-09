@@ -295,6 +295,19 @@ RUN mkdir -p /usr/local/share/fro-bot \
     && chown 0:0 /usr/local/share/fro-bot/opencode.base.json \
     && chmod 0644 /usr/local/share/fro-bot/opencode.base.json
 
+# Task-reuse guard (deploy/plugins/no-task-reuse.mjs), loaded through OpenCode's
+# managed config layer. That layer merges last and concatenates plugin arrays, so
+# agent-written config cannot remove it; both files stay root-owned 0644. The
+# path in managed-config/opencode.json must match the COPY destination
+# (pinned by deploy/scripts/managed-config.test.mjs).
+RUN mkdir -p /usr/local/lib/fro-bot/plugins /etc/opencode \
+    && chown 0:0 /usr/local/lib/fro-bot /usr/local/lib/fro-bot/plugins /etc/opencode \
+    && chmod 0755 /usr/local/lib/fro-bot /usr/local/lib/fro-bot/plugins /etc/opencode
+COPY deploy/plugins/no-task-reuse.mjs /usr/local/lib/fro-bot/plugins/no-task-reuse.mjs
+COPY deploy/managed-config/opencode.json /etc/opencode/opencode.json
+RUN chown 0:0 /usr/local/lib/fro-bot/plugins/no-task-reuse.mjs /etc/opencode/opencode.json \
+    && chmod 0644 /usr/local/lib/fro-bot/plugins/no-task-reuse.mjs /etc/opencode/opencode.json
+
 # Production node_modules + bundled entrypoint (mirror gateway.Dockerfile layout).
 COPY --from=build /workspace/node_modules ./node_modules
 COPY --from=build /workspace/apps/workspace-agent/package.json ./apps/workspace-agent/package.json

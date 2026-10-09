@@ -171,6 +171,7 @@ function makeLaunchWorkDeps(): RunMentionDeps {
       register: vi.fn(),
       lookup: vi.fn(async () => undefined),
       listRunsForRepo: vi.fn(async () => []),
+      readRun: vi.fn().mockResolvedValue(undefined),
     },
   }
 }
@@ -256,6 +257,7 @@ describe('POST /operator/runs — AWAIT-ADMISSION (load-bearing)', () => {
       register: vi.fn(),
       lookup: vi.fn(async () => undefined),
       listRunsForRepo: vi.fn(async () => []),
+      readRun: vi.fn().mockResolvedValue(undefined),
     }
     mockLaunchWork.mockImplementationOnce(async (request: {readonly runId?: string}) => {
       launchWorkRunIndex.register(request.runId, {repo: 'acme/widget', surface: 'web', startedAt: 'now'})

@@ -92,6 +92,12 @@ const ALLOWLISTED_FILES: readonly string[] = [
   // enforced by the Discord adapter's ReplySink implementation in `runMention`.
   // Also uses `editMessage(postedMessage, ...)` which IS the io.ts helper (not raw).
   'approvals/discord-transport.ts',
+
+  // Discord question transport.
+  // Same reasoning as the approval transport: `replySink.send(...)` is the transport-neutral
+  // ReplySink interface, whose Discord implementation applies the `allowedMentions:{parse:[]}` guard,
+  // and settled renders use `editMessage(postedMessage, ...)`, which is the io.ts helper (not raw).
+  'approvals/discord-question-transport.ts',
 ]
 
 // ---------------------------------------------------------------------------

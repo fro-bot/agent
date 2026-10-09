@@ -348,6 +348,35 @@ must_succeed "cannot write the service's global git config" "$MAIN_CID" "0:0" \
   sh -c 'echo "[user] name = harness-positive-control" > /var/lib/workspace-agent/home/.gitconfig && rm -f /var/lib/workspace-agent/home/.gitconfig'
 pass "uid 10001 cannot write /var/lib/workspace-agent/home/.gitconfig (root can)"
 
+# ── the task_id reuse guard: plugin + managed config are root-owned and immutable to the agent ──
+# deploy/plugins/no-task-reuse.mjs is loaded through OpenCode's managed config layer (/etc/opencode/opencode.json,
+# merged last). The agent must not be able to modify, replace, rename or delete either file, nor add or remove
+# entries in their directories. Each denial is paired with the same operation succeeding as root.
+GUARD_PLUGIN=/usr/local/lib/fro-bot/plugins/no-task-reuse.mjs
+GUARD_CONFIG=/etc/opencode/opencode.json
+GUARD_PLUGIN_DIR=/usr/local/lib/fro-bot/plugins
+GUARD_CONFIG_DIR=/etc/opencode
+
+guard_owner_mode="$(run_exec "$MAIN_CID" "0:0" stat -c '%u:%g:%a' "$GUARD_PLUGIN" "$GUARD_CONFIG" "$GUARD_PLUGIN_DIR" "$GUARD_CONFIG_DIR" | tr '\n' ' ')"
+[ "$guard_owner_mode" = "0:0:644 0:0:644 0:0:755 0:0:755 " ] \
+  || fail "reuse guard: expected root-owned 0644 files and 0755 dirs, got: ${guard_owner_mode}"
+
+for guard_file in "$GUARD_PLUGIN" "$GUARD_CONFIG"; do
+  must_fail "cannot open ${guard_file} for writing" "$MAIN_CID" "$AGENT_USER" sh -c ": >> ${guard_file}"
+  must_succeed "cannot open ${guard_file} for writing" "$MAIN_CID" "0:0" sh -c ": >> ${guard_file}"
+  must_fail "cannot overwrite ${guard_file}" "$MAIN_CID" "$AGENT_USER" sh -c "echo '{}' > ${guard_file}"
+  must_fail "cannot delete ${guard_file}" "$MAIN_CID" "$AGENT_USER" rm -f "${guard_file}"
+  must_fail "cannot rename ${guard_file}" "$MAIN_CID" "$AGENT_USER" mv "${guard_file}" "${guard_file}.moved"
+  must_fail "cannot chmod ${guard_file}" "$MAIN_CID" "$AGENT_USER" chmod 0666 "${guard_file}"
+done
+for guard_dir in "$GUARD_PLUGIN_DIR" "$GUARD_CONFIG_DIR"; do
+  must_fail "cannot add a file to ${guard_dir}" "$MAIN_CID" "$AGENT_USER" sh -c "echo x > ${guard_dir}/agent-added"
+  must_succeed "cannot add a file to ${guard_dir}" "$MAIN_CID" "0:0" sh -c "echo x > ${guard_dir}/root-probe && rm -f ${guard_dir}/root-probe"
+done
+must_succeed "reuse guard files are readable by the agent (OpenCode must load them)" "$MAIN_CID" "$AGENT_USER" \
+  sh -c "cat ${GUARD_PLUGIN} ${GUARD_CONFIG} >/dev/null"
+pass "uid 10001 cannot modify, replace, rename, chmod or delete the task_id reuse guard (plugin + /etc/opencode/opencode.json), nor add files beside them; root can; the agent can still read them"
+
 # ── /proc/<pid>/environ of a live root process holding a secret ────────────
 # `docker exec -d` is Docker's own documented detached-exec mode: the spawned
 # process is NOT tied to this docker-exec client's lifetime (unlike a plain
