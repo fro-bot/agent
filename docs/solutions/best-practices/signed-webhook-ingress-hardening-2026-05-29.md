@@ -13,7 +13,7 @@ applies_when:
   - verifying raw-body HMAC signatures
   - preventing replay on awaited side effects
   - enforcing pre-auth body-size limits
-  - rate limiting untrusted ingress by socket address
+  - rate limiting a webhook without letting unauthenticated traffic spend the producer's quota
 tags:
   - webhook-security
   - hmac-signing
@@ -32,15 +32,15 @@ The gateway's `POST /v1/announce` endpoint (`packages/gateway/src/http/`) is the
 
 That combination — pre-auth reachability, non-idempotent work, retry semantics, an awaited downstream call — is exactly where naive webhook handlers leak auth state, double-post, or fall over to memory-pressure DoS. The patterns below are the hardening that survived Oracle review, an 11-persona review pass, and a follow-up review that caught a pre-auth buffering DoS the first pass missed.
 
-The handler runs a single fail-closed pipeline, cheapest check first:
+The handler runs a single fail-closed pipeline. **Authenticate first, then spend quota** (#1645):
 
 ```
 1. Body size guard (8 KB, enforced during read)
-2. Rate limit (socket-keyed)
-3. Required headers present
-4. HMAC verification
-5. Timestamp window check
-6. Replay-cache reserve (atomic check-and-set)
+2. Required headers present
+3. HMAC verification (malformed signature rejected before hashing)
+4. Timestamp window check
+5. Replay-cache reserve (atomic check-and-set)
+6. Producer rate limit (one fixed, server-owned key; 429 releases the reservation)
 7. JSON parse
 8. Timestamp cross-check (body fired_at === header, exact string)
 9. Schema decode (unknown event_type → 400)
@@ -143,20 +143,30 @@ app.post(
 
 A `Content-Length` precheck is a useful fast reject for honest clients, but it is trivially bypassed by omitting or understating the header (chunked transfer encoding). If the only real enforcement is a `rawBody.byteLength` check **after** `arrayBuffer()`, an unauthenticated caller can force the server to buffer an arbitrarily large body into memory before any rejection — a pre-auth memory-pressure DoS. A streaming `bodyLimit` middleware bounds the read itself. Keep the cheap content-length precheck and the post-buffer `byteLength` guard as defense in depth, but the streaming limit is the real control.
 
-### 6. Rate-limit on the socket address, not `X-Forwarded-For`, and bound the key map
+### 6. Authenticate first; rate-limit the authenticated producer, not the socket
 
 ```ts
-// server.ts
-const connInfo = getConnInfo(c) // @hono/node-server/conninfo
-const sourceKey = connInfo.remote.address ?? undefined
+// announce-handler.ts — quota is spent only after HMAC + freshness + replay-reserve pass
+const PRODUCER_KEY = 'control-plane' // fixed and server-owned; never derived from the request
+
+if (replayCache.reserve(replayKey) === false) return {status: 401, body: UNAUTHORIZED_BODY}
+
+if (rateLimiter.allow(PRODUCER_KEY) === false) {
+  replayCache.release(replayKey) // throttled ≠ replayed: the retry after the window must work
+  return {status: 429, body: {error: 'rate limited'}}
+}
 ```
 
 ```ts
-// rate-limit.ts — bounded key cardinality
+// rate-limit.ts — bounded key cardinality (still enforced; the announce path now uses one key)
 if (store.size >= MAX_KEYS) return false
 ```
 
-`X-Forwarded-For` is caller-supplied and spoofable; keying the limiter on it lets an attacker rotate the header to get unlimited buckets — defeating the limit **and** growing the key map without bound (a second memory sink). Key on the real TCP peer address. Behind an ingress that terminates connections, this keys on the proxy, which is the correct trust boundary for a single-caller v1. Cap the number of tracked keys regardless.
+The original design rate-limited **before** authentication on the socket address. Behind an ingress that terminates connections, that key collapses every caller (and an attacker) onto the proxy's address, so a flood of unsigned requests drained the bucket and the legitimate producer got `429` (#1645). An `X-Forwarded-For` key is no better — it is caller-spoofable (unlimited buckets plus an unbounded key map). Rate limiting before authentication also cannot tell a flood from the producer, and rate limiting _after_ HMAC but keyed on the source does not fix the collapse either.
+
+The fix is structural: with a single shared secret, any request that passes HMAC **is** the producer, so the limiter is keyed on one fixed server-owned constant and runs only after HMAC, timestamp freshness, and the replay reservation succeed. Unsigned, bad-signature, malformed-signature, stale, and replayed traffic never touches the limiter, so it cannot starve the producer. Reject a malformed signature (anything but 64 hex characters) **before** computing the HMAC so unauthenticated callers cannot make the server hash on demand, and normalise the signature's case for the replay key so `abc…` and `ABC…` cannot be replayed as two different signatures.
+
+What this does **not** do: it does not bound unauthenticated request volume. Coarse flood protection (per-source connection/request limits, read timeouts) belongs at ingress/transport. The announce listener has its own trust boundary and does not inherit the operator-surface ingress policy (`GATEWAY_OPERATOR_TRUSTED_PROXIES`). Keep log lines reason-only and keep auth rejection reasons (`hmac_invalid`, `timestamp_expired`, `replayed`) distinct from the quota reason (`producer_rate_limited`).
 
 ### 7. Treat payload text as untrusted: disable mentions, confine to the embed body
 
@@ -197,7 +207,7 @@ Webhook ingress is hostile by default, and each of these is a real failure mode,
 - Auth/timing oracles → attackers probe secret validity and replay state.
 - Racey replay checks → duplicate non-idempotent side effects under concurrency.
 - Post-buffer size checks → pre-auth memory DoS via chunked encoding.
-- XFF-keyed rate limits → spoofable bypass plus an unbounded memory sink.
+- Pre-auth or socket/XFF-keyed rate limits → unsigned floods starve the legitimate producer (socket key collapses behind ingress) or spoofable bypass plus an unbounded memory sink (XFF).
 - Trusted-by-default payload text → unwanted `@everyone` pings.
 - Unbounded downstream calls → a single hung API wedges the ingress path.
 
@@ -213,12 +223,16 @@ Use this pattern set for any signed inbound webhook that:
 
 ## Examples
 
-**Good** — sign raw bytes, reserve before the await, release on failure, socket-keyed limit:
+**Good** — sign raw bytes, reserve before the await, rate-limit the authenticated producer after auth, release on failure:
 
 ```ts
 const expected = createHmac('sha256', secret).update(timestampHeader).update('.').update(rawBody).digest()
 
 if (replayCache.reserve(signatureHex) === false) return {status: 401, body: UNAUTHORIZED_BODY}
+if (rateLimiter.allow('control-plane') === false) {
+  replayCache.release(signatureHex)
+  return {status: 429, body: {error: 'rate limited'}}
+}
 
 const postResult = await postPresenceEmbed(client, channelId, embed)
 if (postResult.success === false) {
@@ -228,12 +242,12 @@ if (postResult.success === false) {
 replayCache.commit(signatureHex)
 ```
 
-**Bad** — re-serialized signature, XFF rate-limit key, record-after-await race:
+**Bad** — re-serialized signature, pre-auth XFF/socket rate-limit key, record-after-await race:
 
 ```ts
 const payload = JSON.parse(body.toString('utf8'))
 const sig = createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex') // drift
-if (rateLimit(req.headers['x-forwarded-for']) === false) return res.status(429).end()   // spoofable
+if (rateLimit(req.headers['x-forwarded-for']) === false) return res.status(429).end()   // spoofable, runs pre-auth
 await sendDiscord(payload)                                                              // race window
 replayCache.record(sig)                                                                 // too late
 ```
