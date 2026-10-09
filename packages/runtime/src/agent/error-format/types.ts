@@ -5,6 +5,7 @@ export const ERROR_TYPES = [
   'internal',
   'llm_fetch_error',
   'llm_timeout',
+  'model_not_found',
   'permission',
   'provider_auth_error',
   'quota_exceeded',
@@ -57,6 +58,16 @@ export type ProviderAuthErrorInput =
       readonly kind: 'session-error'
       readonly name?: unknown
     }
+
+/**
+ * Normalized input to {@link classifyModelNotFoundError}. OpenCode reports an unresolvable model as a
+ * generic `UnknownError` whose only signal is its `message` text, so the message is the one field consumed;
+ * the classifier extracts an allowlisted, bounded subset and never echoes the rest.
+ */
+export interface ModelNotFoundErrorInput {
+  readonly kind: 'session-error'
+  readonly message?: string
+}
 
 /**
  * Provider-neutral normalized input to {@link classifyContextOverflowError}.

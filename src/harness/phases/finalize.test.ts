@@ -8,7 +8,7 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
-import {createProviderAuthError} from '@fro-bot/runtime'
+import {classifyModelNotFoundError, createProviderAuthError} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {formatErrorComment} from '../../features/comments/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -1348,6 +1348,37 @@ describe('runFinalize non-file-convention delivery', () => {
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('no delivery surface was available'))
     expect(mocks.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('APIError; status=400'))
     expect(logger.warning).toHaveBeenCalledWith('Cannot post error comment: missing target context')
+  })
+
+  it('carries a model_not_found cause and hint into setFailed and the error log when there is no delivery surface', async () => {
+    // #given none delivery, no resolvable comment target, and a classified model_not_found llmError
+    const bootstrap = createBootstrap({delivery: 'none', responseFilePath: null})
+    const routing = createRouting({
+      agentContext: {...createRouting().agentContext, issueNumber: 0},
+    })
+    const llmError = classifyModelNotFoundError({
+      kind: 'session-error',
+      message: 'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5?',
+    })
+    if (llmError == null) throw new Error('fixture must classify as model_not_found')
+    const execution = createExecution({success: false, exitCode: 0, llmError})
+    const logger = createMockLogger()
+
+    // #when runFinalize runs
+    const exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, createMetrics(), Date.now(), logger)
+
+    // #then the run fails and the failure message itself names the cause, the model, and the hint
+    expect(exitCode).toBe(1)
+    expect(mocks.postComment).not.toHaveBeenCalled()
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('no delivery surface was available'))
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('anthropic/claude-sonnet-5-5'))
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('models.opencode.ai'))
+
+    // #then the cause is also logged as an error before failing
+    expect(logger.error).toHaveBeenCalledWith(
+      'Agent execution failed with no delivery surface to report it',
+      expect.objectContaining({type: 'model_not_found', error: llmError.message}),
+    )
   })
 
   it('posts a recoverable llm error comment and returns 0 when a delivery surface is resolvable', async () => {

@@ -2339,6 +2339,49 @@ describe('detectMessageActivity qualified-tuple predicate (Phase B)', () => {
     expect(observation.failures[0]?.llmError).not.toBeNull()
   })
 
+  it('an assistant message whose error is a model-not-found UnknownError settles as model_not_found with the cause', async () => {
+    // #given a completed assistant message whose `error` is the NamedError.Unknown payload OpenCode
+    // writes when the model can't be resolved ({name: 'UnknownError', data: {message}})
+    vi.useFakeTimers()
+    const messagesFn = vi.fn().mockResolvedValue({
+      data: [
+        {
+          info: {
+            id: 'msg_new',
+            role: 'assistant',
+            time: {completed: 2},
+            finish: 'error',
+            error: {
+              name: 'UnknownError',
+              data: {message: 'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5?'},
+            },
+          },
+        },
+      ],
+    })
+    const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}})
+    const mockClient = {session: {messages: messagesFn, status: statusFn}}
+
+    // #when polling observes it
+    const observationPromise = pollForSessionCompletionObservation(
+      mockClient as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      qualifiedPredicateBaseActivityTracker(),
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    const observation = await observationPromise
+
+    // #then the failure names the real cause rather than a bare name=UnknownError
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.failures[0]?.llmError?.type).toBe('model_not_found')
+    expect(observation.failures[0]?.llmError?.message).toContain('anthropic/claude-sonnet-5-5')
+    expect(observation.failures[0]?.llmError?.message).toContain('claude-sonnet-4-5')
+  })
+
   it('busy status invalidates a prior message-fallback candidate even though it carries no classifiable failure', async () => {
     // #given a qualified stable candidate, but the CORROBORATING status poll comes back busy on
     // this iteration and idle only afterward — renewed activity must invalidate the candidate

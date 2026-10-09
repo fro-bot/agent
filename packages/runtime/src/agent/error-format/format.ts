@@ -1,4 +1,11 @@
-import type {ContextOverflowErrorInput, ErrorInfo, ErrorType, ProviderAuthErrorInput, QuotaErrorInput} from './types.js'
+import type {
+  ContextOverflowErrorInput,
+  ErrorInfo,
+  ErrorType,
+  ModelNotFoundErrorInput,
+  ProviderAuthErrorInput,
+  QuotaErrorInput,
+} from './types.js'
 
 const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   api_error: 'API Error',
@@ -7,6 +14,7 @@ const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   internal: 'Internal Error',
   llm_fetch_error: 'LLM Fetch Error',
   llm_timeout: 'LLM Timeout',
+  model_not_found: 'Model Not Found',
   permission: 'Permission Error',
   provider_auth_error: 'Provider Authentication Error',
   quota_exceeded: 'Quota Exceeded',
@@ -173,6 +181,44 @@ export function createAgentError(message: string, agent?: string): ErrorInfo {
   return createErrorInfo('configuration', `Agent error: ${message}`, false, {
     details: agent == null ? undefined : `Requested agent: ${agent}`,
     suggestedAction: 'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
+  })
+}
+
+// `<providerID>/<modelID>` as OpenCode renders it (the model id may itself contain `/`). The lazy model id stops at
+// the sentence-ending `.` (never a dot inside the id, e.g. `gpt-4.1`), then optional suggestions follow. Deliberately
+// unanchored: the same text arrives bare (`SessionPrompt.getModel`) and wrapped by the error class name and stack
+// frames (`Cause.pretty` in `prompt_async`'s failure handler).
+const MODEL_NOT_FOUND_PATTERN = /Model not found: ([\w.:@+-]+\/[\w.:@+/-]+?)\.(?=\s|$)(?: Did you mean: ([^\n?]*)\?)?/
+const MODEL_SUGGESTION_PATTERN = /^[\w.:@+/-]{1,128}$/
+const MODEL_NOT_FOUND_MAX_SUGGESTIONS = 5
+const MODEL_NOT_FOUND_ACTION =
+  'Check that the configured model id is correct. If it is, the OpenCode model catalog may not have loaded: ' +
+  'make sure the job can reach models.opencode.ai (egress/firewall) or define the model explicitly in the OpenCode config.'
+
+/**
+ * Classify OpenCode's "requested model could not be resolved" failure as `model_not_found`.
+ *
+ * OpenCode (v1.18.34 `session/prompt.ts` `getModel`) reports it as a generic `UnknownError` whose only signal is
+ * `Model not found: <provider>/<model>. Did you mean: a, b?`. Only the allowlisted model id and well-formed
+ * suggestion ids are extracted into the result; the rest of the message (stack frames, class prefix, anything
+ * provider-supplied) is never echoed.
+ */
+export function classifyModelNotFoundError(input: ModelNotFoundErrorInput): ErrorInfo | null {
+  if (typeof input.message !== 'string') return null
+
+  const match = MODEL_NOT_FOUND_PATTERN.exec(input.message)
+  const model = match?.[1]
+  if (model == null) return null
+
+  const suggestions = (match?.[2] ?? '')
+    .split(',')
+    .map(suggestion => suggestion.trim())
+    .filter(suggestion => MODEL_SUGGESTION_PATTERN.test(suggestion))
+    .slice(0, MODEL_NOT_FOUND_MAX_SUGGESTIONS)
+  const hint = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(', ')}?` : ''
+
+  return createErrorInfo('model_not_found', `Model not found: ${model}.${hint}`, false, {
+    suggestedAction: MODEL_NOT_FOUND_ACTION,
   })
 }
 
