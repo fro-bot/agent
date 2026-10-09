@@ -358,8 +358,10 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (repo-scoped read authz, continuous) |
 | `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF + repo write/admin | Submit a tool-approval decision (once/always/reject) |
 | `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run (repo-scoped read authz) |
+| `POST` | `/operator/runs/:runId/questions/:requestId/decision` | Session + CSRF + repo write/admin | Answer or skip an agent question (`{decision: 'skip'}` or `{decision: 'answer', answers}`; options by index, free text up to 4,000 characters; a refused body is `400 {error: 'bad request', reason, questionIndex}`) |
+| `GET` | `/operator/runs/:runId/questions` | Session | List pending agent-question requests for a run (repo-scoped read authz) |
 
-Operator contract: v1.8.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
+Operator contract: v1.9.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
 
 Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gateway restart clears all sessions (global logout).
 
@@ -536,7 +538,7 @@ If an update or recovery subprocess's termination cannot be confirmed, the works
 
 ### Deploy coordination
 
-Operator contract **1.8.0** carries checked remote evidence on `checkoutProvenance` and a new optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.8.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
+Operator contract **1.9.0** carries the agent-question frame and routes, the `waiting_for_question` run status, checked remote evidence on `checkoutProvenance`, and the optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.9.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
 
 The gateway and workspace images must roll together, for the same reason as the control-API bearer above: an older gateway does not send the bearer or request shapes a newer workspace expects, and vice versa.
 
@@ -574,6 +576,20 @@ Each approval prompt has a deadline that is a sub-deadline of the overall run ti
 ### Restart limitation
 
 A pending approval prompt is held in memory by the per-run coordinator. If the gateway or workspace container restarts while a prompt is open, the approval is abandoned. The run surfaces as interrupted in the thread. Re-mention to retry.
+
+## Agent questions
+
+The OpenCode `question` tool is enabled in gateway workspaces, and the gateway answers it. When an agent asks a question, the run pauses and operators can answer or skip it from the operator web surface or, for a Discord-launched run, from the run thread. Nothing in the base workspace config denies the tool. To stop agents from asking, set `"permission":{"question":"deny"}` in `WORKSPACE_OPENCODE_CONFIG`.
+
+Who can answer: a web operator needs write access to the run's repository, and a Discord user must pass the same `userIsAuthorized` rule as approvals. Discord users can answer only their own thread's question; web operators can answer any run's.
+
+Questions fail soft, unlike approvals. Each one has a deadline, a sub-deadline of the run timeout capped at 13 minutes. If it passes without an answer, the gateway replies with an empty answer, the agent sees the question as unanswered and continues, and the run does not fail. A question asked with 90 seconds or less of run time left is skipped immediately. A Discord post that cannot be delivered (for example the thread was deleted) does not settle the question; web answering and the deadline remain.
+
+A single-question request that fits Discord's component limits is shown in the thread with buttons or a select, Skip, and a text-answer button. Any other request posts a notice pointing at the operator web surface, linking `GATEWAY_OPERATOR_PUBLIC_ORIGIN` when it is set.
+
+### Restart limitation
+
+A pending question is held in memory. A gateway restart loses it along with the run. If only the workspace restarts, OpenCode loses the pending question, and the gateway's deadline skip fails closed.
 
 ## Working-state UX
 

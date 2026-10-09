@@ -70,6 +70,7 @@ function makeBaseStatus(overrides: Partial<OperatorRunStatus> = {}): OperatorRun
 function makeDeps(
   baseStatus: OperatorRunStatus | null,
   hasPendingForScope: (scopeId: string) => boolean = () => false,
+  hasPendingQuestionForScope?: (scopeId: string) => boolean,
 ): ProjectRunObservationDeps {
   return {
     nowMs: BASE_NOW_MS,
@@ -77,6 +78,7 @@ function makeDeps(
     bindingsLookup: {getBindingByRepo: async () => ({success: true, data: null})},
     isRepoDenied: () => false,
     hasPendingForScope,
+    ...(hasPendingQuestionForScope === undefined ? {} : {hasPendingQuestionForScope}),
     // Inject a stub so tests don't need a real binding store
     _projectRunStatus: async () => baseStatus,
   }
@@ -257,6 +259,156 @@ describe('projectRunObservation — waiting_for_approval overlay', () => {
     expect(result).not.toBeNull()
     expect(result?.status).toBe('queued')
     expect(result?.status).not.toBe('waiting_for_approval')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Overlay: waiting_for_question (approval takes precedence)
+// ---------------------------------------------------------------------------
+
+describe('projectRunObservation — waiting_for_question overlay', () => {
+  it('overrides running → waiting_for_question when only a question is pending', async () => {
+    // #given a running run whose scope has a pending question but no approval
+    const runState = makeRunState({surface: 'github', run_id: 'run-001'})
+    const deps = makeDeps(
+      makeBaseStatus(),
+      () => false,
+      scopeId => scopeId === 'run-001',
+    )
+
+    // #when projecting
+    const result = await projectRunObservation(runState, deps)
+
+    // #then the status is waiting_for_question
+    expect(result?.status).toBe('waiting_for_question')
+  })
+
+  it('keys the question overlay by the discord thread id, like approvals', async () => {
+    // #given a discord run whose thread scope has a pending question
+    const runState = makeRunState({surface: 'discord', thread_id: 'thread-q', run_id: 'run-001'})
+    const deps = makeDeps(
+      makeBaseStatus({surface: 'discord'}),
+      () => false,
+      scopeId => scopeId === 'thread-q',
+    )
+
+    // #when projecting
+    const result = await projectRunObservation(runState, deps)
+
+    // #then the question overlay applies via the thread scope
+    expect(result?.status).toBe('waiting_for_question')
+  })
+
+  it('shows waiting_for_approval while an approval and a question are both pending', async () => {
+    // #given both families pending for the run's scope
+    const deps = makeDeps(
+      makeBaseStatus(),
+      () => true,
+      () => true,
+    )
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState(), deps)
+
+    // #then approval takes precedence
+    expect(result?.status).toBe('waiting_for_approval')
+  })
+
+  it('moves approval → question → running as each pending item settles', async () => {
+    // #given mutable pending state for both families
+    let approvalPending = true
+    let questionPending = true
+    const deps = makeDeps(
+      makeBaseStatus(),
+      () => approvalPending,
+      () => questionPending,
+    )
+    const runState = makeRunState()
+
+    // #when / #then the status follows the precedence as items settle
+    expect((await projectRunObservation(runState, deps))?.status).toBe('waiting_for_approval')
+    approvalPending = false
+    expect((await projectRunObservation(runState, deps))?.status).toBe('waiting_for_question')
+    questionPending = false
+    expect((await projectRunObservation(runState, deps))?.status).toBe('running')
+  })
+
+  it('applies no question overlay when the predicate is absent', async () => {
+    // #given deps without a question predicate
+    const deps = makeDeps(makeBaseStatus(), () => false)
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState(), deps)
+
+    // #then the status stays running
+    expect(result?.status).toBe('running')
+  })
+
+  it.each([
+    ['succeeded', 'COMPLETED'],
+    ['failed', 'FAILED'],
+    ['cancelled', 'CANCELLED'],
+    ['queued', 'PENDING'],
+  ] as const)('does not overlay a %s status even with a stale pending question', async (status, phase) => {
+    // #given a non-running run and a stale pending question
+    const deps = makeDeps(
+      makeBaseStatus({phase, status}),
+      () => false,
+      () => true,
+    )
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState({phase}), deps)
+
+    // #then the base status is preserved
+    expect(result?.status).toBe(status)
+  })
+
+  it('does not call the question predicate when the bridge returns null', async () => {
+    // #given a denied repo and a spy predicate
+    let called = false
+    const deps = makeDeps(
+      null,
+      () => false,
+      () => {
+        called = true
+        return true
+      },
+    )
+
+    // #when projecting
+    const result = await projectRunObservation(makeRunState(), deps)
+
+    // #then null is returned and the predicate was never consulted
+    expect(result).toBeNull()
+    expect(called).toBe(false)
+  })
+
+  it('round-trips waiting_for_question through JSON as a valid OperatorWebStatus', async () => {
+    // #given a projected waiting_for_question status
+    const deps = makeDeps(
+      makeBaseStatus(),
+      () => false,
+      () => true,
+    )
+    const result = await projectRunObservation(makeRunState(), deps)
+
+    // #when serialized and parsed as an SSE status frame would be
+    const parsed = JSON.parse(JSON.stringify(result)) as OperatorRunStatus
+    const allowed: readonly OperatorWebStatus[] = [
+      'queued',
+      'blocked',
+      'running',
+      'waiting_for_approval',
+      'waiting_for_question',
+      'succeeded',
+      'failed',
+      'cancelled',
+    ]
+
+    // #then the status survives and is in the contract set
+    expect(parsed.status).toBe('waiting_for_question')
+    expect(allowed).toContain(parsed.status)
   })
 })
 

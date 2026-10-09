@@ -2,9 +2,16 @@
  * Program-scoped approval registry bridge.
  *
  * Maps requestID → approval context across all in-flight runs so any approval
- * transport (Discord button, future web callback) can: verify scope binding,
- * claim exactly once (single-winner), and POST the reply to OpenCode. All
- * side effects are injected as closures — this module is pure and unit-testable.
+ * transport (Discord button, web callback) can: verify scope binding, claim
+ * exactly once (single-winner), and POST the reply to OpenCode. All side
+ * effects are injected as closures — this module is pure and unit-testable.
+ *
+ * This module is the approval family of the shared {@link RequestGate}, which
+ * owns the entry map, the `open → claimed → confirmed` lifecycle, the
+ * deadline handshake, teardown, and the terminal notification (see
+ * `request-gate.ts`). What lives here is approval-specific: the
+ * `once/always/reject` vocabulary, the strict scope binding, supersede on
+ * re-register, the reject cascade, and the settled render.
  *
  * ### 3-state entry lifecycle
  *
@@ -25,7 +32,7 @@
  *
  * ### Winner-vs-loser rule (deadline race)
  *
- * - A **deadline** fires in the registry's own timer. If the entry is still
+ * - A **deadline** fires in the gate's own timer. If the entry is still
  *   `open` at that moment: the deadline wins — POST reject, render 'deadline',
  *   delete. If the entry is `claimed` (button approve in-flight): the button
  *   is the winner — deadline is a NO-OP, but `deadlineExpired` is set to true.
@@ -46,9 +53,11 @@
 
 import type {GatewayLogger} from '../discord/client.js'
 import type {ApprovalRequestDetail} from '../operator-contract/approval-frame.js'
-import type {OperatorIdentity} from '../operator-contract/identity.js'
 import type {PermissionReply, PermissionReplyEvent, PermissionRequest, SettlementReason} from './coordinator.js'
+import type {ApprovalGateEntry, GateActor, RequestGate, ScopePolicy, TerminalOutcome} from './request-gate.js'
+
 import {boundApprovalDetail} from './approval-detail.js'
+import {createRequestGate} from './request-gate.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -72,24 +81,7 @@ export type PendingApprovalDTO = ApprovalRequestDetail
 // ApprovalActor — transport-neutral actor/operator identity
 // ---------------------------------------------------------------------------
 
-/**
- * A Discord user who clicked an approval button.
- */
-export interface DiscordApprovalActor {
-  readonly kind: 'discord-user'
-  /** Discord snowflake ID of the user who clicked the button. */
-  readonly userId: string
-}
-
-/**
- * A web operator who submitted an approval decision via the control surface.
- *
- * Type alias for the canonical {@link OperatorIdentity} defined in the
- * operator-contract module. The structural shape is declared exactly once
- * there; this alias keeps the existing export path valid for all consumers
- * (discord-transport.ts, approval-flow.integration.test.ts, registry.test.ts).
- */
-export type WebOperatorActor = OperatorIdentity
+export type {DiscordApprovalActor, WebOperatorActor} from './request-gate.js'
 
 /**
  * Transport-neutral actor identity for an approval decision.
@@ -101,7 +93,7 @@ export type WebOperatorActor = OperatorIdentity
  * }
  * ```
  */
-export type ApprovalActor = DiscordApprovalActor | WebOperatorActor
+export type ApprovalActor = GateActor
 
 /** Render function injected after the approval embed/notification is posted successfully. */
 export type RenderFn = (
@@ -159,7 +151,7 @@ export interface RegisterParams {
 
 export type DecisionOutcome = 'ok' | 'not-found' | 'channel-mismatch' | 'already-claimed' | 'reply-failed'
 
-export type EntryState = 'open' | 'claimed' | 'confirmed'
+export type {EntryState} from './request-gate.js'
 
 export interface ApprovalRegistry {
   /** Register a new entry BEFORE sending the approval embed/notification. */
@@ -235,100 +227,87 @@ export interface ApprovalRegistry {
     readonly reason: SettlementReason
   }) => Promise<void>
   /**
-   * Fail-close every open entry that belongs to `sessionID` (run teardown).
-   * Safe to call even if entries have already been settled.
+   * Fail-close every open approval that belongs to `sessionID` (run teardown).
+   * Safe to call even if entries have already been settled. Approvals only:
+   * questions sharing the gate are torn down by the question registry.
    */
   disposeRun: (sessionID: string, reason: string) => Promise<void>
-  /** Fail-close every open entry (shutdown / global teardown). */
+  /** Fail-close every open approval (global teardown). Approvals only; shutdown uses the gate's `disposeAllAcrossFamilies`. */
   disposeAll: (reason: string) => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
-// Internal entry shape
+// Entry payload
 // ---------------------------------------------------------------------------
 
-interface RegistryEntry {
+/** Approval-specific data carried on a gate entry. */
+export interface ApprovalPayload {
   readonly request: PermissionRequest
-  readonly sessionID: string
-  readonly approvalScopeId: string
   readonly directory: string
   readonly effects: ApprovalSideEffects
-  state: EntryState
-  actor: ApprovalActor | null
   /** Set by attachMessage once the approval notification is posted. */
   renderFn: RenderFn | null
-  /** Deadline timer handle — cleared on any terminal transition. */
-  timer: ReturnType<typeof setTimeout> | null
-  /**
-   * Set to true when the deadline timer fires but the entry is `claimed`
-   * (button in-flight). If the button's postReply subsequently fails and
-   * resets state to `open`, the reset path checks this flag and immediately
-   * fail-closes instead of leaving the entry open with a dead timer.
-   */
-  deadlineExpired: boolean
-  /**
-   * Optional callback invoked when the deadline fires on an `open` entry.
-   * Stored from RegisterParams.onDeadlineSettled.
-   */
-  readonly onDeadlineSettled: (() => void | Promise<void>) | undefined
+}
+
+/** Approvals keep strict scope binding: the acting scope must equal the entry's scope. */
+const approvalScopePolicy: ScopePolicy = (entry, request) => entry.scopeId === request.scopeId
+
+/** Maps a settlement reason to how the entry left the gate. */
+function terminalOutcomeFor(reason: SettlementReason): TerminalOutcome {
+  switch (reason) {
+    case 'replied':
+      return 'confirmed'
+    case 'cascade':
+      return 'cascade'
+    case 'deadline':
+      return 'deadline'
+    case 'disposed':
+    case 'superseded':
+      return 'disposed'
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
-export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): ApprovalRegistry {
+export function createApprovalRegistry(deps: {
+  readonly logger: GatewayLogger
+  /** Shared gate. Pass the same gate to the question registry so terminal events span both families. */
+  readonly gate?: RequestGate
+}): ApprovalRegistry {
   const {logger} = deps
-  const entries = new Map<string, RegistryEntry>()
+  const gate = deps.gate ?? createRequestGate({logger})
 
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
 
-  function clearTimer(entry: RegistryEntry): void {
-    if (entry.timer !== null) {
-      clearTimeout(entry.timer)
-      entry.timer = null
+  function getEntry(requestID: string): ApprovalGateEntry | undefined {
+    const entry = gate.get(requestID)
+    return entry?.family === 'approval' ? entry : undefined
+  }
+
+  function approvalEntries(): readonly ApprovalGateEntry[] {
+    const result: ApprovalGateEntry[] = []
+    for (const entry of gate.list()) {
+      if (entry.family === 'approval') result.push(entry)
     }
+    return result
   }
 
   async function runRender(
-    entry: RegistryEntry,
-    requestID: string,
+    entry: ApprovalGateEntry,
     decision: PermissionReply,
     reason: SettlementReason,
   ): Promise<void> {
-    if (entry.renderFn !== null) {
-      try {
-        await entry.renderFn(entry.request, decision, entry.actor, reason)
-      } catch (error) {
-        logger.error({requestID, reason, err: error}, 'ApprovalRegistry: renderFn threw during settlement — continuing')
-      }
-    }
-  }
-
-  /**
-   * Shared fail-close helper: POST reject + render 'deadline' + delete.
-   * Used by both the deadline open-path and the handleDecision reset
-   * path when deadlineExpired is true.
-   */
-  async function failCloseNow(requestID: string, entry: RegistryEntry): Promise<void> {
-    logger.warn({requestID}, 'ApprovalRegistry: fail-closing entry (deadline already expired)')
-    entry.state = 'claimed'
-    entry.actor = null
+    const {renderFn} = entry.payload
+    if (renderFn === null) return
     try {
-      const r = await entry.effects.postReply(requestID, entry.directory, 'reject')
-      if (!r.ok) {
-        logger.warn(
-          {requestID, error: r.error},
-          'ApprovalRegistry: failCloseNow postReply returned ok:false — continuing',
-        )
-      }
+      await renderFn(entry.payload.request, decision, entry.actor, reason)
     } catch (error) {
-      logger.warn({requestID, err: error}, 'ApprovalRegistry: failCloseNow postReply threw — continuing')
+      gate.logRenderFailure(entry, reason, error)
     }
-    await runRender(entry, requestID, 'reject', 'deadline')
-    entries.delete(requestID)
   }
 
   // -------------------------------------------------------------------------
@@ -337,103 +316,42 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
 
   function register(params: RegisterParams): void {
     const {requestID, sessionID, approvalScopeId, directory, request, effects, deadlineMs, onDeadlineSettled} = params
-    if (entries.has(requestID)) {
-      // FIX 3: clear the existing entry's timer before overwriting so the old
-      // setTimeout cannot fire settleByDeadline on the replacement entry.
-      const existing = entries.get(requestID)
-      if (existing !== undefined) {
-        clearTimer(existing)
-        // NBC4: best-effort render the old embed as superseded so its buttons
-        // become visibly inert. Wrapped so it never throws into register.
-        if (existing.renderFn !== null) {
-          // eslint-disable-next-line no-void
-          void existing.renderFn(existing.request, 'reject', null, 'superseded').catch(() => {})
-        }
+    const entry: ApprovalGateEntry = {
+      family: 'approval',
+      requestID,
+      sessionID,
+      scopeId: approvalScopeId,
+      payload: {request, directory, effects, renderFn: null},
+      ops: {
+        // The next two return the underlying promise instead of wrapping it in an async function:
+        // an async wrapper adds microtask ticks to the fail-close chain, whose depth the
+        // FIX 2 tests in registry.test.ts pin.
+        // eslint-disable-next-line @typescript-eslint/promise-function-async
+        postDeadlineReply: () => effects.postReply(requestID, directory, 'reject'),
+        // eslint-disable-next-line @typescript-eslint/promise-function-async
+        renderDeadline: () => runRender(entry, 'reject', 'deadline'),
+        dispose: async () => applySettlement({requestID, decision: 'reject', reason: 'disposed'}),
+        onDeadlineSettled,
+      },
+      state: 'open',
+      actor: null,
+      timer: null,
+      deadlineExpired: false,
+      terminalFired: false,
+    }
+    // A re-ask for a pending request id replaces the entry. The gate clears the replaced entry's
+    // timer (so it cannot settle the replacement) and emits no terminal notification for it,
+    // because the request id stays pending.
+    const replaced = gate.put(entry, deadlineMs)
+    if (replaced !== undefined) {
+      // Best-effort render the old embed as superseded so its buttons become visibly inert.
+      // Wrapped so it never throws into register.
+      if (replaced.family === 'approval' && replaced.payload.renderFn !== null) {
+        // eslint-disable-next-line no-void
+        void replaced.payload.renderFn(replaced.payload.request, 'reject', null, 'superseded').catch(() => {})
       }
       logger.warn({requestID}, 'ApprovalRegistry: duplicate requestID — overwriting (re-ask)')
     }
-    const entry: RegistryEntry = {
-      request,
-      sessionID,
-      approvalScopeId,
-      directory,
-      effects,
-      state: 'open',
-      actor: null,
-      renderFn: null,
-      timer: null,
-      deadlineExpired: false,
-      onDeadlineSettled,
-    }
-    entries.set(requestID, entry)
-
-    if (deadlineMs !== undefined && deadlineMs > 0) {
-      entry.timer = setTimeout(() => {
-        settleByDeadline(requestID)
-      }, deadlineMs)
-      entry.timer.unref?.()
-    }
-  }
-
-  /**
-   * Deadline timer callback. Only settles if entry is still `open` — the
-   * button winner (claimed state) beats the deadline.
-   *
-   * FIX 2: When the entry is `claimed`, set `deadlineExpired = true` so that
-   * if the button's postReply subsequently fails and resets to `open`, the
-   * reset path can immediately fail-close instead of leaving a dead timer.
-   */
-  function settleByDeadline(requestID: string): void {
-    const entry = entries.get(requestID)
-    if (entry === undefined) return // already gone
-
-    if (entry.state !== 'open') {
-      // Button approve is in-flight (claimed). Deadline LOSES. No-op.
-      // But mark deadlineExpired so the button reset path can fail-close.
-      entry.deadlineExpired = true
-      logger.debug(
-        {requestID, state: entry.state},
-        'ApprovalRegistry: deadline fired but entry is claimed — no-op (button winner); deadlineExpired set',
-      )
-      return
-    }
-
-    // Entry is open — deadline wins.
-    logger.warn({requestID}, 'ApprovalRegistry: deadline expired on open entry — fail-closed')
-    entry.state = 'claimed'
-    entry.timer = null
-
-    // Capture the callback before the entry is deleted.
-    const {onDeadlineSettled} = entry
-
-    // Best-effort POST reject then render.
-    const doDeadline = async () => {
-      try {
-        const r = await entry.effects.postReply(requestID, entry.directory, 'reject')
-        if (!r.ok) {
-          logger.warn(
-            {requestID, error: r.error},
-            'ApprovalRegistry: deadline postReply returned ok:false — continuing',
-          )
-        }
-      } catch (error) {
-        logger.warn({requestID, err: error}, 'ApprovalRegistry: deadline postReply threw — continuing')
-      }
-      await runRender(entry, requestID, 'reject', 'deadline')
-      entries.delete(requestID)
-
-      // Notify the run thread that approval timed out (best-effort).
-      if (onDeadlineSettled !== undefined) {
-        try {
-          await onDeadlineSettled()
-        } catch (error) {
-          logger.warn({requestID, err: error}, 'ApprovalRegistry: onDeadlineSettled threw — continuing')
-        }
-      }
-    }
-
-    // eslint-disable-next-line no-void
-    void doDeadline()
   }
 
   // -------------------------------------------------------------------------
@@ -441,16 +359,16 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   // -------------------------------------------------------------------------
 
   function attachMessage(requestID: string, renderFn: RenderFn): void {
-    const entry = entries.get(requestID)
+    const entry = getEntry(requestID)
     if (entry === undefined) {
       logger.warn({requestID}, 'ApprovalRegistry: attachMessage — entry not found (already settled?)')
       return
     }
-    entry.renderFn = renderFn
+    entry.payload.renderFn = renderFn
   }
 
   function markMessagePostFailed(requestID: string): void {
-    const entry = entries.get(requestID)
+    const entry = getEntry(requestID)
     if (entry === undefined) {
       logger.warn({requestID}, 'ApprovalRegistry: markMessagePostFailed — entry not found (already settled?)')
       return
@@ -459,41 +377,37 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   }
 
   // -------------------------------------------------------------------------
-  // has / pending
+  // has / pending / scope queries
   // -------------------------------------------------------------------------
 
   function has(requestID: string): boolean {
-    return entries.has(requestID)
+    return getEntry(requestID) !== undefined
   }
 
   function pending(): readonly string[] {
-    return Array.from(entries.keys())
+    return approvalEntries().map(entry => entry.requestID)
   }
 
   function hasPendingForScope(approvalScopeId: string): boolean {
-    for (const entry of entries.values()) {
-      if (entry.approvalScopeId === approvalScopeId && (entry.state === 'open' || entry.state === 'claimed')) {
-        return true
-      }
-    }
-    return false
+    return gate.hasPendingForScope('approval', approvalScopeId)
   }
 
   function describePendingForScope(approvalScopeId: string): readonly PendingApprovalDTO[] {
     const result: PendingApprovalDTO[] = []
-    for (const [requestID, entry] of entries) {
-      if (entry.approvalScopeId !== approvalScopeId) continue
+    for (const entry of approvalEntries()) {
+      if (entry.scopeId !== approvalScopeId) continue
       // Only return 'open' entries — 'claimed' entries are mid-decision (in-flight)
       // and not actionable by the browser; returning them would render a prompt
       // the browser cannot decide.
       if (entry.state !== 'open') continue
 
-      const command = boundApprovalDetail(entry.request.command)
-      const filepath = boundApprovalDetail(entry.request.filepath)
+      const {request} = entry.payload
+      const command = boundApprovalDetail(request.command)
+      const filepath = boundApprovalDetail(request.filepath)
 
       const dto: PendingApprovalDTO = {
-        requestID,
-        permission: entry.request.permission,
+        requestID: entry.requestID,
+        permission: request.permission,
         ...(command !== undefined && command.length > 0 ? {command} : {}),
         ...(filepath !== undefined && filepath.length > 0 ? {filepath} : {}),
       }
@@ -514,64 +428,29 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   }): Promise<DecisionOutcome> {
     const {requestID, approvalScopeId, decision, actor} = args
 
-    const entry = entries.get(requestID)
+    const entry = getEntry(requestID)
     if (entry === undefined) {
       return 'not-found'
     }
 
-    if (entry.approvalScopeId !== approvalScopeId) {
-      logger.warn(
-        {requestID, expected: entry.approvalScopeId, received: approvalScopeId},
-        'ApprovalRegistry: scope mismatch — ignoring decision',
-      )
-      return 'channel-mismatch'
+    const admission = gate.admit(entry, {scopeId: approvalScopeId, actor}, approvalScopePolicy)
+    if (admission.kind === 'scope-mismatch') return 'channel-mismatch'
+    if (admission.kind === 'already-claimed') return 'already-claimed'
+
+    const {effects, directory} = entry.payload
+    // Returns the underlying promise: see the note on postDeadlineReply in register().
+    // eslint-disable-next-line @typescript-eslint/promise-function-async
+    const outcome = await admission.submit(() => effects.postReply(requestID, directory, decision))
+    switch (outcome) {
+      case 'ok':
+        return 'ok'
+      case 'already-claimed':
+        return 'already-claimed'
+      case 'not-found':
+        return 'not-found'
+      case 'reply-failed':
+        return 'reply-failed'
     }
-
-    // Single-winner gate: claimed or confirmed both block a second decision.
-    if (entry.state === 'claimed' || entry.state === 'confirmed') {
-      return 'already-claimed'
-    }
-
-    // Atomic claim — transitions open → claimed
-    entry.state = 'claimed'
-    entry.actor = actor
-
-    let result: {readonly ok: boolean; readonly error?: string}
-    try {
-      result = await entry.effects.postReply(requestID, entry.directory, decision)
-    } catch (error) {
-      logger.error({requestID, err: error}, 'ApprovalRegistry: postReply threw — resetting to open')
-      // FIX 2: if deadline already fired while we were in-flight, fail-close immediately
-      // instead of leaving the entry open with a dead timer.
-      if (entry.deadlineExpired) {
-        // eslint-disable-next-line no-void
-        void failCloseNow(requestID, entry)
-      } else {
-        entry.state = 'open'
-        entry.actor = null
-      }
-      return 'reply-failed'
-    }
-
-    if (!result.ok) {
-      logger.error(
-        {requestID, error: result.error},
-        'ApprovalRegistry: postReply returned ok:false — resetting to open',
-      )
-      // FIX 2: same fail-close-on-expired-deadline logic for the ok:false path.
-      if (entry.deadlineExpired) {
-        // eslint-disable-next-line no-void
-        void failCloseNow(requestID, entry)
-      } else {
-        entry.state = 'open'
-        entry.actor = null
-      }
-      return 'reply-failed'
-    }
-
-    // Stay claimed — render happens in confirmReply when OpenCode echoes back.
-    // Do NOT transition to confirmed here; the deadline must see 'claimed' to back off.
-    return 'ok'
   }
 
   // -------------------------------------------------------------------------
@@ -581,13 +460,13 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   function confirmReply(event: PermissionReplyEvent): void {
     const {requestID, sessionID, reply} = event
 
-    const entry = entries.get(requestID)
+    const entry = getEntry(requestID)
     if (entry === undefined) {
       logger.debug({requestID, reply}, 'ApprovalRegistry: confirmReply — entry not found (already settled?)')
       return
     }
 
-    // P2 defensive guard: cross-session settle prevention.
+    // Defensive guard: cross-session settle prevention.
     // requestIDs are globally unique (per_...) so this should never fire in
     // practice, but guards against any future ID-collision scenario.
     if (entry.sessionID !== sessionID) {
@@ -598,9 +477,6 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
       return
     }
 
-    // Clear the deadline timer regardless of state — this event is authoritative.
-    clearTimer(entry)
-
     // Log if OpenCode's reply differs from our claimed decision (it wins).
     if ((entry.state === 'claimed' || entry.state === 'confirmed') && entry.actor !== null) {
       // The reply is the echo of our POST. Render with OpenCode's reply.
@@ -610,38 +486,37 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
       logger.info({requestID, state: entry.state, reply}, 'ApprovalRegistry: confirmReply — OpenCode-initiated')
     }
 
-    entries.delete(requestID)
-
-    // Render asynchronously (best-effort; errors logged inside runRender).
+    // Render asynchronously (best-effort; errors logged by the gate).
     // eslint-disable-next-line no-void
-    void runRender(entry, requestID, reply, 'replied').then(() => {
-      // FIX 1: cascade only `open` siblings — skip `claimed` siblings entirely.
-      // A `claimed` sibling has its own button-approve postReply in-flight and
-      // will settle via its own confirmReply echo (or its own deadline).
-      // Sending a cascade reject to a claimed sibling would create a contradiction:
-      // OpenCode would receive both 'once' (from the button) and 'reject' (cascade).
-      if (reply === 'reject') {
-        // eslint-disable-next-line no-void
-        void cascadeReject(sessionID)
-      }
-    })
+    void gate
+      .settleEcho(entry, async () => runRender(entry, reply, 'replied'))
+      .then(() => {
+        // Cascade only `open` siblings — skip `claimed` siblings entirely.
+        // A `claimed` sibling has its own button-approve postReply in-flight and
+        // will settle via its own confirmReply echo (or its own deadline).
+        // Sending a cascade reject to a claimed sibling would create a contradiction:
+        // OpenCode would receive both 'once' (from the button) and 'reject' (cascade).
+        if (reply === 'reject') {
+          // eslint-disable-next-line no-void
+          void cascadeReject(sessionID)
+        }
+      })
   }
 
   async function cascadeReject(sessionID: string): Promise<void> {
-    // FIX 1: only cascade to `open` siblings; skip `claimed` ones.
-    const siblings = Array.from(entries.entries()).filter(([, e]) => e.sessionID === sessionID && e.state === 'open')
+    // Only cascade to `open` siblings; skip `claimed` ones.
+    const siblings = approvalEntries().filter(e => e.sessionID === sessionID && e.state === 'open')
     await Promise.all(
-      siblings.map(async ([sibID, sib]) => {
-        clearTimer(sib)
-        entries.delete(sibID)
-        logger.info({requestID: sibID, sessionID}, 'ApprovalRegistry: cascade-rejecting sibling permission')
+      siblings.map(async sib => {
+        gate.settleNow(sib, 'cascade')
+        logger.info({requestID: sib.requestID, sessionID}, 'ApprovalRegistry: cascade-rejecting sibling permission')
         // Best-effort reject POST for the sibling (spec: KEEP the cascade POST).
         try {
-          await sib.effects.postReply(sibID, sib.directory, 'reject')
+          await sib.payload.effects.postReply(sib.requestID, sib.payload.directory, 'reject')
         } catch (error) {
-          logger.warn({requestID: sibID, err: error}, 'ApprovalRegistry: cascade postReply threw — continuing')
+          logger.warn({requestID: sib.requestID, err: error}, 'ApprovalRegistry: cascade postReply threw — continuing')
         }
-        await runRender(sib, sibID, 'reject', 'cascade')
+        await runRender(sib, 'reject', 'cascade')
       }),
     )
   }
@@ -668,7 +543,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   }): Promise<void> {
     const {requestID, decision, reason} = args
 
-    const entry = entries.get(requestID)
+    const entry = getEntry(requestID)
     if (entry === undefined) {
       // Already settled/unregistered — idempotent no-op
       return
@@ -683,79 +558,34 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
       return
     }
 
-    // Clear deadline timer on any terminal path.
-    clearTimer(entry)
-
-    // For non-replied/non-cascade reasons on open entries: best-effort postReply.
-    // Skip if already claimed/confirmed (postReply was or is being sent).
-    if (reason !== 'replied' && reason !== 'cascade' && entry.state === 'open') {
-      entry.state = 'claimed'
-      try {
-        const r = await entry.effects.postReply(requestID, entry.directory, decision)
-        if (r.ok) {
-          entry.state = 'confirmed'
-        } else {
+    // The gate clears the deadline timer on any terminal path, runs the work below, then removes
+    // the entry and emits the terminal notification.
+    await gate.retire(entry, terminalOutcomeFor(reason), async () => {
+      // For non-replied/non-cascade reasons on open entries: best-effort postReply.
+      // Skip if already claimed/confirmed (postReply was or is being sent).
+      if (reason !== 'replied' && reason !== 'cascade' && entry.state === 'open') {
+        entry.state = 'claimed'
+        try {
+          const r = await entry.payload.effects.postReply(requestID, entry.payload.directory, decision)
+          if (r.ok) {
+            entry.state = 'confirmed'
+          } else {
+            logger.warn(
+              {requestID, reason, error: r.error},
+              'ApprovalRegistry: best-effort postReply on settlement returned ok:false — continuing',
+            )
+          }
+        } catch (error) {
           logger.warn(
-            {requestID, reason, error: r.error},
-            'ApprovalRegistry: best-effort postReply on settlement returned ok:false — continuing',
+            {requestID, reason, err: error},
+            'ApprovalRegistry: best-effort postReply on settlement threw — continuing',
           )
         }
-      } catch (error) {
-        logger.warn(
-          {requestID, reason, err: error},
-          'ApprovalRegistry: best-effort postReply on settlement threw — continuing',
-        )
       }
-    }
 
-    // Edit the settled embed — only if a message was successfully attached.
-    await runRender(entry, requestID, decision, reason)
-
-    // Unregister
-    entries.delete(requestID)
-  }
-
-  // -------------------------------------------------------------------------
-  // disposeRun
-  // -------------------------------------------------------------------------
-
-  async function disposeRun(sessionID: string, reason: string): Promise<void> {
-    const snapshot = Array.from(entries.entries())
-      .filter(([, entry]) => entry.sessionID === sessionID)
-      .map(([requestID]) => requestID)
-    if (snapshot.length > 0) {
-      logger.warn(
-        {sessionID, reason, count: snapshot.length},
-        'ApprovalRegistry: disposeRun — fail-closing run entries',
-      )
-    }
-    await Promise.all(
-      snapshot.map(async requestID => {
-        try {
-          await applySettlement({requestID, decision: 'reject', reason: 'disposed'})
-        } catch (error) {
-          logger.error({requestID, err: error}, 'ApprovalRegistry: disposeRun — applySettlement threw — continuing')
-        }
-      }),
-    )
-  }
-
-  // -------------------------------------------------------------------------
-  // disposeAll
-  // -------------------------------------------------------------------------
-
-  async function disposeAll(_reason: string): Promise<void> {
-    // Snapshot keys before iteration so deletion during iteration is safe
-    const snapshot = Array.from(entries.keys())
-    await Promise.all(
-      snapshot.map(async requestID => {
-        try {
-          await applySettlement({requestID, decision: 'reject', reason: 'disposed'})
-        } catch (error) {
-          logger.error({requestID, err: error}, 'ApprovalRegistry: disposeAll — applySettlement threw — continuing')
-        }
-      }),
-    )
+      // Edit the settled embed — only if a message was successfully attached.
+      await runRender(entry, decision, reason)
+    })
   }
 
   return {
@@ -769,7 +599,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     handleDecision,
     confirmReply,
     applySettlement,
-    disposeRun,
-    disposeAll,
+    disposeRun: async (sessionID, reason) => gate.disposeFamilyRun('approval', sessionID, reason),
+    disposeAll: async reason => gate.disposeFamilyAll('approval', reason),
   }
 }

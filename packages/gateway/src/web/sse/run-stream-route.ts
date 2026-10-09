@@ -188,6 +188,9 @@ async function writeFrame(stream: SSEStreamingApi, frame: ObservationFrame): Pro
     await stream.writeSSE({event: 'output', data: JSON.stringify(frame.data)})
   } else if (frame.type === 'approval') {
     await stream.writeSSE({event: 'approval', data: JSON.stringify({runId: frame.runId, ...frame.data})})
+  } else if (frame.type === 'question') {
+    // Strings inside are untrusted plain text, carried verbatim as JSON string values.
+    await stream.writeSSE({event: 'question', data: JSON.stringify({...frame.data, runId: frame.runId})})
   } else {
     // Exhaustiveness guard: a new ObservationFrame variant must be handled above.
     const EXHAUSTIVE_CHECK: never = frame

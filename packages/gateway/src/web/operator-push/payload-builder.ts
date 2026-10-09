@@ -1,5 +1,5 @@
 /**
- * Pure builders for the two operator push notification payloads.
+ * Pure builders for the operator push notification payloads (approval, question, run failed).
  *
  * Security invariant: the returned payload NEVER carries repo, prompt,
  * command, run output, endpoint, keys, tokens, cookies, CSRF token,
@@ -12,7 +12,7 @@
 import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
 
 export interface PushPayloadData {
-  readonly type: 'approval' | 'run_failed'
+  readonly type: 'approval' | 'question' | 'run_failed'
   readonly route: string
   readonly failureLabel?: OperatorFailureKind
 }
@@ -54,6 +54,19 @@ export function buildApprovalPayload(): PushPayload {
     title: 'operator.approval_needed.title',
     body: 'operator.approval_needed.body',
     data: {type: 'approval', route: '/'},
+  }
+}
+
+/**
+ * Builds the fixed-copy payload for an agent-question notification. Takes no
+ * arguments on purpose: question text, options, repo, and prompt must never
+ * reach a push payload.
+ */
+export function buildQuestionPayload(): PushPayload {
+  return {
+    title: 'operator.question_pending.title',
+    body: 'operator.question_pending.body',
+    data: {type: 'question', route: '/'},
   }
 }
 

@@ -21,7 +21,12 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {ApprovalFrameData, OperatorOutputFrame, OperatorRunStatus} from '../../operator-contract/index.js'
+import type {
+  ApprovalFrameData,
+  OperatorOutputFrame,
+  OperatorRunStatus,
+  QuestionFrameData,
+} from '../../operator-contract/index.js'
 
 // ---------------------------------------------------------------------------
 // Constants (injectable for tests)
@@ -59,6 +64,9 @@ export const DEFAULT_TERMINAL_REPLAY_MAX_BYTES = 8 * 1024 * 1024
 // ---------------------------------------------------------------------------
 // Terminal statuses
 // ---------------------------------------------------------------------------
+
+/** Max open question frames kept for reconnect replay, per run. Live delivery is not limited by this. */
+export const MAX_OPEN_QUESTION_REPLAY_PER_RUN = 8
 
 const TERMINAL_STATUSES = new Set<OperatorRunStatus['status']>(['succeeded', 'failed', 'cancelled'])
 
@@ -117,8 +125,22 @@ export interface ApprovalFrame {
   readonly data: ApprovalFrameData
 }
 
+/**
+ * A question frame carrying a pending agent question (or its settle/clear
+ * signal) to the browser. All question and answer strings inside are untrusted
+ * plain text; see `operator-contract/question-frame.ts`.
+ *
+ * Like approval frames, question frames are NOT coalesced: they are rare and
+ * must arrive intact, and fan out via the non-coalescing `enqueueFrame` path.
+ */
+export interface QuestionFrame {
+  readonly type: 'question'
+  readonly runId: string
+  readonly data: QuestionFrameData
+}
+
 /** The closed union of all frame types the manager can emit. */
-export type ObservationFrame = StatusFrame | ResetFrame | HeartbeatFrame | OutputFrame | ApprovalFrame
+export type ObservationFrame = StatusFrame | ResetFrame | HeartbeatFrame | OutputFrame | ApprovalFrame | QuestionFrame
 
 // ---------------------------------------------------------------------------
 // Subscriber callbacks
@@ -236,6 +258,27 @@ export interface RunObservationManager {
    * terminal state (out-of-order async guard).
    */
   readonly observeApproval: (runId: string, data: ApprovalFrameData) => void
+
+  /**
+   * Observe a pending or settled agent question for a run. Observer-only / best-effort.
+   *
+   * Fans a QuestionFrame to all current subscribers via the non-coalescing
+   * `enqueueFrame` path, like approval frames. Call with `data.settled === false`
+   * when a question opens and `data.settled === true` when it settles (answered,
+   * skipped, expired, or torn down); the settle frame must be observed BEFORE the
+   * terminal status so the browser dismisses the prompt before the run closes.
+   *
+   * Unlike approval frames, open question frames are also replayed to a
+   * subscriber that connects while the question is pending (reconnect
+   * reconciliation). The replay set is bounded (`MAX_OPEN_QUESTION_REPLAY_PER_RUN`
+   * per run, oldest evicted), cleared on settle and on terminal, and never holds
+   * a settled question. An open frame larger than half the subscriber queue cap
+   * is dropped with a warning (ids only) rather than evicting every subscriber.
+   *
+   * Drops silently when the manager is shut down or the run has already reached
+   * terminal state (out-of-order async guard).
+   */
+  readonly observeQuestion: (runId: string, data: QuestionFrameData) => void
 
   /**
    * Abort a subscription with a given reason (e.g., 'observation-failed' for EOF).
@@ -390,6 +433,14 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
   /** Running total of estimated bytes stored in terminalReplayCache. */
   let terminalReplayCacheBytes = 0
+
+  /**
+   * Open (unsettled) question frames per run, replayed to a subscriber that
+   * connects mid-question. Map<runId, Map<requestID, frame>>; a Map preserves
+   * insertion order, so eviction at the cap drops the oldest. Cleared per
+   * request on settle, per run on terminal, and entirely on shutdown.
+   */
+  const openQuestionFrames = new Map<string, Map<string, QuestionFrame>>()
 
   // ---------------------------------------------------------------------------
   // Internal: terminal replay cache management
@@ -981,6 +1032,8 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     if (isTerminal(projected.status) === true) {
       latestStatusCache.delete(runId)
       outputSeqCounters.delete(runId)
+      // A terminal run has no pending question; late subscribers get the terminal replay only.
+      openQuestionFrames.delete(runId)
 
       // Move final output to terminal replay cache (with TTL) instead of
       // deleting it. Late subscribers connecting within the TTL receive the cached
@@ -1082,6 +1135,69 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // Fan out via the non-coalescing path — approval frames are rare and must
     // arrive intact. Overflow drops the subscriber (same as status frames),
     // not the frame (unlike output frames which coalesce).
+    fanOut(runId, frame)
+  }
+
+  // ---------------------------------------------------------------------------
+  // observeQuestion
+  // ---------------------------------------------------------------------------
+
+  const observeQuestion = (runId: string, data: QuestionFrameData): void => {
+    if (isShutdown === true) {
+      return
+    }
+
+    // Out-of-order async guard, as for approvals: a question frame must not
+    // arrive after the terminal status has committed the replay cache entry.
+    if (terminalRuns.has(runId) === true) {
+      logger.warn({runId, requestID: data.requestID}, 'manager: observeQuestion called after terminal — dropping')
+      return
+    }
+
+    // Pin the fan-out key: the frame's runId is the one the manager routed by.
+    const frame: QuestionFrame = {type: 'question', runId, data: {...data, runId}}
+
+    if (data.settled === true) {
+      // A settled question must never reappear on reconnect.
+      const open = openQuestionFrames.get(runId)
+      if (open !== undefined) {
+        open.delete(data.requestID)
+        if (open.size === 0) {
+          openQuestionFrames.delete(runId)
+        }
+      }
+      fanOut(runId, frame)
+      return
+    }
+
+    // An open frame that cannot fit a healthy subscriber queue would drop the
+    // subscriber on every delivery and every reconnect. Skip it instead; the
+    // registry entry, the pending listing, and the deadline are unaffected.
+    const frameBytes = estimateFrameBytes(frame)
+    if (frameBytes > subscriberQueueCapBytes / 2) {
+      logger.warn(
+        {runId, requestID: data.requestID, frameBytes, reason: 'frame-too-large'},
+        'manager: observeQuestion open frame too large — not delivered',
+      )
+      return
+    }
+
+    let open = openQuestionFrames.get(runId)
+    if (open === undefined) {
+      open = new Map()
+      openQuestionFrames.set(runId, open)
+    }
+    // Re-observing an id keeps one entry at the newest position.
+    open.delete(data.requestID)
+    open.set(data.requestID, frame)
+    if (open.size > MAX_OPEN_QUESTION_REPLAY_PER_RUN) {
+      const oldest = open.keys().next().value
+      if (oldest !== undefined) {
+        open.delete(oldest)
+      }
+    }
+
+    // Non-coalescing path: overflow drops the subscriber, never the frame.
     fanOut(runId, frame)
   }
 
@@ -1188,6 +1304,16 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       enqueueFrame(sub, snapshotFrame)
     }
 
+    // Reconnect reconciliation: deliver every still-open question after the
+    // status snapshot so the browser can re-render the prompt. Settled
+    // questions were removed from the set when they settled.
+    const openQuestions = openQuestionFrames.get(runId)
+    if (openQuestions !== undefined) {
+      for (const questionFrame of openQuestions.values()) {
+        enqueueFrame(sub, questionFrame)
+      }
+    }
+
     // Deliver the cached final output frame (if any) after the status snapshot.
     // This ensures a late subscriber (connecting after the run's final output frame
     // but before terminal) receives the complete answer.
@@ -1256,6 +1382,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     latestStatusCache.clear()
     latestOutputCache.clear()
     outputSeqCounters.clear()
+    openQuestionFrames.clear()
 
     // Clear terminal replay cache (cancel all eviction timers)
     for (const entry of terminalReplayCache.values()) {
@@ -1268,5 +1395,5 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     terminalRuns.clear()
   }
 
-  return {observe, observeOutput, observeApproval, subscribe, abortSubscription, shutdown}
+  return {observe, observeOutput, observeApproval, observeQuestion, subscribe, abortSubscription, shutdown}
 }

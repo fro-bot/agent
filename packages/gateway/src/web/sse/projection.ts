@@ -5,7 +5,8 @@
  * repo yields null and is never surfaced. The result is a closed DTO that copies
  * only the operator-contract fields — RunState and its free-form details never
  * reach the output. When the run's approval scope has a pending decision, the
- * status is overlaid with waiting_for_approval.
+ * status is overlaid with waiting_for_approval; failing that, a pending question
+ * overlays waiting_for_question.
  */
 
 import type {RunState} from '@fro-bot/runtime'
@@ -29,6 +30,11 @@ export interface ProjectRunObservationDeps {
   readonly bindingsLookup: BindingsLookup
   readonly isRepoDenied: (repoKey: {readonly databaseId: number | null; readonly nodeId: string | null}) => boolean
   readonly hasPendingForScope: (approvalScopeId: string) => boolean
+  /**
+   * True when the run's scope has an open or claimed agent question. Optional:
+   * absent means no `waiting_for_question` overlay. Keyed by the same `scopeIdFor` scope.
+   */
+  readonly hasPendingQuestionForScope?: (questionScopeId: string) => boolean
   readonly _projectRunStatus?: (
     runState: RunState,
     deps: ProjectRunObservationDeps,
@@ -88,11 +94,11 @@ export async function projectRunObservation(
   uncopied satisfies Record<string, never>
 
   const scopeId = scopeIdFor(runState)
-  // Only overlay waiting_for_approval when the run is actively running — a stale approval
-  // entry must not override a terminal status (succeeded/failed/cancelled) that has already
-  // been reached. The overlay is meaningless once the run has left the running state.
-  const overlaidStatus =
-    status === 'running' && deps.hasPendingForScope(scopeId) === true ? 'waiting_for_approval' : status
+  // Only overlay a waiting status when the run is actively running — a stale approval or
+  // question entry must not override a terminal status (succeeded/failed/cancelled) that has
+  // already been reached. The overlay is meaningless once the run has left the running state.
+  // Approval wins over question: an approval gates a tool call, so it is the more urgent signal.
+  const overlaidStatus = overlayWaitingStatus(status, scopeId, deps)
 
   const result: OperatorRunStatus = {
     runId,
@@ -108,6 +114,17 @@ export async function projectRunObservation(
   }
 
   return result
+}
+
+function overlayWaitingStatus(
+  status: OperatorRunStatus['status'],
+  scopeId: string,
+  deps: ProjectRunObservationDeps,
+): OperatorRunStatus['status'] {
+  if (status !== 'running') return status
+  if (deps.hasPendingForScope(scopeId) === true) return 'waiting_for_approval'
+  if (deps.hasPendingQuestionForScope?.(scopeId) === true) return 'waiting_for_question'
+  return status
 }
 
 async function callRealBridge(runState: RunState, deps: ProjectRunObservationDeps): Promise<OperatorRunStatus | null> {
