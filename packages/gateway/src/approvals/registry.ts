@@ -451,8 +451,11 @@ export function createApprovalRegistry(deps: {
         return 'not-found'
       case 'reply-failed':
         // Teardown removed the entry while this reply was in flight, and the reply failed: nothing
-        // owns the permission any more, so it would stay pending in OpenCode. Deny it once.
-        if (entry.state === 'disposed') await rejectAfterDisposedReplyFailure(entry)
+        // owns the permission any more, so it would stay pending in OpenCode. Deny it once, unless
+        // the gate's deadline fail-close already started recovery (its reject answers the request).
+        if (entry.state === 'disposed' && entry.recoveryStarted !== true) {
+          await rejectAfterDisposedReplyFailure(entry)
+        }
         return 'reply-failed'
     }
   }

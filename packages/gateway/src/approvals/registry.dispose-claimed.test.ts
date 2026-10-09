@@ -89,6 +89,32 @@ async function decideOnce(registry: ReturnType<typeof setup>['registry']) {
   return registry.handleDecision({requestID: 'per_1', approvalScopeId: 'chan_1', decision: 'once', actor: ACTOR})
 }
 
+/** Registers with a short deadline. Replies in order: claimant (held), deadline reject (held), then ok. */
+function registerWithDeadline(
+  registry: ReturnType<typeof setup>['registry'],
+  claimant: Promise<ReplyResult>,
+  deadlineReject: Promise<ReplyResult>,
+  render: RenderFn,
+) {
+  const postReply = vi
+    .fn<ApprovalSideEffects['postReply']>()
+    .mockReturnValueOnce(claimant)
+    .mockReturnValueOnce(deadlineReject)
+    .mockResolvedValue({ok: true})
+  const request = makeRequest()
+  registry.register({
+    requestID: request.requestID,
+    sessionID: request.sessionID,
+    approvalScopeId: 'chan_1',
+    directory: '/workspace/proj',
+    request,
+    effects: {postReply},
+    deadlineMs: 5,
+  })
+  registry.attachMessage(request.requestID, render)
+  return postReply
+}
+
 describe('teardown while the claimant reply is still in flight', () => {
   it('the reply fails after teardown: one deny is sent, and the entry is never reopened or re-rendered', async () => {
     // #given an approve whose reply POST is still in flight, on an approval with a rendered embed
@@ -204,5 +230,106 @@ describe('teardown while the claimant reply is still in flight', () => {
     expect(render).toHaveBeenCalledExactlyOnceWith(request, 'reject', null, 'disposed')
     expect(registry.has('per_1')).toBe(false)
     expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+  })
+  describe('recovery is owned once: the deadline fail-close and teardown never both reply', () => {
+    it('(a) the deadline expires during the claim, the claimant fails, teardown is queued first: exactly one recovery reject and one terminal event', async () => {
+      // #given an approve in flight, then a deadline that expires while it is claimed
+      const {registry, terminals} = setup()
+      const claimant = deferred()
+      const deadlineReject = deferred() // the deadline fail-close's reject stays unresolved
+      const render = vi.fn().mockResolvedValue(undefined) as unknown as RenderFn
+      const postReply = registerWithDeadline(registry, claimant.promise, deadlineReject.promise, render)
+      const decision = decideOnce(registry)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/proj', 'once')
+
+      // #when the claimant fails and teardown is queued before the decision continuation resumes
+      claimant.settle({ok: false, error: 'down'})
+      let teardown!: Promise<void>
+      queueMicrotask(() => {
+        teardown = registry.disposeRun('ses_1', 'run-ended')
+      })
+      const outcome = await decision
+      await teardown
+
+      // #then the gate's fail-close reject is the only recovery: no second reject from the family
+      expect(outcome).toBe('reply-failed')
+      expect(postReply.mock.calls.map(call => call[2])).toEqual(['once', 'reject'])
+      // #and one terminal event, one render, and the entry is gone
+      expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+      expect(render).toHaveBeenCalledOnce()
+      expect(registry.pending()).toEqual([])
+    })
+
+    it('(a2) the deadline reject resolving while teardown rendering is still open does not render or terminate again', async () => {
+      // #given the same race, with the teardown render held open
+      const {registry, terminals} = setup()
+      const claimant = deferred()
+      const deadlineReject = deferred()
+      let finishRender!: () => void
+      const render = vi.fn().mockReturnValue(
+        new Promise<void>(resolve => {
+          finishRender = resolve
+        }),
+      ) as unknown as RenderFn
+      const postReply = registerWithDeadline(registry, claimant.promise, deadlineReject.promise, render)
+      const decision = decideOnce(registry)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      claimant.settle({ok: false, error: 'down'})
+      let teardown!: Promise<void>
+      queueMicrotask(() => {
+        teardown = registry.disposeRun('ses_1', 'run-ended')
+      })
+      await decision
+
+      // #when the deadline reject lands while the teardown render is still open
+      deadlineReject.settle({ok: true})
+      await flush()
+
+      // #then teardown still owns the single render and the single terminal event
+      expect(render).toHaveBeenCalledOnce()
+      expect(terminals).toEqual([])
+      finishRender()
+      await teardown
+      expect(render).toHaveBeenCalledOnce()
+      expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+      expect(postReply.mock.calls.map(call => call[2])).toEqual(['once', 'reject'])
+    })
+
+    it('(b) the claimant fails while teardown rendering is open, then the permission.replied echo arrives: one render, one terminal event, one recovery reply', async () => {
+      // #given an approve in flight and a teardown whose render is held open
+      const {registry, terminals} = setup()
+      const claimant = deferred()
+      let finishRender!: () => void
+      const render = vi.fn().mockReturnValue(
+        new Promise<void>(resolve => {
+          finishRender = resolve
+        }),
+      ) as unknown as RenderFn
+      const {postReply} = registerWithDelayedClaimantReply(registry, claimant.promise)
+      registry.attachMessage('per_1', render)
+      const decision = decideOnce(registry)
+      await flush()
+      const teardown = registry.disposeRun('ses_1', 'run-ended')
+      await flush()
+      expect(render).toHaveBeenCalledOnce()
+
+      // #when the claimant fails, then OpenCode echoes the recovery reject
+      claimant.settle({ok: false, error: 'down'})
+      await decision
+      registry.confirmReply({requestID: 'per_1', sessionID: 'ses_1', reply: 'reject'})
+      await flush()
+
+      // #then the echo found nothing to settle: no second render, no terminal event yet
+      expect(render).toHaveBeenCalledOnce()
+      expect(terminals).toEqual([])
+
+      // #and when teardown finishes, it emits the only terminal event
+      finishRender()
+      await teardown
+      expect(render).toHaveBeenCalledOnce()
+      expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+      expect(postReply.mock.calls.map(call => call[2])).toEqual(['once', 'reject'])
+    })
   })
 })

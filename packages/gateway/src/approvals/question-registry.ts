@@ -516,7 +516,10 @@ export function createQuestionRegistry(deps: {
       case 'reply-failed':
         // Teardown removed the entry while this reply was in flight, and the reply failed: nothing
         // owns the request any more, so it would stay pending in OpenCode. End it once.
-        if (entry.state === 'disposed') await rejectAfterDisposedReplyFailure(entry)
+        // Unless the gate's deadline fail-close already started recovery: its skip reply answers the request.
+        if (entry.state === 'disposed' && entry.recoveryStarted !== true) {
+          await rejectAfterDisposedReplyFailure(entry)
+        }
         return {kind: 'reply-failed'}
     }
   }
