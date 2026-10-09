@@ -2134,10 +2134,10 @@ describe('runOpenCodeCore — drain completion for background work', () => {
     ]
 
     /**
-     * An upstream-shaped message id (`id/id.ts:51-70`: `msg_` + 12 hex digits of creation order + a base62 tail) for
-     * the moment `n`: ids with a larger `n` were created later.
+     * An upstream-shaped message id (`id/id.ts:51-70`) created at server-clock ms `n`: `msg_` + the 12 hex digits
+     * of `n * 0x1000 + counter` + a base62 tail. Ids with a larger `n` were created later.
      */
-    const mid = (n: number): string => `msg_${n.toString(16).padStart(12, '0')}AAAAAAAAAAAAAA`
+    const mid = (n: number): string => `msg_${(n * 0x1000 + 1).toString(16).padStart(12, '0')}AAAAAAAAAAAAAA`
 
     /** A notice event whose message id is ordered by `n` (the stream's copy of `orderedTurns`' notice). */
     const orderedNotice = (n: number, state: 'completed' | 'error' = 'completed', childId = CHILD): object =>
@@ -2797,6 +2797,66 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
         run.live.add(CHILD)
         await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000, mid(2_000)))
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+
+        // #when the root is idle and REST (read back every second) shows only the surplus notice
+        await run.emit(idleEvent())
+        await run.advance(10_000)
+
+        // #then it credits nothing
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the new job's notice is persisted and the parent answers it
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500}, {n: 2_500})], error: null})
+        await run.advance(1_000)
+        await run.done
+
+        // #then REST alone completes it
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it("j6. a first-observed extension, the original job's surplus notice (from SSE), then a genuine new start whose assistant message predates the notice: the new job still needs its own notice", async () => {
+        // #given the first sight of CHILD is an extension (t=1000); the original job's notice (t=1500) is cached from SSE
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500})], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'updated', 1_000, mid(1_000)))
+        run.live.delete(CHILD)
+        await run.emit(orderedNotice(1_500))
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        expect(stateOf(run, CHILD)).toBe('settled')
+
+        // #when a genuine new start follows (t=2000) and its child settles
+        run.live.add(CHILD)
+        await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000, mid(1_400)))
+        expect(stateOf(run, CHILD)).toBe('outstanding')
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        await run.emit(idleEvent())
+        await run.advance(10_000)
+
+        // #then the surplus notice, ordered before the new dispatch, credits nothing: the run waits
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the new job's own notice arrives and the parent answers it
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500}, {n: 2_500})], error: null})
+        await run.emit(orderedNotice(2_500))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then the run completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('j7. the same (assistant message before the notice, tool start after it), with the surplus notice known only from REST', async () => {
+        // #given the original job's notice (t=1500) exists only in the persisted root transcript
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500})], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'updated', 1_000, mid(1_000)))
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        run.live.add(CHILD)
+        await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000, mid(1_400)))
         run.live.delete(CHILD)
         await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
 

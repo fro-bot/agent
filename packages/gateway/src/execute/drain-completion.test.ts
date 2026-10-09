@@ -12,7 +12,7 @@ import {getEventListeners} from 'node:events'
 import {createOwnershipLedger, ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {createDrainCompletion} from './drain-completion.js'
+import {createDrainCompletion, decodeMessageIdMs} from './drain-completion.js'
 
 const ROOT = 'sess-root'
 const CHILD = 'sess-child'
@@ -325,8 +325,8 @@ describe('createDrainCompletion — a result that arrives after the run ended ne
 })
 
 describe('createDrainCompletion — a notice credits only the job it follows (#1753 probe)', () => {
-  /** An upstream-shaped message id (`id/id.ts:51-70`): larger `n`, created later. */
-  const mid = (n: number): string => `msg_${n.toString(16).padStart(12, '0')}AAAAAAAAAAAAAA`
+  /** An upstream-shaped message id (`id/id.ts:51-70`) created at server-clock ms `n`. */
+  const mid = (n: number): string => `msg_${(n * 0x1000 + 1).toString(16).padStart(12, '0')}AAAAAAAAAAAAAA`
 
   const turns = (...notices: readonly number[]) => [
     {info: {id: 'msg-prompt', role: 'user', sessionID: ROOT}, parts: []},
@@ -393,5 +393,132 @@ describe('createDrainCompletion — a notice credits only the job it follows (#1
     // #then the count alone (2 notices for 2 jobs) is not enough: the second job has no notice of its own
     expect(onAdmitted).not.toHaveBeenCalled()
     completion.dispose()
+  })
+})
+
+describe('createDrainCompletion — the job boundary is the tool start, not its assistant message (#1753)', () => {
+  const mid = (n: number, counter = 1): string =>
+    `msg_${(n * 0x1000 + counter).toString(16).padStart(12, '0')}AAAAAAAAAAAAAA`
+
+  const turns = (...notices: readonly string[]) => [
+    {info: {id: 'msg-prompt', role: 'user', sessionID: ROOT}, parts: []},
+    ...notices.map((id, index) => ({
+      info: {
+        id,
+        role: 'user',
+        sessionID: ROOT,
+        time: {created: Math.floor(Number.parseInt(id.slice(4, 16), 16) / 0x1000)},
+      },
+      parts: [{id: `prt-${index}`, type: 'text', synthetic: true, text: `<task id="${CHILD}" state="completed">`}],
+    })),
+    {
+      info: {
+        id: 'msg-reply',
+        role: 'assistant',
+        sessionID: ROOT,
+        parentID: notices.at(-1) ?? 'msg-prompt',
+        time: {completed: 1},
+        finish: 'stop',
+      },
+      parts: [],
+    },
+  ]
+
+  describe.each([
+    ['persisted in REST only', false],
+    ['cached from the stream', true],
+  ])("Fro Bot probe, original job's notice %s", (_label, viaStream) => {
+    it("is not admitted until the new job's own notice arrives", async () => {
+      // #given t=1000 a first-observed extension; t=1400 the next assistant message; t=1500 the original job's notice
+      let transcript = turns(mid(1_500))
+      const {completion, onAdmitted} = setup({messages: async () => ({data: transcript, error: null})})
+      completion.noteDispatch(CHILD, 'adopted-extension', 1_000, mid(1_000))
+      if (viaStream) completion.noteNotice({childSessionId: CHILD, state: 'completed'}, mid(1_500), 'prt-0')
+
+      // #when the new task's tool starts at t=2000 (its assistant message is the t=1400 one) and the gate validates
+      completion.noteDispatch(CHILD, 'reused', 2_000, mid(1_400))
+      completion.noteRootIdle()
+      completion.beginDrain()
+      completion.requestValidation()
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS * 5)
+
+      // #then the t=1500 notice precedes the new job's start: it is surplus and credits nothing
+      expect(onAdmitted).not.toHaveBeenCalled()
+
+      // #when the new job's own notice (t=2500) lands and the parent has answered it
+      transcript = turns(mid(1_500), mid(2_500))
+      if (viaStream) completion.noteNotice({childSessionId: CHILD, state: 'completed'}, mid(2_500), 'prt-1')
+      completion.noteRootIdle()
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS * 2)
+
+      // #then it is admitted exactly once
+      expect(onAdmitted).toHaveBeenCalledTimes(1)
+      completion.dispose()
+    })
+  })
+
+  async function admitsWithNoticeAt(noticeId: string): Promise<boolean> {
+    const {completion, onAdmitted} = setup({messages: async () => ({data: turns(noticeId), error: null})})
+    completion.noteDispatch(CHILD, 'adopted', 2_000, mid(1_400))
+    completion.noteNotice({childSessionId: CHILD, state: 'completed'}, noticeId, 'prt-0')
+    completion.noteRootIdle()
+    completion.beginDrain()
+    completion.requestValidation()
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 3)
+    completion.dispose()
+    return onAdmitted.mock.calls.length > 0
+  }
+
+  it('a notice created in the same ms as the tool start is eligible', async () => {
+    // #given a job whose tool started at t=2000 and a notice created in that same millisecond
+    // #then it credits the job
+    expect(await admitsWithNoticeAt(mid(2_000, 7))).toBe(true)
+  })
+
+  it('a notice created one ms before the tool start is not', async () => {
+    // #given a job whose tool started at t=2000 and a notice created at t=1999
+    // #then it credits nothing
+    expect(await admitsWithNoticeAt(mid(1_999, 4_000))).toBe(false)
+  })
+})
+
+describe('decodeMessageIdMs — creation time from an upstream message id', () => {
+  /** Mirrors `id/id.ts:51-70`: the low 48 bits of `ms * 0x1000 + counter`, hex, plus a base62 tail. */
+  const encode = (ms: number, counter = 1): string =>
+    `msg_${((BigInt(ms) * 0x1000n + BigInt(counter)) & 0xffffffffffffn).toString(16).padStart(12, '0')}AAAAAAAAAAAAAA`
+  const WRAP = 2 ** 36
+  const BOUNDARY = WRAP * 26 // ~1.787e12 ms: the 48-bit field wraps here, close to today's Date.now()
+
+  it('restores the dropped high bits for a present-day timestamp', () => {
+    // #given an id created at a present-day ms (its 48-bit field has lost the high bits)
+    const ms = 1_790_123_456_789
+    // #then it decodes exactly from a reference shortly before or after it
+    expect(decodeMessageIdMs(encode(ms), ms - 5_000)).toBe(ms)
+    expect(decodeMessageIdMs(encode(ms, 4_000), ms + 100)).toBe(ms)
+  })
+
+  it('is exact across the 2^36 ms wrap: evidence just after it, reference just before it', () => {
+    // #given a job that started 10ms before the wrap and evidence created 5ms after it
+    // #then the evidence decodes to after the wrap, hence after the start
+    expect(decodeMessageIdMs(encode(BOUNDARY + 5), BOUNDARY - 10)).toBe(BOUNDARY + 5)
+  })
+
+  it('is exact across the wrap: evidence just before it, reference just after it', () => {
+    // #given a job that started 10ms after the wrap and evidence created 5ms before it
+    // #then the evidence decodes to before the wrap, hence before the start
+    expect(decodeMessageIdMs(encode(BOUNDARY - 5), BOUNDARY + 10)).toBe(BOUNDARY - 5)
+  })
+
+  it('places evidence up to ~765 days older than the reference before it, and evidence within the span after it', () => {
+    const ref = 1_790_000_000_000
+    // #then 700 days before decodes to 700 days before; 20 days after to 20 days after
+    expect(decodeMessageIdMs(encode(ref - 700 * 86_400_000), ref)).toBe(ref - 700 * 86_400_000)
+    expect(decodeMessageIdMs(encode(ref + 20 * 86_400_000), ref)).toBe(ref + 20 * 86_400_000)
+  })
+
+  it('yields null for an id with no decodable time', () => {
+    // #then client-supplied and fixture ids carry no time
+    expect(decodeMessageIdMs('msg-n1', 1_000)).toBeNull()
+    expect(decodeMessageIdMs(null, 1_000)).toBeNull()
   })
 })
