@@ -907,20 +907,22 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // identified by its own tool part, so a duplicated or replayed completion event is not a second dispatch.
   const seenDispatchIdentities = new Set<string>()
 
-  function observeFirstDispatch(part: unknown, toolState: unknown, jobId: string): void {
+  // A child first seen through an EXTENSION ("Background task updated") belongs to a job started outside this run
+  // (e.g. an earlier turn): `background.extend` chained onto it and never calls `notify`, so this run's dispatch
+  // owes no notice of its own. It is still adopted (settlement tracking) and its identity remembered.
+  function observeFirstDispatch(part: unknown, toolState: unknown, jobId: string, extension: boolean): void {
     const identity = dispatchIdentity(part)
     if (identity !== null) seenDispatchIdentities.add(identity)
-    drainCompletion?.noteDispatch(jobId, 'adopted', dispatchStartedAt(toolState))
+    drainCompletion?.noteDispatch(jobId, extension ? 'adopted-extension' : 'adopted', dispatchStartedAt(toolState))
   }
 
-  function observeReusedDispatch(part: unknown, toolState: unknown, jobId: string): void {
+  function observeReusedDispatch(part: unknown, toolState: unknown, jobId: string, extension: boolean): void {
     if (ledger === undefined) return
     const identity = dispatchIdentity(part)
     // Without the dispatch's own identity a duplicate cannot be told from a new dispatch: keep the old,
     // idempotent behaviour rather than reopening on every replay.
     if (identity === null || seenDispatchIdentities.has(identity)) return
     seenDispatchIdentities.add(identity)
-    const extension = isExtensionOfRunningJob(toolState)
     // Register the dispatch BEFORE reopening: the reopen can request a validation. An extension is not a job (no
     // notice) but does add a user prompt to the child, so the gate must know the child's segments are not all jobs.
     drainCompletion?.noteDispatch(jobId, extension ? 'extension' : 'reused', dispatchStartedAt(toolState))
@@ -1074,10 +1076,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                   const label = stateTitle ?? 'background task'
                   const wasTracked = ledger.isTracked(jobId)
                   ledger.adopt(jobId, label)
+                  const extension = isExtensionOfRunningJob(toolState)
                   if (wasTracked) {
-                    observeReusedDispatch(part, toolState, jobId)
+                    observeReusedDispatch(part, toolState, jobId, extension)
                   } else {
-                    observeFirstDispatch(part, toolState, jobId)
+                    observeFirstDispatch(part, toolState, jobId, extension)
                   }
                   logger.info(
                     {sessionId, jobId, label},

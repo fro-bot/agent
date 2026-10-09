@@ -273,8 +273,10 @@ export interface DrainCompletionOptions {
  * How a dispatching `task` tool part relates to the gate's knowledge of its child: `adopted` is the first sight of
  * the child this run, `reused` a new job on a child already tracked (upstream `background.start`), `extension` a
  * running job chained onto (`background.extend`: a new user prompt in the child, but no new job and no notice).
+ * `adopted-extension` is an extension that is also the first sight of the child this run: the job it chained onto
+ * started outside this run and `extend` never notifies, so the child owes no notice (a later one is surplus).
  */
-export type DispatchKind = 'adopted' | 'reused' | 'extension'
+export type DispatchKind = 'adopted' | 'adopted-extension' | 'reused' | 'extension'
 
 export interface DrainCompletion {
   /** Root assistant/text/tool activity or a root busy/retry status: invalidates current idle evidence. */
@@ -437,17 +439,20 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     if (closed) return
     const previous = dispatchesByChild.get(childSessionId)
     // An entry the gate never saw dispatched (restored ownership) still owes the one notice it was adopted for.
-    const base: ChildDispatches = previous ?? {count: kind === 'adopted' ? 0 : 1, windowStart: null, extended: false}
-    if (kind === 'extension') {
-      dispatchesByChild.set(childSessionId, {...base, extended: true})
-      return
-    }
+    // A child first seen through an extension owes none: its job started outside this run.
+    const firstSight = kind === 'adopted' || kind === 'adopted-extension'
+    const base: ChildDispatches = previous ?? {count: firstSight ? 0 : 1, windowStart: null, extended: false}
     const windowStart =
       startedAt === null
         ? base.windowStart
         : base.windowStart === null
           ? startedAt
           : Math.min(base.windowStart, startedAt)
+    // An extension is not a job (no notice of its own) but adds a user prompt to the child.
+    if (kind === 'extension' || kind === 'adopted-extension') {
+      dispatchesByChild.set(childSessionId, {...base, windowStart, extended: true})
+      return
+    }
     dispatchesByChild.set(childSessionId, {...base, count: base.count + 1, windowStart})
   }
 

@@ -2627,6 +2627,84 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       })
     })
 
+    describe('a child first observed through an extension owes no notice', () => {
+      // Upstream `tool/task.ts:267-281`: `background.extend` returns "Background task updated" and never calls
+      // `notify`; the job it chained onto was started outside this run.
+      it('e1. completes with no notice once the child settles and the other gates pass', async () => {
+        // #given the run's first sight of the child is an extension; it settles and no notice is ever injected
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        await run.emit(taskPart(CHILD, 'tool-1', 'updated', 1_000))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(idleEvent())
+
+        // #when time passes (the reconcile pass settles the child, REST shows the root answered)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 5_000)
+        await run.done
+
+        // #then the run completes without waiting for the deadline
+        expect(run.outcome()).toEqual({ok: true})
+        expect(stateOf(run, CHILD)).toBe('settled')
+      })
+
+      it('e2. a surplus notice from the original job is tolerated and still waits for the parent to answer it', async () => {
+        // #given the extended child settled, and the original job's notice is injected but not yet answered
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({
+          data: [...turnsWithNotices(0), userMessage('msg-n1', [{id: CHILD}])],
+          error: null,
+        })
+        await run.emit(taskPart(CHILD, 'tool-1', 'updated', 1_000))
+        run.live.delete(CHILD)
+        await run.emit(noticeN(1))
+        await run.emit(idleEvent())
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 5_000)
+
+        // #then the surplus notice is a root user turn like any other: held until the parent answers it
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the parent answers it
+        run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+        await run.advance(1_000)
+        await run.done
+
+        // #then it completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('e3. a genuine new start after a first-observed extension needs exactly one notice', async () => {
+        // #given a first-observed extension whose child settled, then a real new start on the same child
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        await run.emit(taskPart(CHILD, 'tool-1', 'updated', 1_000))
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        expect(stateOf(run, CHILD)).toBe('settled')
+        run.live.add(CHILD)
+        await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000))
+        expect(stateOf(run, CHILD)).toBe('outstanding')
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        await run.emit(idleEvent())
+
+        // #when its notice has not been injected
+        await run.advance(10_000)
+
+        // #then the new start is waiting for its own notice
+        expect(stateOf(run, CHILD)).toBe('settled')
+        expect(run.outcome()).toBeUndefined()
+
+        // #when that one notice arrives and the parent answers it
+        run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+        await run.emit(noticeN(1))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then one notice was enough
+        expect(run.outcome()).toEqual({ok: true})
+      })
+    })
+
     it('8. reopening an entry reports a change, so persistence hears about it; no-ops stay silent', () => {
       // #given a wrapped ledger with one settled entry
       const ledger = createOwnershipLedger()
