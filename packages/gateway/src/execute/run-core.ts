@@ -43,6 +43,7 @@ import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordin
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
 import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
+import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 
 // ---------------------------------------------------------------------------
@@ -595,53 +596,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Assigned once the reconcile adapter exists (below); stays undefined for a run with no ledger.
   let drainCompletion: DrainCompletion | undefined
 
-  // What the stream actually delivered to the sink, kept so that REST-admitted completion can add exactly the
-  // follow-up reply text the stream missed. Keyed by text part id; a delta with no part id cannot be attributed,
-  // so those are recorded in aggregate and make recovery conservative (see `recoverUndeliveredReplyText`).
-  const deliveredTextByPart = new Map<string, string>()
-  let unattributedDelivered = ''
+  // What the stream actually delivered to the sink. The drain-completion gate's delivery fence consults it: the
+  // sink is append-only, so completion waits for the follow-up reply to be delivered rather than repairing it.
+  const replyDelivery = createReplyDeliveryTracker()
 
-  function recordDelivered(partId: string | null, text: string): void {
-    if (drainCompletion === undefined) return
-    if (partId === null) {
-      unattributedDelivered += text
-    } else {
-      deliveredTextByPart.set(partId, (deliveredTextByPart.get(partId) ?? '') + text)
-    }
-  }
-
-  // Append, in order and exactly once, the reply text REST shows that the stream did not deliver. The sink is
-  // append-only, so a part that streamed partially gets only its undelivered suffix, and only when what streamed
-  // is a prefix of what REST persisted; a part whose streamed text diverges from the persisted text (anything but
-  // a prefix) is left alone rather than risk delivering it twice.
-  function recoverUndeliveredReplyText(parts: readonly {readonly id: string; readonly text: string}[]): void {
-    for (const part of parts) {
-      const delivered = deliveredTextByPart.get(part.id)
-      let missing: string
-      if (delivered === undefined) {
-        // Never seen by part id. If the stream also delivered text it could not attribute, only treat this part
-        // as missing when that text does not already contain it.
-        missing = unattributedDelivered.length > 0 && unattributedDelivered.includes(part.text) ? '' : part.text
-      } else if (part.text.startsWith(delivered)) {
-        missing = part.text.slice(delivered.length)
-      } else {
-        // Fully delivered (REST trimmed trailing whitespace the stream carried), or diverged: do not re-send.
-        missing = ''
-        if (!delivered.startsWith(part.text)) {
-          logger.warn(
-            {sessionId, partId: part.id},
-            'run-core: streamed reply text diverges from the persisted text — not re-sending it',
-          )
-        }
-      }
-      if (missing.length === 0) continue
-      sink.append(missing)
-      deliveredTextByPart.set(part.id, (delivered ?? '') + missing)
-      logger.info(
-        {sessionId, partId: part.id, recoveredChars: missing.length, partial: delivered !== undefined},
-        'run-core: appended follow-up reply text the stream did not deliver',
-      )
-    }
+  // Only ROOT text counts: the fence is about the parent's follow-up reply, not a descendant's output.
+  function recordDelivered(eventSessionID: string | null, partId: string | null, text: string): void {
+    if (drainCompletion !== undefined && eventSessionID === sessionId) replyDelivery.recordDelta(partId, text)
   }
 
   function persistOwnership(): void {
@@ -695,7 +656,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       adapter: reconcileAdapter,
       signal: combinedSignal,
       logger,
-      deliverReplyText: recoverUndeliveredReplyText,
+      isReplyDelivered: parts => replyDelivery.covers(parts),
       // The only path that completes a drain: an admitted validation unblocks the stream.
       onAdmitted: () => drainDoneController.abort(),
     })
@@ -912,6 +873,17 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       if ((getSessionID(eventPayload) ?? getSessionID(part)) !== sessionId) return
       const notice = parseSyntheticNoticePart(part)
       if (notice === null) {
+        // A root text part seen whole is not on the sink's delivery channel (base appends deltas only).
+        const wholePartId = getStringProperty(part, 'id')
+        const wholePartText = getStringProperty(part, 'text')
+        if (
+          getStringProperty(part, 'type') === 'text' &&
+          getBooleanProperty(part, 'synthetic') !== true &&
+          wholePartId !== null &&
+          wholePartText !== null
+        ) {
+          replyDelivery.recordWholePart(wholePartId, wholePartText)
+        }
         drainCompletion.noteRootActivity()
         return
       }
@@ -974,11 +946,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             const deltaText = getStringProperty(delta, 'text')
             if (deltaType === 'text' && deltaText != null) {
               sink.append(deltaText)
-              recordDelivered(deltaPartId, deltaText)
+              recordDelivered(eventSessionID, deltaPartId, deltaText)
               markActivity()
             } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
               sink.append(delta)
-              recordDelivered(deltaPartId, delta)
+              recordDelivered(eventSessionID, deltaPartId, delta)
               markActivity()
             }
           }
@@ -992,7 +964,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
           if (deltaText != null) {
             sink.append(deltaText)
-            recordDelivered(null, deltaText)
+            recordDelivered(eventSessionID, null, deltaText)
             markActivity()
           }
         }

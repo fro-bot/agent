@@ -465,13 +465,19 @@ async function expectNothingLeftBehind(run: Run, held: Deferred<unknown>) {
   expect(vi.getTimerCount()).toBe(0)
 }
 
-/** A fully answered follow-up whose reply carries `parts`; the notice reaches the stream, the reply text may not. */
-async function recover(parts: readonly object[], streamed: readonly object[] = [], earlierReply: object = FIRST_REPLY) {
-  const run = startRun({deadlineMs: 60_000})
+/**
+ * A follow-up whose reply carries `parts` as REST persisted them, with the notice already on the stream. The run is
+ * returned unfinished: whether it completes depends on what the stream goes on to deliver.
+ */
+async function startFollowUp(
+  parts: readonly object[],
+  options: {readonly deadlineMs?: number; readonly earlierReply?: object} = {},
+) {
+  const run = startRun({deadlineMs: options.deadlineMs ?? 60_000})
   run.fixture.root = async () => ({
     data: [
       PROMPT,
-      earlierReply,
+      options.earlierReply ?? FIRST_REPLY,
       userMessage('msg-n1', [{id: CHILD}]),
       assistantReply('msg-reply-2', 'msg-n1', {parts}),
     ],
@@ -479,13 +485,11 @@ async function recover(parts: readonly object[], streamed: readonly object[] = [
   })
   await run.emit(dispatchEvent(CHILD))
   await run.emit(noticeEvent(CHILD))
-  for (const event of streamed) await run.emit(event)
-  await run.emit(idleEvent())
-  await run.done
-  expect(run.outcome()).toEqual({ok: true})
-  // the dispatch's own tool-summary line is not reply text
-  return run.sink.appended.join('').replace('\nbackground task\n', '')
+  return run
 }
+
+/** What the sink holds, without the dispatch's own tool-summary line. */
+const replyOutput = (run: Run): string => run.sink.appended.join('').replace('\nbackground task\n', '')
 
 afterEach(() => {
   vi.useRealTimers()
@@ -1526,111 +1530,302 @@ describe('runOpenCodeCore — drain completion for background work', () => {
     )
   })
 
-  describe('18. REST-admitted completion delivers the follow-up reply text the stream missed', () => {
+  describe('18. the delivery fence: completion waits for the follow-up reply to reach the sink, and never repairs it', () => {
     const textPart = (id: string, text: string, extra: object = {}) => ({id, type: 'text', text, ...extra})
-
     const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1
-
-    it('text the stream never delivered is appended exactly once', async () => {
-      // #given REST holds the follow-up reply text, and the stream delivered none of it
-      // #when completion is admitted over REST
-      const output = await recover([textPart('part-r2', 'Follow-up answer.')])
-
-      // #then it reaches the sink once
-      expect(output).toBe('Follow-up answer.')
+    const legacyDelta = (text: string): object => ({
+      type: 'session.next.text.delta',
+      properties: {sessionID: ROOT, delta: text},
     })
 
-    it('a part that streamed partially gets only its undelivered suffix', async () => {
-      // #given the stream delivered the start of the part, then went quiet
-      // #when completion is admitted over REST
-      const output = await recover(
-        [textPart('part-r2', 'Follow-up answer.')],
-        [textDeltaEvent('Follow-up ', 'part-r2')],
-      )
+    it('a persisted part the stream never delivered holds the run until the deadline, and nothing is appended', async () => {
+      // #given the follow-up reply is persisted, and the stream delivers none of it
+      const run = await startFollowUp([textPart('part-r2', 'SECRET follow-up answer.')], {deadlineMs: 20_000})
 
-      // #then the sink holds the whole text once, not the prefix twice
-      expect(output).toBe('Follow-up answer.')
-      expect(occurrences(output, 'Follow-up')).toBe(1)
+      // #when the root goes idle and time passes up to the deadline
+      await run.emit(idleEvent())
+      await run.advance(19_000)
+
+      // #then it is not admitted, and the sink holds nothing the stream did not put there
+      expect(run.outcome()).toBeUndefined()
+      expect(replyOutput(run)).toBe('')
+
+      // #when the deadline passes
+      await run.advance(1_500)
+      await run.done
+
+      // #then it reports incomplete, like any other missing drain evidence — never success, still nothing appended
+      expectKind(run.outcome(), 'drain-timeout')
+      expect(replyOutput(run)).toBe('')
+
+      // #and the debug log names part ids, never reply text
+      const debugLogs = JSON.stringify(vi.mocked(run.logger.debug).mock.calls)
+      expect(debugLogs).toContain('reply-text-not-delivered')
+      expect(debugLogs).toContain('part-r2')
+      expect(JSON.stringify(vi.mocked(run.logger.info).mock.calls)).not.toContain('SECRET')
+      expect(debugLogs).not.toContain('SECRET')
     })
 
-    it('a part that streamed completely is not delivered again', async () => {
-      // #given the whole part streamed
-      // #when completion is admitted over REST
-      const output = await recover(
-        [textPart('part-r2', 'Follow-up answer.')],
-        [textDeltaEvent('Follow-up ', 'part-r2'), textDeltaEvent('answer.', 'part-r2')],
-      )
+    it('three persisted parts, only the middle streamed: held; nothing is appended on completion; the rest stream and it completes', async () => {
+      // #given persisted One./Two./Three., of which the stream delivered only the middle one
+      const run = await startFollowUp([textPart('p1', 'One. '), textPart('p2', 'Two. '), textPart('p3', 'Three.')])
+      await run.emit(textDeltaEvent('Two. ', 'p2'))
+      await run.emit(idleEvent())
 
-      // #then it is in the sink exactly once
-      expect(output).toBe('Follow-up answer.')
+      // #when time passes with the others undelivered
+      await run.advance(5_000)
+
+      // #then it is held, and the sink holds exactly what streamed — no part was appended on the gate's behalf
+      expect(run.outcome()).toBeUndefined()
+      expect(replyOutput(run)).toBe('Two. ')
+
+      // #when the remaining parts stream in order, and the root goes idle
+      await run.emit(textDeltaEvent('One. ', 'p1'))
+      await run.emit(textDeltaEvent('Three.', 'p3'))
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then it completes, and the sink is exactly the stream's own appends (the middle part was already on
+      // screen first; the fence guarantees completeness, it cannot and does not reorder)
+      expect(run.outcome()).toEqual({ok: true})
+      expect(replyOutput(run)).toBe('Two. One. Three.')
+      expect(run.sink.appended.filter(chunk => chunk !== '\nbackground task\n')).toEqual(['Two. ', 'One. ', 'Three.'])
     })
 
-    it('rEST trimming trailing whitespace the stream carried does not cause a re-send', async () => {
-      // #given the stream delivered a trailing newline that the persisted text no longer has
-      // #when completion is admitted over REST
-      const output = await recover(
+    it('an earlier part streamed partially and a later part completely: held until the earlier part completes', async () => {
+      // #given the first part only half delivered, the second one whole
+      const run = await startFollowUp([textPart('p1', 'Alpha beta.'), textPart('p2', ' Gamma.')])
+      await run.emit(textDeltaEvent('Alpha ', 'p1'))
+      await run.emit(textDeltaEvent(' Gamma.', 'p2'))
+      await run.emit(idleEvent())
+
+      // #when time passes
+      await run.advance(5_000)
+
+      // #then the half-delivered part holds the run
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the rest of the first part arrives
+      await run.emit(textDeltaEvent('beta.', 'p1'))
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then it completes
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('a partial part-id-less delta ("Follow-up ") against persisted "Follow-up answer.": held, never duplicated; completes once the rest streams', async () => {
+      // #given the legacy delta shape (no part id) delivered only a prefix
+      const run = await startFollowUp([textPart('part-r2', 'Follow-up answer.')])
+      await run.emit(legacyDelta('Follow-up '))
+      await run.emit(idleEvent())
+
+      // #when time passes
+      await run.advance(5_000)
+
+      // #then a prefix is never accepted, and nothing was appended on top of it
+      expect(run.outcome()).toBeUndefined()
+      expect(replyOutput(run)).toBe('Follow-up ')
+
+      // #when the remainder streams
+      await run.emit(legacyDelta('answer.'))
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then it completes with the text in the sink exactly once
+      expect(run.outcome()).toEqual({ok: true})
+      expect(replyOutput(run)).toBe('Follow-up answer.')
+      expect(occurrences(replyOutput(run), 'Follow-up')).toBe(1)
+    })
+
+    it('part-id-less text is matched at the end of what was delivered, so earlier turns that streamed the same way do not interfere', async () => {
+      // #given an earlier turn's part-id-less text, then the follow-up's, fully delivered
+      const run = await startFollowUp([textPart('part-r2', 'Follow-up answer.')])
+      await run.emit(legacyDelta('Earlier turn. '))
+      await run.emit(legacyDelta('Follow-up answer.'))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then it is admitted
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('two part-id-less parts need both, in order, at the end of the delivered text', async () => {
+      // #given persisted "One. " and "Two.", with the stream delivering only the second
+      const run = await startFollowUp([textPart('p1', 'One. '), textPart('p2', 'Two.')])
+      await run.emit(legacyDelta('Two.'))
+      await run.emit(idleEvent())
+      await run.advance(5_000)
+
+      // #then the missing first part holds the run
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the stream replays the turn's text in order
+      await run.emit(legacyDelta('One. '))
+      await run.emit(legacyDelta('Two.'))
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then it completes
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it.each([
+      [
+        'a part-id delivery that carries trailing whitespace REST trimmed',
         [textPart('part-r2', 'Follow-up answer.')],
         [textDeltaEvent('Follow-up answer.\n', 'part-r2')],
-      )
-
-      // #then nothing is added
-      expect(output).toBe('Follow-up answer.\n')
-    })
-
-    it('several parts: missing ones are appended in order, streamed ones are not repeated', async () => {
-      // #given the stream delivered only the second of three parts
-      // #when completion is admitted over REST
-      const output = await recover(
-        [textPart('p1', 'One. '), textPart('p2', 'Two. '), textPart('p3', 'Three.')],
-        [textDeltaEvent('Two. ', 'p2')],
-      )
-
-      // #then the sink has the streamed part first (as it arrived), then the missing ones in order
-      expect(output).toBe('Two. One. Three.')
-      expect(occurrences(output, 'Two.')).toBe(1)
-    })
-
-    it('a streamed prefix that diverges from the persisted text is left alone, not re-sent', async () => {
-      // #given the stream and REST disagree about the part's text
-      // #when completion is admitted over REST
-      const output = await recover(
-        [textPart('part-r2', 'Final wording.')],
-        [textDeltaEvent('Draft wording.', 'part-r2')],
-      )
-
-      // #then nothing is added on top of what already streamed
-      expect(output).toBe('Draft wording.')
-    })
-
-    it('text the stream delivered without a part id is not duplicated', async () => {
-      // #given the stream delivered the reply through the legacy delta shape, which carries no part id
-      // #when completion is admitted over REST
-      const output = await recover(
+      ],
+      [
+        'a part-id-less delivery that carries trailing whitespace REST trimmed',
         [textPart('part-r2', 'Follow-up answer.')],
-        [{type: 'session.next.text.delta', properties: {sessionID: ROOT, delta: 'Follow-up answer.'}}],
-      )
+        [legacyDelta('Follow-up answer.\n')],
+      ],
+      [
+        'two parts, each trimmed by REST',
+        [textPart('p1', 'One.'), textPart('p2', 'Two.')],
+        [legacyDelta('One.\n'), legacyDelta('Two.\n')],
+      ],
+    ])('%s is equivalent and admits', async (_label, parts, streamed) => {
+      // #given the stream delivered each part with trailing whitespace the persisted text no longer has
+      const run = await startFollowUp(parts)
+      for (const event of streamed) await run.emit(event)
 
-      // #then it is in the sink exactly once
-      expect(output).toBe('Follow-up answer.')
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then it is admitted
+      expect(run.outcome()).toEqual({ok: true})
     })
 
-    it('synthetic text and earlier turns are never delivered', async () => {
-      // #given a synthetic assistant part, an earlier turn's unstreamed reply, and the notice text on its user message
-      // #when completion is admitted over REST
-      const output = await recover(
-        [
-          textPart('part-synth', '<task id="sess-child-1" state="completed">', {synthetic: true}),
-          textPart('part-ignored', 'ignored text', {ignored: true}),
-          textPart('part-r2', 'Real answer.'),
-        ],
-        [],
-        assistantReply('msg-reply-1', 'msg-prompt', {
-          parts: [{id: 'part-first', type: 'text', text: 'Earlier turn text.'}],
-        }),
-      )
+    it('a part delivered with different text than REST persisted is not equivalent', async () => {
+      // #given the stream and REST disagree about the part's wording
+      const run = await startFollowUp([textPart('part-r2', 'Final wording.')])
+      await run.emit(textDeltaEvent('Draft wording.', 'part-r2'))
+      await run.emit(idleEvent())
 
-      // #then only the real follow-up text reaches the sink (the earlier turn's own output is not this gate's business)
-      expect(output).toBe('Real answer.')
+      // #when time passes
+      await run.advance(5_000)
+
+      // #then it is held
+      expect(run.outcome()).toBeUndefined()
+    })
+
+    it('a text part that only ever arrived whole (never on the sink channel) does not stall the run, and is not appended', async () => {
+      // #given base never appends a whole message.part.updated text part; the stream carried this one only that way
+      const run = await startFollowUp([textPart('part-r2', 'Whole-part answer.')])
+      await run.emit({
+        type: 'message.part.updated',
+        properties: {
+          sessionID: ROOT,
+          part: {id: 'part-r2', messageID: 'msg-reply-2', sessionID: ROOT, type: 'text', text: 'Whole-part answer.'},
+        },
+      })
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then it is admitted, consistent with base delivery, and the sink was not touched
+      expect(run.outcome()).toEqual({ok: true})
+      expect(replyOutput(run)).toBe('')
+    })
+
+    it('the whole-part exception does not apply once part-id-less text was delivered (it could be that part)', async () => {
+      // #given a whole-part event for the reply AND a partially delivered part-id-less prefix
+      const run = await startFollowUp([textPart('part-r2', 'Follow-up answer.')])
+      await run.emit(legacyDelta('Follow-up '))
+      await run.emit({
+        type: 'message.part.updated',
+        properties: {
+          sessionID: ROOT,
+          part: {id: 'part-r2', messageID: 'msg-reply-2', sessionID: ROOT, type: 'text', text: 'Follow-up answer.'},
+        },
+      })
+      await run.emit(idleEvent())
+
+      // #when time passes
+      await run.advance(5_000)
+
+      // #then the ambiguity is resolved conservatively: held
+      expect(run.outcome()).toBeUndefined()
+    })
+
+    it('synthetic and ignored parts are not required to have been delivered', async () => {
+      // #given an undelivered synthetic part and an undelivered ignored part beside the real, delivered one
+      const run = await startFollowUp([
+        textPart('part-synth', '<task id="sess-child-1" state="completed">', {synthetic: true}),
+        textPart('part-ignored', 'ignored text', {ignored: true}),
+        textPart('part-r2', 'Real answer.'),
+      ])
+      await run.emit(textDeltaEvent('Real answer.', 'part-r2'))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then only the real part was required; notice text never reached the sink
+      expect(run.outcome()).toEqual({ok: true})
+      expect(replyOutput(run)).toBe('Real answer.')
+    })
+
+    it("an earlier turn's undelivered text is not this fence's business", async () => {
+      // #given the prompt turn's own reply carries text the stream never delivered
+      const run = await startFollowUp([textPart('part-r2', 'Follow-up answer.')], {
+        earlierReply: assistantReply('msg-reply-1', 'msg-prompt', {
+          parts: [textPart('part-first', 'Earlier turn text.')],
+        }),
+      })
+      await run.emit(textDeltaEvent('Follow-up answer.', 'part-r2'))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then the follow-up alone decided it
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it("only ROOT text counts: a descendant streaming the same text does not deliver the root's reply", async () => {
+      // #given a descendant that streamed text under the same part id, and no root delivery at all
+      const run = await startFollowUp([textPart('part-r2', 'Follow-up answer.')])
+      await run.emit(textDeltaEvent('Follow-up answer.', 'part-r2', CHILD))
+      await run.emit(idleEvent())
+
+      // #when time passes
+      await run.advance(5_000)
+
+      // #then the root's reply is still undelivered
+      expect(run.outcome()).toBeUndefined()
+    })
+
+    it('rEST lagging behind the stream holds the run, and it retries on the existing cadence until REST catches up', async () => {
+      // #given the stream delivered the whole reply, but REST so far persisted only the start of it
+      const run = await startFollowUp([textPart('part-r2', 'Follow-up ')])
+      await run.emit(textDeltaEvent('Follow-up answer.', 'part-r2'))
+      await run.emit(idleEvent())
+      await run.advance(3_000)
+      expect(run.outcome()).toBeUndefined()
+
+      // #when REST catches up
+      run.fixture.root = async () => ({
+        data: [
+          PROMPT,
+          FIRST_REPLY,
+          userMessage('msg-n1', [{id: CHILD}]),
+          assistantReply('msg-reply-2', 'msg-n1', {parts: [textPart('part-r2', 'Follow-up answer.')]}),
+        ],
+        error: null,
+      })
+      await run.advance(1_000)
+      await run.done
+
+      // #then the next retry admits it, with the text in the sink once
+      expect(run.outcome()).toEqual({ok: true})
+      expect(replyOutput(run)).toBe('Follow-up answer.')
     })
   })
 

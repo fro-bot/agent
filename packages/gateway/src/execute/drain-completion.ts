@@ -29,6 +29,7 @@
 
 import type {LedgerReconcileAdapter, OpenCodeServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
+import type {ReplyTextPart} from './reply-delivery.js'
 
 /** Cadence of re-validation while draining. A rejected pass is re-run no faster than this. */
 export const DRAIN_VALIDATION_INTERVAL_MS = 1_000
@@ -102,12 +103,6 @@ interface RestMessageFacts {
   readonly latestAssistant: {readonly info: unknown; readonly parts: unknown} | null
   /** Every persisted assistant message, in order, with the user message it answers. */
   readonly assistantMessages: readonly {readonly parentId: string | null; readonly parts: unknown}[]
-}
-
-/** A reply text part as REST persisted it — what the stream should have delivered to the sink. */
-export interface ReplyTextPart {
-  readonly id: string
-  readonly text: string
 }
 
 function readMessages(data: unknown): RestMessageFacts | null {
@@ -229,12 +224,12 @@ export interface DrainCompletionOptions {
   /** Called at most once, only for an admitted completion. */
   readonly onAdmitted: () => void
   /**
-   * Called synchronously at admission, before `onAdmitted`, with the follow-up turns' reply text parts as REST
-   * persisted them (in message order, synthetic notice text excluded). The caller owns the reply sink and knows
-   * what the stream already delivered: it appends only what is missing. REST can admit completion when follow-up
-   * stream events were missed or delayed; without this the final reply would silently omit that text.
+   * Delivery fence, AND'ed with every other admission condition: whether the stream has delivered the follow-up
+   * turns' persisted reply text parts (non-synthetic, non-ignored, in message order) to the reply sink in full.
+   * The sink is append-only and may already be on screen, so completion never repairs missing text — it waits for
+   * the stream to deliver it and otherwise reaches the deadline as incomplete. Omitted: no fence.
    */
-  readonly deliverReplyText?: (parts: readonly ReplyTextPart[]) => void
+  readonly isReplyDelivered?: (parts: readonly ReplyTextPart[]) => boolean
   readonly validationIntervalMs?: number
   readonly requestTimeoutMs?: number
 }
@@ -268,7 +263,7 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     signal,
     logger,
     onAdmitted,
-    deliverReplyText,
+    isReplyDelivered,
     validationIntervalMs = DRAIN_VALIDATION_INTERVAL_MS,
     requestTimeoutMs = DRAIN_REQUEST_TIMEOUT_MS,
   } = options
@@ -442,22 +437,17 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
       .filter(id => !noticedChildren.has(id) && !cancelExempt.has(id))
     if (unfenced.length > 0) return reject('notice-not-observed', {children: unfenced})
 
+    // Delivery fence: the reply the user will read must already be in the sink. Ids only in the log, never text.
+    if (isReplyDelivered !== undefined) {
+      const replyParts = followUpReplyText(rootFacts, latestUserId, streamNoticeMessageIds)
+      if (!isReplyDelivered(replyParts))
+        return reject('reply-text-not-delivered', {partIds: replyParts.map(part => part.id)})
+    }
+
     // Commit point — nothing awaited between here and `onAdmitted`.
     if (revision !== requestedRevision) return reject('revision-drift')
     if (idleRevision === null || idleRevision !== revision) return reject('idle-evidence-stale')
     if (!ledger.isDrainComplete()) return reject('ledger-not-drained')
-
-    // Output the stream missed must reach the sink before the run can complete.
-    if (deliverReplyText !== undefined) {
-      try {
-        deliverReplyText(followUpReplyText(rootFacts, latestUserId, streamNoticeMessageIds))
-      } catch (error) {
-        logger.warn(
-          {sessionId: rootSessionId, detail: error instanceof Error ? error.message : String(error)},
-          'run-core: delivering recovered follow-up reply text failed — completing without it',
-        )
-      }
-    }
 
     closed = true
     onAdmitted()
