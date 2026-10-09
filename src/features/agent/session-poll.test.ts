@@ -3835,4 +3835,117 @@ describe('stale session.messages() responses never mutate the pending parent (#1
     expect(rootFreshness.pendingParentMessageId).toBeNull()
     expect(rootFreshness.revision).toBe(revisionAfterSse)
   })
+
+  it('classifies a provider failure from a stale response instead of letting an SSE idle settle completion', async () => {
+    // #given root activity advances and an idle follows WHILE the messages request is in flight, and the
+    // response carries an assistant that failed with a provider auth error (its session.error SSE was missed)
+    const {rootFreshness, activityTracker} = newArmedTracker()
+    const messages = vi
+      .fn()
+      .mockImplementationOnce(async () => {
+        invalidateRootFreshness(rootFreshness)
+        markRootIdleCandidate(rootFreshness)
+        return {
+          data: [
+            {
+              info: {
+                id: 'msg_failed',
+                role: 'assistant',
+                time: {completed: 2},
+                error: {name: 'ProviderAuthError', data: {providerID: 'probe', message: 'Invalid API key'}},
+              },
+            },
+          ],
+        }
+      })
+      .mockImplementation(async () => new Promise(() => {}))
+    const status = vi.fn().mockResolvedValue({data: {}})
+
+    // #when the stale-but-error-bearing response is observed
+    const observation = startObservation(messages, status, activityTracker, mockLogger)
+    await vi.advanceTimersByTimeAsync(600)
+    const result = await observation.settled
+
+    // #then the failure is classified, never settled as a completion by the SSE idle that followed
+    expect(result?.settlement.kind).toBe('failure-observed')
+    expect(result?.failures).toHaveLength(1)
+    expect(result?.failures[0]?.llmError?.type).toBe('provider_auth_error')
+    expect(messages).toHaveBeenCalledTimes(1)
+  })
+
+  it('classifies failure from a stale response without letting it register a REST-derived parent', async () => {
+    // #given SSE registers a newer pending parent while the request is in flight
+    const {rootFreshness, activityTracker} = newArmedTracker()
+    let resolveStale: (value: unknown) => void = () => {}
+    const messages = vi
+      .fn()
+      .mockImplementationOnce(
+        async () =>
+          new Promise(resolve => {
+            resolveStale = resolve
+          }),
+      )
+      .mockImplementation(async () => new Promise(() => {}))
+    const status = vi.fn().mockResolvedValue({data: {}})
+    const observation = startObservation(messages, status, activityTracker, mockLogger)
+    await vi.advanceTimersByTimeAsync(600)
+    registerPendingRootUserMessage(rootFreshness, 'msg_sse_turn')
+    const revisionAfterSse = rootFreshness.revision
+
+    // #when the older response lands carrying a newer REST user turn AND an errored assistant reply
+    resolveStale({
+      data: [
+        userTurn('msg_prompt'),
+        userTurn('msg_rest_turn'),
+        {
+          info: {
+            id: 'msg_failed',
+            role: 'assistant',
+            parentID: 'msg_rest_turn',
+            time: {completed: 2},
+            error: {name: 'ProviderAuthError', data: {message: 'Invalid API key'}},
+          },
+        },
+      ],
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    const result = await observation.settled
+
+    // #then the failure is still observed, but the SSE-registered turn state is untouched
+    expect(result?.settlement.kind).toBe('failure-observed')
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_sse_turn')
+    expect(rootFreshness.latestRootUserMessageId).toBe('msg_sse_turn')
+    expect(rootFreshness.revision).toBe(revisionAfterSse)
+  })
+
+  it('clears seeded confirmation memory immediately when a stale response is discarded', async () => {
+    // #given confirmation memory armed for the current generation by an earlier fresh observation
+    const {rootFreshness, activityTracker} = newArmedTracker()
+    activityTracker.completedAssistantMessageId = {messageId: 'msg_reply', revision: rootFreshness.revision}
+    let resolveStale: (value: unknown) => void = () => {}
+    const messages = vi
+      .fn()
+      .mockImplementationOnce(
+        async () =>
+          new Promise(resolve => {
+            resolveStale = resolve
+          }),
+      )
+      .mockImplementation(async () => new Promise(() => {}))
+    const status = vi.fn().mockResolvedValue({data: {}})
+    const observation = startObservation(messages, status, activityTracker, mockLogger)
+    await vi.advanceTimersByTimeAsync(600)
+    expect(activityTracker.completedAssistantMessageId).toEqual({messageId: 'msg_reply', revision: 0})
+
+    // #when root activity lands mid-request and the stale response (the SAME completed reply) arrives
+    invalidateRootFreshness(rootFreshness)
+    resolveStale({data: [userTurn('msg_prompt'), completedReply('msg_reply', 'msg_prompt')]})
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then the interrupted observation leaves no memory behind to bridge into a later poll
+    expect(activityTracker.completedAssistantMessageId).toBeUndefined()
+
+    observation.controller.abort()
+    await observation.settled
+  })
 })
