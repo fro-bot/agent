@@ -488,8 +488,12 @@ async function startFollowUp(
   return run
 }
 
-/** What the sink holds, without the dispatch's own tool-summary line. */
-const replyOutput = (run: Run): string => run.sink.appended.join('').replace('\nbackground task\n', '')
+/**
+ * What the sink holds, without the dispatch's own tool-summary line and the segment boundary that follows it (a text
+ * part after a tool summary is topped up to a blank line).
+ */
+const replyOutput = (run: Run): string =>
+  run.sink.appended.join('').replace('\nbackground task\n\n', '').replace('\nbackground task\n', '')
 
 afterEach(() => {
   vi.useRealTimers()
@@ -1585,11 +1589,19 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       await run.emit(idleEvent())
       await run.done
 
-      // #then it completes, and the sink is exactly the stream's own appends (the middle part was already on
-      // screen first; the fence guarantees completeness, it cannot and does not reorder)
+      // #then it completes, and the sink is exactly the stream's own appends plus the segment boundaries between the
+      // distinct parts (the middle part was already on screen first; the fence guarantees completeness, it cannot
+      // and does not reorder)
       expect(run.outcome()).toEqual({ok: true})
-      expect(replyOutput(run)).toBe('Two. One. Three.')
-      expect(run.sink.appended.filter(chunk => chunk !== '\nbackground task\n')).toEqual(['Two. ', 'One. ', 'Three.'])
+      expect(replyOutput(run)).toBe('Two. \n\nOne. \n\nThree.')
+      expect(run.sink.appended.filter(chunk => chunk !== '\nbackground task\n')).toEqual([
+        '\n',
+        'Two. ',
+        '\n\n',
+        'One. ',
+        '\n\n',
+        'Three.',
+      ])
     })
 
     it('an earlier part streamed partially and a later part completely: held until the earlier part completes', async () => {
@@ -1669,6 +1681,40 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       await run.done
 
       // #then it completes
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('a multi-part follow-up streamed with segment separators between its parts still admits; the fence sees only part text', async () => {
+      // #given persisted "One." / "Two." streamed by part id, with the separator the run inserts between the parts
+      const run = await startFollowUp([textPart('p1', 'One.'), textPart('p2', 'Two.')])
+      await run.emit(textDeltaEvent('One.', 'p1'))
+      await run.emit(textDeltaEvent('Two.', 'p2'))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then the sink holds the separated text, and the run is admitted on the parts' own text
+      expect(replyOutput(run)).toBe('One.\n\nTwo.')
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('a multi-part follow-up streamed by legacy identity with separators still admits (unattributed match is end-anchored on part text)', async () => {
+      // #given persisted "One. " / "Two." delivered as legacy deltas that carry message/text identity
+      const identified = (text: string, textID: string): object => ({
+        type: 'session.next.text.delta',
+        properties: {sessionID: ROOT, assistantMessageID: 'msg-reply-2', textID, delta: text},
+      })
+      const run = await startFollowUp([textPart('p1', 'One. '), textPart('p2', 'Two.')])
+      await run.emit(identified('One. ', 'text-1'))
+      await run.emit(identified('Two.', 'text-2'))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then the separator sits between the parts in the sink but is not part of the fence's evidence
+      expect(replyOutput(run)).toBe('One. \n\nTwo.')
       expect(run.outcome()).toEqual({ok: true})
     })
 

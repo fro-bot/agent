@@ -45,6 +45,7 @@ import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completio
 import {formatToolPart} from './format-part.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
+import {createTextBoundaryTracker} from './text-boundary.js'
 
 // ---------------------------------------------------------------------------
 // Typed error
@@ -776,6 +777,26 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // never reply text: nothing carrying one of these ids may reach the sink.
   const noticePartIds = new Set<string>()
 
+  // Segment boundaries: the sinks are append-only and see only strings, so separate text parts would otherwise run
+  // together ("...can do.The README..."). Part identity exists only here; the separator is inserted once, through
+  // the sink, so Discord, the web sink and the final output all receive the same text. Every append goes through
+  // `trackedSink` so tool summaries are accounted for. See `text-boundary.ts` for the rule.
+  const textBoundary = createTextBoundaryTracker()
+  const trackedSink: CoreStreamSink = {
+    append: text => {
+      sink.append(text)
+      textBoundary.noteAppended(text)
+    },
+  }
+
+  // Appends a visible text delta, preceded by a segment separator when `segmentKey` starts a new segment. Returns
+  // nothing; the delivery fence records the part's own text separately and never sees the separator.
+  function appendSegmentText(segmentKey: string | null, text: string): void {
+    const separator = textBoundary.separatorBefore(segmentKey, text)
+    if (separator.length > 0) trackedSink.append(separator)
+    trackedSink.append(text)
+  }
+
   // Wrap the raw event stream in an abort-aware iterator so we do not block
   // indefinitely waiting for the next event when the signal fires mid-stream.
   // The inner generator races each `next()` call against the abort signal so
@@ -933,12 +954,20 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             const delta = getObjectProperty(eventPayload, 'delta')
             const deltaType = getStringProperty(delta, 'type')
             const deltaText = getStringProperty(delta, 'text')
+            // Identity: the part id; a delta without one falls back to its message id. Neither → no boundary.
+            const segmentMessageId = getStringProperty(eventPayload, 'messageID')
+            const segmentKey =
+              deltaPartId === null
+                ? segmentMessageId === null
+                  ? null
+                  : `message:${segmentMessageId}`
+                : `part:${deltaPartId}`
             if (deltaType === 'text' && deltaText != null) {
-              sink.append(deltaText)
+              appendSegmentText(segmentKey, deltaText)
               recordDelivered(eventSessionID, deltaPartId, deltaText)
               markActivity()
             } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
-              sink.append(delta)
+              appendSegmentText(segmentKey, delta)
               recordDelivered(eventSessionID, deltaPartId, delta)
               markActivity()
             }
@@ -952,7 +981,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const deltaRaw = getObjectProperty(eventPayload, 'delta')
           const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
           if (deltaText != null) {
-            sink.append(deltaText)
+            // Legacy shape carries `assistantMessageID` + `textID` (no partID): that pair is the segment identity.
+            // With neither there is nothing to key on, so no boundary is ever guessed between anonymous deltas.
+            const assistantMessageId = getStringProperty(eventPayload, 'assistantMessageID')
+            const textId = getStringProperty(eventPayload, 'textID')
+            const segmentKey = assistantMessageId === null ? null : `legacy:${assistantMessageId}:${textId ?? ''}`
+            appendSegmentText(segmentKey, deltaText)
             recordDelivered(eventSessionID, null, deltaText)
             markActivity()
           }
@@ -1020,7 +1054,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                     status: status === 'error' ? 'error' : 'completed',
                   },
                 },
-                sink,
+                trackedSink,
                 logger,
                 onActivity,
               )
@@ -1065,7 +1099,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                     status: 'completed',
                   },
                 },
-                sink,
+                trackedSink,
                 logger,
                 onActivity,
               )

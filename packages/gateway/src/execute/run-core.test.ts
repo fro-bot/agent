@@ -21,6 +21,8 @@ import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
 import {MAX_OPTIONS_PER_QUESTION, MAX_QUESTIONS_PER_REQUEST} from '../approvals/question-detail.js'
 import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
+import {createDiscordStreamSink} from '../discord/streaming.js'
+import {createWebReplySink} from '../web/operator/web-sinks.js'
 import {RunCoreError, runOpenCodeCore, wrapLedgerWithHooks} from './run-core.js'
 
 // ---------------------------------------------------------------------------
@@ -237,6 +239,29 @@ function partDeltaWithPartId(text: string, partId: string, sessionID = 'sess-123
     type: 'message.part.delta',
     properties: {sessionID, partID: partId, delta: {type: 'text', text}, field: 'text'},
   }
+}
+
+/** `message.part.delta` carrying a message id and (optionally) a part id. */
+function partDeltaInMessage(text: string, messageID: string, partID: string | null, sessionID = 'sess-123'): object {
+  return {
+    type: 'message.part.delta',
+    properties: {sessionID, messageID, ...(partID === null ? {} : {partID}), delta: text, field: 'text'},
+  }
+}
+
+/** Legacy `session.next.text.delta` with the identity the real event carries. */
+function legacyTextDelta(text: string, assistantMessageID: string, textID: string, sessionID = 'sess-123'): object {
+  return {
+    type: 'session.next.text.delta',
+    properties: {sessionID, assistantMessageID, textID, delta: text},
+  }
+}
+
+async function runSegmentEvents(events: readonly object[], coordinator = makeCoordinator()) {
+  const sink = makeSink()
+  const handle = makeHandle({subscribe: async () => subscribeOk([...events, sessionIdleEvent('sess-123')])})
+  await runOpenCodeCore({...buildParams(handle), sink, coordinator})
+  return sink
 }
 
 /** `session.error` event for a given session. */
@@ -1583,6 +1608,216 @@ describe('runOpenCodeCore', () => {
 
       // #then — the text delta passes through (other-session reasoning didn't register)
       expect(sink._appended).toEqual(['our answer'])
+    })
+  })
+
+  describe('segment boundaries (#1739) — separate text parts must not run together', () => {
+    const DESCENDANT = 'sess-descendant-1'
+
+    it(
+      String.raw`two text parts → "a\n\nb" in the Discord sink, the web sink (live and final), and the final output`,
+      async () => {
+        // #given the real Discord and web sinks behind a fan-out, fed two parts of one message
+        const discord = createDiscordStreamSink({send: vi.fn()})
+        const observed: {text: string; final: boolean}[] = []
+        const web = createWebReplySink({
+          runId: 'run-1',
+          observeOutput: (text, opts) => observed.push({text, final: opts?.final === true}),
+        })
+        const fanOut = {
+          append: (text: string) => {
+            discord.append(text)
+            web.append(text)
+          },
+        }
+        const handle = makeHandle({
+          subscribe: async () =>
+            subscribeOk([
+              partDeltaInMessage('what the project can do.', 'msg-1', 'part-1'),
+              partDeltaInMessage('The README', 'msg-1', 'part-2'),
+              sessionIdleEvent('sess-123'),
+            ]),
+        })
+
+        // #when
+        await runOpenCodeCore({...buildParams(handle), sink: fanOut, coordinator: makeCoordinator()})
+        await web.flush()
+
+        // #then every consumer holds the same, separated text
+        expect(discord.buffered()).toBe('what the project can do.\n\nThe README')
+        expect(web.buffered()).toBe('what the project can do.\n\nThe README')
+        const live = observed.filter(frame => !frame.final)
+        const final = observed.filter(frame => frame.final)
+        expect(live.map(frame => frame.text).join('')).toBe('what the project can do.\n\nThe README')
+        expect(final).toEqual([{text: 'what the project can do.\n\nThe README', final: true}])
+      },
+    )
+
+    it('parts in different messages are separated too', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        partDeltaInMessage('first.', 'msg-1', 'part-1'),
+        partDeltaInMessage('second.', 'msg-2', 'part-2'),
+      ])
+
+      // #then
+      expect(sink.buffered()).toBe('first.\n\nsecond.')
+    })
+
+    it('no leading separator before the first text', async () => {
+      // #given a run whose first visible text is a part (after a suppressed reasoning part)
+      const sink = await runSegmentEvents([
+        reasoningPartUpdatedEvent('part-r'),
+        partDeltaWithPartId('thinking', 'part-r'),
+        partDeltaWithPartId('hello', 'part-1'),
+      ])
+
+      // #then nothing precedes the text
+      expect(sink._appended).toEqual(['hello'])
+    })
+
+    it('the same part id across many deltas gets no separators', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('hel', 'part-1'),
+        partDeltaWithPartId('lo ', 'part-1'),
+        partDeltaWithPartId('world', 'part-1'),
+      ])
+
+      // #then
+      expect(sink._appended).toEqual(['hel', 'lo ', 'world'])
+    })
+
+    it('a part resumed after another part interleaved is not split mid-part', async () => {
+      // #given deltas of two parts interleaving
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('A1 ', 'part-a'),
+        partDeltaWithPartId('B1 ', 'part-b'),
+        partDeltaWithPartId('A2', 'part-a'),
+      ])
+
+      // #then the return to the already-seen part-a opens no new boundary
+      expect(sink.buffered()).toBe('A1 \n\nB1 A2')
+    })
+
+    it.each([
+      ['no trailing newline', 'a', 'a\n\nb'],
+      ['a single trailing newline is completed to a blank line', 'a\n', 'a\n\nb'],
+      ['a trailing blank line is left alone', 'a\n\n', 'a\n\nb'],
+      ['more than a blank line is left alone', 'a\n\n\n', 'a\n\n\nb'],
+    ])('trailing newlines — %s', async (_label, first, expected) => {
+      // #given
+      const sink = await runSegmentEvents([partDeltaWithPartId(first, 'part-1'), partDeltaWithPartId('b', 'part-2')])
+
+      // #then
+      expect(sink.buffered()).toBe(expected)
+    })
+
+    it('a leading newline on the next part counts toward the blank line', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('a', 'part-1'),
+        partDeltaWithPartId('\n', 'part-2'),
+        partDeltaWithPartId('b', 'part-2'),
+      ])
+
+      // #then
+      expect(sink.buffered()).toBe('a\n\nb')
+    })
+
+    it('a whitespace-only first delta of a new part does not trigger the boundary on its own', async () => {
+      // #given
+      const sink = await runSegmentEvents([partDeltaWithPartId('a', 'part-1'), partDeltaWithPartId('  ', 'part-2')])
+
+      // #then no separator is spent on whitespace
+      expect(sink.buffered()).toBe('a  ')
+    })
+
+    it('text part → tool summary → text part: one blank line after the summary, not two', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('before', 'part-1'),
+        partUpdatedToolEvent('edit', 'completed', {input: {filePath: 'src/foo.ts', newString: 'x', oldString: 'y'}}),
+        partDeltaWithPartId('after', 'part-2'),
+      ])
+
+      // #then the summary ends in a newline, so exactly one more completes the blank line
+      const out = sink.buffered()
+      expect(out).toMatch(/^before\n.*foo\.ts.*\n\nafter$/s)
+      expect(out).not.toContain('\n\n\n')
+    })
+
+    it('the same part continuing after a tool summary adds no separator', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('before', 'part-1'),
+        partUpdatedToolEvent('edit', 'completed', {input: {filePath: 'src/foo.ts', newString: 'x', oldString: 'y'}}),
+        partDeltaWithPartId('more', 'part-1'),
+      ])
+
+      // #then
+      expect(sink._appended.at(-1)).toBe('more')
+      expect(sink._appended.filter(chunk => chunk.trim() === '')).toEqual([])
+    })
+
+    it('a message.part.delta without a part id falls back to its message id', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        partDeltaInMessage('one', 'msg-1', null),
+        partDeltaInMessage(' more', 'msg-1', null),
+        partDeltaInMessage('two', 'msg-2', null),
+      ])
+
+      // #then
+      expect(sink.buffered()).toBe('one more\n\ntwo')
+    })
+
+    it('legacy session.next.text.delta: separated by textID/assistantMessageID, contiguous within a text', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        legacyTextDelta('one', 'msg-1', 'text-1'),
+        legacyTextDelta(' more', 'msg-1', 'text-1'),
+        legacyTextDelta('two', 'msg-1', 'text-2'),
+        legacyTextDelta('three', 'msg-2', 'text-1'),
+      ])
+
+      // #then
+      expect(sink.buffered()).toBe('one more\n\ntwo\n\nthree')
+    })
+
+    it('anonymous deltas with no identity at all are never separated', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        nextTextDeltaStringEvent('tok'),
+        nextTextDeltaStringEvent('en'),
+        partDeltaObjectEvent('s'),
+      ])
+
+      // #then
+      expect(sink._appended).toEqual(['tok', 'en', 's'])
+    })
+
+    it('routed descendant text behaves the same as root text', async () => {
+      // #given an adopted descendant streaming its own part after the root's
+      const sink = await runSegmentEvents(
+        [partDeltaWithPartId('root says', 'part-root'), partDeltaWithPartId('child says', 'part-child', DESCENDANT)],
+        makeCoordinator([DESCENDANT]),
+      )
+
+      // #then
+      expect(sink.buffered()).toBe('root says\n\nchild says')
+    })
+
+    it('text from sessions this run does not own is dropped and never opens a boundary', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('a', 'part-1'),
+        partDeltaWithPartId('foreign', 'part-x', 'sess-foreign'),
+        partDeltaWithPartId('b', 'part-1'),
+      ])
+
+      // #then
+      expect(sink._appended).toEqual(['a', 'b'])
     })
   })
 
