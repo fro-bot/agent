@@ -11,6 +11,8 @@
  * BDD comments: #given / #when / #then.
  */
 
+import type {RunState} from '@fro-bot/runtime'
+import type {OperatorRunStatus} from '../../operator-contract/index.js'
 import type {DenylistCache, RepoKey} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {RepoAuthzCache, RepoAuthzDeps} from '../auth/repo-authz.js'
@@ -21,6 +23,7 @@ import type {RunStreamRouteDeps} from './run-stream-route.js'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
 import {setOperatorRouteGuard} from '../operator-route.js'
+import {createRunObservationManager} from './manager.js'
 import {buildRunStreamRoute} from './run-stream-route.js'
 
 // ---------------------------------------------------------------------------
@@ -2500,5 +2503,355 @@ describe('writeFrame — question frame serialization', () => {
 
     // #then only the id, run id, and settled flag are present
     expect(parsed).toStrictEqual({requestID: 'q-1', runId: 'run-abc', settled: true})
+  })
+})
+
+interface SseChunk {
+  readonly done: boolean
+  readonly value?: Uint8Array
+}
+
+/**
+ * Stateful SSE body reader. A read abandoned by the idle timeout stays pending and is reused
+ * by the next call, so no chunk is ever lost between calls.
+ */
+function openSse(res: Response): {
+  readUntil: (until: (text: string) => boolean, idleMs?: number) => Promise<{text: string; done: boolean}>
+  cancel: () => Promise<void>
+} {
+  const reader = res.body?.getReader()
+  if (reader === undefined) throw new Error('Expected a readable body')
+  const decoder = new TextDecoder()
+  let pending: Promise<SseChunk> | undefined
+
+  const readUntil = async (until: (text: string) => boolean, idleMs = 200): Promise<{text: string; done: boolean}> => {
+    let text = ''
+    for (let i = 0; i < 50; i++) {
+      pending ??= reader.read() as Promise<SseChunk>
+      const result = await Promise.race([
+        pending,
+        new Promise<'idle'>(resolve => setTimeout(() => resolve('idle'), idleMs)),
+      ])
+      if (result === 'idle') return {text, done: false}
+      pending = undefined
+      if (result.done === true) return {text, done: true}
+      text += decoder.decode(result.value, {stream: true})
+      if (until(text)) return {text, done: false}
+    }
+    return {text, done: false}
+  }
+  return {readUntil, cancel: async () => reader.cancel().catch(() => {})}
+}
+
+/**
+ * Wraps a real manager so the terminal status frame's delivery to the route stays pending until
+ * `release()` — a slow SSE write. Close notifications pass straight through.
+ */
+function holdTerminalStatusDelivery(inner: RunObservationManager) {
+  let release!: () => void
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  let terminalWriteStarted = false
+  const manager: RunObservationManager = {
+    ...inner,
+    subscribe: (runId, callbacks, options) =>
+      inner.subscribe(
+        runId,
+        {
+          onEvent: async frame => {
+            if (frame.type === 'status' && frame.data.status === 'succeeded') {
+              terminalWriteStarted = true
+              await gate
+            }
+            await callbacks.onEvent(frame)
+          },
+          onClose: callbacks.onClose,
+        },
+        options,
+      ),
+  }
+  return {manager, release, terminalWriteStarted: () => terminalWriteStarted}
+}
+
+// ---------------------------------------------------------------------------
+// #1639: terminal run with no replay entry resolves from persisted state
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — durable cache-miss resolution (#1639)', () => {
+  function makeRunState(phase: RunState['phase']): RunState {
+    return {
+      run_id: 'run-001',
+      surface: 'github',
+      thread_id: 'thread-001',
+      entity_ref: 'acme/widget#1',
+      phase,
+      started_at: '2024-01-01T00:00:00.000Z',
+      last_heartbeat: '2024-01-01T00:00:00.000Z',
+      holder_id: 'holder-001',
+      details: {},
+    }
+  }
+
+  const STATUS_BY_PHASE: Partial<Record<RunState['phase'], OperatorRunStatus['status']>> = {
+    EXECUTING: 'running',
+    COMPLETED: 'succeeded',
+  }
+
+  function makeRealManager(project?: (runState: RunState) => Promise<OperatorRunStatus | null>) {
+    return createRunObservationManager({
+      projectRunObservation:
+        project ??
+        (async runState => ({
+          runId: runState.run_id,
+          entityRef: runState.entity_ref,
+          surface: runState.surface,
+          phase: runState.phase,
+          status: STATUS_BY_PHASE[runState.phase] ?? 'running',
+          startedAt: runState.started_at,
+          stale: false,
+        })),
+      logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn()},
+      setInterval: globalThis.setInterval.bind(globalThis),
+      clearInterval: globalThis.clearInterval.bind(globalThis),
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      now: () => Date.now(),
+    })
+  }
+
+  const eventNames = (text: string): string[] =>
+    [...text.matchAll(/^event: (\w+)$/gm)].map(m => m[1]).filter((n): n is string => n !== undefined)
+
+  it('terminates the stream with the terminal status when the replay entry was evicted', async () => {
+    // #given a completed run unknown to the (fresh / evicted) in-memory manager, with a persisted state
+    const manager = makeRealManager()
+    const readRunState = vi.fn(async () => makeRunState('COMPLETED'))
+    const deps = makeDeps({manager, readRunState, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    try {
+      // #when the operator opens the stream and reads to the end
+      const res = await fetchStream(app, 'run-001')
+      const {text, done} = await openSse(res).readUntil(() => false, 1_000)
+
+      // #then ready, the no-snapshot reset, then the terminal status — and the body ENDS
+      expect(done).toBe(true)
+      expect(eventNames(text)).toEqual(['ready', 'reset', 'status'])
+      expect(text).toContain('"status":"succeeded"')
+      expect(readRunState).toHaveBeenCalledWith('acme/widget', 'run-001')
+
+      // #then the per-operator slot was released (cap is 1): a second open is not 429
+      const second = await fetchStream(app, 'run-001')
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+    } finally {
+      manager.shutdown()
+    }
+  })
+
+  it('leaves a live run on the open-ended path: ready + reset, then the stream stays open', async () => {
+    // #given a run whose persisted state is still EXECUTING and that has no snapshot yet
+    const manager = makeRealManager()
+    const readRunState = vi.fn(async () => makeRunState('EXECUTING'))
+    const app = buildTestApp(makeDeps({manager, readRunState}))
+
+    try {
+      // #when the operator opens the stream
+      const res = await fetchStream(app, 'run-001')
+      const sse = openSse(res)
+      const {text, done} = await sse.readUntil(() => false, 150)
+
+      // #then exactly ready + reset arrive and the stream is NOT closed
+      expect(done).toBe(false)
+      expect(eventNames(text)).toEqual(['ready', 'reset'])
+      expect(readRunState).toHaveBeenCalledTimes(1)
+
+      // #then a later live terminal still completes the stream normally
+      await manager.observe(makeRunState('COMPLETED'))
+      const rest = await sse.readUntil(() => false, 1_000)
+      expect(rest.done).toBe(true)
+      expect(rest.text).toContain('"status":"succeeded"')
+      await sse.cancel()
+    } finally {
+      manager.shutdown()
+    }
+  })
+
+  it('emits a single terminal status when the run goes terminal between the cache check and the durable read', async () => {
+    // #given a no-snapshot subscriber whose durable read is held open
+    const manager = makeRealManager()
+    let release!: (state: RunState) => void
+    const readRunState = vi.fn(
+      async () =>
+        new Promise<RunState>(resolve => {
+          release = resolve
+        }),
+    )
+    const app = buildTestApp(makeDeps({manager, readRunState}))
+
+    try {
+      const res = await fetchStream(app, 'run-001')
+      const sse = openSse(res)
+      const first = await sse.readUntil(t => t.includes('event: reset'), 500)
+      expect(first.text).toContain('event: reset')
+
+      // #when the live terminal lands first and then the stale durable read resolves
+      await manager.observe(makeRunState('COMPLETED'))
+      release(makeRunState('COMPLETED'))
+      const rest = await sse.readUntil(() => false, 1_000)
+
+      // #then exactly one terminal status frame overall and the body ended
+      expect(rest.done).toBe(true)
+      expect(eventNames(first.text + rest.text).filter(n => n === 'status')).toHaveLength(1)
+    } finally {
+      manager.shutdown()
+    }
+  })
+
+  it('never reads persisted state for a denylisted or unauthorized repo', async () => {
+    // #given a terminal persisted run
+    const readRunState = vi.fn(async () => makeRunState('COMPLETED'))
+
+    // #when the repo is denylisted
+    const deniedApp = buildTestApp(
+      makeDeps({readRunState, denylistCache: makeDenylistCache(true), manager: makeRealManager()}),
+    )
+    const denied = await fetchStream(deniedApp, 'run-001')
+
+    // #when the repo is not authorized for the operator
+    const unauthorizedApp = buildTestApp(
+      makeDeps({readRunState, repoAuthzDeps: makeRepoAuthzDeps(false), manager: makeRealManager()}),
+    )
+    const unauthorized = await fetchStream(unauthorizedApp, 'run-001')
+
+    // #then both are the generic not-found and the durable store was never touched
+    expect(denied.status).toBe(404)
+    expect(unauthorized.status).toBe(404)
+    expect(await denied.json()).toEqual({error: 'not-found'})
+    expect(await unauthorized.json()).toEqual({error: 'not-found'})
+    expect(readRunState).not.toHaveBeenCalled()
+  })
+
+  it('reveals no status and does not close when the deny-gated projection redacts the persisted run', async () => {
+    // #given a terminal persisted run whose projection is redacted (null) at the bridge
+    const manager = makeRealManager(async () => null)
+    const readRunState = vi.fn(async () => makeRunState('COMPLETED'))
+    const app = buildTestApp(makeDeps({manager, readRunState}))
+
+    try {
+      // #when the operator opens the stream
+      const res = await fetchStream(app, 'run-001')
+      const sse = openSse(res)
+      const {text, done} = await sse.readUntil(() => false, 200)
+
+      // #then only ready + reset: no status frame, no completion signal
+      expect(done).toBe(false)
+      expect(eventNames(text)).toEqual(['ready', 'reset'])
+      expect(text).not.toContain('succeeded')
+      await sse.cancel()
+    } finally {
+      manager.shutdown()
+    }
+  })
+
+  it('subscribes exactly as before when no durable reader is wired', async () => {
+    // #given deps without readRunState
+    const subscribe = vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined)
+    const app = buildTestApp(makeDeps({manager: makeManager({subscribe})}))
+
+    // #when
+    const res = await fetchStream(app, 'run-001')
+    await res.body?.cancel()
+
+    // #then the manager saw the original two-argument call
+    expect(subscribe).toHaveBeenCalledTimes(1)
+    expect(subscribe.mock.calls[0]).toHaveLength(2)
+  })
+
+  it('keeps the stream slot and deadline until a durably-resolved terminal status has been delivered', async () => {
+    // #given a no-snapshot run whose durable read is held until the reset has been delivered
+    const inner = makeRealManager()
+    const held = holdTerminalStatusDelivery(inner)
+    let resolveRead!: (state: RunState) => void
+    const readRunState = vi.fn(
+      async () =>
+        new Promise<RunState>(resolve => {
+          resolveRead = resolve
+        }),
+    )
+    const app = buildTestApp(makeDeps({manager: held.manager, readRunState, maxStreamsPerOperator: 1}))
+
+    try {
+      const res = await fetchStream(app, 'run-001')
+      const sse = openSse(res)
+      const first = await sse.readUntil(t => t.includes('event: reset'), 500)
+      expect(eventNames(first.text)).toEqual(['ready', 'reset'])
+      // Keep a read outstanding so the reset write has fully settled (the body is backpressured
+      // until a reader pulls), i.e. the manager's writer is idle before the durable read resolves.
+      await sse.readUntil(() => false, 100)
+
+      // #when the durable read resolves terminal while the terminal write is still pending
+      resolveRead(makeRunState('COMPLETED'))
+      const pending = await sse.readUntil(() => false, 150)
+
+      // #then the write began but nothing was delivered, the stream is open, and the slot is still held
+      expect(held.terminalWriteStarted()).toBe(true)
+      expect(pending.text).not.toContain('event: status')
+      expect(pending.done).toBe(false)
+      const blocked = await fetchStream(app, 'run-001')
+      expect(blocked.status).toBe(429)
+
+      // #when the write settles
+      held.release()
+      const rest = await sse.readUntil(() => false, 1_000)
+
+      // #then the terminal status is delivered, the body ends, and the slot is free again
+      expect(rest.text).toContain('"status":"succeeded"')
+      expect(rest.done).toBe(true)
+      const reopened = await fetchStream(app, 'run-001')
+      expect(reopened.status).toBe(200)
+      await reopened.body?.cancel()
+    } finally {
+      held.release()
+      inner.shutdown()
+    }
+  })
+
+  it('keeps the stream slot until a live terminal status has been delivered', async () => {
+    // #given a live run (persisted state still EXECUTING) and a terminal write that will be slow
+    const inner = makeRealManager()
+    const held = holdTerminalStatusDelivery(inner)
+    const readRunState = vi.fn(async () => makeRunState('EXECUTING'))
+    const app = buildTestApp(makeDeps({manager: held.manager, readRunState, maxStreamsPerOperator: 1}))
+
+    try {
+      const res = await fetchStream(app, 'run-001')
+      const sse = openSse(res)
+      await sse.readUntil(t => t.includes('event: reset'), 500)
+      // Keep a read outstanding so the reset write has settled and the manager's writer is idle.
+      await sse.readUntil(() => false, 100)
+
+      // #when the live terminal lands and its write stays pending
+      await inner.observe(makeRunState('COMPLETED'))
+      const pending = await sse.readUntil(() => false, 150)
+
+      // #then the stream is open with the slot held and no status delivered yet
+      expect(held.terminalWriteStarted()).toBe(true)
+      expect(pending.text).not.toContain('event: status')
+      expect(pending.done).toBe(false)
+      expect((await fetchStream(app, 'run-001')).status).toBe(429)
+
+      // #when the write settles
+      held.release()
+      const rest = await sse.readUntil(() => false, 1_000)
+
+      // #then the status arrives and the stream ends
+      expect(rest.text).toContain('"status":"succeeded"')
+      expect(rest.done).toBe(true)
+    } finally {
+      held.release()
+      inner.shutdown()
+    }
   })
 })
