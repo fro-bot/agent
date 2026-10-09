@@ -939,20 +939,33 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     }
 
     // Drain-state invariant:
-    //   queue empty              → finalize immediately (nothing to deliver)
-    //   queue non-empty, writer running  → trust drainQueue to finalize on empty
-    //   queue non-empty, writer NOT running → start the drain so queued frames
-    //                                         are delivered and finalize is called
+    //   writer running           → drainQueue finalizes once the in-flight write settles
+    //                              and the queue is empty. An EMPTY queue does not mean
+    //                              "nothing left to deliver": drainQueue dequeues a frame
+    //                              BEFORE awaiting onEvent, so the frame being written is
+    //                              in neither the queue nor yet delivered.
+    //   writer idle, queue empty → finalize immediately (nothing to deliver)
+    //   writer idle, queue non-empty → start the drain so queued frames are delivered
+    //                                  and finalize is called
+    startOrFinalizeTerminalDrain(sub)
+  }
+
+  /**
+   * Apply the terminal drain-state invariant to a subscriber already marked
+   * `closingReason = 'terminal'`. Immediate finalization requires BOTH an empty queue AND
+   * no active writer; otherwise the active writer (or the drain started here) finalizes
+   * after the last delivery settles, so `onClose('terminal')` never overtakes a frame.
+   */
+  function startOrFinalizeTerminalDrain(sub: SubscriberState): void {
+    if (sub.writerRunning === true) {
+      return
+    }
     if (sub.queue.length === 0) {
       finalizeTerminalSubscriber(sub)
-    } else if (sub.writerRunning === false) {
-      // Writer stopped but queue is non-empty — start the drain so the queued
-      // frames (including the terminal status) are delivered before closing.
-      sub.writerRunning = true
-      drainQueue(sub).catch(() => {})
+      return
     }
-    // If writerRunning === true, drainQueue will call finalizeTerminalSubscriber
-    // when the queue empties.
+    sub.writerRunning = true
+    drainQueue(sub).catch(() => {})
   }
 
   /**
@@ -1347,17 +1360,8 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       }
 
       // Mark for graceful terminal drain — delivers queued frames then closes with 'terminal'.
-      // Apply the same drain-state invariant as markRunSubscribersForTerminalDrain:
-      //   queue empty              → finalize immediately
-      //   queue non-empty, writer running  → trust drainQueue
-      //   queue non-empty, writer NOT running → start the drain
       sub.closingReason = 'terminal'
-      if (sub.queue.length === 0) {
-        finalizeTerminalSubscriber(sub)
-      } else if (sub.writerRunning === false) {
-        sub.writerRunning = true
-        drainQueue(sub).catch(() => {})
-      }
+      startOrFinalizeTerminalDrain(sub)
 
       // Return a clean-disconnect function
       return () => {

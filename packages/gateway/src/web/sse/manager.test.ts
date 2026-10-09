@@ -3342,3 +3342,244 @@ describe('subscribe — durable cache-miss resolution (#1639)', () => {
     expect(second.frames.filter(f => f.type === 'status')).toHaveLength(0)
   })
 })
+
+// ===========================================================================
+// 25. Terminal close ordering — onClose('terminal') never overtakes a pending delivery
+// ===========================================================================
+
+/** Subscriber whose onEvent for `holdType` frames stays pending until `release()`. Logs ordering. */
+function subscribeWithHeldStatus(
+  manager: RunObservationManager,
+  options?: Parameters<RunObservationManager['subscribe']>[2],
+  runId = 'run-001',
+) {
+  const log: string[] = []
+  const closes: string[] = []
+  const deferred = makeDeferred<void>()
+  manager.subscribe(
+    runId,
+    {
+      onEvent: async frame => {
+        log.push(`${frame.type}:start`)
+        if (frame.type === 'status') await deferred.promise
+        log.push(`${frame.type}:done`)
+      },
+      onClose: reason => {
+        closes.push(reason)
+        log.push(`close:${reason}`)
+      },
+    },
+    options,
+  )
+  return {log, closes, release: deferred.resolve}
+}
+
+describe('terminal close ordering — close waits for the in-flight terminal write', () => {
+  it('durable path: delays onClose until the terminal onEvent settles, after the reset was delivered', async () => {
+    // #given a no-snapshot subscriber whose durable read is delayed until reset delivery completes
+    const {manager} = makeManager(projectByPhase)
+    const read = makeDeferred<RunState | undefined>()
+    const sub = subscribeWithHeldStatus(manager, {readDurableRunState: async () => read.promise})
+    await drain()
+    expect(sub.log).toEqual(['reset:start', 'reset:done'])
+
+    // #when the read resolves terminal and the terminal write is held pending
+    read.resolve(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then the write started but the subscriber is NOT closed yet
+    expect(sub.log).toEqual(['reset:start', 'reset:done', 'status:start'])
+    expect(sub.closes).toEqual([])
+
+    // #when the write settles
+    sub.release()
+    await drain()
+
+    // #then close follows delivery, exactly once
+    expect(sub.log).toEqual(['reset:start', 'reset:done', 'status:start', 'status:done', 'close:terminal'])
+    expect(sub.closes).toEqual(['terminal'])
+
+    manager.shutdown()
+  })
+
+  it('live path: delays onClose until the live terminal onEvent settles', async () => {
+    // #given a subscriber with its reset delivered
+    const {manager} = makeManager(projectByPhase)
+    const sub = subscribeWithHeldStatus(manager)
+    await drain()
+
+    // #when the live terminal lands and its write is held pending
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then the stream stays open until the write settles
+    expect(sub.log).toEqual(['reset:start', 'reset:done', 'status:start'])
+    expect(sub.closes).toEqual([])
+
+    sub.release()
+    await drain()
+    expect(sub.log.slice(-2)).toEqual(['status:done', 'close:terminal'])
+    expect(sub.closes).toEqual(['terminal'])
+
+    manager.shutdown()
+  })
+
+  it('replay path: delays onClose until the replayed terminal onEvent settles', async () => {
+    // #given a run whose terminal entry is in the replay cache
+    const {manager} = makeManager(projectByPhase)
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+
+    // #when a late subscriber attaches and the replayed status write is held pending
+    const sub = subscribeWithHeldStatus(manager)
+    await drain()
+
+    // #then the stream stays open until the write settles
+    expect(sub.log).toEqual(['status:start'])
+    expect(sub.closes).toEqual([])
+
+    sub.release()
+    await drain()
+    expect(sub.log).toEqual(['status:start', 'status:done', 'close:terminal'])
+
+    manager.shutdown()
+  })
+
+  it('still closes immediately when the terminal drain is marked while the writer is idle with an empty queue', async () => {
+    // #given a subscriber whose frames have all been delivered (idle writer, empty queue)
+    const {manager} = makeManager(projectByPhase)
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+    expect(frames.map(f => f.type)).toEqual(['reset'])
+
+    // #when the terminal lands with an instantly-settling writer
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then exactly one close, after the status
+    expect(frames.map(f => f.type)).toEqual(['reset', 'status'])
+    expect(closes).toEqual(['terminal'])
+
+    manager.shutdown()
+  })
+
+  it('a pending terminal write that fails is a writer-error drop, never a terminal close', async () => {
+    // #given a terminal write that stays pending, then rejects
+    const {manager} = makeManager(projectByPhase)
+    const closes: string[] = []
+    let reject!: (error: Error) => void
+    const write = new Promise<void>((_resolve, rej) => {
+      reject = rej
+    })
+    manager.subscribe('run-001', {
+      onEvent: async frame => {
+        if (frame.type === 'status') await write
+      },
+      onClose: reason => {
+        closes.push(reason)
+      },
+    })
+    await drain()
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+    expect(closes).toEqual([])
+
+    // #when the write fails
+    reject(new Error('socket closed'))
+    await drain()
+
+    // #then the subscriber is dropped as a writer error, with exactly one close
+    expect(closes).toEqual(['writer-error'])
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 26. Durable resolution — the guard after the (separately deferred) projection
+// ===========================================================================
+
+describe('subscribe — durable projection is re-guarded after it resolves (#1639)', () => {
+  const DURABLE_HOLDER = 'durable-holder'
+
+  /** Projection that defers only for the durable state (identified by holder_id); live states project instantly. */
+  function makeDeferredDurableProjection() {
+    const projection = makeDeferred<OperatorRunStatus | null>()
+    const projectFn: ProjectFn = async runState =>
+      runState.holder_id === DURABLE_HOLDER ? projection.promise : projectByPhase(runState)
+    return {projectFn, finishProjection: projection.resolve}
+  }
+
+  const durableTerminal = (): RunState => makeRunState({phase: 'COMPLETED', holder_id: DURABLE_HOLDER})
+
+  it('suppresses the stale durable terminal when a live status lands while projection is pending', async () => {
+    // #given a durable read that resolves terminal and a projection that stays pending
+    const {projectFn, finishProjection} = makeDeferredDurableProjection()
+    const {manager} = makeManager(projectFn)
+    const {frames, closes} = subscribeWithDurable(manager, async () => durableTerminal())
+    await drain()
+
+    // #when a live non-terminal status lands, then the stale projection resolves terminal
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+    finishProjection(makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'}))
+    await drain()
+
+    // #then only the live status was delivered: no stale terminal, no close
+    expect(frames.filter(f => f.type === 'status')).toHaveLength(1)
+    expect(frames.find(f => f.type === 'status')).toMatchObject({data: {status: 'running'}})
+    expect(closes).toEqual([])
+
+    manager.shutdown()
+  })
+
+  it('suppresses the durable terminal when the subscriber unsubscribes while projection is pending', async () => {
+    // #given a durable read that resolves terminal and a projection that stays pending
+    const {projectFn, finishProjection} = makeDeferredDurableProjection()
+    const {manager} = makeManager(projectFn)
+    const frames: ObservationFrame[] = []
+    const closes: string[] = []
+    const unsubscribe = manager.subscribe(
+      'run-001',
+      {
+        onEvent: f => {
+          frames.push(f)
+        },
+        onClose: r => {
+          closes.push(r)
+        },
+      },
+      {readDurableRunState: async () => durableTerminal()},
+    )
+    await drain()
+
+    // #when the subscriber leaves, then the projection resolves terminal
+    unsubscribe()
+    finishProjection(makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'}))
+    await drain()
+
+    // #then nothing terminal is delivered and no close fires for a subscriber that already left
+    expect(frames.filter(f => f.type === 'status')).toHaveLength(0)
+    expect(closes).toEqual([])
+
+    manager.shutdown()
+  })
+
+  it('delivers the durable terminal when nothing intervenes during a pending projection', async () => {
+    // #given the same deferred projection with no interference
+    const {projectFn, finishProjection} = makeDeferredDurableProjection()
+    const {manager} = makeManager(projectFn)
+    const {frames, closes} = subscribeWithDurable(manager, async () => durableTerminal())
+    await drain()
+    expect(closes).toEqual([])
+
+    // #when the projection resolves terminal
+    finishProjection(makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'}))
+    await drain()
+
+    // #then the terminal status is delivered and the stream closes (guards do not over-suppress)
+    expect(frames.filter(f => f.type === 'status')).toHaveLength(1)
+    expect(closes).toEqual(['terminal'])
+
+    manager.shutdown()
+  })
+})
