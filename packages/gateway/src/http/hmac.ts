@@ -10,6 +10,9 @@
 import {Buffer} from 'node:buffer'
 import {createHmac, timingSafeEqual} from 'node:crypto'
 
+/** A SHA-256 HMAC signature: exactly 64 hex characters (case-insensitive), no prefix. */
+const SIGNATURE_HEX_PATTERN = /^[0-9a-f]{64}$/i
+
 /** Replay protection window: 5 minutes on each side of now. */
 export const REPLAY_WINDOW_MS = 5 * 60 * 1000
 
@@ -18,7 +21,8 @@ export const REPLAY_WINDOW_MS = 5 * 60 * 1000
  *
  * Guards against:
  * - Wrong secret or tampered body/timestamp → `{ok:false, reason:'hmac_invalid'}`
- * - Malformed hex (odd length, non-hex chars) → `{ok:false, reason:'hmac_invalid'}` (no throw)
+ * - Malformed signature (not exactly 64 hex chars) → `{ok:false, reason:'hmac_invalid'}` before any
+ *   HMAC is computed (no throw, no hashing on unauthenticated garbage)
  * - Length mismatch before `timingSafeEqual` (it throws on unequal-length Buffers) → same
  */
 export function verifyHmac(
@@ -27,18 +31,24 @@ export function verifyHmac(
   timestampHeader: string,
   signatureHex: string,
 ): {ok: true} | {ok: false; reason: string} {
+  // Reject a malformed signature BEFORE any hashing: it must be exactly 64 hex chars
+  // (SHA-256 → 32 bytes → 64 hex). Unauthenticated callers therefore cannot make the
+  // server spend an HMAC computation on garbage, and Buffer.from(...,'hex') never sees
+  // odd-length or non-hex input (it silently truncates / stops at the first bad char).
+  if (SIGNATURE_HEX_PATTERN.test(signatureHex) === false) {
+    return {ok: false, reason: 'hmac_invalid'}
+  }
+
   // Compute the expected HMAC over timestamp + "." + rawBody
   const expected: Buffer = createHmac('sha256', secret).update(timestampHeader).update('.').update(rawBody).digest()
 
-  // Guard: hex string must be exactly twice the byte length to be a valid encoding
-  // (Buffer.from with 'hex' silently truncates odd-length strings; a non-hex char
-  // produces a zero byte at that position — both produce length mismatches or wrong values)
+  // Guard: hex string must be exactly twice the byte length (defense in depth; the pattern
+  // above already guarantees this).
   if (signatureHex.length !== expected.length * 2) {
     return {ok: false, reason: 'hmac_invalid'}
   }
 
-  // Decode the provided signature. Non-hex characters produce 0x00 bytes, which
-  // will fail timingSafeEqual — no throw needed here, but we still guard just in case.
+  // Decode the provided signature (validated hex above).
   const received: Buffer = Buffer.from(signatureHex, 'hex')
 
   // Guard: after decoding, lengths must still match (they should given the check above,

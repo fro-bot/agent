@@ -73,12 +73,12 @@ function makeSignature(rawBody: Buffer, timestamp: string, secret = SECRET): str
 
 function makeHeaders(
   rawBody: Buffer,
-  opts: {timestamp?: string; secret?: string; omitSig?: boolean; omitTs?: boolean} = {},
+  opts: {timestamp?: string; secret?: string; omitSig?: boolean; omitTs?: boolean; sig?: string} = {},
 ): {
   get: (name: string) => string | null
 } {
   const timestamp = opts.timestamp ?? TIMESTAMP
-  const sig = opts.omitSig === true ? null : makeSignature(rawBody, timestamp, opts.secret ?? SECRET)
+  const sig = opts.omitSig === true ? null : (opts.sig ?? makeSignature(rawBody, timestamp, opts.secret ?? SECRET))
   const ts = opts.omitTs === true ? null : timestamp
   return {
     get(name: string): string | null {
@@ -159,13 +159,13 @@ describe('handleAnnounce — happy path (survey_completed)', () => {
     const deps = makeDeps(client, logger, {replayCache})
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 200, body: {ok: true}})
     expect(sendMock).toHaveBeenCalledOnce()
     // replay is committed — a second call with the same sig is rejected
-    const result2 = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result2 = await handleAnnounce(rawBody, headers, deps)
     expect(result2.status).toBe(401)
   })
 })
@@ -180,7 +180,7 @@ describe('handleAnnounce — happy path (invitation_accepted)', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 200, body: {ok: true}})
@@ -201,14 +201,14 @@ describe('handleAnnounce — step 1: body too large', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 413, body: {error: 'payload too large'}})
   })
 })
 
-describe('handleAnnounce — step 2: rate limited', () => {
+describe('handleAnnounce — step 6: producer rate limited', () => {
   it('returns 429 when rate limiter denies', async () => {
     // #given — limiter always denies
     const rawBody = makeRawBody(validSurveyPayload)
@@ -219,14 +219,14 @@ describe('handleAnnounce — step 2: rate limited', () => {
     const deps = makeDeps(client, logger, {rateLimiter})
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 429, body: {error: 'rate limited'}})
   })
 })
 
-describe('handleAnnounce — step 3: missing headers', () => {
+describe('handleAnnounce — step 2: missing headers', () => {
   it('returns 400 when X-Gateway-Signature is absent', async () => {
     // #given
     const rawBody = makeRawBody(validSurveyPayload)
@@ -236,7 +236,7 @@ describe('handleAnnounce — step 3: missing headers', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 400, body: {error: 'bad request'}})
@@ -251,14 +251,14 @@ describe('handleAnnounce — step 3: missing headers', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 400, body: {error: 'bad request'}})
   })
 })
 
-describe('handleAnnounce — step 4: bad HMAC', () => {
+describe('handleAnnounce — step 3: bad HMAC', () => {
   it('returns 401 with generic body when signature is wrong', async () => {
     // #given
     const rawBody = makeRawBody(validSurveyPayload)
@@ -268,14 +268,14 @@ describe('handleAnnounce — step 4: bad HMAC', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 401, body: {error: 'unauthorized'}})
   })
 })
 
-describe('handleAnnounce — step 5: stale timestamp', () => {
+describe('handleAnnounce — step 4: stale timestamp', () => {
   it('returns 401 with SAME body as bad-HMAC (no oracle)', async () => {
     // #given — valid HMAC but timestamp is 10 minutes stale
     const staleTimestamp = '2026-05-29T11:50:00.000Z' // 10 min before NOW_MS
@@ -286,14 +286,14 @@ describe('handleAnnounce — step 5: stale timestamp', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBodyWithStale, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBodyWithStale, headers, deps)
 
     // #then — 401 with same body as step 4
     expect(result).toEqual({status: 401, body: {error: 'unauthorized'}})
   })
 })
 
-describe('handleAnnounce — step 6: replayed request', () => {
+describe('handleAnnounce — step 5: replayed request', () => {
   it('returns 401 with generic body for a replayed (committed) signature', async () => {
     // #given — pre-seed the replay cache with the signature
     const rawBody = makeRawBody(validSurveyPayload)
@@ -307,7 +307,7 @@ describe('handleAnnounce — step 6: replayed request', () => {
     const deps = makeDeps(client, logger, {replayCache})
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 401, body: {error: 'unauthorized'}})
@@ -326,7 +326,7 @@ describe('handleAnnounce — step 6: replayed request', () => {
     const deps = makeDeps(client, logger, {replayCache})
 
     // #when — second request with same sig while first is in-flight
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then — rejected immediately, same 401 body
     expect(result).toEqual({status: 401, body: {error: 'unauthorized'}})
@@ -343,7 +343,7 @@ describe('handleAnnounce — step 7: malformed JSON', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 400, body: {error: 'bad request'}})
@@ -365,7 +365,7 @@ describe('handleAnnounce — step 8: timestamp cross-check mismatch', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 400, body: {error: 'bad request'}})
@@ -383,7 +383,7 @@ describe('handleAnnounce — step 9: unknown event_type', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
     expect(result).toEqual({status: 400, body: {error: 'bad request'}})
@@ -402,7 +402,7 @@ describe('handleAnnounce — step 10: Discord failure', () => {
     const sig = makeSignature(rawBody, TIMESTAMP)
 
     // #when
-    const result = await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then — 500
     expect(result).toEqual({status: 500, body: {error: 'internal error'}})
@@ -413,7 +413,7 @@ describe('handleAnnounce — step 10: Discord failure', () => {
     // retry succeeds (Discord now works)
     const {client: client2} = makeDiscordClient(true)
     const deps2 = makeDeps(client2, logger, {replayCache})
-    const retry = await handleAnnounce(rawBody, headers, '1.2.3.4', deps2)
+    const retry = await handleAnnounce(rawBody, headers, deps2)
     expect(retry).toEqual({status: 200, body: {ok: true}})
   })
 })
@@ -447,10 +447,10 @@ describe('handleAnnounce — concurrency: duplicate in-flight requests', () => {
     const deps2 = makeDeps(client, logger, {replayCache})
 
     // #when — fire both requests concurrently; first wins the reserve(), second loses
-    const p1 = handleAnnounce(rawBody, headers, '1.2.3.4', deps1)
+    const p1 = handleAnnounce(rawBody, headers, deps1)
     // Let req2 start before req1's Discord post completes
     await Promise.resolve()
-    const result2 = await handleAnnounce(rawBody, headers, '1.2.3.4', deps2)
+    const result2 = await handleAnnounce(rawBody, headers, deps2)
     // Now release the Discord post for req1
     resolveDiscord()
     const result1 = await p1
@@ -470,13 +470,13 @@ describe('handleAnnounce — concurrency: duplicate in-flight requests', () => {
 
     const {client: failClient} = makeDiscordClient(false)
     const deps1 = makeDeps(failClient, logger, {replayCache})
-    const fail = await handleAnnounce(rawBody, headers, '1.2.3.4', deps1)
+    const fail = await handleAnnounce(rawBody, headers, deps1)
     expect(fail.status).toBe(500)
 
     // #when — retry with same sig, Discord now succeeds
     const {client: successClient} = makeDiscordClient(true)
     const deps2 = makeDeps(successClient, logger, {replayCache})
-    const retry = await handleAnnounce(rawBody, headers, '1.2.3.4', deps2)
+    const retry = await handleAnnounce(rawBody, headers, deps2)
 
     // #then — not blocked as replay
     expect(retry).toEqual({status: 200, body: {ok: true}})
@@ -492,18 +492,13 @@ describe('handleAnnounce — concurrency: duplicate in-flight requests', () => {
     const {client} = makeDiscordClient(true)
 
     // Send malformed request — it gets a 400 but reserves then releases
-    const badResult = await handleAnnounce(rawBodyBad, headersBad, '1.2.3.4', makeDeps(client, logger, {replayCache}))
+    const badResult = await handleAnnounce(rawBodyBad, headersBad, makeDeps(client, logger, {replayCache}))
     expect(badResult.status).toBe(400)
 
     // #when — a new valid request (different sig because different body) is sent
     const rawBodyGood = makeRawBody(validSurveyPayload)
     const headersGood = makeHeaders(rawBodyGood)
-    const goodResult = await handleAnnounce(
-      rawBodyGood,
-      headersGood,
-      '1.2.3.4',
-      makeDeps(client, logger, {replayCache}),
-    )
+    const goodResult = await handleAnnounce(rawBodyGood, headersGood, makeDeps(client, logger, {replayCache}))
 
     // #then — accepted normally
     expect(goodResult).toEqual({status: 200, body: {ok: true}})
@@ -554,7 +549,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls, sig)
@@ -570,7 +565,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls, sig)
@@ -588,7 +583,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls, sig)
@@ -606,7 +601,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger, {replayCache})
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls, sig)
@@ -622,7 +617,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls, sig)
@@ -639,7 +634,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls, sig)
@@ -662,7 +657,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls, sig)
@@ -677,7 +672,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls)
@@ -686,6 +681,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
   it('does not log secret, repo name, rendered_text, or sig hex on rate limit', async () => {
     // #given
     const rawBody = makeRawBody(sensitivePayload)
+    const sig = makeSignature(rawBody, TIMESTAMP)
     const headers = makeHeaders(rawBody)
     const {client} = makeDiscordClient()
     const {logger, calls} = makeLogger()
@@ -693,10 +689,28 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger, {rateLimiter})
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    const result = await handleAnnounce(rawBody, headers, deps)
+
+    // #then — the 429 path is reached only after auth, so the signature was in play and must not leak
+    expect(result.status).toBe(429)
+    assertNoLeakage(calls, sig)
+  })
+
+  it('does not log secret, repo name, rendered_text, or the supplied value on a malformed signature', async () => {
+    // #given — a malformed signature header that embeds the secret and the planted name
+    const rawBody = makeRawBody(sensitivePayload)
+    const malformed = `${SECRET}-${PLANTED_REPO_NAME}`
+    const headers = makeHeaders(rawBody, {sig: malformed})
+    const {client} = makeDiscordClient()
+    const {logger, calls} = makeLogger()
+    const deps = makeDeps(client, logger)
+
+    // #when
+    const result = await handleAnnounce(rawBody, headers, deps)
 
     // #then
-    assertNoLeakage(calls)
+    expect(result).toEqual({status: 401, body: {error: 'unauthorized'}})
+    assertNoLeakage(calls, malformed)
   })
 
   it('does not log secret, repo name, rendered_text, or sig hex on discord failure', async () => {
@@ -709,7 +723,7 @@ describe('handleAnnounce — security: no secret/body leakage in logs', () => {
     const deps = makeDeps(client, logger)
 
     // #when
-    await handleAnnounce(rawBody, headers, '1.2.3.4', deps)
+    await handleAnnounce(rawBody, headers, deps)
 
     // #then
     assertNoLeakage(calls, sig)
@@ -730,7 +744,7 @@ describe('handleAnnounce — security: no-oracle invariant', () => {
     const badSigHeaders = makeHeaders(rawBody, {secret: 'wrong-secret'})
     const {client: c1} = makeDiscordClient()
     const {logger: l1} = makeLogger()
-    const hmacResult = await handleAnnounce(rawBody, badSigHeaders, '1.2.3.4', makeDeps(c1, l1))
+    const hmacResult = await handleAnnounce(rawBody, badSigHeaders, makeDeps(c1, l1))
 
     // 2. stale timestamp (valid HMAC)
     const staleTimestamp = '2026-05-29T11:50:00.000Z'
@@ -739,7 +753,7 @@ describe('handleAnnounce — security: no-oracle invariant', () => {
     const staleHeaders = makeHeaders(rawBodyStale, {timestamp: staleTimestamp})
     const {client: c2} = makeDiscordClient()
     const {logger: l2} = makeLogger()
-    const tsResult = await handleAnnounce(rawBodyStale, staleHeaders, '1.2.3.4', makeDeps(c2, l2))
+    const tsResult = await handleAnnounce(rawBodyStale, staleHeaders, makeDeps(c2, l2))
 
     // 3. replayed / reserved sig
     const sig = makeSignature(rawBody, TIMESTAMP)
@@ -748,7 +762,7 @@ describe('handleAnnounce — security: no-oracle invariant', () => {
     const replayHeaders = makeHeaders(rawBody)
     const {client: c3} = makeDiscordClient()
     const {logger: l3} = makeLogger()
-    const replayResult = await handleAnnounce(rawBody, replayHeaders, '1.2.3.4', makeDeps(c3, l3, {replayCache}))
+    const replayResult = await handleAnnounce(rawBody, replayHeaders, makeDeps(c3, l3, {replayCache}))
 
     // #then — all three produce the IDENTICAL {status, body}
     expect(hmacResult).toEqual({status: 401, body: {error: 'unauthorized'}})
@@ -771,15 +785,238 @@ describe('replay cache record-only-on-success invariant', () => {
 
     const {client: failClient} = makeDiscordClient(false)
     const deps1 = makeDeps(failClient, logger, {replayCache})
-    const fail = await handleAnnounce(rawBody, headers, '1.2.3.4', deps1)
+    const fail = await handleAnnounce(rawBody, headers, deps1)
     expect(fail.status).toBe(500)
 
     // #when — retry with same sig but Discord now succeeds
     const {client: successClient} = makeDiscordClient(true)
     const deps2 = makeDeps(successClient, logger, {replayCache})
-    const retry = await handleAnnounce(rawBody, headers, '1.2.3.4', deps2)
+    const retry = await handleAnnounce(rawBody, headers, deps2)
 
     // #then — not blocked
     expect(retry).toEqual({status: 200, body: {ok: true}})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// #1645: authenticate first, then rate-limit on one authenticated producer key
+// ---------------------------------------------------------------------------
+
+/** Wraps a real limiter and records every key it is asked about. */
+function makeRecordingLimiter(opts: {limit: number; clock?: () => number}): {
+  rateLimiter: AnnounceHandlerDeps['rateLimiter']
+  keys: string[]
+} {
+  const inner = createRateLimiter({limit: opts.limit, clock: opts.clock ?? (() => NOW_MS)})
+  const keys: string[] = []
+  return {
+    keys,
+    rateLimiter: {
+      allow: key => {
+        keys.push(key)
+        return inner.allow(key)
+      },
+    },
+  }
+}
+
+/** Distinct valid payload per index so each request has its own signature. */
+function makeDistinctRequest(index: number): {rawBody: Buffer; headers: ReturnType<typeof makeHeaders>; sig: string} {
+  const rawBody = makeRawBody({
+    ...validSurveyPayload,
+    context: {...validSurveyPayload.context, wiki_pages_changed: index},
+  })
+  return {rawBody, headers: makeHeaders(rawBody), sig: makeSignature(rawBody, TIMESTAMP)}
+}
+
+describe('handleAnnounce — #1645: unauthenticated traffic cannot spend the producer allowance', () => {
+  it('a fresh valid request still returns 200 after unsigned and bad-signature floods, and invalid traffic never touches the limiter', async () => {
+    // #given — a producer allowance of 2, and a flood far larger than that
+    const {rateLimiter, keys} = makeRecordingLimiter({limit: 2})
+    const {client, sendMock} = makeDiscordClient(true)
+    const {logger} = makeLogger()
+    const deps = makeDeps(client, logger, {rateLimiter})
+    const body = makeRawBody(validSurveyPayload)
+
+    // #when — 5 of each flavour of invalid request
+    const flood = []
+    for (let i = 0; i < 5; i++) {
+      flood.push(await handleAnnounce(body, makeHeaders(body, {omitSig: true}), deps))
+      flood.push(await handleAnnounce(body, makeHeaders(body, {omitTs: true}), deps))
+      flood.push(await handleAnnounce(body, makeHeaders(body, {secret: 'wrong-secret'}), deps))
+      flood.push(await handleAnnounce(body, makeHeaders(body, {sig: 'not-a-signature'}), deps))
+    }
+    const valid = await handleAnnounce(body, makeHeaders(body), deps)
+
+    // #then — none of the flood was admitted, the limiter was never consulted for it,
+    // and the real producer request still gets through
+    expect(flood).toHaveLength(20)
+    expect(flood.filter(r => r.status === 400)).toHaveLength(10)
+    expect(flood.filter(r => r.status === 401)).toHaveLength(10)
+    expect(keys).toEqual(['control-plane'])
+    expect(valid).toEqual({status: 200, body: {ok: true}})
+    expect(sendMock).toHaveBeenCalledOnce()
+  })
+
+  it('stale and replayed requests consume no producer quota', async () => {
+    // #given — allowance of 1; a request that already committed (replay) and a stale one
+    const {rateLimiter, keys} = makeRecordingLimiter({limit: 1})
+    const replayCache = createReplayCache({clock: () => NOW_MS})
+    const {client} = makeDiscordClient(true)
+    const {logger} = makeLogger()
+    const deps = makeDeps(client, logger, {rateLimiter, replayCache})
+
+    const replayed = makeDistinctRequest(1)
+    replayCache.record(replayed.sig, NOW_MS)
+
+    const staleTimestamp = '2026-05-29T11:50:00.000Z'
+    const staleBody = makeRawBody({...validSurveyPayload, fired_at: staleTimestamp})
+    const staleHeaders = makeHeaders(staleBody, {timestamp: staleTimestamp})
+
+    // #when
+    const replayResult = await handleAnnounce(replayed.rawBody, replayed.headers, deps)
+    const staleResult = await handleAnnounce(staleBody, staleHeaders, deps)
+    const fresh = makeDistinctRequest(2)
+    const freshResult = await handleAnnounce(fresh.rawBody, fresh.headers, deps)
+
+    // #then — both rejected generically without touching the limiter; the fresh request owns the allowance
+    expect(replayResult).toEqual({status: 401, body: {error: 'unauthorized'}})
+    expect(staleResult).toEqual({status: 401, body: {error: 'unauthorized'}})
+    expect(keys).toEqual(['control-plane'])
+    expect(freshResult).toEqual({status: 200, body: {ok: true}})
+  })
+
+  it('concurrent duplicates produce one Discord post and one quota charge', async () => {
+    // #given — Discord held pending so the duplicate arrives while the first is in flight
+    const {rateLimiter, keys} = makeRecordingLimiter({limit: 10})
+    const request = makeDistinctRequest(1)
+    let resolveDiscord!: () => void
+    const discordHeld = new Promise<void>(resolve => {
+      resolveDiscord = resolve
+    })
+    const sendMock = vi.fn().mockReturnValue(discordHeld)
+    const fakeClient: FakeClient = {
+      channels: {fetch: vi.fn().mockResolvedValue({isTextBased: () => true, send: sendMock})},
+    }
+    const {logger} = makeLogger()
+    const deps = makeDeps(fakeClient as FakeClient & AnnounceHandlerDeps['client'], logger, {rateLimiter})
+
+    // #when
+    const first = handleAnnounce(request.rawBody, request.headers, deps)
+    await Promise.resolve()
+    const duplicate = await handleAnnounce(request.rawBody, request.headers, deps)
+    resolveDiscord()
+    const firstResult = await first
+
+    // #then
+    expect(sendMock).toHaveBeenCalledOnce()
+    expect(duplicate).toEqual({status: 401, body: {error: 'unauthorized'}})
+    expect(firstResult).toEqual({status: 200, body: {ok: true}})
+    expect(keys).toEqual(['control-plane'])
+  })
+
+  it('a quota-denied request releases its replay reservation and succeeds after the window resets', async () => {
+    // #given — allowance of 1 per 60s window on a controllable limiter clock
+    let limiterNow = NOW_MS
+    const {rateLimiter} = makeRecordingLimiter({limit: 1, clock: () => limiterNow})
+    const replayCache = createReplayCache({clock: () => NOW_MS})
+    const {client, sendMock} = makeDiscordClient(true)
+    const {logger} = makeLogger()
+    const deps = makeDeps(client, logger, {rateLimiter, replayCache})
+    const first = makeDistinctRequest(1)
+    const second = makeDistinctRequest(2)
+
+    // #when — first spends the allowance; second is throttled
+    const firstResult = await handleAnnounce(first.rawBody, first.headers, deps)
+    const throttled = await handleAnnounce(second.rawBody, second.headers, deps)
+
+    // #then — throttled with the generic quota body, and Discord was not touched for it
+    expect(firstResult.status).toBe(200)
+    expect(throttled).toEqual({status: 429, body: {error: 'rate limited'}})
+    expect(sendMock).toHaveBeenCalledOnce()
+
+    // #when — the window resets and the producer retries the exact same signed request
+    limiterNow += 60_000
+    const retry = await handleAnnounce(second.rawBody, second.headers, deps)
+
+    // #then — not blocked as a replay: the 429 released the reservation
+    expect(retry).toEqual({status: 200, body: {ok: true}})
+    expect(sendMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('a case-variant of a committed signature is still rejected as a replay', async () => {
+    // #given — a request that already succeeded
+    const replayCache = createReplayCache({clock: () => NOW_MS})
+    const {client, sendMock} = makeDiscordClient(true)
+    const {logger} = makeLogger()
+    const deps = makeDeps(client, logger, {replayCache})
+    const request = makeDistinctRequest(1)
+    expect((await handleAnnounce(request.rawBody, request.headers, deps)).status).toBe(200)
+
+    // #when — the same signature re-sent in upper-case hex (still a valid HMAC encoding)
+    const upper = makeHeaders(request.rawBody, {sig: request.sig.toUpperCase()})
+    const result = await handleAnnounce(request.rawBody, upper, deps)
+
+    // #then
+    expect(result).toEqual({status: 401, body: {error: 'unauthorized'}})
+    expect(sendMock).toHaveBeenCalledOnce()
+  })
+
+  it('every rate-limit decision uses the one fixed producer key, regardless of how many requests arrive', async () => {
+    // #given
+    const {rateLimiter, keys} = makeRecordingLimiter({limit: 100})
+    const {client} = makeDiscordClient(true)
+    const {logger} = makeLogger()
+    const deps = makeDeps(client, logger, {rateLimiter})
+
+    // #when
+    for (let i = 0; i < 3; i++) {
+      const request = makeDistinctRequest(i)
+      await handleAnnounce(request.rawBody, request.headers, deps)
+    }
+
+    // #then — no per-caller key can exist: handleAnnounce takes no source identity at all
+    expect(keys).toEqual(['control-plane', 'control-plane', 'control-plane'])
+  })
+})
+
+describe('handleAnnounce — #1645: generic responses and distinguishable logs', () => {
+  it('malformed signature, bad HMAC, stale and replayed requests all return the identical generic 401', async () => {
+    // #given
+    const body = makeRawBody(validSurveyPayload)
+    const sig = makeSignature(body, TIMESTAMP)
+    const replayCache = createReplayCache({clock: () => NOW_MS})
+    replayCache.record(sig, NOW_MS)
+    const staleTimestamp = '2026-05-29T11:50:00.000Z'
+    const staleBody = makeRawBody({...validSurveyPayload, fired_at: staleTimestamp})
+    const {client} = makeDiscordClient()
+    const {logger} = makeLogger()
+
+    // #when
+    const results = [
+      await handleAnnounce(body, makeHeaders(body, {sig: 'zz'.repeat(32)}), makeDeps(client, logger)),
+      await handleAnnounce(body, makeHeaders(body, {secret: 'wrong-secret'}), makeDeps(client, logger)),
+      await handleAnnounce(staleBody, makeHeaders(staleBody, {timestamp: staleTimestamp}), makeDeps(client, logger)),
+      await handleAnnounce(body, makeHeaders(body), makeDeps(client, logger, {replayCache})),
+    ]
+
+    // #then
+    for (const result of results) {
+      expect(result).toEqual({status: 401, body: {error: 'unauthorized'}})
+    }
+  })
+
+  it('logs auth rejection and producer-quota rejection under distinct reasons', async () => {
+    // #given
+    const {client} = makeDiscordClient()
+    const {logger, calls} = makeLogger()
+    const body = makeRawBody(validSurveyPayload)
+
+    // #when — one auth rejection, one quota rejection
+    await handleAnnounce(body, makeHeaders(body, {secret: 'wrong-secret'}), makeDeps(client, logger))
+    await handleAnnounce(body, makeHeaders(body), makeDeps(client, logger, {rateLimiter: {allow: () => false}}))
+
+    // #then — reason-only structured logs
+    expect(calls.map(call => call.ctx)).toEqual([{reason: 'hmac_invalid'}, {reason: 'producer_rate_limited'}])
   })
 })
