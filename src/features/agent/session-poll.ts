@@ -525,6 +525,21 @@ async function detectMessageActivity(
     signal,
     deadline,
   )
+
+  // Renewed root activity observed while this request was in flight invalidates the response, and
+  // that rejection happens BEFORE the response is allowed to mutate any tracker state: the parent
+  // turns derived from REST below (`registerPendingRootUserMessage`) would otherwise overwrite a
+  // newer pending parent SSE registered mid-request, discarding that freshness evidence. A stale
+  // response is an interrupted observation, so confirmation memory is reset too. This is the only
+  // rejection point -- every path out of this function after the request sits behind it, so the
+  // mutation sites below can never act on a stale list. A genuinely new parent discovered by a
+  // FRESH response advances the revision itself (the registration), which the final admission
+  // checks in the caller still observe.
+  if (rootFreshness != null && rootFreshness.revision !== requestRevision) {
+    activityTracker.completedAssistantMessageId = undefined
+    return null
+  }
+
   const messages = Array.isArray(messagesResponse.data) ? messagesResponse.data : []
   let latestAssistantMessage: unknown = null
   let latestAssistantMessageInfo: unknown = null
@@ -693,7 +708,9 @@ async function detectMessageActivity(
     }
   }
 
-  // Renewed root activity observed while this request was in flight invalidates the response.
+  // Retained after the early rejection above: the revision can still advance within this call, when
+  // a FRESH response registers a parent turn it discovered (a missed injected turn). That
+  // advancement must still defer confirmation, so the same check stands here.
   if (rootFreshness != null && rootFreshness.revision !== requestRevision) {
     activityTracker.completedAssistantMessageId = undefined
     return null

@@ -3658,3 +3658,181 @@ describe('execute-phase ledger reconciliation for a missed background-task compl
     expect(children).not.toHaveBeenCalled()
   })
 })
+
+interface MessageEntry {
+  readonly info: Record<string, unknown>
+}
+
+const userTurn = (id: string): MessageEntry => ({info: {id, role: 'user'}})
+const completedReply = (id: string, parentID: string): MessageEntry => ({
+  info: {id, role: 'assistant', time: {completed: 2}, finish: 'stop', parentID},
+})
+const unfinishedReply = (id: string, parentID: string): MessageEntry => ({info: {id, role: 'assistant', parentID}})
+
+/**
+ * REST lists that each reach a different REST-derived parent mutation in `detectMessageActivity`.
+ * `registers` is the pending parent a FRESH response (no revision drift) installs from the list.
+ */
+const restDerivedParentMutations = [
+  {
+    name: 'a newer root user turn with no assistant reply (first registration site)',
+    list: [userTurn('msg_prompt'), userTurn('msg_rest_turn')],
+    registers: 'msg_rest_turn',
+  },
+  {
+    name: 'a newer root user turn with an unfinished reply (assistant-state early return)',
+    list: [userTurn('msg_prompt'), userTurn('msg_rest_turn'), unfinishedReply('msg_unfinished', 'msg_rest_turn')],
+    registers: 'msg_rest_turn',
+  },
+  {
+    name: 'a terminal reply to a newer root user turn',
+    list: [userTurn('msg_prompt'), userTurn('msg_rest_turn'), completedReply('msg_reply', 'msg_rest_turn')],
+    registers: 'msg_rest_turn',
+  },
+  {
+    name: 'a candidate whose parent is not the newest root user (second registration site)',
+    list: [userTurn('msg_prompt'), completedReply('msg_other_reply', 'msg_other_parent')],
+    registers: 'msg_prompt',
+  },
+] as const
+
+function newArmedTracker() {
+  const rootFreshness = createRootFreshnessTracker()
+  armRootFreshness(rootFreshness)
+  const activityTracker: ActivityTracker = {...qualifiedPredicateBaseActivityTracker(), rootFreshness}
+  return {rootFreshness, activityTracker}
+}
+
+function startObservation(
+  messages: ReturnType<typeof vi.fn>,
+  status: ReturnType<typeof vi.fn>,
+  activityTracker: ActivityTracker,
+  logger: Logger,
+) {
+  const controller = new AbortController()
+  const client = {session: {messages, status}} as unknown as MockClient
+  const settled = pollForSessionCompletionObservation(
+    client,
+    'ses_123',
+    '/workspace',
+    controller.signal,
+    logger,
+    30_000,
+    activityTracker,
+  ).catch(() => null)
+  return {controller, settled}
+}
+
+describe('stale session.messages() responses never mutate the pending parent (#1730)', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it.each(restDerivedParentMutations)(
+    'leaves the SSE-registered pending parent intact when a stale response carries $name',
+    async ({list}) => {
+      // #given an in-flight session.messages() request issued at revision 0
+      const {rootFreshness, activityTracker} = newArmedTracker()
+      let resolveStale: (value: unknown) => void = () => {}
+      const messages = vi
+        .fn()
+        .mockImplementationOnce(
+          async () =>
+            new Promise(resolve => {
+              resolveStale = resolve
+            }),
+        )
+        .mockImplementation(async () => new Promise(() => {}))
+      const status = vi.fn().mockResolvedValue({data: {}})
+      const observation = startObservation(messages, status, activityTracker, mockLogger)
+      await vi.advanceTimersByTimeAsync(600)
+      expect(messages).toHaveBeenCalledTimes(1)
+
+      // #when SSE registers a newer pending parent while the request is in flight, then the older response lands
+      registerPendingRootUserMessage(rootFreshness, 'msg_sse_turn')
+      const revisionAfterSse = rootFreshness.revision
+      resolveStale({data: list})
+      await vi.advanceTimersByTimeAsync(10)
+
+      // #then the stale response is discarded: the SSE-registered parent and its revision survive
+      expect(rootFreshness.pendingParentMessageId).toBe('msg_sse_turn')
+      expect(rootFreshness.latestRootUserMessageId).toBe('msg_sse_turn')
+      expect(rootFreshness.revision).toBe(revisionAfterSse)
+
+      observation.controller.abort()
+      await observation.settled
+    },
+  )
+
+  it.each(restDerivedParentMutations)(
+    'still registers the REST-derived pending parent from a fresh response carrying $name',
+    async ({list, registers}) => {
+      // #given no root activity between request and response, and no SSE-registered turn
+      const {rootFreshness, activityTracker} = newArmedTracker()
+      const messages = vi
+        .fn()
+        .mockResolvedValueOnce({data: list})
+        .mockImplementation(async () => new Promise(() => {}))
+      const status = vi.fn().mockResolvedValue({data: {}})
+
+      // #when the fresh response is observed
+      const observation = startObservation(messages, status, activityTracker, mockLogger)
+      await vi.advanceTimersByTimeAsync(600)
+
+      // #then the missed newer root turn is registered as the pending parent, exactly as before
+      expect(rootFreshness.pendingParentMessageId).toBe(registers)
+      expect(rootFreshness.latestRootUserMessageId).toBe(registers)
+
+      observation.controller.abort()
+      await observation.settled
+    },
+  )
+
+  it('keeps the newer barrier through a stale response and admits its reply on the next fresh reads', async () => {
+    // #given an in-flight request at revision 0 that will return an older REST turn
+    const {rootFreshness, activityTracker} = newArmedTracker()
+    let resolveStale: (value: unknown) => void = () => {}
+    const freshList = {
+      data: [userTurn('msg_prompt'), userTurn('msg_sse_turn'), completedReply('msg_reply', 'msg_sse_turn')],
+    }
+    const messages = vi
+      .fn()
+      .mockImplementationOnce(
+        async () =>
+          new Promise(resolve => {
+            resolveStale = resolve
+          }),
+      )
+      .mockResolvedValue(freshList)
+    const status = vi.fn().mockResolvedValue({data: {}})
+    const observation = startObservation(messages, status, activityTracker, mockLogger)
+    await vi.advanceTimersByTimeAsync(600)
+
+    // #when SSE registers the newer pending parent mid-flight and the stale response lands
+    registerPendingRootUserMessage(rootFreshness, 'msg_sse_turn')
+    const revisionAfterSse = rootFreshness.revision
+    resolveStale({data: [userTurn('msg_prompt'), userTurn('msg_rest_turn')]})
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then the barrier was neither cleared nor re-learned: no extra invalidation was spent on it
+    expect(rootFreshness.pendingParentMessageId).toBe('msg_sse_turn')
+    expect(rootFreshness.revision).toBe(revisionAfterSse)
+
+    // #when the next fresh reads confirm the reply to that same turn
+    await vi.advanceTimersByTimeAsync(2_000)
+    const result = await observation.settled
+
+    // #then it is admitted on the two-poll confirmation (3 reads total) without re-registering anything
+    expect(result?.settlement.kind).toBe('completion-observed')
+    expect(messages).toHaveBeenCalledTimes(3)
+    expect(rootFreshness.pendingParentMessageId).toBeNull()
+    expect(rootFreshness.revision).toBe(revisionAfterSse)
+  })
+})
