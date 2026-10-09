@@ -650,6 +650,31 @@ describe('agent/error-format/format', () => {
       expect(JSON.stringify(error)).not.toContain('sk-live-123')
     })
 
+    it('drops a malformed suggestion that falls within the cap', () => {
+      // #given fewer than five suggestions, one of them free text
+      const message = 'Model not found: anthropic/x. Did you mean: a-1, Authorization: Bearer sk-live-123, b-2?'
+
+      // #when classifying it
+      const error = classifyModelNotFoundError({kind: 'session-error', message})
+
+      // #then the free text is filtered out, not just truncated away
+      expect(error?.message).toBe('Model not found: anthropic/x. Did you mean: a-1, b-2?')
+      expect(JSON.stringify(error)).not.toContain('sk-live-123')
+    })
+
+    it('keeps a 128-character suggestion and drops a 129-character one', () => {
+      // #given suggestions at and just over the length limit
+      const atLimit = 'm'.repeat(128)
+      const overLimit = 'n'.repeat(129)
+      const message = `Model not found: anthropic/x. Did you mean: ${atLimit}, ${overLimit}?`
+
+      // #when classifying it
+      const error = classifyModelNotFoundError({kind: 'session-error', message})
+
+      // #then only the suggestion within the limit survives
+      expect(error?.message).toBe(`Model not found: anthropic/x. Did you mean: ${atLimit}?`)
+    })
+
     it('renders the Model Not Found label, cause, and hint in the comment body', () => {
       // #given a classified model-not-found failure
       const error = classifyModelNotFoundError({kind: 'session-error', message: UPSTREAM_MESSAGE})
