@@ -12,6 +12,7 @@ import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
 import {
   classifyContextOverflowError,
+  classifyModelNotFoundError,
   classifyProviderAuthError,
   classifyQuotaError,
   createAgentError,
@@ -435,6 +436,12 @@ function classifyAssistantMessageError(
     classifyContextOverflowError({kind: 'session-error', name}) ??
     classifyQuotaError({kind: 'session-error', status: status ?? undefined, code: code ?? undefined})
   if (terminalError != null) return {error: terminalError, classificationPath: 'structured'}
+
+  const modelNotFoundError = classifyModelNotFoundError({
+    kind: 'session-error',
+    message: getStringProperty(messageError, 'message') ?? getStringProperty(errorData, 'message') ?? undefined,
+  })
+  if (modelNotFoundError != null) return {error: modelNotFoundError, classificationPath: 'fallback'}
 
   const errorStr = normalizeSessionError(messageError)
   if (isLlmFetchError(errorStr))
