@@ -274,7 +274,7 @@ export interface OperatorServerDeps {
    *   - GET  /operator/runs/:runId/questions (read-gated, enumeration)
    * When absent, neither route is registered (opt-in).
    */
-  readonly questionRegistry?: Pick<QuestionRegistry, 'decide' | 'describePendingForRun'>
+  readonly questionRegistry?: Pick<QuestionRegistry, 'decide' | 'describePendingForRun' | 'isClaimed'>
   /**
    * Cancel-run engine dependencies (queue, abort registry, approvals, Discord
    * client, coordination config/identity) for the cancel route's `cancelRun`

@@ -179,6 +179,40 @@ describe('option button', () => {
   })
 })
 
+describe('a claimed question is not reported as settled', () => {
+  it('an option click while another answer is in flight gets the fixed already-claimed copy, not no-longer-pending', async () => {
+    // #given a first answer whose reply is still in flight
+    const {registry, effects, deps} = setup()
+    let release: () => void = () => undefined
+    effects.replyQuestion.mockImplementationOnce(
+      async () =>
+        new Promise<{ok: true}>(resolve => {
+          release = () => resolve({ok: true})
+        }),
+    )
+    register(registry, effects)
+    const first = makeInteraction()
+    const firstDone = handleQuestionInteraction(first.interaction, parsed('fb-q:o:que_1:0'), deps)
+    await flush()
+    expect(effects.replyQuestion).toHaveBeenCalledOnce()
+
+    // #when a second operator clicks an option, and another opens the text modal
+    const second = makeInteraction()
+    await handleQuestionInteraction(second.interaction, parsed('fb-q:o:que_1:1'), deps)
+    const text = makeInteraction()
+    await handleQuestionInteraction(text.interaction, parsed('fb-q:t:que_1'), deps)
+
+    // #then both are told it is already being answered (fixed copy), and no second reply goes out
+    expect(repliedContent(second.editReply)).toBe('Already being answered.')
+    const textReply = text.reply.mock.calls.at(-1)?.[0] as {content?: string} | undefined
+    expect(textReply?.content).toBe('Already being answered.')
+    expect(effects.replyQuestion).toHaveBeenCalledOnce()
+
+    release()
+    await firstDone
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Skip
 // ---------------------------------------------------------------------------

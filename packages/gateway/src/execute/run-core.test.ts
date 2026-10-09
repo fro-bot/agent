@@ -4184,6 +4184,97 @@ describe('runOpenCodeCore', () => {
       expectInactivityTimeout(run.outcome())
     })
 
+    describe('activity does not undo the human-wait or drain pause', () => {
+      it('(a) an owned child text delta while a question is pending does not re-arm the watchdog', async () => {
+        // #given a pending question from an owned child, with a long question deadline
+        const run = startQuestionRun({extraOwned: [CHILD]})
+        await run.emit(questionAskedEvent('que_child', CHILD))
+
+        // #when the child streams text, then everything goes quiet for longer than the window
+        await run.emit(partDeltaWithPartId('still working', 'part-1', CHILD))
+        await vi.advanceTimersByTimeAsync(WINDOW * 3)
+
+        // #then no inactivity-timeout fired, and the question is still pending
+        expect(run.outcome()).toBeUndefined()
+        expect(run.registry.has('que_child')).toBe(true)
+      })
+
+      it('(b) a parallel root tool completion while a question is pending does not re-arm the watchdog', async () => {
+        // #given a pending root question
+        const run = startQuestionRun()
+        await run.emit(questionAskedEvent('que_1'))
+
+        // #when a parallel tool completes on the root, then silence longer than the window
+        await run.emit(partUpdatedToolEvent('bash', 'completed', {input: {command: 'ls'}, title: 'ls'}))
+        await vi.advanceTimersByTimeAsync(WINDOW * 3)
+
+        // #then the run is still alive and the question is still pending
+        expect(run.outcome()).toBeUndefined()
+        expect(run.registry.has('que_1')).toBe(true)
+      })
+
+      it('(c) with two waits held and one settled, activity does not re-arm the watchdog', async () => {
+        // #given a question and an approval outstanding
+        const run = startQuestionRun()
+        await run.emit(questionAskedEvent('que_1'))
+        await run.emit(permissionAskedEvent('per_1'))
+
+        // #when the approval settles, activity arrives, and the run goes quiet past the window
+        await run.emit(permissionRepliedEvent('per_1', 'once'))
+        await run.emit(partDeltaWithPartId('still working', 'part-1'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 3)
+
+        // #then the question still holds the watchdog: no timeout
+        expect(run.outcome()).toBeUndefined()
+        expect(run.registry.has('que_1')).toBe(true)
+      })
+
+      it('(d) after the last wait settles outside drain, activity resets normally and silence still times out', async () => {
+        // #given a question that has settled, re-arming the watchdog with a fresh window
+        const run = startQuestionRun()
+        await run.emit(questionAskedEvent('que_1'))
+        await run.emit(questionRepliedEvent('que_1'))
+
+        // #when activity arrives partway through the window
+        await vi.advanceTimersByTimeAsync(WINDOW - 1_000)
+        await run.emit(partDeltaWithPartId('output', 'part-1'))
+
+        // #then the window restarted from the activity: alive just before it expires...
+        await vi.advanceTimersByTimeAsync(WINDOW - 1_000)
+        expect(run.outcome()).toBeUndefined()
+
+        // #and silence past the window times out as before
+        await vi.advanceTimersByTimeAsync(1_100)
+        await run.done
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('(e) activity while draining does not re-arm the watchdog: no inactivity timeout, no drain-timeout, no cancellation', async () => {
+        // #given a live background child and the root gone idle (drain)
+        const sessionAbort = vi.fn().mockResolvedValue({data: {}, error: null})
+        const ownershipLedger = createOwnershipLedger()
+        const run = startQuestionRun({
+          extraOwned: [CHILD],
+          ownershipLedger,
+          sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}),
+          sessionAbort,
+        })
+        await run.emit(backgroundTaskCompletedEvent(CHILD))
+        await run.emit(sessionIdleEvent('sess-123'))
+        expect(ownershipLedger.isDrainComplete()).toBe(false)
+
+        // #when the child produces text and tool activity, then goes quiet past the window
+        await run.emit(partDeltaWithPartId('child output', 'part-1', CHILD))
+        await run.emit(partUpdatedToolEvent('bash', 'completed', {input: {command: 'ls'}, title: 'ls'}, CHILD))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then the run is still draining: no inactivity-timeout (which would surface as drain-timeout)
+        expect(run.outcome()).toBeUndefined()
+        // #and the owned work was not cancelled
+        expect(sessionAbort).not.toHaveBeenCalled()
+      })
+    })
+
     it('#1736 drain: answering a question mid-drain neither completes the run, re-arms inactivity, nor cancels owned work', async () => {
       // #given a live background child, a pending question from it, and the root gone idle (drain)
       let childLive = true

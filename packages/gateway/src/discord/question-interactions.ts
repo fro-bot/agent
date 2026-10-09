@@ -52,13 +52,22 @@ export interface QuestionInteractionLike extends RepliableInteractionTarget {
 }
 
 export interface QuestionInteractionDeps {
-  readonly questionRegistry: Pick<QuestionRegistry, 'decide' | 'describeRequest'>
+  readonly questionRegistry: Pick<QuestionRegistry, 'decide' | 'describeRequest' | 'isClaimed'>
   /** The same role gate the mention and approval paths use. */
   readonly isAuthorized: (guild: Guild, userId: string, logger: GatewayLogger) => Promise<boolean>
   readonly logger: GatewayLogger
 }
 
 const NOT_PENDING = 'This question is no longer pending.'
+const ALREADY_CLAIMED = 'Already being answered.'
+
+/**
+ * Copy for a request that is not open. A claimed request is not settled: another answer's reply is in
+ * flight and the question reopens if it fails, so it must not read as "no longer pending".
+ */
+function notOpenReply(registry: Pick<QuestionRegistry, 'isClaimed'>, requestID: string): string {
+  return registry.isClaimed(requestID) ? ALREADY_CLAIMED : NOT_PENDING
+}
 
 function invalidReply(reason: string): string {
   switch (reason) {
@@ -99,7 +108,7 @@ function buildDecision(
   if (parsed.action === 'skip') return {kind: 'ready', decision: {kind: 'skip'}}
 
   const request = registry.describeRequest(parsed.requestID)
-  if (request === undefined) return {kind: 'reply', content: NOT_PENDING}
+  if (request === undefined) return {kind: 'reply', content: notOpenReply(registry, parsed.requestID)}
 
   let choice: {readonly options?: readonly number[]; readonly text?: string}
   if (parsed.action === 'option') {
@@ -142,7 +151,11 @@ export async function handleQuestionInteraction(
     if (parsed.action === 'text') {
       const modal = buildQuestionAnswerModal(requestID)
       if (questionRegistry.describeRequest(requestID) === undefined || modal === null) {
-        await replyInteractionAsync(interaction, {content: NOT_PENDING, ephemeral: true}, log)
+        await replyInteractionAsync(
+          interaction,
+          {content: notOpenReply(questionRegistry, requestID), ephemeral: true},
+          log,
+        )
         return
       }
       if (interaction.showModal === undefined) {
@@ -217,7 +230,7 @@ export async function handleQuestionInteraction(
         content = 'This question belongs to another thread.'
         break
       case 'already-claimed':
-        content = 'Already being answered.'
+        content = ALREADY_CLAIMED
         break
       case 'reply-failed':
         content = 'Failed to record the answer, try again.'

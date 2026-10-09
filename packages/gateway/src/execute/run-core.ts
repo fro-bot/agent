@@ -499,12 +499,24 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // preserve the exact prior timing (no timer running during session.create/subscribe).
   inactivityTimer.pause()
 
+  // Watchdog pause state, consulted by `resetInactivity`. `draining` becomes true the first time the root
+  // goes idle with owned work outstanding (see 1c); `outstandingHumanWaits` is the request ids a human
+  // still has to settle (see the human-wait gauge below).
+  let draining = false
+  const outstandingHumanWaits = new Map<string, HumanWaitKind>()
+
   function clearInactivity(): void {
     inactivityTimer.pause()
   }
 
+  // The single re-arm path. The watchdog stays paused while a human is being waited on or while the
+  // run drains owned background work: activity (text, tool completions, owned children, parallel tools)
+  // then must not re-arm it, or a quiet human wait / drain would trip `inactivity-timeout` before the
+  // question deadline or the run's own deadline. Releasing the last human wait outside drain is the one
+  // path that re-arms, and it does so after the wait is deleted, so the guard sees an empty gauge.
   function resetInactivity(): void {
     if (!inactivityArmed) return
+    if (draining === true || outstandingHumanWaits.size > 0) return
     inactivityTimer.reset()
   }
 
@@ -565,7 +577,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // (never a failure) that unblocks the abortable stream once the ledger
   // reports drain-complete, without conflating that with `combinedSignal`
   // (whose abort always means timeout/inactivity/cancel).
-  let draining = false
+  // (`draining` itself is declared with the inactivity timer above: the watchdog consults it.)
   const drainDoneController = new AbortController()
 
   function persistOwnership(): void {
@@ -767,8 +779,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Once the event loop has exited the run no longer owns the watchdog: late releases (an
   // asynchronous skip finishing after the run ended) must not re-arm a timer nobody disposes.
   let humanWaitsClosed = false
-
-  const outstandingHumanWaits = new Map<string, HumanWaitKind>()
 
   function holdHumanWait(requestId: string, kind: HumanWaitKind): void {
     outstandingHumanWaits.set(requestId, kind)

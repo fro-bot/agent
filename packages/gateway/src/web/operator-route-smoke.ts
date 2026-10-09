@@ -124,6 +124,7 @@ function makeStubQuestionRegistry() {
   return {
     decide: async () => ({kind: 'not-found' as const}),
     describePendingForRun: () => [],
+    isClaimed: () => false,
   }
 }
 

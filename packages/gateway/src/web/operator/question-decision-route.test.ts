@@ -492,6 +492,149 @@ describe('POST question decision — settlement states', () => {
     expect(effects.replyQuestion).toHaveBeenCalledOnce()
   })
 
+  it('a second ANSWER while the first reply is in flight → already_claimed; if the first fails the question reopens and a third answer succeeds', async () => {
+    // #given a first answer whose reply stays in flight
+    const registry = makeRegistry()
+    const effects = makeEffects()
+    let failFirst: () => void = () => undefined
+    effects.replyQuestion.mockImplementationOnce(
+      async () =>
+        new Promise<{ok: true}>(resolve => {
+          failFirst = () => resolve({ok: false, error: SECRET} as never)
+        }),
+    )
+    register(registry, effects)
+    const deps = makeDeps(registry)
+    const target = app(deps)
+    const first = post(target, 'que_1', {decision: 'answer', answers: [{options: [0]}]})
+    await vi.waitFor(() => expect(effects.replyQuestion).toHaveBeenCalledOnce())
+
+    // #when a second operator answers while the first is claimed
+    const second = await post(target, 'que_1', {decision: 'answer', answers: [{options: [1]}]})
+
+    // #then it is told the request is claimed, not settled, and no second reply goes out
+    expect(second.status).toBe(200)
+    expect(await second.json()).toEqual({state: 'already_claimed'})
+    expect(effects.replyQuestion).toHaveBeenCalledOnce()
+    expect(deps.auditLogger.info).toHaveBeenCalledWith(
+      expect.objectContaining({kind: 'question.rejected', reason: 'already_claimed'}),
+      'audit: question.rejected',
+    )
+
+    // #when the first reply then fails
+    failFirst()
+    const firstRes = await first
+
+    // #then the first operator sees failed_to_settle and the question is open again
+    expect(await firstRes.json()).toEqual({state: 'failed_to_settle'})
+    expect(registry.describePendingForRun(RUN_ID)).toHaveLength(1)
+
+    // #and a third answer is accepted
+    const third = await post(target, 'que_1', {decision: 'answer', answers: [{options: [1]}]})
+    expect(await third.json()).toEqual({state: 'claimed'})
+    expect(effects.replyQuestion).toHaveBeenCalledTimes(2)
+    expect(effects.replyQuestion).toHaveBeenLastCalledWith('que_1', [['prod']])
+  })
+
+  it('a second answer while the first reply is in flight stays already_claimed when the first reply throws', async () => {
+    // #given a first answer whose reply stays in flight and then throws
+    const registry = makeRegistry()
+    const effects = makeEffects()
+    let throwFirst: () => void = () => undefined
+    effects.replyQuestion.mockImplementationOnce(
+      async () =>
+        new Promise<{ok: true}>((_resolve, reject) => {
+          throwFirst = () => reject(new Error(SECRET))
+        }),
+    )
+    register(registry, effects)
+    const target = app(makeDeps(registry))
+    const first = post(target, 'que_1', {decision: 'answer', answers: [{options: [0]}]})
+    await vi.waitFor(() => expect(effects.replyQuestion).toHaveBeenCalledOnce())
+
+    // #when a second answer arrives, then the first reply throws
+    const second = await post(target, 'que_1', {decision: 'answer', answers: [{options: [1]}]})
+    throwFirst()
+    const firstRes = await first
+
+    // #then the second was told claimed, the first failed_to_settle, and the question is open again
+    expect(await second.json()).toEqual({state: 'already_claimed'})
+    expect(await firstRes.json()).toEqual({state: 'failed_to_settle'})
+    expect(registry.describePendingForRun(RUN_ID)).toHaveLength(1)
+  })
+
+  it('a claimed question of ANOTHER run is indistinguishable from an unknown id (never already_claimed)', async () => {
+    // #given a question of run-other whose reply is in flight (claimed through its own run)
+    const registry = makeRegistry()
+    const effects = makeEffects()
+    let release: () => void = () => undefined
+    effects.replyQuestion.mockImplementationOnce(
+      async () =>
+        new Promise<{ok: true}>(resolve => {
+          release = () => resolve({ok: true})
+        }),
+    )
+    register(registry, effects, {runId: 'run-other', scope: 'run-other'})
+    const claim = registry.decide({
+      requestID: 'que_1',
+      scopeId: 'run-other',
+      runId: 'run-other',
+      decision: {kind: 'skip'},
+      actor: {kind: 'web-operator', githubUserId: 99, login: 'other', sessionCorrelationId: 'sess-other'},
+    })
+    await vi.waitFor(() => expect(effects.replyQuestion).toHaveBeenCalledOnce())
+    const target = app(makeDeps(registry))
+
+    // #when an operator authorized only for run-abc targets it, by answer and by skip, and probes an unknown id
+    const answer = await post(target, 'que_1', {decision: 'answer', answers: [{options: [0]}]})
+    const skip = await post(target, 'que_1', {decision: 'skip'})
+    const unknown = await post(target, 'que_missing', {decision: 'answer', answers: [{options: [0]}]})
+
+    // #then the claim is not revealed: same status and body as an unknown id, and nothing was sent
+    expect(answer.status).toBe(unknown.status)
+    expect(await answer.json()).toEqual(await unknown.json())
+    expect(await skip.json()).toEqual({state: 'already_settled'})
+    expect(effects.replyQuestion).toHaveBeenCalledOnce()
+
+    release()
+    await claim
+  })
+
+  it('a claimed question is still behind the denial gates: a read-only operator gets the no-oracle 404', async () => {
+    // #given a claimed question on the operator's own run
+    const registry = makeRegistry()
+    const effects = makeEffects()
+    let release: () => void = () => undefined
+    effects.replyQuestion.mockImplementationOnce(
+      async () =>
+        new Promise<{ok: true}>(resolve => {
+          release = () => resolve({ok: true})
+        }),
+    )
+    register(registry, effects)
+    const claim = registry.decide({
+      requestID: 'que_1',
+      scopeId: RUN_ID,
+      runId: RUN_ID,
+      decision: {kind: 'skip'},
+      actor: {kind: 'web-operator', githubUserId: 99, login: 'other', sessionCorrelationId: 'sess-other'},
+    })
+    await vi.waitFor(() => expect(effects.replyQuestion).toHaveBeenCalledOnce())
+
+    // #when a read-only operator answers
+    const res = await post(app(makeDeps(registry, {repoAuthzDeps: readOnlyAuthz()})), 'que_1', {
+      decision: 'answer',
+      answers: [{options: [0]}],
+    })
+
+    // #then authz refuses first: the claim state is never revealed
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual(NO_ORACLE)
+
+    release()
+    await claim
+  })
+
   it('a reply failure → 200 failed_to_settle, audit reply_failed, request open again', async () => {
     // #given the reply to OpenCode fails
     const registry = makeRegistry()

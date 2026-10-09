@@ -59,7 +59,7 @@ export interface QuestionDecisionRouteDeps {
   /** Repo authorization dependencies (write-level). */
   readonly repoAuthzDeps: RepoAuthzDeps
   /** Question registry — the sole settlement path. */
-  readonly registry: Pick<QuestionRegistry, 'decide' | 'describePendingForRun'>
+  readonly registry: Pick<QuestionRegistry, 'decide' | 'describePendingForRun' | 'isClaimed'>
   readonly auditLogger: AuditLogger
   readonly logger: OperatorLogger
   readonly now: () => number
@@ -192,6 +192,13 @@ export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRout
         // may have been bounded. A request that is not open for this run has nothing to map.
         const request = deps.registry.describePendingForRun(runId).find(entry => entry.requestID === requestId)
         if (request === undefined) {
+          // A claimed request is absent from the open list but not settled: another submission's reply
+          // is in flight and it reopens if that reply fails. `isClaimed` is scoped to this run, so a
+          // claimed request of another run is still indistinguishable from an unknown id.
+          if (deps.registry.isClaimed(requestId, runId)) {
+            refuse('already_claimed')
+            return c.json({state: 'already_claimed'} satisfies QuestionDecisionResponse, 200)
+          }
           refuse('not_found')
           return c.json({state: 'already_settled'} satisfies QuestionDecisionResponse, 200)
         }

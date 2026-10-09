@@ -181,6 +181,13 @@ export interface QuestionRegistry {
   /** Open (not claimed) questions the given run asked, whatever surface scope they are bound to. */
   readonly describePendingForRun: (runId: string) => readonly PendingQuestionDTO[]
   /**
+   * True when the request is `claimed`: another decision's reply is in flight, so it is neither
+   * actionable now (absent from the `describe*` lists) nor settled (it reopens if that reply fails).
+   * When `runId` is given, a request belonging to another run (or registered without one) is
+   * `false`, the same answer as for an unknown id. Boolean only; does not expose entry contents.
+   */
+  readonly isClaimed: (requestID: string, runId?: string) => boolean
+  /**
    * Answer or skip: scope check, single-winner claim, validation, reply POST.
    * When `runId` is given, the request must belong to that run or the outcome is `not-found`
    * (the same answer as for an unknown id, so a caller cannot probe other runs' requests).
@@ -452,6 +459,12 @@ export function createQuestionRegistry(deps: {
       .map(entry => ({requestID: entry.requestID, questions: entry.payload.questions}))
   }
 
+  function isClaimed(requestID: string, runId?: string): boolean {
+    const entry = getEntry(requestID)
+    if (entry === undefined || entry.state !== 'claimed') return false
+    return runId === undefined || entry.payload.runId === runId
+  }
+
   // -------------------------------------------------------------------------
   // decide
   // -------------------------------------------------------------------------
@@ -566,6 +579,7 @@ export function createQuestionRegistry(deps: {
     describePendingForScope,
     describePendingForRun,
     describeRequest,
+    isClaimed,
     decide,
     confirmEcho,
     disposeRun: async (sessionID, reason) => gate.disposeFamilyRun('question', sessionID, reason),

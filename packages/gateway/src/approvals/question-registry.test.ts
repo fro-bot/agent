@@ -1399,6 +1399,41 @@ describe('run-bound questions', () => {
     await pending
   })
 
+  it('isClaimed is true only for a claimed request, scoped to the asking run when a run id is given', async () => {
+    // #given an open question, then the same question claimed (reply in flight)
+    const {questions} = setup()
+    let release: () => void = () => undefined
+    const effects = makeEffects({
+      replyQuestion: vi.fn(
+        async () =>
+          new Promise<QuestionEffectResult>(resolve => {
+            release = () => resolve(OK)
+          }),
+      ),
+    })
+    questions.register(makeParams({effects, runId: 'run_1'}))
+
+    // #then open and unknown requests are not claimed
+    expect(questions.isClaimed('que_1')).toBe(false)
+    expect(questions.isClaimed('que_unknown')).toBe(false)
+
+    // #when claimed
+    const pending = decideAnswer(questions, [['staging']], {actor: WEB_ACTOR})
+    await flush()
+
+    // #then claimed for its own run (or any run when none is given), but not for another run
+    expect(questions.isClaimed('que_1')).toBe(true)
+    expect(questions.isClaimed('que_1', 'run_1')).toBe(true)
+    expect(questions.isClaimed('que_1', 'run_2')).toBe(false)
+
+    // #and after the reply settles and the echo lands, it is gone
+    release()
+    await pending
+    questions.confirmEcho({kind: 'replied', requestID: 'que_1', sessionID: 'ses_1', answers: [['staging']]})
+    await flush()
+    expect(questions.isClaimed('que_1')).toBe(false)
+  })
+
   it('decide with a run id settles only a request that belongs to that run', async () => {
     // #given a question bound to run_1
     const {questions} = setup()
