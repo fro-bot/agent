@@ -873,17 +873,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       if ((getSessionID(eventPayload) ?? getSessionID(part)) !== sessionId) return
       const notice = parseSyntheticNoticePart(part)
       if (notice === null) {
-        // A root text part seen whole is not on the sink's delivery channel (base appends deltas only).
-        const wholePartId = getStringProperty(part, 'id')
-        const wholePartText = getStringProperty(part, 'text')
-        if (
-          getStringProperty(part, 'type') === 'text' &&
-          getBooleanProperty(part, 'synthetic') !== true &&
-          wholePartId !== null &&
-          wholePartText !== null
-        ) {
-          replyDelivery.recordWholePart(wholePartId, wholePartText)
-        }
         drainCompletion.noteRootActivity()
         return
       }

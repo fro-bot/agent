@@ -1674,22 +1674,27 @@ describe('runOpenCodeCore — drain completion for background work', () => {
 
     it.each([
       [
-        'a part-id delivery that carries trailing whitespace REST trimmed',
+        'a part-id delivery with extra trailing whitespace',
         [textPart('part-r2', 'Follow-up answer.')],
         [textDeltaEvent('Follow-up answer.\n', 'part-r2')],
       ],
       [
-        'a part-id-less delivery that carries trailing whitespace REST trimmed',
+        'a part-id-less delivery with extra trailing whitespace',
         [textPart('part-r2', 'Follow-up answer.')],
         [legacyDelta('Follow-up answer.\n')],
       ],
       [
-        'two parts, each trimmed by REST',
-        [textPart('p1', 'One.'), textPart('p2', 'Two.')],
-        [legacyDelta('One.\n'), legacyDelta('Two.\n')],
+        'two part-id-less parts, extra whitespace only after the final one',
+        [textPart('p1', 'One. '), textPart('p2', 'Two.')],
+        [legacyDelta('One. '), legacyDelta('Two.\n\n')],
       ],
-    ])('%s is equivalent and admits', async (_label, parts, streamed) => {
-      // #given the stream delivered each part with trailing whitespace the persisted text no longer has
+      [
+        'persisted trailing whitespace delivered exactly (part-id)',
+        [textPart('part-r2', 'Follow-up answer.\n')],
+        [textDeltaEvent('Follow-up answer.\n', 'part-r2')],
+      ],
+    ])('%s still admits', async (_label, parts, streamed) => {
+      // #given the stream delivered the complete persisted text, plus at most extra trailing whitespace
       const run = await startFollowUp(parts)
       for (const event of streamed) await run.emit(event)
 
@@ -1699,6 +1704,40 @@ describe('runOpenCodeCore — drain completion for background work', () => {
 
       // #then it is admitted
       expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it.each([
+      [
+        'a part-id-less delivery missing the separator between persisted parts ("One.Two." vs "One. " + "Two.")',
+        [textPart('p1', 'One. '), textPart('p2', 'Two.')],
+        [legacyDelta('One.Two.')],
+      ],
+      [
+        'a part-id-less delivery missing persisted trailing whitespace',
+        [textPart('part-r2', 'Follow-up answer.\n')],
+        [legacyDelta('Follow-up answer.')],
+      ],
+      [
+        'a part-id delivery missing persisted trailing whitespace',
+        [textPart('part-r2', 'Follow-up answer.\n')],
+        [textDeltaEvent('Follow-up answer.', 'part-r2')],
+      ],
+      [
+        'a part-id-less delivery with a foreign separator between parts (only the final part tolerates extra whitespace)',
+        [textPart('p1', 'One.'), textPart('p2', 'Two.')],
+        [legacyDelta('One.\n'), legacyDelta('Two.')],
+      ],
+    ])('%s does not cover the reply', async (_label, parts, streamed) => {
+      // #given the stream delivered less than the complete persisted text (the persisted side is never trimmed)
+      const run = await startFollowUp(parts)
+      for (const event of streamed) await run.emit(event)
+      await run.emit(idleEvent())
+
+      // #when time passes
+      await run.advance(5_000)
+
+      // #then the run is held
+      expect(run.outcome()).toBeUndefined()
     })
 
     it('a part delivered with different text than REST persisted is not equivalent', async () => {
@@ -1714,9 +1753,9 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       expect(run.outcome()).toBeUndefined()
     })
 
-    it('a text part that only ever arrived whole (never on the sink channel) does not stall the run, and is not appended', async () => {
-      // #given base never appends a whole message.part.updated text part; the stream carried this one only that way
-      const run = await startFollowUp([textPart('part-r2', 'Whole-part answer.')])
+    it('lost deltas followed by a surviving whole-part update: not delivery evidence, incomplete at the deadline, nothing appended', async () => {
+      // #given every delta of the reply was lost, but the whole text part still arrived on message.part.updated
+      const run = await startFollowUp([textPart('part-r2', 'Whole-part answer.')], {deadlineMs: 20_000})
       await run.emit({
         type: 'message.part.updated',
         properties: {
@@ -1725,17 +1764,25 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         },
       })
 
-      // #when the root goes idle
+      // #when the root goes idle and time passes up to the deadline
       await run.emit(idleEvent())
+      await run.advance(19_000)
+
+      // #then it cannot be told apart from lost deltas: not admitted, and nothing reached the sink
+      expect(run.outcome()).toBeUndefined()
+      expect(replyOutput(run)).toBe('')
+
+      // #when the deadline passes
+      await run.advance(1_500)
       await run.done
 
-      // #then it is admitted, consistent with base delivery, and the sink was not touched
-      expect(run.outcome()).toEqual({ok: true})
+      // #then it reports incomplete, with no admission-time append
+      expectKind(run.outcome(), 'drain-timeout')
       expect(replyOutput(run)).toBe('')
     })
 
-    it('the whole-part exception does not apply once part-id-less text was delivered (it could be that part)', async () => {
-      // #given a whole-part event for the reply AND a partially delivered part-id-less prefix
+    it('a whole-part update never completes a partially delivered part-id-less reply', async () => {
+      // #given a part-id-less prefix delivered, then the whole part seen on message.part.updated
       const run = await startFollowUp([textPart('part-r2', 'Follow-up answer.')])
       await run.emit(legacyDelta('Follow-up '))
       await run.emit({
@@ -1750,7 +1797,7 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       // #when time passes
       await run.advance(5_000)
 
-      // #then the ambiguity is resolved conservatively: held
+      // #then it is held
       expect(run.outcome()).toBeUndefined()
     })
 
