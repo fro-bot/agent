@@ -13,7 +13,13 @@ export interface MetricsCollector {
   addCommitCreated: (sha: string) => void
   incrementComments: () => void
   setTokenUsage: (usage: TokenUsage, model: string | null, cost: number | null) => void
-  recordError: (type: string, message: string, recoverable: boolean, classificationPath?: ClassificationPath) => void
+  recordError: (
+    type: string,
+    message: string,
+    recoverable: boolean,
+    classificationPath?: ClassificationPath,
+    suggestedAction?: string,
+  ) => void
   getMetrics: () => RunMetrics
 }
 
@@ -90,13 +96,20 @@ export function createMetricsCollector(): MetricsCollector {
       cost = costValue
     },
 
-    recordError(type: string, message: string, recoverable: boolean, classificationPath?: ClassificationPath): void {
+    recordError(
+      type: string,
+      message: string,
+      recoverable: boolean,
+      classificationPath?: ClassificationPath,
+      suggestedAction?: string,
+    ): void {
       const error: ErrorRecord = {
         timestamp: new Date().toISOString(),
         type,
         message,
         recoverable,
         ...(classificationPath == null ? {} : {classificationPath}),
+        ...(suggestedAction == null ? {} : {suggestedAction}),
       }
       errors.push(error)
     },

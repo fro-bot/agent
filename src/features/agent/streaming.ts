@@ -280,8 +280,17 @@ export function classifyRetryStatusError(status: unknown): ErrorInfo | null {
   )
 }
 
+/**
+ * Errors that cannot recover within a run settle on first observation (no poll grace cycles, no retry).
+ * `model_not_found` belongs here: a wrong model id or unreachable catalog is identical on every attempt.
+ */
 function isTerminalProviderError(error: ErrorInfo): boolean {
-  return error.type === 'context_overflow' || error.type === 'quota_exceeded' || error.type === 'provider_auth_error'
+  return (
+    error.type === 'context_overflow' ||
+    error.type === 'quota_exceeded' ||
+    error.type === 'provider_auth_error' ||
+    error.type === 'model_not_found'
+  )
 }
 
 /** True when a thrown stream error reflects a shutdown we asked for, not one the transport handed us. */

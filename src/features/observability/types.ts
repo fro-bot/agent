@@ -7,6 +7,7 @@ export interface ErrorRecord {
   readonly message: string
   readonly recoverable: boolean
   readonly classificationPath?: ClassificationPath
+  readonly suggestedAction?: string
 }
 
 export interface RunMetrics {

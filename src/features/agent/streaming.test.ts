@@ -1273,9 +1273,11 @@ describe('processEventStream — structured failure capture on the activity trac
     expect(result.llmError?.message).toContain('anthropic/claude-sonnet-5-5')
     expect(result.llmError?.message).toContain('claude-sonnet-4-5')
     expect(result.llmError?.message).not.toContain('name=UnknownError')
-    expect(activityTracker.genericError?.type).toBe('model_not_found')
+    // #then it is terminal on first observation, so the poll loop settles without a grace period
+    expect(activityTracker.terminalProviderError?.type).toBe('model_not_found')
+    expect(activityTracker.genericError).toBeUndefined()
 
-    // #then the string the poll loop logs after the grace period carries the cause too
+    // #then the tracker string carries the cause too
     expect(activityTracker.sessionError).toContain('anthropic/claude-sonnet-5-5')
 
     // #then the diagnostic is logged with the model id
