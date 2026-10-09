@@ -93,6 +93,20 @@ export function parseSyntheticNoticePart(part: unknown): TaskNotice | null {
   return text === null ? null : parseTaskNotice(text)
 }
 
+/**
+ * The creation-order key of an upstream message id. Ids come from `MessageID.ascending()`
+ * (`packages/opencode/src/id/id.ts:51-70`): `msg_` + 12 hex digits (48 bits of `Date.now() * 0x1000 + counter`,
+ * the counter incrementing within one millisecond and resetting on a new one) + a random base62 tail. The hex
+ * field is fixed-width and lowercase, so plain string comparison of it is creation order. Null: not such an id
+ * (a client-supplied id, or a test fixture), which orders against nothing.
+ */
+const MESSAGE_ORDER_PATTERN = /^msg_([0-9a-f]{12})/
+
+export function messageOrderKey(messageId: string | null): string | null {
+  if (messageId === null) return null
+  return MESSAGE_ORDER_PATTERN.exec(messageId)?.[1] ?? null
+}
+
 type BoundedResult<T> = {readonly ok: true; readonly value: T} | {readonly ok: false}
 
 /** One persisted synthetic notice part: the child it names, its terminal state, and the message that carries it. */
@@ -100,6 +114,8 @@ interface RestNotice {
   readonly childSessionId: string
   readonly state: 'completed' | 'error'
   readonly key: string
+  /** `info.id` of the carrying user message. */
+  readonly messageId: string
   /** `info.time.created` of the carrying user message, or null when REST did not report one. */
   readonly createdAt: number | null
 }
@@ -109,6 +125,8 @@ interface RestNotice {
  * job on a reused session starts a NEW user prompt, so segments are how a session's history is told apart.
  */
 interface RestSegment {
+  /** `info.id` of the segment's user prompt, or null for an assistant message with no prompt before it. */
+  readonly messageId: string | null
   /** `info.time.created` of the segment's user prompt, or null when REST did not report one. */
   readonly startedAt: number | null
   /** The LAST assistant message of the segment ended `MessageAbortedError`. */
@@ -137,7 +155,7 @@ function readMessages(data: unknown): RestMessageFacts | null {
   // A child session is resumed by sending it a new user prompt, so each dispatch is one run of messages starting at a
   // user prompt. An aborted segment is one whose LAST assistant message ended aborted; an aborted message that a
   // later message in the same segment followed is not a cancellation.
-  const segments: {startedAt: number | null; aborted: boolean}[] = []
+  const segments: {messageId: string | null; startedAt: number | null; aborted: boolean}[] = []
   let latestAssistant: {readonly info: unknown; readonly parts: unknown} | null = null
   for (const message of data as readonly unknown[]) {
     const info = getObjectProperty(message, 'info')
@@ -147,7 +165,7 @@ function readMessages(data: unknown): RestMessageFacts | null {
     const createdAt = getNumberProperty(getObjectProperty(info, 'time'), 'created')
     if (role === 'user') {
       userMessageIds.push(id)
-      segments.push({startedAt: createdAt, aborted: false})
+      segments.push({messageId: id, startedAt: createdAt, aborted: false})
       const parts = getObjectProperty(message, 'parts')
       if (Array.isArray(parts)) {
         for (const [index, part] of (parts as readonly unknown[]).entries()) {
@@ -158,6 +176,7 @@ function readMessages(data: unknown): RestMessageFacts | null {
               childSessionId: notice.childSessionId,
               state: notice.state,
               key: `${id}:${getStringProperty(part, 'id') ?? `index-${index}`}`,
+              messageId: id,
               createdAt,
             })
             noticeMessageIds.add(id)
@@ -168,7 +187,8 @@ function readMessages(data: unknown): RestMessageFacts | null {
       const parts = getObjectProperty(message, 'parts')
       latestAssistant = {info, parts}
       // An assistant message before any user prompt (a truncated history) still belongs to some segment.
-      const segment = segments.at(-1) ?? (segments.push({startedAt: null, aborted: false}), segments.at(-1))
+      const segment =
+        segments.at(-1) ?? (segments.push({messageId: null, startedAt: null, aborted: false}), segments.at(-1))
       if (segment !== undefined) {
         segment.aborted = getStringProperty(getObjectProperty(info, 'error'), 'name') === ABORTED_ERROR_NAME
       }
@@ -291,10 +311,16 @@ export interface DrainCompletion {
   /**
    * A background `task` dispatch reached a child session (see `DispatchKind`). Each `adopted`/`reused` dispatch is a
    * separate upstream job that injects its own notice, and `startedAt` (the tool part's `state.time.start`) opens
-   * the window of child segments and parent notices that belong to this run. The caller dedupes by the dispatch's
+   * the window of child segments and parent notices that belong to this run; `dispatchMessageId` (the tool part's
+   * `messageID`) orders the job against the evidence that can credit it. The caller dedupes by the dispatch's
    * own tool part identity. Call BEFORE anything that can request validation.
    */
-  readonly noteDispatch: (childSessionId: string, kind: DispatchKind, startedAt: number | null) => void
+  readonly noteDispatch: (
+    childSessionId: string,
+    kind: DispatchKind,
+    startedAt: number | null,
+    dispatchMessageId: string | null,
+  ) => void
   /** Root idle stamps the current revision. */
   readonly noteRootIdle: () => void
   /** The run entered drain: validation passes may now run, retried on the interval. */
@@ -304,17 +330,71 @@ export interface DrainCompletion {
   readonly dispose: () => void
 }
 
+/** One upstream background job a run started on a child session. */
+interface DispatchJob {
+  /**
+   * Creation-order key of the assistant message that carried the dispatching `task` tool part. A notice or a child
+   * segment can belong to this job only if it was created AFTER that message. Null: the dispatch reported no
+   * orderable message id, so it cannot be told apart from other jobs (any evidence may credit it).
+   */
+  readonly orderKey: string | null
+}
+
 /** What the gate knows of the dispatches (upstream background jobs) a run made on one child session. */
 interface ChildDispatches {
-  /** Jobs started on the child during this run (extensions are not jobs). */
-  readonly count: number
+  /** Jobs started on the child during this run, in observation order (extensions are not jobs). */
+  readonly jobs: readonly DispatchJob[]
   /**
    * Earliest known start (`state.time.start` of the dispatching tool part) of this run's dispatches. Child segments
-   * and parent notices created before it predate the run. Null: no dispatch reported a time, so no windowing.
+   * and persisted parent notices created before it predate the run. Null: no dispatch reported a time.
    */
   readonly windowStart: number | null
   /** A running job was extended: the child holds user prompts that are not dispatches. */
   readonly extended: boolean
+}
+
+/** A notice the gate has seen for a child. */
+interface ChildNotice {
+  readonly state: TaskNotice['state']
+  readonly orderKey: string | null
+  /** Seen on the live stream (this run by construction) rather than read back from REST. */
+  readonly live: boolean
+  /** REST `time.created` of the carrying message; meaningful only when not `live`. */
+  readonly createdAt: number | null
+}
+
+/** An aborted child segment inside the child's window. */
+interface AbortedSegment {
+  readonly orderKey: string | null
+}
+
+/** Whether evidence created after message `evidenceKey` can belong to `job`. */
+function followsDispatch(job: DispatchJob, evidenceKey: string | null): boolean {
+  if (job.orderKey === null) return true
+  return evidenceKey !== null && evidenceKey > job.orderKey
+}
+
+/**
+ * Whether every job can be given its own distinct resolver (maximum bipartite matching by augmenting paths —
+ * optimal for any eligibility shape, and the sets here hold a handful of items).
+ */
+function everyJobResolved(jobs: readonly DispatchJob[], resolverKeys: readonly (string | null)[]): boolean {
+  const owner = Array.from({length: resolverKeys.length}, () => -1)
+  function assign(jobIndex: number, visited: Set<number>): boolean {
+    const job = jobs[jobIndex]
+    if (job === undefined) return false
+    for (const [resolverIndex, key] of resolverKeys.entries()) {
+      if (visited.has(resolverIndex) || !followsDispatch(job, key)) continue
+      visited.add(resolverIndex)
+      const current = owner[resolverIndex] ?? -1
+      if (current === -1 || assign(current, visited)) {
+        owner[resolverIndex] = jobIndex
+        return true
+      }
+    }
+    return false
+  }
+  return jobs.every((_job, index) => assign(index, new Set<number>()))
 }
 
 export function createDrainCompletion(options: DrainCompletionOptions): DrainCompletion {
@@ -351,14 +431,15 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
   const streamNoticeMessageIds = new Set<string>()
   // The fence is per DISPATCH (one upstream background job), not per child session: a reused session injects one
   // notice per job. See `lacksEvidence` for the exact coverage rule.
-  const noticesByChild = new Map<string, Map<string, TaskNotice['state']>>()
+  const noticesByChild = new Map<string, Map<string, ChildNotice>>()
   const dispatchesByChild = new Map<string, ChildDispatches>()
   // Aborted segments REST last showed inside each child's window (this run's dispatches only).
-  const abortedByChild = new Map<string, number>()
+  const abortedByChild = new Map<string, readonly AbortedSegment[]>()
 
-  function recordNotice(childSessionId: string, key: string, state: TaskNotice['state']): void {
-    const notices = noticesByChild.get(childSessionId) ?? new Map<string, TaskNotice['state']>()
-    notices.set(key, state)
+  function recordNotice(childSessionId: string, key: string, notice: ChildNotice): void {
+    const notices = noticesByChild.get(childSessionId) ?? new Map<string, ChildNotice>()
+    // The stream's copy of a notice wins over its REST copy: same message, and the stream needs no clock.
+    if (notices.get(key)?.live !== true) notices.set(key, notice)
     noticesByChild.set(childSessionId, notices)
   }
 
@@ -371,29 +452,53 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
   }
 
   /**
-   * Whether `childSessionId` still lacks evidence for one of its dispatches (upstream jobs).
+   * Whether `childSessionId` still lacks evidence for one of its dispatches (upstream jobs). Evidence is
+   * correlated to JOBS, never pooled per child:
    *
-   * Notices name only the child (no dispatch id) and a cancelled job injects none, while an abort of a child that
-   * is not cancelled (our own teardown, a user abort) both ends its segment `MessageAbortedError` AND injects an
-   * `error` notice (`tool/task.ts:213-218` fails the job, `:256-264` notifies). One dispatch can therefore show
-   * both signals, and they must earn ONE credit, not two. With D dispatches, N distinct in-window notices
-   * (E of them `error`) and A in-window aborted segments (capped at D):
-   *   - at most min(A, E) notices can belong to aborted segments (a `completed` notice never does: an aborted
-   *     last message fails the job), so the worst case leaves N - min(A, E) notices for the other D - A jobs;
-   *   - covered iff N - min(A, E) >= D - A.
-   * That reduces to: plain notices (N >= D), plain cancels (A >= D), notice on one job + cancel of another
-   * (`completed` notice), and rejects "an aborted+error job plus a job with neither".
-   * A child whose job was EXTENDED ran extra user prompts that belong to no dispatch, so its aborted segments
-   * can no longer be attributed: it earns no cancel credit and waits for notices alone.
+   * - **Ordering.** Every job's dispatching tool part belongs to an assistant message created before the job
+   *   runs; its child segments and its notice are created after it (`MessageID.ascending()` is creation order
+   *   within the server: `id/id.ts:51-70`; assistant message `session/prompt.ts:1187`; child prompt
+   *   `tool/task.ts:203`; notice `tool/task.ts:231-252` → `session/prompt.ts:657`). A notice or an aborted
+   *   segment can credit a job only if its message id is greater than the job's dispatch message id. Evidence
+   *   ordered before every job (the original job of a first-seen extension, an earlier run's notice) is
+   *   surplus and credits nothing. This needs no clock and works on the stream as well as REST, and a notice
+   *   observed before its own dispatch's tool-completion event is still ordered after it.
+   * - **Matching.** Each job needs its own distinct resolver (a notice or an aborted segment that follows its
+   *   dispatch): a maximum bipartite matching must cover every job.
+   * - **Overlap.** A dispatch can show both signals: aborting a child ends its segment `MessageAbortedError` AND
+   *   fails the job, which injects an `error` notice (`tool/task.ts:213-218`, `:256-264`). Notices carry no job
+   *   id, so the two cannot be tied to one job, and a matching alone could spend them on two jobs. The
+   *   aggregate bound stays as a second, necessary condition over the eligible evidence: with D jobs, N
+   *   eligible notices (E `error`) and A eligible aborted segments (capped at D), at most min(A, E) notices can
+   *   belong to aborted segments (a `completed` notice never does), so `N - min(A, E) >= D - A`.
+   * - A job with no orderable dispatch id is credited by any evidence, and for such jobs the bound alone decides
+   *   (the matching reduces to N + A >= D, which the bound implies).
+   * - A child that was EXTENDED holds user prompts that belong to no job, so its aborted segments cannot be
+   *   attributed: it earns no cancel credit and waits for notices alone.
+   * Notices read back from REST must also lie inside the child's time window (an earlier run's parent turns).
    */
   function lacksEvidence(childSessionId: string): boolean {
     const dispatches = dispatchesByChild.get(childSessionId)
-    const required = dispatches?.count ?? 1
-    const notices = noticesByChild.get(childSessionId)
-    const noticed = notices?.size ?? 0
-    const errored = [...(notices?.values() ?? [])].filter(state => state === 'error').length
-    const aborted = dispatches?.extended === true ? 0 : Math.min(abortedByChild.get(childSessionId) ?? 0, required)
-    return noticed - Math.min(aborted, errored) < required - aborted
+    // A tracked child the gate never saw dispatched (restored ownership) owes one notice that any evidence covers.
+    const jobs = dispatches?.jobs ?? [{orderKey: null}]
+    if (jobs.length === 0) return false
+    const notices = [...(noticesByChild.get(childSessionId)?.values() ?? [])].filter(
+      notice => notice.live || inWindow(childSessionId, notice.createdAt),
+    )
+    const eligibleNotices = notices.filter(notice => jobs.some(job => followsDispatch(job, notice.orderKey)))
+    const eligibleAborted =
+      dispatches?.extended === true
+        ? []
+        : (abortedByChild.get(childSessionId) ?? []).filter(segment =>
+            jobs.some(job => followsDispatch(job, segment.orderKey)),
+          )
+    const errored = eligibleNotices.filter(notice => notice.state === 'error').length
+    const aborted = Math.min(eligibleAborted.length, jobs.length)
+    if (eligibleNotices.length - Math.min(aborted, errored) < jobs.length - aborted) return true
+    return !everyJobResolved(jobs, [
+      ...eligibleNotices.map(notice => notice.orderKey),
+      ...eligibleAborted.map(segment => segment.orderKey),
+    ])
   }
 
   function invalidate(): void {
@@ -431,17 +536,31 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     if (messageId === null) invalidate()
     else if (seenUserMessageIds.has(messageId)) invalidate()
     else registerUserMessage(messageId)
-    recordNotice(notice.childSessionId, key, notice.state)
+    recordNotice(notice.childSessionId, key, {
+      state: notice.state,
+      orderKey: messageOrderKey(messageId),
+      live: true,
+      createdAt: null,
+    })
     requestValidation()
   }
 
-  function noteDispatch(childSessionId: string, kind: DispatchKind, startedAt: number | null): void {
+  function noteDispatch(
+    childSessionId: string,
+    kind: DispatchKind,
+    startedAt: number | null,
+    dispatchMessageId: string | null,
+  ): void {
     if (closed) return
     const previous = dispatchesByChild.get(childSessionId)
     // An entry the gate never saw dispatched (restored ownership) still owes the one notice it was adopted for.
     // A child first seen through an extension owes none: its job started outside this run.
     const firstSight = kind === 'adopted' || kind === 'adopted-extension'
-    const base: ChildDispatches = previous ?? {count: firstSight ? 0 : 1, windowStart: null, extended: false}
+    const base: ChildDispatches = previous ?? {
+      jobs: firstSight ? [] : [{orderKey: null}],
+      windowStart: null,
+      extended: false,
+    }
     const windowStart =
       startedAt === null
         ? base.windowStart
@@ -453,7 +572,11 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
       dispatchesByChild.set(childSessionId, {...base, windowStart, extended: true})
       return
     }
-    dispatchesByChild.set(childSessionId, {...base, count: base.count + 1, windowStart})
+    dispatchesByChild.set(childSessionId, {
+      ...base,
+      jobs: [...base.jobs, {orderKey: messageOrderKey(dispatchMessageId)}],
+      windowStart,
+    })
   }
 
   function noteRootIdle(): void {
@@ -534,12 +657,17 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     ])
     if (closed || signal.aborted) return
 
-    // A persisted notice the stream never delivered still counts toward the fence — unless it predates this run's
-    // dispatches of that child (a reused session's earlier jobs notified an earlier run's parent turns).
+    // A persisted notice the stream never delivered still counts toward the fence. It is cached with its creation
+    // time and order key, and judged against the child's CURRENT window and jobs each time (`lacksEvidence`), so a
+    // later dispatch moves the window past notices that were cached earlier.
     if (rootFacts !== null) {
       for (const notice of rootFacts.notices) {
-        if (inWindow(notice.childSessionId, notice.createdAt))
-          recordNotice(notice.childSessionId, notice.key, notice.state)
+        recordNotice(notice.childSessionId, notice.key, {
+          state: notice.state,
+          orderKey: messageOrderKey(notice.messageId),
+          live: false,
+          createdAt: notice.createdAt,
+        })
       }
     }
     // Cancel evidence: positive REST evidence only, and only segments that started within this run's window — a
@@ -549,7 +677,9 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
       if (facts === null || !lacksEvidence(id)) continue
       abortedByChild.set(
         id,
-        facts.segments.filter(segment => segment.aborted && inWindow(id, segment.startedAt)).length,
+        facts.segments
+          .filter(segment => segment.aborted && inWindow(id, segment.startedAt))
+          .map(segment => ({orderKey: messageOrderKey(segment.messageId)})),
       )
     }
 

@@ -323,3 +323,75 @@ describe('createDrainCompletion — a result that arrives after the run ended ne
     )
   })
 })
+
+describe('createDrainCompletion — a notice credits only the job it follows (#1753 probe)', () => {
+  /** An upstream-shaped message id (`id/id.ts:51-70`): larger `n`, created later. */
+  const mid = (n: number): string => `msg_${n.toString(16).padStart(12, '0')}AAAAAAAAAAAAAA`
+
+  const turns = (...notices: readonly number[]) => [
+    {info: {id: 'msg-prompt', role: 'user', sessionID: ROOT}, parts: []},
+    ...notices.map(n => ({
+      info: {id: mid(n), role: 'user', sessionID: ROOT, time: {created: n}},
+      parts: [{id: `prt-${n}`, type: 'text', synthetic: true, text: `<task id="${CHILD}" state="completed">`}],
+    })),
+    {
+      info: {
+        id: 'msg-reply',
+        role: 'assistant',
+        sessionID: ROOT,
+        parentID: mid(notices.at(-1) ?? 0),
+        time: {completed: 1},
+        finish: 'stop',
+      },
+      parts: [],
+    },
+  ]
+
+  it("an extension, the original job's notice, then a new start: not admitted until the new job's own notice arrives", async () => {
+    // #given the first sight of the child is an extension at t=1000 and the original job's notice (t=1500) is seen
+    let transcript = turns(1_500)
+    const {completion, onAdmitted} = setup({messages: async () => ({data: transcript, error: null})})
+    completion.noteDispatch(CHILD, 'adopted-extension', 1_000, mid(1_000))
+    completion.noteNotice({childSessionId: CHILD, state: 'completed'}, mid(1_500), 'prt-1500')
+
+    // #when a genuine new start follows at t=2000 and the gate validates repeatedly
+    completion.noteDispatch(CHILD, 'reused', 2_000, mid(2_000))
+    completion.noteRootIdle()
+    completion.beginDrain()
+    completion.requestValidation()
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 5)
+
+    // #then the surplus notice does not credit the new job
+    expect(onAdmitted).not.toHaveBeenCalled()
+
+    // #when the new job's own notice (t=2500) arrives and the parent answers it
+    transcript = turns(1_500, 2_500)
+    completion.noteNotice({childSessionId: CHILD, state: 'completed'}, mid(2_500), 'prt-2500')
+    completion.noteRootIdle()
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 2)
+
+    // #then it is admitted exactly once
+    expect(onAdmitted).toHaveBeenCalledTimes(1)
+    completion.dispose()
+  })
+
+  it('two notices that both follow only the first job cannot cover two jobs', async () => {
+    // #given jobs dispatched at t=1000 and t=2000, and two notices (t=1500, t=1600) that follow only the first
+    const transcript = turns(1_500, 1_600)
+    const {completion, onAdmitted} = setup({messages: async () => ({data: transcript, error: null})})
+    completion.noteDispatch(CHILD, 'adopted', 1_000, mid(1_000))
+    completion.noteDispatch(CHILD, 'reused', 2_000, mid(2_000))
+    completion.noteNotice({childSessionId: CHILD, state: 'completed'}, mid(1_500), 'prt-1500')
+    completion.noteNotice({childSessionId: CHILD, state: 'completed'}, mid(1_600), 'prt-1600')
+
+    // #when the gate validates repeatedly
+    completion.noteRootIdle()
+    completion.beginDrain()
+    completion.requestValidation()
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 5)
+
+    // #then the count alone (2 notices for 2 jobs) is not enough: the second job has no notice of its own
+    expect(onAdmitted).not.toHaveBeenCalled()
+    completion.dispose()
+  })
+})

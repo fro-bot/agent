@@ -913,7 +913,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   function observeFirstDispatch(part: unknown, toolState: unknown, jobId: string, extension: boolean): void {
     const identity = dispatchIdentity(part)
     if (identity !== null) seenDispatchIdentities.add(identity)
-    drainCompletion?.noteDispatch(jobId, extension ? 'adopted-extension' : 'adopted', dispatchStartedAt(toolState))
+    drainCompletion?.noteDispatch(
+      jobId,
+      extension ? 'adopted-extension' : 'adopted',
+      dispatchStartedAt(toolState),
+      getStringProperty(part, 'messageID'),
+    )
   }
 
   function observeReusedDispatch(part: unknown, toolState: unknown, jobId: string, extension: boolean): void {
@@ -925,7 +930,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     seenDispatchIdentities.add(identity)
     // Register the dispatch BEFORE reopening: the reopen can request a validation. An extension is not a job (no
     // notice) but does add a user prompt to the child, so the gate must know the child's segments are not all jobs.
-    drainCompletion?.noteDispatch(jobId, extension ? 'extension' : 'reused', dispatchStartedAt(toolState))
+    drainCompletion?.noteDispatch(
+      jobId,
+      extension ? 'extension' : 'reused',
+      dispatchStartedAt(toolState),
+      getStringProperty(part, 'messageID'),
+    )
     // A settled entry whose job is in fact running (or restarted) is outstanding again. `unknown` is left alone.
     ledger.reopen(jobId)
     logger.info(

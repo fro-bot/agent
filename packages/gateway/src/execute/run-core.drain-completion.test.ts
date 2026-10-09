@@ -2031,12 +2031,14 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       partID: string,
       kind: 'started' | 'updated' = 'started',
       startedAt?: number,
+      messageID?: string,
     ): object => ({
       type: 'message.part.updated',
       properties: {
         sessionID: ROOT,
         part: {
           ...(partID === '' ? {} : {id: partID}),
+          ...(messageID === undefined ? {} : {messageID}),
           type: 'tool',
           tool: 'task',
           sessionID: ROOT,
@@ -2129,6 +2131,54 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         },
         assistantReply(`msg-reply-${index + 2}`, `msg-n${index + 1}`),
       ]),
+    ]
+
+    /**
+     * An upstream-shaped message id (`id/id.ts:51-70`: `msg_` + 12 hex digits of creation order + a base62 tail) for
+     * the moment `n`: ids with a larger `n` were created later.
+     */
+    const mid = (n: number): string => `msg_${n.toString(16).padStart(12, '0')}AAAAAAAAAAAAAA`
+
+    /** A notice event whose message id is ordered by `n` (the stream's copy of `orderedTurns`' notice). */
+    const orderedNotice = (n: number, state: 'completed' | 'error' = 'completed', childId = CHILD): object =>
+      noticeEvent(childId, {messageID: mid(n), partID: `prt-${n}`, state})
+
+    /** Persisted root turns: the prompt answered, then one notice per `n` (created at `n`), each answered. */
+    const orderedTurns = (...notices: readonly {readonly n: number; readonly state?: 'completed' | 'error'}[]) => [
+      PROMPT,
+      FIRST_REPLY,
+      ...notices.flatMap(notice => [
+        {
+          info: {id: mid(notice.n), role: 'user', sessionID: ROOT, time: {created: notice.n}},
+          parts: [
+            {
+              id: `prt-${notice.n}`,
+              type: 'text',
+              synthetic: true,
+              text: `<task id="${CHILD}" state="${notice.state ?? 'completed'}">`,
+            },
+          ],
+        },
+        assistantReply(`msg-reply-${notice.n}`, mid(notice.n)),
+      ]),
+    ]
+
+    /** A child segment whose user prompt id is ordered by `n`. */
+    const orderedSegment = (n: number, outcome: 'aborted' | 'ok'): readonly object[] => [
+      {info: {id: mid(n), role: 'user', sessionID: CHILD, time: {created: n}}, parts: []},
+      {
+        info: {
+          id: mid(n + 1),
+          role: 'assistant',
+          sessionID: CHILD,
+          parentID: mid(n),
+          time: {created: n + 1, completed: n + 2},
+          ...(outcome === 'aborted'
+            ? {error: {name: 'MessageAbortedError', data: {message: 'Aborted'}}}
+            : {finish: 'stop'}),
+        },
+        parts: [],
+      },
     ]
 
     const stateOf = (run: Run, id: string) =>
@@ -2701,6 +2751,155 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         await run.done
 
         // #then one notice was enough
+        expect(run.outcome()).toEqual({ok: true})
+      })
+    })
+
+    describe('per-job correlation: evidence credits only the job it follows', () => {
+      it("j1. a first-observed extension, the original job's surplus notice (from SSE), then a genuine new start: the new job still needs its own notice", async () => {
+        // #given the first sight of CHILD is an extension (t=1000); the original job's notice (t=1500) is cached from SSE
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500})], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'updated', 1_000, mid(1_000)))
+        run.live.delete(CHILD)
+        await run.emit(orderedNotice(1_500))
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        expect(stateOf(run, CHILD)).toBe('settled')
+
+        // #when a genuine new start follows (t=2000) and its child settles
+        run.live.add(CHILD)
+        await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000, mid(2_000)))
+        expect(stateOf(run, CHILD)).toBe('outstanding')
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        await run.emit(idleEvent())
+        await run.advance(10_000)
+
+        // #then the surplus notice, ordered before the new dispatch, credits nothing: the run waits
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the new job's own notice arrives and the parent answers it
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500}, {n: 2_500})], error: null})
+        await run.emit(orderedNotice(2_500))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then the run completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('j2. the same, with the surplus notice known only from REST', async () => {
+        // #given the original job's notice (t=1500) exists only in the persisted root transcript
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500})], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'updated', 1_000, mid(1_000)))
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        run.live.add(CHILD)
+        await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000, mid(2_000)))
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+
+        // #when the root is idle and REST (read back every second) shows only the surplus notice
+        await run.emit(idleEvent())
+        await run.advance(10_000)
+
+        // #then it credits nothing
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the new job's notice is persisted and the parent answers it
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500}, {n: 2_500})], error: null})
+        await run.advance(1_000)
+        await run.done
+
+        // #then REST alone completes it
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it("j3. an earlier run's notice (ordered before the dispatch) credits nothing, with no time window to help", async () => {
+        // #given a dispatch that reports its message id but no start time, and a persisted notice from before it
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 100})], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'started', undefined, mid(5_000)))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(idleEvent())
+
+        // #when time passes
+        await run.advance(10_000)
+
+        // #then only the id ordering keeps the stale notice from crediting the dispatch
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the dispatch's own notice (after it) is persisted and answered
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 100}, {n: 5_500})], error: null})
+        await run.advance(1_000)
+        await run.done
+
+        // #then it completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('j4. an aborted child segment from before the dispatch (ordered earlier) credits nothing', async () => {
+        // #given a reused child with an old aborted segment (id ordered 100) and the current dispatch (message 5000)
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.child = childHistory(orderedSegment(100, 'aborted'), orderedSegment(5_001, 'ok'))
+        await run.emit(taskPart(CHILD, 'tool-1', 'started', undefined, mid(5_000)))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(idleEvent())
+        await run.advance(10_000)
+
+        // #then the old abort does not cancel the dispatch
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the dispatch's own segment is aborted
+        run.fixture.child = childHistory(orderedSegment(100, 'aborted'), orderedSegment(5_001, 'aborted'))
+        await run.advance(1_000)
+        await run.done
+
+        // #then it is covered by its own cancellation
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it("j5. a notice that reaches the stream before its own dispatch's tool-completion event still credits it", async () => {
+        // #given dispatch 1 (message 1000) settled and noticed (1500); the parent is working on that follow-up
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({data: [...orderedTurns({n: 1_500})], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'started', 1_000, mid(1_000)))
+        run.live.delete(CHILD)
+        await run.emit(orderedNotice(1_500))
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+
+        // #when a fast second job's notice (2500) is observed BEFORE the tool-completion event of the dispatch (2000)
+        // that started it, and REST shows it unanswered
+        run.fixture.root = async () => ({
+          data: [...orderedTurns({n: 1_500}), {info: {id: mid(2_500), role: 'user', sessionID: ROOT}, parts: []}],
+          error: null,
+        })
+        await run.emit(orderedNotice(2_500))
+        await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000, mid(2_000)))
+        await run.emit(idleEvent())
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 10_000)
+
+        // #then not admitted early, and not wedged
+        expect(run.outcome()).toBeUndefined()
+        expect(stateOf(run, CHILD)).toBe('settled')
+
+        // #when the parent answers it
+        // (REST persists the injected message without a parseable notice part: only the stream saw the notice)
+        run.fixture.root = async () => ({
+          data: [
+            ...orderedTurns({n: 1_500}),
+            {info: {id: mid(2_500), role: 'user', sessionID: ROOT}, parts: []},
+            assistantReply('msg-reply-2500', mid(2_500)),
+          ],
+          error: null,
+        })
+        await run.advance(1_000)
+        await run.done
+
+        // #then it completes: the notice was ordered after its own dispatch
         expect(run.outcome()).toEqual({ok: true})
       })
     })
