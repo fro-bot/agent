@@ -10,6 +10,8 @@
  *   6. checkRepoAuthz (allowlist + GitHub repo access)
  *   7. Acquire per-operator stream slot (keyed on numeric githubUserId)
  *   8. Open SSE stream → deliver ready frame (contract version) + first snapshot/reset frame
+ *      On a cache miss the manager may resolve the run from persisted state (read only after
+ *      gates 1–7, so a denied or unauthorized caller never triggers a durable read).
  *
  * Every failure at steps 2–6 returns the identical generic not-found shape.
  * Step 7 failure returns 429 (honest backpressure for an already-authorized operator).
@@ -18,6 +20,7 @@
  */
 
 import type {Socket} from 'node:net'
+import type {RunState} from '@fro-bot/runtime'
 import type {HttpBindings} from '@hono/node-server'
 import type {Context, Hono} from 'hono'
 import type {RunIndex as FullRunIndex} from '../../execute/run-index.js'
@@ -46,6 +49,12 @@ export interface RunStreamRouteDeps {
   readonly sessionStore: SessionStore
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<FullRunIndex, 'lookup'>
+  /**
+   * Durable single-run read (`owner/repo`, runId), used only after all gates pass to resolve a
+   * subscribe-time cache miss (terminal run whose replay entry was evicted or lost to a restart).
+   * Optional — absent keeps the pre-existing cache-miss behavior (`reset: no-snapshot`, stay live).
+   */
+  readonly readRunState?: (repo: string, runId: string) => Promise<RunState | undefined>
   /** Denylist cache for pre-subscribe redaction check. */
   readonly denylistCache: DenylistCache
   /** Bindings lookup for deny-key resolution. */
@@ -439,7 +448,7 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
             .writeSSE({event: 'ready', data: JSON.stringify({contractVersion: OPERATOR_CONTRACT_VERSION})})
             .catch(() => {})
 
-          unsubscribe = deps.manager.subscribe(runId, {
+          const callbacks = {
             onEvent: async (frame: ObservationFrame) => {
               if (cleaned === true) return
               try {
@@ -454,7 +463,17 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
               cleanup(reason)
               resolve()
             },
-          })
+          }
+          const readRunState = deps.readRunState
+          // The repo was resolved server-side at gate 3 and has passed redaction (gate 5) and
+          // authz (gate 6); the optional durable read is therefore strictly post-gate. With no
+          // reader wired the call is the original two-argument subscribe.
+          unsubscribe =
+            readRunState === undefined
+              ? deps.manager.subscribe(runId, callbacks)
+              : deps.manager.subscribe(runId, callbacks, {
+                  readDurableRunState: async () => readRunState(`${owner}/${repo}`, runId),
+                })
 
           // If onClose fired synchronously during subscribe (e.g. 'shutdown'),
           // cleaned is already true — no further setup needed.

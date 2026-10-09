@@ -3055,3 +3055,290 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllMocks()
 })
+
+function makeDeferred<T>(): {promise: Promise<T>; resolve: (value: T) => void} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(res => {
+    resolve = res
+  })
+  return {promise, resolve}
+}
+
+const projectByPhase: ProjectFn = async runState => {
+  const byPhase: Record<string, OperatorRunStatus['status']> = {
+    PENDING: 'queued',
+    EXECUTING: 'running',
+    COMPLETED: 'succeeded',
+    FAILED: 'failed',
+    CANCELLED: 'cancelled',
+  }
+  return makeOperatorRunStatus({
+    runId: runState.run_id,
+    phase: runState.phase,
+    status: byPhase[runState.phase] ?? 'running',
+  })
+}
+
+function subscribeWithDurable(
+  manager: RunObservationManager,
+  read: () => Promise<RunState | undefined>,
+  runId = 'run-001',
+): {frames: ObservationFrame[]; closes: string[]} {
+  const frames: ObservationFrame[] = []
+  const closes: string[] = []
+  manager.subscribe(
+    runId,
+    {
+      onEvent: frame => {
+        frames.push(frame)
+      },
+      onClose: reason => {
+        closes.push(reason)
+      },
+    },
+    {readDurableRunState: read},
+  )
+  return {frames, closes}
+}
+
+// ===========================================================================
+// 24. Durable cache-miss resolution (#1639)
+//
+// A terminal run whose replay entry was evicted (TTL/caps) or lost to a restart is
+// indistinguishable from a live run that has not emitted yet. The caller-supplied durable
+// read resolves it from persisted run state.
+// ===========================================================================
+
+describe('subscribe — durable cache-miss resolution (#1639)', () => {
+  it('delivers the terminal status from persisted state and closes when the replay entry was evicted', async () => {
+    // #given a run that completed and whose replay entry then expired (TTL eviction)
+    const {manager, timers} = makeManager(projectByPhase, {terminalReplayTtlMs: 1_000})
+    manager.observeOutput('run-001', 'the answer', {final: true})
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    timers.advance(1_001)
+    const read = vi.fn(async () => makeRunState({phase: 'COMPLETED'}))
+
+    // #when an operator subscribes with a durable seam
+    const {frames, closes} = subscribeWithDurable(manager, read)
+    await drain()
+
+    // #then the terminal status frame is delivered from persisted state and the stream closes
+    expect(read).toHaveBeenCalledTimes(1)
+    const statusFrames = frames.filter(f => f.type === 'status')
+    expect(statusFrames).toHaveLength(1)
+    expect(statusFrames[0]).toMatchObject({type: 'status', data: {runId: 'run-001', status: 'succeeded'}})
+    expect(closes).toEqual(['terminal'])
+    // #then no output frame is fabricated — durable state carries no output text
+    expect(frames.filter(f => f.type === 'output')).toHaveLength(0)
+
+    manager.shutdown()
+  })
+
+  it('closes with the persisted failed and cancelled outcomes too', async () => {
+    // #given a fresh manager (restart) and persisted failed / cancelled runs
+    const {manager} = makeManager(projectByPhase)
+
+    // #when subscribing to each
+    const failed = subscribeWithDurable(manager, async () => makeRunState({run_id: 'run-f', phase: 'FAILED'}), 'run-f')
+    const cancelled = subscribeWithDurable(
+      manager,
+      async () => makeRunState({run_id: 'run-c', phase: 'CANCELLED'}),
+      'run-c',
+    )
+    await drain()
+
+    // #then each gets its own terminal status and closes
+    expect(failed.frames.find(f => f.type === 'status')).toMatchObject({data: {status: 'failed'}})
+    expect(cancelled.frames.find(f => f.type === 'status')).toMatchObject({data: {status: 'cancelled'}})
+    expect(failed.closes).toEqual(['terminal'])
+    expect(cancelled.closes).toEqual(['terminal'])
+
+    manager.shutdown()
+  })
+
+  it('leaves a live run byte-identical: reset frame, no durable read when a snapshot exists, no close', async () => {
+    // #given a live run with a cached snapshot and another run with no observation yet
+    const {manager} = makeManager(projectByPhase)
+    await manager.observe(makeRunState({run_id: 'run-live', phase: 'EXECUTING'}))
+    const readSnapshotRun = vi.fn(async () => makeRunState({run_id: 'run-live', phase: 'COMPLETED'}))
+    const readNoSnapshotRun = vi.fn(async () => makeRunState({run_id: 'run-new', phase: 'EXECUTING'}))
+
+    // #when subscribing to each with a durable seam, and to a third without one
+    const snapshotSub = subscribeWithDurable(manager, readSnapshotRun, 'run-live')
+    const noSnapshotSub = subscribeWithDurable(manager, readNoSnapshotRun, 'run-new')
+    const plain = collectFrames(manager, 'run-new')
+    await drain()
+
+    // #then the snapshot path never touches durable storage and stays open
+    expect(readSnapshotRun).not.toHaveBeenCalled()
+    expect(snapshotSub.frames).toHaveLength(1)
+    expect(snapshotSub.frames[0]).toMatchObject({type: 'status', data: {status: 'running'}})
+    expect(snapshotSub.closes).toEqual([])
+    // #then a non-terminal durable read leaves the exact frames of a manager with no seam
+    expect(readNoSnapshotRun).toHaveBeenCalledTimes(1)
+    expect(noSnapshotSub.frames).toEqual(plain.frames)
+    expect(noSnapshotSub.frames).toEqual([{type: 'reset', runId: 'run-new', reason: 'no-snapshot'}])
+    expect(noSnapshotSub.closes).toEqual([])
+
+    manager.shutdown()
+  })
+
+  it('stays live when the durable read fails, finds nothing, or returns a mismatched run', async () => {
+    // #given durable reads that throw, find nothing, and return another run's state
+    const {manager} = makeManager(projectByPhase)
+    const thrown = subscribeWithDurable(
+      manager,
+      async () => {
+        throw new Error('s3 down')
+      },
+      'run-a',
+    )
+    const missing = subscribeWithDurable(manager, async () => undefined, 'run-b')
+    const mismatched = subscribeWithDurable(
+      manager,
+      async () => makeRunState({run_id: 'someone-else', phase: 'COMPLETED'}),
+      'run-c',
+    )
+
+    // #when the reads settle
+    await drain()
+
+    // #then every subscriber keeps today's behaviour: one reset frame, no close
+    for (const sub of [thrown, missing, mismatched]) {
+      expect(sub.frames.map(f => f.type)).toEqual(['reset'])
+      expect(sub.closes).toEqual([])
+    }
+
+    manager.shutdown()
+  })
+
+  it('does not close a stream that a live observation has since made live, even if the durable read says terminal', async () => {
+    // #given a no-snapshot subscriber with a slow durable read
+    const {manager} = makeManager(projectByPhase)
+    const deferred = makeDeferred<RunState | undefined>()
+    const {frames, closes} = subscribeWithDurable(manager, async () => deferred.promise)
+
+    // #when a live non-terminal observation lands, then a (contradictory) terminal durable read resolves
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    deferred.resolve(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then the live run wins: running status delivered, no terminal frame, stream still open
+    const statusFrames = frames.filter(f => f.type === 'status')
+    expect(statusFrames).toHaveLength(1)
+    expect(statusFrames[0]).toMatchObject({data: {status: 'running'}})
+    expect(closes).toEqual([])
+
+    manager.shutdown()
+  })
+
+  it('terminalizes when a slow durable read resolves terminal after the subscriber has waited', async () => {
+    // #given a no-snapshot subscriber with a slow durable read
+    const {manager} = makeManager(projectByPhase)
+    const deferred = makeDeferred<RunState | undefined>()
+    const {frames, closes} = subscribeWithDurable(manager, async () => deferred.promise)
+    await drain()
+    expect(closes).toEqual([])
+
+    // #when the read finally resolves terminal
+    deferred.resolve(makeRunState({phase: 'FAILED'}))
+    await drain()
+
+    // #then the terminal status is still delivered and the stream closes
+    expect(frames.find(f => f.type === 'status')).toMatchObject({data: {status: 'failed'}})
+    expect(closes).toEqual(['terminal'])
+
+    manager.shutdown()
+  })
+
+  it('does not duplicate or override the live terminal when it wins the race against the durable read', async () => {
+    // #given a no-snapshot subscriber whose durable read is still in flight
+    const {manager} = makeManager(projectByPhase)
+    const deferred = makeDeferred<RunState | undefined>()
+    const {frames, closes} = subscribeWithDurable(manager, async () => deferred.promise)
+
+    // #when the live terminal observation lands first, then the (now stale) durable read resolves
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+    deferred.resolve(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then exactly one terminal status frame and one close — the live path owns delivery
+    expect(frames.filter(f => f.type === 'status')).toHaveLength(1)
+    expect(closes).toEqual(['terminal'])
+
+    manager.shutdown()
+  })
+
+  it('lets the durable terminal win when the live observation has not arrived, without poisoning the replay cache', async () => {
+    // #given a no-snapshot subscriber resolved from durable state first
+    const {manager} = makeManager(projectByPhase)
+    const first = subscribeWithDurable(manager, async () => makeRunState({phase: 'COMPLETED'}))
+    await drain()
+    expect(first.closes).toEqual(['terminal'])
+
+    // #when the live terminal (with its final output) arrives afterwards
+    manager.observeOutput('run-001', 'late answer', {final: true})
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then the first subscriber saw no second close, and a later subscriber still gets the final output
+    expect(first.closes).toEqual(['terminal'])
+    const late = collectFrames(manager, 'run-001')
+    await drain()
+    expect(late.frames.find(f => f.type === 'output')).toMatchObject({data: {text: 'late answer', final: true}})
+    expect(late.closes).toEqual(['terminal'])
+
+    manager.shutdown()
+  })
+
+  it('reveals nothing for a denied or keyless repo: null projection emits no frame and no close', async () => {
+    // #given the deny gate projects the persisted state to null
+    const projectNull = vi.fn<ProjectFn>(async () => null)
+    const {manager} = makeManager(projectNull)
+
+    // #when a subscriber with a terminal persisted state attaches
+    const {frames, closes} = subscribeWithDurable(manager, async () => makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then the persisted state went through the deny-gated projection and leaked no status frame
+    expect(projectNull).toHaveBeenCalledTimes(1)
+    expect(frames.map(f => f.type)).toEqual(['reset'])
+    expect(closes).toEqual([])
+
+    manager.shutdown()
+  })
+
+  it('does not synthesize after the subscriber unsubscribed or the manager shut down', async () => {
+    // #given two in-flight durable reads
+    const {manager} = makeManager(projectByPhase)
+    const d1 = makeDeferred<RunState | undefined>()
+    const d2 = makeDeferred<RunState | undefined>()
+    const frames1: ObservationFrame[] = []
+    const closes1: string[] = []
+    const unsubscribe = manager.subscribe(
+      'run-001',
+      {
+        onEvent: f => {
+          frames1.push(f)
+        },
+        onClose: r => {
+          closes1.push(r)
+        },
+      },
+      {readDurableRunState: async () => d1.promise},
+    )
+    const second = subscribeWithDurable(manager, async () => d2.promise, 'run-002')
+
+    // #when one unsubscribes and the manager shuts down before the reads resolve
+    unsubscribe()
+    manager.shutdown()
+    d1.resolve(makeRunState({phase: 'COMPLETED'}))
+    d2.resolve(makeRunState({run_id: 'run-002', phase: 'COMPLETED'}))
+    await drain()
+
+    // #then no status frame is produced for either
+    expect(frames1.filter(f => f.type === 'status')).toHaveLength(0)
+    expect(second.frames.filter(f => f.type === 'status')).toHaveLength(0)
+  })
+})

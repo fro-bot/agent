@@ -212,7 +212,7 @@ export interface OperatorServerDeps {
    * launchWork (via launchWorkDeps.runIndex). Optional — omit in tests
    * that don't exercise the run-stream route.
    */
-  readonly runIndex?: Pick<RunIndex, 'lookup' | 'register' | 'listRunsForRepo'>
+  readonly runIndex?: Pick<RunIndex, 'lookup' | 'register' | 'listRunsForRepo'> & Partial<Pick<RunIndex, 'readRun'>>
   /**
    * Shared repo-authz cache for the run-stream route's checkRepoAuthz calls.
    * When absent, a fresh in-memory cache is created per buildOperatorApp call.
@@ -768,6 +768,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     buildRunStreamRoute(app, {
       sessionStore: deps.sessionStore,
       runIndex: deps.runIndex,
+      ...(deps.runIndex.readRun === undefined ? {} : {readRunState: deps.runIndex.readRun.bind(deps.runIndex)}),
       denylistCache: deps.denylistCache,
       bindingsLookup: deps.bindingsLookup,
       repoAuthzDeps: {

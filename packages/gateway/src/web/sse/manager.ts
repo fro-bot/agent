@@ -153,6 +153,18 @@ export interface SubscriberCallbacks {
   readonly onClose: (reason: string) => void
 }
 
+/**
+ * Optional per-subscription seams.
+ *
+ * `readDurableRunState` resolves a subscribe-time cache miss from persisted run state.
+ * It is supplied by the caller (the route), which has already resolved the run's repo
+ * server-side and passed the redaction and authz gates — the manager has no storage or
+ * authorization knowledge of its own. Absent → the cache-miss path is unchanged.
+ */
+export interface SubscribeOptions {
+  readonly readDurableRunState?: () => Promise<RunState | undefined>
+}
+
 // ---------------------------------------------------------------------------
 // Logger interface (minimal — matches GatewayLogger shape)
 // ---------------------------------------------------------------------------
@@ -221,9 +233,18 @@ export interface RunObservationManager {
    * Subscribe to run-status frames for a given runId.
    * If a latest-status cache entry exists, delivers it immediately as the first frame.
    * If none exists, emits a single `reset` frame.
+   *
+   * When `options.readDurableRunState` is supplied and there is no cached snapshot, the
+   * persisted run state is consulted (fail-soft, off the subscribe path — the subscriber is
+   * live and queued before the read starts). A terminal persisted state is
+   * projected through the same deny-gated projection as live observations, delivered as the
+   * terminal status frame, and the subscriber is closed with `terminal`. A live, unknown,
+   * denied, or failed read leaves the subscriber on the ordinary live path.
+   * No terminal output frame is synthesized: durable state carries no output text.
+   *
    * Returns an unsubscribe function for clean disconnect (no onClose called).
    */
-  readonly subscribe: (runId: string, callbacks: SubscriberCallbacks) => () => void
+  readonly subscribe: (runId: string, callbacks: SubscriberCallbacks, options?: SubscribeOptions) => () => void
 
   /**
    * Observe an output text fragment for a run. Observer-only / best-effort.
@@ -894,6 +915,47 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   // ---------------------------------------------------------------------------
 
   /**
+   * Mark one subscriber for graceful terminal drain (see markRunSubscribersForTerminalDrain).
+   * No-op for a subscriber that is already dropped.
+   */
+  function markSubscriberForTerminalDrain(sub: SubscriberState): void {
+    if (sub.dropped === true) {
+      return
+    }
+    sub.closingReason = 'terminal'
+
+    // Cancel the maxDuration and heartbeat timers now that we are in graceful-drain
+    // mode. Without this, a maxDuration timer firing during the drain window would
+    // call dropSubscriber('max-duration'), clearing the queue and reporting the wrong
+    // close reason. The heartbeat callback already early-returns on closingReason===
+    // 'terminal', but cancelling it here is cleaner and avoids the macrotask entirely.
+    if (sub.maxDurationTimer !== undefined) {
+      deps.clearTimeout(sub.maxDurationTimer)
+      sub.maxDurationTimer = undefined
+    }
+    if (sub.heartbeatTimer !== undefined) {
+      deps.clearInterval(sub.heartbeatTimer)
+      sub.heartbeatTimer = undefined
+    }
+
+    // Drain-state invariant:
+    //   queue empty              → finalize immediately (nothing to deliver)
+    //   queue non-empty, writer running  → trust drainQueue to finalize on empty
+    //   queue non-empty, writer NOT running → start the drain so queued frames
+    //                                         are delivered and finalize is called
+    if (sub.queue.length === 0) {
+      finalizeTerminalSubscriber(sub)
+    } else if (sub.writerRunning === false) {
+      // Writer stopped but queue is non-empty — start the drain so the queued
+      // frames (including the terminal status) are delivered before closing.
+      sub.writerRunning = true
+      drainQueue(sub).catch(() => {})
+    }
+    // If writerRunning === true, drainQueue will call finalizeTerminalSubscriber
+    // when the queue empties.
+  }
+
+  /**
    * Mark all subscribers of a run for graceful terminal drain.
    *
    * Unlike closeRunSubscribers (hard abort), this path:
@@ -914,40 +976,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // Snapshot before iterating (finalization modifies the map)
     const snapshot = Array.from(subs.values())
     for (const sub of snapshot) {
-      if (sub.dropped === true) {
-        continue
-      }
-      sub.closingReason = 'terminal'
-
-      // Cancel the maxDuration and heartbeat timers now that we are in graceful-drain
-      // mode. Without this, a maxDuration timer firing during the drain window would
-      // call dropSubscriber('max-duration'), clearing the queue and reporting the wrong
-      // close reason. The heartbeat callback already early-returns on closingReason===
-      // 'terminal', but cancelling it here is cleaner and avoids the macrotask entirely.
-      if (sub.maxDurationTimer !== undefined) {
-        deps.clearTimeout(sub.maxDurationTimer)
-        sub.maxDurationTimer = undefined
-      }
-      if (sub.heartbeatTimer !== undefined) {
-        deps.clearInterval(sub.heartbeatTimer)
-        sub.heartbeatTimer = undefined
-      }
-
-      // Drain-state invariant:
-      //   queue empty              → finalize immediately (nothing to deliver)
-      //   queue non-empty, writer running  → trust drainQueue to finalize on empty
-      //   queue non-empty, writer NOT running → start the drain so queued frames
-      //                                         are delivered and finalize is called
-      if (sub.queue.length === 0) {
-        finalizeTerminalSubscriber(sub)
-      } else if (sub.writerRunning === false) {
-        // Writer stopped but queue is non-empty — start the drain so the queued
-        // frames (including the terminal status) are delivered before closing.
-        sub.writerRunning = true
-        drainQueue(sub).catch(() => {})
-      }
-      // If writerRunning === true, drainQueue will call finalizeTerminalSubscriber
-      // when the queue empties.
+      markSubscriberForTerminalDrain(sub)
     }
   }
 
@@ -1202,10 +1231,84 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   }
 
   // ---------------------------------------------------------------------------
+  // Durable cache-miss resolution
+  // ---------------------------------------------------------------------------
+
+  const DURABLE_TERMINAL_PHASES: ReadonlySet<RunState['phase']> = new Set(['COMPLETED', 'FAILED', 'CANCELLED'])
+
+  /**
+   * True while the subscriber is still on the undecided live path: not dropped or draining,
+   * the manager is up, and no live observation has landed a snapshot for the run since the
+   * cache miss. Re-checked after every await so a live terminal that wins the race — which
+   * drains this subscriber through the ordinary fan-out — is never duplicated or overridden.
+   */
+  function isAwaitingLiveResolution(sub: SubscriberState): boolean {
+    return (
+      isShutdown === false &&
+      sub.dropped === false &&
+      sub.closingReason === undefined &&
+      latestStatusCache.has(sub.runId) === false
+    )
+  }
+
+  /**
+   * Resolve a subscribe-time cache miss from persisted run state.
+   *
+   * Only a terminal persisted state is acted on: it is projected through the same deny-gated
+   * projection as live observations, enqueued as the terminal status frame, and the subscriber
+   * is drained and closed with `terminal`. Everything else (non-terminal, missing, mismatched,
+   * denied/null projection, read failure) leaves the subscriber on the live path,
+   * identical to a manager with no durable read. Nothing is written to a shared cache, so a
+   * live terminal arriving later still builds its own replay entry (with final output) intact.
+   */
+  async function resolveCacheMissFromDurableState(
+    sub: SubscriberState,
+    read: () => Promise<RunState | undefined>,
+  ): Promise<void> {
+    const runId = sub.runId
+
+    let runState: RunState | undefined
+    try {
+      runState = await read()
+    } catch (error) {
+      logger.warn({subId: sub.id, runId, err: String(error)}, 'manager: durable run-state read failed — staying live')
+      return
+    }
+    if (runState === undefined || runState.run_id !== runId || DURABLE_TERMINAL_PHASES.has(runState.phase) === false) {
+      return
+    }
+    if (isAwaitingLiveResolution(sub) === false) {
+      return
+    }
+
+    let projected: OperatorRunStatus | null
+    try {
+      projected = await deps.projectRunObservation(runState)
+    } catch (error) {
+      logger.warn(
+        {subId: sub.id, runId, err: String(error)},
+        'manager: projectRunObservation threw for durable state — staying live',
+      )
+      return
+    }
+    // Null projection (denied/keyless repo) reveals nothing: no frame, no close.
+    if (projected === null || isTerminal(projected.status) === false) {
+      return
+    }
+    if (isAwaitingLiveResolution(sub) === false) {
+      return
+    }
+
+    const statusFrame: StatusFrame = {type: 'status', data: projected}
+    enqueueFrame(sub, statusFrame)
+    markSubscriberForTerminalDrain(sub)
+  }
+
+  // ---------------------------------------------------------------------------
   // subscribe
   // ---------------------------------------------------------------------------
 
-  const subscribe = (runId: string, callbacks: SubscriberCallbacks): (() => void) => {
+  const subscribe = (runId: string, callbacks: SubscriberCallbacks, options?: SubscribeOptions): (() => void) => {
     if (isShutdown === true) {
       // Manager is shut down — immediately close
       try {
@@ -1322,6 +1425,15 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     if (cachedOutput !== undefined) {
       const outputFrame: OutputFrame = {type: 'output', data: cachedOutput}
       enqueueOutputFrame(sub, outputFrame)
+    }
+
+    // Cache miss with a durable seam: the run may be terminal with its replay entry evicted
+    // (TTL/caps) or lost to a restart. Resolve from persisted state in the background; the
+    // reset frame above is already queued, so a live run sees exactly the frames it always did.
+    if (cached === undefined && options?.readDurableRunState !== undefined) {
+      resolveCacheMissFromDurableState(sub, options.readDurableRunState).catch((error: unknown) => {
+        logger.warn({subId: sub.id, runId, err: String(error)}, 'manager: durable cache-miss resolution failed')
+      })
     }
 
     // Return a clean-disconnect function (no onClose called)
