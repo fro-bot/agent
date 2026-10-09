@@ -190,8 +190,8 @@ unrelated errors whose payload happens to contain those tokens.
 
 Root `session.idle` is the success signal only for a run that never adopted background work. Once a
 background dispatch has been adopted, idle (or a settled ledger) is not completion on its own: the run
-completes through the drain-completion gate, which also needs each child's completion notice (or cancel
-evidence), current-generation root idle, and REST corroboration of the parent's follow-up reply. See
+completes through the drain-completion gate, which also needs each dispatch's completion notice (or its own
+cancel evidence), current-generation root idle, and REST corroboration of the parent's follow-up reply. See
 "Drain-completion gate" in [ARCHITECTURE.md](../../../ARCHITECTURE.md).
 
 ```ts
@@ -241,5 +241,5 @@ never let a flush failure hide the real error.
 **Lifecycle** — `AbortSignal.timeout(runTimeoutMs)`; inner finally = heartbeat stop + lock
 release; outer finally = concurrency slot release.
 
-**Stream correctness** — `session.idle` = success for runs with no adopted background work (background-work runs complete through the drain-completion gate, see `ARCHITECTURE.md`); EOF without idle = `stream-ended` (throw);
+**Stream correctness** — `session.idle` = success for runs with no adopted background work (background-work runs complete through the drain-completion gate, which needs a notice or cancel per dispatch rather than per child; see `ARCHITECTURE.md`); EOF without idle = `stream-ended` (throw);
 auth detection by `401/403` status, not message text.

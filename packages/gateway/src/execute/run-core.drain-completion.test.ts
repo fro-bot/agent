@@ -2026,12 +2026,17 @@ describe('runOpenCodeCore — drain completion for background work', () => {
     // job under the same id (core :213-214 refuses only a running one), notifies (:317) and renders "started".
 
     /** A completed background `task` tool part, with the part identity that tells one dispatch from a replay. */
-    const taskPart = (jobId: string, partID: string, kind: 'started' | 'updated' = 'started'): object => ({
+    const taskPart = (
+      jobId: string,
+      partID: string,
+      kind: 'started' | 'updated' = 'started',
+      startedAt?: number,
+    ): object => ({
       type: 'message.part.updated',
       properties: {
         sessionID: ROOT,
         part: {
-          id: partID,
+          ...(partID === '' ? {} : {id: partID}),
           type: 'tool',
           tool: 'task',
           sessionID: ROOT,
@@ -2040,14 +2045,58 @@ describe('runOpenCodeCore — drain completion for background work', () => {
             title: 'background task',
             output: `<task id="${jobId}" state="running">\n<summary>Background task ${kind}</summary>\n</task>`,
             metadata: {background: true, jobId},
+            // Upstream stamps `time.start` when the call turns `running`, before the tool executes (processor.ts).
+            ...(startedAt === undefined ? {} : {time: {start: startedAt, end: startedAt + 1}}),
           },
         },
       },
     })
 
+    /** A dispatch identified only by its `callID` (no part id). */
+    const callIdPart = (jobId: string, callID: string, startedAt: number): object => {
+      const event = taskPart(jobId, '', 'started', startedAt) as {
+        properties: {part: Record<string, unknown>}
+      }
+      event.properties.part.callID = callID
+      return event
+    }
+
+    /**
+     * One dispatch segment of a child session as REST persists it: a user prompt created at `createdAt` and the
+     * assistant message answering it, which ended aborted (a cancel) or normally.
+     */
+    const childSegment = (
+      n: number,
+      createdAt: number,
+      outcome: 'aborted' | 'ok',
+      childId = CHILD,
+    ): readonly object[] => [
+      {info: {id: `c-u${n}`, role: 'user', sessionID: childId, time: {created: createdAt}}, parts: []},
+      {
+        info: {
+          id: `c-a${n}`,
+          role: 'assistant',
+          sessionID: childId,
+          parentID: `c-u${n}`,
+          time: {created: createdAt + 1, completed: createdAt + 2},
+          ...(outcome === 'aborted'
+            ? {error: {name: 'MessageAbortedError', data: {message: 'Aborted'}}}
+            : {finish: 'stop'}),
+        },
+        parts: [],
+      },
+    ]
+
+    const childHistory =
+      (...segments: readonly (readonly object[])[]) =>
+      async (id: string) => ({
+        data: id === CHILD ? segments.flat() : [],
+        error: null,
+      })
+
     /** The notice for dispatch `n`, with the same message/part ids the persisted copy carries. */
-    const noticeN = (n: number, childId = CHILD): object =>
-      noticeEvent(childId, {messageID: `msg-n${n}`, partID: `msg-n${n}-part-0`})
+    const noticeN = (n: number, childId = CHILD, state: 'completed' | 'error' = 'completed'): object =>
+      noticeEvent(childId, {messageID: `msg-n${n}`, partID: `msg-n${n}-part-0`, state})
 
     /** Persisted root turns: the prompt answered, then `n` injected notices for CHILD, each answered. */
     const turnsWithNotices = (n: number): readonly object[] => [
@@ -2057,6 +2106,29 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         userMessage(`msg-n${index + 1}`, [{id: CHILD}]),
         assistantReply(`msg-reply-${index + 2}`, `msg-n${index + 1}`),
       ]).flat(),
+    ]
+
+    /**
+     * Persisted root turns as a real server reports them: the prompt answered, then one injected notice per entry
+     * (naming CHILD, with its state and creation time), each answered. Ids match `noticeN`.
+     */
+    const timedTurns = (...notices: readonly {readonly state: 'completed' | 'error'; readonly createdAt: number}[]) => [
+      PROMPT,
+      FIRST_REPLY,
+      ...notices.flatMap((notice, index) => [
+        {
+          info: {id: `msg-n${index + 1}`, role: 'user', sessionID: ROOT, time: {created: notice.createdAt}},
+          parts: [
+            {
+              id: `msg-n${index + 1}-part-0`,
+              type: 'text',
+              synthetic: true,
+              text: `<task id="${CHILD}" state="${notice.state}">`,
+            },
+          ],
+        },
+        assistantReply(`msg-reply-${index + 2}`, `msg-n${index + 1}`),
+      ]),
     ]
 
     const stateOf = (run: Run, id: string) =>
@@ -2292,6 +2364,267 @@ describe('runOpenCodeCore — drain completion for background work', () => {
 
       // #then it cannot be told from a replay, so the settled entry stays settled
       expect(stateOf(run, CHILD)).toBe('settled')
+    })
+
+    /** Two dispatches on CHILD while it runs; the child then stops and the root is idle and answered. */
+    async function twoDispatchesSettled(history: ReturnType<typeof childHistory>, root: readonly object[]) {
+      const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+      run.fixture.child = history
+      run.fixture.root = async () => ({data: [...root], error: null})
+      await run.emit(taskPart(CHILD, 'tool-1', 'started', 1_000))
+      await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000))
+      await run.emit(idleEvent())
+      run.live.delete(CHILD)
+      await run.emit(idleEvent())
+      await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+      expect(stateOf(run, CHILD)).toBe('settled')
+      return run
+    }
+
+    describe("per-dispatch correlation: one credit per dispatch, only this run's evidence", () => {
+      it('r1. a dispatch with both an error notice and an aborted segment does not cover a second dispatch with neither', async () => {
+        // #given dispatch 1 aborted (our teardown) AND injected an error notice; dispatch 2 has neither yet
+        const run = await twoDispatchesSettled(
+          childHistory(childSegment(1, 1_001, 'aborted'), childSegment(2, 2_001, 'ok')),
+          timedTurns({state: 'error', createdAt: 1_500}),
+        )
+        await run.emit(noticeN(1, CHILD, 'error'))
+        await run.emit(idleEvent())
+
+        // #when time passes
+        await run.advance(10_000)
+
+        // #then one dispatch's two signals earned one credit: the run stays pending
+        expect(run.outcome()).toBeUndefined()
+
+        // #when dispatch 2 gets its own notice and the parent answers it
+        run.fixture.root = async () => ({
+          data: [...timedTurns({state: 'error', createdAt: 1_500}, {state: 'completed', createdAt: 2_500})],
+          error: null,
+        })
+        await run.emit(noticeN(2))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then the run completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('r1b. the same pending run completes when dispatch 2 is itself cancelled', async () => {
+        // #given the R1 state
+        const run = await twoDispatchesSettled(
+          childHistory(childSegment(1, 1_001, 'aborted'), childSegment(2, 2_001, 'ok')),
+          timedTurns({state: 'error', createdAt: 1_500}),
+        )
+        await run.emit(noticeN(1, CHILD, 'error'))
+        await run.emit(idleEvent())
+        await run.advance(10_000)
+        expect(run.outcome()).toBeUndefined()
+
+        // #when REST shows dispatch 2's segment aborted too
+        run.fixture.child = childHistory(childSegment(1, 1_001, 'aborted'), childSegment(2, 2_001, 'aborted'))
+        await run.advance(1_000)
+        await run.done
+
+        // #then both dispatches have evidence of their own
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('r2. a reused child whose pre-existing history holds an aborted segment is not covered by it', async () => {
+        // #given a child resumed by this run's dispatch (starts at 5000); an aborted segment from before the run
+        // (created at 100) and this dispatch's own segment, which ended normally
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.child = childHistory(childSegment(0, 100, 'aborted'), childSegment(1, 5_001, 'ok'))
+        await run.emit(taskPart(CHILD, 'tool-1', 'started', 5_000))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(idleEvent())
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        expect(stateOf(run, CHILD)).toBe('settled')
+
+        // #when its notice has not arrived
+        await run.advance(10_000)
+
+        // #then the historical abort does not stand in for it
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the notice arrives and the parent's reply to it is delivered
+        run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+        await run.emit(noticeN(1))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then the run completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it("r2b. a persisted notice from before this run (an earlier run's parent turn) is not this dispatch's notice", async () => {
+        // #given the root session already holds a notice for CHILD from an earlier run (created at 100)
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({
+          data: [
+            PROMPT,
+            FIRST_REPLY,
+            {
+              ...userMessage('msg-n1', [{id: CHILD}]),
+              info: {id: 'msg-n1', role: 'user', sessionID: ROOT, time: {created: 100}},
+            },
+            assistantReply('msg-reply-2', 'msg-n1'),
+          ],
+          error: null,
+        })
+        await run.emit(taskPart(CHILD, 'tool-1', 'started', 5_000))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(idleEvent())
+
+        // #when time passes
+        await run.advance(10_000)
+
+        // #then the stale notice does not cover the new dispatch
+        expect(run.outcome()).toBeUndefined()
+      })
+
+      it('r3. a cancelled job and a noticed job on one child are both covered', async () => {
+        // #given dispatch 1 cancelled (aborted, no notice) and dispatch 2 completed with its own notice
+        const run = await twoDispatchesSettled(
+          childHistory(childSegment(1, 1_001, 'aborted'), childSegment(2, 2_001, 'ok')),
+          timedTurns({state: 'completed', createdAt: 2_500}),
+        )
+
+        // #when the completed notice arrives and the parent answers it
+        await run.emit(noticeN(1, CHILD, 'completed'))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then the run completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('r4. an extension adds a child segment but no job: one notice still suffices', async () => {
+        // #given one job extended once (the extension's prompt is a second child segment, with no notice of its own)
+        const run = startRun({deadlineMs: 60_000, live: [CHILD]})
+        run.fixture.child = childHistory(childSegment(1, 1_001, 'ok'), childSegment(2, 1_501, 'ok'))
+        run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'started', 1_000))
+        await run.emit(taskPart(CHILD, 'tool-2', 'updated', 1_500))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(noticeN(1))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then it completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it("r4b. an extended child's aborted segment earns no cancel credit toward a later job", async () => {
+        // #given job 1 (extended; its first segment aborted, the extension's fine) noticed `completed`, then job 2
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.child = childHistory(
+          childSegment(1, 1_001, 'aborted'),
+          childSegment(2, 1_501, 'ok'),
+          childSegment(3, 3_001, 'ok'),
+        )
+        run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'started', 1_000))
+        await run.emit(taskPart(CHILD, 'tool-2', 'updated', 1_500))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(noticeN(1))
+        run.live.add(CHILD)
+        await run.emit(taskPart(CHILD, 'tool-3', 'started', 3_000))
+        run.live.delete(CHILD)
+        await run.emit(idleEvent())
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 10_000)
+
+        // #then job 2 has no notice and the extended child's abort cannot stand in for it
+        expect(run.outcome()).toBeUndefined()
+
+        // #when job 2's notice arrives and is answered
+        run.fixture.root = async () => ({data: [...turnsWithNotices(2)], error: null})
+        await run.emit(noticeN(2))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then it completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it("p2. the second dispatch's notice arriving before its own tool-completion event neither wedges nor admits early", async () => {
+        // #given dispatch 1 settled and noticed; the parent is working on that follow-up
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+        await run.emit(taskPart(CHILD, 'tool-1', 'started', 1_000))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(noticeN(1))
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+
+        // #when a fast second job's notice reaches the stream BEFORE the tool-completion event that dispatched it,
+        // and REST shows that notice not yet answered
+        run.fixture.root = async () => ({
+          data: [...turnsWithNotices(1), userMessage('msg-n2', [{id: CHILD}])],
+          error: null,
+        })
+        await run.emit(noticeN(2))
+        await run.emit(taskPart(CHILD, 'tool-2', 'started', 2_000))
+        await run.emit(idleEvent())
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 10_000)
+
+        // #then not admitted early (the parent has not answered), and the entry is not wedged outstanding
+        expect(run.outcome()).toBeUndefined()
+        expect(stateOf(run, CHILD)).toBe('settled')
+
+        // #when the parent answers the notice
+        run.fixture.root = async () => ({data: [...turnsWithNotices(2)], error: null})
+        await run.advance(1_000)
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then it completes
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('p3. a dispatch identified only by callID reopens once; a replay of it adds no expected notice', async () => {
+        // #given a callID-only dispatch that settled and was noticed
+        const run = startRun({deadlineMs: 120_000, live: [CHILD]})
+        run.fixture.root = async () => ({data: [...turnsWithNotices(1)], error: null})
+        await run.emit(callIdPart(CHILD, 'call-1', 1_000))
+        await run.emit(idleEvent())
+        run.live.delete(CHILD)
+        await run.emit(noticeN(1))
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        expect(stateOf(run, CHILD)).toBe('settled')
+
+        // #when a new callID dispatches the same child again
+        run.live.add(CHILD)
+        await run.emit(callIdPart(CHILD, 'call-2', 2_000))
+
+        // #then it reopens the entry
+        expect(stateOf(run, CHILD)).toBe('outstanding')
+
+        // #when it settles, and the same callID is replayed
+        run.live.delete(CHILD)
+        await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS + 1_000)
+        expect(stateOf(run, CHILD)).toBe('settled')
+        await run.emit(callIdPart(CHILD, 'call-2', 2_000))
+        await run.emit(idleEvent())
+        await run.advance(10_000)
+
+        // #then the replay reopened nothing, and the run waits for the second dispatch's notice
+        expect(stateOf(run, CHILD)).toBe('settled')
+        expect(run.outcome()).toBeUndefined()
+
+        // #when exactly one more notice arrives and is answered
+        run.fixture.root = async () => ({data: [...turnsWithNotices(2)], error: null})
+        await run.emit(noticeN(2))
+        await run.emit(idleEvent())
+        await run.done
+
+        // #then two dispatches needed two notices — the replay added no third
+        expect(run.outcome()).toEqual({ok: true})
+      })
     })
 
     it('8. reopening an entry reports a change, so persistence hears about it; no-ops stay silent', () => {

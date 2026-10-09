@@ -379,6 +379,21 @@ export function wrapLedgerWithHooks(
   }
 }
 
+function getNumberProperty(value: unknown, property: string): number | null {
+  if (value == null || typeof value !== 'object') return null
+  const descriptor = Object.getOwnPropertyDescriptor(value, property)
+  return typeof descriptor?.value === 'number' ? descriptor.value : null
+}
+
+/**
+ * When the dispatching tool call started (`state.time.start`, stamped when the call turned `running`, before the
+ * tool executes — `session/processor.ts` tool-call handling). The child's prompt for the dispatch is created inside
+ * `execute`, so every child segment of this dispatch is created at or after it.
+ */
+function dispatchStartedAt(toolState: unknown): number | null {
+  return getNumberProperty(getObjectProperty(toolState, 'time'), 'start')
+}
+
 function dispatchIdentity(part: unknown): string | null {
   return getStringProperty(part, 'id') ?? getStringProperty(part, 'callID')
 }
@@ -892,9 +907,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // identified by its own tool part, so a duplicated or replayed completion event is not a second dispatch.
   const seenDispatchIdentities = new Set<string>()
 
-  function rememberDispatchIdentity(part: unknown): void {
+  function observeFirstDispatch(part: unknown, toolState: unknown, jobId: string): void {
     const identity = dispatchIdentity(part)
     if (identity !== null) seenDispatchIdentities.add(identity)
+    drainCompletion?.noteDispatch(jobId, 'adopted', dispatchStartedAt(toolState))
   }
 
   function observeReusedDispatch(part: unknown, toolState: unknown, jobId: string): void {
@@ -905,8 +921,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     if (identity === null || seenDispatchIdentities.has(identity)) return
     seenDispatchIdentities.add(identity)
     const extension = isExtensionOfRunningJob(toolState)
-    // Register the extra expected notice BEFORE reopening: the reopen can request a validation.
-    if (!extension) drainCompletion?.noteDispatch(jobId)
+    // Register the dispatch BEFORE reopening: the reopen can request a validation. An extension is not a job (no
+    // notice) but does add a user prompt to the child, so the gate must know the child's segments are not all jobs.
+    drainCompletion?.noteDispatch(jobId, extension ? 'extension' : 'reused', dispatchStartedAt(toolState))
     // A settled entry whose job is in fact running (or restarted) is outstanding again. `unknown` is left alone.
     ledger.reopen(jobId)
     logger.info(
@@ -1060,7 +1077,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                   if (wasTracked) {
                     observeReusedDispatch(part, toolState, jobId)
                   } else {
-                    rememberDispatchIdentity(part)
+                    observeFirstDispatch(part, toolState, jobId)
                   }
                   logger.info(
                     {sessionId, jobId, label},
