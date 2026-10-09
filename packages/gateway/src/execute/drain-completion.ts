@@ -97,13 +97,25 @@ interface RestMessageFacts {
   readonly latestUserMessageId: string | null
   /** Children named by a synthetic notice part on any persisted user message. */
   readonly noticeChildren: ReadonlySet<string>
+  /** Ids of the persisted user messages that carry a synthetic notice part. */
+  readonly noticeMessageIds: ReadonlySet<string>
   readonly latestAssistant: {readonly info: unknown; readonly parts: unknown} | null
+  /** Every persisted assistant message, in order, with the user message it answers. */
+  readonly assistantMessages: readonly {readonly parentId: string | null; readonly parts: unknown}[]
+}
+
+/** A reply text part as REST persisted it — what the stream should have delivered to the sink. */
+export interface ReplyTextPart {
+  readonly id: string
+  readonly text: string
 }
 
 function readMessages(data: unknown): RestMessageFacts | null {
   if (!Array.isArray(data)) return null
   const userMessageIds: string[] = []
   const noticeChildren = new Set<string>()
+  const noticeMessageIds = new Set<string>()
+  const assistantMessages: {readonly parentId: string | null; readonly parts: unknown}[] = []
   let latestAssistant: {readonly info: unknown; readonly parts: unknown} | null = null
   for (const message of data as readonly unknown[]) {
     const info = getObjectProperty(message, 'info')
@@ -116,18 +128,25 @@ function readMessages(data: unknown): RestMessageFacts | null {
       if (Array.isArray(parts)) {
         for (const part of parts as readonly unknown[]) {
           const notice = parseSyntheticNoticePart(part)
-          if (notice !== null) noticeChildren.add(notice.childSessionId)
+          if (notice !== null) {
+            noticeChildren.add(notice.childSessionId)
+            noticeMessageIds.add(id)
+          }
         }
       }
     } else if (role === 'assistant') {
-      latestAssistant = {info, parts: getObjectProperty(message, 'parts')}
+      const parts = getObjectProperty(message, 'parts')
+      latestAssistant = {info, parts}
+      assistantMessages.push({parentId: getStringProperty(info, 'parentID'), parts})
     }
   }
   return {
     userMessageIds,
     latestUserMessageId: userMessageIds.at(-1) ?? null,
     noticeChildren,
+    noticeMessageIds,
     latestAssistant,
+    assistantMessages,
   }
 }
 
@@ -170,6 +189,33 @@ function endedAborted(facts: RestMessageFacts): boolean {
   return getStringProperty(getObjectProperty(facts.latestAssistant.info, 'error'), 'name') === ABORTED_ERROR_NAME
 }
 
+/**
+ * Text parts of the assistant messages that answer a follow-up turn: a user message carrying a synthetic notice
+ * (persisted or seen on the stream) or the latest root user message. Earlier turns' output is not this gate's
+ * business. Synthetic parts (the harness talking to the agent) and `ignored` parts are never reply text.
+ */
+function followUpReplyText(
+  facts: RestMessageFacts,
+  latestUserId: string,
+  streamNoticeMessageIds: ReadonlySet<string>,
+): readonly ReplyTextPart[] {
+  const followUpParents = new Set<string>([latestUserId, ...facts.noticeMessageIds, ...streamNoticeMessageIds])
+  const result: ReplyTextPart[] = []
+  for (const message of facts.assistantMessages) {
+    if (message.parentId === null || !followUpParents.has(message.parentId)) continue
+    if (!Array.isArray(message.parts)) continue
+    for (const part of message.parts as readonly unknown[]) {
+      if (getStringProperty(part, 'type') !== 'text') continue
+      if (getBooleanProperty(part, 'synthetic') === true || getBooleanProperty(part, 'ignored') === true) continue
+      const id = getStringProperty(part, 'id')
+      const text = getStringProperty(part, 'text')
+      if (id === null || text === null || text.length === 0) continue
+      result.push({id, text})
+    }
+  }
+  return result
+}
+
 export interface DrainCompletionOptions {
   readonly client: OpenCodeServerHandle['client']
   readonly directory: string
@@ -182,6 +228,13 @@ export interface DrainCompletionOptions {
   readonly logger: GatewayLogger
   /** Called at most once, only for an admitted completion. */
   readonly onAdmitted: () => void
+  /**
+   * Called synchronously at admission, before `onAdmitted`, with the follow-up turns' reply text parts as REST
+   * persisted them (in message order, synthetic notice text excluded). The caller owns the reply sink and knows
+   * what the stream already delivered: it appends only what is missing. REST can admit completion when follow-up
+   * stream events were missed or delayed; without this the final reply would silently omit that text.
+   */
+  readonly deliverReplyText?: (parts: readonly ReplyTextPart[]) => void
   readonly validationIntervalMs?: number
   readonly requestTimeoutMs?: number
 }
@@ -215,6 +268,7 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     signal,
     logger,
     onAdmitted,
+    deliverReplyText,
     validationIntervalMs = DRAIN_VALIDATION_INTERVAL_MS,
     requestTimeoutMs = DRAIN_REQUEST_TIMEOUT_MS,
   } = options
@@ -236,6 +290,7 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
   const seenUserMessageIds = new Set<string>()
   const seenNoticeKeys = new Set<string>()
   const noticedChildren = new Set<string>()
+  const streamNoticeMessageIds = new Set<string>()
   const cancelExempt = new Set<string>()
 
   function invalidate(): void {
@@ -268,6 +323,7 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
         : `child:${notice.childSessionId}:${notice.state}`
     if (seenNoticeKeys.has(key)) return
     seenNoticeKeys.add(key)
+    if (messageId !== null) streamNoticeMessageIds.add(messageId)
     // Register the injected turn as pending first: nothing can test completion between these statements.
     if (messageId === null) invalidate()
     else if (seenUserMessageIds.has(messageId)) invalidate()
@@ -390,6 +446,18 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     if (revision !== requestedRevision) return reject('revision-drift')
     if (idleRevision === null || idleRevision !== revision) return reject('idle-evidence-stale')
     if (!ledger.isDrainComplete()) return reject('ledger-not-drained')
+
+    // Output the stream missed must reach the sink before the run can complete.
+    if (deliverReplyText !== undefined) {
+      try {
+        deliverReplyText(followUpReplyText(rootFacts, latestUserId, streamNoticeMessageIds))
+      } catch (error) {
+        logger.warn(
+          {sessionId: rootSessionId, detail: error instanceof Error ? error.message : String(error)},
+          'run-core: delivering recovered follow-up reply text failed — completing without it',
+        )
+      }
+    }
 
     closed = true
     onAdmitted()

@@ -586,15 +586,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // (`draining` itself is declared with the inactivity timer above: the watchdog consults it.)
   const drainDoneController = new AbortController()
 
-  function persistOwnership(): void {
-    if (ownershipLedger === undefined) return
-    const ownedSessionIds = ownershipLedger
-      .snapshot()
-      .filter(entry => entry.state !== 'settled')
-      .map(entry => entry.sessionId)
-    onOwnershipChange?.({rootSessionId: sessionId, ownedSessionIds})
-  }
-
   // A ledger mutation only asks the drain-completion gate to validate; it never completes the drain
   // itself. A settled ledger means every child is non-live, which upstream does BEFORE it injects the
   // parent's follow-up turn (see `drain-completion.ts`), so the ledger alone is not completion. Human
@@ -603,6 +594,64 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // only mean an owned background child, which is already a ledger entry.
   // Assigned once the reconcile adapter exists (below); stays undefined for a run with no ledger.
   let drainCompletion: DrainCompletion | undefined
+
+  // What the stream actually delivered to the sink, kept so that REST-admitted completion can add exactly the
+  // follow-up reply text the stream missed. Keyed by text part id; a delta with no part id cannot be attributed,
+  // so those are recorded in aggregate and make recovery conservative (see `recoverUndeliveredReplyText`).
+  const deliveredTextByPart = new Map<string, string>()
+  let unattributedDelivered = ''
+
+  function recordDelivered(partId: string | null, text: string): void {
+    if (drainCompletion === undefined) return
+    if (partId === null) {
+      unattributedDelivered += text
+    } else {
+      deliveredTextByPart.set(partId, (deliveredTextByPart.get(partId) ?? '') + text)
+    }
+  }
+
+  // Append, in order and exactly once, the reply text REST shows that the stream did not deliver. The sink is
+  // append-only, so a part that streamed partially gets only its undelivered suffix, and only when what streamed
+  // is a prefix of what REST persisted; a part whose streamed text diverges from the persisted text (anything but
+  // a prefix) is left alone rather than risk delivering it twice.
+  function recoverUndeliveredReplyText(parts: readonly {readonly id: string; readonly text: string}[]): void {
+    for (const part of parts) {
+      const delivered = deliveredTextByPart.get(part.id)
+      let missing: string
+      if (delivered === undefined) {
+        // Never seen by part id. If the stream also delivered text it could not attribute, only treat this part
+        // as missing when that text does not already contain it.
+        missing = unattributedDelivered.length > 0 && unattributedDelivered.includes(part.text) ? '' : part.text
+      } else if (part.text.startsWith(delivered)) {
+        missing = part.text.slice(delivered.length)
+      } else {
+        // Fully delivered (REST trimmed trailing whitespace the stream carried), or diverged: do not re-send.
+        missing = ''
+        if (!delivered.startsWith(part.text)) {
+          logger.warn(
+            {sessionId, partId: part.id},
+            'run-core: streamed reply text diverges from the persisted text — not re-sending it',
+          )
+        }
+      }
+      if (missing.length === 0) continue
+      sink.append(missing)
+      deliveredTextByPart.set(part.id, (delivered ?? '') + missing)
+      logger.info(
+        {sessionId, partId: part.id, recoveredChars: missing.length, partial: delivered !== undefined},
+        'run-core: appended follow-up reply text the stream did not deliver',
+      )
+    }
+  }
+
+  function persistOwnership(): void {
+    if (ownershipLedger === undefined) return
+    const ownedSessionIds = ownershipLedger
+      .snapshot()
+      .filter(entry => entry.state !== 'settled')
+      .map(entry => entry.sessionId)
+    onOwnershipChange?.({rootSessionId: sessionId, ownedSessionIds})
+  }
 
   const ledger: OwnershipLedger | undefined =
     ownershipLedger === undefined
@@ -646,6 +695,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       adapter: reconcileAdapter,
       signal: combinedSignal,
       logger,
+      deliverReplyText: recoverUndeliveredReplyText,
       // The only path that completes a drain: an admitted validation unblocks the stream.
       onAdmitted: () => drainDoneController.abort(),
     })
@@ -662,8 +712,17 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // still alive and writing. If settlement cannot be confirmed within its bound, the
   // SAME kind and message re-throw with `quarantined: true` (never a different kind —
   // quarantine is additional evidence, not a replacement explanation).
+  //
+  // Follow-up window: a run that adopted background work keeps draining after its children settle, because
+  // upstream then injects a follow-up turn on the ROOT, which may be writing to the checkout again. A failure
+  // there (cancel, deadline, a dropped stream) must not take the settled-ledger fast path: the root is aborted
+  // and confirmed quiescent first (`confirmRootQuiescent`), inside the same teardown budget, and an unconfirmed
+  // root is quarantined exactly like an unconfirmed child. Runs that never adopted background work are never
+  // `draining`, so they keep the original fast path.
   async function throwWithBarrier(kind: RunCoreErrorKind, message: string): Promise<never> {
-    if (ledger === undefined || ledger.isDrainComplete() === true) {
+    const rootFollowUpOpen =
+      drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false
+    if (ledger === undefined || (ledger.isDrainComplete() === true && rootFollowUpOpen === false)) {
       throw new RunCoreError(kind, message)
     }
     const settlement = await settleOwnedSessions({
@@ -672,6 +731,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       rootSessionId: sessionId,
       ledger,
       logger,
+      ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
     })
     if (settlement.settled === true) {
       throw new RunCoreError(kind, message)
@@ -914,9 +974,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             const deltaText = getStringProperty(delta, 'text')
             if (deltaType === 'text' && deltaText != null) {
               sink.append(deltaText)
+              recordDelivered(deltaPartId, deltaText)
               markActivity()
             } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
               sink.append(delta)
+              recordDelivered(deltaPartId, delta)
               markActivity()
             }
           }
@@ -930,6 +992,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
           if (deltaText != null) {
             sink.append(deltaText)
+            recordDelivered(null, deltaText)
             markActivity()
           }
         }

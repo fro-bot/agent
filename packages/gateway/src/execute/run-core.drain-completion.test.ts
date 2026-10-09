@@ -257,6 +257,12 @@ const completedTurns = (...children: readonly string[]): readonly object[] => [
 /** Only the original prompt, answered: nothing about any background child has been injected yet. */
 const quietTurns: readonly object[] = [PROMPT, FIRST_REPLY]
 
+/** A request that never settles. */
+const hangForever = async (): Promise<never> =>
+  new Promise<never>(() => {
+    /* never settles */
+  })
+
 const abortedAssistant = {
   info: {
     id: 'c-a1',
@@ -282,6 +288,8 @@ interface RunOptions {
   readonly children?: readonly string[]
   readonly withQuestions?: boolean
   readonly noLedger?: boolean
+  /** `client.session.abort` implementation (the root and child teardown). Default: resolves OK immediately. */
+  readonly sessionAbort?: (args: unknown) => Promise<unknown>
   readonly onBusy?: (busy: boolean) => void
 }
 
@@ -296,7 +304,7 @@ function startRun(options: RunOptions = {}) {
 
   const live = new Set<string>(options.live ?? [])
   const ownershipLedger = options.noLedger === true ? undefined : (options.ownershipLedger ?? createOwnershipLedger())
-  const sessionAbort = vi.fn().mockResolvedValue({data: {}, error: null})
+  const sessionAbort = vi.fn().mockImplementation(options.sessionAbort ?? (async () => ({data: {}, error: null})))
   const onActivity = vi.fn()
   const onBusy = vi.fn(options.onBusy)
 
@@ -455,6 +463,28 @@ async function expectNothingLeftBehind(run: Run, held: Deferred<unknown>) {
   await vi.advanceTimersByTimeAsync(5_000)
   expect(run.outcome()?.ok).toBe(false)
   expect(vi.getTimerCount()).toBe(0)
+}
+
+/** A fully answered follow-up whose reply carries `parts`; the notice reaches the stream, the reply text may not. */
+async function recover(parts: readonly object[], streamed: readonly object[] = [], earlierReply: object = FIRST_REPLY) {
+  const run = startRun({deadlineMs: 60_000})
+  run.fixture.root = async () => ({
+    data: [
+      PROMPT,
+      earlierReply,
+      userMessage('msg-n1', [{id: CHILD}]),
+      assistantReply('msg-reply-2', 'msg-n1', {parts}),
+    ],
+    error: null,
+  })
+  await run.emit(dispatchEvent(CHILD))
+  await run.emit(noticeEvent(CHILD))
+  for (const event of streamed) await run.emit(event)
+  await run.emit(idleEvent())
+  await run.done
+  expect(run.outcome()).toEqual({ok: true})
+  // the dispatch's own tool-summary line is not reply text
+  return run.sink.appended.join('').replace('\nbackground task\n', '')
 }
 
 afterEach(() => {
@@ -952,9 +982,12 @@ describe('runOpenCodeCore — drain completion for background work', () => {
     await run.advance(2_000)
     await run.done
 
-    // #then the existing incomplete classification is reported, and the settled child is not re-cancelled
+    // #then the existing incomplete classification is reported; the settled child is not re-cancelled, but the
+    // root (which may be running a follow-up turn) is aborted and confirmed quiescent first
     expectKind(run.outcome(), 'drain-timeout')
-    expect(run.sessionAbort).not.toHaveBeenCalled()
+    expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
+    expect(run.sessionAbort).toHaveBeenCalledTimes(1)
+    expect(run.sessionAbort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
   })
 
   describe('11. root REST corroboration and bounded requests', () => {
@@ -1309,5 +1342,423 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       expectKind(run.outcome(), 'session-error')
       await expectNothingLeftBehind(run, held)
     })
+  })
+
+  describe('16. failure teardown covers the parent follow-up turn', () => {
+    const DEADLINE_MS = 10_000
+
+    /** Children settled, the notice delivered, and the parent's follow-up turn running (root live, no reply yet). */
+    async function inFollowUp(options: RunOptions = {}) {
+      const run = startRun({deadlineMs: DEADLINE_MS, ...options})
+      run.fixture.root = async () => ({
+        data: [PROMPT, FIRST_REPLY, userMessage('msg-n1', [{id: CHILD}])],
+        error: null,
+      })
+      await adoptAndGoIdle(run, CHILD)
+      await run.emit(noticeEvent(CHILD))
+      await run.emit(statusEvent('busy'))
+      run.live.add(ROOT)
+      expect(run.ownershipLedger?.isDrainComplete()).toBe(true)
+      return run
+    }
+
+    it.each([
+      ['the deadline expires', async (run: Run) => run.advance(DEADLINE_MS + 50)],
+      [
+        'the operator cancels',
+        async (run: Run) => {
+          run.controller.abort()
+          await run.advance(50)
+        },
+      ],
+    ])(
+      '%s while the parent runs its follow-up: the root is aborted and confirmed quiescent before the run rejects',
+      async (_label, interrupt) => {
+        // #given the follow-up turn running, a root abort that takes ~700ms to actually stop it
+        const order: string[] = []
+        const run = await inFollowUp({
+          sessionAbort: async () => {
+            order.push('abort-root')
+            setTimeout(() => run.live.delete(ROOT), 700)
+            return {data: {}, error: null}
+          },
+        })
+        const healthyStatus = run.fixture.status
+        run.fixture.status = async () => {
+          const result = await healthyStatus()
+          if (order.includes('abort-root') && !run.live.has(ROOT)) order.push('confirmed-quiescent')
+          return result
+        }
+        run.done.then(
+          () => order.push('rejected'),
+          () => order.push('rejected'),
+        )
+
+        // #when the run is interrupted
+        await interrupt(run)
+        await run.advance(400)
+
+        // #then the root was told to stop (scoped to the run's directory) but the run has not yet released anything
+        expect(run.sessionAbort).toHaveBeenCalledWith(
+          expect.objectContaining({path: {id: ROOT}, query: {directory: DIRECTORY}}),
+        )
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the root stops
+        await run.advance(1_200)
+        await run.done
+
+        // #then the run rejected only after quiescence was confirmed, with the existing classification, unquarantined
+        expectKind(run.outcome(), 'drain-timeout')
+        expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
+        expect(order).toEqual(['abort-root', 'confirmed-quiescent', 'rejected'])
+        expect(run.sessionAbort).not.toHaveBeenCalledWith(expect.objectContaining({path: {id: CHILD}}))
+      },
+    )
+
+    it.each([
+      ['the root never stops running', {sessionAbort: async () => ({data: {}, error: null})}, (_run: Run) => undefined],
+      [
+        'the abort call rejects and the root keeps running',
+        {
+          sessionAbort: async () => {
+            throw new Error('server down')
+          },
+        },
+        (_run: Run) => undefined,
+      ],
+      [
+        'the abort call returns an error envelope and the root keeps running',
+        {sessionAbort: async () => ({data: undefined, error: {message: 'nope'}})},
+        (_run: Run) => undefined,
+      ],
+      [
+        'the abort call hangs',
+        {sessionAbort: async () => hangForever()},
+        (run: Run) => {
+          run.live.delete(ROOT)
+        },
+      ],
+      [
+        'the confirmation lookup keeps failing',
+        {sessionAbort: async () => ({data: {}, error: null})},
+        (run: Run) => {
+          run.fixture.status = async () => ({data: undefined, error: {message: 'boom'}})
+        },
+      ],
+      [
+        'the confirmation lookup hangs',
+        {sessionAbort: async () => ({data: {}, error: null})},
+        (run: Run) => {
+          run.fixture.status = async () => hangForever()
+        },
+      ],
+    ])('%s: the barrier is bounded and the run is quarantined', async (_label, options, sabotage) => {
+      // #given the follow-up turn running and the teardown sabotaged
+      const run = await inFollowUp(options)
+      sabotage(run)
+
+      // #when the deadline expires
+      await run.advance(DEADLINE_MS + 50)
+
+      // #then it is still inside the teardown bound — nothing released yet
+      await run.advance(14_000)
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the bound passes
+      await run.advance(1_500)
+      await run.done
+
+      // #then the run is quarantined with the original classification, and nothing keeps polling
+      expectKind(run.outcome(), 'drain-timeout')
+      expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(true)
+      await run.advance(2_000)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('a failed abort is not a quarantine when the root is nonetheless confirmed quiescent', async () => {
+      // #given the follow-up turn already over from the server's point of view, and an abort that errors
+      const run = await inFollowUp({sessionAbort: async () => ({data: undefined, error: {message: 'nope'}})})
+      run.live.delete(ROOT)
+
+      // #when the deadline expires
+      await run.advance(DEADLINE_MS + 600)
+      await run.done
+
+      // #then the confirmation, not the abort receipt, is the authority
+      expectKind(run.outcome(), 'drain-timeout')
+      expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
+    })
+  })
+
+  describe('17. runs that never adopted background work are unchanged on cancel and deadline', () => {
+    it.each([
+      ['no ledger', 'deadline', {noLedger: true}],
+      ['no ledger', 'cancel', {noLedger: true}],
+      ['an empty ledger', 'deadline', {}],
+      ['an empty ledger', 'cancel', {}],
+    ])(
+      '%s, %s: no root abort, no liveness or messages lookups, original classification',
+      async (_label, how, options) => {
+        // #given a run with nothing adopted, mid-execution
+        const run = startRun({deadlineMs: 10_000, ...options})
+        await run.emit(textDeltaEvent('working…'))
+
+        // #when it is cancelled or its deadline expires
+        if (how === 'deadline') await run.advance(10_100)
+        else {
+          run.controller.abort()
+          await run.advance(50)
+        }
+        await run.done
+
+        // #then the pre-existing classification, unquarantined, and the SDK was touched exactly as before
+        expectKind(run.outcome(), 'timeout')
+        expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
+        expect(run.client.session.create).toHaveBeenCalledTimes(1)
+        expect(run.client.session.promptAsync).toHaveBeenCalledTimes(1)
+        expect(run.client.event.subscribe).toHaveBeenCalledTimes(1)
+        expect(run.client.session.abort).not.toHaveBeenCalled()
+        expect(run.client.session.status).not.toHaveBeenCalled()
+        expect(run.client.session.children).not.toHaveBeenCalled()
+        expect(run.client.session.messages).not.toHaveBeenCalled()
+      },
+    )
+  })
+
+  describe('18. REST-admitted completion delivers the follow-up reply text the stream missed', () => {
+    const textPart = (id: string, text: string, extra: object = {}) => ({id, type: 'text', text, ...extra})
+
+    const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1
+
+    it('text the stream never delivered is appended exactly once', async () => {
+      // #given REST holds the follow-up reply text, and the stream delivered none of it
+      // #when completion is admitted over REST
+      const output = await recover([textPart('part-r2', 'Follow-up answer.')])
+
+      // #then it reaches the sink once
+      expect(output).toBe('Follow-up answer.')
+    })
+
+    it('a part that streamed partially gets only its undelivered suffix', async () => {
+      // #given the stream delivered the start of the part, then went quiet
+      // #when completion is admitted over REST
+      const output = await recover(
+        [textPart('part-r2', 'Follow-up answer.')],
+        [textDeltaEvent('Follow-up ', 'part-r2')],
+      )
+
+      // #then the sink holds the whole text once, not the prefix twice
+      expect(output).toBe('Follow-up answer.')
+      expect(occurrences(output, 'Follow-up')).toBe(1)
+    })
+
+    it('a part that streamed completely is not delivered again', async () => {
+      // #given the whole part streamed
+      // #when completion is admitted over REST
+      const output = await recover(
+        [textPart('part-r2', 'Follow-up answer.')],
+        [textDeltaEvent('Follow-up ', 'part-r2'), textDeltaEvent('answer.', 'part-r2')],
+      )
+
+      // #then it is in the sink exactly once
+      expect(output).toBe('Follow-up answer.')
+    })
+
+    it('rEST trimming trailing whitespace the stream carried does not cause a re-send', async () => {
+      // #given the stream delivered a trailing newline that the persisted text no longer has
+      // #when completion is admitted over REST
+      const output = await recover(
+        [textPart('part-r2', 'Follow-up answer.')],
+        [textDeltaEvent('Follow-up answer.\n', 'part-r2')],
+      )
+
+      // #then nothing is added
+      expect(output).toBe('Follow-up answer.\n')
+    })
+
+    it('several parts: missing ones are appended in order, streamed ones are not repeated', async () => {
+      // #given the stream delivered only the second of three parts
+      // #when completion is admitted over REST
+      const output = await recover(
+        [textPart('p1', 'One. '), textPart('p2', 'Two. '), textPart('p3', 'Three.')],
+        [textDeltaEvent('Two. ', 'p2')],
+      )
+
+      // #then the sink has the streamed part first (as it arrived), then the missing ones in order
+      expect(output).toBe('Two. One. Three.')
+      expect(occurrences(output, 'Two.')).toBe(1)
+    })
+
+    it('a streamed prefix that diverges from the persisted text is left alone, not re-sent', async () => {
+      // #given the stream and REST disagree about the part's text
+      // #when completion is admitted over REST
+      const output = await recover(
+        [textPart('part-r2', 'Final wording.')],
+        [textDeltaEvent('Draft wording.', 'part-r2')],
+      )
+
+      // #then nothing is added on top of what already streamed
+      expect(output).toBe('Draft wording.')
+    })
+
+    it('text the stream delivered without a part id is not duplicated', async () => {
+      // #given the stream delivered the reply through the legacy delta shape, which carries no part id
+      // #when completion is admitted over REST
+      const output = await recover(
+        [textPart('part-r2', 'Follow-up answer.')],
+        [{type: 'session.next.text.delta', properties: {sessionID: ROOT, delta: 'Follow-up answer.'}}],
+      )
+
+      // #then it is in the sink exactly once
+      expect(output).toBe('Follow-up answer.')
+    })
+
+    it('synthetic text and earlier turns are never delivered', async () => {
+      // #given a synthetic assistant part, an earlier turn's unstreamed reply, and the notice text on its user message
+      // #when completion is admitted over REST
+      const output = await recover(
+        [
+          textPart('part-synth', '<task id="sess-child-1" state="completed">', {synthetic: true}),
+          textPart('part-ignored', 'ignored text', {ignored: true}),
+          textPart('part-r2', 'Real answer.'),
+        ],
+        [],
+        assistantReply('msg-reply-1', 'msg-prompt', {
+          parts: [{id: 'part-first', type: 'text', text: 'Earlier turn text.'}],
+        }),
+      )
+
+      // #then only the real follow-up text reaches the sink (the earlier turn's own output is not this gate's business)
+      expect(output).toBe('Real answer.')
+    })
+  })
+
+  describe('19. in-flight validation is invalidated by each root activity trigger on its own', () => {
+    const rootMessageUpdated = (): object => ({
+      type: 'message.updated',
+      properties: {info: {id: 'msg-x', role: 'assistant', sessionID: ROOT}},
+    })
+
+    /** A validation held in flight with fully admissible data; `trigger` then fires, a fresh idle stamps, and the response lands. */
+    async function raceTrigger(trigger: object) {
+      const run = startRun()
+      const first = deferred<unknown>()
+      const second = deferred<unknown>()
+      const full = {data: [...completedTurns(CHILD)], error: null}
+      let calls = 0
+      run.fixture.root = async () => {
+        calls += 1
+        if (calls === 1) return first.promise
+        if (calls === 2) return second.promise
+        return full
+      }
+      await run.emit(dispatchEvent(CHILD))
+      await run.emit(noticeEvent(CHILD))
+      await run.emit(idleEvent())
+      expect(calls).toBe(1)
+      await run.emit(trigger)
+      await run.emit(idleEvent())
+      first.resolve(full)
+      await vi.advanceTimersByTimeAsync(1)
+      return {run, second, full, calls: () => calls}
+    }
+
+    it.each([
+      ['root message.updated (assistant)', rootMessageUpdated()],
+      ['root session.status retry', statusEvent('retry')],
+      ['root session.status busy', statusEvent('busy')],
+      ['root session.next.text.delta', {type: 'session.next.text.delta', properties: {sessionID: ROOT, delta: 'x'}}],
+      [
+        'root session.next.tool.called',
+        {type: 'session.next.tool.called', properties: {sessionID: ROOT, callID: 'c1', tool: 'bash', input: {}}},
+      ],
+      [
+        'root session.next.tool.success',
+        {type: 'session.next.tool.success', properties: {sessionID: ROOT, callID: 'c-unknown'}},
+      ],
+      ['root message.part.delta', textDeltaEvent('x', 'part-live')],
+      ['root tool part update', toolCompletedEvent()],
+    ])('%s invalidates the validation that was in flight', async (_label, trigger) => {
+      // #given a validation in flight when the trigger and a fresh idle arrive, then its (stale) response
+      const {run, second, full, calls} = await raceTrigger(trigger)
+
+      // #then that response is discarded: not admitted, and a fresh validation was requested
+      expect(run.outcome()).toBeUndefined()
+      expect(calls()).toBe(2)
+
+      // #when the fresh validation answers
+      second.resolve(full)
+      await run.done
+
+      // #then the run completes only now
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it.each([
+      [
+        'a descendant message.updated',
+        {type: 'message.updated', properties: {info: {id: 'msg-c', role: 'assistant', sessionID: CHILD}}},
+      ],
+      ['a descendant busy status', statusEvent('busy', CHILD)],
+      ['a descendant text delta', textDeltaEvent('child output', 'part-child', CHILD)],
+      ['a root idle status (not a busy/retry)', statusEvent('idle')],
+    ])('%s does not invalidate it', async (_label, event) => {
+      // #given a validation in flight when only non-root-activity events arrive
+      const {run} = await raceTrigger(event)
+      await run.done
+
+      // #then the first response was admissible and admitted
+      expect(run.outcome()).toEqual({ok: true})
+    })
+  })
+
+  describe('20. things that are not notices never count toward the fence', () => {
+    const noticeText = '<task id="sess-child-1" state="completed">\n<summary>done</summary>\n</task>'
+    const runningText = '<task id="sess-child-1" state="running">\n<summary>started</summary>\n</task>'
+    const messagePart = (part: object): object => ({
+      type: 'message.part.updated',
+      properties: {sessionID: ROOT, part: {id: 'part-n1', messageID: 'msg-n1', sessionID: ROOT, ...part}},
+    })
+
+    it.each([
+      ['non-synthetic text containing the marker', {type: 'text', text: noticeText}],
+      ['non-synthetic text with synthetic explicitly false', {type: 'text', synthetic: false, text: noticeText}],
+      ['a running-state task tag', {type: 'text', synthetic: true, text: runningText}],
+      ['a non-text part carrying the marker', {type: 'reasoning', synthetic: true, text: noticeText}],
+      ['a tool part carrying the marker', {type: 'tool', synthetic: true, text: noticeText}],
+    ])(
+      '%s: no notice is recorded, on the stream or over REST, so the run waits for the deadline',
+      async (_label, part) => {
+        // #given a settled child whose only "notice" candidates are the negatives, on the stream AND persisted,
+        // with a latest user message that is answered and a root that is not live
+        const run = startRun({deadlineMs: 20_000})
+        run.fixture.root = async () => ({
+          data: [
+            PROMPT,
+            FIRST_REPLY,
+            {info: {id: 'msg-n1', role: 'user', sessionID: ROOT}, parts: [{id: 'part-n1', ...part}]},
+            assistantReply('msg-reply-2', 'msg-n1'),
+          ],
+          error: null,
+        })
+
+        // #when the stream delivers it and the root goes idle
+        await run.emit(dispatchEvent(CHILD))
+        await run.emit(messagePart(part))
+        await run.emit(idleEvent())
+        await run.advance(19_000)
+
+        // #then it is still waiting: the fence was never satisfied
+        expect(run.outcome()).toBeUndefined()
+
+        // #when the deadline passes
+        await run.advance(1_500)
+        await run.done
+
+        // #then it reports incomplete rather than success
+        expectKind(run.outcome(), 'drain-timeout')
+      },
+    )
   })
 })
