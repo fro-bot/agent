@@ -34,8 +34,10 @@
  *   a dead timer.
  * - Teardown always wins, regardless of state. A `claimed` entry torn down while the
  *   claimant's reply is still in flight is marked `disposed`: the entry leaves the gate at
- *   once, and a late failure of that reply never reopens, re-arms, or re-renders it (the
- *   question family rejects the orphaned request instead).
+ *   once, and a late failure of that reply never reopens, re-arms, or re-renders it. The family
+ *   sends one recovery reply for the orphaned request (a question `reject`, a permission `reject`),
+ *   unless the gate already started recovery: `recoveryStarted` marks the deadline fail-close, whose
+ *   reply already answers the request, so exactly one recovery reply goes out either way.
  *
  * ### Lifecycle surface
  *
@@ -123,6 +125,13 @@ interface EntryBase {
   deadlineExpired: boolean
   /** True once the terminal notification was emitted (or deliberately suppressed on replacement). */
   terminalFired: boolean
+  /**
+   * True once the gate itself started recovering the entry: the deadline fail-close sent the family's
+   * deadline reply because the claimant's reply failed after the deadline passed. Set by the gate only.
+   * A family that recovers a disposed entry's failed claimant reply must not also send its own recovery
+   * reply when this is set: the gate's reply already answers the request, and a second one would double it.
+   */
+  recoveryStarted?: boolean
 }
 
 export interface ApprovalGateEntry extends EntryBase {
@@ -361,6 +370,11 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     )
   }
 
+  /** Read through a call: a family's teardown can set `disposed` across an await, which TS cannot see. */
+  function isDisposed(entry: GateEntry): boolean {
+    return entry.state === 'disposed'
+  }
+
   /**
    * Fail-close: send the deadline reply, render the deadline outcome, remove.
    * Used when a claim's reply fails after the deadline already passed.
@@ -369,12 +383,16 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     logger.warn({requestID: entry.requestID}, `${label(entry)}: fail-closing entry (deadline already expired)`)
     entry.state = 'claimed'
     entry.actor = null
+    entry.recoveryStarted = true
     try {
       const r = await entry.ops.postDeadlineReply()
       if (!r.ok) logDeadlineReplyFailure(entry, 'failCloseNow', r)
     } catch (error) {
       logDeadlineReplyThrow(entry, 'failCloseNow', error)
     }
+    // Teardown took the entry while the reply was in flight: `retire` owns its render and its single
+    // terminal event, so a second render or terminal event here would double both.
+    if (isDisposed(entry)) return
     // An echo that landed while the reply was in flight already rendered and removed the entry.
     if (entries.get(entry.requestID) === entry) {
       await renderDeadline(entry)

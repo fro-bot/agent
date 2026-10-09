@@ -787,6 +787,28 @@ function deferredReply() {
   return {promise, settle}
 }
 
+/**
+ * Short deadline. Replies in order: claimant (held), deadline skip (held), then ok.
+ * `onDeadlineSkip` runs synchronously when the gate's fail-close sends its skip, so a teardown started
+ * there lands after the fail-close began and before the decision continuation resumes: Fro Bot's race.
+ */
+function deadlineEffects(
+  claimant: Promise<QuestionEffectResult>,
+  deadlineSkip: Promise<QuestionEffectResult>,
+  onDeadlineSkip: () => void,
+) {
+  return makeEffects({
+    replyQuestion: vi
+      .fn()
+      .mockReturnValueOnce(claimant)
+      .mockImplementationOnce(async () => {
+        onDeadlineSkip()
+        return deadlineSkip
+      })
+      .mockResolvedValue(OK),
+  })
+}
+
 describe('disposeRun across families', () => {
   it('run teardown: each registry disposes its own family, so the approval is fail-closed and the question rejected, once each', async () => {
     // #given one approval and one question pending on the same session
@@ -1016,6 +1038,113 @@ describe('disposeRun across families', () => {
       await teardown
       reply.settle({ok: true})
       await decision
+    })
+
+    describe('recovery is owned once: the deadline fail-close and teardown never both reply', () => {
+      it('(c) the deadline expires during the claim, the claimant fails, teardown starts behind the fail-close: the skip is the only recovery, no reject', async () => {
+        // #given an answer in flight, then a deadline that expires while it is claimed
+        const {questions, terminals} = setup()
+        const claimant = deferredReply()
+        const deadlineSkip = deferredReply() // the fail-close's skip reply stays unresolved
+        let teardown!: Promise<void>
+        const effects = deadlineEffects(claimant.promise, deadlineSkip.promise, () => {
+          teardown = questions.disposeRun('ses_1', 'run-ended')
+        })
+        const render = makeRenderFn()
+        questions.register(makeParams({effects, deadlineMs: 5}))
+        questions.attachMessage('que_1', render)
+        const decision = decideAnswer(questions, [['staging']])
+        await new Promise(resolve => setTimeout(resolve, 20))
+        expect(effects.replyQuestion).toHaveBeenCalledOnce()
+
+        // #when the claimant fails: the fail-close sends its skip, and teardown starts right behind it
+        claimant.settle({ok: false, error: 'down'})
+        const outcome = await decision
+        await teardown
+
+        // #then the gate's skip reply is the only recovery: no reject on top of it
+        expect(outcome).toEqual({kind: 'reply-failed'})
+        expect(effects.replyQuestion).toHaveBeenCalledTimes(2)
+        expect(effects.replyQuestion).toHaveBeenNthCalledWith(2, 'que_1', [[]])
+        expect(effects.rejectQuestion).not.toHaveBeenCalled()
+        // #and one terminal event, one render, and the entry is gone
+        expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+        expect(render).toHaveBeenCalledOnce()
+        expect(questions.pending()).toEqual([])
+      })
+
+      it('(c2) the deadline skip resolving while teardown rendering is still open does not render or terminate again', async () => {
+        // #given the same race, with the teardown render held open
+        const {questions, terminals} = setup()
+        const claimant = deferredReply()
+        const deadlineSkip = deferredReply()
+        let teardown!: Promise<void>
+        const effects = deadlineEffects(claimant.promise, deadlineSkip.promise, () => {
+          teardown = questions.disposeRun('ses_1', 'run-ended')
+        })
+        let finishRender!: () => void
+        const render = vi.fn().mockReturnValue(
+          new Promise<void>(resolve => {
+            finishRender = resolve
+          }),
+        )
+        questions.register(makeParams({effects, deadlineMs: 5}))
+        questions.attachMessage('que_1', render)
+        const decision = decideAnswer(questions, [['staging']])
+        await new Promise(resolve => setTimeout(resolve, 20))
+        claimant.settle({ok: false, error: 'down'})
+        await decision
+
+        // #when the deadline skip lands while the teardown render is still open
+        deadlineSkip.settle(OK)
+        await flush()
+
+        // #then teardown still owns the single render and the single terminal event
+        expect(render).toHaveBeenCalledOnce()
+        expect(terminals).toEqual([])
+        finishRender()
+        await teardown
+        expect(render).toHaveBeenCalledOnce()
+        expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+        expect(effects.rejectQuestion).not.toHaveBeenCalled()
+      })
+
+      it('(d) the claimant fails while teardown rendering is open, then the question.rejected echo arrives: one render, one terminal event, one reject', async () => {
+        // #given an answer in flight and a teardown whose render is held open
+        const {questions, terminals} = setup()
+        const claimant = deferredReply()
+        const effects = makeEffects({replyQuestion: vi.fn().mockReturnValue(claimant.promise)})
+        let finishRender!: () => void
+        const render = vi.fn().mockReturnValue(
+          new Promise<void>(resolve => {
+            finishRender = resolve
+          }),
+        )
+        questions.register(makeParams({effects}))
+        questions.attachMessage('que_1', render)
+        const decision = decideAnswer(questions, [['staging']])
+        await flush()
+        const teardown = questions.disposeRun('ses_1', 'run-ended')
+        await flush()
+        expect(render).toHaveBeenCalledOnce()
+
+        // #when the claimant fails, then OpenCode echoes the reject
+        claimant.settle({ok: false, error: 'down'})
+        await decision
+        questions.confirmEcho({kind: 'rejected', requestID: 'que_1', sessionID: 'ses_1'})
+        await flush()
+
+        // #then the echo found nothing to settle: no second render, no terminal event yet
+        expect(render).toHaveBeenCalledOnce()
+        expect(terminals).toEqual([])
+
+        // #and when teardown finishes, it emits the only terminal event
+        finishRender()
+        await teardown
+        expect(render).toHaveBeenCalledOnce()
+        expect(terminals.map(event => event.outcome)).toEqual(['disposed'])
+        expect(effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+      })
     })
   })
 
