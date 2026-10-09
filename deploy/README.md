@@ -358,8 +358,10 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (repo-scoped read authz, continuous) |
 | `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF + repo write/admin | Submit a tool-approval decision (once/always/reject) |
 | `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run (repo-scoped read authz) |
+| `POST` | `/operator/runs/:runId/questions/:requestId/decision` | Session + CSRF + repo write/admin | Answer or skip an agent question (`{decision: 'skip'}` or `{decision: 'answer', answers}`; options by index, free text up to 4,000 characters; a refused body is `400 {error: 'bad request', reason, questionIndex}`) |
+| `GET` | `/operator/runs/:runId/questions` | Session | List pending agent-question requests for a run (repo-scoped read authz) |
 
-Operator contract: v1.8.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
+Operator contract: v1.9.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
 
 Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gateway restart clears all sessions (global logout).
 
@@ -454,6 +456,15 @@ The image's `ENTRYPOINT` runs `tini` as pid 1; the workspace-agent service is it
 
 Both images build on `node:<ver>-alpine3.24@sha256:…`, and the workspace runtime's `apk add` packages are pinned to exact Alpine 3.24 versions. Renovate bumps them in one grouped "Alpine packages" PR, using the `registryUrls` rule in `.github/renovate.json5`. The tag's Alpine suffix, that `registryUrls` branch, and the pins must all name the same Alpine minor — to move to a new minor, change them together in one deliberate PR.
 
+#### Reuse guard (baked plugin + managed config)
+
+Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see "Background Subagent Ownership Ledger (Gateway)" in `ARCHITECTURE.md` for why). The workspace image bakes two root-owned, read-only files for this:
+
+- `/usr/local/lib/fro-bot/plugins/no-task-reuse.mjs` — an OpenCode server plugin (source: `deploy/plugins/no-task-reuse.mjs`) whose `tool.execute.before` hook throws a fixed error for `tool === 'task'` with a truthy `task_id`. The tool part ends in `error` with that message, the model sees it, and the turn continues.
+- `/etc/opencode/opencode.json` (source: `deploy/managed-config/opencode.json`) — OpenCode's Linux **managed config** layer. It is merged LAST (after the agent's own config, project config and `OPENCODE_CONFIG_CONTENT`) and plugin arrays are concatenated, so nothing written under `/home/opencode` or into a checkout can remove the entry. The OpenCode child's environment is built from a fixed allowlist, so `OPENCODE_PURE` and `OPENCODE_TEST_MANAGED_CONFIG_DIR` cannot reach it.
+
+The Systematic plugin and the `subagent_depth: 1` pin are different: they live in the agent-writable merged config (`merge-config.mjs`) and are enforced at provisioning time only. `deploy/tests/isolation-harness.sh` proves the agent uid cannot modify, replace, rename, chmod or delete either guard file (root can), and `deploy/scripts/managed-config.test.mjs` pins the config-to-file path and ownership. Residual exposure: a plugin the agent loads from its own config or a project `.opencode/plugins` directory runs before the guard and could mutate the tool arguments in memory; that code already runs inside the OpenCode process as uid 10001, so the guard is a model-behavior boundary, not a sandbox.
+
 #### Harness OpenCode binary
 
 The workspace runs the **harness build** of OpenCode — the patched binary published to [fro-bot/agent releases](https://github.com/fro-bot/agent/releases), not the stock `anomalyco/opencode` build. The harness binary carries session, plugin, and compaction fixes that apply to the mention-loop execution path.
@@ -480,7 +491,7 @@ The mention-loop agent needs a model and a provider to talk to. These mirror the
 - `WORKSPACE_OPENCODE_CONFIG` — a JSON object shallow-merged over the baked base config; supply the `provider` block that points OpenCode at your endpoint.
 - `WORKSPACE_OPENCODE_READY_TIMEOUT_MS` — how long (in milliseconds) the workspace agent waits for the OpenCode server to become ready before marking it `down`. Default: `60000` (60 s — sized for a cold boot behind the egress proxy). Absent or empty → default applies (fail-soft). Set to a non-numeric value, zero, or a negative number → startup fails immediately with an explicit error (fail-fast).
 
-The image bakes no default model — the entrypoint overlays these onto the base config at startup (the Systematic plugin is always preserved; a malformed value fails fast). Provider **credentials** stay in the `workspace-opencode-auth` secret (above); these two are non-secret operator config.
+The image bakes no default model — the entrypoint overlays these onto the base config at startup (the Systematic plugin is always preserved; a malformed value fails fast; the reuse guard lives in the root-owned managed config layer and is unaffected by the overlay). Provider **credentials** stay in the `workspace-opencode-auth` secret (above); these two are non-secret operator config.
 
 To route Claude/OpenAI through a [cliproxyapi](https://github.com/router-for-me/CLIProxyAPI) proxy (the default in `marcusrbrown/infra`), point the stock `anthropic`/`openai` providers at the proxy's `/v1` base URL and set the model:
 
@@ -536,7 +547,7 @@ If an update or recovery subprocess's termination cannot be confirmed, the works
 
 ### Deploy coordination
 
-Operator contract **1.8.0** carries checked remote evidence on `checkoutProvenance` and a new optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.8.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
+Operator contract **1.9.0** carries the agent-question frame and routes, the `waiting_for_question` run status, checked remote evidence on `checkoutProvenance`, and the optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.9.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
 
 The gateway and workspace images must roll together, for the same reason as the control-API bearer above: an older gateway does not send the bearer or request shapes a newer workspace expects, and vice versa.
 
@@ -574,6 +585,20 @@ Each approval prompt has a deadline that is a sub-deadline of the overall run ti
 ### Restart limitation
 
 A pending approval prompt is held in memory by the per-run coordinator. If the gateway or workspace container restarts while a prompt is open, the approval is abandoned. The run surfaces as interrupted in the thread. Re-mention to retry.
+
+## Agent questions
+
+The OpenCode `question` tool is enabled in gateway workspaces, and the gateway answers it. When an agent asks a question, the run pauses and operators can answer or skip it from the operator web surface or, for a Discord-launched run, from the run thread. Nothing in the base workspace config denies the tool. To stop agents from asking, set `"permission":{"question":"deny"}` in `WORKSPACE_OPENCODE_CONFIG`.
+
+Who can answer: a web operator needs write access to the run's repository, and a Discord user must pass the same `userIsAuthorized` rule as approvals. Discord users can answer only their own thread's question; web operators can answer any run's.
+
+Questions fail soft, unlike approvals. Each one has a deadline, a sub-deadline of the run timeout capped at 13 minutes. If it passes without an answer, the gateway replies with an empty answer, the agent sees the question as unanswered and continues, and the run does not fail. A question asked with 90 seconds or less of run time left is skipped immediately. A Discord post that cannot be delivered (for example the thread was deleted) does not settle the question; web answering and the deadline remain.
+
+A single-question request that fits Discord's component limits is shown in the thread with buttons or a select, Skip, and a text-answer button. Any other request posts a notice pointing at the operator web surface, linking `GATEWAY_OPERATOR_PUBLIC_ORIGIN` when it is set.
+
+### Restart limitation
+
+A pending question is held in memory. A gateway restart loses it along with the run. If only the workspace restarts, OpenCode loses the pending question, and the gateway's deadline skip fails closed.
 
 ## Working-state UX
 
@@ -738,3 +763,7 @@ The compose topology guard (`deploy/validate-stack.sh`) enforces this model stat
 - **Operator surface** (gateway-net only, NOT sandbox-net reachable): the operator web listener bound to a gateway-net address. It is not reachable from the workspace. TLS is terminated by the infra reverse proxy at `GATEWAY_OPERATOR_PUBLIC_ORIGIN`; the listener receives plain HTTP over gateway-net. The operator listener must never be bound to `0.0.0.0`, `127.0.0.1`, or any sandbox-net address.
 
 If a new workspace-reachable gateway endpoint is added that performs caller-directed outbound, the topology must be revisited. A CI pinning test enforces this: it asserts the gateway's announce ingress surface is exactly `{POST /v1/announce}` and the operator surface is exactly `{GET /operator/health}` (Unit 2 skeleton), and fails if a new route is added without a deliberate review. The test also asserts there are exactly two `serve()` calls in the gateway source — one for each surface.
+
+**Announce request ordering and flood protection.** The announce listener authenticates before it spends any quota: bounded body (8 KiB) → required headers → HMAC (a malformed signature is rejected before any hashing) → timestamp freshness → atomic replay reservation → producer rate limit → JSON/schema → Discord. Bad-signature, stale, and replayed requests all get the same generic `401` and consume none of the producer's allowance. The rate limit (60 requests/minute) is a **producer-quota** control, keyed on one fixed server-owned key (`control-plane`, since there is a single shared secret); it is never keyed on the socket address or `X-Forwarded-For`. A throttled request returns `429` and releases its replay reservation, so the producer can retry the same signed request once the window resets. Log lines carry a reason only (`hmac_invalid`, `timestamp_expired`, `replayed` for authentication rejections; `producer_rate_limited` for quota) — never the secret, signature, headers, body, or rendered text.
+
+Coarse flood protection for **unauthenticated** traffic (per-source connection/request limits, request-read timeouts, bandwidth caps) belongs at ingress/transport — the reverse proxy or network policy in front of `GATEWAY_HTTP_PORT` — not in the gateway. The announce listener has its own trust boundary: it does **not** inherit the operator-surface ingress policy (`GATEWAY_OPERATOR_TRUSTED_PROXIES` applies to the operator listener only), and the gateway makes no attempt to identify unauthenticated callers.

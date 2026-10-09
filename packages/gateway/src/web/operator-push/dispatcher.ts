@@ -1,6 +1,6 @@
 /**
- * Orchestrates operator push notification dispatch: approval-pending and
- * run-failed events broadcast to every active subscription across ALL
+ * Orchestrates operator push notification dispatch: approval-pending,
+ * question-pending, and run-failed events broadcast to every active subscription across ALL
  * operators, subject to dedupe and key-rotation trigger policy.
  *
  * Broadcast model: the operator dashboard is a shared surface — approvals
@@ -20,7 +20,7 @@
  * kind), not per operator, so one event produces at most one nudge per
  * subscription within the window.
  *
- * Fail-soft by design: `dispatchApprovalPending` / `dispatchRunFailed`
+ * Fail-soft by design: `dispatchApprovalPending` / `dispatchQuestionPending` / `dispatchRunFailed`
  * NEVER throw into the caller. Every dependency call and the whole flow is
  * wrapped so an unexpected failure degrades to a coarse log, not a crash of
  * whatever fire-and-forget call site invoked it.
@@ -43,7 +43,7 @@ import type {PushSender} from './push-sender.js'
 import type {OperatorPushSubscriptionStore, SubscriptionRecord} from './subscription-store.js'
 import type {TriggerDecision} from './trigger-policy.js'
 import {emitAudit} from '../audit.js'
-import {buildApprovalPayload, buildFailedRunPayload} from './payload-builder.js'
+import {buildApprovalPayload, buildFailedRunPayload, buildQuestionPayload} from './payload-builder.js'
 
 export interface DispatcherLogger {
   readonly debug: (context: Record<string, unknown>, message: string) => void
@@ -79,13 +79,22 @@ export interface CreatePushDispatcherDeps {
 
 export interface PushDispatcher {
   dispatchApprovalPending: (approvalId: string) => Promise<void>
+  /**
+   * Nudge operators that an agent question is waiting. Deduped per run: one nudge covers every
+   * question the run asks within the dedupe window. Carries no question content by construction.
+   */
+  dispatchQuestionPending: (runId: string) => Promise<void>
   dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
 }
 
 export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispatcher {
   const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger, auditLogger} = deps
 
-  async function broadcast(kind: 'approval' | 'run_failed', dedupeId: string, payload: string): Promise<void> {
+  async function broadcast(
+    kind: 'approval' | 'question' | 'run_failed',
+    dedupeId: string,
+    payload: string,
+  ): Promise<void> {
     const dedupeKey = `${dedupeId}:${kind}`
 
     // List first: a transient list failure must not consume the dedupe
@@ -162,7 +171,7 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
   }
 
   async function dispatchToRecord(
-    kind: 'approval' | 'run_failed',
+    kind: 'approval' | 'question' | 'run_failed',
     record: SubscriptionRecord,
     payload: string,
   ): Promise<'delivered' | 'dead' | 'failed' | 'skipped'> {
@@ -222,6 +231,15 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     }
   }
 
+  async function dispatchQuestionPending(runId: string): Promise<void> {
+    try {
+      const payload = JSON.stringify(buildQuestionPayload())
+      await broadcast('question', runId, payload)
+    } catch {
+      logger.warn({runId}, 'operator push dispatch: question dispatch threw — continuing')
+    }
+  }
+
   async function dispatchRunFailed(runId: string, failureLabel?: OperatorFailureKind): Promise<void> {
     try {
       const payload = JSON.stringify(buildFailedRunPayload(failureLabel))
@@ -231,5 +249,5 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     }
   }
 
-  return {dispatchApprovalPending, dispatchRunFailed}
+  return {dispatchApprovalPending, dispatchQuestionPending, dispatchRunFailed}
 }

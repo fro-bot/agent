@@ -1,7 +1,10 @@
 import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 import type {PermissionRequest} from '../approvals/coordinator.js'
+import type {QuestionAskedRequest} from '../approvals/question-coordinator.js'
+import type {QuestionRegistry} from '../approvals/question-registry.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
+import type {RequestGate} from '../approvals/request-gate.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
@@ -36,6 +39,7 @@ import {
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createDiscordApprovalOnPending} from '../approvals/discord-transport.js'
+import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
 import {sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
 import {buildRecoverEntryButton} from '../discord/recover-checkout-button.js'
@@ -59,11 +63,24 @@ import {
   toCheckoutPreparation,
   toRemoteFreshnessFromUpdateReady,
 } from './provenance.js'
+import {createQuestionEffects} from './question-client.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 
 // ---------------------------------------------------------------------------
 // Public interfaces
 // ---------------------------------------------------------------------------
+
+/**
+ * What a question transport needs to know about the run it announces for. `surface` tells a
+ * transport whether the run was launched from Discord (its thread is where operators are) or from
+ * the web; `replySink` is the run's sink, whose `'thread'` target is that Discord thread.
+ */
+export interface QuestionTransportContext {
+  readonly runId: string
+  readonly repo: string
+  readonly surface: LaunchWorkRequest['surface']
+  readonly replySink: ReplySink
+}
 
 export interface RunMentionDeps {
   readonly coordinationConfig: CoordinationConfig
@@ -98,6 +115,26 @@ export interface RunMentionDeps {
   readonly logger: GatewayLogger
   /** Program-scoped approval registry shared with the button handler and shutdown drain. */
   readonly approvalRegistry: ApprovalRegistry
+  /**
+   * Program-scoped question registry, sharing one request gate with `approvalRegistry`.
+   * When absent, a run does not handle `question.*` events (an agent question then ends in the
+   * inactivity timeout, as before questions were bridged). Production always supplies it.
+   */
+  readonly questionRegistry?: QuestionRegistry
+  /**
+   * The shared request gate's terminal-notification subscription. Each run subscribes once so a
+   * human wait is released on every settlement path, including ones OpenCode never echoes.
+   * Optional like `questionRegistry`; approvals fall back to their echo-driven release.
+   */
+  readonly requestGate?: Pick<RequestGate, 'onTerminal'>
+  /**
+   * Builds the per-run hook that announces a newly registered question to operator surfaces (the
+   * web transport attaches its settle render and emits the SSE open frame). Called once per run
+   * with the run's identity; the returned hook runs after the registry holds the question, for
+   * Discord-launched and web-launched runs alike. Injected so the engine stays transport-neutral.
+   * Absent: questions are still registered and answerable, just not announced.
+   */
+  readonly createQuestionOnRegistered?: (context: QuestionTransportContext) => (request: QuestionAskedRequest) => void
   /**
    * Gateway approval mode. Propagated from `GatewayConfig.approvalMode`.
    * Currently only `approval-required` is supported.
@@ -186,6 +223,8 @@ export interface RunMentionDeps {
    */
   readonly operatorPushDispatcher?: {
     readonly dispatchApprovalPending: (approvalId: string) => Promise<void>
+    /** Optional so fakes that only exercise the approval and run-failed nudges stay valid. */
+    readonly dispatchQuestionPending?: (runId: string) => Promise<void>
     readonly dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
   }
 }
@@ -1335,6 +1374,36 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         },
       })
 
+      // ── Question coordinator — per-run, wired to the program-scoped question registry ──
+      // Effects come from a v2 client with the v1 handle's base URL and bearer, and the run's
+      // canonical directory. The deadline is evaluated when a question is asked, from the budget
+      // left then (not at run start), so a late question never outlives the hard abort. Scope
+      // matches cancellation's: the Discord thread for Discord runs, the run id otherwise.
+      const announceQuestion = deps.createQuestionOnRegistered?.({runId, repo, surface: request.surface, replySink})
+      // Runs after the registry holds the question: surface announcement first, push last so a
+      // push failure can never preempt the surfaces. Neither can throw into the coordinator.
+      const buildQuestionOnRegistered = (): ((asked: QuestionAskedRequest) => void) => asked => {
+        announceQuestion?.(asked)
+        // Fire-and-forget; the dispatcher is fail-soft by contract, and a rejection is swallowed anyway.
+        deps.operatorPushDispatcher?.dispatchQuestionPending?.(runId)?.catch(() => undefined)
+      }
+      const questionCoordinator =
+        deps.questionRegistry === undefined
+          ? undefined
+          : createQuestionCoordinator({
+              logger,
+              registry: deps.questionRegistry,
+              effects: createQuestionEffects({
+                baseURL: attachUrl,
+                token: attachToken,
+                directory: sessionDirectory,
+              }),
+              scopeId: request.surface === 'discord' ? threadId : runId,
+              runId,
+              computeDeadlineMs: () => computeApprovalDeadlineMs(Math.max(0, runTimeoutMs - (Date.now() - runStartMs))),
+              onRegistered: buildQuestionOnRegistered(),
+            })
+
       try {
         await runOpenCodeCore({
           handle,
@@ -1344,6 +1413,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           signal: effectiveSignal,
           logger,
           coordinator,
+          questions: questionCoordinator,
+          onHumanWaitTerminal: deps.requestGate?.onTerminal,
           approvalMode,
           inactivityTimeoutMs: runInactivityTimeoutMs,
           onActivity: (summary: string) => {
@@ -1359,6 +1430,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // Fail-closed: dispose any still-open coordinator entries so pending approvals
         // don't hang if the run ended (normally or via error) before they were settled.
         coordinator.dispose('run ended')
+        // Pending questions are rejected (ending the agent's turn) before the run releases its
+        // resources. Bounded by the reject call's own timeout; never rejects.
+        await questionCoordinator?.dispose('run ended')
       }
 
       // ── Succeeded reaction — best-effort, fire-and-forget ────────────────────────────────────

@@ -38,7 +38,7 @@ fro-bot/agent/
 │   │       ├── execute/        # run-core, queue, concurrency, recovery, checkout provenance
 │   │       ├── web/            # Operator HTTP routes, auth, ingress trust, SSE, audit
 │   │       ├── workspace-api/  # Workspace API surface
-│   │       ├── approvals/      # Approval gate
+│   │       ├── approvals/      # Approval and question gate
 │   │       ├── operator-contract/ # Operator contract types
 │   │       └── redaction/      # PII/secret redaction gate
 │   ├── harness/                # @fro.bot/harness — patched-OpenCode build + publish pipeline
@@ -96,6 +96,7 @@ fro-bot/agent/
 - **`packages/harness/`** — Patched-OpenCode build and publish pipeline; touch when updating the bundled OpenCode binary.
 - **`packages/runtime/`** — Shared runtime primitives consumed by both `src/` and `packages/gateway/`; owns the authoritative version-pin constants.
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
+- **`deploy/plugins/`**, **`deploy/managed-config/`** — the baked OpenCode reuse-guard plugin (`no-task-reuse.mjs`) and the root-owned managed config (`/etc/opencode/opencode.json`) that loads it; plain Node ESM / JSON, tested from `deploy/scripts/*.test.mjs`.
 - **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations (auth validation, config merge, protected-dir creation, legacy checkout ownership migration, agent-side config provisioning); uses `node --test`, not Vitest.
 - **`deploy/tests/`** — `isolation-harness.sh`, the CI acceptance harness that proves the service/agent uid boundary in a real container started with production's security posture.
 - **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch.

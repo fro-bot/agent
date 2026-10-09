@@ -30,6 +30,8 @@ sources:
   - packages/gateway/src/github/app-client.ts
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/approvals/coordinator.ts
+  - packages/gateway/src/approvals/request-gate.ts
+  - packages/gateway/src/approvals/question-registry.ts
   - packages/runtime/src/agent/remote-client.ts
   - packages/runtime/src/agent/filter-env.ts
   - packages/runtime/src/agent/with-scrubbed-env.ts
@@ -113,6 +115,8 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 The gateway has no separate drain stage because it does not need one: `run-core.ts` does not return until the run's ownership ledger drains, so the heartbeat stop, terminal transition, and concurrency-slot handoff in `run.ts` all happen after owned background work has settled. `settle-owned-sessions.ts` is the termination barrier every post-ledger error passes through — it aborts unsettled sessions, confirms by reconciliation rather than trusting the abort response, and re-raises the original error marked _quarantined_ when it cannot confirm. A quarantined failure holds the channel's slot for a bounded window instead of handing the workspace to the next queued run. `recovery.ts` reads persisted ownership back on restart and refuses to release a stale run's lock when the claim names work it cannot verify is finished. See [[Background Subagents and Ownership]].
 
 **Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
+
+**Agent questions** (`approvals/question-registry.ts`, `question-coordinator.ts`) — the same gate, second family. When an agent calls OpenCode's `question` tool, the run's question coordinator registers the request with a mandatory deadline and announces it to the web surface (SSE `question` frame) and, for Discord-launched runs, the run thread. `request-gate.ts` is the shared lifecycle core for approvals and questions: one claim machine, scope check, deadline owner, echo settlement, teardown, and terminal notification. A skip or an expired deadline replies with an empty answer so the agent continues; reject is used only on cancel and teardown. Web operators with write access can answer any run's question; Discord answers only its own thread's. See [[Operator Web Control Surface]] for the routes and frames.
 
 **HTTP** (`http/`) — The signed announce webhook server. Handles control-plane presence messages with HMAC signature verification (`hmac.ts`), replay protection (`replay-cache.ts`), rate limiting (`rate-limit.ts`), and schema validation (`announce-schema.ts`).
 

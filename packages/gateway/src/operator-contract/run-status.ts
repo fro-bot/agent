@@ -23,7 +23,7 @@
  * The caller (gateway bridge) resolves the run → its binding → deny keys and passes them in.
  * The contract function stays pure and synchronous — no binding lookups, no I/O.
  *
- * Note: 'blocked' and 'waiting_for_approval' are NOT produced by this pure projection.
+ * Note: 'blocked', 'waiting_for_approval', and 'waiting_for_question' are NOT produced by this pure projection.
  * They are derived by the snapshot endpoint from queue/registry state and layered on top
  * of the web status after this function returns. This function maps RunPhase only.
  */
@@ -51,14 +51,24 @@ export type {
 export type {RunPhase, Surface} from '@fro-bot/runtime'
 
 /**
- * The 7-value operator-facing web status set (snake_case).
+ * The 8-value operator-facing web status set (snake_case).
  *
- * 'blocked' and 'waiting_for_approval' are endpoint-layer overlays derived from
- * queue/registry state — they are NOT produced by toOperatorRunStatus (which maps
- * RunPhase only). The snapshot endpoint layers them on top after projection.
+ * 'blocked', 'waiting_for_approval', and 'waiting_for_question' are endpoint-layer
+ * overlays derived from queue/registry state — they are NOT produced by
+ * toOperatorRunStatus (which maps RunPhase only). The snapshot endpoint layers them
+ * on top after projection. 'waiting_for_question' (contract 1.9.0) marks a running run
+ * with a pending agent question; 'waiting_for_approval' takes precedence when both are
+ * pending, because an approval gates a tool call.
  */
 export type OperatorWebStatus =
-  'queued' | 'blocked' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled'
+  | 'queued'
+  | 'blocked'
+  | 'running'
+  | 'waiting_for_approval'
+  | 'waiting_for_question'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
 
 /**
  * Operator-safe projection of a run's status.
@@ -107,7 +117,7 @@ export interface OperatorRunStatus {
 /**
  * Maps a RunPhase to its operator-facing web status.
  *
- * 'blocked' and 'waiting_for_approval' are NOT in this map — they are
+ * 'blocked', 'waiting_for_approval', and 'waiting_for_question' are NOT in this map — they are
  * endpoint-layer overlays, not derivable from RunPhase alone.
  *
  * Exported so sibling projectors (e.g. run-summary.ts) can reuse the mapping

@@ -16,6 +16,10 @@ import type {RunTask} from './run.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
+import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
+import {createQuestionRegistry} from '../approvals/question-registry.js'
+import {createRequestGate} from '../approvals/request-gate.js'
+import {createAbortRegistry} from './abort-registry.js'
 import {cancelRun} from './cancel.js'
 
 // ---------------------------------------------------------------------------
@@ -314,6 +318,51 @@ describe('cancelRun — executing', () => {
 // ---------------------------------------------------------------------------
 // Double-miss rendezvous
 // ---------------------------------------------------------------------------
+
+describe('cancelRun — executing with a pending agent question', () => {
+  it('reaches run teardown, which rejects the question (never skips it); the cancel result is unchanged', async () => {
+    // #given a real abort registry, and a run that does what run.ts does: tear down its
+    // question coordinator when its effective signal aborts
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const logger = makeLogger()
+    const registry = createQuestionRegistry({logger, gate: createRequestGate({logger})})
+    const effects = {
+      replyQuestion: vi.fn().mockResolvedValue({ok: true}),
+      rejectQuestion: vi.fn().mockResolvedValue({ok: true}),
+    }
+    const coordinator = createQuestionCoordinator({
+      logger,
+      registry,
+      effects,
+      scopeId: 'thread-1',
+      runId: 'run-1',
+      computeDeadlineMs: () => 60_000,
+    })
+    await coordinator.onAsked({
+      requestID: 'que_1',
+      sessionID: 'ses_1',
+      questions: [{question: 'Which?', header: 'H', options: [], multiple: false, custom: true}],
+    })
+    const abortRegistry = createAbortRegistry()
+    const signal = abortRegistry.register('run-1')
+    const tornDown = new Promise<void>(resolve => {
+      signal.addEventListener('abort', () => {
+        coordinator.dispose('run ended').then(resolve, resolve)
+      })
+    })
+    const deps = makeDeps({runState, abortRegistry})
+
+    // #when the operator cancels
+    const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+    await tornDown
+
+    // #then the question was rejected once, never answered with an empty reply, and left the registry
+    expect(result).toEqual({outcome: 'cancelled', wasQueued: false})
+    expect(effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+    expect(effects.replyQuestion).not.toHaveBeenCalled()
+    expect(registry.pending()).toEqual([])
+  })
+})
 
 describe('cancelRun — double-miss rendezvous', () => {
   it('commits CANCELLED directly when no queue entry and no abort-registry entry exist', async () => {

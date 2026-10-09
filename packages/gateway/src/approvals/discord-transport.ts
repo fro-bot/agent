@@ -118,7 +118,7 @@ const TERMINAL_DISCORD_ERROR_CODES: ReadonlySet<number> = new Set([
  * never on `error.message` — so a wording change in Discord's API responses
  * cannot silently reclassify a retryable failure as terminal (or vice versa).
  */
-function isTerminalDeliveryFailure(error: unknown): boolean {
+export function isTerminalDeliveryFailure(error: unknown): boolean {
   return (
     error instanceof DiscordAPIError && typeof error.code === 'number' && TERMINAL_DISCORD_ERROR_CODES.has(error.code)
   )

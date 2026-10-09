@@ -527,3 +527,123 @@ describe('createPushDispatcher — push.dispatch audit event', () => {
     expect(serialized).not.toContain('p256dh-secret')
   })
 })
+
+// ---------------------------------------------------------------------------
+// dispatchQuestionPending
+// ---------------------------------------------------------------------------
+
+function build(options: {readonly records?: readonly SubscriptionRecord[]; readonly windowMs?: number} = {}) {
+  const listAllActiveRecords = vi.fn(async () => ({success: true as const, data: options.records ?? [makeRecord()]}))
+  const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+  const sender = createFakeSender([])
+  const auditLogger = createAuditLogger()
+  const dispatcher = createPushDispatcher({
+    store: {listAllActiveRecords, markDead},
+    sender,
+    dedupeCache: createDedupeCache({windowMs: options.windowMs ?? 60_000}),
+    triggerPolicy: {shouldNotify},
+    vapidConfig: VAPID_CONFIG,
+    logger: createLogger(),
+    auditLogger,
+  })
+  return {dispatcher, sender, auditLogger, listAllActiveRecords}
+}
+
+describe('createPushDispatcher — dispatchQuestionPending', () => {
+  // #given an active subscription
+  // #when a question nudge is dispatched
+  // #then the wire payload is the fixed question copy and nothing else
+  it('sends the fixed-copy question payload to every active subscription', async () => {
+    const {dispatcher, sender} = build({
+      records: [
+        makeRecord({endpointHash: 'h1', endpoint: 'https://push.example.com/1', operatorId: 'operator-a'}),
+        makeRecord({endpointHash: 'h2', endpoint: 'https://push.example.com/2', operatorId: 'operator-b'}),
+      ],
+    })
+
+    await dispatcher.dispatchQuestionPending('run-1')
+
+    expect(sender.sendNotification).toHaveBeenCalledTimes(2)
+    const sentPayloads = (sender.sendNotification.mock.calls as unknown as [unknown, string][]).map(call => call[1])
+    for (const payload of sentPayloads) {
+      expect(JSON.parse(payload)).toEqual({
+        title: 'operator.question_pending.title',
+        body: 'operator.question_pending.body',
+        data: {type: 'question', route: '/'},
+      })
+    }
+  })
+
+  // #given no subscribers
+  // #when a question nudge is dispatched
+  // #then it is a silent no-op: nothing sent, no audit event, dedupe slot not consumed
+  it('is a silent no-op with no subscribers', async () => {
+    const {dispatcher, sender, auditLogger} = build({records: []})
+
+    await expect(dispatcher.dispatchQuestionPending('run-1')).resolves.toBeUndefined()
+
+    expect(sender.sendNotification).not.toHaveBeenCalled()
+    expect(auditLogger.info).not.toHaveBeenCalled()
+  })
+
+  // #given two questions from the same run inside the dedupe window
+  // #when each is dispatched
+  // #then the run gets one nudge, while another run is still nudged
+  it('dedupes per run', async () => {
+    const {dispatcher, sender} = build()
+
+    await dispatcher.dispatchQuestionPending('run-1')
+    await dispatcher.dispatchQuestionPending('run-1')
+    await dispatcher.dispatchQuestionPending('run-2')
+
+    expect(sender.sendNotification).toHaveBeenCalledTimes(2)
+  })
+
+  // #given the same id used by an approval nudge
+  // #when a question nudge follows
+  // #then the kinds do not suppress each other
+  it('does not share a dedupe slot with approval or run-failed nudges for the same id', async () => {
+    const {dispatcher, sender} = build()
+
+    await dispatcher.dispatchApprovalPending('x')
+    await dispatcher.dispatchQuestionPending('x')
+    await dispatcher.dispatchRunFailed('x')
+
+    expect(sender.sendNotification).toHaveBeenCalledTimes(3)
+  })
+
+  // #given a delivered broadcast
+  // #when the audit event is read
+  // #then it names the question trigger and the run, with counts only
+  it('emits one push.dispatch audit event with trigger question', async () => {
+    const {dispatcher, auditLogger} = build()
+
+    await dispatcher.dispatchQuestionPending('run-1')
+
+    expect(auditLogger.info).toHaveBeenCalledOnce()
+    const [ctx] = auditLogger.info.mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx).toMatchObject({kind: 'push.dispatch', correlationId: 'run-1', trigger: 'question', delivered: 1})
+  })
+
+  // #given the store throws
+  // #when a question nudge is dispatched
+  // #then it never rejects into the caller
+  it('never throws into the caller', async () => {
+    const dispatcher = createPushDispatcher({
+      store: {
+        listAllActiveRecords: vi.fn(async () => {
+          throw new Error('store down')
+        }),
+        markDead: vi.fn(),
+      },
+      sender: createFakeSender([]),
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: createLogger(),
+      auditLogger: createAuditLogger(),
+    })
+
+    await expect(dispatcher.dispatchQuestionPending('run-1')).resolves.toBeUndefined()
+  })
+})

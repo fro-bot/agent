@@ -1,5 +1,11 @@
 // Operator API contract version — build-time pinned, never negotiated over the wire.
 //
+// Changelog (latest first):
+//   1.9.0 — pending-question surface: `question` SSE frame, PendingQuestionDTO, answer/skip request
+//           types, and the `waiting_for_question` run status (additive). Every question and answer
+//           string is untrusted plain text that consumers must render inertly.
+//   1.8.0 — checked remote evidence on `checkoutProvenance` and optional `checkoutPreparation`.
+//
 // Increment policy:
 //   MAJOR — breaking change to a frozen type (field removed, renamed, or type narrowed)
 //   MINOR — additive change (new optional field, new type added to the surface)
@@ -12,4 +18,4 @@
 // Security constraint: the version is BUILD-TIME pinned and is never supplied or
 // negotiated over the wire. Any endpoint reading a version header must reject
 // unrecognized versions fail-closed.
-export const OPERATOR_CONTRACT_VERSION = '1.8.0'
+export const OPERATOR_CONTRACT_VERSION = '1.9.0'

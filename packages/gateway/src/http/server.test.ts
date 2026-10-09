@@ -586,21 +586,17 @@ describe('POST /v1/announce — Discord failure → 5xx', () => {
 })
 
 // ---------------------------------------------------------------------------
-// FIX 2: Rate-limit key comes from connection info, NOT x-forwarded-for
+// #1645: authenticate first, then rate-limit on one fixed producer key
 // ---------------------------------------------------------------------------
 
-describe('POST /v1/announce — rate limit keyed on connection (not XFF)', () => {
-  it('records the same key for two requests with different x-forwarded-for, and the key is not either XFF value', async () => {
-    // #given — a key-RECORDING limiter: it captures every key it is handed and always allows.
-    // This pins the actual property in question — what key does the handler derive? — independent
-    // of any accept/reject behaviour, which a bucketing limiter can't isolate on its own.
+describe('POST /v1/announce — producer-keyed rate limit (not socket / XFF)', () => {
+  it('uses the same fixed key for valid requests carrying rotating x-forwarded-for values', async () => {
+    // #given — a key-RECORDING limiter that always allows
     const rawBody1 = makeRawBody(validSurveyPayload)
     const rawBody2 = makeRawBody({
       ...validSurveyPayload,
       context: {...validSurveyPayload.context, wiki_pages_changed: 5},
     })
-    const sig1 = makeSignature(rawBody1, TIMESTAMP)
-    const sig2 = makeSignature(rawBody2, TIMESTAMP)
     const recordedKeys: string[] = []
     const rateLimiter = {
       allow: (key: string): boolean => {
@@ -619,42 +615,32 @@ describe('POST /v1/announce — rate limit keyed on connection (not XFF)', () =>
     )
 
     try {
-      // #when — two requests over the same TCP connection pool but with different XFF headers
+      // #when — two valid requests with different (spoofable) XFF values
       await postAnnounce(port, rawBody1, {
-        'x-gateway-signature': sig1,
+        'x-gateway-signature': makeSignature(rawBody1, TIMESTAMP),
         'x-gateway-timestamp': TIMESTAMP,
         'x-forwarded-for': '10.0.0.1',
       })
       await postAnnounce(port, rawBody2, {
-        'x-gateway-signature': sig2,
+        'x-gateway-signature': makeSignature(rawBody2, TIMESTAMP),
         'x-gateway-timestamp': TIMESTAMP,
         'x-forwarded-for': '10.0.0.2',
       })
 
-      // #then — same key both times, and it is neither of the spoofable XFF values (it's the real
-      // loopback socket address the test client actually connected from).
-      expect(recordedKeys).toHaveLength(2)
-      expect(recordedKeys[0]).toBe(recordedKeys[1])
-      expect(recordedKeys[0]).not.toBe('10.0.0.1')
-      expect(recordedKeys[0]).not.toBe('10.0.0.2')
-      expect(recordedKeys[0]).toMatch(/^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/)
+      // #then — neither the socket address nor any XFF value ever becomes a limiter key
+      expect(recordedKeys).toEqual(['control-plane', 'control-plane'])
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
     }
   })
 
-  it('two requests with different x-forwarded-for but the same connection share the same rate-limit bucket', async () => {
-    // #given — a genuinely key-SENSITIVE limiter (the real fixed-window implementation, capped
-    // at 1 request/window) proves the observable consequence: if both requests bucket together,
-    // the second is rejected. A stub that rejects its second call regardless of key would pass
-    // this test even if the handler keyed on XFF — the real bucketing algorithm won't.
+  it('rotating x-forwarded-for does not bypass the producer allowance', async () => {
+    // #given — the real fixed-window limiter capped at 1 request/window
     const rawBody1 = makeRawBody(validSurveyPayload)
     const rawBody2 = makeRawBody({
       ...validSurveyPayload,
       context: {...validSurveyPayload.context, wiki_pages_changed: 5},
     })
-    const sig1 = makeSignature(rawBody1, TIMESTAMP)
-    const sig2 = makeSignature(rawBody2, TIMESTAMP)
     const rateLimiter = createRateLimiter({limit: 1, clock: () => NOW_MS})
 
     const port = await findFreePort()
@@ -667,23 +653,62 @@ describe('POST /v1/announce — rate limit keyed on connection (not XFF)', () =>
     )
 
     try {
-      // #when — first request succeeds (rate limit not exhausted)
+      // #when
       const res1 = await postAnnounce(port, rawBody1, {
-        'x-gateway-signature': sig1,
+        'x-gateway-signature': makeSignature(rawBody1, TIMESTAMP),
         'x-gateway-timestamp': TIMESTAMP,
-        'x-forwarded-for': '10.0.0.1', // different XFF — should NOT get a fresh bucket
+        'x-forwarded-for': '10.0.0.1',
       })
-
-      // #when — second request: different XFF but same real connection (127.0.0.1) → rate-limited
       const res2 = await postAnnounce(port, rawBody2, {
-        'x-gateway-signature': sig2,
+        'x-gateway-signature': makeSignature(rawBody2, TIMESTAMP),
         'x-gateway-timestamp': TIMESTAMP,
-        'x-forwarded-for': '10.0.0.2', // different XFF — should still be rate-limited
+        'x-forwarded-for': '10.0.0.2',
       })
 
-      // #then — second is denied; they share the same connection-based bucket
+      // #then
       expect(res1.status).toBe(200)
       expect(res2.status).toBe(429)
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
+
+  it('an unsigned / bad-signature flood from the same source does not starve a valid request', async () => {
+    // #given — allowance of 1; a flood of garbage from the same loopback source first
+    const rawBody = makeRawBody(validSurveyPayload)
+    const rateLimiter = createRateLimiter({limit: 1, clock: () => NOW_MS})
+
+    const port = await findFreePort()
+    const {client, sendMock} = makeDiscordClient(true)
+    const logger = makeLogger()
+
+    const server = createAnnounceServer(
+      {client, logger, rateLimiter, clock: () => NOW_MS},
+      {webhookSecret: SECRET, presenceChannelId: CHANNEL_ID, httpPort: port},
+    )
+
+    try {
+      // #when
+      const flood = []
+      for (let i = 0; i < 5; i++) {
+        flood.push(await postAnnounce(port, rawBody))
+        flood.push(
+          await postAnnounce(port, rawBody, {
+            'x-gateway-signature': makeSignature(rawBody, TIMESTAMP, 'wrong-secret'),
+            'x-gateway-timestamp': TIMESTAMP,
+          }),
+        )
+      }
+      const valid = await postAnnounce(port, rawBody, {
+        'x-gateway-signature': makeSignature(rawBody, TIMESTAMP),
+        'x-gateway-timestamp': TIMESTAMP,
+      })
+
+      // #then — the flood was rejected as auth failures, never 429, and the producer got through
+      expect(flood.map(r => r.status)).toEqual([400, 401, 400, 401, 400, 401, 400, 401, 400, 401])
+      expect(flood.every(r => (r.body as {error: string}).error !== 'rate limited')).toBe(true)
+      expect(valid.status).toBe(200)
+      expect(sendMock).toHaveBeenCalledOnce()
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
     }

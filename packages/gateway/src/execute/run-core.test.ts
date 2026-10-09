@@ -10,12 +10,17 @@
 
 import type {OpenCodeServerHandle} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
+import type {QuestionSideEffects} from '../approvals/question-registry.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
 
 import {createOwnershipLedger, DEFAULT_LEDGER_RECONCILE_INTERVAL_MS} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
+import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
+import {MAX_OPTIONS_PER_QUESTION, MAX_QUESTIONS_PER_REQUEST} from '../approvals/question-detail.js'
+import {createQuestionRegistry} from '../approvals/question-registry.js'
+import {createRequestGate} from '../approvals/request-gate.js'
 import {RunCoreError, runOpenCodeCore, wrapLedgerWithHooks} from './run-core.js'
 
 // ---------------------------------------------------------------------------
@@ -260,6 +265,86 @@ function backgroundTaskCompletedEvent(jobId: string, sessionID = 'sess-123', tit
 }
 
 /**
+ * Upstream's injected background-task notice (`tool/task.ts` `inject`): a whole synthetic text part on a
+ * root user message, rendered as `<task id="{childSessionId}" state="completed|error">`. No `part.time`.
+ */
+function taskNoticeEvent(
+  childId: string,
+  options: {
+    readonly state?: 'completed' | 'error'
+    readonly messageID?: string
+    readonly partID?: string
+    readonly sessionID?: string
+  } = {},
+): object {
+  const {state = 'completed', messageID = 'msg-notice-1', partID = 'part-notice-1', sessionID = 'sess-123'} = options
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID,
+      part: {
+        id: partID,
+        messageID,
+        sessionID,
+        type: 'text',
+        synthetic: true,
+        text: `<task id="${childId}" state="${state}">\n<summary>Background task ${state}</summary>\n</task>`,
+      },
+    },
+  }
+}
+
+/** REST `session.messages` shape of a persisted root turn: the prompt answered, then an injected notice answered. */
+function completedFollowUpMessages(
+  childIds: readonly string[],
+  noticeMessageId = 'msg-notice-1',
+  sessionID = 'sess-123',
+): readonly object[] {
+  return [
+    {info: {id: 'msg-prompt', role: 'user', sessionID}, parts: [{type: 'text', text: 'prompt'}]},
+    {
+      info: {
+        id: 'msg-reply-1',
+        role: 'assistant',
+        sessionID,
+        parentID: 'msg-prompt',
+        time: {completed: 1},
+        finish: 'stop',
+      },
+      parts: [],
+    },
+    {
+      info: {id: noticeMessageId, role: 'user', sessionID},
+      parts: childIds.map((childId, index) => ({
+        id: `part-notice-${index + 1}`,
+        type: 'text',
+        synthetic: true,
+        text: `<task id="${childId}" state="completed">`,
+      })),
+    },
+    {
+      info: {
+        id: 'msg-reply-2',
+        role: 'assistant',
+        sessionID,
+        parentID: noticeMessageId,
+        time: {completed: 2},
+        finish: 'stop',
+      },
+      parts: [],
+    },
+  ]
+}
+
+/** `session.messages` handler: the root's persisted turns, and nothing for any other session. */
+function rootMessages(messages: readonly object[]): (args: unknown) => Promise<unknown> {
+  return async args => {
+    const id = (args as {readonly path?: {readonly id?: string}}).path?.id
+    return {data: id === 'sess-123' ? messages : [], error: null}
+  }
+}
+
+/**
  * Build a minimal `OpenCodeServerHandle` test double.
  * All SDK methods are vi.fn() by default; callers override what they need.
  *
@@ -280,6 +365,8 @@ function makeHandle(
     readonly sessionStatus?: (args: unknown) => Promise<unknown>
     /** `client.session.abort` — used by the drain-deadline cancellation path. */
     readonly sessionAbort?: (args: unknown) => Promise<unknown>
+    /** `client.session.messages` — used by the drain-completion REST validation. */
+    readonly sessionMessages?: (args: unknown) => Promise<unknown>
   } = {},
 ): OpenCodeServerHandle {
   const sessionCreate = overrides.sessionCreate ?? (async () => sessionCreateOk())
@@ -289,10 +376,12 @@ function makeHandle(
   const sessionChildren = overrides.sessionChildren ?? (async () => ({data: [], error: null}))
   const sessionStatus = overrides.sessionStatus ?? (async () => ({data: {}, error: null}))
   const sessionAbort = overrides.sessionAbort ?? (async () => ({data: {}, error: null}))
+  const sessionMessages = overrides.sessionMessages ?? (async () => ({data: [], error: null}))
 
   const client = {
     session: {
       create: vi.fn().mockImplementation(sessionCreate),
+      messages: vi.fn().mockImplementation(sessionMessages),
       promptAsync: vi.fn().mockImplementation(promptAsync),
       children: vi.fn().mockImplementation(sessionChildren),
       status: vi.fn().mockImplementation(sessionStatus),
@@ -386,6 +475,33 @@ function permissionRepliedEvent(
     type: 'permission.replied',
     properties: {sessionID, requestID, reply},
   }
+}
+
+// Question-event helpers (module scope; used by the 'question events' tests)
+
+function questionAskedEvent(requestID: string, sessionID = 'sess-123', text = 'Which environment?'): object {
+  return {
+    type: 'question.asked',
+    properties: {
+      id: requestID,
+      sessionID,
+      questions: [{question: text, header: 'Env', options: [{label: 'staging', description: 'Deploy to staging'}]}],
+    },
+  }
+}
+
+function questionRepliedEvent(requestID: string, sessionID = 'sess-123', answers = [['staging']]): object {
+  return {type: 'question.replied', properties: {sessionID, requestID, answers}}
+}
+
+function questionRejectedEvent(requestID: string, sessionID = 'sess-123'): object {
+  return {type: 'question.rejected', properties: {sessionID, requestID}}
+}
+
+function loggedText(logger: GatewayLogger): string {
+  return [logger.debug, logger.info, logger.warn, logger.error]
+    .flatMap(fn => vi.mocked(fn).mock.calls.map(call => JSON.stringify(call)))
+    .join('\n')
 }
 
 describe('runOpenCodeCore', () => {
@@ -2736,6 +2852,216 @@ describe('runOpenCodeCore', () => {
         expect(vi.getTimerCount()).toBe(0)
       })
     })
+
+    // -------------------------------------------------------------------------
+    // Human-wait gauge — the watchdog stays paused until every outstanding
+    // approval has been released, not just the first one.
+    // -------------------------------------------------------------------------
+
+    describe('human-wait gauge', () => {
+      const WINDOW = 5_000
+
+      afterEach(() => {
+        vi.useRealTimers()
+      })
+
+      type Outcome = {readonly ok: true} | {readonly ok: false; readonly error: unknown}
+
+      /** Starts a run over a hand-fed event stream under fake timers. */
+      function startGaugeRun(): {
+        readonly emit: (event: object) => Promise<void>
+        readonly outcome: () => Outcome | undefined
+        readonly done: Promise<void>
+        readonly coordinator: ReturnType<typeof makeCoordinator>
+      } {
+        vi.useFakeTimers()
+        const queue: object[] = []
+        let wake: (() => void) | null = null
+
+        async function* stream(): AsyncGenerator<object> {
+          while (true) {
+            const next = queue.shift()
+            if (next === undefined) {
+              await new Promise<void>(resolve => {
+                wake = resolve
+              })
+            } else {
+              yield next
+            }
+          }
+        }
+
+        const coordinator = makeCoordinator()
+        const handle = makeHandle({subscribe: async () => Promise.resolve({stream: stream()})})
+        let settled: Outcome | undefined
+        const done = runOpenCodeCore({...buildParams(handle), coordinator, inactivityTimeoutMs: WINDOW}).then(
+          () => {
+            settled = {ok: true}
+          },
+          (error: unknown) => {
+            settled = {ok: false, error}
+          },
+        )
+
+        return {
+          emit: async event => {
+            queue.push(event)
+            if (wake !== null) {
+              const resume: () => void = wake
+              wake = null
+              resume()
+            }
+            // Let the loop consume the event before the caller advances the clock.
+            await vi.advanceTimersByTimeAsync(1)
+          },
+          outcome: () => settled,
+          done,
+          coordinator,
+        }
+      }
+
+      function expectInactivityTimeout(outcome: Outcome | undefined): void {
+        expect(outcome?.ok).toBe(false)
+        if (outcome?.ok === false) {
+          expect(outcome.error).toBeInstanceOf(RunCoreError)
+          expect((outcome.error as RunCoreError).kind).toBe('inactivity-timeout')
+        }
+      }
+
+      it('one approval asked then replied: paused while pending, then re-armed with a fresh window', async () => {
+        // #given — one approval pending for far longer than the window
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+        expect(run.outcome()).toBeUndefined()
+
+        // #when — the approval is replied
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+
+        // #then — the window restarts from the reply: not expired just before it, expired just after
+        await vi.advanceTimersByTimeAsync(WINDOW - 10)
+        expect(run.outcome()).toBeUndefined()
+        await vi.advanceTimersByTimeAsync(20)
+        await run.done
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('two approvals, first replied: watchdog stays paused; re-arms only after the second is replied', async () => {
+        // #given — two concurrent approvals
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+        await run.emit(permissionAskedEvent('req-b'))
+
+        // #when — the first is replied
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then — still paused: the second approval is outstanding
+        expect(run.outcome()).toBeUndefined()
+
+        // #when — the second is replied
+        await run.emit(permissionRepliedEvent('req-b', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW + 10)
+        await run.done
+
+        // #then — the watchdog is armed again and fires
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('replied event for an unknown request id leaves the count unchanged while another item is pending', async () => {
+        // #given — one approval pending
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+
+        // #when — an echo arrives for an id that was never asked
+        await run.emit(permissionRepliedEvent('req-ghost', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then — no re-arm: the real approval is still outstanding
+        expect(run.outcome()).toBeUndefined()
+
+        // #when — the real approval is replied
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW + 10)
+        await run.done
+
+        // #then
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('duplicate permission.asked for one id is counted once: a single reply re-arms', async () => {
+        // #given — the same approval id asked twice
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+        await run.emit(permissionAskedEvent('req-a'))
+
+        // #when — one reply
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW + 10)
+        await run.done
+
+        // #then — the duplicate did not leave a phantom pending item
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('repeated replied echo for the same id releases once: the other approval keeps the watchdog paused', async () => {
+        // #given — two approvals, the first replied twice (echo repeated)
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+        await run.emit(permissionAskedEvent('req-b'))
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+
+        // #when
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then — the repeat did not drive the count below the outstanding second item
+        expect(run.outcome()).toBeUndefined()
+
+        // #when — second approval replied, then the run finishes
+        await run.emit(permissionRepliedEvent('req-b', 'once'))
+        await run.emit(sessionIdleEvent('sess-123'))
+        await run.done
+
+        // #then
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('replied echo from a session the run does not own does not release a pending approval', async () => {
+        // #given — an owned approval pending
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+
+        // #when — a foreign session replies with the same request id
+        await run.emit(permissionRepliedEvent('req-a', 'once', 'sess-foreign'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then — ownership gating keeps the approval outstanding
+        expect(run.outcome()).toBeUndefined()
+        expect(run.coordinator.onPermissionReplied).not.toHaveBeenCalled()
+
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await run.emit(sessionIdleEvent('sess-123'))
+        await run.done
+        expect(run.outcome()).toEqual({ok: true})
+      })
+
+      it('inactivity timeout does not fire during a single pending approval', async () => {
+        // #given — one approval pending across many windows
+        const run = startGaugeRun()
+        await run.emit(permissionAskedEvent('req-a'))
+
+        // #when
+        await vi.advanceTimersByTimeAsync(WINDOW * 10)
+
+        // #then — the run is still alive and completes once the approval resolves
+        expect(run.outcome()).toBeUndefined()
+        await run.emit(permissionRepliedEvent('req-a', 'once'))
+        await run.emit(sessionIdleEvent('sess-123'))
+        await run.done
+        expect(run.outcome()).toEqual({ok: true})
+      })
+    })
   })
 
   // ---------------------------------------------------------------------------
@@ -2939,6 +3265,7 @@ describe('runOpenCodeCore', () => {
           // Second pass (triggered by the interval, or another idle) — no longer live.
           return {data: statusCallCount === 1 ? {[CHILD]: {}} : {}, error: null}
         },
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
 
       const onOwnershipChange = vi.fn()
@@ -2949,9 +3276,10 @@ describe('runOpenCodeCore', () => {
       emitNext(backgroundTaskCompletedEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
 
-      // Allow the immediate post-idle reconcile pass (still live) to land, then trigger
-      // a second idle so the loop reconciles again and observes the child gone.
+      // Allow the immediate post-idle reconcile pass (still live) to land. The child then finishes: upstream
+      // injects its completion notice into the parent, the parent answers it, and the root goes idle again.
       await new Promise(resolve => setTimeout(resolve, 10))
+      emitNext(taskNoticeEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
 
       // #then — resolves once the ledger drains; no drain-timeout, no throw.
@@ -3132,6 +3460,7 @@ describe('runOpenCodeCore', () => {
           statusCallCount += 1
           return {data: statusCallCount === 1 ? {[CHILD]: {}} : {}, error: null}
         },
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
 
       const onOwnershipChange = vi.fn()
@@ -3151,6 +3480,7 @@ describe('runOpenCodeCore', () => {
       // Drive the run to completion so nothing leaks into the next test.
       emitNext(sessionIdleEvent('sess-123'))
       await new Promise(resolve => setTimeout(resolve, 10))
+      emitNext(taskNoticeEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
       await runPromise
 
@@ -3420,19 +3750,24 @@ describe('runOpenCodeCore', () => {
       ownershipLedger.adopt(CHILD, 'background task')
       ownershipLedger.settle(CHILD)
 
+      // The child's completion notice reaches the parent and is answered before the root's idle, so the
+      // drain-completion gate has its evidence once the run reaches idle.
+      const {stream, emitNext} = makeControlledStream()
       const abortSpy = vi.fn().mockResolvedValue({data: {}, error: null})
       const handle = makeHandle({
-        subscribe: async () =>
-          subscribeOk([
-            sessionErrorEvent('sess-someone-elses-session', 'unrelated failure'),
-            sessionIdleEvent('sess-123'),
-          ]),
+        subscribe: async () => Promise.resolve({stream}),
         sessionAbort: abortSpy,
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
       const params = {...buildParams(handle), coordinator, ownershipLedger}
+      const runPromise = runOpenCodeCore(params)
+
+      emitNext(sessionErrorEvent('sess-someone-elses-session', 'unrelated failure'))
+      emitNext(taskNoticeEvent(CHILD))
+      emitNext(sessionIdleEvent('sess-123'))
 
       // #when / #then — resolves normally; the barrier never runs at all.
-      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+      await expect(runPromise).resolves.toBeUndefined()
       expect(abortSpy).not.toHaveBeenCalled()
     })
   })
@@ -3507,6 +3842,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () => Promise.resolve({stream}),
         sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
         sessionStatus: async () => ({data: {}, error: null}), // CHILD absent — no longer live
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
 
       const sink = makeSink()
@@ -3532,7 +3868,8 @@ describe('runOpenCodeCore', () => {
       // #then — settled without ever seeing a completion event for CHILD
       expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
 
-      // Cleanup: nothing outstanding remains, so root session.idle completes the run.
+      // Cleanup: nothing outstanding remains; the child's notice was answered, so root idle completes the run.
+      emitNext(taskNoticeEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
       await runPromise
     })
@@ -3551,7 +3888,12 @@ describe('runOpenCodeCore', () => {
         data: childBusy && args?.query?.directory === directory ? {[CHILD]: {type: 'busy'}} : {},
         error: null,
       }))
-      const handle = makeHandle({subscribe: async () => Promise.resolve({stream}), sessionChildren, sessionStatus})
+      const handle = makeHandle({
+        subscribe: async () => Promise.resolve({stream}),
+        sessionChildren,
+        sessionStatus,
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
+      })
       const params = {...buildParams(handle, {directory}), coordinator, ownershipLedger}
       const runPromise = runOpenCodeCore(params)
 
@@ -3570,6 +3912,7 @@ describe('runOpenCodeCore', () => {
       childBusy = false
       await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
       expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
+      emitNext(taskNoticeEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
       await runPromise
     })
@@ -3741,6 +4084,770 @@ describe('runOpenCodeCore', () => {
 
       controller.abort()
       await expect(runPromise).rejects.toThrow()
+    })
+  })
+  // ---------------------------------------------------------------------------
+  // Question events (Unit 3)
+  //
+  // Real question coordinator, registry and request gate over a hand-fed event
+  // stream and fake timers: these tests exercise run-core's gauge, drain, and
+  // gate-subscription behavior against the actual settlement machinery.
+  // ---------------------------------------------------------------------------
+  describe('question events', () => {
+    const WINDOW = 5_000
+    const CHILD = 'sess-child-1'
+    const FOREIGN = 'sess-other-run'
+    const SECRET = 'SECRET-QUESTION-sk-live-abc123'
+    const SCOPE = 'thread-1'
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    type Outcome = {readonly ok: true} | {readonly ok: false; readonly error: unknown}
+
+    function expectInactivityTimeout(outcome: Outcome | undefined): void {
+      expect(outcome?.ok).toBe(false)
+      if (outcome?.ok === false) {
+        expect(outcome.error).toBeInstanceOf(RunCoreError)
+        expect((outcome.error as RunCoreError).kind).toBe('inactivity-timeout')
+      }
+    }
+
+    /** Starts a run with the real question coordinator, registry and gate under fake timers. */
+    function startQuestionRun(
+      options: {
+        readonly extraOwned?: readonly string[]
+        /** Deadline for a question asked now; `'none'` models a run with no budget left for one. */
+        readonly deadlineMs?: number | 'none'
+        readonly effects?: Partial<QuestionSideEffects>
+        readonly withQuestions?: boolean
+        readonly ownershipLedger?: ReturnType<typeof createOwnershipLedger>
+        readonly sessionStatus?: () => Promise<unknown>
+        readonly sessionAbort?: () => Promise<unknown>
+        readonly sessionMessages?: (args: unknown) => Promise<unknown>
+        readonly onBusy?: (busy: boolean) => void
+        readonly onRegistered?: () => void
+        readonly signal?: AbortSignal
+      } = {},
+    ) {
+      vi.useFakeTimers()
+      const logger = makeLogger()
+      const gate = createRequestGate({logger})
+      const registry = createQuestionRegistry({logger, gate})
+      const effects: QuestionSideEffects = {
+        replyQuestion: vi.fn().mockResolvedValue({ok: true}),
+        rejectQuestion: vi.fn().mockResolvedValue({ok: true}),
+        ...options.effects,
+      }
+      const deadline = options.deadlineMs ?? 60_000
+      const questions = createQuestionCoordinator({
+        logger,
+        registry,
+        effects,
+        scopeId: SCOPE,
+        computeDeadlineMs: () => (deadline === 'none' ? undefined : deadline),
+        ...(options.onRegistered === undefined ? {} : {onRegistered: options.onRegistered}),
+      })
+      const {stream, emitNext} = makeControlledStream()
+      const coordinator = makeCoordinator(options.extraOwned)
+      const handle = makeHandle({
+        subscribe: async () => Promise.resolve({stream}),
+        sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
+        ...(options.sessionStatus === undefined ? {} : {sessionStatus: options.sessionStatus}),
+        ...(options.sessionAbort === undefined ? {} : {sessionAbort: options.sessionAbort}),
+        ...(options.sessionMessages === undefined ? {} : {sessionMessages: options.sessionMessages}),
+      })
+
+      let settled: Outcome | undefined
+      const done = runOpenCodeCore({
+        ...buildParams(handle),
+        logger,
+        coordinator,
+        ...(options.withQuestions === false ? {} : {questions}),
+        onHumanWaitTerminal: gate.onTerminal,
+        inactivityTimeoutMs: WINDOW,
+        ...(options.ownershipLedger === undefined ? {} : {ownershipLedger: options.ownershipLedger}),
+        ...(options.onBusy === undefined ? {} : {onBusy: options.onBusy}),
+        ...(options.signal === undefined ? {} : {signal: options.signal}),
+      }).then(
+        () => {
+          settled = {ok: true}
+        },
+        (error: unknown) => {
+          settled = {ok: false, error}
+        },
+      )
+
+      return {
+        logger,
+        gate,
+        registry,
+        questions,
+        effects,
+        coordinator,
+        done,
+        outcome: () => settled,
+        emit: async (event: object) => {
+          emitNext(event)
+          // Let the loop consume the event before the caller advances the clock.
+          await vi.advanceTimersByTimeAsync(1)
+        },
+      }
+    }
+
+    it('root question asked: registered and the watchdog pauses; the replied echo confirms and re-arms', async () => {
+      // #given a root-session question
+      const run = startQuestionRun()
+      await run.emit(questionAskedEvent('que_1'))
+
+      // #then it is registered with the run's scope, and the watchdog stays paused far past the window
+      expect(run.registry.describePendingForScope(SCOPE).map(dto => dto.requestID)).toEqual(['que_1'])
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(run.outcome()).toBeUndefined()
+
+      // #when OpenCode echoes the reply
+      await run.emit(questionRepliedEvent('que_1'))
+
+      // #then the entry is confirmed and the watchdog re-armed with a fresh window
+      expect(run.registry.has('que_1')).toBe(false)
+      await vi.advanceTimersByTimeAsync(WINDOW - 10)
+      expect(run.outcome()).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(20)
+      await run.done
+      expectInactivityTimeout(run.outcome())
+    })
+
+    it('a rejected echo releases the wait like a replied one: outside drain the watchdog re-arms', async () => {
+      // #given a root-session question holding the watchdog
+      const run = startQuestionRun()
+      await run.emit(questionAskedEvent('que_1'))
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(run.outcome()).toBeUndefined()
+
+      // #when OpenCode echoes a rejection
+      await run.emit(questionRejectedEvent('que_1'))
+
+      // #then the entry is gone and the quiet run now times out on a fresh window
+      expect(run.registry.has('que_1')).toBe(false)
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await run.done
+      expectInactivityTimeout(run.outcome())
+    })
+
+    it('an adopted child session question is registered with the run scope', async () => {
+      // #given a child session the run owns
+      const run = startQuestionRun({extraOwned: [CHILD]})
+
+      // #when the child asks
+      await run.emit(questionAskedEvent('que_child', CHILD))
+
+      // #then
+      expect(run.registry.describePendingForScope(SCOPE).map(dto => dto.requestID)).toEqual(['que_child'])
+    })
+
+    it('a question from a session the run does not own is ignored with a warning; the watchdog is unaffected', async () => {
+      // #given
+      const run = startQuestionRun()
+
+      // #when a foreign session asks, carrying secret-shaped text
+      await run.emit(questionAskedEvent('que_foreign', FOREIGN, SECRET))
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await run.done
+
+      // #then not registered, warned with ids and a reason code, and the watchdog was never paused
+      expect(run.registry.pending()).toEqual([])
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'que_foreign', sessionID: FOREIGN, reason: 'unowned-session'}),
+        expect.stringContaining('does not own'),
+      )
+      expectInactivityTimeout(run.outcome())
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it('approval and question pending together: the watchdog re-arms only after both settle', async () => {
+      // #given an approval and a question outstanding
+      const run = startQuestionRun()
+      await run.emit(permissionAskedEvent('per_1'))
+      await run.emit(questionAskedEvent('que_1'))
+
+      // #when the approval is replied first
+      await run.emit(permissionRepliedEvent('per_1', 'once'))
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+      // #then the question still holds the watchdog
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the question settles
+      await run.emit(questionRepliedEvent('que_1'))
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await run.done
+
+      // #then the watchdog is armed again
+      expectInactivityTimeout(run.outcome())
+    })
+
+    describe('activity does not undo the human-wait or drain pause', () => {
+      it('(a) an owned child text delta while a question is pending does not re-arm the watchdog', async () => {
+        // #given a pending question from an owned child, with a long question deadline
+        const run = startQuestionRun({extraOwned: [CHILD]})
+        await run.emit(questionAskedEvent('que_child', CHILD))
+
+        // #when the child streams text, then everything goes quiet for longer than the window
+        await run.emit(partDeltaWithPartId('still working', 'part-1', CHILD))
+        await vi.advanceTimersByTimeAsync(WINDOW * 3)
+
+        // #then no inactivity-timeout fired, and the question is still pending
+        expect(run.outcome()).toBeUndefined()
+        expect(run.registry.has('que_child')).toBe(true)
+      })
+
+      it('(b) a parallel root tool completion while a question is pending does not re-arm the watchdog', async () => {
+        // #given a pending root question
+        const run = startQuestionRun()
+        await run.emit(questionAskedEvent('que_1'))
+
+        // #when a parallel tool completes on the root, then silence longer than the window
+        await run.emit(partUpdatedToolEvent('bash', 'completed', {input: {command: 'ls'}, title: 'ls'}))
+        await vi.advanceTimersByTimeAsync(WINDOW * 3)
+
+        // #then the run is still alive and the question is still pending
+        expect(run.outcome()).toBeUndefined()
+        expect(run.registry.has('que_1')).toBe(true)
+      })
+
+      it('(c) with two waits held and one settled, activity does not re-arm the watchdog', async () => {
+        // #given a question and an approval outstanding
+        const run = startQuestionRun()
+        await run.emit(questionAskedEvent('que_1'))
+        await run.emit(permissionAskedEvent('per_1'))
+
+        // #when the approval settles, activity arrives, and the run goes quiet past the window
+        await run.emit(permissionRepliedEvent('per_1', 'once'))
+        await run.emit(partDeltaWithPartId('still working', 'part-1'))
+        await vi.advanceTimersByTimeAsync(WINDOW * 3)
+
+        // #then the question still holds the watchdog: no timeout
+        expect(run.outcome()).toBeUndefined()
+        expect(run.registry.has('que_1')).toBe(true)
+      })
+
+      it('(d) after the last wait settles outside drain, activity resets normally and silence still times out', async () => {
+        // #given a question that has settled, re-arming the watchdog with a fresh window
+        const run = startQuestionRun()
+        await run.emit(questionAskedEvent('que_1'))
+        await run.emit(questionRepliedEvent('que_1'))
+
+        // #when activity arrives partway through the window
+        await vi.advanceTimersByTimeAsync(WINDOW - 1_000)
+        await run.emit(partDeltaWithPartId('output', 'part-1'))
+
+        // #then the window restarted from the activity: alive just before it expires...
+        await vi.advanceTimersByTimeAsync(WINDOW - 1_000)
+        expect(run.outcome()).toBeUndefined()
+
+        // #and silence past the window times out as before
+        await vi.advanceTimersByTimeAsync(1_100)
+        await run.done
+        expectInactivityTimeout(run.outcome())
+      })
+
+      it('(e) activity while draining does not re-arm the watchdog: no inactivity timeout, no drain-timeout, no cancellation', async () => {
+        // #given a live background child and the root gone idle (drain)
+        const sessionAbort = vi.fn().mockResolvedValue({data: {}, error: null})
+        const ownershipLedger = createOwnershipLedger()
+        const run = startQuestionRun({
+          extraOwned: [CHILD],
+          ownershipLedger,
+          sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}),
+          sessionAbort,
+        })
+        await run.emit(backgroundTaskCompletedEvent(CHILD))
+        await run.emit(sessionIdleEvent('sess-123'))
+        expect(ownershipLedger.isDrainComplete()).toBe(false)
+
+        // #when the child produces text and tool activity, then goes quiet past the window
+        await run.emit(partDeltaWithPartId('child output', 'part-1', CHILD))
+        await run.emit(partUpdatedToolEvent('bash', 'completed', {input: {command: 'ls'}, title: 'ls'}, CHILD))
+        await vi.advanceTimersByTimeAsync(WINDOW * 4)
+
+        // #then the run is still draining: no inactivity-timeout (which would surface as drain-timeout)
+        expect(run.outcome()).toBeUndefined()
+        // #and the owned work was not cancelled
+        expect(sessionAbort).not.toHaveBeenCalled()
+      })
+    })
+
+    it('#1736 drain: answering a question mid-drain neither completes the run, re-arms inactivity, nor cancels owned work', async () => {
+      // #given a live background child, a pending question from it, and the root gone idle (drain)
+      let childLive = true
+      const sessionAbort = vi.fn().mockResolvedValue({data: {}, error: null})
+      const onBusy = vi.fn()
+      const ownershipLedger = createOwnershipLedger()
+      const run = startQuestionRun({
+        extraOwned: [CHILD],
+        ownershipLedger,
+        sessionStatus: async () => ({data: childLive ? {[CHILD]: {}} : {}, error: null}),
+        sessionAbort,
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
+        onBusy,
+      })
+      await run.emit(backgroundTaskCompletedEvent(CHILD))
+      await run.emit(questionAskedEvent('que_child', CHILD))
+      await run.emit(sessionIdleEvent('sess-123'))
+      expect(ownershipLedger.isDrainComplete()).toBe(false)
+      onBusy.mockClear()
+
+      // #when the question is answered while draining
+      await run.emit(questionRepliedEvent('que_child', CHILD))
+
+      // #then the run is still draining and inactivity was not re-armed (typing stays off too)
+      expect(run.outcome()).toBeUndefined()
+      expect(onBusy).not.toHaveBeenCalledWith(true)
+
+      // #and a quiet but valid child outlasts the inactivity window: no drain-timeout, no cancellation
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(run.outcome()).toBeUndefined()
+      expect(sessionAbort).not.toHaveBeenCalled()
+
+      // #when the child settles through the ledger, its notice reaches the parent, and the parent answers it
+      childLive = false
+      await run.emit(taskNoticeEvent(CHILD))
+      await run.emit(sessionIdleEvent('sess-123'))
+      await run.done
+
+      // #then the run completes normally, with the owned work settled rather than cancelled
+      expect(run.outcome()).toEqual({ok: true})
+      expect(ownershipLedger.snapshot().find(entry => entry.sessionId === CHILD)?.state).toBe('settled')
+      expect(sessionAbort).not.toHaveBeenCalled()
+    })
+
+    it('#1736 drain: a question released by a failed deadline skip mid-drain does not complete the drain either', async () => {
+      // #given a live child, its pending question with a short deadline whose skip reply fails, and drain
+      const replyQuestion = vi.fn().mockResolvedValue({ok: false, error: 'down'})
+      const sessionAbort = vi.fn().mockResolvedValue({data: {}, error: null})
+      const run = startQuestionRun({
+        deadlineMs: 1_000,
+        effects: {replyQuestion},
+        extraOwned: [CHILD],
+        ownershipLedger: createOwnershipLedger(),
+        sessionStatus: async () => ({data: {[CHILD]: {}}, error: null}),
+        sessionAbort,
+      })
+      await run.emit(backgroundTaskCompletedEvent(CHILD))
+      await run.emit(questionAskedEvent('que_child', CHILD))
+      await run.emit(sessionIdleEvent('sess-123'))
+
+      // #when the deadline passes and the terminal notification releases the wait
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(replyQuestion).toHaveBeenCalledExactlyOnceWith('que_child', [[]])
+      expect(run.registry.has('que_child')).toBe(false)
+
+      // #then the watchdog stays paused and the run keeps draining on the ledger
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(run.outcome()).toBeUndefined()
+      expect(sessionAbort).not.toHaveBeenCalled()
+    })
+
+    it('#1736 drain: root idle with a question pending and an empty ledger completes on the ledger alone; teardown rejects the question', async () => {
+      // #given a question outstanding and nothing owned in the ledger
+      const run = startQuestionRun({ownershipLedger: createOwnershipLedger()})
+      await run.emit(questionAskedEvent('que_1'))
+      expect(run.registry.has('que_1')).toBe(true)
+
+      // #when the root goes idle
+      await run.emit(sessionIdleEvent('sess-123'))
+      await run.done
+
+      // #then the run completed without waiting on the question, which nothing has settled
+      expect(run.outcome()).toEqual({ok: true})
+      expect(run.registry.has('que_1')).toBe(true)
+      expect(run.effects.replyQuestion).not.toHaveBeenCalled()
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+
+      // #when run teardown disposes the question
+      await run.questions.dispose('run ended')
+
+      // #then it is rejected through the existing teardown path
+      expect(run.effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
+      expect(run.registry.has('que_1')).toBe(false)
+    })
+
+    it('#1736 drain: root idle with a question pending and a settled ledger completes on notice and root freshness, not the question; teardown rejects the question', async () => {
+      // #given a background child that finishes (not live) while its question is still pending, and whose
+      // completion notice the parent has already answered
+      const ownershipLedger = createOwnershipLedger()
+      const run = startQuestionRun({
+        extraOwned: [CHILD],
+        ownershipLedger,
+        sessionStatus: async () => ({data: {}, error: null}),
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
+      })
+      await run.emit(backgroundTaskCompletedEvent(CHILD))
+      await run.emit(questionAskedEvent('que_child', CHILD))
+      await run.emit(taskNoticeEvent(CHILD))
+
+      // #when the root goes idle and the reconcile pass settles the child
+      await run.emit(sessionIdleEvent('sess-123'))
+      await run.done
+
+      // #then the ledger plus the notice and root freshness ended the drain; the question did not hold the run
+      expect(ownershipLedger.isDrainComplete()).toBe(true)
+      expect(run.outcome()).toEqual({ok: true})
+      expect(run.registry.has('que_child')).toBe(true)
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+
+      // #when run teardown disposes the question
+      await run.questions.dispose('run ended')
+
+      // #then it is rejected through the existing teardown path
+      expect(run.effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_child')
+      expect(run.registry.has('que_child')).toBe(false)
+    })
+
+    it('a pending approval alone does not hold root-idle completion (existing behavior)', async () => {
+      // #given an approval pending when the root goes idle
+      const run = startQuestionRun()
+      await run.emit(permissionAskedEvent('per_1'))
+
+      // #when
+      await run.emit(sessionIdleEvent('sess-123'))
+      await run.done
+
+      // #then
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('malformed question.asked: warns with a reason code only, registers nothing, does not pause the watchdog', async () => {
+      // #given a payload with a secret-shaped question but no options array
+      const run = startQuestionRun()
+      await run.emit({
+        type: 'question.asked',
+        properties: {id: 'que_bad', sessionID: 'sess-123', questions: [{question: SECRET, header: SECRET}]},
+      })
+      await run.emit({type: 'question.asked', properties: {sessionID: 'sess-123', questions: []}})
+
+      // #when the run goes quiet
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await run.done
+
+      // #then nothing registered; the warnings carry reason codes; no secret in any log; watchdog fired
+      expect(run.registry.pending()).toEqual([])
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({reason: 'invalid-question'}),
+        expect.stringContaining('malformed'),
+      )
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({reason: 'missing-request-id'}),
+        expect.stringContaining('malformed'),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+      expectInactivityTimeout(run.outcome())
+    })
+
+    it('malformed question.asked with a readable id is rejected so the agent does not wait for the timeout', async () => {
+      // #given a payload whose questions are unparseable (secret-shaped) but whose id and session parse
+      const run = startQuestionRun()
+
+      // #when it arrives
+      await run.emit({
+        type: 'question.asked',
+        properties: {id: 'que_bad', sessionID: 'sess-123', questions: [{question: SECRET, header: SECRET}]},
+      })
+
+      // #then the request is rejected through the question effects, and nothing is registered
+      expect(run.effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_bad')
+      expect(run.effects.replyQuestion).not.toHaveBeenCalled()
+      expect(run.registry.pending()).toEqual([])
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'que_bad', reason: 'invalid-question'}),
+        expect.stringContaining('rejected'),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it.each([
+      ['more questions than the cap', MAX_QUESTIONS_PER_REQUEST + 1, 2],
+      ['more options than the cap', 1, MAX_OPTIONS_PER_QUESTION + 1],
+    ])('an ask with %s is rejected once and never stored or fanned out', async (_label, questionCount, optionCount) => {
+      // #given an oversize ask with secret-shaped text and a readable id
+      const onRegistered = vi.fn()
+      const run = startQuestionRun({onRegistered})
+      const oversizeQuestion = {
+        question: SECRET,
+        header: SECRET,
+        options: Array.from({length: optionCount}, (_, index) => ({label: `${SECRET}-${index}`, description: ''})),
+      }
+
+      // #when it arrives
+      await run.emit({
+        type: 'question.asked',
+        properties: {
+          id: 'que_big',
+          sessionID: 'sess-123',
+          questions: Array.from({length: questionCount}, () => oversizeQuestion),
+        },
+      })
+
+      // #then OpenCode is told to reject it, exactly once, and the gateway holds and announces nothing
+      expect(run.effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_big')
+      expect(run.effects.replyQuestion).not.toHaveBeenCalled()
+      expect(run.registry.pending()).toEqual([])
+      expect(run.registry.describePendingForScope(SCOPE)).toEqual([])
+      expect(onRegistered).not.toHaveBeenCalled()
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'que_big', reason: 'oversize'}),
+        expect.stringContaining('rejected'),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it('malformed question.asked whose reject fails is warned with a reason code and never throws', async () => {
+      // #given the reject call fails
+      const run = startQuestionRun({effects: {rejectQuestion: vi.fn().mockRejectedValue(new Error(SECRET))}})
+
+      // #when a malformed ask with a readable id arrives
+      await run.emit({
+        type: 'question.asked',
+        properties: {id: 'que_bad', sessionID: 'sess-123', questions: 'not-an-array'},
+      })
+
+      // #then the failure is a reason code in a warning, with no error text
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'que_bad', rejectOutcome: 'reject-threw'}),
+        expect.stringContaining('could not be rejected'),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it('malformed question.asked with no parseable id is only warn-logged, never rejected', async () => {
+      // #given a payload with no id
+      const run = startQuestionRun()
+
+      // #when it arrives
+      await run.emit({type: 'question.asked', properties: {sessionID: 'sess-123', questions: []}})
+
+      // #then nothing can be addressed: warn only, no reject
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({reason: 'missing-request-id'}),
+        expect.stringContaining('malformed'),
+      )
+    })
+
+    it('malformed question.asked from an unowned session is never rejected', async () => {
+      // #given a malformed ask from a session this run does not own
+      const run = startQuestionRun()
+
+      // #when it arrives
+      await run.emit({
+        type: 'question.asked',
+        properties: {id: 'que_foreign', sessionID: FOREIGN, questions: 'not-an-array'},
+      })
+
+      // #then the run leaves another run's request alone
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+    })
+
+    it('without a question handler an owned question.asked is warned and does not pause the watchdog', async () => {
+      // #given
+      const run = startQuestionRun({withQuestions: false})
+
+      // #when
+      await run.emit(questionAskedEvent('que_1', 'sess-123', SECRET))
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await run.done
+
+      // #then
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({reason: 'no-question-handler'}),
+        expect.any(String),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+      expectInactivityTimeout(run.outcome())
+    })
+
+    it('budget below the deadline floor: skipped immediately with empty answers, never registered, gauge back to zero', async () => {
+      // #given a run with no budget left for a deadline
+      const run = startQuestionRun({deadlineMs: 'none'})
+
+      // #when a question is asked (secret-shaped text)
+      await run.emit(questionAskedEvent('que_late', 'sess-123', SECRET))
+
+      // #then an empty reply for every question went out and nothing is registered
+      expect(run.effects.replyQuestion).toHaveBeenCalledExactlyOnceWith('que_late', [[]])
+      expect(run.effects.rejectQuestion).not.toHaveBeenCalled()
+      expect(run.registry.pending()).toEqual([])
+      expect(run.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'que_late', reason: 'no-deadline-budget'}),
+        expect.any(String),
+      )
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+
+      // #and the gauge returned to zero: the watchdog is armed again and root idle completes
+      await run.emit(sessionIdleEvent('sess-123'))
+      await run.done
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('budget below the floor with a failing skip reply: the gauge is still released', async () => {
+      // #given the immediate skip fails (reported error) and then throws
+      const replyQuestion = vi
+        .fn()
+        .mockResolvedValueOnce({ok: false, error: 'down'})
+        .mockRejectedValueOnce(new Error(SECRET))
+      const run = startQuestionRun({deadlineMs: 'none', effects: {replyQuestion}})
+
+      // #when two questions are asked
+      await run.emit(questionAskedEvent('que_a'))
+      await run.emit(questionAskedEvent('que_b'))
+
+      // #then the watchdog re-armed (nothing is held)
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await run.done
+      expectInactivityTimeout(run.outcome())
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it('deadline skip POST fails with no echo: the terminal notification releases the gauge and re-arms the watchdog', async () => {
+      // #given a registered question whose skip reply will fail, and no echo will ever arrive
+      const replyQuestion = vi.fn().mockResolvedValue({ok: false, error: 'down'})
+      const run = startQuestionRun({deadlineMs: 1_000, effects: {replyQuestion}})
+      await run.emit(questionAskedEvent('que_1'))
+
+      // #when the deadline passes
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      // #then the skip was attempted and the entry left the gate
+      expect(replyQuestion).toHaveBeenCalledExactlyOnceWith('que_1', [[]])
+      expect(run.registry.has('que_1')).toBe(false)
+
+      // #and the watchdog was re-armed by the terminal notification alone: the quiet run times out
+      expect(run.outcome()).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await run.done
+      expectInactivityTimeout(run.outcome())
+    })
+
+    it('deadline skip with a throwing reply effect: contained, the watchdog re-arms', async () => {
+      // #given
+      const replyQuestion = vi.fn().mockRejectedValue(new Error(SECRET))
+      const run = startQuestionRun({deadlineMs: 1_000, effects: {replyQuestion}})
+      await run.emit(questionAskedEvent('que_1'))
+
+      // #when the deadline passes and the run then goes quiet for a full window
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await run.done
+
+      // #then nothing threw into the loop; the only failure is the (re-armed) inactivity timeout
+      expectInactivityTimeout(run.outcome())
+      expect(loggedText(run.logger)).not.toContain(SECRET)
+    })
+
+    it('#1736: a question with no further events is skipped at its deadline, not failed by the inactivity timeout', async () => {
+      // #given the historical failure: a question is asked and OpenCode then goes quiet for far
+      // longer than the inactivity window (5s here; 5 min in production)
+      const run = startQuestionRun({deadlineMs: 60_000})
+      await run.emit(questionAskedEvent('que_1', 'sess-123', SECRET))
+
+      // #when the question deadline passes
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      // #then it was skipped with an empty reply and the run is still alive
+      expect(run.effects.replyQuestion).toHaveBeenCalledExactlyOnceWith('que_1', [[]])
+      expect(run.outcome()).toBeUndefined()
+
+      // #when OpenCode echoes the skip and the agent finishes
+      await run.emit(questionRepliedEvent('que_1', 'sess-123', [[]]))
+      await run.emit(sessionIdleEvent('sess-123'))
+      await run.done
+
+      // #then the run completed; it did not reach the inactivity timeout
+      expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('an echo releases the wait even when the gate holds no entry for it', async () => {
+      // #given a handler that accepts the question but never registers it with the gate
+      vi.useFakeTimers()
+      const logger = makeLogger()
+      const questions = {
+        onAsked: vi.fn().mockResolvedValue('registered'),
+        onEcho: vi.fn(),
+        onMalformed: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn().mockResolvedValue(undefined),
+      }
+      const {stream, emitNext} = makeControlledStream()
+      let settled: Outcome | undefined
+      const done = runOpenCodeCore({
+        ...buildParams(makeHandle({subscribe: async () => Promise.resolve({stream})})),
+        logger,
+        coordinator: makeCoordinator(),
+        questions,
+        inactivityTimeoutMs: WINDOW,
+      }).then(
+        () => {
+          settled = {ok: true}
+        },
+        (error: unknown) => {
+          settled = {ok: false, error}
+        },
+      )
+      emitNext(questionAskedEvent('que_1'))
+      await vi.advanceTimersByTimeAsync(WINDOW * 4)
+      expect(settled).toBeUndefined()
+
+      // #when OpenCode echoes the settlement
+      emitNext(questionRepliedEvent('que_1'))
+      await vi.advanceTimersByTimeAsync(WINDOW + 10)
+      await done
+
+      // #then the echo reached the handler and re-armed the watchdog
+      expect(questions.onEcho).toHaveBeenCalledOnce()
+      expectInactivityTimeout(settled)
+    })
+
+    it('a skip that finishes after the run ended does not re-arm a timer', async () => {
+      // #given a question skipped for lack of budget whose reply is still in flight when the run is aborted
+      const controller = new AbortController()
+      let resolveReply!: (result: {ok: true}) => void
+      const replyQuestion = vi.fn().mockReturnValue(
+        new Promise<{ok: true}>(resolve => {
+          resolveReply = resolve
+        }),
+      )
+      const run = startQuestionRun({
+        deadlineMs: 'none',
+        effects: {replyQuestion},
+        signal: controller.signal,
+      })
+      await run.emit(questionAskedEvent('que_1'))
+      controller.abort()
+      await vi.advanceTimersByTimeAsync(1)
+      await run.done
+      expect(run.outcome()?.ok).toBe(false)
+
+      // #when the reply finally completes
+      resolveReply({ok: true})
+      await vi.advanceTimersByTimeAsync(1)
+
+      // #then the late release did not resurrect the disposed watchdog
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('aborting the run with a question pending ends the run without hanging on the wait', async () => {
+      // #given a pending question and an operator cancel
+      const controller = new AbortController()
+      const run = startQuestionRun({signal: controller.signal})
+      await run.emit(questionAskedEvent('que_1'))
+
+      // #when the run is aborted
+      controller.abort()
+      await vi.advanceTimersByTimeAsync(1)
+      await run.done
+
+      // #then run-core exits with the timeout-signal failure (run.ts rejects the pending question during teardown)
+      expect(run.outcome()).toMatchObject({ok: false, error: {kind: 'timeout'}})
     })
   })
 })

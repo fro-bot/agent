@@ -783,6 +783,7 @@ describe('runIndex.register() wiring (FIX 5)', () => {
       register: registerFn,
       lookup: vi.fn().mockResolvedValue(undefined),
       listRunsForRepo: vi.fn().mockResolvedValue([]),
+      readRun: vi.fn().mockResolvedValue(undefined),
     }
 
     const deps = makeDeps({runIndex})
@@ -824,6 +825,7 @@ describe('runIndex.register() wiring (FIX 5)', () => {
       register: registerFn,
       lookup: vi.fn().mockResolvedValue(undefined),
       listRunsForRepo: vi.fn().mockResolvedValue([]),
+      readRun: vi.fn().mockResolvedValue(undefined),
     }
 
     const deps = makeDeps({runIndex})
@@ -1065,6 +1067,7 @@ describe('launchWork admission', () => {
       register: registerFn,
       lookup: vi.fn().mockResolvedValue(undefined),
       listRunsForRepo: vi.fn().mockResolvedValue([]),
+      readRun: vi.fn().mockResolvedValue(undefined),
     }
 
     const request = makeInMemoryRequest()

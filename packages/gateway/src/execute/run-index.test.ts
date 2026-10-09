@@ -1668,3 +1668,93 @@ describe('createRunIndex', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// readRun — single-run durable read (#1639)
+// ---------------------------------------------------------------------------
+
+type GetObjectFn = NonNullable<CoordinationConfig['storeAdapter']['getObject']>
+
+function makeIndexWithGetObject(getObject: GetObjectFn) {
+  const base = makeCoordinationConfig()
+  const coordinationConfig: CoordinationConfig = {
+    ...base,
+    storeAdapter: {...base.storeAdapter, getObject},
+  }
+  const deps = makeDeps()
+  const index = createRunIndex({
+    bindingsStore: deps.bindingsStore,
+    coordinationConfig,
+    identity: 'gateway',
+    logger: deps.logger,
+  })
+  return {index, list: coordinationConfig.storeAdapter.list as ReturnType<typeof vi.fn>, logger: deps.logger}
+}
+
+describe('createRunIndex — readRun', () => {
+  it('reads exactly one object by run key and returns the parsed state, without listing', async () => {
+    // #given a durable store holding one completed run
+    const stored: RunState = {...makeRunState('run-a', 'acme/widget'), phase: 'COMPLETED'}
+    const getObject = vi.fn<GetObjectFn>(async () => ({
+      success: true as const,
+      data: {data: JSON.stringify(stored), etag: 'etag-1'},
+    }))
+    const {index, list} = makeIndexWithGetObject(getObject)
+
+    // #when
+    const result = await index.readRun('acme/widget', 'run-a')
+
+    // #then a single targeted GET (no repo scan) returns the stored state
+    expect(result).toMatchObject({run_id: 'run-a', phase: 'COMPLETED'})
+    expect(getObject).toHaveBeenCalledTimes(1)
+    expect(String(getObject.mock.calls[0]?.[0])).toContain('run-a')
+    expect(list).not.toHaveBeenCalled()
+  })
+
+  it('returns undefined when the object is missing, unparsable, or the read throws', async () => {
+    // #given each failure mode of the store
+    const missing = makeIndexWithGetObject(
+      vi.fn(async () => ({success: false as const, error: new Error('NoSuchKey')})),
+    )
+    const garbage = makeIndexWithGetObject(
+      vi.fn(async () => ({success: true as const, data: {data: '{not json', etag: 'e'}})),
+    )
+    const throwing = makeIndexWithGetObject(
+      vi.fn(async () => {
+        throw new Error('socket hang up')
+      }),
+    )
+
+    // #when / #then each resolves to undefined and never throws
+    await expect(missing.index.readRun('acme/widget', 'run-a')).resolves.toBeUndefined()
+    await expect(garbage.index.readRun('acme/widget', 'run-a')).resolves.toBeUndefined()
+    await expect(throwing.index.readRun('acme/widget', 'run-a')).resolves.toBeUndefined()
+  })
+
+  it('refuses a stored state whose run id does not match the one requested', async () => {
+    // #given a store entry for a different run than asked for
+    const other = makeRunState('run-other', 'acme/widget')
+    const {index} = makeIndexWithGetObject(
+      vi.fn(async () => ({success: true as const, data: {data: JSON.stringify(other), etag: 'e'}})),
+    )
+
+    // #when / #then
+    await expect(index.readRun('acme/widget', 'run-a')).resolves.toBeUndefined()
+  })
+
+  it('uses the injected findRunsForRepo override when provided', async () => {
+    // #given the test seam instead of the store adapter
+    const deps = makeDeps()
+    const index = createRunIndex({
+      bindingsStore: deps.bindingsStore,
+      coordinationConfig: deps.coordinationConfig,
+      identity: 'gateway',
+      logger: deps.logger,
+      findRunsForRepo: async () => [makeRunState('run-a', 'acme/widget'), makeRunState('run-b', 'acme/widget')],
+    })
+
+    // #when / #then
+    await expect(index.readRun('acme/widget', 'run-b')).resolves.toMatchObject({run_id: 'run-b'})
+    await expect(index.readRun('acme/widget', 'nope')).resolves.toBeUndefined()
+  })
+})
