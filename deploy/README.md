@@ -381,7 +381,7 @@ The operator web surface is a browser-facing authenticated API that lets human o
 | `GATEWAY_OPERATOR_CSRF_SECRET` / `_FILE` | CSRF signing key — 256-bit CSPRNG entropy, base64url-encoded, no padding |
 | `GATEWAY_OPERATOR_ALLOWLIST` / `GATEWAY_OPERATOR_ALLOWLIST_FILE` | Newline-separated numeric GitHub user IDs permitted to log in |
 | `GATEWAY_OPERATOR_TRUSTED_PROXIES` | **Required.** Comma-separated exact IPv4/IPv6 addresses of the reverse-proxy hop(s) in front of the operator listener. Gateway refuses to start without it. See [Trusted proxies](#trusted-proxies) below. |
-| `GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS` | Optional comma-separated list of allowed post-auth redirect paths (default: `/operator`) |
+| `GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS` | Optional comma-separated list of allowed post-auth redirect paths (default: `/operator`). The **first** entry is also the default landing path: a sign-in with no `return_to` (e.g. opening `/operator/auth/github/start` directly) redirects there. |
 
 For secret provisioning details see [Required secrets](#required-secrets) above.
 

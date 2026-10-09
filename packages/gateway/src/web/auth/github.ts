@@ -160,7 +160,8 @@ export interface GitHubOAuthDeps {
   /**
    * Server-side session store. When present, a successful OAuth callback mints
    * a fresh session and sets the __Host- session cookie. When absent, the
-   * callback returns a coarse JSON identity response (pre-session-layer posture).
+   * callback returns a coarse JSON identity response (pre-session-layer posture;
+   * there is no session to land in, so no default-path redirect applies).
    */
   readonly sessionStore?: SessionStore
   /**
@@ -208,6 +209,9 @@ export interface GitHubOAuthConfig {
   /**
    * Allowlisted same-origin return paths for post-auth redirect.
    * Only paths in this list are accepted as return_to targets.
+   *
+   * The FIRST entry doubles as the default landing path: when sign-in completes
+   * with no captured return_to, the callback redirects there (still validated).
    */
   readonly allowedReturnPaths: readonly string[]
   /**
@@ -439,6 +443,16 @@ const OAUTH_START_PATH = '/operator/auth/github/start'
  */
 export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config: GitHubOAuthConfig): void {
   const callbackUri = `${config.publicOrigin}${config.callbackPath}`
+
+  // Default post-auth landing path, used when no (valid) return_to was captured
+  // (e.g. /start opened directly): the first allowedReturnPaths entry — the
+  // config default is ['/operator'], the operator UI. It runs through the same
+  // validator as every other redirect target, so a misconfigured entry (absolute
+  // URL, protocol-relative, non-rooted) or an empty list yields null and can
+  // never become an open redirect.
+  const [firstAllowedPath] = config.allowedReturnPaths
+  const defaultLandingPath =
+    firstAllowedPath === undefined ? null : validateReturnPath(firstAllowedPath, config.allowedReturnPaths)
 
   // ── GET /operator/auth/github/start ────────────────────────────────────────
 
@@ -817,6 +831,16 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
         }
       }
 
+      // No usable captured return path: land on the default operator landing
+      // path rather than a bare identity JSON page.
+      if (defaultLandingPath !== null) {
+        return c.redirect(defaultLandingPath, 302)
+      }
+
+      // Misconfigured allowlist (empty, or first entry fails validation): the
+      // session is already minted, so never invent a redirect target — fall back
+      // to the coarse identity response rather than risk an open redirect.
+      deps.sessionDeps.logger.warn({}, 'oauth callback: no valid default landing path — returning identity JSON')
       return c.json({githubUserId, login}, 200)
     }
 

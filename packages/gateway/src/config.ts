@@ -195,6 +195,7 @@ export interface GatewayConfig {
      * Comma-separated list read from GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS.
      * Defaults to ['/operator'] when unset.
      * Only paths in this list are accepted as return_to targets.
+     * The first entry is also the default post-auth landing path when no return_to was captured.
      */
     readonly oauthAllowedReturnPaths: readonly string[]
     /**

@@ -2229,7 +2229,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     const res = await app.fetch(req)
 
     // #then — success
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
 
     // #and — session was created in the store
     expect(sessionStore.size()).toBe(1)
@@ -2340,7 +2340,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     const res = await app.fetch(req)
 
     // #then — success
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
 
     // #and — stale session is revoked server-side
     expect(sessionStore.get(staleSessionId, now + 2000)).toBeUndefined()
@@ -2723,7 +2723,7 @@ describe('GET /operator/auth/github/callback — OAuth token retention', () => {
       'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
     )
     const res = await app.fetch(req)
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
 
     // #then — extract session ID from cookie and verify token is retained
     const setCookieHeaders = res.headers.getSetCookie()
@@ -2880,7 +2880,7 @@ describe('GET /operator/auth/github/callback — OAuth token retention', () => {
       'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
     )
     const res = await app.fetch(req)
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
 
     // Extract session ID
     const setCookieHeaders = res.headers.getSetCookie()
@@ -2948,8 +2948,8 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
     expect(sessionStore.size()).toBe(1)
   })
 
-  it('falls back to 200 JSON when state has no redirectTarget (no return_to)', async () => {
-    // #given — state has no redirectTarget
+  it('redirects (302) to the default landing path when state has no redirectTarget (no return_to)', async () => {
+    // #given — state has no redirectTarget (e.g. /operator/auth/github/start opened directly)
     const stateStore = createInMemoryStateStore()
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
@@ -2966,7 +2966,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
       fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
     })
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
+    const config = makeStubConfig() // allowedReturnPaths: ['/operator/dashboard', '/operator/runs']
     const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
 
     // #when
@@ -2975,18 +2975,142 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
     )
     const res = await app.fetch(req)
 
-    // #then — falls back to existing 200 JSON behavior
-    expect(res.status).toBe(200)
-    const body = await res.json()
-    expect(body).toMatchObject({githubUserId: 42, login: 'octocat'})
+    // #then — redirected to the first allowed return path, not a bare JSON identity page
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/operator/dashboard')
 
-    // #and — session cookie is still set
+    // #and — session cookie is still set on the redirect
     const setCookieHeaders = res.headers.getSetCookie()
     const sessionCookie = setCookieHeaders.find(h => h.startsWith(`${SESSION_COOKIE_NAME}=`))
     expect(sessionCookie).toBeDefined()
   })
 
-  it('falls back to 200 JSON when redirectTarget is NOT in allowedReturnPaths (security: no unvalidated redirect)', async () => {
+  it('a captured return_to wins over the default landing path', async () => {
+    // #given — captured target is the SECOND allowed path, so it differs from the default (first entry)
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      redirectTarget: '/operator/runs',
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig() // default (first entry) is '/operator/dashboard'
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const res = await app.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+      ),
+    )
+
+    // #then — the captured path, not the default
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/operator/runs')
+  })
+
+  it.each([
+    ['an absolute URL', ['https://evil.attacker.com/steal', '/operator']],
+    ['a protocol-relative URL', ['//evil.attacker.com/steal', '/operator']],
+    ['a non-rooted path', ['operator', '/operator']],
+  ])(
+    'never redirects to a misconfigured default landing path that is %s (falls back to identity JSON)',
+    async (_label, allowedReturnPaths) => {
+      // #given — the FIRST allowedReturnPaths entry (the default) is unsafe, even though it is "in the list"
+      const stateStore = createInMemoryStateStore()
+      const sessionStore = createInMemorySessionStore()
+      const now = Date.now()
+      stateStore.set('valid-state-value', {
+        codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+        issuedAt: now,
+        consumed: false,
+      })
+
+      const deps = makeStubDeps({
+        stateStore,
+        clock: () => now + 1000,
+        fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+      })
+      const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+      const config = makeStubConfig({allowedReturnPaths})
+      const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+      // #when
+      const res = await app.fetch(
+        new Request(
+          'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+        ),
+      )
+
+      // #then — no redirect at all (no open redirect); coarse identity JSON, session still minted
+      expect(res.status).toBe(200)
+      expect(res.headers.get('location')).toBeNull()
+      expect(await res.json()).toMatchObject({githubUserId: 42, login: 'octocat'})
+      expect(sessionStore.size()).toBe(1)
+    },
+  )
+
+  it('falls back to identity JSON (no redirect) when allowedReturnPaths is empty', async () => {
+    // #given — nothing to validate a default against
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig({allowedReturnPaths: []})
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const res = await app.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+      ),
+    )
+
+    // #then
+    expect(res.status).toBe(200)
+    expect(res.headers.get('location')).toBeNull()
+    expect(await res.json()).toMatchObject({githubUserId: 42, login: 'octocat'})
+  })
+
+  it('end-to-end: /start with no return_to then /callback lands on the default path', async () => {
+    // #given — real start handler mints the state (no return_to), real callback consumes it
+    const sessionStore = createInMemorySessionStore()
+    const deps = makeStubDeps({fetch: makeSuccessFetch({userId: 42, login: 'octocat'})})
+    const sessionDeps = makeStubSessionDeps()
+    const app = buildTestAppWithSession(deps, makeStubConfig(), sessionStore, sessionDeps)
+    const state = await mintState(app)
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=${state}`),
+    )
+
+    // #then
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/operator/dashboard')
+  })
+
+  it('redirects to the default landing path when redirectTarget is NOT in allowedReturnPaths (security: no unvalidated redirect)', async () => {
     // #given — state has a redirectTarget that is NOT in the allowlist
     const stateStore = createInMemoryStateStore()
     const sessionStore = createInMemorySessionStore()
@@ -3013,16 +3137,15 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
     )
     const res = await app.fetch(req)
 
-    // #then — MUST NOT redirect; falls back to 200 JSON (security-critical assertion)
-    expect(res.status).toBe(200)
-    const body = await res.json()
-    expect(body).toMatchObject({githubUserId: 42, login: 'octocat'})
+    // #then — MUST NOT redirect to the unlisted path; lands on the validated default (security-critical assertion)
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/operator/dashboard')
 
     // #and — session was still minted (allowlist failure only affects redirect, not session)
     expect(sessionStore.size()).toBe(1)
   })
 
-  it('falls back to 200 JSON when redirectTarget is an absolute URL (cross-origin attempt)', async () => {
+  it('redirects to the default landing path when redirectTarget is an absolute URL (cross-origin attempt)', async () => {
     // #given — state has an absolute URL as redirectTarget (should be rejected by validateReturnPath)
     const stateStore = createInMemoryStateStore()
     const sessionStore = createInMemorySessionStore()
@@ -3049,9 +3172,9 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
     )
     const res = await app.fetch(req)
 
-    // #then — MUST NOT redirect to cross-origin URL; falls back to 200 JSON
-    expect(res.status).toBe(200)
-    expect(res.headers.get('location')).toBeNull()
+    // #then — MUST NOT redirect to the cross-origin URL; lands on the validated default instead
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/operator/dashboard')
 
     // #and — session was still minted
     expect(sessionStore.size()).toBe(1)
@@ -3253,8 +3376,8 @@ describe('GET /operator/auth/github/callback — allowlist check before session 
     )
     const res = await app.fetch(req)
 
-    // #then — 200 OK, session created
-    expect(res.status).toBe(200)
+    // #then — redirected (default landing path), session created
+    expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
     expect(sessionStore.size()).toBe(1)
   })
 })
