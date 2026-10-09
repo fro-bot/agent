@@ -149,10 +149,19 @@ export interface LedgerReconcileChild {
  * to forget to wire up.
  */
 export interface LedgerReconcileAdapter {
-  /** Every child session ever created under `parentSessionId` — no liveness filter. */
-  readonly children: (parentSessionId: string) => Promise<Result<readonly LedgerReconcileChild[], Error>>
-  /** The set of session ids that are currently non-idle (live) upstream. */
-  readonly liveSessionIds: () => Promise<Result<ReadonlySet<string>, Error>>
+  /**
+   * Every child session ever created under `parentSessionId` — no liveness filter. The optional `signal`
+   * aborts the underlying request; callers that pass none behave exactly as before.
+   */
+  readonly children: (
+    parentSessionId: string,
+    signal?: AbortSignal,
+  ) => Promise<Result<readonly LedgerReconcileChild[], Error>>
+  /**
+   * The set of session ids that are currently non-idle (live) upstream. The optional `signal` aborts the
+   * underlying request (the SDK has no fetch timeout of its own); callers that pass none behave as before.
+   */
+  readonly liveSessionIds: (signal?: AbortSignal) => Promise<Result<ReadonlySet<string>, Error>>
 }
 
 export interface ReconcileLedgerOptions {
@@ -309,9 +318,20 @@ export function createLedgerReconciler(options: CreateLedgerReconcilerOptions): 
  */
 export function createSdkLedgerReconcileAdapter(client: SessionClient, directory: string): LedgerReconcileAdapter {
   return {
-    children: async (parentSessionId: string): Promise<Result<readonly LedgerReconcileChild[], Error>> => {
+    children: async (
+      parentSessionId: string,
+      signal?: AbortSignal,
+    ): Promise<Result<readonly LedgerReconcileChild[], Error>> => {
       try {
-        const response = await client.session.children({path: {id: parentSessionId}, query: {directory}})
+        // Per-request `signal` rides in the same options object as `path`/`query`: the SDK's generated `Config`
+        // extends `RequestInit` (`@opencode-ai/sdk` dist/gen/client/types.gen.d.ts) and `request()` spreads the
+        // options into `new Request(url, requestInit)` (dist/gen/client/client.gen.js). Only added when given, so
+        // a caller with no signal sends exactly the options it always did.
+        const response = await client.session.children({
+          path: {id: parentSessionId},
+          query: {directory},
+          ...(signal === undefined ? {} : {signal}),
+        })
         if (response.error != null || response.data == null) {
           return err(toError(response.error ?? 'session.children returned no data'))
         }
@@ -324,9 +344,9 @@ export function createSdkLedgerReconcileAdapter(client: SessionClient, directory
       }
     },
 
-    liveSessionIds: async (): Promise<Result<ReadonlySet<string>, Error>> => {
+    liveSessionIds: async (signal?: AbortSignal): Promise<Result<ReadonlySet<string>, Error>> => {
       try {
-        const response = await client.session.status({query: {directory}})
+        const response = await client.session.status({query: {directory}, ...(signal === undefined ? {} : {signal})})
         if (response.error != null || response.data == null) {
           return err(toError(response.error ?? 'session.status returned no data'))
         }

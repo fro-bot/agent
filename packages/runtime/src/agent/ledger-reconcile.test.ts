@@ -90,6 +90,37 @@ describe('createSdkLedgerReconcileAdapter', () => {
     // #then — documents why the directory matters: an empty live set settles the child
     expect(ledger.snapshot()[0]?.state).toBe('settled')
   })
+
+  it('threads a per-request signal into both SDK calls when one is given', async () => {
+    // #given — a caller that bounds its requests
+    const {client, childrenCalls, statusCalls} = makeScopedClient('child-1')
+    const adapter = createSdkLedgerReconcileAdapter(client, WORKSPACE)
+    const signal = new AbortController().signal
+
+    // #when
+    await adapter.children(PARENT_SESSION_ID, signal)
+    await adapter.liveSessionIds(signal)
+
+    // #then — the signal rides in the same options object as path/query (the SDK's per-request RequestInit)
+    expect(childrenCalls).toEqual([{path: {id: PARENT_SESSION_ID}, query: {directory: WORKSPACE}, signal}])
+    expect(statusCalls).toEqual([{query: {directory: WORKSPACE}, signal}])
+  })
+
+  it('sends exactly the original options when no signal is given', async () => {
+    // #given — an existing caller (the reconciler, the Action) that passes no signal
+    const {client, childrenCalls, statusCalls} = makeScopedClient('child-1')
+    const adapter = createSdkLedgerReconcileAdapter(client, WORKSPACE)
+
+    // #when
+    await adapter.children(PARENT_SESSION_ID)
+    await adapter.liveSessionIds()
+
+    // #then — no `signal` key at all, so behaviour is unchanged
+    expect(childrenCalls).toEqual([{path: {id: PARENT_SESSION_ID}, query: {directory: WORKSPACE}}])
+    expect(statusCalls).toEqual([{query: {directory: WORKSPACE}}])
+    expect('signal' in (childrenCalls[0] as object)).toBe(false)
+    expect('signal' in (statusCalls[0] as object)).toBe(false)
+  })
 })
 
 describe('reconcileLedgerOnce', () => {

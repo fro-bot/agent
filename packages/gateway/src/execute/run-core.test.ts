@@ -265,6 +265,86 @@ function backgroundTaskCompletedEvent(jobId: string, sessionID = 'sess-123', tit
 }
 
 /**
+ * Upstream's injected background-task notice (`tool/task.ts` `inject`): a whole synthetic text part on a
+ * root user message, rendered as `<task id="{childSessionId}" state="completed|error">`. No `part.time`.
+ */
+function taskNoticeEvent(
+  childId: string,
+  options: {
+    readonly state?: 'completed' | 'error'
+    readonly messageID?: string
+    readonly partID?: string
+    readonly sessionID?: string
+  } = {},
+): object {
+  const {state = 'completed', messageID = 'msg-notice-1', partID = 'part-notice-1', sessionID = 'sess-123'} = options
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID,
+      part: {
+        id: partID,
+        messageID,
+        sessionID,
+        type: 'text',
+        synthetic: true,
+        text: `<task id="${childId}" state="${state}">\n<summary>Background task ${state}</summary>\n</task>`,
+      },
+    },
+  }
+}
+
+/** REST `session.messages` shape of a persisted root turn: the prompt answered, then an injected notice answered. */
+function completedFollowUpMessages(
+  childIds: readonly string[],
+  noticeMessageId = 'msg-notice-1',
+  sessionID = 'sess-123',
+): readonly object[] {
+  return [
+    {info: {id: 'msg-prompt', role: 'user', sessionID}, parts: [{type: 'text', text: 'prompt'}]},
+    {
+      info: {
+        id: 'msg-reply-1',
+        role: 'assistant',
+        sessionID,
+        parentID: 'msg-prompt',
+        time: {completed: 1},
+        finish: 'stop',
+      },
+      parts: [],
+    },
+    {
+      info: {id: noticeMessageId, role: 'user', sessionID},
+      parts: childIds.map((childId, index) => ({
+        id: `part-notice-${index + 1}`,
+        type: 'text',
+        synthetic: true,
+        text: `<task id="${childId}" state="completed">`,
+      })),
+    },
+    {
+      info: {
+        id: 'msg-reply-2',
+        role: 'assistant',
+        sessionID,
+        parentID: noticeMessageId,
+        time: {completed: 2},
+        finish: 'stop',
+      },
+      parts: [],
+    },
+  ]
+}
+
+/** `session.messages` handler: the root's persisted turns, and nothing for any other session. */
+function rootMessages(messages: readonly object[]): (args: unknown) => Promise<unknown> {
+  return async args => {
+    const id = (args as {readonly path?: {readonly id?: string}}).path?.id
+    return {data: id === 'sess-123' ? messages : [], error: null}
+  }
+}
+
+/**
  * Build a minimal `OpenCodeServerHandle` test double.
  * All SDK methods are vi.fn() by default; callers override what they need.
  *
@@ -285,6 +365,8 @@ function makeHandle(
     readonly sessionStatus?: (args: unknown) => Promise<unknown>
     /** `client.session.abort` — used by the drain-deadline cancellation path. */
     readonly sessionAbort?: (args: unknown) => Promise<unknown>
+    /** `client.session.messages` — used by the drain-completion REST validation. */
+    readonly sessionMessages?: (args: unknown) => Promise<unknown>
   } = {},
 ): OpenCodeServerHandle {
   const sessionCreate = overrides.sessionCreate ?? (async () => sessionCreateOk())
@@ -294,10 +376,12 @@ function makeHandle(
   const sessionChildren = overrides.sessionChildren ?? (async () => ({data: [], error: null}))
   const sessionStatus = overrides.sessionStatus ?? (async () => ({data: {}, error: null}))
   const sessionAbort = overrides.sessionAbort ?? (async () => ({data: {}, error: null}))
+  const sessionMessages = overrides.sessionMessages ?? (async () => ({data: [], error: null}))
 
   const client = {
     session: {
       create: vi.fn().mockImplementation(sessionCreate),
+      messages: vi.fn().mockImplementation(sessionMessages),
       promptAsync: vi.fn().mockImplementation(promptAsync),
       children: vi.fn().mockImplementation(sessionChildren),
       status: vi.fn().mockImplementation(sessionStatus),
@@ -3181,6 +3265,7 @@ describe('runOpenCodeCore', () => {
           // Second pass (triggered by the interval, or another idle) — no longer live.
           return {data: statusCallCount === 1 ? {[CHILD]: {}} : {}, error: null}
         },
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
 
       const onOwnershipChange = vi.fn()
@@ -3191,9 +3276,10 @@ describe('runOpenCodeCore', () => {
       emitNext(backgroundTaskCompletedEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
 
-      // Allow the immediate post-idle reconcile pass (still live) to land, then trigger
-      // a second idle so the loop reconciles again and observes the child gone.
+      // Allow the immediate post-idle reconcile pass (still live) to land. The child then finishes: upstream
+      // injects its completion notice into the parent, the parent answers it, and the root goes idle again.
       await new Promise(resolve => setTimeout(resolve, 10))
+      emitNext(taskNoticeEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
 
       // #then — resolves once the ledger drains; no drain-timeout, no throw.
@@ -3374,6 +3460,7 @@ describe('runOpenCodeCore', () => {
           statusCallCount += 1
           return {data: statusCallCount === 1 ? {[CHILD]: {}} : {}, error: null}
         },
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
 
       const onOwnershipChange = vi.fn()
@@ -3393,6 +3480,7 @@ describe('runOpenCodeCore', () => {
       // Drive the run to completion so nothing leaks into the next test.
       emitNext(sessionIdleEvent('sess-123'))
       await new Promise(resolve => setTimeout(resolve, 10))
+      emitNext(taskNoticeEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
       await runPromise
 
@@ -3662,19 +3750,24 @@ describe('runOpenCodeCore', () => {
       ownershipLedger.adopt(CHILD, 'background task')
       ownershipLedger.settle(CHILD)
 
+      // The child's completion notice reaches the parent and is answered before the root's idle, so the
+      // drain-completion gate has its evidence once the run reaches idle.
+      const {stream, emitNext} = makeControlledStream()
       const abortSpy = vi.fn().mockResolvedValue({data: {}, error: null})
       const handle = makeHandle({
-        subscribe: async () =>
-          subscribeOk([
-            sessionErrorEvent('sess-someone-elses-session', 'unrelated failure'),
-            sessionIdleEvent('sess-123'),
-          ]),
+        subscribe: async () => Promise.resolve({stream}),
         sessionAbort: abortSpy,
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
       const params = {...buildParams(handle), coordinator, ownershipLedger}
+      const runPromise = runOpenCodeCore(params)
+
+      emitNext(sessionErrorEvent('sess-someone-elses-session', 'unrelated failure'))
+      emitNext(taskNoticeEvent(CHILD))
+      emitNext(sessionIdleEvent('sess-123'))
 
       // #when / #then — resolves normally; the barrier never runs at all.
-      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+      await expect(runPromise).resolves.toBeUndefined()
       expect(abortSpy).not.toHaveBeenCalled()
     })
   })
@@ -3749,6 +3842,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () => Promise.resolve({stream}),
         sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
         sessionStatus: async () => ({data: {}, error: null}), // CHILD absent — no longer live
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
 
       const sink = makeSink()
@@ -3774,7 +3868,8 @@ describe('runOpenCodeCore', () => {
       // #then — settled without ever seeing a completion event for CHILD
       expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
 
-      // Cleanup: nothing outstanding remains, so root session.idle completes the run.
+      // Cleanup: nothing outstanding remains; the child's notice was answered, so root idle completes the run.
+      emitNext(taskNoticeEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
       await runPromise
     })
@@ -3793,7 +3888,12 @@ describe('runOpenCodeCore', () => {
         data: childBusy && args?.query?.directory === directory ? {[CHILD]: {type: 'busy'}} : {},
         error: null,
       }))
-      const handle = makeHandle({subscribe: async () => Promise.resolve({stream}), sessionChildren, sessionStatus})
+      const handle = makeHandle({
+        subscribe: async () => Promise.resolve({stream}),
+        sessionChildren,
+        sessionStatus,
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
+      })
       const params = {...buildParams(handle, {directory}), coordinator, ownershipLedger}
       const runPromise = runOpenCodeCore(params)
 
@@ -3812,6 +3912,7 @@ describe('runOpenCodeCore', () => {
       childBusy = false
       await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
       expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
+      emitNext(taskNoticeEvent(CHILD))
       emitNext(sessionIdleEvent('sess-123'))
       await runPromise
     })
@@ -4024,6 +4125,7 @@ describe('runOpenCodeCore', () => {
         readonly ownershipLedger?: ReturnType<typeof createOwnershipLedger>
         readonly sessionStatus?: () => Promise<unknown>
         readonly sessionAbort?: () => Promise<unknown>
+        readonly sessionMessages?: (args: unknown) => Promise<unknown>
         readonly onBusy?: (busy: boolean) => void
         readonly onRegistered?: () => void
         readonly signal?: AbortSignal
@@ -4054,6 +4156,7 @@ describe('runOpenCodeCore', () => {
         sessionChildren: async () => ({data: [{id: CHILD}], error: null}),
         ...(options.sessionStatus === undefined ? {} : {sessionStatus: options.sessionStatus}),
         ...(options.sessionAbort === undefined ? {} : {sessionAbort: options.sessionAbort}),
+        ...(options.sessionMessages === undefined ? {} : {sessionMessages: options.sessionMessages}),
       })
 
       let settled: Outcome | undefined
@@ -4286,6 +4389,7 @@ describe('runOpenCodeCore', () => {
         ownershipLedger,
         sessionStatus: async () => ({data: childLive ? {[CHILD]: {}} : {}, error: null}),
         sessionAbort,
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
         onBusy,
       })
       await run.emit(backgroundTaskCompletedEvent(CHILD))
@@ -4306,8 +4410,9 @@ describe('runOpenCodeCore', () => {
       expect(run.outcome()).toBeUndefined()
       expect(sessionAbort).not.toHaveBeenCalled()
 
-      // #when the child settles through the ledger
+      // #when the child settles through the ledger, its notice reaches the parent, and the parent answers it
       childLive = false
+      await run.emit(taskNoticeEvent(CHILD))
       await run.emit(sessionIdleEvent('sess-123'))
       await run.done
 
@@ -4368,22 +4473,25 @@ describe('runOpenCodeCore', () => {
       expect(run.registry.has('que_1')).toBe(false)
     })
 
-    it('#1736 drain: root idle with a question pending and an already-settled ledger completes on the ledger alone; teardown rejects the question', async () => {
-      // #given a background child that finishes (not live) while its question is still pending
+    it('#1736 drain: root idle with a question pending and a settled ledger completes on notice and root freshness, not the question; teardown rejects the question', async () => {
+      // #given a background child that finishes (not live) while its question is still pending, and whose
+      // completion notice the parent has already answered
       const ownershipLedger = createOwnershipLedger()
       const run = startQuestionRun({
         extraOwned: [CHILD],
         ownershipLedger,
         sessionStatus: async () => ({data: {}, error: null}),
+        sessionMessages: rootMessages(completedFollowUpMessages([CHILD])),
       })
       await run.emit(backgroundTaskCompletedEvent(CHILD))
       await run.emit(questionAskedEvent('que_child', CHILD))
+      await run.emit(taskNoticeEvent(CHILD))
 
       // #when the root goes idle and the reconcile pass settles the child
       await run.emit(sessionIdleEvent('sess-123'))
       await run.done
 
-      // #then the ledger alone ended the drain; the question did not hold the run
+      // #then the ledger plus the notice and root freshness ended the drain; the question did not hold the run
       expect(ownershipLedger.isDrainComplete()).toBe(true)
       expect(run.outcome()).toEqual({ok: true})
       expect(run.registry.has('que_child')).toBe(true)
