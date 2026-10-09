@@ -2086,6 +2086,22 @@ describe('buildOpencodeEnv', () => {
     expect(Object.values(env)).not.toContain('service-side-secret')
   })
 
+  it('never forwards the variables that could disable or relocate the root-owned managed config layer (the task_id reuse guard)', () => {
+    // #given — OPENCODE_PURE skips every plugin, OPENCODE_TEST_MANAGED_CONFIG_DIR relocates /etc/opencode,
+    // OPENCODE_CONFIG_DIR / OPENCODE_DISABLE_PROJECT_CONFIG / OPENCODE_CONFIG change what loads
+    const env = buildOpencodeEnv({
+      OPENCODE_PURE: 'true',
+      OPENCODE_TEST_MANAGED_CONFIG_DIR: '/tmp/evil',
+      OPENCODE_CONFIG_DIR: '/tmp/evil',
+      OPENCODE_CONFIG: '/tmp/evil.json',
+      OPENCODE_DISABLE_PROJECT_CONFIG: 'true',
+      OPENCODE_DISABLE_DEFAULT_PLUGINS: 'true',
+    })
+
+    // #then — none reaches the OpenCode child
+    expect(Object.keys(env).filter(key => key.startsWith('OPENCODE_'))).toEqual([])
+  })
+
   it('copies locale variables only when set', () => {
     // #given
     const env = buildOpencodeEnv({LANG: 'en_US.UTF-8'})

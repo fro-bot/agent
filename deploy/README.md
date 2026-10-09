@@ -456,6 +456,15 @@ The image's `ENTRYPOINT` runs `tini` as pid 1; the workspace-agent service is it
 
 Both images build on `node:<ver>-alpine3.24@sha256:…`, and the workspace runtime's `apk add` packages are pinned to exact Alpine 3.24 versions. Renovate bumps them in one grouped "Alpine packages" PR, using the `registryUrls` rule in `.github/renovate.json5`. The tag's Alpine suffix, that `registryUrls` branch, and the pins must all name the same Alpine minor — to move to a new minor, change them together in one deliberate PR.
 
+#### Reuse guard (baked plugin + managed config)
+
+Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see "Background Subagent Ownership Ledger (Gateway)" in `ARCHITECTURE.md` for why). The workspace image bakes two root-owned, read-only files for this:
+
+- `/usr/local/lib/fro-bot/plugins/no-task-reuse.mjs` — an OpenCode server plugin (source: `deploy/plugins/no-task-reuse.mjs`) whose `tool.execute.before` hook throws a fixed error for `tool === 'task'` with a truthy `task_id`. The tool part ends in `error` with that message, the model sees it, and the turn continues.
+- `/etc/opencode/opencode.json` (source: `deploy/managed-config/opencode.json`) — OpenCode's Linux **managed config** layer. It is merged LAST (after the agent's own config, project config and `OPENCODE_CONFIG_CONTENT`) and plugin arrays are concatenated, so nothing written under `/home/opencode` or into a checkout can remove the entry. The OpenCode child's environment is built from a fixed allowlist, so `OPENCODE_PURE` and `OPENCODE_TEST_MANAGED_CONFIG_DIR` cannot reach it.
+
+The Systematic plugin and the `subagent_depth: 1` pin are different: they live in the agent-writable merged config (`merge-config.mjs`) and are enforced at provisioning time only. `deploy/tests/isolation-harness.sh` proves the agent uid cannot modify, replace, rename, chmod or delete either guard file (root can), and `deploy/scripts/managed-config.test.mjs` pins the config-to-file path and ownership. Residual exposure: a plugin the agent loads from its own config or a project `.opencode/plugins` directory runs before the guard and could mutate the tool arguments in memory; that code already runs inside the OpenCode process as uid 10001, so the guard is a model-behavior boundary, not a sandbox.
+
 #### Harness OpenCode binary
 
 The workspace runs the **harness build** of OpenCode — the patched binary published to [fro-bot/agent releases](https://github.com/fro-bot/agent/releases), not the stock `anomalyco/opencode` build. The harness binary carries session, plugin, and compaction fixes that apply to the mention-loop execution path.
@@ -482,7 +491,7 @@ The mention-loop agent needs a model and a provider to talk to. These mirror the
 - `WORKSPACE_OPENCODE_CONFIG` — a JSON object shallow-merged over the baked base config; supply the `provider` block that points OpenCode at your endpoint.
 - `WORKSPACE_OPENCODE_READY_TIMEOUT_MS` — how long (in milliseconds) the workspace agent waits for the OpenCode server to become ready before marking it `down`. Default: `60000` (60 s — sized for a cold boot behind the egress proxy). Absent or empty → default applies (fail-soft). Set to a non-numeric value, zero, or a negative number → startup fails immediately with an explicit error (fail-fast).
 
-The image bakes no default model — the entrypoint overlays these onto the base config at startup (the Systematic plugin is always preserved; a malformed value fails fast). Provider **credentials** stay in the `workspace-opencode-auth` secret (above); these two are non-secret operator config.
+The image bakes no default model — the entrypoint overlays these onto the base config at startup (the Systematic plugin is always preserved; a malformed value fails fast; the reuse guard lives in the root-owned managed config layer and is unaffected by the overlay). Provider **credentials** stay in the `workspace-opencode-auth` secret (above); these two are non-secret operator config.
 
 To route Claude/OpenAI through a [cliproxyapi](https://github.com/router-for-me/CLIProxyAPI) proxy (the default in `marcusrbrown/infra`), point the stock `anthropic`/`openai` providers at the proxy's `/v1` base URL and set the model:
 
