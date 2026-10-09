@@ -33,12 +33,14 @@ export interface ReplyDeliveryTracker {
    *   is NOT covered. No ordering is demanded among these: the sink is append-only, so what already streamed in
    *   whatever order cannot be changed, and the gate's job is completeness, not repair.
    * - UNATTRIBUTED (no part id) DELTAS: such text cannot be matched by id. The parts that have no part-id
-   *   delivery, taken in persisted order, must be spelled out EXACTLY, separators included and adjacent, by the
-   *   END of the root's part-id-less delivered text: walking from the last part backwards, each part must end
-   *   exactly where the next begins. Only the final part tolerates extra whitespace after it. That is the turn's
-   *   total unattributed text, in persisted order, equal to the parts joined — anchored at the end because the
-   *   run's earlier turns may have delivered unattributed text too, so the turn cannot be delimited from the
-   *   front. A PREFIX of a part, a part missing from the middle, or a missing separator never matches.
+   *   delivery, concatenated exactly in persisted order (nothing trimmed, separators included), must END the
+   *   root's part-id-less delivered text, followed by nothing but extra whitespace: covered iff some
+   *   whitespace-only suffix of the delivered text can be dropped so that what remains ends with the
+   *   concatenation. That is the turn's total unattributed text, in persisted order, equal to the parts joined —
+   *   anchored at the end because the run's earlier turns may have delivered unattributed text too, so the turn
+   *   cannot be delimited from the front. Aligning the concatenation, not each part, keeps a whitespace-only
+   *   final part from being mis-split. A PREFIX of a part, a part missing from the middle, a missing separator,
+   *   or a foreign separator between parts never matches.
    * - A text part seen only as a whole `message.part.updated` is not delivery evidence and is never counted.
    */
   readonly covers: (parts: readonly ReplyTextPart[]) => boolean
@@ -49,21 +51,17 @@ function coversPersisted(delivered: string, persisted: string): boolean {
   return delivered.startsWith(persisted) && delivered.slice(persisted.length).trim() === ''
 }
 
-/** `text` exactly as the segment of `log` ending at `end`; returns where it starts, or -1. */
-function matchExactlyEndingAt(log: string, end: number, text: string): number {
-  const start = end - text.length
-  return start >= 0 && log.startsWith(text, start) ? start : -1
-}
-
-/** As above, but tolerating extra whitespace after the text (before `end`). Used for the final part only. */
-function matchFinalPartEndingAt(log: string, end: number, text: string): number {
-  let candidateEnd = end
-  while (true) {
-    const start = matchExactlyEndingAt(log, candidateEnd, text)
-    if (start >= 0) return start
-    if (candidateEnd > 0 && log.charAt(candidateEnd - 1).trim() === '') candidateEnd -= 1
-    else return -1
+/**
+ * Whether `delivered` ends with `expected`, allowing a whitespace-only suffix of `delivered` after it. Tries every
+ * suffix length from none up to the whole trailing-whitespace run, so a `expected` that itself ends in whitespace
+ * (or is whitespace only) aligns exactly where it is delivered, and any whitespace beyond it is the extra.
+ */
+function endsWithAllowingTrailingWhitespace(delivered: string, expected: string): boolean {
+  for (let end = delivered.length; end >= expected.length; end -= 1) {
+    if (delivered.startsWith(expected, end - expected.length)) return true
+    if (end === 0 || delivered.charAt(end - 1).trim() !== '') return false
   }
+  return false
 }
 
 export function createReplyDeliveryTracker(): ReplyDeliveryTracker {
@@ -88,17 +86,11 @@ export function createReplyDeliveryTracker(): ReplyDeliveryTracker {
           return false
         }
       }
-      let end = unattributedText.length
-      for (let index = needUnattributed.length - 1; index >= 0; index -= 1) {
-        const part = needUnattributed[index]
-        if (part === undefined) continue
-        const start =
-          index === needUnattributed.length - 1
-            ? matchFinalPartEndingAt(unattributedText, end, part.text)
-            : matchExactlyEndingAt(unattributedText, end, part.text)
-        if (start < 0) return false
-        end = start
-      }
+      // The part-id-less parts, concatenated exactly in persisted order (nothing trimmed, separators included),
+      // must END the part-id-less delivered text, followed by nothing but extra whitespace. Aligning the whole
+      // concatenation (rather than part by part) cannot mis-split a whitespace-only part at the end.
+      const expected = needUnattributed.map(part => part.text).join('')
+      if (expected.length > 0 && !endsWithAllowingTrailingWhitespace(unattributedText, expected)) return false
       return true
     },
   }

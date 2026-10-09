@@ -1689,6 +1689,16 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         [legacyDelta('One. '), legacyDelta('Two.\n\n')],
       ],
       [
+        String.raw`a whitespace-only final part delivered exactly (legacy "One.\n" vs "One." + "\n")`,
+        [textPart('p1', 'One.'), textPart('p2', '\n')],
+        [legacyDelta('One.\n')],
+      ],
+      [
+        String.raw`a whitespace-only final part plus extra trailing whitespace (legacy "One.\n\n" vs "One." + "\n")`,
+        [textPart('p1', 'One.'), textPart('p2', '\n')],
+        [legacyDelta('One.\n\n')],
+      ],
+      [
         'persisted trailing whitespace delivered exactly (part-id)',
         [textPart('part-r2', 'Follow-up answer.\n')],
         [textDeltaEvent('Follow-up answer.\n', 'part-r2')],
@@ -1723,7 +1733,12 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         [textDeltaEvent('Follow-up answer.', 'part-r2')],
       ],
       [
-        'a part-id-less delivery with a foreign separator between parts (only the final part tolerates extra whitespace)',
+        String.raw`a whitespace-only final part that was not delivered (legacy "One." vs "One." + "\n")`,
+        [textPart('p1', 'One.'), textPart('p2', '\n')],
+        [legacyDelta('One.')],
+      ],
+      [
+        String.raw`a part-id-less delivery with a separator between the parts that the persisted text lacks ("One.\nTwo." vs "One." + "Two.")`,
         [textPart('p1', 'One.'), textPart('p2', 'Two.')],
         [legacyDelta('One.\n'), legacyDelta('Two.')],
       ],
