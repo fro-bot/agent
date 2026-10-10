@@ -125,6 +125,54 @@ describe('bootstrapOpenCodeServer', () => {
     expect(capturedEnvUrl).toBe(`http://127.0.0.1:${String(callArgs?.port)}`)
   })
 
+  it('forwards a supplied config to createOpencode so the SDK sends it as OPENCODE_CONFIG_CONTENT', async () => {
+    // #given a caller that wants a plugin loaded regardless of any on-disk config
+    const logger = createMockLogger()
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+    const config = {plugin: ['file:///cfg/guard.mjs']}
+
+    // #when
+    const result = await bootstrapOpenCodeServer(
+      new AbortController().signal,
+      logger,
+      WORKSPACE_PATH,
+      undefined,
+      undefined,
+      {config},
+    )
+
+    // #then the config reaches the SDK verbatim
+    expect(result.success).toBe(true)
+    expect(vi.mocked(createOpencode).mock.calls[0]?.[0]?.config).toEqual(config)
+  })
+
+  it('omits config entirely when none is given, leaving the SDK on its default', async () => {
+    // #given a caller (the gateway shape) that passes no options
+    const logger = createMockLogger()
+    vi.mocked(createOpencode).mockImplementation(async options => {
+      const port = (options as {port?: number}).port
+      return {
+        client: createMockClient() as never,
+        server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+      }
+    })
+
+    // #when
+    const result = await bootstrapOpenCodeServer(new AbortController().signal, logger, WORKSPACE_PATH)
+
+    // #then the SDK is called without a `config` key at all (not `config: undefined`, not `{}`)
+    expect(result.success).toBe(true)
+    const callArgs = vi.mocked(createOpencode).mock.calls[0]?.[0]
+    expect(callArgs).toBeDefined()
+    expect(Object.keys(callArgs ?? {})).not.toContain('config')
+  })
+
   it('scrubs denied secrets (e.g. GITHUB_TOKEN) from spawn env and restores them after bootstrap', async () => {
     // #given
     process.env.GITHUB_TOKEN = 'ghp_super_secret'

@@ -10,11 +10,6 @@ import {
   RESPONSE_FILE_DIR_SEGMENT,
 } from '@fro-bot/runtime'
 import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
-import {
-  defaultOpenCodeConfigDir,
-  normalizeTaskReuseGuardPlugins,
-  noTaskReusePluginSpec,
-} from './no-task-reuse-config.js'
 
 export interface CIConfigResult {
   readonly config: Record<string, unknown>
@@ -372,8 +367,6 @@ export function buildCIConfig(
     omoSlimVersion?: string
     omoSlimPreset?: OmoSlimPreset
     integrationWorkDir?: string
-    /** OpenCode config dir the task-reuse guard plugin was (or will be) written into. Defaults to `~/.config/opencode`. */
-    configDir?: string
   },
   logger: Logger,
 ): CIConfigResult {
@@ -395,15 +388,6 @@ export function buildCIConfig(
       return {config: ciConfig, error: 'opencode-config must be a JSON object'}
     }
     Object.assign(ciConfig, parsed)
-
-    // The plugin list below is rebuilt from arrays only, so a non-array value is dropped. Say so here,
-    // before later steps replace it, since the task-reuse guard is enforced regardless.
-    if (ciConfig.plugin != null && !Array.isArray(ciConfig.plugin)) {
-      logger.warning(
-        'OpenCode config plugin must be an array; the supplied value is discarded and the task-reuse guard plugin is enforced.',
-        {receivedType: typeof ciConfig.plugin},
-      )
-    }
   }
 
   // Dual-plugin guard: detect conflict before any mode-specific assembly
@@ -536,18 +520,6 @@ export function buildCIConfig(
       pluginCount: Array.isArray(ciConfig.plugin) ? ciConfig.plugin.length : 0,
     })
   }
-
-  // Enforced, not defaulted, like the Systematic plugin and the `subagent_depth` pin: an operator `plugin` array
-  // (including `[]`) cannot drop the task-reuse guard (`deploy/plugins/no-task-reuse.mjs`, the file the gateway
-  // image bakes), and a tuple/options form is normalized to the bare spec with a warning. The Action's
-  // background-subagent ledger keys one entry per child session and expects one completion notice per child,
-  // so a `task_id` that resumes a settled child would start a second job the ledger cannot see. A boundary on
-  // model behavior, not a sandbox: the agent runs as the runner user.
-  ciConfig.plugin = normalizeTaskReuseGuardPlugins(
-    ciConfig.plugin,
-    noTaskReusePluginSpec(inputs.configDir ?? defaultOpenCodeConfigDir()),
-    logger,
-  )
 
   return {config: ciConfig, error: null}
 }

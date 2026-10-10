@@ -1,14 +1,12 @@
 import type {SetupInputs} from './types.js'
 
 import * as fs from 'node:fs/promises'
-import {homedir} from 'node:os'
 import {join} from 'node:path'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import * as github from '@actions/github'
 import * as tc from '@actions/tool-cache'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import * as noTaskReuseConfig from './no-task-reuse-config.js'
 import * as sessionToolsConfig from './session-tools-config.js'
 import {runSetup} from './setup.js'
 import * as systematicPlugin from './systematic-plugin.js'
@@ -131,21 +129,9 @@ vi.mock('./session-tools-config.js', () => ({
   writeSessionToolsFile: vi.fn().mockResolvedValue(undefined),
 }))
 
-// Keep the real path/spec/normalizer helpers (the config must reference the exact path the provisioner
-// targets) and mock only the filesystem provisioning, so tests can assert it ran and drive its failure.
-vi.mock('./no-task-reuse-config.js', async importOriginal => {
-  const actual = await importOriginal<typeof import('./no-task-reuse-config.js')>()
-  return {...actual, provisionTaskReuseGuard: vi.fn().mockResolvedValue(undefined)}
-})
-
 vi.mock('./systematic-plugin.js', () => ({
   installSystematicPlugin: vi.fn().mockResolvedValue({status: 'installed', duration: 1}),
 }))
-
-// Same derivation setup uses (`~/.config/opencode`), kept separate from the code under test.
-function defaultConfigDirForTest(): string {
-  return `${homedir()}/.config/opencode`
-}
 
 describe('setup', () => {
   const originalEnv = process.env
@@ -197,7 +183,6 @@ describe('setup', () => {
 
     // Re-apply session-tools-config mock cleared by vi.resetAllMocks() above.
     vi.mocked(sessionToolsConfig.writeSessionToolsFile).mockResolvedValue(undefined)
-    vi.mocked(noTaskReuseConfig.provisionTaskReuseGuard).mockResolvedValue(undefined)
     vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'installed', duration: 1})
   })
 
@@ -660,39 +645,6 @@ describe('setup', () => {
         expect(typeof configDirArg).toBe('string')
       })
 
-      it('provisions the task-reuse guard and registers it in the config OpenCode loads', async () => {
-        // #given an operator config that tries to clear the plugin list
-        const opencodeConfig = JSON.stringify({plugin: []})
-
-        // #when
-        const result = await runSetup(createSetupInputs({opencodeConfig}), 'ghs_test_token')
-
-        // #then the provisioner ran against the config dir, and the written config references that exact file
-        expect(result).not.toBeNull()
-        expect(noTaskReuseConfig.provisionTaskReuseGuard).toHaveBeenCalledTimes(1)
-        const [configDirArg] = vi.mocked(noTaskReuseConfig.provisionTaskReuseGuard).mock.calls[0] ?? []
-        expect(typeof configDirArg).toBe('string')
-        const guardSpec = noTaskReuseConfig.noTaskReusePluginSpec(String(configDirArg))
-        const configFile = vi
-          .mocked(fs.writeFile)
-          .mock.calls.find(([filePath]) => typeof filePath === 'string' && filePath.endsWith('opencode.json'))
-        expect(configFile).toBeDefined()
-        expect((JSON.parse(String(configFile?.[1])) as {plugin: unknown[]}).plugin).toContain(guardSpec)
-      })
-
-      it('fails setup, and writes no config, when the task-reuse guard cannot be installed', async () => {
-        // #given the bundled asset is missing
-        vi.mocked(noTaskReuseConfig.provisionTaskReuseGuard).mockRejectedValue(new Error('asset missing'))
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then setup refuses to continue without the guard
-        expect(result).toBeNull()
-        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('asset missing'))
-        expect(core.exportVariable).not.toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', expect.anything())
-      })
-
       it('warns that OPENCODE_PURE is withheld from the server when the runner sets it', async () => {
         // #given an operator environment with OPENCODE_PURE
         process.env.OPENCODE_PURE = 'true'
@@ -781,67 +733,6 @@ describe('setup', () => {
         expect(core.exportVariable).toHaveBeenCalledWith('OMO_SEND_ANONYMOUS_TELEMETRY', '0')
         expect(core.exportVariable).toHaveBeenCalledWith('OMO_DISABLE_POSTHOG', '1')
         expect(result?.omoStatus).toBe('installed')
-      })
-
-      it('keeps the task-reuse guard exactly once when a restored opencode.json already lists it', async () => {
-        // #given a restored opencode.json that already carries the guard (written by an earlier run) and another plugin
-        const configDirProbe = noTaskReuseConfig.noTaskReusePluginSpec(defaultConfigDirForTest())
-        vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify({plugin: ['other-plugin@1.0.0', configDirProbe]}))
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then the merged config lists the guard once, alongside the other plugin
-        expect(result).not.toBeNull()
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        const plugins = (JSON.parse(String(configExportCall?.[1])) as {plugin: unknown[]}).plugin
-        expect(plugins.filter(p => p === configDirProbe)).toHaveLength(1)
-        expect(plugins).toContain('other-plugin@1.0.0')
-      })
-
-      it('adds the task-reuse guard to a restored opencode.json that lacks it', async () => {
-        // #given a restored opencode.json with only another plugin
-        vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify({plugin: ['other-plugin@1.0.0']}))
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then the merged config gained the guard
-        expect(result).not.toBeNull()
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        const plugins = (JSON.parse(String(configExportCall?.[1])) as {plugin: unknown[]}).plugin
-        expect(plugins).toContain(noTaskReuseConfig.noTaskReusePluginSpec(defaultConfigDirForTest()))
-      })
-
-      it('writes exactly one bare guard entry, last, when a restored opencode.json lists it first, twice and as a tuple', async () => {
-        // #given a restored opencode.json whose guard entries lead the list, repeat, and carry options
-        const guardSpec = noTaskReuseConfig.noTaskReusePluginSpec(defaultConfigDirForTest())
-        vi.mocked(fs.readFile).mockResolvedValue(
-          JSON.stringify({
-            plugin: [guardSpec, 'other-plugin@1.0.0', [guardSpec, {mode: 'off'}], guardSpec, 'late-plugin@2.0.0'],
-          }),
-        )
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then the config handed to the server AND the file on disk list the guard once, last, as the bare spec
-        expect(result).not.toBeNull()
-        const exported = vi.mocked(core.exportVariable).mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        const written = vi
-          .mocked(fs.writeFile)
-          .mock.calls.find(([filePath]) => typeof filePath === 'string' && filePath.endsWith('opencode.json'))
-        for (const serialized of [exported?.[1], written?.[1]]) {
-          const plugins = (JSON.parse(String(serialized)) as {plugin: unknown[]}).plugin
-          expect(plugins.at(-1)).toBe(guardSpec)
-          expect(plugins.filter(p => p === guardSpec)).toHaveLength(1)
-          expect(plugins.some(p => Array.isArray(p))).toBe(false)
-          expect(plugins).toEqual(expect.arrayContaining(['other-plugin@1.0.0', 'late-plugin@2.0.0']))
-        }
       })
 
       it('writes the session tools file in enabled mode too', async () => {

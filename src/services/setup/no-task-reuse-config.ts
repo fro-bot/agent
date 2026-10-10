@@ -7,7 +7,7 @@ import {pathToFileURL} from 'node:url'
 
 // A subdirectory OpenCode does not scan. It auto-loads `<configDir>/{plugin,plugins}/*.{ts,js}`
 // (packages/opencode/src/config/plugin.ts:18-30), so keeping the guard out of those directories means
-// the explicit `plugin` entry buildCIConfig writes is the ONLY way it loads.
+// the explicit `plugin` entry in the config the Action passes the server is the ONLY way it loads.
 const NO_TASK_REUSE_DIRNAME = 'fro-bot'
 const NO_TASK_REUSE_FILENAME = 'no-task-reuse.mjs'
 
@@ -18,7 +18,8 @@ const NO_TASK_REUSE_FILENAME = 'no-task-reuse.mjs'
  * `<that dir>/opencode.json` into every server's config. `OPENCODE_CONFIG_DIR` does NOT move this layer
  * (`Global.Path.config` is the plain XDG path, `global.ts:21`); it only adds another directory. `filterAgentEnv`
  * lets `XDG_*` through to the server child, so a runner that sets `XDG_CONFIG_HOME` reads from there and a
- * hard-coded `~/.config` would register the guard in a file the server never loads.
+ * hard-coded `~/.config` would put everything setup writes (`opencode.json`, Systematic config, session tools)
+ * where the server never looks. The guard plugin file lives here too, but it is loaded by explicit path.
  */
 export function defaultOpenCodeConfigDir(env: Readonly<Record<string, string | undefined>> = process.env): string {
   const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() ?? ''
@@ -32,8 +33,8 @@ export function noTaskReusePluginPath(configDir: string): string {
 
 /**
  * The `plugin` config entry for the guard: an absolute `file://` URL. OpenCode keeps `file://` specs as
- * written (config/plugin.ts:51) and de-duplicates them by exact URL (config/plugin.ts:64-75), so the
- * same entry in the global config file and in `OPENCODE_CONFIG_CONTENT` loads once.
+ * written (config/plugin.ts:51) and de-duplicates plugin origins by exact URL, keeping the LAST occurrence
+ * (config/plugin.ts:64-77), so listing the same URL in any earlier layer is harmless: this layer's entry wins.
  */
 export function noTaskReusePluginSpec(configDir: string): string {
   return pathToFileURL(noTaskReusePluginPath(configDir)).href
@@ -81,105 +82,15 @@ export async function writeNoTaskReuseFile(
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value != null && typeof value === 'object' && !Array.isArray(value)
-}
-
 /**
- * Returns `plugins` with every entry that names the guard (a bare string or a `[spec, options]` tuple) removed
- * and exactly one bare guard spec appended last. The single normalizer for every writer of the `plugin` list
- * (`buildCIConfig`, the oMo-enabled merge in `runSetup`, and `provisionTaskReuseGuard`), so they cannot drift.
- *
- * Last matters: plugin hooks run in registration order, so a hook registered after the guard could rewrite a
- * `task` call's args after the guard has checked them. A tuple form is dropped for its bare form so no option
- * can neuter the guard; that is reported, since the operator asked for something that is not honored.
+ * The OpenCode config the Action hands the server at spawn (`createOpencode({config})`, which the SDK sends as
+ * `OPENCODE_CONFIG_CONTENT`): just the guard plugin. Upstream merges that env var as its own layer after the
+ * global file, `OPENCODE_CONFIG`, project config and `.opencode` dirs (`config/config.ts:482-490`), and plugin
+ * origins from separate layers concatenate and can only be de-duplicated, never removed (`:344-367`), so no
+ * earlier file (a global `opencode.jsonc` with `plugin: []` included) can drop it. No user file is read or
+ * edited. Only the managed-config dir and macOS MDM layers load after it (`:530-548`), and those are
+ * administrator-controlled. `OPENCODE_PURE` is the one switch that skips it, and `filterAgentEnv` denies that.
  */
-export function normalizeTaskReuseGuardPlugins(plugins: unknown, guardSpec: string, logger: Logger): unknown[] {
-  const entries: unknown[] = Array.isArray(plugins) ? (plugins as unknown[]) : []
-  const specifierOf = (entry: unknown): unknown => (Array.isArray(entry) ? (entry as unknown[])[0] : entry)
-  if (entries.some(entry => specifierOf(entry) === guardSpec && entry !== guardSpec)) {
-    logger.warning(
-      'OpenCode config supplied options for the task-reuse guard plugin; they are discarded and the guard is enforced unmodified.',
-    )
-  }
-  return [...entries.filter(entry => specifierOf(entry) !== guardSpec), guardSpec]
-}
-
-/**
- * Registers the guard in `<configDir>/opencode.json`: parses the existing file (if any), applies
- * `normalizeTaskReuseGuardPlugins`, and writes the result atomically (temp file + rename) only when it changed.
- * Everything else in the file is preserved. An unreadable or non-object file throws: OpenCode itself discards a
- * global config it cannot parse, so overwriting it would lose the operator's settings and leaving it would
- * run the server unguarded.
- */
-async function registerTaskReuseGuard(configDir: string, logger: Logger): Promise<void> {
-  const configPath = path.join(configDir, 'opencode.json')
-
-  let raw: string | null = null
-  let mode: number | undefined
-  try {
-    raw = await fs.readFile(configPath, 'utf8')
-    mode = (await fs.stat(configPath)).mode & 0o777
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw new Error(`Could not read ${configPath} to register the task-reuse guard: ${String(error)}`, {cause: error})
-    }
-  }
-
-  let config: Record<string, unknown> = {}
-  if (raw != null) {
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(raw)
-    } catch (error) {
-      throw new Error(`Could not register the task-reuse guard: ${configPath} is not valid JSON`, {cause: error})
-    }
-    if (!isRecord(parsed)) {
-      throw new Error(`Could not register the task-reuse guard: ${configPath} is not a JSON object`)
-    }
-    config = parsed
-  }
-
-  if (config.plugin != null && !Array.isArray(config.plugin)) {
-    logger.warning(
-      'OpenCode config plugin must be an array; the supplied value is discarded and the task-reuse guard plugin is enforced.',
-      {
-        receivedType: typeof config.plugin,
-      },
-    )
-  }
-
-  const next = JSON.stringify(
-    {...config, plugin: normalizeTaskReuseGuardPlugins(config.plugin, noTaskReusePluginSpec(configDir), logger)},
-    null,
-    2,
-  )
-  if (next === raw) return
-
-  await fs.mkdir(configDir, {recursive: true})
-  const tempPath = `${configPath}.${process.pid}.tmp`
-  try {
-    await fs.writeFile(tempPath, next, mode === undefined ? undefined : {mode})
-    await fs.rename(tempPath, configPath)
-  } catch (error) {
-    await fs.rm(tempPath, {force: true})
-    throw new Error(`Could not register the task-reuse guard in ${configPath}: ${String(error)}`, {cause: error})
-  }
-  logger.info('Registered task-reuse guard in OpenCode config', {path: configPath})
-}
-
-/**
- * Makes the task-reuse guard load on the next OpenCode server start: writes the plugin file, then ensures the
- * global config the server reads lists exactly one bare guard spec, last. Idempotent and fail-CLOSED (throws).
- *
- * Every Action server start goes through this, not just a fresh `runSetup`: a runner with OpenCode already
- * installed never runs setup, and its global config knows nothing of the guard.
- */
-export async function provisionTaskReuseGuard(
-  configDir: string,
-  logger: Logger,
-  resolveAssetUrl: () => URL = defaultAssetUrl,
-): Promise<void> {
-  await writeNoTaskReuseFile(configDir, logger, resolveAssetUrl)
-  await registerTaskReuseGuard(configDir, logger)
+export function taskReuseGuardServerConfig(configDir: string): {plugin: string[]} {
+  return {plugin: [noTaskReusePluginSpec(configDir)]}
 }

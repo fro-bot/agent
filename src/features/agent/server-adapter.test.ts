@@ -19,14 +19,20 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
   return {...actual, bootstrapOpenCodeServer: mocks.runtimeBootstrap}
 })
 
-// Use the REAL provisioner (real fs, real registration) and redirect only the bundled-asset lookup: under
-// Vitest the code runs from src/, where no `dist/no-task-reuse.js` sibling exists.
+// Record every file read so a test can prove user config files are never opened.
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return {...actual, readFile: vi.fn(actual.readFile)}
+})
+
+// Use the REAL writer (real fs) and redirect only the bundled-asset lookup: under Vitest the code runs from
+// src/, where no `dist/no-task-reuse.js` sibling exists.
 vi.mock('../../services/setup/no-task-reuse-config.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../../services/setup/no-task-reuse-config.js')>()
   return {
     ...actual,
-    provisionTaskReuseGuard: async (configDir: string, logger: Parameters<typeof actual.provisionTaskReuseGuard>[1]) =>
-      actual.provisionTaskReuseGuard(configDir, logger, () => mocks.assetUrl.current ?? new URL('file:///nonexistent')),
+    writeNoTaskReuseFile: async (configDir: string, logger: Parameters<typeof actual.writeNoTaskReuseFile>[1]) =>
+      actual.writeNoTaskReuseFile(configDir, logger, () => mocks.assetUrl.current ?? new URL('file:///nonexistent')),
   }
 })
 
@@ -36,15 +42,16 @@ const handle = {url: 'http://127.0.0.1:1', close: () => {}} as unknown as OpenCo
 
 describe('bootstrapOpenCodeServer (Action server-start choke point)', () => {
   let tmpDir: string
-  let xdgConfigHome: string
+  let configDir: string
   let originalXdg: string | undefined
 
   beforeEach(async () => {
     mocks.runtimeBootstrap.mockReset()
+    vi.mocked(fs.readFile).mockClear()
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'server-adapter-test-'))
-    xdgConfigHome = path.join(tmpDir, 'xdg')
+    configDir = path.join(tmpDir, 'xdg', 'opencode')
     originalXdg = process.env.XDG_CONFIG_HOME
-    process.env.XDG_CONFIG_HOME = xdgConfigHome
+    process.env.XDG_CONFIG_HOME = path.join(tmpDir, 'xdg')
     const assetPath = path.join(tmpDir, 'no-task-reuse.js')
     await fs.writeFile(assetPath, 'export default {}\n')
     mocks.assetUrl.current = pathToFileURL(assetPath)
@@ -57,55 +64,53 @@ describe('bootstrapOpenCodeServer (Action server-start choke point)', () => {
     await fs.rm(tmpDir, {recursive: true, force: true})
   })
 
-  it('writes the guard file and its registration before the server starts, with no setup having run', async () => {
-    // #given a runner whose OpenCode was already installed (didSetup: false): no setup, no opencode.json
-    const configDir = path.join(xdgConfigHome, 'opencode')
-    const seenAtStart: {file: boolean; plugins: unknown} = {file: false, plugins: null}
+  it('writes the guard file, then starts the server with exactly the guard plugin as its config', async () => {
+    // #given a runner whose OpenCode was already installed (didSetup: false): setup never ran, no guard file exists
+    let fileExistedAtStart: boolean | null = null
     mocks.runtimeBootstrap.mockImplementation(async () => {
-      seenAtStart.file = await fs.access(noTaskReusePluginPath(configDir)).then(
+      fileExistedAtStart = await fs.access(noTaskReusePluginPath(configDir)).then(
         () => true,
         () => false,
       )
-      seenAtStart.plugins = (
-        JSON.parse(await fs.readFile(path.join(configDir, 'opencode.json'), 'utf8')) as {
-          plugin: unknown
-        }
-      ).plugin
       return ok(handle)
     })
+    const signal = new AbortController().signal
+    const logger = createMockLogger()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(signal, logger, '/workspace', 1234, 5678)
+
+    // #then the file was already on disk when the server started, and the runtime got the other arguments
+    // untouched plus a config naming only the guard
+    expect(result.success).toBe(true)
+    expect(fileExistedAtStart).toBe(true)
+    expect(mocks.runtimeBootstrap).toHaveBeenCalledTimes(1)
+    expect(mocks.runtimeBootstrap).toHaveBeenCalledWith(signal, logger, '/workspace', 1234, 5678, {
+      config: {plugin: [noTaskReusePluginSpec(configDir)]},
+    })
+  })
+
+  it('never opens or modifies a user config file, so one OpenCode accepts but JSON.parse rejects cannot block startup', async () => {
+    // #given global config files with comments and trailing commas (valid JSONC), one clearing the plugin list
+    await fs.mkdir(configDir, {recursive: true})
+    const jsonc = '{\n  // operator note\n  "plugin": [],\n}\n'
+    const json = '{"model": "x/y", /* kept */ "plugin": ["other@1.0.0",],}'
+    await fs.writeFile(path.join(configDir, 'opencode.jsonc'), jsonc)
+    await fs.writeFile(path.join(configDir, 'opencode.json'), json)
+    mocks.runtimeBootstrap.mockResolvedValue(ok(handle))
 
     // #when
     const result = await bootstrapOpenCodeServer(new AbortController().signal, createMockLogger(), '/workspace')
 
-    // #then the server was started, and the guard was already on disk and registered last when it was
+    // #then startup succeeded, neither file was read, and both are byte-for-byte unchanged
     expect(result.success).toBe(true)
-    expect(mocks.runtimeBootstrap).toHaveBeenCalledTimes(1)
-    expect(seenAtStart.file).toBe(true)
-    expect(seenAtStart.plugins).toEqual([noTaskReusePluginSpec(configDir)])
+    const readPaths = vi.mocked(fs.readFile).mock.calls.map(([target]) => String(target))
+    expect(readPaths.some(target => target.includes('opencode.json'))).toBe(false)
+    expect(await fs.readFile(path.join(configDir, 'opencode.jsonc'), 'utf8')).toBe(jsonc)
+    expect(await fs.readFile(path.join(configDir, 'opencode.json'), 'utf8')).toBe(json)
   })
 
-  it('preserves an existing operator config and moves a guard-first entry to the end', async () => {
-    // #given a preinstalled runner with its own config that already lists the guard first
-    const configDir = path.join(xdgConfigHome, 'opencode')
-    const spec = noTaskReusePluginSpec(configDir)
-    await fs.mkdir(configDir, {recursive: true})
-    await fs.writeFile(
-      path.join(configDir, 'opencode.json'),
-      JSON.stringify({model: 'x/y', plugin: [spec, 'other@1.0.0']}),
-    )
-    mocks.runtimeBootstrap.mockResolvedValue(ok(handle))
-
-    // #when
-    await bootstrapOpenCodeServer(new AbortController().signal, createMockLogger(), '/workspace')
-
-    // #then
-    expect(JSON.parse(await fs.readFile(path.join(configDir, 'opencode.json'), 'utf8'))).toEqual({
-      model: 'x/y',
-      plugin: ['other@1.0.0', spec],
-    })
-  })
-
-  it('returns an error and never starts the server when the guard cannot be provisioned', async () => {
+  it('returns an error and never starts the server when the guard file cannot be written', async () => {
     // #given the bundled asset is unreadable
     mocks.assetUrl.current = pathToFileURL(path.join(tmpDir, 'missing.js'))
 
@@ -116,20 +121,6 @@ describe('bootstrapOpenCodeServer (Action server-start choke point)', () => {
     expect(result.success).toBe(false)
     if (result.success) return
     expect(result.error.message).toMatch(/without the task-reuse guard/)
-    expect(mocks.runtimeBootstrap).not.toHaveBeenCalled()
-  })
-
-  it('returns an error and never starts the server when the existing opencode.json cannot be parsed', async () => {
-    // #given a config OpenCode would discard (which would silently drop the guard)
-    const configDir = path.join(xdgConfigHome, 'opencode')
-    await fs.mkdir(configDir, {recursive: true})
-    await fs.writeFile(path.join(configDir, 'opencode.json'), '{broken')
-
-    // #when
-    const result = await bootstrapOpenCodeServer(new AbortController().signal, createMockLogger(), '/workspace')
-
-    // #then
-    expect(result.success).toBe(false)
     expect(mocks.runtimeBootstrap).not.toHaveBeenCalled()
   })
 })
