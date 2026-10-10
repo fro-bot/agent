@@ -186,7 +186,9 @@ describe('runCoordinationDecline restoring the label after the re-stamp removed 
       expect.objectContaining({issueNumber: 7, reason: 'restore-failed-after-remove'}),
     )
     // #and the job summary tells the operator to add it manually
-    expect(summaryText()).toContain(`the \`${BLOCKED_LABEL}\` label could not be re-applied to #7; add it manually`)
+    expect(summaryText()).toContain(
+      `<p><strong>Action needed:</strong> the <code>${BLOCKED_LABEL}</code> label could not be re-applied to #7; add it manually.</p>`,
+    )
   })
 
   it('does not retry when the remove found no label (404): nothing was lost', async () => {

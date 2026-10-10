@@ -397,3 +397,62 @@ describe('saveDedupMarker', () => {
     )
   })
 })
+
+describe('dedup skip summary HTML', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('renders the prior run as an anchor and the entity label in bold, with no Markdown', async () => {
+    // #given a recent marker from a different run
+    vi.spyOn(Date, 'now').mockReturnValue(30_000)
+    vi.mocked(restoreDeduplicationMarker).mockResolvedValueOnce(createMarker(999, new Date(25_000).toISOString()))
+    const context = createTriggerContext({runId: 1001})
+
+    // #when the dedup phase skips
+    await runDedup(10_000, context, 'fro-bot/agent', 5_000, createMockLogger())
+
+    // #then the intro is a paragraph with <strong>
+    expect(vi.mocked(core.summary).addRaw).toHaveBeenNthCalledWith(
+      1,
+      '<p>Execution skipped because the agent already ran for <strong>pr #42</strong> recently.</p>\n',
+    )
+
+    // #and the table cells are exact HTML
+    const rows = vi.mocked(core.summary).addTable.mock.calls[0]![0]
+    expect(rows).toContainEqual(['Current action', '<code>pull_request.opened</code>'])
+    expect(rows).toContainEqual(['Prior run', '<a href="https://github.com/fro-bot/agent/actions/runs/999">999</a>'])
+    expect(rows).toContainEqual(['Prior action', '<code>pull_request.opened</code>'])
+
+    // #and the note is a blockquote, not a Markdown quote
+    expect(vi.mocked(core.summary).addRaw).toHaveBeenNthCalledWith(
+      2,
+      '<blockquote>Dedup is best-effort suppression. Use workflow concurrency groups to prevent overlapping runs.</blockquote>\n',
+    )
+    const everything = JSON.stringify([
+      vi.mocked(core.summary).addRaw.mock.calls,
+      vi.mocked(core.summary).addTable.mock.calls,
+    ])
+    expect(everything).not.toContain('**')
+    expect(everything).not.toContain('](')
+    expect(everything).not.toContain('`')
+  })
+
+  it('escapes hostile trigger action text in code cells', async () => {
+    // #given a trigger action carrying markup
+    vi.spyOn(Date, 'now').mockReturnValue(30_000)
+    vi.mocked(restoreDeduplicationMarker).mockResolvedValueOnce(createMarker(999, new Date(25_000).toISOString()))
+    const context = createTriggerContext({runId: 1001, action: '<script>&"'})
+
+    // #when the dedup phase skips
+    await runDedup(10_000, context, 'fro-bot/agent', 5_000, createMockLogger())
+
+    // #then it is escaped exactly once
+    const rows = vi.mocked(core.summary).addTable.mock.calls[0]![0]
+    expect(rows).toContainEqual(['Current action', '<code>pull_request.&lt;script&gt;&amp;&quot;</code>'])
+  })
+})

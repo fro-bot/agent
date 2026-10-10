@@ -8,6 +8,7 @@ import {createS3Adapter, syncSessionsToStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {htmlParagraph, htmlStrong, htmlText} from '../../shared/summary-html.js'
 import {buildSaveCacheKey} from './cache-key.js'
 import {checkpointDatabase} from './checkpoint.js'
 import {buildCachePaths, DB_FAMILY_BASENAMES, DB_MAIN_BASENAME, DB_WAL_BASENAME, deleteAuthJson} from './paths.js'
@@ -96,8 +97,8 @@ async function hasCacheableContent(storagePath: string, cachePaths: readonly str
 async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Promise<void> {
   try {
     core.summary.addHeading('Fro Bot Agent Run — Cache Save Declined', 2).addRaw(
-      'The session cache was not saved at this point because the SQLite write-ahead log could not be checkpointed.\n\n' +
-        `**Reason:** ${reason}\n\n` +
+      `${htmlParagraph('The session cache was not saved at this point because the SQLite write-ahead log could not be checkpointed.')}\n` +
+        `${htmlParagraph(`${htmlStrong('Reason:')} ${htmlText(reason)}`)}\n` +
         // core.summary.write() appends by default, so this block is never edited or
         // removed after the fact once written — it must describe only what is true right
         // now, not a predicted final outcome. It used to assert "the next run may restore
@@ -106,7 +107,7 @@ async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Pr
         // decline exists to make room for. That retry does not itself write a job summary
         // entry on success, so this wording is deliberately conditional rather than
         // promising a correction that may never visibly appear.
-        '> A retry from the post-action hook may still save the cache later in this run. Only if that retry also fails does the next run risk restoring an older session.\n',
+        '<blockquote>A retry from the post-action hook may still save the cache later in this run. Only if that retry also fails does the next run risk restoring an older session.</blockquote>\n',
     )
     await core.summary.write()
   } catch (error) {

@@ -68,8 +68,8 @@ function createHolder(overrides: Partial<LockRecord> = {}): LockRecord {
 }
 
 function summaryText(): string {
-  const raw = vi.mocked(core.summary.addRaw).mock.calls.map(call => String(call[0]))
-  const tables = vi.mocked(core.summary.addTable).mock.calls.map(call => JSON.stringify(call[0]))
+  const raw = vi.mocked(core.summary).addRaw.mock.calls.map(call => String(call[0]))
+  const tables = vi.mocked(core.summary).addTable.mock.calls.map(call => JSON.stringify(call[0]))
   const headings = vi.mocked(core.summary.addHeading).mock.calls.map(call => String(call[0]))
   return [...headings, ...raw, ...tables].join('\n')
 }
@@ -327,5 +327,92 @@ describe('runCoordinationDecline', () => {
     // #then the reason and holder surface are reported without a run link
     expect(summaryText()).toContain('expired coordination lease')
     expect(summaryText()).not.toContain('/actions/runs/')
+  })
+})
+
+describe('runCoordinationDecline summary HTML', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('builds links, code, and the heading paragraph as escaped HTML, with no Markdown in cells', async () => {
+    // #given an Action holder with a live lease and an issue target
+    // #when the decline runs
+    await runCoordinationDecline({
+      githubClient: client,
+      triggerContext: createContext(target('issue')),
+      holder: createHolder(),
+      reason: 'active-holder',
+      responseMode: 'github',
+      logger: createMockLogger(),
+    })
+
+    // #then the table cells are exact HTML
+    const rows = vi.mocked(core.summary).addTable.mock.calls[0]![0]
+    expect(rows).toContainEqual(['Target', '<a href="https://github.com/fro-bot/agent/issues/7">issue #7</a>'])
+    expect(rows).toContainEqual(['Trigger', '<code>issue_comment.created</code>'])
+    expect(rows).toContainEqual([
+      'Last observed holder',
+      'github (Action run <a href="https://github.com/fro-bot/agent/actions/runs/4242">4242</a>)',
+    ])
+    expect(rows).toContainEqual([
+      'Lease expiry (observed)',
+      '<code>2026-10-05T00:15:00.000Z</code> — NOT an estimated completion time',
+    ])
+    expect(rows).toContainEqual(['Label <code>agent: blocked</code>', 'applied'])
+
+    // #and the raw sections are block-level paragraphs, with the recovery label in <strong>
+    const raw = vi.mocked(core.summary).addRaw.mock.calls.map(call => String(call[0]))
+    expect(raw[0]).toBe('<p>Another Fro Bot Action run is active for this repository.</p>\n')
+    expect(raw[1]).toBe(
+      '<p>No agent execution occurred. This request was not automatically requeued.</p>\n<p><strong>Recovery:</strong> re-run this workflow, or mention the bot again after the other run finishes. Editing the issue alone does not retrigger it. The <code>agent: blocked</code> label is removed automatically when a later run for this item succeeds; remove it manually if needed.</p>\n',
+    )
+    expect(summaryText()).not.toContain('**')
+    expect(summaryText()).not.toContain('`')
+  })
+
+  it('renders pull request and discussion targets as anchors', async () => {
+    // #given pull request and discussion targets
+    // #when each decline runs
+    await runCoordinationDecline({
+      githubClient: client,
+      triggerContext: createContext(target('pr', 12)),
+      holder: createHolder(),
+      reason: 'active-holder',
+      responseMode: 'github',
+      logger: createMockLogger(),
+    })
+    await runCoordinationDecline({
+      githubClient: client,
+      triggerContext: createContext(target('discussion', 3)),
+      holder: createHolder(),
+      reason: 'active-holder',
+      responseMode: 'github',
+      logger: createMockLogger(),
+    })
+
+    // #then
+    const targets = vi.mocked(core.summary).addTable.mock.calls.map(call => call[0].find(row => row[0] === 'Target'))
+    expect(targets).toEqual([
+      ['Target', '<a href="https://github.com/fro-bot/agent/pull/12">pull request #12</a>'],
+      ['Target', '<a href="https://github.com/fro-bot/agent/discussions/3">discussion #3</a>'],
+    ])
+  })
+
+  it('escapes a hostile trigger action exactly once', async () => {
+    // #given a trigger action carrying markup and an entity-like string
+    // #when the decline runs
+    await runCoordinationDecline({
+      githubClient: client,
+      triggerContext: createContext(target('issue'), '<b>&amp;</b>'),
+      holder: createHolder(),
+      reason: 'active-holder',
+      responseMode: 'github',
+      logger: createMockLogger(),
+    })
+
+    // #then no double escaping and no raw tag
+    const rows = vi.mocked(core.summary).addTable.mock.calls[0]![0]
+    expect(rows).toContainEqual(['Trigger', '<code>issue_comment.&lt;b&gt;&amp;amp;&lt;/b&gt;</code>'])
   })
 })

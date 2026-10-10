@@ -173,8 +173,8 @@ describe('writeJobSummary', () => {
 
     // #then
     expect(core.summary.addHeading).toHaveBeenCalledWith('Sessions', 3)
-    expect(core.summary.addRaw).toHaveBeenCalledWith('**Used:** ses_prior\n')
-    expect(core.summary.addRaw).toHaveBeenCalledWith('**Created:** ses_new\n')
+    expect(core.summary.addRaw).toHaveBeenCalledWith('<p><strong>Used:</strong> ses_prior</p>\n')
+    expect(core.summary.addRaw).toHaveBeenCalledWith('<p><strong>Created:</strong> ses_new</p>\n')
   })
 
   it('includes token usage section when tokens exist', async () => {
@@ -192,8 +192,8 @@ describe('writeJobSummary', () => {
 
     // #then
     expect(core.summary.addHeading).toHaveBeenCalledWith('Token Usage', 3)
-    expect(core.summary.addRaw).toHaveBeenCalledWith('**Model:** claude-sonnet-4-20250514\n')
-    expect(core.summary.addRaw).toHaveBeenCalledWith('**Cost:** $0.0100\n')
+    expect(core.summary.addRaw).toHaveBeenCalledWith('<p><strong>Model:</strong> claude-sonnet-4-20250514</p>\n')
+    expect(core.summary.addRaw).toHaveBeenCalledWith('<p><strong>Cost:</strong> $0.0100</p>\n')
   })
 
   it('includes artifacts section when artifacts exist', async () => {
@@ -212,7 +212,7 @@ describe('writeJobSummary', () => {
     // #then
     expect(core.summary.addHeading).toHaveBeenCalledWith('Created Artifacts', 3)
     expect(core.summary.addList).toHaveBeenCalled()
-    expect(core.summary.addRaw).toHaveBeenCalledWith('**Comments Posted:** 2\n')
+    expect(core.summary.addRaw).toHaveBeenCalledWith('<p><strong>Comments Posted:</strong> 2</p>\n')
   })
 
   it('includes errors section when errors exist', async () => {
@@ -231,8 +231,10 @@ describe('writeJobSummary', () => {
 
     // #then
     expect(core.summary.addHeading).toHaveBeenCalledWith('Errors', 3)
-    expect(core.summary.addRaw).toHaveBeenCalledWith('- **RateLimit** (🔄 Recovered): API limited\n')
-    expect(core.summary.addRaw).toHaveBeenCalledWith('- **NetworkError** (❌ Failed): Timeout\n')
+    expect(core.summary.addList).toHaveBeenCalledWith([
+      '<strong>RateLimit</strong> (🔄 Recovered): API limited',
+      '<strong>NetworkError</strong> (❌ Failed): Timeout',
+    ])
   })
 
   it('includes the classification path for errors in the job summary', async () => {
@@ -247,9 +249,9 @@ describe('writeJobSummary', () => {
     await writeJobSummary(options, logger)
 
     // #then the classification path is visible alongside the error
-    expect(core.summary.addRaw).toHaveBeenCalledWith(
-      '- **APIError** (🔄 Recovered, classification: structured): Provider unavailable\n',
-    )
+    expect(core.summary.addList).toHaveBeenCalledWith([
+      '<strong>APIError</strong> (🔄 Recovered, classification: structured): Provider unavailable',
+    ])
   })
 
   it('shows the escaped suggested action after the message when an error has one', async () => {
@@ -267,9 +269,9 @@ describe('writeJobSummary', () => {
     await writeJobSummary(options, logger)
 
     // #then the action is appended and escaped like other summary text
-    expect(core.summary.addRaw).toHaveBeenCalledWith(
-      '- **model_not_found** (❌ Failed): Model not found: acme/x. Suggested action: Set &lt;model&gt; &#124; &#96;id&#96; then retry\n',
-    )
+    expect(core.summary.addList).toHaveBeenCalledWith([
+      '<strong>model_not_found</strong> (❌ Failed): Model not found: acme/x. Suggested action: Set &lt;model&gt; | `id` then retry',
+    ])
   })
 
   it('renders an error without a suggested action exactly as before', async () => {
@@ -293,8 +295,10 @@ describe('writeJobSummary', () => {
     await writeJobSummary(options, logger)
 
     // #then the lines carry no suggested-action text
-    expect(core.summary.addRaw).toHaveBeenCalledWith('- **RateLimit** (🔄 Recovered): API limited\n')
-    expect(core.summary.addRaw).toHaveBeenCalledWith('- **NetworkError** (❌ Failed): Timeout\n')
+    expect(core.summary.addList).toHaveBeenCalledWith([
+      '<strong>RateLimit</strong> (🔄 Recovered): API limited',
+      '<strong>NetworkError</strong> (❌ Failed): Timeout',
+    ])
   })
 
   it('omits optional sections when empty', async () => {
@@ -372,7 +376,7 @@ describe('writeJobSummary', () => {
 
       // #then the section confirms nothing is missing, without naming anything as unfinished
       expect(core.summary.addHeading).toHaveBeenCalledWith('Background Work', 3)
-      expect(core.summary.addRaw).toHaveBeenCalledWith('All background work finished.\n')
+      expect(core.summary.addRaw).toHaveBeenCalledWith('<p>All background work finished.</p>\n')
       expect(core.summary.addRaw).not.toHaveBeenCalledWith(expect.stringContaining('Did not finish'))
     })
 
@@ -391,7 +395,7 @@ describe('writeJobSummary', () => {
 
       // #then the unconfirmed one is named by label, not folded into a bare count -- and
       // the settled one is not named as unfinished (the array is exact, not a superset)
-      expect(core.summary.addRaw).toHaveBeenCalledWith('**Did not finish:**\n')
+      expect(core.summary.addRaw).toHaveBeenCalledWith('<p><strong>Did not finish:</strong></p>\n')
       expect(core.summary.addList).toHaveBeenCalledWith(['reviewer-subagent-b (unconfirmed)'])
     })
 
@@ -407,7 +411,7 @@ describe('writeJobSummary', () => {
 
       // #then it is listed with its unconfirmed state, never claimed as finished
       expect(core.summary.addList).toHaveBeenCalledWith(['linter-subagent (unconfirmed)'])
-      expect(core.summary.addRaw).not.toHaveBeenCalledWith('All background work finished.\n')
+      expect(core.summary.addRaw).not.toHaveBeenCalledWith('<p>All background work finished.</p>\n')
     })
 
     it('edge case: a run finishing with unknown entries explicitly reports the degraded state', async () => {
@@ -550,7 +554,8 @@ describe('writeCacheSaveResultSummary', () => {
     // #then keeping R4's "one sentence, not a paragraph" bar: no blank line, and no
     // sentence-ending period until the single one that closes the remediation text
     expect(remediationText).not.toContain('\n\n')
-    expect(remediationText.trim().indexOf('.')).toBe(remediationText.trim().length - 1)
+    const sentence = remediationText.replaceAll(/<\/?(?:p|code)>/g, '').trim()
+    expect(sentence.indexOf('.')).toBe(sentence.length - 1)
   })
 
   it('distinguishes store-only from both full success and failure, without s3-backup advice', async () => {
@@ -653,7 +658,7 @@ describe('writeCacheSaveResultSummary', () => {
     // and the specific declineReason is appended so a reader does not need the logs
     const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
     expect(remediationText).toContain('persistence safety could not be confirmed')
-    expect(remediationText).toContain('**Reason:** the coordination lease could not be renewed')
+    expect(remediationText).toContain('<p><strong>Reason:</strong> the coordination lease could not be renewed</p>')
     expect(remediationText).not.toContain('did not accept the write')
     expect(remediationText).not.toContain('s3-backup')
   })
@@ -683,7 +688,7 @@ describe('writeCacheSaveResultSummary', () => {
     // #then
     const remediationText = vi.mocked(core.summary).addRaw.mock.calls.flat().join(' ')
     expect(remediationText).toContain('persistence safety could not be confirmed')
-    expect(remediationText).not.toContain('**Reason:**')
+    expect(remediationText).not.toContain('Reason:')
   })
 
   it('does not fail the run when the summary write throws', async () => {
@@ -717,7 +722,9 @@ describe('writeInvocationOutcomeSummary (skipped)', () => {
     })
 
     // #then the specific reason is rendered, not just the generic skipped sentence
-    expect(summaryText()).toContain('**Skip reason:** <code>draft_pr</code> — Pull request is a draft')
+    expect(summaryText()).toContain(
+      '<p><strong>Skip reason:</strong> <code>draft_pr</code> — Pull request is a draft</p>',
+    )
     expect(core.summary.write).toHaveBeenCalledTimes(1)
   })
 
@@ -745,10 +752,10 @@ describe('writeInvocationOutcomeSummary (skipped)', () => {
       message: 'Pull requests from bots (<img src=x onerror=alert(1)>|`evil`\n# pwn) are not processed',
     })
 
-    // #then no raw markup, pipes, backticks, or newlines survive
+    // #then no raw markup or newlines survive (pipes and backticks are inert inside an HTML block)
     const text = summaryText()
     expect(text).not.toContain('<img')
-    expect(text).toContain('&lt;img src=x onerror=alert(1)&gt;&#124;&#96;evil&#96; # pwn')
+    expect(text).toContain('&lt;img src=x onerror=alert(1)&gt;|`evil` # pwn')
   })
 
   it.each(SKIP_REASONS)('renders the %s reason code', async reason => {
