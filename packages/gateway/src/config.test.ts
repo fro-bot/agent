@@ -2275,6 +2275,22 @@ describe('loadGatewayConfig — operator web OAuth credentials', () => {
     expect(config.operatorWeb?.oauthAllowedReturnPaths).toEqual(['/operator/dashboard', '/operator/runs'])
   })
 
+  it.each([
+    ['a backslash path', String.raw`/\evil.example/landing`],
+    ['a protocol-relative URL', '//evil.example/landing'],
+    ['an absolute URL', 'https://evil.example/landing'],
+    ['a non-rooted path', 'operator'],
+    ['an embedded control character', '/operator\u0007'],
+  ])('error path: GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS entry that is %s → throws', (_label, entry) => {
+    // #given — a safe first entry plus one unsafe entry
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS = `/operator,${entry}`
+
+    // #when / #then — fail loud at startup
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS entry/)
+  })
+
   it('happy path: GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS defaults to ["/operator"]', () => {
     // #given — no override
     setRequiredEnv()
